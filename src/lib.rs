@@ -4,8 +4,8 @@ pub mod pulsebeam {
     }
 }
 use moka::sync::Cache;
-use pulsebeam::v1::Message;
 pub use pulsebeam::v1::{self as rpc};
+use pulsebeam::v1::{IceServer, Message};
 use pulsebeam::v1::{PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp};
 use std::sync::Arc;
 use tokio::time;
@@ -87,8 +87,17 @@ impl rpc::Tunnel for Server {
         _ctx: twirp::Context,
         _req: PrepareReq,
     ) -> Result<PrepareResp, twirp::TwirpErrorResponse> {
+        // WARNING: PLEASE READ THIS FIRST!
+        // By default, OSS/self-hosting only provides a public STUN server.
+        // You must provide your own TURN and STUN services.
+        // TURN is required in some network condition.
+        // Public TURN and STUN services are UNRELIABLE.
         Ok(PrepareResp {
-            ice_servers: vec![],
+            ice_servers: vec![IceServer {
+                urls: vec![String::from("stun.l.google.com:19302")],
+                username: None,
+                credential: None,
+            }],
         })
     }
 
@@ -189,16 +198,22 @@ mod test {
     async fn recv_normal() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        s.send(dummy_ctx(), SendReq {
-            msg: Some(msgs[0].clone()),
-        })
+        s.send(
+            dummy_ctx(),
+            SendReq {
+                msg: Some(msgs[0].clone()),
+            },
+        )
         .await
         .unwrap();
 
         let resp = s
-            .recv(dummy_ctx(), RecvReq {
-                src: Some(peer2.clone()),
-            })
+            .recv(
+                dummy_ctx(),
+                RecvReq {
+                    src: Some(peer2.clone()),
+                },
+            )
             .await
             .unwrap();
 
@@ -213,18 +228,24 @@ mod test {
         let cloned_s = Arc::clone(&s);
         let join = tokio::spawn(async move {
             cloned_s
-                .recv(dummy_ctx(), RecvReq {
-                    src: Some(peer2.clone()),
-                })
+                .recv(
+                    dummy_ctx(),
+                    RecvReq {
+                        src: Some(peer2.clone()),
+                    },
+                )
                 .await
                 .unwrap()
         });
 
         // let recv runs first since tokio test starts with single thread by default
         tokio::task::yield_now().await;
-        s.send(dummy_ctx(), SendReq {
-            msg: Some(msgs[0].clone()),
-        })
+        s.send(
+            dummy_ctx(),
+            SendReq {
+                msg: Some(msgs[0].clone()),
+            },
+        )
         .await
         .unwrap();
 
@@ -236,18 +257,24 @@ mod test {
     async fn recv_after_timeout() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        s.send(dummy_ctx(), SendReq {
-            msg: Some(msgs[0].clone()),
-        })
+        s.send(
+            dummy_ctx(),
+            SendReq {
+                msg: Some(msgs[0].clone()),
+            },
+        )
         .await
         .unwrap();
 
         s.mailboxes.invalidate_all();
         let resp = time::timeout(
             time::Duration::from_millis(5),
-            s.recv(dummy_ctx(), RecvReq {
-                src: Some(peer2.clone()),
-            }),
+            s.recv(
+                dummy_ctx(),
+                RecvReq {
+                    src: Some(peer2.clone()),
+                },
+            ),
         )
         .await;
 
