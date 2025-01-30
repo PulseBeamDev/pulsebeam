@@ -123,3 +123,74 @@ impl rpc::Tunnel for Server {
         Ok(RecvResp { msgs })
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::iter::zip;
+    use std::sync::Mutex;
+
+    use super::*;
+    use rpc::{MessageHeader, MessagePayload, Tunnel};
+
+    fn dummy_ctx() -> twirp::Context {
+        twirp::Context::new(
+            http::Extensions::new(),
+            Arc::new(Mutex::new(http::Extensions::new())),
+        )
+    }
+
+    fn dummy_msg(src: PeerInfo, dst: PeerInfo, seqnum: u32) -> Message {
+        Message {
+            header: Some(MessageHeader {
+                src: Some(src),
+                dst: Some(dst),
+                seqnum,
+                reliable: true,
+            }),
+            payload: Some(MessagePayload { payload_type: None }),
+        }
+    }
+
+    fn assert_msgs(received: &Vec<Message>, sent: &Vec<Message>) {
+        assert_eq!(received.len(), sent.len());
+        let pairs = zip(received, sent);
+        for (a, b) in pairs.into_iter() {
+            assert_eq!(a, b);
+        }
+    }
+
+    fn setup() -> (Arc<Server>, PeerInfo, PeerInfo) {
+        let s = Server::new();
+        let peer1 = PeerInfo {
+            group_id: String::from("default"),
+            peer_id: String::from("peer1"),
+            conn_id: 32,
+        };
+        let peer2 = PeerInfo {
+            group_id: peer1.group_id.clone(),
+            peer_id: String::from("peer2"),
+            conn_id: 64,
+        };
+        (s, peer1, peer2)
+    }
+
+    #[tokio::test]
+    async fn recv_normal() {
+        let (s, peer1, peer2) = setup();
+        let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
+        s.send(dummy_ctx(), SendReq {
+            msg: Some(msgs[0].clone()),
+        })
+        .await
+        .unwrap();
+
+        let resp = s
+            .recv(dummy_ctx(), RecvReq {
+                src: Some(peer2.clone()),
+            })
+            .await
+            .unwrap();
+
+        assert_msgs(&resp.msgs, &msgs);
+    }
+}
