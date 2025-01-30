@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/app/target/ \
 FROM docker.io/library/alpine:3
 
 WORKDIR /app
-COPY --from=builder /app/target/release/pulsebeam-server-lite .
+COPY --from=builder /app/pulsebeam-server-lite .
 
 ENTRYPOINT ["./pulsebeam-server-lite"]
 
