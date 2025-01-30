@@ -11,8 +11,6 @@ use std::sync::Arc;
 use tokio::time;
 use twirp::async_trait::async_trait;
 
-const SESSION_TTL: time::Duration = time::Duration::from_secs(3);
-const SESSION_CAPACITY: u64 = 10_000;
 const SESSION_MAILBOX_CAPACITY: usize = 32;
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
 const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
@@ -26,10 +24,7 @@ pub struct Server {
 impl Server {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            mailboxes: Cache::builder()
-                .time_to_live(SESSION_TTL)
-                .max_capacity(SESSION_CAPACITY)
-                .build(),
+            mailboxes: Cache::builder().time_to_idle(SESSION_POLL_TIMEOUT).build(),
         })
     }
 
@@ -192,5 +187,55 @@ mod test {
             .unwrap();
 
         assert_msgs(&resp.msgs, &msgs);
+    }
+
+    #[tokio::test]
+    async fn recv_first_then_send() {
+        let (s, peer1, peer2) = setup();
+        let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
+
+        let cloned_s = Arc::clone(&s);
+        let join = tokio::spawn(async move {
+            cloned_s
+                .recv(dummy_ctx(), RecvReq {
+                    src: Some(peer2.clone()),
+                })
+                .await
+                .unwrap()
+        });
+
+        // let recv runs first since tokio test starts with single thread by default
+        tokio::task::yield_now().await;
+        s.send(dummy_ctx(), SendReq {
+            msg: Some(msgs[0].clone()),
+        })
+        .await
+        .unwrap();
+
+        let resp = join.await.unwrap();
+        assert_msgs(&resp.msgs, &msgs);
+    }
+
+    #[tokio::test]
+    async fn recv_after_timeout() {
+        let (s, peer1, peer2) = setup();
+        let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
+        s.send(dummy_ctx(), SendReq {
+            msg: Some(msgs[0].clone()),
+        })
+        .await
+        .unwrap();
+
+        s.mailboxes.invalidate_all();
+        let resp = time::timeout(
+            time::Duration::from_millis(5),
+            s.recv(dummy_ctx(), RecvReq {
+                src: Some(peer2.clone()),
+            }),
+        )
+        .await;
+
+        // expect timeout to hit because there's no message
+        assert!(resp.is_err());
     }
 }

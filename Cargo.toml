@@ -8,7 +8,7 @@ axum = "0.8.1"
 mimalloc = "0.1.43"
 moka = { version = "0.12.10", features = ["sync"] }
 prost = "0.13"
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.43.0", features = ["full", "test-util"] }
 twirp = { git = "https://github.com/github/twirp-rs.git", rev = "b33e3a5835d5b874e8c16840475184d8c9761622" }
 tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.19" }
