@@ -20,5 +20,5 @@ FROM docker.io/library/alpine:3
 WORKDIR /app
 COPY --from=builder /app/target/release/pulsebeam-server-lite .
 
-ENTRYPOINT ["./server-rs"]
+ENTRYPOINT ["./pulsebeam-server-lite"]
 
