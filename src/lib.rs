@@ -7,6 +7,7 @@ use moka::future::Cache;
 pub use pulsebeam::v1::{self as rpc};
 use pulsebeam::v1::{IceServer, Message};
 use pulsebeam::v1::{PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time;
 use twirp::async_trait::async_trait;
@@ -16,9 +17,9 @@ const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs
 const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
-type Channel = (flume::Sender<Message>, flume::Receiver<Message>);
+type Mailbox = (flume::Sender<rpc::Message>, flume::Receiver<rpc::Message>);
 pub struct Server {
-    mailboxes: Cache<String, Channel>,
+    mailboxes: Cache<String, Mailbox, ahash::RandomState>,
     cfg: ServerConfig,
 }
 
@@ -36,13 +37,13 @@ impl Server {
             mailboxes: Cache::builder()
                 .time_to_idle(SESSION_POLL_TIMEOUT)
                 .max_capacity(cfg.max_capacity)
-                .build(),
+                .build_with_hasher(ahash::RandomState::default()),
             cfg,
         })
     }
 
     #[inline]
-    async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Channel {
+    async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Mailbox {
         let id = format!("{}:{}:{}", group_id, peer_id, conn_id);
         self.mailboxes
             .get_with_by_ref(&id, async { flume::bounded(self.cfg.mailbox_capacity) })
@@ -50,11 +51,14 @@ impl Server {
     }
 
     async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
-        let (_, discovery_ch) = self
+        let (_, discovery) = self
             .get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY)
             .await;
-        let (_, payload_ch) = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
-        let mut msgs = Vec::new();
+        let (_, payload) = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
+        let mut set = HashSet::with_capacity_and_hasher(
+            self.cfg.mailbox_capacity,
+            ahash::RandomState::default(),
+        );
         let mut poll_timeout = time::interval_at(
             time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
             SESSION_BATCH_TIMEOUT,
@@ -63,23 +67,25 @@ impl Server {
         loop {
             let mut msg: Option<Message> = None;
             tokio::select! {
-                res = discovery_ch.recv_async() => {
-                    msg = res.ok();
+                m = discovery.recv_async() => {
+                    msg = m.ok();
                     poll_timeout.reset();
                 }
-                res = payload_ch.recv_async() => {
-                    msg = res.ok();
+                m = payload.recv_async() => {
+                    msg= m.ok();
                     poll_timeout.reset();
                 }
                 _ = poll_timeout.tick() => {}
             }
 
-            if let Some(msg) = msg {
-                msgs.push(msg);
+            if let Some(msgs) = msg {
+                set.insert(msgs);
             } else {
-                return msgs;
+                break;
             }
         }
+
+        set.into_iter().collect()
     }
 }
 
@@ -120,8 +126,9 @@ impl rpc::Tunnel for Server {
             .ok_or(twirp::invalid_argument("dst is required"))?;
 
         let (ch, _) = self.get(&dst.group_id, &dst.peer_id, dst.conn_id).await;
-        ch.send(msg)
-            .map_err(|err| twirp::internal(err.to_string()))?;
+        ch.send_async(msg)
+            .await
+            .map_err(|err| twirp::aborted(err.to_string()))?;
 
         Ok(SendResp {})
     }
