@@ -3,12 +3,13 @@ pub mod pulsebeam {
         include!(concat!(env!("OUT_DIR"), "/pulsebeam.v1.rs"));
     }
 }
-use moka::sync::Cache;
+use moka::future::Cache;
 pub use pulsebeam::v1::{self as rpc};
 use pulsebeam::v1::{IceServer, Message};
 use pulsebeam::v1::{PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp};
 use std::sync::Arc;
 use tokio::time;
+use tracing::warn;
 use twirp::async_trait::async_trait;
 
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
@@ -42,15 +43,18 @@ impl Server {
     }
 
     #[inline]
-    fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Channel {
+    async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Channel {
         let id = format!("{}:{}:{}", group_id, peer_id, conn_id);
         self.mailboxes
-            .get_with_by_ref(&id, || flume::bounded(self.cfg.mailbox_capacity))
+            .get_with_by_ref(&id, async { flume::bounded(self.cfg.mailbox_capacity) })
+            .await
     }
 
     async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
-        let (_, discovery_ch) = self.get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY);
-        let (_, payload_ch) = self.get(&src.group_id, &src.peer_id, src.conn_id);
+        let (_, discovery_ch) = self
+            .get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY)
+            .await;
+        let (_, payload_ch) = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
         let mut msgs = Vec::new();
         let mut poll_timeout = time::interval_at(
             time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
@@ -60,20 +64,22 @@ impl Server {
         loop {
             let mut msg: Option<Message> = None;
             tokio::select! {
-                Ok(m) = discovery_ch.recv_async() => {
-                    msg = Some(m);
+                res = discovery_ch.recv_async() => {
+                    msg = res.ok();
                     poll_timeout.reset();
                 }
-                Ok(m) = payload_ch.recv_async() => {
-                    msg = Some(m);
+                res = payload_ch.recv_async() => {
+                    msg = res.ok();
                     poll_timeout.reset();
                 }
                 _ = poll_timeout.tick() => {}
             }
 
+            // TODO: deduplicate messages
             if let Some(msg) = msg {
                 msgs.push(msg);
             } else {
+                warn!("senders have dropped");
                 return msgs;
             }
         }
@@ -116,7 +122,7 @@ impl rpc::Tunnel for Server {
             .as_ref()
             .ok_or(twirp::invalid_argument("dst is required"))?;
 
-        let (ch, _) = self.get(&dst.group_id, &dst.peer_id, dst.conn_id);
+        let (ch, _) = self.get(&dst.group_id, &dst.peer_id, dst.conn_id).await;
         ch.send(msg)
             .map_err(|err| twirp::internal(err.to_string()))?;
 
@@ -254,31 +260,26 @@ mod test {
     }
 
     #[tokio::test]
-    async fn recv_after_timeout() {
+    async fn recv_after_ttl() {
         let (s, peer1, peer2) = setup();
-        let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        s.send(
-            dummy_ctx(),
-            SendReq {
-                msg: Some(msgs[0].clone()),
-            },
-        )
-        .await
-        .unwrap();
-
         s.mailboxes.invalidate_all();
-        let resp = time::timeout(
-            time::Duration::from_millis(5),
-            s.recv(
-                dummy_ctx(),
-                RecvReq {
-                    src: Some(peer2.clone()),
-                },
-            ),
-        )
-        .await;
+        s.mailboxes.run_pending_tasks().await;
+        let sent = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
+        let msg = sent[0].clone();
 
-        // expect timeout to hit because there's no message
-        assert!(resp.is_err());
+        let cloned = Arc::clone(&s);
+        tokio::spawn(async move {
+            cloned
+                .send(dummy_ctx(), SendReq { msg: Some(msg) })
+                .await
+                .unwrap();
+        });
+        let received = s.recv_batch(&peer2).await;
+        assert_msgs(&received, &sent);
+
+        // at this point, cache has been refreshed. So, it will stuck until it receives more
+        // messages
+        let res = time::timeout(time::Duration::from_millis(5), s.recv_batch(&peer2)).await;
+        assert!(res.is_err());
     }
 }
