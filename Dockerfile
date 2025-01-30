@@ -11,7 +11,9 @@ RUN --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/root/.cargo/registry \
-    cargo build --release
+    cargo build --release && \
+    # Copy executable out of the cache so it is available in the final image.
+    cp target/release/pulsebeam-server-lite ./pulsebeam-server-lite
 
 FROM docker.io/library/alpine:3
 
