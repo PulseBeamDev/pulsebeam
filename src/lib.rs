@@ -94,7 +94,7 @@ impl rpc::Tunnel for Server {
         // Public TURN and STUN services are UNRELIABLE.
         Ok(PrepareResp {
             ice_servers: vec![IceServer {
-                urls: vec![String::from("stun.l.google.com:19302")],
+                urls: vec![String::from("stun:stun.l.google.com:19302")],
                 username: None,
                 credential: None,
             }],
