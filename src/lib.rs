@@ -11,7 +11,6 @@ use std::sync::Arc;
 use tokio::time;
 use twirp::async_trait::async_trait;
 
-const SESSION_MAILBOX_CAPACITY: usize = 32;
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
 const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs(5);
 const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
@@ -20,18 +19,25 @@ const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 type Channel = (flume::Sender<Message>, flume::Receiver<Message>);
 pub struct Server {
     mailboxes: Cache<String, Channel>,
+    cfg: ServerConfig,
+}
+
+pub struct ServerConfig {
+    pub max_capacity: u64,
+    pub mailbox_capacity: usize,
 }
 
 impl Server {
-    pub fn new(max_capacity: u64) -> Arc<Self> {
+    pub fn new(cfg: ServerConfig) -> Arc<Self> {
         Arc::new(Self {
             // | peerA | peerB | description |
             // | t+0   | t+SESSION_POLL_TIMEOUT | let peerA messages drop, peerB will initiate |
             // | t+0   | t+SESSION_POLL_TIMEOUT-SESSION_POLL_LATENCY_TOLERANCE | peerB receives messages then it'll refresh cache on the next poll |
             mailboxes: Cache::builder()
                 .time_to_idle(SESSION_POLL_TIMEOUT)
-                .max_capacity(max_capacity)
+                .max_capacity(cfg.max_capacity)
                 .build(),
+            cfg,
         })
     }
 
@@ -39,7 +45,7 @@ impl Server {
     fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Channel {
         let id = format!("{}:{}:{}", group_id, peer_id, conn_id);
         self.mailboxes
-            .get_with_by_ref(&id, || flume::bounded(SESSION_MAILBOX_CAPACITY))
+            .get_with_by_ref(&id, || flume::bounded(self.cfg.mailbox_capacity))
     }
 
     async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
@@ -162,7 +168,10 @@ mod test {
     }
 
     fn setup() -> (Arc<Server>, PeerInfo, PeerInfo) {
-        let s = Server::new(10_000);
+        let s = Server::new(ServerConfig {
+            max_capacity: 10_000,
+            mailbox_capacity: 32,
+        });
         let peer1 = PeerInfo {
             group_id: String::from("default"),
             peer_id: String::from("peer1"),
