@@ -7,7 +7,9 @@ use moka::future::Cache;
 pub use pulsebeam::v1::{self as rpc};
 use pulsebeam::v1::{IceServer, Message};
 use pulsebeam::v1::{PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp};
+use std::hash::Hash;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::time;
 use twirp::async_trait::async_trait;
 
@@ -16,15 +18,53 @@ const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs
 const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
-type Channel = (flume::Sender<Message>, flume::Receiver<Message>);
+#[derive(Hash, PartialEq)]
+struct MailboxMessage(rpc::Message);
+impl Eq for MailboxMessage {}
+
+struct Mailbox {
+    notify: Notify,
+    queue: Cache<MailboxMessage, (), ahash::RandomState>,
+}
+
+impl Mailbox {
+    fn new(max_capacity: u64) -> Arc<Self> {
+        let queue = Cache::builder()
+            .time_to_idle(SESSION_POLL_LATENCY_TOLERANCE)
+            .max_capacity(max_capacity)
+            .build_with_hasher(ahash::RandomState::default());
+        Arc::new(Self {
+            notify: Notify::new(),
+            queue,
+        })
+    }
+
+    async fn send(&self, msg: rpc::Message) {
+        self.queue.insert(MailboxMessage(msg), ()).await;
+        self.notify.notify_one();
+    }
+
+    async fn recv(&self) -> Vec<rpc::Message> {
+        self.notify.notified().await;
+        let queue = &self.queue;
+        let mut msgs = Vec::new();
+        for (m, _) in queue.iter() {
+            queue.invalidate(m.as_ref()).await;
+            msgs.push(m.0.clone());
+        }
+
+        msgs
+    }
+}
+
 pub struct Server {
-    mailboxes: Cache<String, Channel>,
+    mailboxes: Cache<String, Arc<Mailbox>>,
     cfg: ServerConfig,
 }
 
 pub struct ServerConfig {
     pub max_capacity: u64,
-    pub mailbox_capacity: usize,
+    pub mailbox_capacity: u64,
 }
 
 impl Server {
@@ -42,42 +82,42 @@ impl Server {
     }
 
     #[inline]
-    async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Channel {
+    async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Arc<Mailbox> {
         let id = format!("{}:{}:{}", group_id, peer_id, conn_id);
         self.mailboxes
-            .get_with_by_ref(&id, async { flume::bounded(self.cfg.mailbox_capacity) })
+            .get_with_by_ref(&id, async { Mailbox::new(self.cfg.mailbox_capacity) })
             .await
     }
 
     async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
-        let (_, discovery_ch) = self
+        let discovery = self
             .get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY)
             .await;
-        let (_, payload_ch) = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
-        let mut msgs = Vec::new();
+        let payload = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
+        let mut res = Vec::new();
         let mut poll_timeout = time::interval_at(
             time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
             SESSION_BATCH_TIMEOUT,
         );
 
         loop {
-            let mut msg: Option<Message> = None;
+            let mut msgs: Option<Vec<Message>> = None;
             tokio::select! {
-                res = discovery_ch.recv_async() => {
-                    msg = res.ok();
+                m = discovery.recv() => {
+                    msgs = Some(m);
                     poll_timeout.reset();
                 }
-                res = payload_ch.recv_async() => {
-                    msg = res.ok();
+                m = payload.recv() => {
+                    msgs = Some(m);
                     poll_timeout.reset();
                 }
                 _ = poll_timeout.tick() => {}
             }
 
-            if let Some(msg) = msg {
-                msgs.push(msg);
+            if let Some(msgs) = msgs {
+                res.extend(msgs);
             } else {
-                return msgs;
+                return res;
             }
         }
     }
@@ -119,9 +159,8 @@ impl rpc::Tunnel for Server {
             .as_ref()
             .ok_or(twirp::invalid_argument("dst is required"))?;
 
-        let (ch, _) = self.get(&dst.group_id, &dst.peer_id, dst.conn_id).await;
-        ch.send(msg)
-            .map_err(|err| twirp::internal(err.to_string()))?;
+        let m = self.get(&dst.group_id, &dst.peer_id, dst.conn_id).await;
+        m.send(msg).await;
 
         Ok(SendResp {})
     }
