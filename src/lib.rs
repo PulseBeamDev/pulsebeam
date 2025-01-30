@@ -9,7 +9,6 @@ use pulsebeam::v1::{IceServer, Message};
 use pulsebeam::v1::{PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp};
 use std::sync::Arc;
 use tokio::time;
-use tracing::warn;
 use twirp::async_trait::async_trait;
 
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
@@ -75,11 +74,9 @@ impl Server {
                 _ = poll_timeout.tick() => {}
             }
 
-            // TODO: deduplicate messages
             if let Some(msg) = msg {
                 msgs.push(msg);
             } else {
-                warn!("senders have dropped");
                 return msgs;
             }
         }
