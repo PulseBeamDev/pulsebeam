@@ -4,25 +4,46 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::Context;
-use axum::Router;
+use axum::{routing::get, Router};
+use http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE};
 use std::net::SocketAddr;
+use tower_http::trace::TraceLayer;
 use tracing::info;
+
+use http::Method;
+use std::time::Duration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 const SERVER_CONFIG: pulsebeam_server_lite::ServerConfig = pulsebeam_server_lite::ServerConfig {
     max_capacity: 65536,
     mailbox_capacity: 32,
 };
 
+async fn ping() -> &'static str {
+    "Pong\n"
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    let cors = CorsLayer::new()
+        .allow_methods([Method::POST])
+        .allow_headers([CONTENT_TYPE, ACCEPT_ENCODING, AUTHORIZATION])
+        // https://github.com/tower-rs/tower-http/issues/194
+        .allow_origin(AllowOrigin::mirror_request())
+        .max_age(Duration::from_secs(86400));
     let api_impl = pulsebeam_server_lite::Server::new(SERVER_CONFIG);
-    let twirp_routes = Router::new().nest(
-        pulsebeam_server_lite::rpc::SERVICE_FQN,
-        pulsebeam_server_lite::rpc::router(api_impl),
-    );
-    let router = Router::new().nest("/twirp", twirp_routes);
+    let twirp_routes = Router::new()
+        .nest(
+            pulsebeam_server_lite::rpc::SERVICE_FQN,
+            pulsebeam_server_lite::rpc::router(api_impl),
+        )
+        .layer(cors);
+    let router = Router::new()
+        .nest("/twirp", twirp_routes)
+        .route("/_ping", get(ping))
+        .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = "[::]:3000".parse().unwrap();
 
