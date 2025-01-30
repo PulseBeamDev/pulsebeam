@@ -259,24 +259,22 @@ mod test {
     #[tokio::test]
     async fn recv_after_ttl() {
         let (s, peer1, peer2) = setup();
-        s.mailboxes.invalidate_all();
-        s.mailboxes.run_pending_tasks().await;
         let sent = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
         let msg = sent[0].clone();
 
         let cloned = Arc::clone(&s);
         tokio::spawn(async move {
+            cloned.mailboxes.invalidate_all();
+            cloned.mailboxes.run_pending_tasks().await;
             cloned
                 .send(dummy_ctx(), SendReq { msg: Some(msg) })
                 .await
                 .unwrap();
         });
         let received = s.recv_batch(&peer2).await;
-        assert_msgs(&received, &sent);
+        assert_eq!(received.len(), 0);
 
-        // at this point, cache has been refreshed. So, it will stuck until it receives more
-        // messages
-        let res = time::timeout(time::Duration::from_millis(5), s.recv_batch(&peer2)).await;
-        assert!(res.is_err());
+        let received = s.recv_batch(&peer2).await;
+        assert_msgs(&received, &sent);
     }
 }
