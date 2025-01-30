@@ -13,6 +13,7 @@ use twirp::async_trait::async_trait;
 
 const SESSION_MAILBOX_CAPACITY: usize = 32;
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
+const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs(5);
 const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
@@ -22,9 +23,15 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Arc<Self> {
+    pub fn new(max_capacity: u64) -> Arc<Self> {
         Arc::new(Self {
-            mailboxes: Cache::builder().time_to_idle(SESSION_POLL_TIMEOUT).build(),
+            // | peerA | peerB | description |
+            // | t+0   | t+SESSION_POLL_TIMEOUT | let peerA messages drop, peerB will initiate |
+            // | t+0   | t+SESSION_POLL_TIMEOUT-SESSION_POLL_LATENCY_TOLERANCE | peerB receives messages then it'll refresh cache on the next poll |
+            mailboxes: Cache::builder()
+                .time_to_idle(SESSION_POLL_TIMEOUT)
+                .max_capacity(max_capacity)
+                .build(),
         })
     }
 
@@ -40,7 +47,7 @@ impl Server {
         let (_, payload_ch) = self.get(&src.group_id, &src.peer_id, src.conn_id);
         let mut msgs = Vec::new();
         let mut poll_timeout = time::interval_at(
-            time::Instant::now() + SESSION_POLL_TIMEOUT,
+            time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
             SESSION_BATCH_TIMEOUT,
         );
 
@@ -155,7 +162,7 @@ mod test {
     }
 
     fn setup() -> (Arc<Server>, PeerInfo, PeerInfo) {
-        let s = Server::new();
+        let s = Server::new(10_000);
         let peer1 = PeerInfo {
             group_id: String::from("default"),
             peer_id: String::from("peer1"),
