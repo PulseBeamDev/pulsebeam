@@ -16,7 +16,6 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 const SERVER_CONFIG: pulsebeam_server_lite::ServerConfig = pulsebeam_server_lite::ServerConfig {
     max_capacity: 65536,
-    mailbox_capacity: 32,
 };
 
 async fn ping() -> &'static str {

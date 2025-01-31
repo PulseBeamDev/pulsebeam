@@ -20,12 +20,10 @@ const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 type Mailbox = (flume::Sender<rpc::Message>, flume::Receiver<rpc::Message>);
 pub struct Server {
     mailboxes: Cache<String, Mailbox, ahash::RandomState>,
-    cfg: ServerConfig,
 }
 
 pub struct ServerConfig {
     pub max_capacity: u64,
-    pub mailbox_capacity: usize,
 }
 
 impl Server {
@@ -38,7 +36,6 @@ impl Server {
                 .time_to_idle(SESSION_POLL_TIMEOUT)
                 .max_capacity(cfg.max_capacity)
                 .build_with_hasher(ahash::RandomState::default()),
-            cfg,
         })
     }
 
@@ -46,7 +43,7 @@ impl Server {
     async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Mailbox {
         let id = format!("{}:{}:{}", group_id, peer_id, conn_id);
         self.mailboxes
-            .get_with_by_ref(&id, async { flume::bounded(self.cfg.mailbox_capacity) })
+            .get_with_by_ref(&id, async { flume::bounded(0) })
             .await
     }
 
@@ -55,10 +52,7 @@ impl Server {
             .get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY)
             .await;
         let (_, payload) = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
-        let mut set = HashSet::with_capacity_and_hasher(
-            self.cfg.mailbox_capacity,
-            ahash::RandomState::default(),
-        );
+        let mut set = HashSet::with_capacity_and_hasher(16, ahash::RandomState::default());
         let mut poll_timeout = time::interval_at(
             time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
             SESSION_BATCH_TIMEOUT,
@@ -189,7 +183,6 @@ mod test {
     fn setup() -> (Arc<Server>, PeerInfo, PeerInfo) {
         let s = Server::new(ServerConfig {
             max_capacity: 10_000,
-            mailbox_capacity: 32,
         });
         let peer1 = PeerInfo {
             group_id: String::from("default"),
@@ -208,25 +201,23 @@ mod test {
     async fn recv_normal() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        s.send(
-            dummy_ctx(),
-            SendReq {
-                msg: Some(msgs[0].clone()),
-            },
-        )
-        .await
-        .unwrap();
-
-        let resp = s
-            .recv(
+        let (send, recv) = tokio::join!(
+            s.send(
+                dummy_ctx(),
+                SendReq {
+                    msg: Some(msgs[0].clone()),
+                },
+            ),
+            s.recv(
                 dummy_ctx(),
                 RecvReq {
                     src: Some(peer2.clone()),
                 },
             )
-            .await
-            .unwrap();
+        );
 
+        send.unwrap();
+        let resp = recv.unwrap();
         assert_msgs(&resp.msgs, &msgs);
     }
 
