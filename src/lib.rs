@@ -20,7 +20,7 @@ const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
 type Mailbox = (flume::Sender<rpc::Message>, flume::Receiver<rpc::Message>);
 pub struct Server {
-    mailboxes: Cache<String, Mailbox, ahash::RandomState>,
+    mailboxes: Cache<PeerInfo, Mailbox, ahash::RandomState>,
 }
 
 pub struct ServerConfig {
@@ -41,19 +41,20 @@ impl Server {
     }
 
     #[inline]
-    async fn get(&self, group_id: &str, peer_id: &str, conn_id: u32) -> Mailbox {
-        let id = format!("{}:{}:{}", group_id, peer_id, conn_id);
+    async fn get(&self, info: &PeerInfo) -> Mailbox {
         self.mailboxes
-            .get_with_by_ref(&id, async { flume::bounded(0) })
+            .get_with_by_ref(info, async { flume::bounded(0) })
             .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
-        let (_, discovery) = self
-            .get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY)
-            .await;
-        let (_, payload) = self.get(&src.group_id, &src.peer_id, src.conn_id).await;
+        let discovery_info = PeerInfo {
+            conn_id: RESERVED_CONN_ID_DISCOVERY,
+            ..src.clone()
+        };
+        let (_, discovery) = self.get(&discovery_info).await;
+        let (_, payload) = self.get(src).await;
         let mut set = HashSet::with_capacity_and_hasher(16, ahash::RandomState::default());
         let mut poll_timeout = time::interval_at(
             time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
@@ -128,7 +129,7 @@ impl rpc::Tunnel for Server {
             .as_ref()
             .ok_or(twirp::invalid_argument("dst is required"))?;
 
-        let (ch, _) = self.get(&dst.group_id, &dst.peer_id, dst.conn_id).await;
+        let (ch, _) = self.get(dst).await;
         ch.send_async(msg)
             .await
             .map_err(|err| twirp::aborted(err.to_string()))?;
