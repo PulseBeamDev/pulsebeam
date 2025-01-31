@@ -47,6 +47,7 @@ impl Server {
             .await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
         let (_, discovery) = self
             .get(&src.group_id, &src.peer_id, RESERVED_CONN_ID_DISCOVERY)
@@ -60,6 +61,7 @@ impl Server {
 
         loop {
             let mut msg: Option<Message> = None;
+            tracing::trace!("receiving");
             tokio::select! {
                 m = discovery.recv_async() => {
                     msg = m.ok();
@@ -72,8 +74,9 @@ impl Server {
                 _ = poll_timeout.tick() => {}
             }
 
-            if let Some(msgs) = msg {
-                set.insert(msgs);
+            if let Some(msg) = msg {
+                tracing::trace!("received: {:?}", msg);
+                set.insert(msg);
             } else {
                 break;
             }
@@ -217,6 +220,40 @@ mod test {
         );
 
         send.unwrap();
+        let resp = recv.unwrap();
+        assert_msgs(&resp.msgs, &msgs);
+    }
+
+    #[tokio::test]
+    async fn recv_normal_many() {
+        let (s, peer1, peer2) = setup();
+        let msgs = vec![
+            dummy_msg(peer1.clone(), peer2.clone(), 0),
+            dummy_msg(peer1.clone(), peer2.clone(), 1),
+        ];
+        let (send1, send2, recv) = tokio::join!(
+            s.send(
+                dummy_ctx(),
+                SendReq {
+                    msg: Some(msgs[0].clone()),
+                },
+            ),
+            s.send(
+                dummy_ctx(),
+                SendReq {
+                    msg: Some(msgs[1].clone()),
+                },
+            ),
+            s.recv(
+                dummy_ctx(),
+                RecvReq {
+                    src: Some(peer2.clone()),
+                },
+            )
+        );
+
+        send1.unwrap();
+        send2.unwrap();
         let resp = recv.unwrap();
         assert_msgs(&resp.msgs, &msgs);
     }
