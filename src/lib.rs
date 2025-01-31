@@ -15,6 +15,7 @@ use twirp::async_trait::async_trait;
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
 const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs(5);
 const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
+const SESSION_BATCH_MAX: usize = 128;
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
 type Mailbox = (flume::Sender<rpc::Message>, flume::Receiver<rpc::Message>);
@@ -77,6 +78,11 @@ impl Server {
             if let Some(msg) = msg {
                 tracing::trace!("received: {:?}", msg);
                 set.insert(msg);
+
+                if set.len() >= SESSION_BATCH_MAX {
+                    tracing::warn!("filled to {}, will return early.", SESSION_BATCH_MAX);
+                    break;
+                }
             } else {
                 break;
             }
@@ -155,6 +161,7 @@ mod test {
 
     use super::*;
     use rpc::{MessageHeader, MessagePayload, Tunnel};
+    use tokio::task::JoinSet;
 
     fn dummy_ctx() -> twirp::Context {
         twirp::Context::new(
@@ -182,11 +189,11 @@ mod test {
         sum
     }
 
-    fn assert_msgs(received: &Vec<Message>, sent: &Vec<Message>) {
+    fn assert_msgs(received: &[Message], sent: &[Message]) {
         assert_eq!(received.len(), sent.len());
-        let mut received = received.clone();
+        let mut received = received.to_vec();
         received.sort_by_key(|m| m.header.as_ref().unwrap().seqnum);
-        let mut sent = sent.clone();
+        let mut sent = sent.to_vec();
         sent.sort_by_key(|m| m.header.as_ref().unwrap().seqnum);
         let pairs = zip(received, sent);
         for (a, b) in pairs.into_iter() {
@@ -267,6 +274,43 @@ mod test {
         send2.unwrap();
         let resp = recv.unwrap();
         assert_msgs(&resp.msgs, &msgs);
+    }
+
+    #[tokio::test]
+    async fn recv_normal_more_than_max() {
+        let (s, peer1, peer2) = setup();
+        let mut msgs = Vec::with_capacity(SESSION_BATCH_MAX + 1);
+        let mut join_set = JoinSet::new();
+        for i in 0..SESSION_BATCH_MAX + 1 {
+            let msg = dummy_msg(peer1.clone(), peer2.clone(), i as u32);
+            msgs.push(msg.clone());
+            let cloned = Arc::clone(&s);
+            join_set
+                .spawn(async move { cloned.send(dummy_ctx(), SendReq { msg: Some(msg) }).await });
+        }
+
+        // we should only receive up to SESSION_BATCH_MAX
+        let recv = s
+            .recv(
+                dummy_ctx(),
+                RecvReq {
+                    src: Some(peer2.clone()),
+                },
+            )
+            .await;
+        assert_msgs(&recv.unwrap().msgs, &msgs[..SESSION_BATCH_MAX]);
+
+        // then get the rest of messages
+        let recv = s
+            .recv(
+                dummy_ctx(),
+                RecvReq {
+                    src: Some(peer2.clone()),
+                },
+            )
+            .await;
+        assert_msgs(&recv.unwrap().msgs, &msgs[SESSION_BATCH_MAX..]);
+        join_set.join_all().await;
     }
 
     #[tokio::test]
