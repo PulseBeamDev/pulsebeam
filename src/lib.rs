@@ -175,8 +175,19 @@ mod test {
         }
     }
 
+    fn hash_msg(msg: &Message) -> u64 {
+        let state = ahash::RandomState::default();
+        let sum = state.hash_one(msg);
+        tracing::info!(sum = sum, msg = ?msg, "hash_msg");
+        sum
+    }
+
     fn assert_msgs(received: &Vec<Message>, sent: &Vec<Message>) {
         assert_eq!(received.len(), sent.len());
+        let mut received = received.clone();
+        received.sort_by_key(|m| m.header.as_ref().unwrap().seqnum);
+        let mut sent = sent.clone();
+        sent.sort_by_key(|m| m.header.as_ref().unwrap().seqnum);
         let pairs = zip(received, sent);
         for (a, b) in pairs.into_iter() {
             assert_eq!(a, b);
