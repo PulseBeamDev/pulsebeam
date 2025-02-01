@@ -1,4 +1,4 @@
-# Rust server implementation for PulseBeam
+# PulseBeam FOSS Server
 
 > [!WARNING]
 > This SDK is currently in **Developer Preview**. During this phase:
