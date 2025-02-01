@@ -13,7 +13,7 @@
 
 ## How to start a server for development?
 
-`RUST_LOG='tower_http=trace,pulsebeam_server_lite=info' cargo run`
+`RUST_LOG='tower_http=trace,pulsebeam_server_foss=info' cargo run`
 
 ## How to build for production?
 
@@ -21,7 +21,7 @@
 
 ## How to run with docker?
 
-`docker run --rm -p 3000:3000 ghcr.io/pulsebeamdev/pulsebeam-server-lite:main`
+`docker run --rm -p 3000:3000 ghcr.io/pulsebeamdev/pulsebeam-server-foss:main`
 
 
 ## Semantic Versioning
