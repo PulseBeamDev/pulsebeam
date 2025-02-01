@@ -39,3 +39,15 @@ This project adheres to [Semantic Versioning 2.0.0](https://semver.org/).
 * **MAJOR version (X.y.z):** Incompatible API changes.
 * **MINOR version (x.Y.z):** Functionality added in a backwards compatible manner.
 * **PATCH version (x.y.Z):** Backwards compatible bug fixes.
+
+## FAQ
+
+### What are the differences between FOSS and the Cloud version?
+
+|Feature|FOSS|Cloud|
+|-|-|-|
+|Client SDKs Compatible|yes|yes|
+|Self-host|yes|no|
+|Time Limited JWT Auth|no|yes|
+|Built-in TURN Service|no|yes|
+|Analytics|no|yes|
