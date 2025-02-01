@@ -12,7 +12,7 @@
 > • [Create GitHub Issues](https://github.com/PulseBeamDev/pulsebeam-server-foss/issues)  
 > • [Join PulseBeam Developer Discord](https://discord.gg/Bhd3t9afuB)  
 
-## How to start a server for development?
+## How to start a development server
 
 `RUST_LOG='tower_http=trace,pulsebeam_server_foss=info' cargo run`
 
@@ -24,6 +24,9 @@
 
 `docker run --rm -p 3000:3000 ghcr.io/pulsebeamdev/pulsebeam-server-foss:main`
 
+## How to run a demo with the local server?
+
+https://meet.pulsebeam.dev/?baseUrl=http://localhost:3000/twirp
 
 ## Semantic Versioning
 
