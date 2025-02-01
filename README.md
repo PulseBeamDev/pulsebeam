@@ -26,7 +26,7 @@ RUST_LOG='tower_http=trace,pulsebeam_server_foss=info' cargo run
 
 ## How to run with docker?
 
-`docker run --rm -p 3000:3000 ghcr.io/pulsebeamdev/pulsebeam-server-foss:main`
+`docker run --rm --name pulsebeam -p 3000:3000 ghcr.io/pulsebeamdev/pulsebeam-server-foss:main`
 
 ## How to run a demo with the local server?
 
