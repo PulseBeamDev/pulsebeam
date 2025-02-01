@@ -1,5 +1,5 @@
 [package]
-name = "pulsebeam-server-lite"
+name = "pulsebeam-server-foss"
 version = "0.1.0"
 edition = "2021"
 

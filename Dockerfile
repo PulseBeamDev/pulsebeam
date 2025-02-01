@@ -13,12 +13,12 @@ RUN --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release && \
     # Copy executable out of the cache so it is available in the final image.
-    cp target/release/pulsebeam-server-lite ./pulsebeam-server-lite
+    cp target/release/pulsebeam-server-foss ./pulsebeam-server-foss
 
 FROM docker.io/library/alpine:3
 
 WORKDIR /app
-COPY --from=builder /app/pulsebeam-server-lite .
+COPY --from=builder /app/pulsebeam-server-foss .
 
 ENTRYPOINT ["./pulsebeam-server-lite"]
 
