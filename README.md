@@ -8,6 +8,7 @@
 >
 > **We value your input!**  
 > Report bugs, suggest improvements, or collaborate directly with our team:
+> 
 > • [Create GitHub Issues](https://github.com/PulseBeamDev/pulsebeam-server-lite/issues)  
 > • [Join PulseBeam Developer Discord](https://discord.gg/Bhd3t9afuB)  
 
