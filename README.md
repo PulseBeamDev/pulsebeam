@@ -14,7 +14,11 @@
 
 ## How to start a development server
 
-`RUST_LOG='tower_http=trace,pulsebeam_server_foss=info' cargo run`
+```
+git clone --recurse-submodules https://github.com/PulseBeamDev/pulsebeam-server-foss.git
+cd pulsebeam-server-foss
+RUST_LOG='tower_http=trace,pulsebeam_server_foss=info' cargo run
+```
 
 ## How to build for production?
 
