@@ -1,5 +1,7 @@
 # PulseBeam FOSS Server
 
+## Status
+
 > [!WARNING]
 > This SDK is currently in **Developer Preview**. During this phase:
 > - APIs are subject to breaking changes
