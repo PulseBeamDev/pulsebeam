@@ -14,7 +14,7 @@ use http::Method;
 use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-const SERVER_CONFIG: pulsebeam_server_lite::ServerConfig = pulsebeam_server_lite::ServerConfig {
+const SERVER_CONFIG: pulsebeam_server_foss::ServerConfig = pulsebeam_server_foss::ServerConfig {
     max_capacity: 65536,
 };
 
@@ -32,11 +32,11 @@ async fn main() -> anyhow::Result<()> {
         // https://github.com/tower-rs/tower-http/issues/194
         .allow_origin(AllowOrigin::mirror_request())
         .max_age(Duration::from_secs(86400));
-    let api_impl = pulsebeam_server_lite::Server::new(SERVER_CONFIG);
+    let api_impl = pulsebeam_server_foss::Server::new(SERVER_CONFIG);
     let twirp_routes = Router::new()
         .nest(
-            pulsebeam_server_lite::rpc::SERVICE_FQN,
-            pulsebeam_server_lite::rpc::router(api_impl),
+            pulsebeam_server_foss::rpc::SERVICE_FQN,
+            pulsebeam_server_foss::rpc::router(api_impl),
         )
         .layer(cors);
     let router = Router::new()
