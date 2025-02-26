@@ -1,8 +1,3 @@
-use mimalloc::MiMalloc;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
 use anyhow::Context;
 use axum::{routing::get, Router};
 use http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE};
