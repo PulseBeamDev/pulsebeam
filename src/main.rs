@@ -6,6 +6,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use http::Method;
+use pulsebeam_server_foss::rpc::Tunnel;
 use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -30,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let api_impl = pulsebeam_server_foss::Server::new(SERVER_CONFIG);
     let twirp_routes = Router::new()
         .nest(
-            pulsebeam_server_foss::rpc::SERVICE_FQN,
+            api_impl.service_fqn(),
             pulsebeam_server_foss::rpc::router(api_impl),
         )
         .layer(cors);

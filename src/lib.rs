@@ -95,6 +95,8 @@ impl Server {
 
 #[async_trait]
 impl rpc::Tunnel for Server {
+    type Error = rpc::twirp::TwirpErrorResponse;
+
     async fn prepare(
         &self,
         _ctx: twirp::Context,
