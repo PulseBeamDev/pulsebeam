@@ -1,16 +1,20 @@
 pub mod pulsebeam {
     pub mod v1 {
-        include!(concat!(env!("OUT_DIR"), "/pulsebeam.v1.rs"));
+        tonic::include_proto!("pulsebeam.v1");
     }
 }
+
 use moka::future::Cache;
-pub use pulsebeam::v1::{self as rpc};
-use pulsebeam::v1::{IceServer, Message};
-use pulsebeam::v1::{PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp};
+use pulsebeam::v1::signaling_server::Signaling;
+pub use pulsebeam::v1::signaling_server::SignalingServer;
+use pulsebeam::v1::{
+    IceServer, Message, PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp,
+};
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::time;
-use twirp::async_trait::async_trait;
+use tokio_stream::{Stream, StreamExt};
 
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
 const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs(5);
@@ -18,7 +22,7 @@ const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
 const SESSION_BATCH_MAX: usize = 128;
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
-type Mailbox = (flume::Sender<rpc::Message>, flume::Receiver<rpc::Message>);
+type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
 pub struct Server {
     mailboxes: Cache<PeerInfo, Mailbox, ahash::RandomState>,
 }
@@ -28,8 +32,8 @@ pub struct ServerConfig {
 }
 
 impl Server {
-    pub fn new(cfg: ServerConfig) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(cfg: ServerConfig) -> Self {
+        Self {
             // | peerA | peerB | description |
             // | t+0   | t+SESSION_POLL_TIMEOUT | let peerA messages drop, peerB will initiate |
             // | t+0   | t+SESSION_POLL_TIMEOUT-SESSION_POLL_LATENCY_TOLERANCE | peerB receives messages then it'll refresh cache on the next poll |
@@ -37,7 +41,7 @@ impl Server {
                 .time_to_idle(SESSION_POLL_TIMEOUT)
                 .max_capacity(cfg.max_capacity)
                 .build_with_hasher(ahash::RandomState::default()),
-        })
+        }
     }
 
     #[inline]
@@ -93,67 +97,85 @@ impl Server {
     }
 }
 
-#[async_trait]
-impl rpc::Tunnel for Server {
-    type Error = rpc::twirp::TwirpErrorResponse;
-
+#[tonic::async_trait]
+impl Signaling for Server {
     async fn prepare(
         &self,
-        _ctx: twirp::Context,
-        _req: PrepareReq,
-    ) -> Result<PrepareResp, twirp::TwirpErrorResponse> {
+        _req: tonic::Request<PrepareReq>,
+    ) -> Result<tonic::Response<PrepareResp>, tonic::Status> {
         // WARNING: PLEASE READ THIS FIRST!
         // By default, OSS/self-hosting only provides a public STUN server.
         // You must provide your own TURN and STUN services.
         // TURN is required in some network condition.
         // Public TURN and STUN services are UNRELIABLE.
-        Ok(PrepareResp {
+        Ok(tonic::Response::new(PrepareResp {
             ice_servers: vec![IceServer {
                 urls: vec![String::from("stun:stun.l.google.com:19302")],
                 username: None,
                 credential: None,
             }],
-        })
+        }))
     }
 
     async fn send(
         &self,
-        _ctx: twirp::Context,
-        req: SendReq,
-    ) -> Result<SendResp, twirp::TwirpErrorResponse> {
-        let msg = req.msg.ok_or(twirp::invalid_argument("msg is required"))?;
+        req: tonic::Request<SendReq>,
+    ) -> Result<tonic::Response<SendResp>, tonic::Status> {
+        let msg = req
+            .into_inner()
+            .msg
+            .ok_or(tonic::Status::invalid_argument("msg is required"))?;
         let hdr = msg
             .header
             .as_ref()
-            .ok_or(twirp::invalid_argument("header is required"))?;
+            .ok_or(tonic::Status::invalid_argument("header is required"))?;
         let dst = hdr
             .dst
             .as_ref()
-            .ok_or(twirp::invalid_argument("dst is required"))?;
+            .ok_or(tonic::Status::invalid_argument("dst is required"))?;
 
         let (ch, _) = self.get(dst).await;
         ch.send_async(msg)
             .await
-            .map_err(|err| twirp::aborted(err.to_string()))?;
+            .map_err(|err| tonic::Status::aborted(err.to_string()))?;
 
-        Ok(SendResp {})
+        Ok(tonic::Response::new(SendResp {}))
     }
 
+    type RecvStream = Pin<Box<dyn Stream<Item = Result<RecvResp, tonic::Status>> + Send>>;
     async fn recv(
         &self,
-        _ctx: twirp::Context,
-        req: RecvReq,
-    ) -> Result<RecvResp, twirp::TwirpErrorResponse> {
-        let src = req.src.ok_or(twirp::invalid_argument("src is required"))?;
+        req: tonic::Request<pulsebeam::v1::RecvReq>,
+    ) -> std::result::Result<tonic::Response<Self::RecvStream>, tonic::Status> {
+        let src = req
+            .into_inner()
+            .src
+            .ok_or(tonic::Status::invalid_argument("src is required"))?;
 
         if src.conn_id == RESERVED_CONN_ID_DISCOVERY {
-            return Err(twirp::invalid_argument(
+            return Err(tonic::Status::invalid_argument(
                 "conn_id must not use reserved conn ids",
             ));
         }
 
-        let msgs = self.recv_batch(&src).await;
-        Ok(RecvResp { msgs })
+        let discovery_info = PeerInfo {
+            conn_id: RESERVED_CONN_ID_DISCOVERY,
+            ..src.clone()
+        };
+        let (_, discovery) = self.get(&discovery_info).await;
+        let (_, payload) = self.get(&src).await;
+
+        let discovery_stream = discovery
+            .into_stream()
+            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
+        let payload_stream = payload
+            .into_stream()
+            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
+        let merged_stream = discovery_stream.merge(payload_stream);
+
+        Ok(tonic::Response::new(
+            Box::pin(merged_stream) as Self::RecvStream
+        ))
     }
 }
 
@@ -163,15 +185,8 @@ mod test {
     use std::sync::Mutex;
 
     use super::*;
-    use rpc::{MessageHeader, MessagePayload, Tunnel};
+    use pulsebeam::v1::{MessageHeader, MessagePayload};
     use tokio::task::JoinSet;
-
-    fn dummy_ctx() -> twirp::Context {
-        twirp::Context::new(
-            http::Extensions::new(),
-            Arc::new(Mutex::new(http::Extensions::new())),
-        )
-    }
 
     fn dummy_msg(src: PeerInfo, dst: PeerInfo, seqnum: u32) -> Message {
         Message {
@@ -204,7 +219,7 @@ mod test {
         }
     }
 
-    fn setup() -> (Arc<Server>, PeerInfo, PeerInfo) {
+    fn setup() -> (Server, PeerInfo, PeerInfo) {
         let s = Server::new(ServerConfig {
             max_capacity: 10_000,
         });
@@ -225,27 +240,23 @@ mod test {
     async fn recv_normal() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        let (send, recv) = tokio::join!(
-            s.send(
-                dummy_ctx(),
-                SendReq {
-                    msg: Some(msgs[0].clone()),
-                },
-            ),
-            s.recv(
-                dummy_ctx(),
-                RecvReq {
-                    src: Some(peer2.clone()),
-                },
-            )
-        );
+        s.send(tonic::Request::new(SendReq {
+            msg: Some(msgs[0].clone()),
+        }))
+        .await
+        .unwrap();
 
-        send.unwrap();
-        let resp = recv.unwrap();
-        assert_msgs(&resp.msgs, &msgs);
+        let recv_stream = s
+            .recv(tonic::Request::new(RecvReq {
+                src: Some(peer2.clone()),
+            }))
+            .await
+            .unwrap();
+
+        let resp = recv_stream.into_inner().next().await.unwrap().unwrap();
+        assert_eq!(resp.msg.unwrap(), msgs[0]);
     }
 
-    #[tokio::test]
     async fn recv_normal_many() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![
@@ -253,30 +264,22 @@ mod test {
             dummy_msg(peer1.clone(), peer2.clone(), 1),
         ];
         let (send1, send2, recv) = tokio::join!(
-            s.send(
-                dummy_ctx(),
-                SendReq {
-                    msg: Some(msgs[0].clone()),
-                },
-            ),
-            s.send(
-                dummy_ctx(),
-                SendReq {
-                    msg: Some(msgs[1].clone()),
-                },
-            ),
-            s.recv(
-                dummy_ctx(),
-                RecvReq {
-                    src: Some(peer2.clone()),
-                },
-            )
+            s.send(tonic::Request::new(SendReq {
+                msg: Some(msgs[0].clone()),
+            })),
+            s.send(tonic::Request::new(SendReq {
+                msg: Some(msgs[1].clone()),
+            })),
+            s.recv(tonic::Request::new(RecvReq {
+                src: Some(peer2.clone()),
+            }))
         );
 
         send1.unwrap();
         send2.unwrap();
         let resp = recv.unwrap();
-        assert_msgs(&resp.msgs, &msgs);
+        let recv_stream: Vec<Result<RecvResp>> = resp.into_inner().take(2).collect().await;
+        assert_msgs(&resp, &msgs);
     }
 
     #[tokio::test]
@@ -288,29 +291,22 @@ mod test {
             let msg = dummy_msg(peer1.clone(), peer2.clone(), i as u32);
             msgs.push(msg.clone());
             let cloned = Arc::clone(&s);
-            join_set
-                .spawn(async move { cloned.send(dummy_ctx(), SendReq { msg: Some(msg) }).await });
+            join_set.spawn(async move { cloned.send(SendReq { msg: Some(msg) }).await });
         }
 
         // we should only receive up to SESSION_BATCH_MAX
         let recv = s
-            .recv(
-                dummy_ctx(),
-                RecvReq {
-                    src: Some(peer2.clone()),
-                },
-            )
+            .recv(RecvReq {
+                src: Some(peer2.clone()),
+            })
             .await;
         assert_msgs(&recv.unwrap().msgs, &msgs[..SESSION_BATCH_MAX]);
 
         // then get the rest of messages
         let recv = s
-            .recv(
-                dummy_ctx(),
-                RecvReq {
-                    src: Some(peer2.clone()),
-                },
-            )
+            .recv(RecvReq {
+                src: Some(peer2.clone()),
+            })
             .await;
         assert_msgs(&recv.unwrap().msgs, &msgs[SESSION_BATCH_MAX..]);
         join_set.join_all().await;
@@ -324,24 +320,18 @@ mod test {
         let cloned_s = Arc::clone(&s);
         let join = tokio::spawn(async move {
             cloned_s
-                .recv(
-                    dummy_ctx(),
-                    RecvReq {
-                        src: Some(peer2.clone()),
-                    },
-                )
+                .recv(RecvReq {
+                    src: Some(peer2.clone()),
+                })
                 .await
                 .unwrap()
         });
 
         // let recv runs first since tokio test starts with single thread by default
         tokio::task::yield_now().await;
-        s.send(
-            dummy_ctx(),
-            SendReq {
-                msg: Some(msgs[0].clone()),
-            },
-        )
+        s.send(SendReq {
+            msg: Some(msgs[0].clone()),
+        })
         .await
         .unwrap();
 
@@ -359,10 +349,7 @@ mod test {
         tokio::spawn(async move {
             cloned.mailboxes.invalidate_all();
             cloned.mailboxes.run_pending_tasks().await;
-            cloned
-                .send(dummy_ctx(), SendReq { msg: Some(msg) })
-                .await
-                .unwrap();
+            cloned.send(SendReq { msg: Some(msg) }).await.unwrap();
         });
         let received = s.recv_batch(&peer2).await;
         assert_eq!(received.len(), 0);
