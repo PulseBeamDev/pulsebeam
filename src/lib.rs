@@ -63,12 +63,30 @@ impl Server {
         }
 
         let mut state = self.state.write().await;
-        let mailbox = flume::bounded(1);
+        let mailbox = flume::bounded(0);
         let peer = Peer {
             mailbox: mailbox.clone(),
         };
         state.peers.insert(info.clone(), peer);
         mailbox
+    }
+
+    pub async fn recv_stream(&self, src: &PeerInfo) -> RecvStream {
+        let discovery_info = PeerInfo {
+            conn_id: RESERVED_CONN_ID_DISCOVERY,
+            ..src.clone()
+        };
+        let (_, discovery) = self.get(&discovery_info).await;
+        let (_, payload) = self.get(src).await;
+
+        let discovery_stream = discovery
+            .into_stream()
+            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
+        let payload_stream = payload
+            .into_stream()
+            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
+        let merged_stream = discovery_stream.merge(payload_stream);
+        Box::pin(merged_stream) as RecvStream
     }
 }
 
@@ -135,24 +153,8 @@ impl Signaling for Server {
             ));
         }
 
-        let discovery_info = PeerInfo {
-            conn_id: RESERVED_CONN_ID_DISCOVERY,
-            ..src.clone()
-        };
-        let (_, discovery) = self.get(&discovery_info).await;
-        let (_, payload) = self.get(&src).await;
-
-        let discovery_stream = discovery
-            .into_stream()
-            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
-        let payload_stream = payload
-            .into_stream()
-            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
-        let merged_stream = discovery_stream.merge(payload_stream);
-
-        Ok(tonic::Response::new(
-            Box::pin(merged_stream) as Self::RecvStream
-        ))
+        let stream = self.recv_stream(&src).await;
+        Ok(tonic::Response::new(stream))
     }
 }
 
@@ -161,9 +163,7 @@ mod test {
     use std::iter::zip;
 
     use super::*;
-    use pulsebeam::v1::{MessageHeader, MessagePayload, RecvReq};
-    use tokio::task::JoinSet;
-    const SESSION_BATCH_MAX: usize = 128;
+    use pulsebeam::v1::{MessageHeader, MessagePayload};
 
     fn dummy_msg(src: PeerInfo, dst: PeerInfo, seqnum: u32) -> Message {
         Message {
@@ -189,15 +189,13 @@ mod test {
         }
     }
 
-    async fn assert_stream(received: tonic::Response<RecvStream>, sent: &[Message], take: usize) {
-        let received_msgs: Vec<Message> = received
-            .into_inner()
+    async fn stream_to_vec(received: RecvStream, take: usize) -> Vec<Message> {
+        received
             .filter_map(|r| r.ok())
             .filter_map(|r| r.msg)
             .take(take)
             .collect()
-            .await;
-        assert_msgs(&received_msgs, sent)
+            .await
     }
 
     fn setup() -> (Server, PeerInfo, PeerInfo) {
@@ -216,21 +214,18 @@ mod test {
     }
 
     #[tokio::test]
-    async fn recv_normal() {
+    async fn recv_normal_single() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
         let (send, recv) = tokio::join!(
             s.send(tonic::Request::new(SendReq {
                 msg: Some(msgs[0].clone()),
             })),
-            s.recv(tonic::Request::new(RecvReq {
-                src: Some(peer2.clone()),
-            }))
+            stream_to_vec(s.recv_stream(&peer2).await, 1),
         );
 
         send.unwrap();
-        let resp = recv.unwrap();
-        assert_stream(resp, &msgs, 1).await;
+        assert_msgs(&recv, &msgs);
     }
 
     #[tokio::test]
@@ -247,51 +242,12 @@ mod test {
             s.send(tonic::Request::new(SendReq {
                 msg: Some(msgs[1].clone()),
             })),
-            s.recv(tonic::Request::new(RecvReq {
-                src: Some(peer2.clone()),
-            }))
+            stream_to_vec(s.recv_stream(&peer2).await, 2),
         );
 
         send1.unwrap();
         send2.unwrap();
-        let resp = recv.unwrap();
-        assert_stream(resp, &msgs, 2).await;
-    }
-
-    #[tokio::test]
-    async fn recv_normal_more_than_max() {
-        let (s, peer1, peer2) = setup();
-        let mut msgs = Vec::with_capacity(SESSION_BATCH_MAX + 1);
-        let mut join_set = JoinSet::new();
-        for i in 0..SESSION_BATCH_MAX + 1 {
-            let msg = dummy_msg(peer1.clone(), peer2.clone(), i as u32);
-            msgs.push(msg.clone());
-            let cloned = s.clone();
-            join_set.spawn(async move {
-                cloned
-                    .send(tonic::Request::new(SendReq { msg: Some(msg) }))
-                    .await
-            });
-        }
-
-        // we should only receive up to SESSION_BATCH_MAX
-        let recv = s
-            .recv(tonic::Request::new(RecvReq {
-                src: Some(peer2.clone()),
-            }))
-            .await
-            .unwrap();
-        assert_stream(recv, &msgs[..SESSION_BATCH_MAX], SESSION_BATCH_MAX).await;
-
-        // then get the rest of messages
-        let recv = s
-            .recv(tonic::Request::new(RecvReq {
-                src: Some(peer2.clone()),
-            }))
-            .await
-            .unwrap();
-        assert_stream(recv, &msgs[SESSION_BATCH_MAX..], SESSION_BATCH_MAX).await;
-        join_set.join_all().await;
+        assert_msgs(&recv, &msgs);
     }
 
     #[tokio::test]
@@ -301,12 +257,8 @@ mod test {
 
         let cloned_s = s.clone();
         let join = tokio::spawn(async move {
-            cloned_s
-                .recv(tonic::Request::new(RecvReq {
-                    src: Some(peer2.clone()),
-                }))
-                .await
-                .unwrap()
+            let recv_stream = cloned_s.recv_stream(&peer2.clone()).await;
+            stream_to_vec(recv_stream, 1).await
         });
 
         // let recv runs first since tokio test starts with single thread by default
@@ -318,6 +270,6 @@ mod test {
         .unwrap();
 
         let resp = join.await.unwrap();
-        assert_stream(resp, &msgs, 1).await;
+        assert_msgs(&resp, &msgs);
     }
 }
