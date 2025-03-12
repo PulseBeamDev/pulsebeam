@@ -8,21 +8,18 @@ use moka::future::Cache;
 use pulsebeam::v1::signaling_server::Signaling;
 pub use pulsebeam::v1::signaling_server::SignalingServer;
 use pulsebeam::v1::{
-    IceServer, Message, PeerInfo, PrepareReq, PrepareResp, RecvReq, RecvResp, SendReq, SendResp,
+    IceServer, Message, PeerInfo, PrepareReq, PrepareResp, RecvResp, SendReq, SendResp,
 };
-use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::Arc;
 use tokio::time;
 use tokio_stream::{Stream, StreamExt};
 
 const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
-const SESSION_POLL_LATENCY_TOLERANCE: time::Duration = time::Duration::from_secs(5);
-const SESSION_BATCH_TIMEOUT: time::Duration = time::Duration::from_millis(5);
-const SESSION_BATCH_MAX: usize = 128;
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
 type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
+
+#[derive(Clone)]
 pub struct Server {
     mailboxes: Cache<PeerInfo, Mailbox, ahash::RandomState>,
 }
@@ -50,52 +47,9 @@ impl Server {
             .get_with_by_ref(info, async { flume::bounded(0) })
             .await
     }
-
-    #[tracing::instrument(skip(self))]
-    async fn recv_batch(&self, src: &PeerInfo) -> Vec<Message> {
-        let discovery_info = PeerInfo {
-            conn_id: RESERVED_CONN_ID_DISCOVERY,
-            ..src.clone()
-        };
-        let (_, discovery) = self.get(&discovery_info).await;
-        let (_, payload) = self.get(src).await;
-        let mut set = HashSet::with_capacity_and_hasher(16, ahash::RandomState::default());
-        let mut poll_timeout = time::interval_at(
-            time::Instant::now() + SESSION_POLL_TIMEOUT - SESSION_POLL_LATENCY_TOLERANCE,
-            SESSION_BATCH_TIMEOUT,
-        );
-
-        loop {
-            let mut msg: Option<Message> = None;
-            tracing::trace!("receiving");
-            tokio::select! {
-                m = discovery.recv_async() => {
-                    msg = m.ok();
-                    poll_timeout.reset();
-                }
-                m = payload.recv_async() => {
-                    msg= m.ok();
-                    poll_timeout.reset();
-                }
-                _ = poll_timeout.tick() => {}
-            }
-
-            if let Some(msg) = msg {
-                tracing::trace!("received: {:?}", msg);
-                set.insert(msg);
-
-                if set.len() >= SESSION_BATCH_MAX {
-                    tracing::warn!("filled to {}, will return early.", SESSION_BATCH_MAX);
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        set.into_iter().collect()
-    }
 }
+
+type RecvStream = Pin<Box<dyn Stream<Item = Result<RecvResp, tonic::Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Signaling for Server {
@@ -142,7 +96,7 @@ impl Signaling for Server {
         Ok(tonic::Response::new(SendResp {}))
     }
 
-    type RecvStream = Pin<Box<dyn Stream<Item = Result<RecvResp, tonic::Status>> + Send>>;
+    type RecvStream = RecvStream;
     async fn recv(
         &self,
         req: tonic::Request<pulsebeam::v1::RecvReq>,
@@ -182,11 +136,11 @@ impl Signaling for Server {
 #[cfg(test)]
 mod test {
     use std::iter::zip;
-    use std::sync::Mutex;
 
     use super::*;
-    use pulsebeam::v1::{MessageHeader, MessagePayload};
+    use pulsebeam::v1::{MessageHeader, MessagePayload, RecvReq};
     use tokio::task::JoinSet;
+    const SESSION_BATCH_MAX: usize = 128;
 
     fn dummy_msg(src: PeerInfo, dst: PeerInfo, seqnum: u32) -> Message {
         Message {
@@ -200,13 +154,6 @@ mod test {
         }
     }
 
-    fn hash_msg(msg: &Message) -> u64 {
-        let state = ahash::RandomState::default();
-        let sum = state.hash_one(msg);
-        tracing::info!(sum = sum, msg = ?msg, "hash_msg");
-        sum
-    }
-
     fn assert_msgs(received: &[Message], sent: &[Message]) {
         assert_eq!(received.len(), sent.len());
         let mut received = received.to_vec();
@@ -217,6 +164,17 @@ mod test {
         for (a, b) in pairs.into_iter() {
             assert_eq!(a, b);
         }
+    }
+
+    async fn assert_stream(received: tonic::Response<RecvStream>, sent: &[Message], take: usize) {
+        let received_msgs: Vec<Message> = received
+            .into_inner()
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.msg)
+            .take(take)
+            .collect()
+            .await;
+        assert_msgs(&received_msgs, sent)
     }
 
     fn setup() -> (Server, PeerInfo, PeerInfo) {
@@ -240,23 +198,21 @@ mod test {
     async fn recv_normal() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        s.send(tonic::Request::new(SendReq {
-            msg: Some(msgs[0].clone()),
-        }))
-        .await
-        .unwrap();
-
-        let recv_stream = s
-            .recv(tonic::Request::new(RecvReq {
+        let (send, recv) = tokio::join!(
+            s.send(tonic::Request::new(SendReq {
+                msg: Some(msgs[0].clone()),
+            })),
+            s.recv(tonic::Request::new(RecvReq {
                 src: Some(peer2.clone()),
             }))
-            .await
-            .unwrap();
+        );
 
-        let resp = recv_stream.into_inner().next().await.unwrap().unwrap();
-        assert_eq!(resp.msg.unwrap(), msgs[0]);
+        send.unwrap();
+        let resp = recv.unwrap();
+        assert_stream(resp, &msgs, 1).await;
     }
 
+    #[tokio::test]
     async fn recv_normal_many() {
         let (s, peer1, peer2) = setup();
         let msgs = vec![
@@ -278,8 +234,7 @@ mod test {
         send1.unwrap();
         send2.unwrap();
         let resp = recv.unwrap();
-        let recv_stream: Vec<Result<RecvResp>> = resp.into_inner().take(2).collect().await;
-        assert_msgs(&resp, &msgs);
+        assert_stream(resp, &msgs, 2).await;
     }
 
     #[tokio::test]
@@ -290,25 +245,31 @@ mod test {
         for i in 0..SESSION_BATCH_MAX + 1 {
             let msg = dummy_msg(peer1.clone(), peer2.clone(), i as u32);
             msgs.push(msg.clone());
-            let cloned = Arc::clone(&s);
-            join_set.spawn(async move { cloned.send(SendReq { msg: Some(msg) }).await });
+            let cloned = s.clone();
+            join_set.spawn(async move {
+                cloned
+                    .send(tonic::Request::new(SendReq { msg: Some(msg) }))
+                    .await
+            });
         }
 
         // we should only receive up to SESSION_BATCH_MAX
         let recv = s
-            .recv(RecvReq {
+            .recv(tonic::Request::new(RecvReq {
                 src: Some(peer2.clone()),
-            })
-            .await;
-        assert_msgs(&recv.unwrap().msgs, &msgs[..SESSION_BATCH_MAX]);
+            }))
+            .await
+            .unwrap();
+        assert_stream(recv, &msgs[..SESSION_BATCH_MAX], SESSION_BATCH_MAX).await;
 
         // then get the rest of messages
         let recv = s
-            .recv(RecvReq {
+            .recv(tonic::Request::new(RecvReq {
                 src: Some(peer2.clone()),
-            })
-            .await;
-        assert_msgs(&recv.unwrap().msgs, &msgs[SESSION_BATCH_MAX..]);
+            }))
+            .await
+            .unwrap();
+        assert_stream(recv, &msgs[SESSION_BATCH_MAX..], SESSION_BATCH_MAX).await;
         join_set.join_all().await;
     }
 
@@ -317,26 +278,26 @@ mod test {
         let (s, peer1, peer2) = setup();
         let msgs = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
 
-        let cloned_s = Arc::clone(&s);
+        let cloned_s = s.clone();
         let join = tokio::spawn(async move {
             cloned_s
-                .recv(RecvReq {
+                .recv(tonic::Request::new(RecvReq {
                     src: Some(peer2.clone()),
-                })
+                }))
                 .await
                 .unwrap()
         });
 
         // let recv runs first since tokio test starts with single thread by default
         tokio::task::yield_now().await;
-        s.send(SendReq {
+        s.send(tonic::Request::new(SendReq {
             msg: Some(msgs[0].clone()),
-        })
+        }))
         .await
         .unwrap();
 
         let resp = join.await.unwrap();
-        assert_msgs(&resp.msgs, &msgs);
+        assert_stream(resp, &msgs, 1).await;
     }
 
     #[tokio::test]
@@ -345,16 +306,21 @@ mod test {
         let sent = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
         let msg = sent[0].clone();
 
-        let cloned = Arc::clone(&s);
+        let cloned = s.clone();
         tokio::spawn(async move {
             cloned.mailboxes.invalidate_all();
             cloned.mailboxes.run_pending_tasks().await;
-            cloned.send(SendReq { msg: Some(msg) }).await.unwrap();
+            cloned
+                .send(tonic::Request::new(SendReq { msg: Some(msg) }))
+                .await
+                .unwrap();
         });
-        let received = s.recv_batch(&peer2).await;
-        assert_eq!(received.len(), 0);
-
-        let received = s.recv_batch(&peer2).await;
-        assert_msgs(&received, &sent);
+        let received = s
+            .recv(tonic::Request::new(RecvReq {
+                src: Some(peer2.clone()),
+            }))
+            .await
+            .unwrap();
+        assert_stream(received, &sent, 1).await;
     }
 }
