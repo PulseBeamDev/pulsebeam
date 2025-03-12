@@ -1,12 +1,8 @@
-fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    let proto_source_files = ["./pulsebeam-proto/v1/tunnel.proto"];
-    for entry in &proto_source_files {
-        println!("cargo:rerun-if-changed={}", entry);
-    }
-
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let msg_attr = "#[derive(Hash, Eq)]";
-    prost_build::Config::new()
+    let proto_source_files = ["./pulsebeam-proto/v1/signaling.proto"];
+    tonic_build::configure()
+        .build_server(true)
         // there's a lot of incorrect code generation with prost, so this is the best trade-off:
         // manual add vs manual delete. manual add is simpler.
         // https://github.com/tokio-rs/prost/issues/332
@@ -16,7 +12,7 @@ fn main() {
         .type_attribute("Signal.data", msg_attr)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
-        .service_generator(twirp_build::service_generator())
-        .compile_protos(&proto_source_files, &["./"])
+        .compile_protos(&proto_source_files, &["pulsebeam-proto"])
         .expect("error compiling protos");
+    Ok(())
 }
