@@ -1,92 +1,88 @@
 pub mod pulsebeam {
     pub mod v1 {
-        use std::cmp::Ordering;
-
         tonic::include_proto!("pulsebeam.v1");
-
-        impl Ord for PeerInfo {
-            fn cmp(&self, other: &Self) -> Ordering {
-                match self.group_id.cmp(&other.group_id) {
-                    Ordering::Equal => match self.peer_id.cmp(&other.peer_id) {
-                        Ordering::Equal => self.conn_id.cmp(&other.conn_id),
-                        other_ordering => other_ordering,
-                    },
-                    group_ordering => group_ordering,
-                }
-            }
-        }
-
-        impl PartialOrd for PeerInfo {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
     }
 }
 
+use moka::future::{Cache, CacheBuilder};
 use pulsebeam::v1::signaling_server::Signaling;
 pub use pulsebeam::v1::signaling_server::SignalingServer;
 use pulsebeam::v1::{
     IceServer, Message, PeerInfo, PrepareReq, PrepareResp, RecvResp, SendReq, SendResp,
 };
-use std::collections::BTreeMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::{ops::Deref, pin::Pin};
 use tokio_stream::{Stream, StreamExt};
 
-const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
-
 type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
+type GroupId = String;
+type PeerId = String;
+type Group = Cache<PeerId, Mailbox, ahash::RandomState>;
 
-pub struct Peer {
-    mailbox: Mailbox,
+pub struct ServerConfig {
+    pub max_groups: u64,
+    pub max_peers_per_group: u64,
 }
 
-#[derive(Default)]
-pub struct ServerState {
-    peers: BTreeMap<PeerInfo, Peer>,
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_groups: 65536,
+            max_peers_per_group: 16,
+        }
+    }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Server {
-    state: Arc<RwLock<ServerState>>,
+    groups: Cache<GroupId, Group, ahash::RandomState>,
+    cfg: Arc<ServerConfig>,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self::new(ServerConfig::default())
+    }
 }
 
 impl Server {
-    async fn get(&self, info: &PeerInfo) -> Mailbox {
-        {
-            let state = self.state.read().await;
-            if let Some(peer) = state.peers.get(info) {
-                return peer.mailbox.clone();
-            }
+    pub fn new(cfg: ServerConfig) -> Self {
+        Self {
+            groups: CacheBuilder::new(cfg.max_groups)
+                .build_with_hasher(ahash::RandomState::default()),
+            cfg: Arc::new(cfg),
         }
+    }
 
-        let mut state = self.state.write().await;
-        let mailbox = flume::bounded(0);
-        let peer = Peer {
-            mailbox: mailbox.clone(),
-        };
-        state.peers.insert(info.clone(), peer);
-        mailbox
+    async fn get(&self, info: &PeerInfo) -> Mailbox {
+        let peers = self
+            .groups
+            .get_with_by_ref(&info.group_id, async {
+                CacheBuilder::new(self.cfg.max_peers_per_group)
+                    .build_with_hasher(ahash::RandomState::default())
+            })
+            .await;
+
+        peers
+            .get_with_by_ref(&info.peer_id, async { flume::bounded(0) })
+            .await
+    }
+
+    pub async fn query_peers(&self, group_id: &str) -> Vec<PeerId> {
+        let result = self.groups.get(group_id).await;
+        if let Some(peers) = result {
+            peers.iter().map(|(k, _)| k.deref().clone()).collect()
+        } else {
+            vec![]
+        }
     }
 
     pub async fn recv_stream(&self, src: &PeerInfo) -> RecvStream {
-        let discovery_info = PeerInfo {
-            conn_id: RESERVED_CONN_ID_DISCOVERY,
-            ..src.clone()
-        };
-        let (_, discovery) = self.get(&discovery_info).await;
         let (_, payload) = self.get(src).await;
-
-        let discovery_stream = discovery
-            .into_stream()
-            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
         let payload_stream = payload
             .into_stream()
             .map(|msg| Ok(RecvResp { msg: Some(msg) }));
-        let merged_stream = discovery_stream.merge(payload_stream);
-        Box::pin(merged_stream) as RecvStream
+        Box::pin(payload_stream) as RecvStream
     }
 }
 
@@ -146,12 +142,6 @@ impl Signaling for Server {
             .into_inner()
             .src
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
-
-        if src.conn_id == RESERVED_CONN_ID_DISCOVERY {
-            return Err(tonic::Status::invalid_argument(
-                "conn_id must not use reserved conn ids",
-            ));
-        }
 
         let stream = self.recv_stream(&src).await;
         Ok(tonic::Response::new(stream))
@@ -271,5 +261,20 @@ mod test {
 
         let resp = join.await.unwrap();
         assert_msgs(&resp, &msgs);
+    }
+
+    #[tokio::test]
+    async fn query_peers() {
+        let (s, peer1, peer2) = setup();
+        let results = s.query_peers(&peer1.group_id).await;
+        assert_eq!(results.len(), 0);
+
+        let _stream1 = s.recv_stream(&peer1).await;
+        let _stream2 = s.recv_stream(&peer2).await;
+        let results = s.query_peers(&peer1.group_id).await;
+        println!("{:?}", results);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], peer1.peer_id);
+        assert_eq!(results[1], peer2.peer_id);
     }
 }
