@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 axum = "0.8.1"
-moka = { version = "0.12.10", features = ["future"] }
 prost = "0.13"
 tokio = { version = "1.43.0", features = ["full", "test-util"] }
 tracing = { version = "0.1.41" }

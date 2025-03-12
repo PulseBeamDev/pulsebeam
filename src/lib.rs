@@ -1,51 +1,74 @@
 pub mod pulsebeam {
     pub mod v1 {
+        use std::cmp::Ordering;
+
         tonic::include_proto!("pulsebeam.v1");
+
+        impl Ord for PeerInfo {
+            fn cmp(&self, other: &Self) -> Ordering {
+                match self.group_id.cmp(&other.group_id) {
+                    Ordering::Equal => match self.peer_id.cmp(&other.peer_id) {
+                        Ordering::Equal => self.conn_id.cmp(&other.conn_id),
+                        other_ordering => other_ordering,
+                    },
+                    group_ordering => group_ordering,
+                }
+            }
+        }
+
+        impl PartialOrd for PeerInfo {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
     }
 }
 
-use moka::future::Cache;
 use pulsebeam::v1::signaling_server::Signaling;
 pub use pulsebeam::v1::signaling_server::SignalingServer;
 use pulsebeam::v1::{
     IceServer, Message, PeerInfo, PrepareReq, PrepareResp, RecvResp, SendReq, SendResp,
 };
+use std::collections::BTreeMap;
 use std::pin::Pin;
-use tokio::time;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_stream::{Stream, StreamExt};
 
-const SESSION_POLL_TIMEOUT: time::Duration = time::Duration::from_secs(1200);
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 
 type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
 
-#[derive(Clone)]
-pub struct Server {
-    mailboxes: Cache<PeerInfo, Mailbox, ahash::RandomState>,
+pub struct Peer {
+    mailbox: Mailbox,
 }
 
-pub struct ServerConfig {
-    pub max_capacity: u64,
+#[derive(Default)]
+pub struct ServerState {
+    peers: BTreeMap<PeerInfo, Peer>,
+}
+
+#[derive(Default, Clone)]
+pub struct Server {
+    state: Arc<RwLock<ServerState>>,
 }
 
 impl Server {
-    pub fn new(cfg: ServerConfig) -> Self {
-        Self {
-            // | peerA | peerB | description |
-            // | t+0   | t+SESSION_POLL_TIMEOUT | let peerA messages drop, peerB will initiate |
-            // | t+0   | t+SESSION_POLL_TIMEOUT-SESSION_POLL_LATENCY_TOLERANCE | peerB receives messages then it'll refresh cache on the next poll |
-            mailboxes: Cache::builder()
-                .time_to_idle(SESSION_POLL_TIMEOUT)
-                .max_capacity(cfg.max_capacity)
-                .build_with_hasher(ahash::RandomState::default()),
-        }
-    }
-
-    #[inline]
     async fn get(&self, info: &PeerInfo) -> Mailbox {
-        self.mailboxes
-            .get_with_by_ref(info, async { flume::bounded(0) })
-            .await
+        {
+            let state = self.state.read().await;
+            if let Some(peer) = state.peers.get(info) {
+                return peer.mailbox.clone();
+            }
+        }
+
+        let mut state = self.state.write().await;
+        let mailbox = flume::bounded(1);
+        let peer = Peer {
+            mailbox: mailbox.clone(),
+        };
+        state.peers.insert(info.clone(), peer);
+        mailbox
     }
 }
 
@@ -178,9 +201,7 @@ mod test {
     }
 
     fn setup() -> (Server, PeerInfo, PeerInfo) {
-        let s = Server::new(ServerConfig {
-            max_capacity: 10_000,
-        });
+        let s = Server::default();
         let peer1 = PeerInfo {
             group_id: String::from("default"),
             peer_id: String::from("peer1"),
@@ -298,29 +319,5 @@ mod test {
 
         let resp = join.await.unwrap();
         assert_stream(resp, &msgs, 1).await;
-    }
-
-    #[tokio::test]
-    async fn recv_after_ttl() {
-        let (s, peer1, peer2) = setup();
-        let sent = vec![dummy_msg(peer1.clone(), peer2.clone(), 0)];
-        let msg = sent[0].clone();
-
-        let cloned = s.clone();
-        tokio::spawn(async move {
-            cloned.mailboxes.invalidate_all();
-            cloned.mailboxes.run_pending_tasks().await;
-            cloned
-                .send(tonic::Request::new(SendReq { msg: Some(msg) }))
-                .await
-                .unwrap();
-        });
-        let received = s
-            .recv(tonic::Request::new(RecvReq {
-                src: Some(peer2.clone()),
-            }))
-            .await
-            .unwrap();
-        assert_stream(received, &sent, 1).await;
     }
 }
