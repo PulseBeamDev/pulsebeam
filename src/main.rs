@@ -1,3 +1,4 @@
+use axum::routing::get;
 use std::net::SocketAddr;
 use tracing::info;
 
@@ -28,10 +29,15 @@ async fn main() -> anyhow::Result<()> {
 
     let router = axum::Router::new()
         .nest_service("/grpc", grpc_routes)
+        .route("/_ping", get(ping))
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
 
     Ok(())
+}
+
+async fn ping() -> &'static str {
+    "Pong\n"
 }
