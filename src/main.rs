@@ -22,15 +22,15 @@ async fn main() -> anyhow::Result<()> {
         .named_layer(server);
     let grpc_routes = tonic::service::Routes::new(server)
         .prepare()
-        .into_axum_router();
+        .into_axum_router()
+        .layer(cors);
 
     let addr: SocketAddr = "[::]:3000".parse().unwrap();
     info!("Listening on {addr}");
 
     let router = axum::Router::new()
         .nest_service("/grpc", grpc_routes)
-        .route("/_ping", get(ping))
-        .layer(cors);
+        .route("/_ping", get(ping));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
