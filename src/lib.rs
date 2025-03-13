@@ -271,9 +271,10 @@ mod test {
 
         let _stream1 = s.recv_stream(&peer1).await;
         let _stream2 = s.recv_stream(&peer2).await;
-        let results = s.query_peers(&peer1.group_id).await;
+        let mut results = s.query_peers(&peer1.group_id).await;
         println!("{:?}", results);
         assert_eq!(results.len(), 2);
+        results.sort();
         assert_eq!(results[0], peer1.peer_id);
         assert_eq!(results[1], peer2.peer_id);
     }
