@@ -64,7 +64,7 @@ impl Server {
             .await;
 
         peers
-            .get_with_by_ref(&info.peer_id, async { flume::bounded(0) })
+            .get_with_by_ref(&info.peer_id, async { flume::bounded(1) })
             .await
     }
 
