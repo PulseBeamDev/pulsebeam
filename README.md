@@ -32,7 +32,7 @@ RUST_LOG='tower_http=trace,pulsebeam_server_foss=info' cargo run
 
 ## How to run a demo with the local server?
 
-https://meet.pulsebeam.dev/?baseUrl=http://localhost:3000/twirp
+https://meet.pulsebeam.dev/?baseUrl=http://localhost:3000/grpc
 
 ## Semantic Versioning
 
