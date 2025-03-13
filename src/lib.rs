@@ -86,7 +86,7 @@ impl Server {
     }
 }
 
-type RecvStream = Pin<Box<dyn Stream<Item = Result<RecvResp, tonic::Status>> + Send>>;
+pub type RecvStream = Pin<Box<dyn Stream<Item = Result<RecvResp, tonic::Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Signaling for Server {
