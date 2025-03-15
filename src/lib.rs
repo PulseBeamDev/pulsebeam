@@ -15,10 +15,12 @@ use std::{ops::Deref, pin::Pin};
 use tokio_stream::{Stream, StreamExt};
 use tracing::field::valuable;
 
+const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
 type GroupId = String;
 type PeerId = String;
-type Group = Cache<PeerId, Mailbox, ahash::RandomState>;
+type PeerConn = (PeerId, u32);
+type Group = Cache<PeerConn, Mailbox, ahash::RandomState>;
 
 pub struct ServerConfig {
     pub max_groups: u64,
@@ -64,12 +66,13 @@ impl Server {
             })
             .await;
 
+        let peer_conn = (info.peer_id.clone(), info.conn_id);
         peers
-            .get_with_by_ref(&info.peer_id, async { flume::bounded(1) })
+            .get_with_by_ref(&peer_conn, async { flume::bounded(0) })
             .await
     }
 
-    pub async fn query_peers(&self, group_id: &str) -> Vec<PeerId> {
+    pub async fn query_peers(&self, group_id: &str) -> Vec<PeerConn> {
         let result = self.groups.get(group_id).await;
         if let Some(peers) = result {
             peers.iter().map(|(k, _)| k.deref().clone()).collect()
@@ -79,11 +82,25 @@ impl Server {
     }
 
     pub async fn recv_stream(&self, src: &PeerInfo) -> RecvStream {
+        let discovery_info = PeerInfo {
+            group_id: src.group_id.clone(),
+            peer_id: src.peer_id.clone(),
+            conn_id: RESERVED_CONN_ID_DISCOVERY,
+        };
+        let (_, discovery) = self.get(&discovery_info).await;
         let (_, payload) = self.get(src).await;
-        let payload_stream = payload
-            .into_stream()
-            .map(|msg| Ok(RecvResp { msg: Some(msg) }));
-        Box::pin(payload_stream) as RecvStream
+
+        let discovery_stream = discovery.into_stream().map(|msg| {
+            tracing::trace!(msg = valuable(&msg), "discovery stream");
+            Ok(RecvResp { msg: Some(msg) })
+        });
+        let payload_stream = payload.into_stream().map(|msg| {
+            tracing::trace!(msg = valuable(&msg), "payload stream");
+            Ok(RecvResp { msg: Some(msg) })
+        });
+
+        let merged = discovery_stream.merge(payload_stream);
+        Box::pin(merged) as RecvStream
     }
 }
 
@@ -276,9 +293,16 @@ mod test {
         let _stream2 = s.recv_stream(&peer2).await;
         let mut results = s.query_peers(&peer1.group_id).await;
         println!("{:?}", results);
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 4);
         results.sort();
-        assert_eq!(results[0], peer1.peer_id);
-        assert_eq!(results[1], peer2.peer_id);
+        assert_eq!(results[0].0, peer1.peer_id);
+        assert_eq!(results[0].1, RESERVED_CONN_ID_DISCOVERY);
+        assert_eq!(results[1].0, peer1.peer_id);
+        assert_eq!(results[1].1, peer1.conn_id);
+
+        assert_eq!(results[2].0, peer2.peer_id);
+        assert_eq!(results[2].1, RESERVED_CONN_ID_DISCOVERY);
+        assert_eq!(results[3].0, peer2.peer_id);
+        assert_eq!(results[3].1, peer2.conn_id);
     }
 }

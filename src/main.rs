@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
     tracing_subscriber::fmt()
-        .json()
+        .pretty()
         .with_env_filter(env_filter)
         .init();
 
