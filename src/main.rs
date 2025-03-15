@@ -2,6 +2,8 @@ use axum::routing::get;
 use std::net::SocketAddr;
 use tracing::{info, level_filters::LevelFilter};
 
+use pulsebeam_server_foss::proto::signaling_server::SignalingServer;
+use pulsebeam_server_foss::server::Server;
 use std::time::Duration;
 use tonic::service::LayerExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -20,8 +22,7 @@ async fn main() -> anyhow::Result<()> {
         // https://github.com/tower-rs/tower-http/issues/194
         .allow_origin(AllowOrigin::mirror_request())
         .max_age(Duration::from_secs(86400));
-    let server =
-        pulsebeam_server_foss::SignalingServer::new(pulsebeam_server_foss::Server::default());
+    let server = SignalingServer::new(Server::default());
     let server = tower::ServiceBuilder::new()
         .layer(tonic_web::GrpcWebLayer::new())
         .into_inner()

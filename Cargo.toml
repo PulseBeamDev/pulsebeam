@@ -19,9 +19,9 @@ tonic = { git = "https://github.com/hyperium/tonic.git", rev = "72b0fd59442d7180
 tonic-web = { git = "https://github.com/hyperium/tonic.git", rev = "72b0fd59442d71804d4104e313ef6f140ab8f6d1" }
 tokio-stream = "0.1.17"
 tower = "0.5.2"
-moka = { version = "0.12.10", features = ["future"] }
 valuable = { version = "0.1.1", features = ["derive"] }
 valuable-serde = "0.1.1"
+tokio-util = { version = "0.7.14", features = ["time"] }
 
 [build-dependencies]
 tonic-build = { git = "https://github.com/hyperium/tonic.git", rev = "72b0fd59442d71804d4104e313ef6f140ab8f6d1" }
