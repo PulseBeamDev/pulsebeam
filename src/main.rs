@@ -1,6 +1,6 @@
 use axum::routing::get;
 use std::net::SocketAddr;
-use tracing::info;
+use tracing::{info, level_filters::LevelFilter};
 
 use std::time::Duration;
 use tonic::service::LayerExt;
@@ -8,7 +8,13 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(env_filter)
+        .init();
 
     let cors = CorsLayer::very_permissive()
         // https://github.com/tower-rs/tower-http/issues/194

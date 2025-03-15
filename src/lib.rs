@@ -13,6 +13,7 @@ use pulsebeam::v1::{
 use std::sync::Arc;
 use std::{ops::Deref, pin::Pin};
 use tokio_stream::{Stream, StreamExt};
+use tracing::field::valuable;
 
 type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
 type GroupId = String;
@@ -116,6 +117,7 @@ impl Signaling for Server {
             .into_inner()
             .msg
             .ok_or(tonic::Status::invalid_argument("msg is required"))?;
+        tracing::trace!(msg = valuable(&msg), "send");
         let hdr = msg
             .header
             .as_ref()
@@ -125,7 +127,6 @@ impl Signaling for Server {
             .as_ref()
             .ok_or(tonic::Status::invalid_argument("dst is required"))?;
 
-        tracing::trace!(?msg, "send");
         let (ch, _) = self.get(dst).await;
         ch.send_async(msg)
             .await
@@ -144,7 +145,7 @@ impl Signaling for Server {
             .src
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
 
-        tracing::trace!(?src, "recv");
+        tracing::trace!(src = valuable(&src), "recv");
         let stream = self.recv_stream(&src).await;
         Ok(tonic::Response::new(stream))
     }
