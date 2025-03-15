@@ -125,6 +125,7 @@ impl Signaling for Server {
             .as_ref()
             .ok_or(tonic::Status::invalid_argument("dst is required"))?;
 
+        tracing::trace!(?msg, "send");
         let (ch, _) = self.get(dst).await;
         ch.send_async(msg)
             .await
@@ -143,6 +144,7 @@ impl Signaling for Server {
             .src
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
 
+        tracing::trace!(?src, "recv");
         let stream = self.recv_stream(&src).await;
         Ok(tonic::Response::new(stream))
     }
