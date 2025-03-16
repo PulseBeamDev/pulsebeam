@@ -1,4 +1,4 @@
-use crate::proto::Message;
+use crate::proto::{Message, PeerInfo};
 use std::{collections::BTreeMap, sync::Arc};
 
 use ahash::HashMap;
@@ -71,6 +71,20 @@ impl Manager {
             None => self.insert(group_id).await,
         }
     }
+
+    pub async fn remove(&self, peer: PeerInfo) {
+        let mut state = self.state.write().await;
+        if let Some(group) = state.groups.get(&peer.group_id) {
+            let conn = PeerConn {
+                peer_id: peer.peer_id,
+                conn_id: peer.conn_id,
+            };
+            let group_size = group.remove(&conn).await;
+            if group_size == 0 {
+                state.groups.remove(&peer.group_id);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -137,5 +151,11 @@ impl Group {
         let found = state.peers.range(start..=end).next()?;
         let result = (found.0.clone(), found.1.clone());
         Some(result)
+    }
+
+    pub async fn remove(&self, peer_id: &PeerConn) -> usize {
+        let mut state = self.state.write().await;
+        state.peers.remove(peer_id);
+        state.peers.len()
     }
 }

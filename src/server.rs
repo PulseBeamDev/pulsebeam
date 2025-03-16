@@ -1,6 +1,8 @@
+use crate::evicter::Evicter;
 use crate::proto::signaling_server::Signaling;
 use crate::proto::{self, PeerInfo};
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_stream::{Stream, StreamExt};
 use tracing::field::valuable;
 
@@ -10,6 +12,7 @@ const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 #[derive(Clone)]
 pub struct Server {
     manager: Manager,
+    evicter: Evicter,
 }
 
 impl Default for Server {
@@ -23,9 +26,10 @@ impl Default for Server {
 
 impl Server {
     pub fn new(cfg: ManagerConfig) -> Self {
-        Self {
-            manager: Manager::new(cfg),
-        }
+        let manager = Manager::new(cfg);
+        // TODO: configurable timeout
+        let evicter = Evicter::new(manager.clone(), Duration::from_secs(30));
+        Self { manager, evicter }
     }
 
     pub async fn recv_stream(&self, src: PeerInfo) -> RecvStream {
@@ -255,9 +259,9 @@ mod test {
         println!("{:?}", results);
         assert_eq!(results.len(), 2);
         results.sort();
-        assert_eq!(results[0].0, peer1.peer_id);
-        assert_eq!(results[0].1, peer1.conn_id);
-        assert_eq!(results[1].0, peer2.peer_id);
-        assert_eq!(results[1].1, peer2.conn_id);
+        assert_eq!(results[0].peer_id, peer1.peer_id);
+        assert_eq!(results[0].conn_id, peer1.conn_id);
+        assert_eq!(results[1].peer_id, peer2.peer_id);
+        assert_eq!(results[1].conn_id, peer2.conn_id);
     }
 }
