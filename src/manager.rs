@@ -203,6 +203,16 @@ mod test {
         let (conn, _) = result.unwrap();
         assert_eq!(conn.peer_id, conn_a.peer_id);
         assert_eq!(conn.conn_id, conn_a.conn_id);
+
+        let conn_a_new = PeerConn {
+            peer_id: "a".to_string(),
+            conn_id: 1,
+        };
+        group.upsert(conn_a_new.clone());
+        let result = group.select_one("a".to_string());
+        let (conn, _) = result.unwrap();
+        assert_eq!(conn.peer_id, conn_a_new.peer_id);
+        assert_eq!(conn.conn_id, conn_a_new.conn_id);
     }
 
     #[test]
