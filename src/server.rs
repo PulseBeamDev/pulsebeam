@@ -93,6 +93,16 @@ impl Signaling for Server {
             .dst
             .as_mut()
             .ok_or(tonic::Status::invalid_argument("dst is required"))?;
+        let src = hdr
+            .src
+            .as_ref()
+            .ok_or(tonic::Status::invalid_argument("src is required"))?;
+
+        if src.group_id == dst.group_id && src.peer_id == dst.peer_id {
+            return Err(tonic::Status::invalid_argument(
+                "detected a loopback, dst must be different than src",
+            ));
+        }
 
         let cloned_dst = dst.clone();
         let group = self
