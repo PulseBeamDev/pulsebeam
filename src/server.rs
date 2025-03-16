@@ -2,12 +2,14 @@ use crate::proto::signaling_server::Signaling;
 use crate::proto::{self, PeerInfo};
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
-use tokio_util::sync::CancellationToken;
 use tracing::field::valuable;
 
 use crate::manager::{Manager, ManagerConfig, PeerConn};
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
+const RECV_STREAM_BUFFER: usize = 8;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
@@ -24,35 +26,31 @@ impl Default for Server {
     }
 }
 
+pub type MessageStream = Pin<Box<dyn Stream<Item = proto::Message> + Send>>;
+
 impl Server {
     pub fn new(cfg: ManagerConfig) -> Self {
         let manager = Manager::new(cfg);
         Self { manager }
     }
 
-    pub fn recv_stream(&self, src: PeerInfo) -> RecvStream {
-        let group = self.manager.get(src.group_id);
+    pub fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
+        let group = self.manager.get_or_insert(src.group_id);
         let conn = PeerConn {
             peer_id: src.peer_id,
             conn_id: src.conn_id,
         };
-        let peer = group.get(conn);
+        let payload_stream = ReceiverStream::new(group.upsert(conn));
 
-        let repeat = std::iter::repeat(Ok(proto::RecvResp {
-            msg: Some(proto::Message {
-                header: None,
-                payload: Some(proto::MessagePayload {
-                    payload_type: Some(proto::message_payload::PayloadType::Ping(proto::Ping {})),
-                }),
+        let repeat = std::iter::repeat(proto::Message {
+            header: None,
+            payload: Some(proto::MessagePayload {
+                payload_type: Some(proto::message_payload::PayloadType::Ping(proto::Ping {})),
             }),
-        }));
-        let keep_alive = tokio_stream::iter(repeat).throttle(KEEP_ALIVE_INTERVAL);
-        let payload_stream = peer.mailbox.1.into_stream().map(|msg| {
-            tracing::trace!(msg = valuable(&msg), "payload stream");
-            Ok(proto::RecvResp { msg: Some(msg) })
         });
+        let keep_alive = tokio_stream::iter(repeat).throttle(KEEP_ALIVE_INTERVAL);
         let merged = keep_alive.merge(payload_stream);
-        Box::pin(merged) as RecvStream
+        Box::pin(merged) as MessageStream
     }
 }
 
@@ -97,32 +95,29 @@ impl Signaling for Server {
             .ok_or(tonic::Status::invalid_argument("dst is required"))?;
 
         let cloned_dst = dst.clone();
-        let group = self.manager.get(cloned_dst.group_id);
+        let group = self
+            .manager
+            .get(cloned_dst.group_id)
+            .ok_or(tonic::Status::not_found("group_id is not available"))?;
 
         // TODO: use a different RPC for connecting?
         let peer = if dst.conn_id == RESERVED_CONN_ID_DISCOVERY {
-            tracing::trace!(
-                conn_id = dst.conn_id,
-                group_id = dst.group_id,
-                peer_id = cloned_dst.peer_id,
-                "electing"
-            );
             let selected = group
                 .select_one(cloned_dst.peer_id)
-                .ok_or(tonic::Status::out_of_range("peer id not present"))?;
+                .ok_or(tonic::Status::not_found("peer_id is not available"))?;
             dst.conn_id = selected.0.conn_id;
-            tracing::trace!(dst = valuable(&dst), "select_one found");
             selected.1
         } else {
             let conn = PeerConn {
                 peer_id: cloned_dst.peer_id,
                 conn_id: dst.conn_id,
             };
-            group.get(conn)
+            group
+                .get(conn)
+                .ok_or(tonic::Status::not_found("peer_id is not available"))?
         };
         peer.mailbox
-            .0
-            .send_async(msg)
+            .send(msg)
             .await
             .map_err(|err| tonic::Status::aborted(err.to_string()))?;
 
@@ -140,21 +135,37 @@ impl Signaling for Server {
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
 
         tracing::trace!(src = valuable(&src), "recv");
-        let token = CancellationToken::new();
-        let _guard = token.clone().drop_guard();
 
         let manager = self.manager.clone();
         let peer = src.clone();
+
+        let mut payload = self.insert_recv_stream(src);
+        let (tx, rx) = mpsc::channel(RECV_STREAM_BUFFER);
         tokio::spawn(async move {
-            token.cancelled().await;
+            while let Some(item) = payload.next().await {
+                let resp = proto::RecvResp { msg: Some(item) };
+                match tx.send(Result::<_, tonic::Status>::Ok(resp)).await {
+                    Ok(_) => {
+                        // item (server response) was queued to be send to client
+                    }
+                    Err(_item) => {
+                        // output_stream was build from rx and both are dropped
+                        break;
+                    }
+                }
+            }
+
             tracing::info!(
                 peer = valuable(&peer),
                 "detected connection dropped, removing peer"
             );
             manager.remove(peer);
         });
-        let payload = self.recv_stream(src);
-        Ok(tonic::Response::new(payload))
+
+        let output_stream = ReceiverStream::new(rx);
+        Ok(tonic::Response::new(
+            Box::pin(output_stream) as Self::RecvStream
+        ))
     }
 }
 
@@ -189,10 +200,8 @@ mod test {
         }
     }
 
-    async fn stream_to_vec(received: RecvStream, take: usize) -> Vec<Message> {
+    async fn stream_to_vec(received: MessageStream, take: usize) -> Vec<Message> {
         received
-            .filter_map(|r| r.ok())
-            .filter_map(|r| r.msg)
             .filter(|m| m.header.is_some())
             .take(take)
             .collect()
@@ -222,7 +231,7 @@ mod test {
             s.send(tonic::Request::new(SendReq {
                 msg: Some(msgs[0].clone()),
             })),
-            stream_to_vec(s.recv_stream(peer2), 1),
+            stream_to_vec(s.insert_recv_stream(peer2), 1),
         );
 
         send.unwrap();
@@ -243,7 +252,7 @@ mod test {
             s.send(tonic::Request::new(SendReq {
                 msg: Some(msgs[1].clone()),
             })),
-            stream_to_vec(s.recv_stream(peer2), 2),
+            stream_to_vec(s.insert_recv_stream(peer2), 2),
         );
 
         send1.unwrap();
@@ -258,7 +267,7 @@ mod test {
 
         let cloned_s = s.clone();
         let join = tokio::spawn(async move {
-            let recv_stream = cloned_s.recv_stream(peer2.clone());
+            let recv_stream = cloned_s.insert_recv_stream(peer2.clone());
             stream_to_vec(recv_stream, 1).await
         });
 
@@ -277,12 +286,12 @@ mod test {
     #[tokio::test]
     async fn query_peers() {
         let (s, peer1, peer2) = setup();
-        let group = s.manager.get(peer1.group_id.clone());
+        let group = s.manager.get_or_insert(peer1.group_id.clone());
         let results = group.collect();
         assert_eq!(results.len(), 0);
 
-        let _stream1 = s.recv_stream(peer1.clone());
-        let _stream2 = s.recv_stream(peer2.clone());
+        let _stream1 = s.insert_recv_stream(peer1.clone());
+        let _stream2 = s.insert_recv_stream(peer2.clone());
         let mut results = group.collect();
         println!("{:?}", results);
         assert_eq!(results.len(), 2);

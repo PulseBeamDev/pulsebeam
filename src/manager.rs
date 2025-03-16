@@ -3,9 +3,8 @@ use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::Instant};
 
 use ahash::HashMap;
 use parking_lot::RwLock;
+use tokio::sync::mpsc;
 
-pub const MAILBOX_CAPACITY: usize = 8;
-pub type Mailbox = (flume::Sender<Message>, flume::Receiver<Message>);
 pub type GroupId = String;
 pub type PeerId = String;
 
@@ -43,12 +42,12 @@ impl Manager {
         }
     }
 
-    pub fn insert(&self, group_id: GroupId) -> Group {
+    pub fn get_or_insert(&self, group_id: GroupId) -> Group {
         let mut state = self.state.write();
         let group = state
             .groups
             .entry(group_id.clone())
-            .or_insert_with(|| Group::new(group_id, self.cfg.max_peers_per_group));
+            .or_insert_with(|| Group::new(self.cfg.max_peers_per_group));
         group.clone()
     }
 
@@ -60,16 +59,9 @@ impl Manager {
         Some(group.collect())
     }
 
-    pub fn get(&self, group_id: GroupId) -> Group {
-        let group_maybe = {
-            let state = self.state.read();
-            state.groups.get(&group_id).cloned()
-        };
-
-        match group_maybe {
-            Some(mailbox) => mailbox,
-            None => self.insert(group_id),
-        }
+    pub fn get(&self, group_id: GroupId) -> Option<Group> {
+        let state = self.state.read();
+        state.groups.get(&group_id).cloned()
     }
 
     pub fn remove(&self, peer: PeerInfo) {
@@ -90,7 +82,6 @@ impl Manager {
 #[derive(Clone)]
 pub struct Group {
     state: Arc<RwLock<GroupState>>,
-    group_id: GroupId,
     capacity: u16,
 }
 
@@ -107,7 +98,7 @@ pub struct PeerConn {
 
 #[derive(Clone)]
 pub struct Peer {
-    pub mailbox: Mailbox,
+    pub mailbox: mpsc::Sender<Message>,
     pub started_at: Instant,
 }
 
@@ -131,17 +122,9 @@ impl PartialEq for PeerConn {
         self.peer_id == other.peer_id && self.conn_id == other.conn_id
     }
 }
-
-impl std::fmt::Debug for Group {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.group_id)
-    }
-}
-
 impl Group {
-    pub fn new(group_id: String, capacity: u16) -> Self {
+    pub fn new(capacity: u16) -> Self {
         Self {
-            group_id,
             capacity,
             state: Arc::new(RwLock::new(GroupState::default())),
         }
@@ -152,35 +135,24 @@ impl Group {
         state.peers.keys().cloned().collect()
     }
 
-    #[tracing::instrument]
-    pub fn insert(&self, conn: PeerConn) -> Peer {
+    pub fn upsert(&self, conn: PeerConn) -> mpsc::Receiver<Message> {
+        let (sender, receiver) = mpsc::channel(1);
         let mut state = self.state.write();
-        let peer = state
-            .peers
-            .entry(conn)
-            .and_modify(|p| p.started_at = Instant::now())
-            .or_insert_with(|| Peer {
+        state.peers.insert(
+            conn,
+            Peer {
                 started_at: Instant::now(),
-                mailbox: flume::bounded(MAILBOX_CAPACITY),
-            });
-
-        peer.clone()
+                mailbox: sender,
+            },
+        );
+        receiver
     }
 
-    #[tracing::instrument]
-    pub fn get(&self, conn: PeerConn) -> Peer {
-        let peer_maybe = {
-            let state = self.state.read();
-            state.peers.get(&conn).cloned()
-        };
-
-        match peer_maybe {
-            Some(peer) => peer,
-            None => self.insert(conn),
-        }
+    pub fn get(&self, conn: PeerConn) -> Option<Peer> {
+        let state = self.state.read();
+        state.peers.get(&conn).cloned()
     }
 
-    #[tracing::instrument]
     pub fn select_one(&self, peer_id: PeerId) -> Option<(PeerConn, Peer)> {
         let state = self.state.read();
         let start = PeerConn {
@@ -214,7 +186,7 @@ mod test {
 
     #[test]
     fn select_one() {
-        let group = Group::new("default".to_string(), 8);
+        let group = Group::new(8);
         let conn_a = PeerConn {
             peer_id: "a".to_string(),
             conn_id: 2818993334,
@@ -224,8 +196,8 @@ mod test {
             conn_id: 2913253855,
         };
 
-        group.insert(conn_a.clone());
-        group.insert(conn_b);
+        group.upsert(conn_a.clone());
+        group.upsert(conn_b);
 
         let result = group.select_one("a".to_string());
         let (conn, _) = result.unwrap();
@@ -247,8 +219,12 @@ mod test {
             conn_id: 2913253855,
         };
 
-        manager1.get(group_id.to_string()).get(conn_a.clone());
-        manager2.get(group_id.to_string()).get(conn_b.clone());
+        manager1
+            .get_or_insert(group_id.to_string())
+            .upsert(conn_a.clone());
+        manager2
+            .get_or_insert(group_id.to_string())
+            .upsert(conn_b.clone());
 
         for manager in [manager1, manager2] {
             let mut peers = manager.collect_peers(&group_id.to_string()).unwrap();
@@ -259,7 +235,7 @@ mod test {
             assert_eq!(peers[1].peer_id, conn_b.peer_id);
             assert_eq!(peers[1].conn_id, conn_b.conn_id);
 
-            let group = manager.get(group_id.to_string());
+            let group = manager.get(group_id.to_string()).unwrap();
             let result = group.select_one(conn_b.peer_id.clone()).unwrap();
             assert_eq!(result.0.peer_id, conn_b.peer_id);
             assert_eq!(result.0.conn_id, conn_b.conn_id);
