@@ -1,10 +1,11 @@
 use axum::routing::get;
 use std::net::SocketAddr;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::fmt::format::FmtSpan;
 
-use pulsebeam_server_foss::proto::signaling_server::SignalingServer;
 use pulsebeam_server_foss::server::Server;
+use pulsebeam_server_foss::{manager::ManagerConfig, proto::signaling_server::SignalingServer};
 use std::time::Duration;
 use tonic::service::LayerExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -24,12 +25,14 @@ async fn main() -> anyhow::Result<()> {
         // https://github.com/tower-rs/tower-http/issues/194
         .allow_origin(AllowOrigin::mirror_request())
         .max_age(Duration::from_secs(86400));
-    let server = SignalingServer::new(Server::default());
-    let server = tower::ServiceBuilder::new()
+    let token = CancellationToken::new();
+    let server = Server::spawn(token, ManagerConfig::default());
+    let query_routes = server.query_routes();
+    let grpc_server = tower::ServiceBuilder::new()
         .layer(tonic_web::GrpcWebLayer::new())
         .into_inner()
-        .named_layer(server);
-    let grpc_routes = tonic::service::Routes::new(server)
+        .named_layer(SignalingServer::new(server));
+    let grpc_routes = tonic::service::Routes::new(grpc_server)
         .prepare()
         .into_axum_router()
         .layer(cors)
@@ -40,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     let router = axum::Router::new()
         .nest_service("/grpc", grpc_routes)
+        .nest_service("/query", query_routes)
         .route("/_ping", get(ping));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

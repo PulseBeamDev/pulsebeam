@@ -1,13 +1,19 @@
 use crate::proto::signaling_server::Signaling;
 use crate::proto::{self, PeerInfo};
+use axum::extract::{Path, State};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Json;
 use std::pin::Pin;
 use std::time::Duration;
+use std::u32;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 use tracing::field::valuable;
 
-use crate::manager::{Manager, ManagerConfig, PeerConn};
+use crate::manager::{GroupId, Manager, ManagerConfig, PeerStats};
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 const RECV_STREAM_BUFFER: usize = 8;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
@@ -17,30 +23,17 @@ pub struct Server {
     manager: Manager,
 }
 
-impl Default for Server {
-    fn default() -> Self {
-        Self::new(ManagerConfig {
-            max_groups: 65536,
-            max_peers_per_group: 16,
-        })
-    }
-}
-
 pub type MessageStream = Pin<Box<dyn Stream<Item = proto::Message> + Send>>;
 
 impl Server {
-    pub fn new(cfg: ManagerConfig) -> Self {
-        let manager = Manager::new(cfg);
+    pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
+        let manager = Manager::spawn(token, cfg);
         Self { manager }
     }
 
-    pub fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
-        let group = self.manager.get_or_insert(src.group_id);
-        let conn = PeerConn {
-            peer_id: src.peer_id,
-            conn_id: src.conn_id,
-        };
-        let payload_stream = ReceiverStream::new(group.upsert(conn));
+    pub async fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
+        let conn = self.manager.conns.insert(src).await;
+        let payload_stream = ReceiverStream::new(conn);
 
         let repeat = std::iter::repeat(proto::Message {
             header: None,
@@ -52,6 +45,32 @@ impl Server {
         let merged = keep_alive.merge(payload_stream);
         Box::pin(merged) as MessageStream
     }
+
+    pub fn query_routes(&self) -> axum::Router {
+        axum::Router::new()
+            .route("/{group_id}", get(handle_group_query))
+            .with_state(self.clone())
+    }
+}
+
+#[axum::debug_handler]
+async fn handle_group_query(
+    Path(group_id): Path<GroupId>,
+    State(server): State<Server>,
+) -> Json<Vec<(PeerInfo, PeerStats)>> {
+    let start = PeerInfo {
+        group_id: group_id.clone(),
+        peer_id: "".to_string(),
+        conn_id: u32::MIN,
+    };
+
+    let end = PeerInfo {
+        group_id,
+        peer_id: "~".to_string(),
+        conn_id: u32::MAX,
+    };
+    let result = server.manager.index.select(start..=end);
+    Json(result)
 }
 
 pub type RecvStream = Pin<Box<dyn Stream<Item = Result<proto::RecvResp, tonic::Status>> + Send>>;
@@ -104,30 +123,30 @@ impl Signaling for Server {
             ));
         }
 
-        let cloned_dst = dst.clone();
-        let group = self
-            .manager
-            .get(&cloned_dst.group_id)
-            .ok_or(tonic::Status::not_found("group_id is not available"))?;
-
         // TODO: use a different RPC for connecting?
         let peer = if dst.conn_id == RESERVED_CONN_ID_DISCOVERY {
-            let selected = group
-                .select_one(cloned_dst.peer_id)
+            let start = dst.clone();
+            let mut end = dst.clone();
+            end.conn_id = u32::MAX;
+
+            let selected = self
+                .manager
+                .index
+                .select_one(start..=end)
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?;
-            dst.conn_id = selected.0.conn_id;
-            selected.1
+            dst.conn_id = selected.conn_id;
+            self.manager
+                .conns
+                .get(&selected)
+                .ok_or(tonic::Status::not_found("peer_id is not available"))?
         } else {
-            let conn = PeerConn {
-                peer_id: cloned_dst.peer_id,
-                conn_id: dst.conn_id,
-            };
-            group
-                .get(conn)
+            self.manager
+                .conns
+                .get(dst)
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?
         };
-        peer.mailbox
-            .send(msg)
+
+        peer.send(msg)
             .await
             .map_err(|err| tonic::Status::aborted(err.to_string()))?;
 
@@ -149,7 +168,7 @@ impl Signaling for Server {
         let manager = self.manager.clone();
         let peer = src.clone();
 
-        let mut payload = self.insert_recv_stream(src);
+        let mut payload = self.insert_recv_stream(src).await;
         let (tx, rx) = mpsc::channel(RECV_STREAM_BUFFER);
         tokio::spawn(async move {
             while let Some(item) = payload.next().await {
@@ -169,7 +188,7 @@ impl Signaling for Server {
                 peer = valuable(&peer),
                 "detected connection dropped, removing peer"
             );
-            manager.remove(peer);
+            manager.conns.remove(&peer).await;
         });
 
         let output_stream = ReceiverStream::new(rx);
@@ -219,7 +238,7 @@ mod test {
     }
 
     fn setup() -> (Server, PeerInfo, PeerInfo) {
-        let s = Server::default();
+        let s = Server::spawn(CancellationToken::new(), ManagerConfig::default());
         let peer1 = PeerInfo {
             group_id: String::from("default"),
             peer_id: String::from("peer1"),
@@ -296,7 +315,7 @@ mod test {
     #[tokio::test]
     async fn query_peers() {
         let (s, peer1, peer2) = setup();
-        let group = s.manager.get_or_insert(peer1.group_id.clone());
+        let group = s.manager.index(peer1.group_id.clone());
         let results = group.collect();
         assert_eq!(results.len(), 0);
 

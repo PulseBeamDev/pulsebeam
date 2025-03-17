@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.8.1"
+axum = { version = "0.8.1", features = ["macros"] }
 prost = "0.13"
 tokio = { version = "1.43.0", features = ["full", "test-util"] }
 tracing = { version = "0.1.41", features = ["valuable"] }
@@ -24,6 +24,8 @@ tokio-util = { version = "0.7.14", features = ["time"] }
 futures = "0.3.31"
 parking_lot = { version = "0.12.3", features = ["deadlock_detection"] }
 quick_cache = "0.6.12"
+metrics = "0.24.1"
+chrono = { version = "0.4.40", features = ["serde"] }
 
 [build-dependencies]
 tonic-build = { git = "https://github.com/hyperium/tonic.git", rev = "72b0fd59442d71804d4104e313ef6f140ab8f6d1" }
