@@ -107,7 +107,7 @@ impl Signaling for Server {
         let cloned_dst = dst.clone();
         let group = self
             .manager
-            .get(cloned_dst.group_id)
+            .get(&cloned_dst.group_id)
             .ok_or(tonic::Status::not_found("group_id is not available"))?;
 
         // TODO: use a different RPC for connecting?

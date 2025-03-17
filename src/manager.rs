@@ -1,10 +1,14 @@
 use crate::proto::{Message, PeerInfo};
 use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::Instant};
 
-use ahash::HashMap;
 use parking_lot::RwLock;
+use quick_cache::sync::Cache;
 use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_util::sync::CancellationToken;
+use tracing::event;
 
+const EVENT_CHANNEL_CAPACITY: usize = 64;
 pub type GroupId = String;
 pub type PeerId = String;
 
@@ -22,60 +26,62 @@ impl Default for ManagerConfig {
     }
 }
 
+pub type Index = BTreeMap<PeerInfo, PeerStats>;
+
 #[derive(Clone)]
 pub struct Manager {
     cfg: Arc<ManagerConfig>,
-    state: Arc<RwLock<ManagerState>>,
+    conns: Arc<Cache<PeerInfo, mpsc::Sender<Message>>>,
+    index: Arc<RwLock<Index>>,
+    event_ch: mpsc::Sender<ConnEvent>,
 }
 
-pub struct ManagerState {
-    groups: HashMap<GroupId, Group>,
+pub struct PeerStats {}
+
+pub enum ConnEvent {
+    Inserted(PeerInfo),
+    Removed(PeerInfo),
+}
+
+async fn index_worker(event_ch: mpsc::Receiver<ConnEvent>, index: Arc<RwLock<Index>>) {
+    let handle_event = |e: ConnEvent| {
+        let mut idx = index.write();
+        match e {
+            // TODO: update PeerStats
+            ConnEvent::Inserted(peer) => idx.insert(peer, PeerStats {}),
+            ConnEvent::Removed(peer) => idx.remove(&peer),
+        }
+    };
+
+    let mut event_stream = ReceiverStream::new(event_ch);
+    while let Some(e) = event_stream.next().await {
+        handle_event(e);
+    }
 }
 
 impl Manager {
-    pub fn new(cfg: ManagerConfig) -> Self {
+    pub fn start(token: CancellationToken, cfg: ManagerConfig) -> Self {
+        let conns = Arc::new(Cache::new(
+            cfg.max_groups as usize * cfg.max_peers_per_group as usize,
+        ));
+        let index = Arc::new(RwLock::new(BTreeMap::new()));
+        let event_ch = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             cfg: Arc::new(cfg),
-            state: Arc::new(RwLock::new(ManagerState {
-                groups: HashMap::default(),
-            })),
+            conns,
+            index,
+            event_ch,
         }
     }
 
-    pub fn get_or_insert(&self, group_id: GroupId) -> Group {
-        let mut state = self.state.write();
-        let group = state
-            .groups
-            .entry(group_id.clone())
-            .or_insert_with(|| Group::new(self.cfg.max_peers_per_group));
-        group.clone()
+    pub fn insert(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
+        let (sender, receiver) = mpsc::channel(1);
+        self.conns.insert(peer, sender);
+        receiver
     }
 
-    pub fn collect_peers(&self, group_id: &GroupId) -> Option<Vec<PeerConn>> {
-        let group = {
-            let state = self.state.read();
-            state.groups.get(group_id).cloned()?
-        };
-        Some(group.collect())
-    }
-
-    pub fn get(&self, group_id: GroupId) -> Option<Group> {
-        let state = self.state.read();
-        state.groups.get(&group_id).cloned()
-    }
-
-    pub fn remove(&self, peer: PeerInfo) {
-        let mut state = self.state.write();
-        if let Some(group) = state.groups.get(&peer.group_id) {
-            let conn = PeerConn {
-                peer_id: peer.peer_id,
-                conn_id: peer.conn_id,
-            };
-            let group_size = group.remove(&conn);
-            if group_size == 0 {
-                state.groups.remove(&peer.group_id);
-            }
-        }
+    pub fn get(&self, peer: &PeerInfo) -> Option<mpsc::Sender<Message>> {
+        self.conns.get(peer)
     }
 }
 
@@ -102,26 +108,6 @@ pub struct Peer {
     pub started_at: Instant,
 }
 
-impl Ord for PeerConn {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.peer_id.cmp(&other.peer_id) {
-            std::cmp::Ordering::Equal => self.conn_id.cmp(&other.conn_id),
-            ordering => ordering,
-        }
-    }
-}
-
-impl PartialOrd for PeerConn {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for PeerConn {
-    fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id && self.conn_id == other.conn_id
-    }
-}
 impl Group {
     pub fn new(capacity: u16) -> Self {
         Self {
@@ -237,7 +223,7 @@ mod test {
             .upsert(conn_b.clone());
 
         for manager in [manager1, manager2] {
-            let mut peers = manager.collect_peers(&group_id.to_string()).unwrap();
+            let mut peers = manager.get(group_id).unwrap().collect();
             peers.sort();
             assert_eq!(peers.len(), 2);
             assert_eq!(peers[0].peer_id, conn_a.peer_id);
@@ -245,7 +231,7 @@ mod test {
             assert_eq!(peers[1].peer_id, conn_b.peer_id);
             assert_eq!(peers[1].conn_id, conn_b.conn_id);
 
-            let group = manager.get(group_id.to_string()).unwrap();
+            let group = manager.get(group_id).unwrap();
             let result = group.select_one(conn_b.peer_id.clone()).unwrap();
             assert_eq!(result.0.peer_id, conn_b.peer_id);
             assert_eq!(result.0.conn_id, conn_b.conn_id);
