@@ -1,17 +1,16 @@
 use crate::proto::signaling_server::Signaling;
 use crate::proto::{self, PeerInfo};
 use axum::extract::{Path, State};
-use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Json;
 use std::pin::Pin;
 use std::time::Duration;
-use std::u32;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::field::valuable;
+use valuable::Enumerable;
 
 use crate::manager::{GroupId, Manager, ManagerConfig, PeerStats};
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
@@ -32,7 +31,7 @@ impl Server {
     }
 
     pub async fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
-        let conn = self.manager.conns.insert(src).await;
+        let conn = self.manager.allocate(src).await;
         let payload_stream = ReceiverStream::new(conn);
 
         let repeat = std::iter::repeat(proto::Message {
@@ -103,7 +102,6 @@ impl Signaling for Server {
             .into_inner()
             .msg
             .ok_or(tonic::Status::invalid_argument("msg is required"))?;
-        tracing::trace!(msg = valuable(&msg), "send");
         let hdr = msg
             .header
             .as_mut()
@@ -116,6 +114,16 @@ impl Signaling for Server {
             .src
             .as_ref()
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
+
+        tracing::trace!(
+            "send: {} -> {} ({:?})",
+            src,
+            dst,
+            msg.payload
+                .as_ref()
+                .and_then(|p| p.payload_type.as_ref())
+                .map(|p| p.variant().name().to_string())
+        );
 
         if src.group_id == dst.group_id && src.peer_id == dst.peer_id {
             return Err(tonic::Status::invalid_argument(
@@ -138,11 +146,13 @@ impl Signaling for Server {
             self.manager
                 .conns
                 .get(&selected)
+                .await
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?
         } else {
             self.manager
                 .conns
                 .get(dst)
+                .await
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?
         };
 
@@ -162,8 +172,6 @@ impl Signaling for Server {
             .into_inner()
             .src
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
-
-        tracing::trace!(src = valuable(&src), "recv");
 
         let manager = self.manager.clone();
         let peer = src.clone();
@@ -188,7 +196,7 @@ impl Signaling for Server {
                 peer = valuable(&peer),
                 "detected connection dropped, removing peer"
             );
-            manager.conns.remove(&peer).await;
+            manager.conns.invalidate(&peer).await;
         });
 
         let output_stream = ReceiverStream::new(rx);

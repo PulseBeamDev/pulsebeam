@@ -1,10 +1,13 @@
 use crate::proto::{Message, PeerInfo};
 use std::{collections::BTreeMap, ops::RangeBounds, sync::Arc};
 
+use futures::FutureExt;
+use moka::{
+    future::Cache,
+    notification::{ListenerFuture, RemovalCause},
+};
 use parking_lot::RwLock;
-use quick_cache::sync::Cache;
 use serde::Serialize;
-use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -13,16 +16,12 @@ pub type GroupId = String;
 pub type PeerId = String;
 
 pub struct ManagerConfig {
-    pub max_groups: u32,
-    pub max_peers_per_group: u16,
+    pub capacity: u64,
 }
 
 impl Default for ManagerConfig {
     fn default() -> Self {
-        Self {
-            max_groups: 65536,
-            max_peers_per_group: 16,
-        }
+        Self { capacity: 65536 }
     }
 }
 
@@ -31,33 +30,59 @@ pub type Index = BTreeMap<PeerInfo, PeerStats>;
 #[derive(Clone)]
 pub struct Manager {
     pub cfg: Arc<ManagerConfig>,
-    pub conns: Arc<ConnectionManager>,
+    pub conns: Cache<PeerInfo, mpsc::Sender<Message>, ahash::RandomState>,
     pub index: IndexManager,
+    pub event_ch: mpsc::Sender<ConnEvent>,
 }
 
 impl Manager {
     pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
-        let (conn, event_ch) = ConnectionManager::new(EVENT_CHANNEL_CAPACITY);
+        let event_ch = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let sender = event_ch.0.clone();
+        let eviction_listener = move |k: Arc<PeerInfo>,
+                                      _v: mpsc::Sender<Message>,
+                                      _cause: RemovalCause|
+              -> ListenerFuture {
+            let event_ch = sender.clone();
+            async move {
+                let peer = k.as_ref().clone();
+                if let Err(err) = event_ch.send(ConnEvent::Removed(peer)).await {
+                    tracing::warn!(
+                        "unexpected event_ch ended prematurely on eviction: {:?}",
+                        err
+                    );
+                }
+            }
+            .boxed()
+        };
+        let conns = Cache::builder()
+            .max_capacity(cfg.capacity)
+            .async_eviction_listener(eviction_listener)
+            .build_with_hasher(ahash::RandomState::default());
+
         let index = IndexManager::new();
         let index_worker = index.clone();
         tokio::spawn(async move {
             token
-                .run_until_cancelled_owned(index_worker.spawn(event_ch))
+                .run_until_cancelled_owned(index_worker.spawn(event_ch.1))
                 .await
         });
         Self {
             cfg: Arc::new(cfg),
-            conns: Arc::new(conn),
+            conns,
             index,
+            event_ch: event_ch.0,
         }
     }
 
-    pub fn select_one_conn(
-        &self,
-        range: impl RangeBounds<PeerInfo>,
-    ) -> Option<mpsc::Sender<Message>> {
-        let peer = self.index.select_one(range)?;
-        self.conns.get(&peer)
+    pub async fn allocate(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
+        let (sender, receiver) = mpsc::channel(1);
+        tracing::info!("allocated connection: {}", peer);
+        self.conns.insert(peer.clone(), sender).await;
+        if let Err(err) = self.event_ch.send(ConnEvent::Inserted(peer)).await {
+            tracing::warn!("unexpected event_ch ended prematurely on insert: {:?}", err);
+        }
+        receiver
     }
 }
 
@@ -65,41 +90,6 @@ impl Manager {
 pub enum ConnEvent {
     Inserted(PeerInfo),
     Removed(PeerInfo),
-}
-
-pub struct ConnectionManager {
-    conns: Cache<PeerInfo, mpsc::Sender<Message>>,
-    event_ch: mpsc::Sender<ConnEvent>,
-}
-
-impl ConnectionManager {
-    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<ConnEvent>) {
-        let conns = Cache::new(capacity);
-        let event_ch = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let manager = Self {
-            conns,
-            event_ch: event_ch.0,
-        };
-        (manager, event_ch.1)
-    }
-
-    pub async fn insert(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
-        let (sender, receiver) = mpsc::channel(1);
-        self.conns.insert(peer.clone(), sender);
-        self.event_ch.send(ConnEvent::Inserted(peer)).await;
-        receiver
-    }
-
-    pub async fn remove(&self, peer: &PeerInfo) {
-        if let Some((peer, _)) = self.conns.remove(peer) {
-            // TODO: handle back pressure
-            self.event_ch.send(ConnEvent::Removed(peer)).await;
-        }
-    }
-
-    pub fn get(&self, peer: &PeerInfo) -> Option<mpsc::Sender<Message>> {
-        self.conns.get(peer)
-    }
 }
 
 #[derive(Clone)]
@@ -128,7 +118,6 @@ impl IndexManager {
                     state.handle_event(event);
                 }
                 buf.clear();
-                tracing::trace!("current index state: {:?}", state.index);
             }
         }
     }

@@ -19,6 +19,12 @@ pub mod pulsebeam {
                 Some(self.cmp(other))
             }
         }
+
+        impl std::fmt::Display for PeerInfo {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}:{}:{}", self.group_id, self.peer_id, self.conn_id)
+            }
+        }
     }
 }
 pub use pulsebeam::v1::*;
