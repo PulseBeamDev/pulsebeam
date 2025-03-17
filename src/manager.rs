@@ -1,182 +1,184 @@
 use crate::proto::{Message, PeerInfo};
-use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, ops::RangeBounds, sync::Arc};
 
-use ahash::HashMap;
+use futures::FutureExt;
+use moka::{
+    future::Cache,
+    notification::{ListenerFuture, RemovalCause},
+};
 use parking_lot::RwLock;
+use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
+const EVENT_CHANNEL_CAPACITY: usize = 64;
 pub type GroupId = String;
 pub type PeerId = String;
 
 pub struct ManagerConfig {
-    pub max_groups: u32,
-    pub max_peers_per_group: u16,
+    pub capacity: u64,
 }
 
 impl Default for ManagerConfig {
     fn default() -> Self {
-        Self {
-            max_groups: 65536,
-            max_peers_per_group: 16,
-        }
+        Self { capacity: 65536 }
     }
 }
 
+pub type Index = BTreeMap<PeerInfo, PeerStats>;
+
 #[derive(Clone)]
 pub struct Manager {
-    cfg: Arc<ManagerConfig>,
-    state: Arc<RwLock<ManagerState>>,
-}
-
-pub struct ManagerState {
-    groups: HashMap<GroupId, Group>,
+    pub cfg: Arc<ManagerConfig>,
+    pub conns: Cache<PeerInfo, mpsc::Sender<Message>, ahash::RandomState>,
+    pub index: IndexManager,
+    pub event_ch: mpsc::Sender<ConnEvent>,
 }
 
 impl Manager {
-    pub fn new(cfg: ManagerConfig) -> Self {
+    pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
+        let event_ch = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let sender = event_ch.0.clone();
+        let eviction_listener = move |k: Arc<PeerInfo>,
+                                      _v: mpsc::Sender<Message>,
+                                      _cause: RemovalCause|
+              -> ListenerFuture {
+            let event_ch = sender.clone();
+            async move {
+                let peer = k.as_ref().clone();
+                if let Err(err) = event_ch.send(ConnEvent::Removed(peer)).await {
+                    tracing::warn!(
+                        "unexpected event_ch ended prematurely on eviction: {:?}",
+                        err
+                    );
+                }
+            }
+            .boxed()
+        };
+        let conns = Cache::builder()
+            .max_capacity(cfg.capacity)
+            .async_eviction_listener(eviction_listener)
+            .build_with_hasher(ahash::RandomState::default());
+
+        let index = IndexManager::new();
+        let index_worker = index.clone();
+        tokio::spawn(async move {
+            token
+                .run_until_cancelled_owned(index_worker.spawn(event_ch.1))
+                .await
+        });
         Self {
             cfg: Arc::new(cfg),
-            state: Arc::new(RwLock::new(ManagerState {
-                groups: HashMap::default(),
+            conns,
+            index,
+            event_ch: event_ch.0,
+        }
+    }
+
+    pub async fn allocate(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
+        let (sender, receiver) = mpsc::channel(1);
+        tracing::info!("allocated connection: {}", peer);
+        self.conns.insert(peer.clone(), sender).await;
+        if let Err(err) = self.event_ch.send(ConnEvent::Inserted(peer)).await {
+            tracing::warn!("unexpected event_ch ended prematurely on insert: {:?}", err);
+        }
+        receiver
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ConnEvent {
+    Inserted(PeerInfo),
+    Removed(PeerInfo),
+}
+
+#[derive(Clone)]
+pub struct IndexManager {
+    state: Arc<RwLock<IndexManagerState>>,
+}
+
+impl IndexManager {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(IndexManagerState {
+                index: BTreeMap::new(),
             })),
         }
     }
 
-    pub fn get_or_insert(&self, group_id: GroupId) -> Group {
-        let mut state = self.state.write();
-        let group = state
-            .groups
-            .entry(group_id.clone())
-            .or_insert_with(|| Group::new(self.cfg.max_peers_per_group));
-        group.clone()
-    }
+    pub async fn spawn(&self, mut event_ch: mpsc::Receiver<ConnEvent>) {
+        tracing::info!("spawned index worker");
+        let mut buf = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
+        loop {
+            let received = event_ch.recv_many(&mut buf, EVENT_CHANNEL_CAPACITY).await;
 
-    pub fn collect_peers(&self, group_id: &GroupId) -> Option<Vec<PeerConn>> {
-        let group = {
-            let state = self.state.read();
-            state.groups.get(group_id).cloned()?
-        };
-        Some(group.collect())
-    }
-
-    pub fn get(&self, group_id: GroupId) -> Option<Group> {
-        let state = self.state.read();
-        state.groups.get(&group_id).cloned()
-    }
-
-    pub fn remove(&self, peer: PeerInfo) {
-        let mut state = self.state.write();
-        if let Some(group) = state.groups.get(&peer.group_id) {
-            let conn = PeerConn {
-                peer_id: peer.peer_id,
-                conn_id: peer.conn_id,
-            };
-            let group_size = group.remove(&conn);
-            if group_size == 0 {
-                state.groups.remove(&peer.group_id);
+            {
+                let mut state = self.state.write();
+                for event in buf[..received].iter() {
+                    state.handle_event(event);
+                }
+                buf.clear();
             }
         }
     }
-}
 
-#[derive(Clone)]
-pub struct Group {
-    state: Arc<RwLock<GroupState>>,
-    capacity: u16,
-}
-
-#[derive(Default)]
-pub struct GroupState {
-    peers: BTreeMap<PeerConn, Peer>,
-}
-
-#[derive(Clone, Debug, Eq)]
-pub struct PeerConn {
-    pub peer_id: PeerId,
-    pub conn_id: u32,
-}
-
-#[derive(Clone)]
-pub struct Peer {
-    pub mailbox: mpsc::Sender<Message>,
-    pub started_at: Instant,
-}
-
-impl Ord for PeerConn {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.peer_id.cmp(&other.peer_id) {
-            std::cmp::Ordering::Equal => self.conn_id.cmp(&other.conn_id),
-            ordering => ordering,
+    pub fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)> {
+        let state = self.state.read();
+        let mut result = Vec::new();
+        for (k, v) in state.index.range(range) {
+            result.push((k.clone(), v.clone()))
         }
-    }
-}
-
-impl PartialOrd for PeerConn {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for PeerConn {
-    fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id && self.conn_id == other.conn_id
-    }
-}
-impl Group {
-    pub fn new(capacity: u16) -> Self {
-        Self {
-            capacity,
-            state: Arc::new(RwLock::new(GroupState::default())),
-        }
+        result
     }
 
-    pub fn collect(&self) -> Vec<PeerConn> {
+    pub fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo> {
         let state = self.state.read();
-        state.peers.keys().cloned().collect()
-    }
-
-    pub fn upsert(&self, conn: PeerConn) -> mpsc::Receiver<Message> {
-        let (sender, receiver) = mpsc::channel(1);
-        let mut state = self.state.write();
-        state.peers.insert(
-            conn,
-            Peer {
-                started_at: Instant::now(),
-                mailbox: sender,
-            },
-        );
-        receiver
-    }
-
-    pub fn get(&self, conn: PeerConn) -> Option<Peer> {
-        let state = self.state.read();
-        state.peers.get(&conn).cloned()
-    }
-
-    pub fn select_one(&self, peer_id: PeerId) -> Option<(PeerConn, Peer)> {
-        let state = self.state.read();
-        let start = PeerConn {
-            peer_id: peer_id.clone(),
-            conn_id: 0,
-        };
-        let end = PeerConn {
-            peer_id,
-            conn_id: u32::MAX,
-        };
-
         // pick the youngest connection
         let found = state
-            .peers
-            .range(start..=end)
-            .max_by_key(|(_, p)| p.started_at)?;
-        let result = (found.0.clone(), found.1.clone());
-        Some(result)
+            .index
+            .range(range)
+            .max_by_key(|(_, p)| p.inserted_at)?;
+        Some(found.0.clone())
     }
 
-    pub fn remove(&self, peer_id: &PeerConn) -> usize {
-        let mut state = self.state.write();
-        state.peers.remove(peer_id);
-        state.peers.len()
+    pub fn select_group(&self, group_id: GroupId) -> Vec<(PeerInfo, PeerStats)> {
+        let start = PeerInfo {
+            group_id: group_id.clone(),
+            peer_id: "".to_string(),
+            conn_id: u32::MIN,
+        };
+
+        let end = PeerInfo {
+            group_id,
+            peer_id: "~".to_string(),
+            conn_id: u32::MAX,
+        };
+        self.select(start..=end)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerStats {
+    inserted_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct IndexManagerState {
+    index: BTreeMap<PeerInfo, PeerStats>,
+}
+
+impl IndexManagerState {
+    pub fn handle_event(&mut self, e: &ConnEvent) {
+        tracing::trace!("handle event: {:?}", e);
+        match e {
+            // TODO: update PeerStats
+            ConnEvent::Inserted(peer) => self.index.insert(
+                peer.clone(),
+                PeerStats {
+                    inserted_at: chrono::Utc::now(),
+                },
+            ),
+            ConnEvent::Removed(peer) => self.index.remove(peer),
+        };
     }
 }
 
@@ -186,69 +188,89 @@ mod test {
 
     #[test]
     fn select_one() {
-        let group = Group::new(8);
-        let conn_a = PeerConn {
+        let conn_a = PeerInfo {
+            group_id: "default".to_string(),
             peer_id: "a".to_string(),
             conn_id: 2818993334,
         };
-        let conn_b = PeerConn {
+        let conn_b = PeerInfo {
+            group_id: "default".to_string(),
             peer_id: "b".to_string(),
             conn_id: 2913253855,
         };
 
-        group.upsert(conn_a.clone());
-        group.upsert(conn_b);
+        let manager = IndexManager::new();
+        manager
+            .state
+            .write()
+            .handle_event(&ConnEvent::Inserted(conn_a.clone()));
+        manager
+            .state
+            .write()
+            .handle_event(&ConnEvent::Inserted(conn_b.clone()));
 
-        let result = group.select_one("a".to_string());
-        let (conn, _) = result.unwrap();
+        let start = PeerInfo {
+            conn_id: 0,
+            ..conn_a.clone()
+        };
+        let end = PeerInfo {
+            conn_id: u32::MAX,
+            ..conn_a.clone()
+        };
+        let conn = manager.select_one(start.clone()..=end.clone()).unwrap();
         assert_eq!(conn.peer_id, conn_a.peer_id);
         assert_eq!(conn.conn_id, conn_a.conn_id);
 
-        let conn_a_new = PeerConn {
+        let conn_a_new = PeerInfo {
+            group_id: "default".to_string(),
             peer_id: "a".to_string(),
             conn_id: 1,
         };
-        group.upsert(conn_a_new.clone());
-        let result = group.select_one("a".to_string());
-        let (conn, _) = result.unwrap();
+        manager
+            .state
+            .write()
+            .handle_event(&ConnEvent::Inserted(conn_a_new.clone()));
+        let conn = manager.select_one(start..=end).unwrap();
         assert_eq!(conn.peer_id, conn_a_new.peer_id);
         assert_eq!(conn.conn_id, conn_a_new.conn_id);
     }
 
     #[test]
     fn insert_multiple_peers() {
-        let manager1 = Manager::new(ManagerConfig::default());
-        let manager2 = manager1.clone();
-        let group_id = "default";
-        let conn_a = PeerConn {
+        let conn_a = PeerInfo {
+            group_id: "default".to_string(),
             peer_id: "a".to_string(),
             conn_id: 2818993334,
         };
-        let conn_b = PeerConn {
+        let conn_b = PeerInfo {
+            group_id: "default".to_string(),
             peer_id: "b".to_string(),
             conn_id: 2913253855,
         };
 
+        let manager1 = IndexManager::new();
+        let manager2 = manager1.clone();
         manager1
-            .get_or_insert(group_id.to_string())
-            .upsert(conn_a.clone());
+            .state
+            .write()
+            .handle_event(&ConnEvent::Inserted(conn_a.clone()));
         manager2
-            .get_or_insert(group_id.to_string())
-            .upsert(conn_b.clone());
+            .state
+            .write()
+            .handle_event(&ConnEvent::Inserted(conn_b.clone()));
 
         for manager in [manager1, manager2] {
-            let mut peers = manager.collect_peers(&group_id.to_string()).unwrap();
+            let mut peers: Vec<PeerInfo> = manager
+                .select_group("default".to_string())
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
             peers.sort();
             assert_eq!(peers.len(), 2);
             assert_eq!(peers[0].peer_id, conn_a.peer_id);
             assert_eq!(peers[0].conn_id, conn_a.conn_id);
             assert_eq!(peers[1].peer_id, conn_b.peer_id);
             assert_eq!(peers[1].conn_id, conn_b.conn_id);
-
-            let group = manager.get(group_id.to_string()).unwrap();
-            let result = group.select_one(conn_b.peer_id.clone()).unwrap();
-            assert_eq!(result.0.peer_id, conn_b.peer_id);
-            assert_eq!(result.0.conn_id, conn_b.conn_id);
         }
     }
 }
