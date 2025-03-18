@@ -133,15 +133,11 @@ impl Signaling for Server {
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?;
             dst.conn_id = selected.conn_id;
             self.manager
-                .conns
                 .get(&selected)
-                .await
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?
         } else {
             self.manager
-                .conns
                 .get(dst)
-                .await
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?
         };
 
@@ -185,7 +181,7 @@ impl Signaling for Server {
                 peer = valuable(&peer),
                 "detected connection dropped, removing peer"
             );
-            manager.conns.invalidate(&peer).await;
+            manager.remove(peer).await;
         });
 
         let output_stream = ReceiverStream::new(rx);

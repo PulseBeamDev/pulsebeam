@@ -1,12 +1,9 @@
 use crate::proto::{Message, PeerInfo};
 use std::{collections::BTreeMap, ops::RangeBounds, sync::Arc};
 
-use futures::FutureExt;
-use moka::{
-    future::Cache,
-    notification::{ListenerFuture, RemovalCause},
-};
+use ahash::RandomState;
 use parking_lot::RwLock;
+use quick_cache::{sync::Cache, DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +27,7 @@ pub type Index = BTreeMap<PeerInfo, PeerStats>;
 #[derive(Clone)]
 pub struct Manager {
     pub cfg: Arc<ManagerConfig>,
-    pub conns: Cache<PeerInfo, mpsc::Sender<Message>, ahash::RandomState>,
+    conns: Arc<Cache<PeerInfo, mpsc::Sender<Message>, UnitWeighter, RandomState, EvictionListener>>,
     pub index: IndexManager,
     pub event_ch: mpsc::Sender<ConnEvent>,
 }
@@ -38,27 +35,6 @@ pub struct Manager {
 impl Manager {
     pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
         let event_ch = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let sender = event_ch.0.clone();
-        let eviction_listener = move |k: Arc<PeerInfo>,
-                                      _v: mpsc::Sender<Message>,
-                                      _cause: RemovalCause|
-              -> ListenerFuture {
-            let event_ch = sender.clone();
-            async move {
-                let peer = k.as_ref().clone();
-                if let Err(err) = event_ch.send(ConnEvent::Removed(peer)).await {
-                    tracing::warn!(
-                        "unexpected event_ch ended prematurely on eviction: {:?}",
-                        err
-                    );
-                }
-            }
-            .boxed()
-        };
-        let conns = Cache::builder()
-            .max_capacity(cfg.capacity)
-            .async_eviction_listener(eviction_listener)
-            .build_with_hasher(ahash::RandomState::default());
 
         let index = IndexManager::new();
         let index_worker = index.clone();
@@ -67,9 +43,20 @@ impl Manager {
                 .run_until_cancelled_owned(index_worker.spawn(event_ch.1))
                 .await
         });
+
+        let eviction_listener = EvictionListener(event_ch.0.clone());
+
+        let conns = Cache::with(
+            cfg.capacity as usize,
+            cfg.capacity,
+            UnitWeighter,
+            DefaultHashBuilder::default(),
+            eviction_listener,
+        );
+
         Self {
             cfg: Arc::new(cfg),
-            conns,
+            conns: Arc::new(conns),
             index,
             event_ch: event_ch.0,
         }
@@ -78,11 +65,45 @@ impl Manager {
     pub async fn allocate(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
         let (sender, receiver) = mpsc::channel(1);
         tracing::info!("allocated connection: {}", peer);
-        self.conns.insert(peer.clone(), sender).await;
+        self.conns.insert(peer.clone(), sender);
         if let Err(err) = self.event_ch.send(ConnEvent::Inserted(peer)).await {
             tracing::warn!("unexpected event_ch ended prematurely on insert: {:?}", err);
         }
         receiver
+    }
+
+    pub fn get(&self, peer: &PeerInfo) -> Option<mpsc::Sender<Message>> {
+        self.conns.get(peer)
+    }
+
+    pub async fn remove(&self, peer: PeerInfo) {
+        self.conns.remove(&peer);
+        if let Err(err) = self.event_ch.send(ConnEvent::Removed(peer)).await {
+            tracing::warn!("unexpected event_ch ended prematurely on remove: {:?}", err);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvictionListener(mpsc::Sender<ConnEvent>);
+
+impl Lifecycle<PeerInfo, mpsc::Sender<Message>> for EvictionListener {
+    type RequestState = ();
+
+    fn begin_request(&self) -> Self::RequestState {}
+
+    fn on_evict(
+        &self,
+        _state: &mut Self::RequestState,
+        key: PeerInfo,
+        _val: mpsc::Sender<Message>,
+    ) {
+        if let Err(err) = self.0.blocking_send(ConnEvent::Removed(key)) {
+            tracing::warn!(
+                "unexpected event_ch ended prematurely on eviction: {:?}",
+                err
+            );
+        }
     }
 }
 
