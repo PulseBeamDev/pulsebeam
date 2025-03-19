@@ -132,6 +132,10 @@ impl IndexManager {
         let mut buf = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
         loop {
             let received = event_ch.recv_many(&mut buf, EVENT_CHANNEL_CAPACITY).await;
+            if received == 0 {
+                tracing::info!("index worker is drained, exiting gracefully");
+                break;
+            }
 
             {
                 let mut state = self.state.write();
@@ -293,5 +297,14 @@ mod test {
             assert_eq!(peers[1].peer_id, conn_b.peer_id);
             assert_eq!(peers[1].conn_id, conn_b.conn_id);
         }
+    }
+
+    #[tokio::test]
+    async fn drain_index_worker() {
+        let index = IndexManager::new();
+        let event_ch = mpsc::channel(1);
+        let join = tokio::spawn(async move { index.spawn(event_ch.1).await });
+        drop(event_ch.0);
+        join.await.unwrap();
     }
 }
