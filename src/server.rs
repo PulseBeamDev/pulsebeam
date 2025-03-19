@@ -30,8 +30,8 @@ impl Server {
         Self { manager }
     }
 
-    pub async fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
-        let conn = self.manager.allocate(src).await;
+    pub fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
+        let conn = self.manager.allocate(src);
         let payload_stream = ReceiverStream::new(conn);
 
         let repeat = std::iter::repeat(proto::Message {
@@ -161,7 +161,7 @@ impl Signaling for Server {
         let manager = self.manager.clone();
         let peer = src.clone();
 
-        let mut payload = self.insert_recv_stream(src).await;
+        let mut payload = self.insert_recv_stream(src);
         let (tx, rx) = mpsc::channel(RECV_STREAM_BUFFER);
         tokio::spawn(async move {
             while let Some(item) = payload.next().await {
@@ -181,7 +181,7 @@ impl Signaling for Server {
                 peer = valuable(&peer),
                 "detected connection dropped, removing peer"
             );
-            manager.remove(peer).await;
+            manager.remove(peer);
         });
 
         let output_stream = ReceiverStream::new(rx);
@@ -253,7 +253,7 @@ mod test {
             s.send(tonic::Request::new(SendReq {
                 msg: Some(msgs[0].clone()),
             })),
-            stream_to_vec(s.insert_recv_stream(peer2).await, 1),
+            stream_to_vec(s.insert_recv_stream(peer2), 1),
         );
 
         send.unwrap();
@@ -274,7 +274,7 @@ mod test {
             s.send(tonic::Request::new(SendReq {
                 msg: Some(msgs[1].clone()),
             })),
-            stream_to_vec(s.insert_recv_stream(peer2).await, 2),
+            stream_to_vec(s.insert_recv_stream(peer2), 2),
         );
 
         send1.unwrap();
@@ -289,7 +289,7 @@ mod test {
 
         let cloned_s = s.clone();
         let join = tokio::spawn(async move {
-            let recv_stream = cloned_s.insert_recv_stream(peer2.clone()).await;
+            let recv_stream = cloned_s.insert_recv_stream(peer2.clone());
             stream_to_vec(recv_stream, 1).await
         });
 
@@ -311,8 +311,8 @@ mod test {
         let results = s.manager.index.select_group(peer1.group_id.clone());
         assert_eq!(results.len(), 0);
 
-        let _stream1 = s.insert_recv_stream(peer1.clone()).await;
-        let _stream2 = s.insert_recv_stream(peer2.clone()).await;
+        let _stream1 = s.insert_recv_stream(peer1.clone());
+        let _stream2 = s.insert_recv_stream(peer2.clone());
         tokio::task::yield_now().await;
         let mut results: Vec<PeerInfo> = s
             .manager

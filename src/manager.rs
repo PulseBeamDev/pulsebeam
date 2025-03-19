@@ -29,12 +29,12 @@ pub struct Manager {
     pub cfg: Arc<ManagerConfig>,
     conns: Arc<Cache<PeerInfo, mpsc::Sender<Message>, UnitWeighter, RandomState, EvictionListener>>,
     pub index: IndexManager,
-    pub event_ch: mpsc::Sender<ConnEvent>,
+    pub event_ch: mpsc::UnboundedSender<ConnEvent>,
 }
 
 impl Manager {
     pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
-        let event_ch = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let event_ch = mpsc::unbounded_channel();
 
         let index = IndexManager::new();
         let index_worker = index.clone();
@@ -62,11 +62,11 @@ impl Manager {
         }
     }
 
-    pub async fn allocate(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
+    pub fn allocate(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
         let (sender, receiver) = mpsc::channel(1);
         tracing::info!("allocated connection: {}", peer);
         self.conns.insert(peer.clone(), sender);
-        if let Err(err) = self.event_ch.send(ConnEvent::Inserted(peer)).await {
+        if let Err(err) = self.event_ch.send(ConnEvent::Inserted(peer)) {
             tracing::warn!("unexpected event_ch ended prematurely on insert: {:?}", err);
         }
         receiver
@@ -76,16 +76,16 @@ impl Manager {
         self.conns.get(peer)
     }
 
-    pub async fn remove(&self, peer: PeerInfo) {
+    pub fn remove(&self, peer: PeerInfo) {
         self.conns.remove(&peer);
-        if let Err(err) = self.event_ch.send(ConnEvent::Removed(peer)).await {
+        if let Err(err) = self.event_ch.send(ConnEvent::Removed(peer)) {
             tracing::warn!("unexpected event_ch ended prematurely on remove: {:?}", err);
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct EvictionListener(mpsc::Sender<ConnEvent>);
+struct EvictionListener(mpsc::UnboundedSender<ConnEvent>);
 
 impl Lifecycle<PeerInfo, mpsc::Sender<Message>> for EvictionListener {
     type RequestState = ();
@@ -98,7 +98,7 @@ impl Lifecycle<PeerInfo, mpsc::Sender<Message>> for EvictionListener {
         key: PeerInfo,
         _val: mpsc::Sender<Message>,
     ) {
-        if let Err(err) = self.0.blocking_send(ConnEvent::Removed(key)) {
+        if let Err(err) = self.0.send(ConnEvent::Removed(key)) {
             tracing::warn!(
                 "unexpected event_ch ended prematurely on eviction: {:?}",
                 err
@@ -127,7 +127,7 @@ impl IndexManager {
         }
     }
 
-    pub async fn spawn(&self, mut event_ch: mpsc::Receiver<ConnEvent>) {
+    pub async fn spawn(&self, mut event_ch: mpsc::UnboundedReceiver<ConnEvent>) {
         tracing::info!("spawned index worker");
         let mut buf = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
         loop {
@@ -302,9 +302,27 @@ mod test {
     #[tokio::test]
     async fn drain_index_worker() {
         let index = IndexManager::new();
-        let event_ch = mpsc::channel(1);
+        let event_ch = mpsc::unbounded_channel();
         let join = tokio::spawn(async move { index.spawn(event_ch.1).await });
         drop(event_ch.0);
         join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_capacity() {
+        let token = CancellationToken::new();
+        let manager = Manager::spawn(token, ManagerConfig { capacity: 1 });
+        let mut peer = PeerInfo {
+            group_id: "default".to_string(),
+            peer_id: "a".to_string(),
+            conn_id: 0,
+        };
+        manager.allocate(peer.clone());
+        peer.conn_id = 1;
+        manager.allocate(peer.clone());
+        peer.conn_id = 2;
+        manager.allocate(peer.clone());
+        peer.conn_id = 3;
+        manager.allocate(peer.clone());
     }
 }
