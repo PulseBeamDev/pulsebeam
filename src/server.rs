@@ -19,7 +19,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
 pub struct Server {
-    manager: Manager,
+    pub manager: Manager,
 }
 
 pub type MessageStream = Pin<Box<dyn Stream<Item = proto::Message> + Send>>;

@@ -82,6 +82,14 @@ impl Manager {
             tracing::warn!("unexpected event_ch ended prematurely on remove: {:?}", err);
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.conns.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.conns.len()
+    }
 }
 
 #[derive(Debug, Clone)]
