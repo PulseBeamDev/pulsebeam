@@ -32,7 +32,7 @@ impl Server {
 
     pub fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
         let conn = self.manager.allocate(src);
-        let payload_stream = conn.into_stream();
+        let payload_stream = ReceiverStream::new(conn);
 
         let repeat = std::iter::repeat(proto::Message {
             header: None,
@@ -141,7 +141,7 @@ impl Signaling for Server {
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?
         };
 
-        peer.send_async(msg)
+        peer.send(msg)
             .await
             .map_err(|err| tonic::Status::aborted(err.to_string()))?;
 
