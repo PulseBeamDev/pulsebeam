@@ -5,7 +5,6 @@ use ahash::RandomState;
 use parking_lot::RwLock;
 use quick_cache::{sync::Cache, DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::Serialize;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -27,14 +26,15 @@ pub type Index = BTreeMap<PeerInfo, PeerStats>;
 #[derive(Clone)]
 pub struct Manager {
     pub cfg: Arc<ManagerConfig>,
-    conns: Arc<Cache<PeerInfo, mpsc::Sender<Message>, UnitWeighter, RandomState, EvictionListener>>,
+    conns:
+        Arc<Cache<PeerInfo, flume::Sender<Message>, UnitWeighter, RandomState, EvictionListener>>,
     pub index: IndexManager,
-    pub event_ch: mpsc::UnboundedSender<ConnEvent>,
+    pub event_ch: flume::Sender<ConnEvent>,
 }
 
 impl Manager {
     pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
-        let event_ch = mpsc::unbounded_channel();
+        let event_ch = flume::bounded(EVENT_CHANNEL_CAPACITY);
 
         let index = IndexManager::new();
         let index_worker = index.clone();
@@ -62,8 +62,8 @@ impl Manager {
         }
     }
 
-    pub fn allocate(&self, peer: PeerInfo) -> mpsc::Receiver<Message> {
-        let (sender, receiver) = mpsc::channel(1);
+    pub fn allocate(&self, peer: PeerInfo) -> flume::Receiver<Message> {
+        let (sender, receiver) = flume::bounded(1);
         tracing::info!("allocated connection: {}", peer);
         self.conns.insert(peer.clone(), sender);
         if let Err(err) = self.event_ch.send(ConnEvent::Inserted(peer)) {
@@ -72,7 +72,7 @@ impl Manager {
         receiver
     }
 
-    pub fn get(&self, peer: &PeerInfo) -> Option<mpsc::Sender<Message>> {
+    pub fn get(&self, peer: &PeerInfo) -> Option<flume::Sender<Message>> {
         self.conns.get(peer)
     }
 
@@ -93,9 +93,9 @@ impl Manager {
 }
 
 #[derive(Debug, Clone)]
-struct EvictionListener(mpsc::UnboundedSender<ConnEvent>);
+struct EvictionListener(flume::Sender<ConnEvent>);
 
-impl Lifecycle<PeerInfo, mpsc::Sender<Message>> for EvictionListener {
+impl Lifecycle<PeerInfo, flume::Sender<Message>> for EvictionListener {
     type RequestState = ();
 
     fn begin_request(&self) -> Self::RequestState {}
@@ -104,7 +104,7 @@ impl Lifecycle<PeerInfo, mpsc::Sender<Message>> for EvictionListener {
         &self,
         _state: &mut Self::RequestState,
         key: PeerInfo,
-        _val: mpsc::Sender<Message>,
+        _val: flume::Sender<Message>,
     ) {
         if let Err(err) = self.0.send(ConnEvent::Removed(key)) {
             tracing::warn!(
@@ -135,24 +135,13 @@ impl IndexManager {
         }
     }
 
-    pub async fn spawn(&self, mut event_ch: mpsc::UnboundedReceiver<ConnEvent>) {
+    pub async fn spawn(&self, event_ch: flume::Receiver<ConnEvent>) {
         tracing::info!("spawned index worker");
-        let mut buf = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
-        loop {
-            let received = event_ch.recv_many(&mut buf, EVENT_CHANNEL_CAPACITY).await;
-            if received == 0 {
-                tracing::info!("index worker is drained, exiting gracefully");
-                break;
-            }
-
-            {
-                let mut state = self.state.write();
-                for event in buf[..received].iter() {
-                    state.handle_event(event);
-                }
-                buf.clear();
-            }
+        while let Ok(event) = event_ch.recv_async().await {
+            let mut state = self.state.write();
+            state.handle_event(event);
         }
+        tracing::info!("index worker is drained, exiting gracefully");
     }
 
     pub fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)> {
@@ -200,17 +189,17 @@ pub struct IndexManagerState {
 }
 
 impl IndexManagerState {
-    pub fn handle_event(&mut self, e: &ConnEvent) {
+    pub fn handle_event(&mut self, e: ConnEvent) {
         tracing::trace!("handle event: {:?}", e);
         match e {
             // TODO: update PeerStats
             ConnEvent::Inserted(peer) => self.index.insert(
-                peer.clone(),
+                peer,
                 PeerStats {
                     inserted_at: chrono::Utc::now(),
                 },
             ),
-            ConnEvent::Removed(peer) => self.index.remove(peer),
+            ConnEvent::Removed(peer) => self.index.remove(&peer),
         };
     }
 }
@@ -236,11 +225,11 @@ mod test {
         manager
             .state
             .write()
-            .handle_event(&ConnEvent::Inserted(conn_a.clone()));
+            .handle_event(ConnEvent::Inserted(conn_a.clone()));
         manager
             .state
             .write()
-            .handle_event(&ConnEvent::Inserted(conn_b.clone()));
+            .handle_event(ConnEvent::Inserted(conn_b.clone()));
 
         let start = PeerInfo {
             conn_id: 0,
@@ -262,7 +251,7 @@ mod test {
         manager
             .state
             .write()
-            .handle_event(&ConnEvent::Inserted(conn_a_new.clone()));
+            .handle_event(ConnEvent::Inserted(conn_a_new.clone()));
         let conn = manager.select_one(start..=end).unwrap();
         assert_eq!(conn.peer_id, conn_a_new.peer_id);
         assert_eq!(conn.conn_id, conn_a_new.conn_id);
@@ -286,11 +275,11 @@ mod test {
         manager1
             .state
             .write()
-            .handle_event(&ConnEvent::Inserted(conn_a.clone()));
+            .handle_event(ConnEvent::Inserted(conn_a.clone()));
         manager2
             .state
             .write()
-            .handle_event(&ConnEvent::Inserted(conn_b.clone()));
+            .handle_event(ConnEvent::Inserted(conn_b.clone()));
 
         for manager in [manager1, manager2] {
             let mut peers: Vec<PeerInfo> = manager
@@ -310,7 +299,7 @@ mod test {
     #[tokio::test]
     async fn drain_index_worker() {
         let index = IndexManager::new();
-        let event_ch = mpsc::unbounded_channel();
+        let event_ch = flume::bounded(1);
         let join = tokio::spawn(async move { index.spawn(event_ch.1).await });
         drop(event_ch.0);
         join.await.unwrap();

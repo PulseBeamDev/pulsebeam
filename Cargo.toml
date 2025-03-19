@@ -26,6 +26,7 @@ parking_lot = { version = "0.12.3", features = ["deadlock_detection"] }
 metrics = "0.24.1"
 chrono = { version = "0.4.40", features = ["serde"] }
 quick_cache = "0.6.12"
+flume = "0.11.1"
 
 [build-dependencies]
 tonic-build = { git = "https://github.com/hyperium/tonic.git", rev = "72b0fd59442d71804d4104e313ef6f140ab8f6d1" }
