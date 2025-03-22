@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let reflector = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(pulsebeam_server_foss::proto::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
-        .build_v1alpha()?;
+        .build_v1()?;
     let server = Server::spawn(token, ManagerConfig::default());
     let grpc_server = tower::ServiceBuilder::new()
         .layer(cors)
