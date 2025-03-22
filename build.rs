@@ -1,4 +1,7 @@
+use std::{env, path::PathBuf};
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let proto_source_files = ["./pulsebeam-proto/v1/signaling.proto"];
     let msg_attr = "#[derive(Hash, Eq)]";
     tonic_build::configure()
@@ -15,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[derive(serde::Serialize, serde::Deserialize, valuable::Valuable)]",
         )
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        .file_descriptor_set_path(out_dir.join("descriptor.bin"))
         .compile_protos(&proto_source_files, &["pulsebeam-proto"])
         .expect("error compiling protos");
     Ok(())

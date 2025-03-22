@@ -25,6 +25,16 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(AllowOrigin::mirror_request())
         .max_age(Duration::from_secs(86400));
     let token = CancellationToken::new();
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<SignalingServer<crate::Server>>()
+        .await;
+    // https://github.com/hyperium/tonic/discussions/1784
+    // switch to v1 after tooling supports it
+    let reflector = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(pulsebeam_server_foss::proto::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
     let server = Server::spawn(token, ManagerConfig::default());
     let grpc_server = tower::ServiceBuilder::new()
         .layer(cors)
@@ -38,6 +48,8 @@ async fn main() -> anyhow::Result<()> {
     tonic::transport::Server::builder()
         .accept_http1(true)
         .layer(tower_http::trace::TraceLayer::new_for_grpc())
+        .add_service(health_service)
+        .add_service(reflector)
         .add_service(grpc_server)
         .serve(addr)
         .await?;

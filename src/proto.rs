@@ -25,6 +25,8 @@ pub mod pulsebeam {
                 write!(f, "{}:{}:{}", self.group_id, self.peer_id, self.conn_id)
             }
         }
+
+        pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("descriptor");
     }
 }
 pub use pulsebeam::v1::*;
