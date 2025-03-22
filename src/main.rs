@@ -1,4 +1,3 @@
-use axum::routing::get;
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, level_filters::LevelFilter};
@@ -27,31 +26,21 @@ async fn main() -> anyhow::Result<()> {
         .max_age(Duration::from_secs(86400));
     let token = CancellationToken::new();
     let server = Server::spawn(token, ManagerConfig::default());
-    let query_routes = server.query_routes();
     let grpc_server = tower::ServiceBuilder::new()
+        .layer(cors)
         .layer(tonic_web::GrpcWebLayer::new())
         .into_inner()
         .named_layer(SignalingServer::new(server));
-    let grpc_routes = tonic::service::Routes::new(grpc_server)
-        .prepare()
-        .into_axum_router()
-        .layer(cors)
-        .layer(tower_http::trace::TraceLayer::new_for_grpc());
 
     let addr: SocketAddr = "[::]:3000".parse().unwrap();
     info!("Listening on {addr}");
 
-    let router = axum::Router::new()
-        .nest_service("/grpc", grpc_routes)
-        .nest_service("/query", query_routes)
-        .route("/_ping", get(ping));
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(tower_http::trace::TraceLayer::new_for_grpc())
+        .add_service(grpc_server)
+        .serve(addr)
+        .await?;
 
     Ok(())
-}
-
-async fn ping() -> &'static str {
-    "Pong\n"
 }
