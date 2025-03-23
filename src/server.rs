@@ -9,24 +9,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::field::valuable;
 use valuable::Enumerable;
 
-use crate::manager::{IndexManager, Indexer, Manager};
+use crate::manager::{IndexManager, Manager};
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 const RECV_STREAM_BUFFER: usize = 8;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
-pub struct Server<I> {
+pub struct Server {
     pub manager: Manager,
-    pub index: I,
+    pub index: IndexManager,
 }
 
 pub type MessageStream = Pin<Box<dyn Stream<Item = proto::Message> + Send>>;
 
-impl Server<IndexManager> {
-    pub fn spawn_default(token: CancellationToken, capacity: u64) -> Self {
+impl Server {
+    pub fn spawn(token: CancellationToken, capacity: u64, index: IndexManager) -> Self {
         let event_ch = mpsc::unbounded_channel();
         let manager = Manager::new(capacity, event_ch.0);
-        let index = IndexManager::default();
         {
             let index = index.clone();
             tokio::spawn(
@@ -35,9 +34,13 @@ impl Server<IndexManager> {
         }
         Self { manager, index }
     }
+
+    pub fn spawn_default(token: CancellationToken, capacity: u64) -> Self {
+        Self::spawn(token, capacity, IndexManager::default())
+    }
 }
 
-impl<I: Indexer> Server<I> {
+impl Server {
     pub fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
         let conn = self.manager.allocate(src);
         let payload_stream = ReceiverStream::new(conn);
@@ -57,7 +60,7 @@ impl<I: Indexer> Server<I> {
 pub type RecvStream = Pin<Box<dyn Stream<Item = Result<proto::RecvResp, tonic::Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<I: Indexer> Signaling for Server<I> {
+impl Signaling for Server {
     async fn prepare(
         &self,
         _req: tonic::Request<proto::PrepareReq>,
@@ -187,8 +190,6 @@ impl<I: Indexer> Signaling for Server<I> {
 mod test {
     use std::iter::zip;
 
-    use crate::manager::IndexManager;
-
     use super::*;
     use proto::*;
 
@@ -224,7 +225,7 @@ mod test {
             .await
     }
 
-    fn setup() -> (Server<IndexManager>, PeerInfo, PeerInfo) {
+    fn setup() -> (Server, PeerInfo, PeerInfo) {
         let s = Server::spawn_default(CancellationToken::new(), 65536);
         let peer1 = PeerInfo {
             group_id: String::from("default"),

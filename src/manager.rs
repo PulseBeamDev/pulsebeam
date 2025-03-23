@@ -93,65 +93,16 @@ pub enum ConnEvent {
     Removed(PeerInfo),
 }
 
-pub trait Indexer: Send + Sync + 'static {
-    fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)>;
-    fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo>;
-
-    fn select_group(&self, group_id: GroupId) -> Vec<(PeerInfo, PeerStats)> {
-        let start = PeerInfo {
-            group_id: group_id.clone(),
-            peer_id: "".to_string(),
-            conn_id: u32::MIN,
-        };
-
-        let end = PeerInfo {
-            group_id,
-            peer_id: "~".to_string(),
-            conn_id: u32::MAX,
-        };
-        self.select(start..=end)
-    }
-}
-
 #[derive(Clone)]
 pub struct IndexManager {
     state: Arc<RwLock<IndexManagerState>>,
 }
 
-impl Default for IndexManager {
-    fn default() -> Self {
-        Self::new(Box::new(|e| {
-            tracing::trace!("handle event: {:?}", e);
-        }))
-    }
-}
-
-impl Indexer for IndexManager {
-    fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)> {
-        let state = self.state.read();
-        let mut result = Vec::new();
-        for (k, v) in state.index.range(range) {
-            result.push((k.clone(), v.clone()))
-        }
-        result
-    }
-
-    fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo> {
-        let state = self.state.read();
-        // pick the youngest connection
-        let found = state
-            .index
-            .range(range)
-            .max_by_key(|(_, p)| p.inserted_at)?;
-        Some(found.0.clone())
-    }
-}
-
 impl IndexManager {
-    pub fn new(event_cb: EventCallbackFn) -> Self {
+    pub fn new(event_handler: EventHandlerSend) -> Self {
         let state = IndexManagerState {
             index: BTreeMap::new(),
-            event_cb,
+            event_handler,
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -172,11 +123,46 @@ impl IndexManager {
                 let mut state = self.state.write();
                 for event in buf[..received].iter() {
                     state.handle_event(event);
-                    (state.event_cb)(event);
+                    state.event_handler.handle_event(event);
                 }
-                buf.clear();
             }
+
+            buf.clear();
         }
+    }
+
+    pub fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)> {
+        let state = self.state.read();
+        let mut result = Vec::new();
+        for (k, v) in state.index.range(range) {
+            result.push((k.clone(), v.clone()))
+        }
+        result
+    }
+
+    pub fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo> {
+        let state = self.state.read();
+        // pick the youngest connection
+        let found = state
+            .index
+            .range(range)
+            .max_by_key(|(_, p)| p.inserted_at)?;
+        Some(found.0.clone())
+    }
+
+    pub fn select_group(&self, group_id: GroupId) -> Vec<(PeerInfo, PeerStats)> {
+        let start = PeerInfo {
+            group_id: group_id.clone(),
+            peer_id: "".to_string(),
+            conn_id: u32::MIN,
+        };
+
+        let end = PeerInfo {
+            group_id,
+            peer_id: "~".to_string(),
+            conn_id: u32::MAX,
+        };
+        self.select(start..=end)
     }
 }
 
@@ -185,15 +171,29 @@ pub struct PeerStats {
     inserted_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub type EventCallbackFn = Box<dyn Fn(&ConnEvent) + Send + Sync + 'static>;
+pub trait EventHandler {
+    fn handle_event(&self, _e: &ConnEvent) {}
+}
+
+pub type EventHandlerSend = Arc<Box<dyn EventHandler + Send + Sync>>;
+
+struct DefaultEventHandler();
+impl EventHandler for DefaultEventHandler {}
+
+impl Default for IndexManager {
+    fn default() -> Self {
+        Self::new(Arc::new(Box::new(DefaultEventHandler())))
+    }
+}
 
 pub struct IndexManagerState {
     index: BTreeMap<PeerInfo, PeerStats>,
-    event_cb: EventCallbackFn,
+    event_handler: EventHandlerSend,
 }
 
 impl IndexManagerState {
     pub fn handle_event(&mut self, e: &ConnEvent) {
+        tracing::trace!("handle event: {:?}", e);
         match e {
             // TODO: update PeerStats
             ConnEvent::Inserted(peer) => self.index.insert(
