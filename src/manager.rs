@@ -297,8 +297,8 @@ mod test {
         join.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn out_of_capacity() {
+    #[test]
+    fn out_of_capacity() {
         let manager = Manager::new(1, mpsc::unbounded_channel().0);
         let mut peer = PeerInfo {
             group_id: "default".to_string(),
