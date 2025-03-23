@@ -3,11 +3,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::fmt::format::FmtSpan;
 
+use pulsebeam_server_foss::proto::signaling_server::SignalingServer;
 use pulsebeam_server_foss::server::Server;
-use pulsebeam_server_foss::{manager::ManagerConfig, proto::signaling_server::SignalingServer};
 use std::time::Duration;
 use tonic::service::LayerExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+const CONNECTION_CAPACITY: u64 = 65536;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .register_encoded_file_descriptor_set(pulsebeam_server_foss::proto::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
-    let server = Server::spawn(token, ManagerConfig::default());
+    let server = Server::spawn(token, CONNECTION_CAPACITY);
     let grpc_server = tower::ServiceBuilder::new()
         .layer(cors)
         .layer(tonic_web::GrpcWebLayer::new())

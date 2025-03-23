@@ -6,59 +6,31 @@ use parking_lot::RwLock;
 use quick_cache::{sync::Cache, DefaultHashBuilder, Lifecycle, UnitWeighter};
 use serde::Serialize;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 pub type GroupId = String;
 pub type PeerId = String;
 
-pub struct ManagerConfig {
-    pub capacity: u64,
-}
-
-impl Default for ManagerConfig {
-    fn default() -> Self {
-        Self { capacity: 65536 }
-    }
-}
-
-pub type Index = BTreeMap<PeerInfo, PeerStats>;
-
 #[derive(Clone)]
 pub struct Manager {
-    pub cfg: Arc<ManagerConfig>,
     conns: Arc<Cache<PeerInfo, mpsc::Sender<Message>, UnitWeighter, RandomState, EvictionListener>>,
-    pub index: IndexManager,
     pub event_ch: mpsc::UnboundedSender<ConnEvent>,
 }
 
 impl Manager {
-    pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
-        let event_ch = mpsc::unbounded_channel();
-
-        let index = IndexManager::new();
-        let index_worker = index.clone();
-        tokio::spawn(async move {
-            token
-                .run_until_cancelled_owned(index_worker.spawn(event_ch.1))
-                .await
-        });
-
-        let eviction_listener = EvictionListener(event_ch.0.clone());
-
+    pub fn new(capacity: u64, event_ch: mpsc::UnboundedSender<ConnEvent>) -> Self {
+        let eviction_listener = EvictionListener(event_ch.clone());
         let conns = Cache::with(
-            cfg.capacity as usize,
-            cfg.capacity,
+            capacity as usize,
+            capacity,
             UnitWeighter,
             DefaultHashBuilder::default(),
             eviction_listener,
         );
 
         Self {
-            cfg: Arc::new(cfg),
             conns: Arc::new(conns),
-            index,
-            event_ch: event_ch.0,
+            event_ch,
         }
     }
 
@@ -126,16 +98,18 @@ pub struct IndexManager {
     state: Arc<RwLock<IndexManagerState>>,
 }
 
-impl IndexManager {
-    pub fn new() -> Self {
+impl Default for IndexManager {
+    fn default() -> Self {
         Self {
             state: Arc::new(RwLock::new(IndexManagerState {
                 index: BTreeMap::new(),
             })),
         }
     }
+}
 
-    pub async fn spawn(&self, mut event_ch: mpsc::UnboundedReceiver<ConnEvent>) {
+impl IndexManager {
+    pub async fn run_until_cancelled_owned(self, mut event_ch: mpsc::UnboundedReceiver<ConnEvent>) {
         tracing::info!("spawned index worker");
         let mut buf = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
         loop {
@@ -232,7 +206,7 @@ mod test {
             conn_id: 2913253855,
         };
 
-        let manager = IndexManager::new();
+        let manager = IndexManager::default();
         manager
             .state
             .write()
@@ -281,7 +255,7 @@ mod test {
             conn_id: 2913253855,
         };
 
-        let manager1 = IndexManager::new();
+        let manager1 = IndexManager::default();
         let manager2 = manager1.clone();
         manager1
             .state
@@ -309,17 +283,16 @@ mod test {
 
     #[tokio::test]
     async fn drain_index_worker() {
-        let index = IndexManager::new();
         let event_ch = mpsc::unbounded_channel();
-        let join = tokio::spawn(async move { index.spawn(event_ch.1).await });
+        let index = IndexManager::default();
+        let join = tokio::spawn(index.run_until_cancelled_owned(event_ch.1));
         drop(event_ch.0);
         join.await.unwrap();
     }
 
     #[tokio::test]
     async fn out_of_capacity() {
-        let token = CancellationToken::new();
-        let manager = Manager::spawn(token, ManagerConfig { capacity: 1 });
+        let manager = Manager::new(1, mpsc::unbounded_channel().0);
         let mut peer = PeerInfo {
             group_id: "default".to_string(),
             peer_id: "a".to_string(),

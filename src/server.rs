@@ -1,8 +1,5 @@
 use crate::proto::signaling_server::Signaling;
 use crate::proto::{self, PeerInfo};
-use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::Json;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -12,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::field::valuable;
 use valuable::Enumerable;
 
-use crate::manager::{GroupId, Manager, ManagerConfig, PeerStats};
+use crate::manager::{IndexManager, Manager};
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
 const RECV_STREAM_BUFFER: usize = 8;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
@@ -20,14 +17,23 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 #[derive(Clone)]
 pub struct Server {
     pub manager: Manager,
+    pub index: IndexManager,
 }
 
 pub type MessageStream = Pin<Box<dyn Stream<Item = proto::Message> + Send>>;
 
 impl Server {
-    pub fn spawn(token: CancellationToken, cfg: ManagerConfig) -> Self {
-        let manager = Manager::spawn(token, cfg);
-        Self { manager }
+    pub fn spawn(token: CancellationToken, capacity: u64) -> Self {
+        let event_ch = mpsc::unbounded_channel();
+        let manager = Manager::new(capacity, event_ch.0);
+        let index = IndexManager::default();
+        {
+            let index = index.clone();
+            tokio::spawn(
+                token.run_until_cancelled_owned(index.run_until_cancelled_owned(event_ch.1)),
+            );
+        }
+        Self { manager, index }
     }
 
     pub fn insert_recv_stream(&self, src: PeerInfo) -> MessageStream {
@@ -44,21 +50,6 @@ impl Server {
         let merged = keep_alive.merge(payload_stream);
         Box::pin(merged) as MessageStream
     }
-
-    pub fn query_routes(&self) -> axum::Router {
-        axum::Router::new()
-            .route("/{group_id}", get(handle_group_query))
-            .with_state(self.clone())
-    }
-}
-
-#[axum::debug_handler]
-async fn handle_group_query(
-    Path(group_id): Path<GroupId>,
-    State(server): State<Server>,
-) -> Json<Vec<(PeerInfo, PeerStats)>> {
-    let result = server.manager.index.select_group(group_id);
-    Json(result)
 }
 
 pub type RecvStream = Pin<Box<dyn Stream<Item = Result<proto::RecvResp, tonic::Status>> + Send>>;
@@ -127,7 +118,6 @@ impl Signaling for Server {
             end.conn_id = u32::MAX;
 
             let selected = self
-                .manager
                 .index
                 .select_one(start..=end)
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?;
@@ -231,7 +221,7 @@ mod test {
     }
 
     fn setup() -> (Server, PeerInfo, PeerInfo) {
-        let s = Server::spawn(CancellationToken::new(), ManagerConfig::default());
+        let s = Server::spawn(CancellationToken::new(), 65536);
         let peer1 = PeerInfo {
             group_id: String::from("default"),
             peer_id: String::from("peer1"),
@@ -308,14 +298,13 @@ mod test {
     #[tokio::test]
     async fn query_peers() {
         let (s, peer1, peer2) = setup();
-        let results = s.manager.index.select_group(peer1.group_id.clone());
+        let results = s.index.select_group(peer1.group_id.clone());
         assert_eq!(results.len(), 0);
 
         let _stream1 = s.insert_recv_stream(peer1.clone());
         let _stream2 = s.insert_recv_stream(peer2.clone());
         tokio::task::yield_now().await;
         let mut results: Vec<PeerInfo> = s
-            .manager
             .index
             .select_group(peer1.group_id.clone())
             .into_iter()
