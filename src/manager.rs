@@ -120,11 +120,9 @@ pub struct IndexManager {
 
 impl Default for IndexManager {
     fn default() -> Self {
-        Self {
-            state: Arc::new(RwLock::new(IndexManagerState {
-                index: BTreeMap::new(),
-            })),
-        }
+        Self::new(Box::new(|e| {
+            tracing::trace!("handle event: {:?}", e);
+        }))
     }
 }
 
@@ -150,6 +148,16 @@ impl Indexer for IndexManager {
 }
 
 impl IndexManager {
+    pub fn new(event_cb: EventCallbackFn) -> Self {
+        let state = IndexManagerState {
+            index: BTreeMap::new(),
+            event_cb,
+        };
+        Self {
+            state: Arc::new(RwLock::new(state)),
+        }
+    }
+
     pub async fn run_until_cancelled_owned(self, mut event_ch: mpsc::UnboundedReceiver<ConnEvent>) {
         tracing::info!("spawned index worker");
         let mut buf = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
@@ -164,6 +172,7 @@ impl IndexManager {
                 let mut state = self.state.write();
                 for event in buf[..received].iter() {
                     state.handle_event(event);
+                    (state.event_cb)(event);
                 }
                 buf.clear();
             }
@@ -176,13 +185,15 @@ pub struct PeerStats {
     inserted_at: chrono::DateTime<chrono::Utc>,
 }
 
+pub type EventCallbackFn = Box<dyn Fn(&ConnEvent) + Send + Sync + 'static>;
+
 pub struct IndexManagerState {
     index: BTreeMap<PeerInfo, PeerStats>,
+    event_cb: EventCallbackFn,
 }
 
 impl IndexManagerState {
     pub fn handle_event(&mut self, e: &ConnEvent) {
-        tracing::trace!("handle event: {:?}", e);
         match e {
             // TODO: update PeerStats
             ConnEvent::Inserted(peer) => self.index.insert(
