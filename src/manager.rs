@@ -93,6 +93,26 @@ pub enum ConnEvent {
     Removed(PeerInfo),
 }
 
+pub trait Indexer: Send + Sync + 'static {
+    fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)>;
+    fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo>;
+
+    fn select_group(&self, group_id: GroupId) -> Vec<(PeerInfo, PeerStats)> {
+        let start = PeerInfo {
+            group_id: group_id.clone(),
+            peer_id: "".to_string(),
+            conn_id: u32::MIN,
+        };
+
+        let end = PeerInfo {
+            group_id,
+            peer_id: "~".to_string(),
+            conn_id: u32::MAX,
+        };
+        self.select(start..=end)
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexManager {
     state: Arc<RwLock<IndexManagerState>>,
@@ -105,6 +125,27 @@ impl Default for IndexManager {
                 index: BTreeMap::new(),
             })),
         }
+    }
+}
+
+impl Indexer for IndexManager {
+    fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)> {
+        let state = self.state.read();
+        let mut result = Vec::new();
+        for (k, v) in state.index.range(range) {
+            result.push((k.clone(), v.clone()))
+        }
+        result
+    }
+
+    fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo> {
+        let state = self.state.read();
+        // pick the youngest connection
+        let found = state
+            .index
+            .range(range)
+            .max_by_key(|(_, p)| p.inserted_at)?;
+        Some(found.0.clone())
     }
 }
 
@@ -127,40 +168,6 @@ impl IndexManager {
                 buf.clear();
             }
         }
-    }
-
-    pub fn select(&self, range: impl RangeBounds<PeerInfo>) -> Vec<(PeerInfo, PeerStats)> {
-        let state = self.state.read();
-        let mut result = Vec::new();
-        for (k, v) in state.index.range(range) {
-            result.push((k.clone(), v.clone()))
-        }
-        result
-    }
-
-    pub fn select_one(&self, range: impl RangeBounds<PeerInfo>) -> Option<PeerInfo> {
-        let state = self.state.read();
-        // pick the youngest connection
-        let found = state
-            .index
-            .range(range)
-            .max_by_key(|(_, p)| p.inserted_at)?;
-        Some(found.0.clone())
-    }
-
-    pub fn select_group(&self, group_id: GroupId) -> Vec<(PeerInfo, PeerStats)> {
-        let start = PeerInfo {
-            group_id: group_id.clone(),
-            peer_id: "".to_string(),
-            conn_id: u32::MIN,
-        };
-
-        let end = PeerInfo {
-            group_id,
-            peer_id: "~".to_string(),
-            conn_id: u32::MAX,
-        };
-        self.select(start..=end)
     }
 }
 

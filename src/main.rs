@@ -3,8 +3,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::fmt::format::FmtSpan;
 
-use pulsebeam_server_foss::proto::signaling_server::SignalingServer;
 use pulsebeam_server_foss::server::Server;
+use pulsebeam_server_foss::{manager::IndexManager, proto::signaling_server::SignalingServer};
 use std::time::Duration;
 use tonic::service::LayerExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let token = CancellationToken::new();
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
-        .set_serving::<SignalingServer<crate::Server>>()
+        .set_serving::<SignalingServer<crate::Server<IndexManager>>>()
         .await;
     // https://github.com/hyperium/tonic/discussions/1784
     // switch to v1 after tooling supports it
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .register_encoded_file_descriptor_set(pulsebeam_server_foss::proto::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
-    let server = Server::spawn(token, CONNECTION_CAPACITY);
+    let server = Server::spawn_default(token, CONNECTION_CAPACITY);
     let grpc_server = tower::ServiceBuilder::new()
         .layer(cors)
         .layer(tonic_web::GrpcWebLayer::new())
