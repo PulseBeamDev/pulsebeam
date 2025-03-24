@@ -1,5 +1,6 @@
+use crate::proto::message_payload::PayloadType;
 use crate::proto::signaling_server::Signaling;
-use crate::proto::{self, PeerInfo};
+use crate::proto::{self, Join, Message, MessageHeader, MessagePayload, PeerInfo};
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -55,6 +56,25 @@ impl Server {
         let merged = keep_alive.merge(payload_stream);
         Box::pin(merged) as MessageStream
     }
+
+    pub async fn send_join(&self, src: &PeerInfo, dst: PeerInfo) -> Option<()> {
+        let conn = self.manager.get(&dst)?;
+        let msg = Message {
+            header: Some(MessageHeader {
+                src: Some(src.clone()),
+                dst: Some(dst),
+                seqnum: 0,
+                reliable: false,
+            }),
+            payload: Some(MessagePayload {
+                payload_type: Some(PayloadType::Join(Join {})),
+            }),
+        };
+        tracing::trace!("send join: {:?}", msg);
+        conn.send(msg).await.ok()?;
+
+        Some(())
+    }
 }
 
 pub type RecvStream = Pin<Box<dyn Stream<Item = Result<proto::RecvResp, tonic::Status>> + Send>>;
@@ -101,13 +121,14 @@ impl Signaling for Server {
             .ok_or(tonic::Status::invalid_argument("src is required"))?;
 
         tracing::trace!(
-            "send: {} -> {} ({:?})",
+            "send: {} -> {} ({:?})\n{:?}",
             src,
             dst,
             msg.payload
                 .as_ref()
                 .and_then(|p| p.payload_type.as_ref())
-                .map(|p| p.variant().name().to_string())
+                .map(|p| p.variant().name().to_string()),
+            msg.payload
         );
 
         if src.group_id == dst.group_id && src.peer_id == dst.peer_id {
@@ -156,7 +177,7 @@ impl Signaling for Server {
         let manager = self.manager.clone();
         let peer = src.clone();
 
-        let mut payload = self.insert_recv_stream(src);
+        let mut payload = self.insert_recv_stream(src.clone());
         let (tx, rx) = mpsc::channel(RECV_STREAM_BUFFER);
         tokio::spawn(async move {
             while let Some(item) = payload.next().await {
@@ -177,6 +198,20 @@ impl Signaling for Server {
                 "detected connection dropped, removing peer"
             );
             manager.remove(peer);
+        });
+
+        // TODO: handle back-pressure properly. Maybe make this a general message pattern?
+        // e.g. broadcast a generic message to a group.
+        let cloned = self.clone();
+        tokio::spawn(async move {
+            let peers = cloned.index.select_group(src.group_id.clone());
+            for (p, _) in peers.into_iter() {
+                if p == src {
+                    continue;
+                }
+
+                cloned.send_join(&src, p).await;
+            }
         });
 
         let output_stream = ReceiverStream::new(rx);
