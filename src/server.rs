@@ -57,7 +57,7 @@ impl Server {
         Box::pin(merged) as MessageStream
     }
 
-    pub async fn send(&self, msg: ValidatedMessage) -> anyhow::Result<()> {
+    pub async fn send_msg(&self, msg: ValidatedMessage) -> anyhow::Result<()> {
         if msg.header.src == msg.header.dst {
             tracing::warn!("detected loopback, dropping message: {:?}", msg);
             return Ok(());
@@ -128,7 +128,7 @@ impl Signaling for Server {
             msg.header.dst.conn_id = selected.conn_id;
         }
 
-        self.send(msg)
+        self.send_msg(msg)
             .await
             .map_err(|err| tonic::Status::aborted(err.to_string()))?;
 
@@ -182,7 +182,7 @@ impl Signaling for Server {
                 }
 
                 let msg = ValidatedMessage::new_join(src.clone(), p.clone());
-                if let Err(err) = cloned.send(msg).await {
+                if let Err(err) = cloned.send_msg(msg).await {
                     tracing::warn!("join is dropped: {:?}", err);
                 }
             }
