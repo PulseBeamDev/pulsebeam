@@ -1,6 +1,6 @@
-use crate::proto::message_payload::PayloadType;
 use crate::proto::signaling_server::Signaling;
-use crate::proto::{self, Join, Message, MessageHeader, MessagePayload, PeerInfo};
+use crate::proto::{self, PeerInfo, ValidatedMessage};
+use anyhow::Context;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -57,23 +57,28 @@ impl Server {
         Box::pin(merged) as MessageStream
     }
 
-    pub async fn send_join(&self, src: &PeerInfo, dst: PeerInfo) -> Option<()> {
-        let conn = self.manager.get(&dst)?;
-        let msg = Message {
-            header: Some(MessageHeader {
-                src: Some(src.clone()),
-                dst: Some(dst),
-                seqnum: 0,
-                reliable: false,
-            }),
-            payload: Some(MessagePayload {
-                payload_type: Some(PayloadType::Join(Join {})),
-            }),
-        };
-        tracing::trace!("send join: {:?}", msg);
-        conn.send(msg).await.ok()?;
+    pub async fn send(&self, msg: ValidatedMessage) -> anyhow::Result<()> {
+        if msg.header.src == msg.header.dst {
+            tracing::warn!("detected loopback, dropping message: {:?}", msg);
+            return Ok(());
+        }
 
-        Some(())
+        tracing::trace!(
+            "send: {} -> {} ({:?})\n{:?}",
+            msg.header.src,
+            msg.header.dst,
+            msg.payload
+                .payload_type
+                .as_ref()
+                .map(|p| p.variant().name().to_string()),
+            msg.payload
+        );
+        let conn = self
+            .manager
+            .get(&msg.header.dst)
+            .context("conn is staled")?;
+        conn.send(msg.into()).await?;
+        Ok(())
     }
 }
 
@@ -103,61 +108,27 @@ impl Signaling for Server {
         &self,
         req: tonic::Request<proto::SendReq>,
     ) -> Result<tonic::Response<proto::SendResp>, tonic::Status> {
-        let mut msg = req
+        let msg = req
             .into_inner()
             .msg
             .ok_or(tonic::Status::invalid_argument("msg is required"))?;
-        let hdr = msg
-            .header
-            .as_mut()
-            .ok_or(tonic::Status::invalid_argument("header is required"))?;
-        let dst = hdr
-            .dst
-            .as_mut()
-            .ok_or(tonic::Status::invalid_argument("dst is required"))?;
-        let src = hdr
-            .src
-            .as_ref()
-            .ok_or(tonic::Status::invalid_argument("src is required"))?;
-
-        tracing::trace!(
-            "send: {} -> {} ({:?})\n{:?}",
-            src,
-            dst,
-            msg.payload
-                .as_ref()
-                .and_then(|p| p.payload_type.as_ref())
-                .map(|p| p.variant().name().to_string()),
-            msg.payload
-        );
-
-        if src.group_id == dst.group_id && src.peer_id == dst.peer_id {
-            return Err(tonic::Status::invalid_argument(
-                "detected a loopback, dst must be different than src",
-            ));
-        }
+        let mut msg = ValidatedMessage::try_from(msg)
+            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
 
         // TODO: use a different RPC for connecting?
-        let peer = if dst.conn_id == RESERVED_CONN_ID_DISCOVERY {
-            let start = dst.clone();
-            let mut end = dst.clone();
+        if msg.header.dst.conn_id == RESERVED_CONN_ID_DISCOVERY {
+            let start = msg.header.dst.clone();
+            let mut end = msg.header.dst.clone();
             end.conn_id = u32::MAX;
 
             let selected = self
                 .index
                 .select_one(start..=end)
                 .ok_or(tonic::Status::not_found("peer_id is not available"))?;
-            dst.conn_id = selected.conn_id;
-            self.manager
-                .get(&selected)
-                .ok_or(tonic::Status::not_found("peer_id is not available"))?
-        } else {
-            self.manager
-                .get(dst)
-                .ok_or(tonic::Status::not_found("peer_id is not available"))?
-        };
+            msg.header.dst.conn_id = selected.conn_id;
+        }
 
-        peer.send(msg)
+        self.send(msg)
             .await
             .map_err(|err| tonic::Status::aborted(err.to_string()))?;
 
@@ -210,7 +181,10 @@ impl Signaling for Server {
                     continue;
                 }
 
-                cloned.send_join(&src, p).await;
+                let msg = ValidatedMessage::new_join(src.clone(), p.clone());
+                if let Err(err) = cloned.send(msg).await {
+                    tracing::warn!("join is dropped: {:?}", err);
+                }
             }
         });
 
