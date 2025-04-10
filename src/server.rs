@@ -7,8 +7,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
-use tracing::field::valuable;
-use valuable::Enumerable;
 
 use crate::manager::{IndexManager, Manager};
 const RESERVED_CONN_ID_DISCOVERY: u32 = 0;
@@ -67,10 +65,7 @@ impl Server {
             "send: {} -> {} ({:?})\n{:?}",
             msg.header.src,
             msg.header.dst,
-            msg.payload
-                .payload_type
-                .as_ref()
-                .map(|p| p.variant().name().to_string()),
+            msg.payload.payload_type.as_ref(),
             msg.payload
         );
         let conn = self
@@ -96,11 +91,18 @@ impl Signaling for Server {
         // TURN is required in some network condition.
         // Public TURN and STUN services are UNRELIABLE.
         Ok(tonic::Response::new(proto::PrepareResp {
-            ice_servers: vec![proto::IceServer {
-                urls: vec![String::from("stun:stun.l.google.com:19302")],
-                username: None,
-                credential: None,
-            }],
+            ice_servers: vec![
+                proto::IceServer {
+                    urls: vec![String::from("stun:stun.l.google.com:19302")],
+                    username: None,
+                    credential: None,
+                },
+                proto::IceServer {
+                    username: Some("user1".to_string()),
+                    credential: Some("test".to_string()),
+                    urls: vec![String::from("turn:178.156.172.180:3478?transport=udp")],
+                },
+            ],
         }))
     }
 
@@ -164,10 +166,7 @@ impl Signaling for Server {
                 }
             }
 
-            tracing::info!(
-                peer = valuable(&peer),
-                "detected connection dropped, removing peer"
-            );
+            tracing::info!("detected connection dropped, removing peer: {:?}", peer);
             manager.remove(peer);
         });
 
@@ -192,6 +191,16 @@ impl Signaling for Server {
         Ok(tonic::Response::new(
             Box::pin(output_stream) as Self::RecvStream
         ))
+    }
+
+    async fn analytics_report(
+        &self,
+        _request: tonic::Request<proto::pulsebeam::v1::AnalyticsReportReq>,
+    ) -> std::result::Result<
+        tonic::Response<proto::pulsebeam::v1::AnalyticsReportResp>,
+        tonic::Status,
+    > {
+        Ok(tonic::Response::new(proto::AnalyticsReportResp {}))
     }
 }
 

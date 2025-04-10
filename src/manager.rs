@@ -78,6 +78,7 @@ impl Lifecycle<PeerInfo, mpsc::Sender<Message>> for EvictionListener {
         key: PeerInfo,
         _val: mpsc::Sender<Message>,
     ) {
+        tracing::trace!("remove {} on_evict", key);
         if let Err(err) = self.0.send(ConnEvent::Removed(key)) {
             tracing::warn!(
                 "unexpected event_ch ended prematurely on eviction: {:?}",
