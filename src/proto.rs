@@ -105,9 +105,35 @@ pub mod pulsebeam {
         }
 
         #[derive(Debug)]
+        pub struct ValidatedAnalyticsTags {
+            pub src: PeerInfo,
+            pub dst: PeerInfo,
+        }
+
+        impl TryFrom<AnalyticsTags> for ValidatedAnalyticsTags {
+            type Error = anyhow::Error;
+
+            fn try_from(value: AnalyticsTags) -> Result<Self, Self::Error> {
+                let src = value.src.context("event tags src is required")?;
+                let dst = value.dst.context("event tags dst is required")?;
+
+                Ok(Self { src, dst })
+            }
+        }
+
+        impl From<ValidatedAnalyticsTags> for AnalyticsTags {
+            fn from(value: ValidatedAnalyticsTags) -> Self {
+                Self {
+                    src: Some(value.src),
+                    dst: Some(value.dst),
+                }
+            }
+        }
+
+        #[derive(Debug)]
         pub struct ValidatedAnalyticsEvent {
             pub timestamp: prost_wkt_types::Timestamp,
-            pub tags: AnalyticsTags,
+            pub tags: ValidatedAnalyticsTags,
             pub metrics: AnalyticsMetrics,
         }
 
@@ -116,7 +142,9 @@ pub mod pulsebeam {
 
             fn try_from(value: AnalyticsEvent) -> Result<Self, Self::Error> {
                 let timestamp = value.timestamp.context("event timestamp is required")?;
-                let tags = value.tags.context("event tags is required")?;
+                let tags = ValidatedAnalyticsTags::try_from(
+                    value.tags.context("event tags is required")?,
+                )?;
                 let metrics = value.metrics.context("event metrics is required")?;
                 Ok(Self {
                     timestamp,
@@ -130,7 +158,7 @@ pub mod pulsebeam {
             fn from(value: ValidatedAnalyticsEvent) -> Self {
                 Self {
                     timestamp: Some(value.timestamp),
-                    tags: Some(value.tags),
+                    tags: Some(value.tags.into()),
                     metrics: Some(value.metrics),
                 }
             }
