@@ -103,6 +103,38 @@ pub mod pulsebeam {
                 }
             }
         }
+
+        #[derive(Debug)]
+        pub struct ValidatedAnalyticsEvent {
+            pub timestamp: prost_wkt_types::Timestamp,
+            pub tags: AnalyticsTags,
+            pub metrics: AnalyticsMetrics,
+        }
+
+        impl TryFrom<AnalyticsEvent> for ValidatedAnalyticsEvent {
+            type Error = anyhow::Error;
+
+            fn try_from(value: AnalyticsEvent) -> Result<Self, Self::Error> {
+                let timestamp = value.timestamp.context("event timestamp is required")?;
+                let tags = value.tags.context("event tags is required")?;
+                let metrics = value.metrics.context("event metrics is required")?;
+                Ok(Self {
+                    timestamp,
+                    tags,
+                    metrics,
+                })
+            }
+        }
+
+        impl From<ValidatedAnalyticsEvent> for AnalyticsEvent {
+            fn from(value: ValidatedAnalyticsEvent) -> Self {
+                Self {
+                    timestamp: Some(value.timestamp),
+                    tags: Some(value.tags),
+                    metrics: Some(value.metrics),
+                }
+            }
+        }
     }
 }
 pub use pulsebeam::v1::*;
