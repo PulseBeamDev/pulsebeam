@@ -13,9 +13,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute("MessagePayload.payload_type", msg_attr)
         .type_attribute("DataChannel.payload", msg_attr)
         .type_attribute("Signal.data", msg_attr)
-        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(
+            ".",
+            "#[derive(serde::Serialize, serde::Deserialize, valuable::Valuable)]",
+        )
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
-        .extern_path(".google.protobuf.Timestamp", "::prost_wkt_types::Timestamp")
         .file_descriptor_set_path(out_dir.join("descriptor.bin"))
         .compile_protos(&proto_source_files, &["pulsebeam-proto"])
         .expect("error compiling protos");

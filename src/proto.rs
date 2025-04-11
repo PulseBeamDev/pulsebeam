@@ -1,6 +1,7 @@
 pub mod pulsebeam {
     pub mod v1 {
         use anyhow::Context;
+        use valuable::Valuable;
         tonic::include_proto!("pulsebeam.v1");
 
         impl Ord for PeerInfo {
@@ -104,7 +105,7 @@ pub mod pulsebeam {
             }
         }
 
-        #[derive(Debug)]
+        #[derive(Debug, Valuable)]
         pub struct ValidatedAnalyticsTags {
             pub src: PeerInfo,
             pub dst: PeerInfo,
@@ -130,9 +131,9 @@ pub mod pulsebeam {
             }
         }
 
-        #[derive(Debug)]
+        #[derive(Debug, Valuable)]
         pub struct ValidatedAnalyticsEvent {
-            pub timestamp: prost_wkt_types::Timestamp,
+            pub timestamp_us: i64,
             pub tags: ValidatedAnalyticsTags,
             pub metrics: AnalyticsMetrics,
         }
@@ -141,13 +142,12 @@ pub mod pulsebeam {
             type Error = anyhow::Error;
 
             fn try_from(value: AnalyticsEvent) -> Result<Self, Self::Error> {
-                let timestamp = value.timestamp.context("event timestamp is required")?;
                 let tags = ValidatedAnalyticsTags::try_from(
                     value.tags.context("event tags is required")?,
                 )?;
                 let metrics = value.metrics.context("event metrics is required")?;
                 Ok(Self {
-                    timestamp,
+                    timestamp_us: value.timestamp_us,
                     tags,
                     metrics,
                 })
@@ -157,7 +157,7 @@ pub mod pulsebeam {
         impl From<ValidatedAnalyticsEvent> for AnalyticsEvent {
             fn from(value: ValidatedAnalyticsEvent) -> Self {
                 Self {
-                    timestamp: Some(value.timestamp),
+                    timestamp_us: value.timestamp_us,
                     tags: Some(value.tags.into()),
                     metrics: Some(value.metrics),
                 }
