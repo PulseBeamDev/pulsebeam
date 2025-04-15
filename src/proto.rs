@@ -132,15 +132,15 @@ pub mod pulsebeam {
         }
 
         #[derive(Debug, Valuable)]
-        pub struct ValidatedAnalyticsEvent {
+        pub struct ValidatedAnalyticsReport {
             pub tags: ValidatedAnalyticsTags,
             pub metrics: Vec<AnalyticsMetrics>,
         }
 
-        impl TryFrom<AnalyticsEvent> for ValidatedAnalyticsEvent {
+        impl TryFrom<AnalyticsReport> for ValidatedAnalyticsReport {
             type Error = anyhow::Error;
 
-            fn try_from(value: AnalyticsEvent) -> Result<Self, Self::Error> {
+            fn try_from(value: AnalyticsReport) -> Result<Self, Self::Error> {
                 let tags = ValidatedAnalyticsTags::try_from(
                     value.tags.context("event tags is required")?,
                 )?;
@@ -151,8 +151,8 @@ pub mod pulsebeam {
             }
         }
 
-        impl From<ValidatedAnalyticsEvent> for AnalyticsEvent {
-            fn from(value: ValidatedAnalyticsEvent) -> Self {
+        impl From<ValidatedAnalyticsReport> for AnalyticsReport {
+            fn from(value: ValidatedAnalyticsReport) -> Self {
                 Self {
                     tags: Some(value.tags.into()),
                     metrics: value.metrics,
