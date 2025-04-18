@@ -1,3 +1,0 @@
-[submodule "pulsebeam-proto"]
-	path = pulsebeam-proto
-	url = https://github.com/PulseBeamDev/pulsebeam-proto.git
