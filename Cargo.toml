@@ -4,18 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-str0m = "0.7"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-rand = "0.8"
-bytes = "1"
 anyhow = "1"
-thiserror = "1"
-clap = { version = "4", features = ["derive"] }
-futures = "0.3"
-uuid = { version = "1", features = ["v4"] }
-rstest = "0.18"
-parking_lot = "0.12"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+config = { version = "0.15", features = ["toml"] }
+rand = "0.9"
 serde = { version = "1", features = ["derive"]}
-toml = "0.8" 
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# SFU Specific
+str0m = "0.8.0"
+
+[dev-dependencies]
