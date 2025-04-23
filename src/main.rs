@@ -1,4 +1,3 @@
-use pulsebeam::ingress::IngressHandle;
 use tracing::level_filters::LevelFilter;
 
 #[tokio::main]
@@ -10,9 +9,6 @@ async fn main() {
         .compact()
         .with_env_filter(env_filter)
         .init();
-
-    let ingress = IngressHandle::spawn();
-    ingress.ping().unwrap();
 
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 }

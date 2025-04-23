@@ -16,8 +16,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# SFU Specific
 str0m = "0.8.0"
+axum = { version = "0.8.3", features = ["macros"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
 
 [dev-dependencies]
