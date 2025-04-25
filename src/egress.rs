@@ -35,7 +35,7 @@ impl EgressActor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EgressHandle {
     sender: mpsc::Sender<EgressMessage>,
 }

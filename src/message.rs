@@ -173,8 +173,6 @@ impl AsRef<str> for PeerId {
 
 #[cfg(test)]
 mod tests {
-    use str0m::change::SdpOffer;
-
     use super::*;
 
     #[test]

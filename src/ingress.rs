@@ -51,7 +51,7 @@ impl IngressActor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IngressHandle {
     sender: mpsc::Sender<IngressMessage>,
 }
