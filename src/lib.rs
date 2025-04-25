@@ -1,4 +1,5 @@
 pub mod egress;
+pub mod group;
 pub mod ice;
 pub mod ingress;
 pub mod manager;

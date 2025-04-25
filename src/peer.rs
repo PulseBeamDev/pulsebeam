@@ -17,12 +17,6 @@ pub enum PeerMessage {
     UdpPacket(message::EgressUDPPacket),
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
-pub struct PeerInfo {
-    group_id: GroupId,
-    peer_id: PeerId,
-}
-
 #[derive(Debug)]
 pub struct PeerActor {
     rtc: str0m::Rtc,

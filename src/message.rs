@@ -6,6 +6,18 @@ use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Debug)]
+pub struct PeerOffer {
+    info: PeerInfo,
+    offer: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
+pub struct PeerInfo {
+    group_id: GroupId,
+    peer_id: PeerId,
+}
+
+#[derive(Debug)]
 pub struct IngressUDPPacket {
     pub raw: Bytes,
     pub src: SocketAddr,
