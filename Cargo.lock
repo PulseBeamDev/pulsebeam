@@ -1037,6 +1037,7 @@ dependencies = [
  "config",
  "rand 0.9.1",
  "serde",
+ "serde_json",
  "str0m",
  "thiserror 2.0.12",
  "tokio",

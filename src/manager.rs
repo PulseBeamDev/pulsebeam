@@ -1,26 +1,28 @@
+use std::time::Duration;
+
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, oneshot},
-};
+use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
     egress::EgressHandle,
     ingress::IngressHandle,
-    peer::{PeerError, PeerHandle},
+    peer::{PeerActor, PeerError, PeerInfo},
 };
 
 #[derive(thiserror::Error, Debug)]
 pub enum ManagerError {
     #[error(transparent)]
     Peer(PeerError),
+
+    #[error("server is busy, please try again later.")]
+    ServiceUnavailable,
 
     #[error("unknown error: {0}")]
     Unknown(String),
@@ -31,6 +33,7 @@ impl IntoResponse for ManagerError {
         let status = match self {
             ManagerError::Peer(_) => StatusCode::UNAUTHORIZED,
             ManagerError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ManagerError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, self.to_string()).into_response()
     }
@@ -38,7 +41,7 @@ impl IntoResponse for ManagerError {
 
 #[derive(Debug)]
 pub enum ManagerMessage {
-    Offer(String, oneshot::Sender<Result<String, PeerError>>),
+    AddPeer(PeerActor),
 }
 
 pub struct ManagerActor {
@@ -56,14 +59,7 @@ impl ManagerActor {
 
     fn handle_message(&self, msg: ManagerMessage) {
         match msg {
-            ManagerMessage::Offer(offer, resp_tx) => {
-                let res = PeerHandle::spawn(offer);
-                let answer = match res {
-                    Ok((handle, answer)) => Ok(answer),
-                    Err(err) => Err(err),
-                };
-                let _ = resp_tx.send(answer);
-            }
+            ManagerMessage::AddPeer(peer) => {}
         }
     }
 }
@@ -80,26 +76,27 @@ impl ManagerHandle {
         tokio::spawn(actor.run(receiver));
         handle
     }
+
+    pub async fn add_peer(&self, peer: PeerActor) -> Result<(), ManagerError> {
+        self.sender
+            .send_timeout(ManagerMessage::AddPeer(peer), Duration::from_millis(100))
+            .await
+            .map_err(|_| ManagerError::ServiceUnavailable)
+    }
 }
 
 #[axum::debug_handler]
 async fn spawn_peer(
+    Query(peer): Query<PeerInfo>,
     State(handle): State<ManagerHandle>,
     TypedHeader(content_type): TypedHeader<ContentType>,
     offer: String,
 ) -> Result<String, ManagerError> {
     // TODO: validate content_type = "application/sdp"
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    handle
-        .sender
-        .send(ManagerMessage::Offer(offer, resp_tx))
-        .await
-        .map_err(|err| ManagerError::Unknown(err.to_string()))?;
-    let answer = resp_rx
-        .await
-        .map_err(|err| ManagerError::Unknown(err.to_string()))?
-        .map_err(ManagerError::Peer)?;
+    let (peer, answer) = PeerActor::offer(peer, &offer).map_err(ManagerError::Peer)?;
+    handle.add_peer(peer).await?;
+
     Ok(answer)
 }
 
