@@ -1,26 +1,16 @@
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 
-use axum::{
-    Router,
-    extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-};
-use axum_extra::{TypedHeader, headers::ContentType};
 use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
     egress::EgressHandle,
+    group::GroupHandle,
     ingress::IngressHandle,
-    peer::{PeerActor, PeerError, PeerInfo},
+    message::{GroupId, JoinRequest},
 };
 
 #[derive(thiserror::Error, Debug)]
 pub enum ManagerError {
-    #[error(transparent)]
-    Peer(PeerError),
-
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
 
@@ -28,38 +18,36 @@ pub enum ManagerError {
     Unknown(String),
 }
 
-impl IntoResponse for ManagerError {
-    fn into_response(self) -> Response {
-        let status = match self {
-            ManagerError::Peer(_) => StatusCode::UNAUTHORIZED,
-            ManagerError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ManagerError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        (status, self.to_string()).into_response()
-    }
-}
-
 #[derive(Debug)]
 pub enum ManagerMessage {
-    AddPeer(PeerActor),
+    Join(JoinRequest),
 }
 
 pub struct ManagerActor {
     pub ingress: IngressHandle,
     pub egress: EgressHandle,
     pub listener: TcpListener,
+    pub groups: HashMap<Arc<GroupId>, GroupHandle>,
 }
 
 impl ManagerActor {
-    async fn run(self, mut receiver: mpsc::Receiver<ManagerMessage>) {
+    async fn run(mut self, mut receiver: mpsc::Receiver<ManagerMessage>) {
         while let Some(msg) = receiver.recv().await {
             self.handle_message(msg);
         }
     }
 
-    fn handle_message(&self, msg: ManagerMessage) {
+    fn handle_message(&mut self, msg: ManagerMessage) {
         match msg {
-            ManagerMessage::AddPeer(peer) => {}
+            ManagerMessage::Join(req) => {
+                if let Some(group) = self.groups.get(&req.group_id) {
+                    group.join(req);
+                } else {
+                    let handle = GroupHandle::spawn(req.group_id.clone());
+                    self.groups.insert(req.group_id.clone(), handle.clone());
+                    handle.join(req);
+                };
+            }
         }
     }
 }
@@ -77,29 +65,9 @@ impl ManagerHandle {
         handle
     }
 
-    pub async fn add_peer(&self, peer: PeerActor) -> Result<(), ManagerError> {
+    pub fn join(&self, req: JoinRequest) -> Result<(), ManagerError> {
         self.sender
-            .send_timeout(ManagerMessage::AddPeer(peer), Duration::from_millis(100))
-            .await
+            .try_send(ManagerMessage::Join(req))
             .map_err(|_| ManagerError::ServiceUnavailable)
     }
-}
-
-#[axum::debug_handler]
-async fn spawn_peer(
-    Query(peer): Query<PeerInfo>,
-    State(handle): State<ManagerHandle>,
-    TypedHeader(content_type): TypedHeader<ContentType>,
-    offer: String,
-) -> Result<String, ManagerError> {
-    // TODO: validate content_type = "application/sdp"
-
-    let (peer, answer) = PeerActor::offer(peer, &offer).map_err(ManagerError::Peer)?;
-    handle.add_peer(peer).await?;
-
-    Ok(answer)
-}
-
-pub fn router(handle: ManagerHandle) -> Router {
-    Router::new().route("/", get(spawn_peer)).with_state(handle)
 }

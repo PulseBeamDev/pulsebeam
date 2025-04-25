@@ -1,7 +1,16 @@
-use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
+use std::sync::Arc;
+
+use str0m::{
+    Candidate, Rtc, RtcError,
+    change::{SdpAnswer, SdpOffer},
+    error::SdpError,
+};
 use tokio::sync::mpsc::{self, error::TrySendError};
 
-use crate::message::{self, GroupId, PeerId};
+use crate::{
+    group::GroupHandle,
+    message::{self, PeerId},
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum PeerError {
@@ -19,13 +28,17 @@ pub enum PeerMessage {
 
 #[derive(Debug)]
 pub struct PeerActor {
+    group: GroupHandle,
+    peer_id: Arc<PeerId>,
     rtc: str0m::Rtc,
-    pub info: PeerInfo,
 }
 
 impl PeerActor {
-    pub fn offer(info: PeerInfo, sdp: &str) -> Result<(Self, String), PeerError> {
-        let offer = SdpOffer::from_sdp_string(sdp).map_err(PeerError::InvalidOfferFormat)?;
+    pub fn new(
+        group: GroupHandle,
+        peer_id: Arc<PeerId>,
+        offer: SdpOffer,
+    ) -> Result<(Self, SdpAnswer), PeerError> {
         let mut rtc = Rtc::builder()
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
@@ -42,16 +55,22 @@ impl PeerActor {
             .accept_offer(offer)
             .map_err(PeerError::OfferRejected)?;
 
-        let actor = PeerActor { rtc, info };
-        Ok((actor, answer.to_sdp_string()))
+        let actor = PeerActor {
+            group,
+            rtc,
+            peer_id,
+        };
+        Ok((actor, answer))
     }
 
     async fn run(self, mut receiver: mpsc::Receiver<PeerMessage>) {
+        // TODO: notify ingress to add self to the routing table
+
         while let Some(msg) = receiver.recv().await {}
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PeerHandle {
     sender: mpsc::Sender<PeerMessage>,
 }

@@ -1,20 +1,31 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::{fmt, sync::Arc};
 use thiserror::Error;
+use tokio::sync::oneshot;
+
+pub use str0m::change::{SdpAnswer, SdpOffer};
+pub use str0m::error::SdpError;
+
+use crate::group::GroupError;
 
 #[derive(Debug)]
-pub struct PeerOffer {
-    info: PeerInfo,
-    offer: String,
+pub struct JoinRequest {
+    pub group_id: Arc<GroupId>,
+    pub peer_id: Arc<PeerId>,
+    pub offer: SdpOffer,
+    pub reply: oneshot::Sender<Result<SdpAnswer, JoinError>>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
-pub struct PeerInfo {
-    group_id: GroupId,
-    peer_id: PeerId,
+#[derive(thiserror::Error, Debug)]
+pub enum JoinError {
+    #[error("group error")]
+    Group(#[from] GroupError),
+
+    #[error("unknown error: {0}")]
+    Unknown(String),
 }
 
 #[derive(Debug)]
@@ -162,6 +173,8 @@ impl AsRef<str> for PeerId {
 
 #[cfg(test)]
 mod tests {
+    use str0m::change::SdpOffer;
+
     use super::*;
 
     #[test]
