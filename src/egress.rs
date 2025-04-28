@@ -17,10 +17,6 @@ pub struct EgressActor {
 }
 
 impl EgressActor {
-    pub fn new(socket: Arc<UdpSocket>) -> Self {
-        Self { socket }
-    }
-
     async fn run(self, mut receiver: mpsc::Receiver<EgressMessage>) {
         while let Some(msg) = receiver.recv().await {
             match msg {
@@ -41,8 +37,9 @@ pub struct EgressHandle {
 }
 
 impl EgressHandle {
-    pub fn spawn(actor: EgressActor) -> Self {
+    pub fn spawn(socket: Arc<UdpSocket>) -> Self {
         let (sender, receiver) = mpsc::channel(8);
+        let actor = EgressActor { socket };
         tokio::spawn(actor.run(receiver));
         Self { sender }
     }

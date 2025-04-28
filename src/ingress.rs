@@ -6,6 +6,8 @@ use tokio::{
     sync::mpsc::{self, error::TrySendError},
 };
 
+use crate::peer::PeerHandle;
+
 #[derive(Debug)]
 pub enum IngressMessage {
     Ping,
@@ -13,13 +15,10 @@ pub enum IngressMessage {
 
 pub struct IngressActor {
     socket: Arc<UdpSocket>,
+    conns: dashmap::ReadOnlyView<String, PeerHandle>,
 }
 
 impl IngressActor {
-    fn new(socket: Arc<UdpSocket>) -> Self {
-        Self { socket }
-    }
-
     fn handle_message(&mut self, msg: IngressMessage) {
         tracing::info!("received: {:?}", msg);
     }
@@ -57,8 +56,9 @@ pub struct IngressHandle {
 }
 
 impl IngressHandle {
-    pub fn spawn(actor: IngressActor) -> Self {
+    pub fn spawn(socket: Arc<UdpSocket>, conns: dashmap::ReadOnlyView<String, PeerHandle>) -> Self {
         let (sender, receiver) = mpsc::channel(8);
+        let actor = IngressActor { socket, conns };
         tokio::spawn(actor.run(receiver));
         Self { sender }
     }

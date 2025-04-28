@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use crate::{
     egress::EgressHandle,
@@ -7,7 +7,8 @@ use crate::{
     peer::PeerHandle,
 };
 use dashmap::DashMap;
-use str0m::{Rtc, RtcError, change::SdpOffer, error::SdpError};
+use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
+use tokio::net::UdpSocket;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -19,6 +20,9 @@ pub enum ControllerError {
 
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
+
+    #[error("IO error: {0}")]
+    IOError(#[from] io::Error),
 
     #[error("unknown error: {0}")]
     Unknown(String),
@@ -32,9 +36,34 @@ pub struct ControllerState {
     egress: EgressHandle,
     conns: DashMap<String, PeerHandle>,
     groups: DashMap<Arc<GroupId>, Group>,
+
+    socket: Arc<UdpSocket>,
+    local_addr: SocketAddr,
 }
 
 impl Controller {
+    pub async fn spawn() -> Result<Self, ControllerError> {
+        // TODO: replace this with a config
+        let socket = UdpSocket::bind("0.0.0.0:3478").await?;
+        let socket = Arc::new(socket);
+        let local_addr = socket.local_addr()?;
+
+        let conns = DashMap::new();
+        let ingress = IngressHandle::spawn(socket.clone(), conns.clone().into_read_only());
+        let egress = EgressHandle::spawn(socket.clone());
+
+        let controller_state = ControllerState {
+            ingress,
+            egress,
+            conns,
+            groups: DashMap::new(),
+            socket,
+            local_addr,
+        };
+        let controller = Self(Arc::new(controller_state));
+        Ok(controller)
+    }
+
     pub fn allocate(
         &self,
         group_id: GroupId,
@@ -49,8 +78,8 @@ impl Controller {
             .build();
 
         // Add the shared UDP socket as a host candidate
-        // let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-        // rtc.add_local_candidate(candidate);
+        let candidate = Candidate::host(self.0.local_addr, "udp").expect("a host candidate");
+        rtc.add_local_candidate(candidate);
 
         // Create an SDP Answer.
         let answer = rtc
