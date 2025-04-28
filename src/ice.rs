@@ -158,6 +158,30 @@ pub fn parse_stun_username_str(data: &[u8]) -> Option<&str> {
         .and_then(|slice| std::str::from_utf8(slice).ok())
 }
 
+/// Similar to `parse_stun_username_str`, but it only takes the remote ufrag.
+///
+/// https://datatracker.ietf.org/doc/html/rfc8445#section-7.2.2
+///
+/// Stun binding from L to R. The username is formatted as "<R's ufrag>:<L's ufrag>"
+///
+/// Returns `Some(&str)` if the USERNAME attribute is found, returns <R's ufrag>
+#[inline]
+pub fn parse_stun_remote_ufrag(data: &[u8]) -> Option<&str> {
+    find_stun_username_slice(data)
+        .and_then(|slice| first_token(slice, b':'))
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+}
+
+#[inline]
+fn first_token(input: &[u8], delimiter: u8) -> Option<&[u8]> {
+    for (i, &b) in input.iter().enumerate() {
+        if b == delimiter {
+            return Some(&input[..i]);
+        }
+    }
+    None
+}
+
 // --- Robust Test Suite ---
 #[cfg(test)]
 mod tests {

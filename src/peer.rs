@@ -19,7 +19,7 @@ pub enum PeerError {
 
 #[derive(Debug)]
 pub enum PeerMessage {
-    UdpPacket(message::EgressUDPPacket),
+    UdpPacket(message::IngressUDPPacket),
 }
 
 pub struct PeerActor {
@@ -53,10 +53,7 @@ impl PeerHandle {
         Self { sender }
     }
 
-    pub async fn send(
-        &self,
-        msg: message::EgressUDPPacket,
-    ) -> Result<(), TrySendError<PeerMessage>> {
+    pub fn forward(&self, msg: message::IngressUDPPacket) -> Result<(), TrySendError<PeerMessage>> {
         self.sender.try_send(PeerMessage::UdpPacket(msg))
     }
 }
