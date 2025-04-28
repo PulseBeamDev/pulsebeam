@@ -1,4 +1,8 @@
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use crate::{
     egress::EgressHandle,
@@ -12,6 +16,25 @@ use tokio::{
     net::UdpSocket,
     sync::{Mutex, mpsc},
 };
+
+use systemstat::{Platform, System};
+
+pub fn select_host_address() -> IpAddr {
+    let system = System::new();
+    let networks = system.networks().unwrap();
+
+    for net in networks.values() {
+        for n in &net.addrs {
+            if let systemstat::IpAddr::V4(v) = n.addr {
+                if !v.is_loopback() && !v.is_link_local() && !v.is_broadcast() {
+                    return IpAddr::V4(v);
+                }
+            }
+        }
+    }
+
+    panic!("Found no usable network interface");
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -57,14 +80,16 @@ impl Controller {
         socket.set_reuse_address(true)?;
         socket.set_send_buffer_size(4 * 1024 * 1024)?;
         socket.set_recv_buffer_size(4 * 1024 * 1024)?;
-        let local_addr: SocketAddr = "0.0.0.0:3478".parse().expect("valid bind addr");
+
+        let ip = select_host_address();
+        let local_addr: SocketAddr = format!("{ip}:3478").parse().expect("valid bind addr");
         socket.bind(&local_addr.into())?;
 
         let socket = tokio::net::UdpSocket::from_std(socket.into())?;
         let socket = Arc::new(socket);
 
         let conns = DashMap::new();
-        let ingress = Ingress::new(socket.clone(), conns.clone().into_read_only());
+        let ingress = Ingress::new(local_addr, socket.clone(), conns.clone().into_read_only());
         let egress = EgressHandle::spawn(socket.clone());
 
         tokio::spawn(ingress.clone().run());
@@ -117,6 +142,10 @@ impl Controller {
 
         Ok(answer.to_sdp_string())
     }
+
+    pub fn egress(&self) -> EgressHandle {
+        self.0.egress.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -160,7 +189,7 @@ impl Group {
         }
 
         let peer_id = Arc::new(peer_id);
-        PeerHandle::spawn(self.clone(), peer_id, rtc)
+        PeerHandle::spawn(self.0.controller.egress(), self.clone(), peer_id, rtc)
     }
 
     pub fn propagate(&self, mut msg: RouterMessage) {

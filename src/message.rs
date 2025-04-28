@@ -10,9 +10,10 @@ pub use str0m::error::SdpError;
 pub use str0m::{Rtc, RtcError};
 
 #[derive(Debug)]
-pub struct IngressUDPPacket {
+pub struct UDPPacket {
     pub raw: Bytes,
     pub src: SocketAddr,
+    pub dst: SocketAddr,
 }
 
 #[derive(Debug)]

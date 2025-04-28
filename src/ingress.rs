@@ -3,20 +3,26 @@ use std::{net::SocketAddr, sync::Arc};
 use bytes::BytesMut;
 use tokio::net::UdpSocket;
 
-use crate::{ice, message::IngressUDPPacket, peer::PeerHandle};
+use crate::{ice, message::UDPPacket, peer::PeerHandle};
 
 #[derive(Clone)]
 pub struct Ingress(Arc<IngressState>);
 
 pub struct IngressState {
+    local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     conns: dashmap::ReadOnlyView<String, PeerHandle>,
     mapping: dashmap::DashMap<SocketAddr, PeerHandle>,
 }
 
 impl Ingress {
-    pub fn new(socket: Arc<UdpSocket>, conns: dashmap::ReadOnlyView<String, PeerHandle>) -> Self {
+    pub fn new(
+        local_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        conns: dashmap::ReadOnlyView<String, PeerHandle>,
+    ) -> Self {
         let state = IngressState {
+            local_addr,
             socket,
             conns,
             mapping: dashmap::DashMap::new(),
@@ -44,9 +50,10 @@ impl Ingress {
                 continue;
             };
 
-            let _ = peer_handle.forward(IngressUDPPacket {
+            let _ = peer_handle.forward(UDPPacket {
                 raw: packet,
                 src: source,
+                dst: state.local_addr,
             });
         }
 
