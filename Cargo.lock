@@ -1059,6 +1059,7 @@ dependencies = [
  "rand 0.9.1",
  "serde",
  "serde_json",
+ "socket2",
  "str0m",
  "thiserror 2.0.12",
  "tokio",

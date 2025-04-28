@@ -2,7 +2,7 @@ use std::{io, net::SocketAddr, sync::Arc};
 
 use crate::{
     egress::EgressHandle,
-    ingress::IngressHandle,
+    ingress::Ingress,
     message::{GroupId, PeerId},
     peer::PeerHandle,
 };
@@ -35,7 +35,7 @@ pub enum ControllerError {
 pub struct Controller(Arc<ControllerState>);
 
 pub struct ControllerState {
-    ingress: IngressHandle,
+    ingress: Ingress,
     egress: EgressHandle,
     conns: DashMap<String, PeerHandle>,
     groups: DashMap<Arc<GroupId>, Group>,
@@ -47,13 +47,27 @@ pub struct ControllerState {
 impl Controller {
     pub async fn spawn() -> Result<Self, ControllerError> {
         // TODO: replace this with a config
-        let socket = UdpSocket::bind("0.0.0.0:3478").await?;
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        // tokio requires this
+        socket.set_nonblocking(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_send_buffer_size(4 * 1024 * 1024)?;
+        socket.set_recv_buffer_size(4 * 1024 * 1024)?;
+        let local_addr: SocketAddr = "0.0.0.0:3478".parse().expect("valid bind addr");
+        socket.bind(&local_addr.into())?;
+
+        let socket = tokio::net::UdpSocket::from_std(socket.into())?;
         let socket = Arc::new(socket);
-        let local_addr = socket.local_addr()?;
 
         let conns = DashMap::new();
-        let ingress = IngressHandle::spawn(socket.clone(), conns.clone().into_read_only());
+        let ingress = Ingress::new(socket.clone(), conns.clone().into_read_only());
         let egress = EgressHandle::spawn(socket.clone());
+
+        tokio::spawn(ingress.clone().run());
 
         let controller_state = ControllerState {
             ingress,

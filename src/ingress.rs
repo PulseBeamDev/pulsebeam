@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 
 use crate::{ice, message::IngressUDPPacket, peer::PeerHandle};
 
+#[derive(Clone)]
 pub struct Ingress(Arc<IngressState>);
 
 pub struct IngressState {
@@ -23,7 +24,7 @@ impl Ingress {
         Self(Arc::new(state))
     }
 
-    async fn run(self) {
+    pub async fn run(self) {
         let state = self.0;
         let mut buf = BytesMut::with_capacity(128 * 1024);
 
@@ -34,6 +35,7 @@ impl Ingress {
                 peer_handle.clone()
             } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(&packet) {
                 if let Some(peer_handle) = state.conns.get(ufrag) {
+                    state.mapping.insert(source, peer_handle.clone());
                     peer_handle.clone()
                 } else {
                     continue;
@@ -42,7 +44,7 @@ impl Ingress {
                 continue;
             };
 
-            peer_handle.forward(IngressUDPPacket {
+            let _ = peer_handle.forward(IngressUDPPacket {
                 raw: packet,
                 src: source,
             });
