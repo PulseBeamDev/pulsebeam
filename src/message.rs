@@ -1,33 +1,13 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::{fmt, sync::Arc};
 use thiserror::Error;
-use tokio::sync::oneshot;
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
 pub use str0m::error::SdpError;
 pub use str0m::{Rtc, RtcError};
-
-use crate::group::GroupError;
-
-#[derive(Debug)]
-pub struct JoinRequest {
-    pub group_id: Arc<GroupId>,
-    pub peer_id: Arc<PeerId>,
-    pub rtc: Rtc,
-    pub reply: oneshot::Sender<Result<(), JoinError>>,
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum JoinError {
-    #[error("group error")]
-    Group(#[from] GroupError),
-
-    #[error("unknown error: {0}")]
-    Unknown(String),
-}
 
 #[derive(Debug)]
 pub struct IngressUDPPacket {

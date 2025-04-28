@@ -8,7 +8,10 @@ use crate::{
 };
 use dashmap::DashMap;
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex, mpsc},
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -64,7 +67,7 @@ impl Controller {
         Ok(controller)
     }
 
-    pub fn allocate(
+    pub async fn allocate(
         &self,
         group_id: GroupId,
         peer_id: PeerId,
@@ -95,7 +98,7 @@ impl Controller {
             .or_insert_with(|| Group::new(self.clone(), group_id));
 
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
-        let peer_handle = entry.spawn(peer_id, rtc);
+        let peer_handle = entry.spawn(peer_id, rtc).await;
         self.0.conns.insert(ufrag, peer_handle);
 
         Ok(answer.to_sdp_string())
@@ -109,6 +112,8 @@ pub struct GroupState {
     controller: Controller,
     group_id: Arc<GroupId>,
     peers: DashMap<Arc<PeerId>, PeerHandle>,
+    routers: DashMap<usize, RouterHandle>,
+    spawn_lock: Arc<Mutex<usize>>,
 }
 
 impl Group {
@@ -117,6 +122,8 @@ impl Group {
             controller,
             group_id,
             peers: DashMap::new(),
+            routers: DashMap::new(),
+            spawn_lock: Arc::new(Mutex::new(0)),
         };
         Self(Arc::new(state))
     }
@@ -125,8 +132,68 @@ impl Group {
         self.0.peers.len()
     }
 
-    pub fn spawn(&self, peer_id: PeerId, rtc: Rtc) -> PeerHandle {
-        // PeerHandle::spawn(ingress, egress, group, peer_id, rtc)
-        todo!()
+    pub async fn spawn(&self, peer_id: PeerId, rtc: Rtc) -> PeerHandle {
+        {
+            let mut n = self.0.spawn_lock.lock().await;
+
+            if self.0.routers.is_empty() {
+                let router = RouterHandle::spawn(self.clone());
+                self.0.routers.insert(*n, router);
+                *n += 1;
+            }
+
+            // TODO: handle scaling for big groups
+        }
+
+        let peer_id = Arc::new(peer_id);
+        let peer_handle = PeerHandle::spawn(self.clone(), peer_id, rtc);
+
+        peer_handle
+    }
+
+    pub fn propagate(&self, mut msg: RouterMessage) {
+        for e in self.0.routers.iter() {
+            match e.sender.try_send(msg) {
+                Ok(_) => {
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(bounced)) => {
+                    msg = bounced;
+                    // TODO: handle closed channel
+                }
+                Err(mpsc::error::TrySendError::Full(bounced)) => {
+                    msg = bounced;
+                }
+            }
+        }
+    }
+}
+
+pub enum RouterMessage {}
+
+pub struct RouterActor {
+    group: Group,
+    receiver: mpsc::Receiver<RouterMessage>,
+}
+
+impl RouterActor {
+    async fn run(self) {}
+}
+
+#[derive(Clone)]
+pub struct RouterHandle {
+    pub sender: mpsc::Sender<RouterMessage>,
+}
+
+impl RouterHandle {
+    fn spawn(group: Group) -> Self {
+        // TODO: channel size
+        let (tx, rx) = mpsc::channel(8);
+        let actor = RouterActor {
+            group,
+            receiver: rx,
+        };
+        tokio::spawn(actor.run());
+        Self { sender: tx }
     }
 }

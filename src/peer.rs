@@ -1,16 +1,10 @@
 use std::sync::Arc;
 
-use str0m::{
-    Candidate, Rtc, RtcError,
-    change::{SdpAnswer, SdpOffer},
-    error::SdpError,
-};
+use str0m::{Rtc, RtcError, error::SdpError};
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::{
-    egress::EgressHandle,
-    group::GroupHandle,
-    ingress::IngressHandle,
+    controller::Group,
     message::{self, PeerId},
 };
 
@@ -28,29 +22,13 @@ pub enum PeerMessage {
     UdpPacket(message::EgressUDPPacket),
 }
 
-#[derive(Debug)]
 pub struct PeerActor {
-    ingress: IngressHandle,
-    egress: EgressHandle,
-    group: GroupHandle,
+    group: Group,
     peer_id: Arc<PeerId>,
     rtc: str0m::Rtc,
 }
 
 impl PeerActor {
-    pub fn new(
-        group: GroupHandle,
-        peer_id: Arc<PeerId>,
-        offer: SdpOffer,
-    ) -> Result<(Self, SdpAnswer), PeerError> {
-        let actor = PeerActor {
-            group,
-            rtc,
-            peer_id,
-        };
-        Ok((actor, answer))
-    }
-
     async fn run(self, mut receiver: mpsc::Receiver<PeerMessage>) {
         // TODO: notify ingress to add self to the routing table
 
@@ -64,16 +42,8 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn spawn(
-        ingress: IngressHandle,
-        egress: EgressHandle,
-        group: GroupHandle,
-        peer_id: Arc<PeerId>,
-        rtc: Rtc,
-    ) -> Self {
+    pub fn spawn(group: Group, peer_id: Arc<PeerId>, rtc: Rtc) -> Self {
         let actor = PeerActor {
-            ingress,
-            egress,
             group,
             peer_id,
             rtc,

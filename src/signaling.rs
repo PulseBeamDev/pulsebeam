@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use crate::message::{Rtc, RtcError, SdpError, SdpOffer};
+use crate::controller::{Controller, ControllerError};
 use axum::{
     Router,
     extract::{Query, State},
@@ -9,23 +7,13 @@ use axum::{
     routing::get,
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-use tokio::sync::oneshot;
 
-use crate::{
-    manager::ManagerHandle,
-    message::{GroupId, JoinError, JoinRequest, PeerId},
-};
+use crate::message::{GroupId, PeerId};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
     #[error("join failed: {0}")]
-    JoinError(#[from] JoinError),
-
-    #[error("sdp offer is invalid: {0}")]
-    OfferInvalid(#[from] SdpError),
-
-    #[error("sdp offer is rejected: {0}")]
-    OfferRejected(#[from] RtcError),
+    JoinError(#[from] ControllerError),
 
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
@@ -37,9 +25,17 @@ pub enum SignalingError {
 impl IntoResponse for SignalingError {
     fn into_response(self) -> Response {
         let status = match self {
-            SignalingError::JoinError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            SignalingError::OfferInvalid(_) => StatusCode::BAD_REQUEST,
-            SignalingError::OfferRejected(_) => StatusCode::BAD_REQUEST,
+            SignalingError::JoinError(ControllerError::OfferInvalid(_)) => StatusCode::BAD_REQUEST,
+            SignalingError::JoinError(ControllerError::OfferRejected(_)) => StatusCode::BAD_REQUEST,
+            SignalingError::JoinError(ControllerError::ServiceUnavailable) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            SignalingError::JoinError(ControllerError::Unknown(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            SignalingError::JoinError(ControllerError::IOError(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             SignalingError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SignalingError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
@@ -56,45 +52,21 @@ pub struct PeerInfo {
 #[axum::debug_handler]
 async fn spawn_peer(
     Query(peer): Query<PeerInfo>,
-    State(handle): State<ManagerHandle>,
+    State(controller): State<Controller>,
     TypedHeader(content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<String, SignalingError> {
     // TODO: validate content_type = "application/sdp"
 
-    let offer = SdpOffer::from_sdp_string(&raw_offer)?;
-    let mut rtc = Rtc::builder()
-        // Uncomment this to see statistics
-        // .set_stats_interval(Some(Duration::from_secs(1)))
-        // .set_ice_lite(true)
-        .build();
+    let answer = controller
+        .allocate(peer.group_id, peer.peer_id, raw_offer)
+        .await?;
 
-    // Add the shared UDP socket as a host candidate
-    // let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-    // rtc.add_local_candidate(candidate);
-
-    // Create an SDP Answer.
-    let answer = rtc
-        .sdp_api()
-        .accept_offer(offer)
-        .map_err(SignalingError::OfferRejected)?;
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .join(JoinRequest {
-            group_id: Arc::new(peer.group_id),
-            peer_id: Arc::new(peer.peer_id),
-            rtc,
-            reply: reply_tx,
-        })
-        .map_err(|err| SignalingError::Unknown(err.to_string()))?;
-    reply_rx
-        .await
-        .map_err(|_| SignalingError::ServiceUnavailable)??;
-
-    Ok(answer.to_sdp_string())
+    Ok(answer)
 }
 
-pub fn router(handle: ManagerHandle) -> Router {
-    Router::new().route("/", get(spawn_peer)).with_state(handle)
+pub fn router(controller: Controller) -> Router {
+    Router::new()
+        .route("/", get(spawn_peer))
+        .with_state(controller)
 }
