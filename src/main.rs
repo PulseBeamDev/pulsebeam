@@ -1,3 +1,4 @@
+use pulsebeam::{controller::Controller, signaling};
 use tracing::level_filters::LevelFilter;
 
 #[tokio::main]
@@ -10,5 +11,8 @@ async fn main() {
         .with_env_filter(env_filter)
         .init();
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    let controller = Controller::spawn().await.unwrap();
+    let router = signaling::router(controller);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, router).await.unwrap();
 }

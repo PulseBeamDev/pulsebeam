@@ -85,6 +85,8 @@ impl PeerActor {
     }
 
     fn poll(&mut self) -> Option<Duration> {
+        // WARN: be careful with spending too much time in this loop.
+        // We should yield back to the scheduler based on some heuristic here.
         loop {
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
