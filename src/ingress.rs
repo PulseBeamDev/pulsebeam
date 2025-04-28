@@ -1,69 +1,37 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
-use tokio::{
-    net::UdpSocket,
-    sync::mpsc::{self, error::TrySendError},
-};
+use tokio::net::UdpSocket;
 
 use crate::peer::PeerHandle;
 
-#[derive(Debug)]
-pub enum IngressMessage {
-    Ping,
-}
+pub struct Ingress(Arc<IngressState>);
 
-pub struct IngressActor {
+pub struct IngressState {
     socket: Arc<UdpSocket>,
     conns: dashmap::ReadOnlyView<String, PeerHandle>,
+    mapping: dashmap::DashMap<SocketAddr, PeerHandle>,
 }
 
-impl IngressActor {
-    fn handle_message(&mut self, msg: IngressMessage) {
-        tracing::info!("received: {:?}", msg);
+impl Ingress {
+    pub fn new(socket: Arc<UdpSocket>, conns: dashmap::ReadOnlyView<String, PeerHandle>) -> Self {
+        let state = IngressState {
+            socket,
+            conns,
+            mapping: dashmap::DashMap::new(),
+        };
+        Self(Arc::new(state))
     }
 
-    async fn run(mut self, mut receiver: mpsc::Receiver<IngressMessage>) {
+    async fn run(self) {
+        let state = self.0;
         let mut buf = vec![0; 2000];
 
-        loop {
-            // bias toward internal loop
-            tokio::select! {
-                msg = receiver.recv() => {
-                    match msg {
-                        Some(msg) => self.handle_message(msg),
-                        None => break,
-                    }
-                }
-                res = self.socket.recv_from(&mut buf) => {
-                    match res {
-                        Ok((size, source)) => {
-                            let bytes = Bytes::copy_from_slice(&buf[..size]);
-                        },
-                        Err(err) => {
-                            tracing::warn!("udp error in receiving: {:?}", err);
-                        }
-                    }
-                }
-            }
+        while let Ok((size, source)) = state.socket.recv_from(&mut buf).await {
+            let bytes = Bytes::copy_from_slice(&buf[..size]);
+            // TODO: demux and forward
         }
-    }
-}
 
-#[derive(Clone, Debug)]
-pub struct IngressHandle {
-    sender: mpsc::Sender<IngressMessage>,
-}
-
-impl IngressHandle {
-    pub fn spawn(socket: Arc<UdpSocket>, conns: dashmap::ReadOnlyView<String, PeerHandle>) -> Self {
-        let (sender, receiver) = mpsc::channel(8);
-        let actor = IngressActor { socket, conns };
-        tokio::spawn(actor.run(receiver));
-        Self { sender }
-    }
-
-    pub fn ping(&self) -> Result<(), TrySendError<IngressMessage>> {
-        self.sender.try_send(IngressMessage::Ping)
+        tracing::info!("ingress has exited");
     }
 }

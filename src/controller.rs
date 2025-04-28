@@ -146,9 +146,7 @@ impl Group {
         }
 
         let peer_id = Arc::new(peer_id);
-        let peer_handle = PeerHandle::spawn(self.clone(), peer_id, rtc);
-
-        peer_handle
+        PeerHandle::spawn(self.clone(), peer_id, rtc)
     }
 
     pub fn propagate(&self, mut msg: RouterMessage) {
@@ -162,6 +160,7 @@ impl Group {
                     // TODO: handle closed channel
                 }
                 Err(mpsc::error::TrySendError::Full(bounced)) => {
+                    // TODO: handle scaling for big groups
                     msg = bounced;
                 }
             }
