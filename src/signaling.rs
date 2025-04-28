@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::message::{Rtc, RtcError, SdpError, SdpOffer};
 use axum::{
     Router,
     extract::{Query, State},
@@ -8,7 +9,6 @@ use axum::{
     routing::get,
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-use str0m::{change::SdpOffer, error::SdpError};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -24,6 +24,9 @@ pub enum SignalingError {
     #[error("sdp offer is invalid: {0}")]
     OfferInvalid(#[from] SdpError),
 
+    #[error("sdp offer is rejected: {0}")]
+    OfferRejected(#[from] RtcError),
+
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
 
@@ -36,6 +39,7 @@ impl IntoResponse for SignalingError {
         let status = match self {
             SignalingError::JoinError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SignalingError::OfferInvalid(_) => StatusCode::BAD_REQUEST,
+            SignalingError::OfferRejected(_) => StatusCode::BAD_REQUEST,
             SignalingError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SignalingError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
@@ -59,16 +63,32 @@ async fn spawn_peer(
     // TODO: validate content_type = "application/sdp"
 
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
+    let mut rtc = Rtc::builder()
+        // Uncomment this to see statistics
+        // .set_stats_interval(Some(Duration::from_secs(1)))
+        // .set_ice_lite(true)
+        .build();
+
+    // Add the shared UDP socket as a host candidate
+    // let candidate = Candidate::host(addr, "udp").expect("a host candidate");
+    // rtc.add_local_candidate(candidate);
+
+    // Create an SDP Answer.
+    let answer = rtc
+        .sdp_api()
+        .accept_offer(offer)
+        .map_err(SignalingError::OfferRejected)?;
+
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .join(JoinRequest {
             group_id: Arc::new(peer.group_id),
             peer_id: Arc::new(peer.peer_id),
-            offer,
+            rtc,
             reply: reply_tx,
         })
         .map_err(|err| SignalingError::Unknown(err.to_string()))?;
-    let answer = reply_rx
+    reply_rx
         .await
         .map_err(|_| SignalingError::ServiceUnavailable)??;
 

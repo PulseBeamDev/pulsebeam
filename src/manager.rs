@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
     egress::EgressHandle,
@@ -26,7 +26,6 @@ pub enum ManagerMessage {
 pub struct ManagerActor {
     pub ingress: IngressHandle,
     pub egress: EgressHandle,
-    pub listener: TcpListener,
     pub groups: HashMap<Arc<GroupId>, GroupHandle>,
 }
 
@@ -43,7 +42,11 @@ impl ManagerActor {
                 if let Some(group) = self.groups.get(&req.group_id) {
                     group.join(req);
                 } else {
-                    let handle = GroupHandle::spawn(req.group_id.clone());
+                    let handle = GroupHandle::spawn(
+                        self.ingress.clone(),
+                        self.egress.clone(),
+                        req.group_id.clone(),
+                    );
                     self.groups.insert(req.group_id.clone(), handle.clone());
                     handle.join(req);
                 };

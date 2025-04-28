@@ -8,7 +8,9 @@ use str0m::{
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::{
+    egress::EgressHandle,
     group::GroupHandle,
+    ingress::IngressHandle,
     message::{self, PeerId},
 };
 
@@ -28,6 +30,8 @@ pub enum PeerMessage {
 
 #[derive(Debug)]
 pub struct PeerActor {
+    ingress: IngressHandle,
+    egress: EgressHandle,
     group: GroupHandle,
     peer_id: Arc<PeerId>,
     rtc: str0m::Rtc,
@@ -39,22 +43,6 @@ impl PeerActor {
         peer_id: Arc<PeerId>,
         offer: SdpOffer,
     ) -> Result<(Self, SdpAnswer), PeerError> {
-        let mut rtc = Rtc::builder()
-            // Uncomment this to see statistics
-            // .set_stats_interval(Some(Duration::from_secs(1)))
-            // .set_ice_lite(true)
-            .build();
-
-        // Add the shared UDP socket as a host candidate
-        // let candidate = Candidate::host(addr, "udp").expect("a host candidate");
-        // rtc.add_local_candidate(candidate);
-
-        // Create an SDP Answer.
-        let answer = rtc
-            .sdp_api()
-            .accept_offer(offer)
-            .map_err(PeerError::OfferRejected)?;
-
         let actor = PeerActor {
             group,
             rtc,
@@ -76,7 +64,20 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn spawn(actor: PeerActor) -> Self {
+    pub fn spawn(
+        ingress: IngressHandle,
+        egress: EgressHandle,
+        group: GroupHandle,
+        peer_id: Arc<PeerId>,
+        rtc: Rtc,
+    ) -> Self {
+        let actor = PeerActor {
+            ingress,
+            egress,
+            group,
+            peer_id,
+            rtc,
+        };
         let (sender, receiver) = mpsc::channel(8);
         tokio::spawn(actor.run(receiver));
         Self { sender }

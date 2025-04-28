@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
 pub use str0m::error::SdpError;
+pub use str0m::{Rtc, RtcError};
 
 use crate::group::GroupError;
 
@@ -15,8 +16,8 @@ use crate::group::GroupError;
 pub struct JoinRequest {
     pub group_id: Arc<GroupId>,
     pub peer_id: Arc<PeerId>,
-    pub offer: SdpOffer,
-    pub reply: oneshot::Sender<Result<SdpAnswer, JoinError>>,
+    pub rtc: Rtc,
+    pub reply: oneshot::Sender<Result<(), JoinError>>,
 }
 
 #[derive(thiserror::Error, Debug)]
