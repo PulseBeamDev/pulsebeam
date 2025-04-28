@@ -1,3 +1,4 @@
+pub mod controller;
 pub mod egress;
 pub mod group;
 pub mod ice;
