@@ -44,10 +44,8 @@ impl EgressHandle {
         Self { sender }
     }
 
-    pub async fn send(
-        &self,
-        msg: message::EgressUDPPacket,
-    ) -> Result<(), TrySendError<EgressMessage>> {
+    pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<EgressMessage>> {
+        // TODO: monitor backpressure and packet dropping
         self.sender.try_send(EgressMessage::UdpPacket(msg))
     }
 }

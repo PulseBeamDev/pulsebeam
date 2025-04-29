@@ -60,8 +60,8 @@ pub struct Controller(Arc<ControllerState>);
 pub struct ControllerState {
     ingress: Ingress,
     egress: EgressHandle,
-    conns: DashMap<String, PeerHandle>,
-    groups: DashMap<Arc<GroupId>, Group>,
+    conns: Arc<DashMap<String, PeerHandle>>,
+    groups: Arc<DashMap<Arc<GroupId>, Group>>,
 
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
@@ -88,8 +88,8 @@ impl Controller {
         let socket = tokio::net::UdpSocket::from_std(socket.into())?;
         let socket = Arc::new(socket);
 
-        let conns = DashMap::new();
-        let ingress = Ingress::new(local_addr, socket.clone(), conns.clone().into_read_only());
+        let conns = Arc::new(DashMap::new());
+        let ingress = Ingress::new(local_addr, socket.clone(), Arc::clone(&conns));
         let egress = EgressHandle::spawn(socket.clone());
 
         tokio::spawn(ingress.clone().run());
@@ -98,7 +98,7 @@ impl Controller {
             ingress,
             egress,
             conns,
-            groups: DashMap::new(),
+            groups: Arc::new(DashMap::new()),
             socket,
             local_addr,
         };
@@ -138,6 +138,7 @@ impl Controller {
 
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let peer_handle = entry.spawn(peer_id, rtc).await;
+        tracing::trace!("added {ufrag} to connection map");
         self.0.conns.insert(ufrag, peer_handle);
 
         Ok(answer.to_sdp_string())
@@ -154,8 +155,8 @@ pub struct Group(Arc<GroupState>);
 pub struct GroupState {
     controller: Controller,
     group_id: Arc<GroupId>,
-    peers: DashMap<Arc<PeerId>, PeerHandle>,
-    routers: DashMap<usize, RouterHandle>,
+    peers: Arc<DashMap<Arc<PeerId>, PeerHandle>>,
+    routers: Arc<DashMap<usize, RouterHandle>>,
     spawn_lock: Arc<Mutex<usize>>,
 }
 
@@ -164,8 +165,8 @@ impl Group {
         let state = GroupState {
             controller,
             group_id,
-            peers: DashMap::new(),
-            routers: DashMap::new(),
+            peers: Arc::new(DashMap::new()),
+            routers: Arc::new(DashMap::new()),
             spawn_lock: Arc::new(Mutex::new(0)),
         };
         Self(Arc::new(state))

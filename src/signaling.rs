@@ -4,7 +4,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::post,
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 
@@ -67,6 +67,6 @@ async fn spawn_peer(
 
 pub fn router(controller: Controller) -> Router {
     Router::new()
-        .route("/", get(spawn_peer))
+        .route("/", post(spawn_peer))
         .with_state(controller)
 }

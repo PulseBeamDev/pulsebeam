@@ -651,4 +651,20 @@ mod tests {
         // But converting to &str should fail
         assert_eq!(parse_stun_username_str(&msg), None);
     }
+
+    #[test]
+    fn test_ice_binding_from_raw() {
+        let packet_hex = "000100502112a4426943746c7a422f4d706e594800060009447172673a35504c4d000000c0570004000003e7802a0008e2e197300acfe8da00250000002400046e001eff00080014b610b03b8165bb4c317192054e00c73afb204dd480280004a953f217";
+        let packet_raw = hex::decode(packet_hex).unwrap();
+
+        assert_eq!(parse_stun_username_str(&packet_raw), Some("Dqrg:5PLM"));
+        assert_eq!(parse_stun_remote_ufrag(&packet_raw), Some("5PLM"));
+    }
+
+    #[test]
+    fn test_first_token() {
+        assert_eq!(first_token(b"asd", b':'), None);
+        assert_eq!(first_token(b"asd:", b':'), Some(b"asd".as_slice()));
+        assert_eq!(first_token(b"asd:bcd", b':'), Some(b"asd".as_slice()));
+    }
 }
