@@ -1,3 +1,8 @@
+extern crate jemallocator;
+
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use std::time::Duration;
 
 use pulsebeam::{controller::Controller, signaling};
