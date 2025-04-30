@@ -1,15 +1,22 @@
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt::Display,
+    sync::Arc,
+};
 
+use str0m::media::{MediaAdded, MediaData};
 use tokio::sync::mpsc::{self, error::SendError};
 
 use crate::{
     controller::ControllerHandle,
-    message::{GroupId, PeerId},
-    peer::PeerHandle,
+    message::{GroupId, MediaKey, PeerId},
+    peer::{PeerHandle, PeerMessage},
 };
 
+#[derive(Debug)]
 pub enum GroupMessage {
-    PublishTrack,
+    PublishMedia(MediaKey, MediaAdded),
+    ForwardMedia(MediaKey, Arc<MediaData>),
     UnpublishTrack,
     SubscribeTrack,
     UnsubscribeTrack,
@@ -23,6 +30,9 @@ pub struct GroupActor {
     group_id: Arc<GroupId>,
     handle: GroupHandle,
     peers: HashMap<Arc<PeerId>, PeerHandle>,
+
+    medias: HashMap<MediaKey, MediaAdded>,
+    subscriptions: HashMap<MediaKey, BTreeSet<PeerHandle>>,
 }
 
 impl GroupActor {
@@ -34,8 +44,28 @@ impl GroupActor {
 
     async fn handle_message(&mut self, mut msg: GroupMessage) {
         match msg {
-            GroupMessage::AddPeer(peer) => self.peers.insert(peer.peer_id.clone(), peer),
-            GroupMessage::RemovePeer(peer_id) => self.peers.remove(&peer_id),
+            GroupMessage::AddPeer(peer) => {
+                self.peers.insert(peer.peer_id.clone(), peer);
+            }
+            GroupMessage::RemovePeer(peer_id) => {
+                self.peers.remove(&peer_id);
+            }
+            GroupMessage::PublishMedia(key, media) => {
+                self.medias.insert(key, media);
+                todo!("forward based on subscriptions");
+            }
+            GroupMessage::ForwardMedia(key, data) => {
+                if let Some(interests) = self.subscriptions.get(&key) {
+                    for interest in interests.iter() {
+                        if let Err(res) = interest
+                            .sender
+                            .try_send(PeerMessage::ForwardMedia(key.clone(), data.clone()))
+                        {
+                            tracing::warn!("dropping a media data to {interest}");
+                        }
+                    }
+                }
+            }
             _ => todo!(),
         };
     }
@@ -43,8 +73,8 @@ impl GroupActor {
 
 #[derive(Clone)]
 pub struct GroupHandle {
-    sender: mpsc::Sender<GroupMessage>,
-    group_id: Arc<GroupId>,
+    pub sender: mpsc::Sender<GroupMessage>,
+    pub group_id: Arc<GroupId>,
 }
 
 impl GroupHandle {
@@ -60,6 +90,7 @@ impl GroupHandle {
             group_id,
             handle: handle.clone(),
             peers: HashMap::new(),
+            medias: HashMap::new(),
         };
         (handle, actor)
     }

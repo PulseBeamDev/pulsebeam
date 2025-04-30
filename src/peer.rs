@@ -1,7 +1,17 @@
-use std::{fmt::Display, sync::Arc, time::Duration};
+use std::{
+    fmt::Display,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
-use str0m::{Event, Input, Output, Rtc, RtcError, error::SdpError, net};
+use str0m::{
+    Event, Input, Output, Rtc, RtcError,
+    error::SdpError,
+    media::{MediaAdded, MediaData},
+    net,
+};
 use tokio::{
     sync::mpsc::{self, error::TrySendError},
     time::Instant,
@@ -10,7 +20,7 @@ use tokio::{
 use crate::{
     egress::EgressHandle,
     group::GroupHandle,
-    message::{self, EgressUDPPacket, PeerId},
+    message::{self, EgressUDPPacket, MediaKey, PeerId},
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -25,6 +35,8 @@ pub enum PeerError {
 #[derive(Debug)]
 pub enum PeerMessage {
     UdpPacket(message::UDPPacket),
+    PublishMedia(MediaKey, MediaAdded),
+    ForwardMedia(MediaKey, Arc<MediaData>),
 }
 
 pub struct PeerActor {
@@ -40,7 +52,7 @@ impl PeerActor {
         // TODO: notify ingress to add self to the routing table
 
         loop {
-            let deadline = if let Some(deadline) = self.poll() {
+            let deadline = if let Some(deadline) = self.poll().await {
                 deadline
             } else {
                 // Rtc timeout
@@ -85,7 +97,7 @@ impl PeerActor {
         }
     }
 
-    fn poll(&mut self) -> Option<Duration> {
+    async fn poll(&mut self) -> Option<Duration> {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
         loop {
@@ -115,7 +127,7 @@ impl PeerActor {
                         Event::IceConnectionStateChange(
                             str0m::IceConnectionState::Disconnected,
                         ) => return None,
-                        Event::MediaAdded(e) => todo!(),
+                        Event::MediaAdded(e) => self.publish_media(e).await,
                         Event::MediaData(e) => {
                             todo!()
                         }
@@ -139,6 +151,17 @@ impl PeerActor {
 
             return Some(duration);
         }
+    }
+
+    async fn publish_media(&self, media: MediaAdded) {
+        // TODO: handle back pressure by buffering temporarily
+        self.group
+            .sender
+            .send(crate::group::GroupMessage::PublishMedia(
+                self.peer_id.clone(),
+                media,
+            ))
+            .await;
     }
 }
 
@@ -180,3 +203,17 @@ impl Display for PeerHandle {
         f.write_str(self.peer_id.as_str())
     }
 }
+
+impl Hash for PeerHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.peer_id.hash(state);
+    }
+}
+
+impl PartialEq for PeerHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.peer_id == other.peer_id
+    }
+}
+
+impl Eq for PeerHandle {}

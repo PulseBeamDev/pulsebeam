@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
+use str0m::media::Mid;
 use thiserror::Error;
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
@@ -20,6 +22,12 @@ pub struct UDPPacket {
 pub struct EgressUDPPacket {
     pub raw: Bytes,
     pub dst: SocketAddr,
+}
+
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct MediaKey {
+    pub peer_id: Arc<PeerId>,
+    pub mid: Mid,
 }
 
 #[derive(thiserror::Error, Debug)]
