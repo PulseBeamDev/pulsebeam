@@ -1,4 +1,4 @@
-use crate::controller::{Controller, ControllerError};
+use crate::controller::{ControllerError, ControllerHandle};
 use axum::{
     Router,
     extract::{Query, State},
@@ -52,7 +52,7 @@ pub struct PeerInfo {
 #[axum::debug_handler]
 async fn spawn_peer(
     Query(peer): Query<PeerInfo>,
-    State(controller): State<Controller>,
+    State(controller): State<ControllerHandle>,
     TypedHeader(content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<String, SignalingError> {
@@ -65,7 +65,7 @@ async fn spawn_peer(
     Ok(answer)
 }
 
-pub fn router(controller: Controller) -> Router {
+pub fn router(controller: ControllerHandle) -> Router {
     Router::new()
         .route("/", post(spawn_peer))
         .with_state(controller)

@@ -14,7 +14,7 @@ async function start() {
       },
     },
   ).then((r) => r.text());
-  pc.setRemoteDescription({
+  await pc.setRemoteDescription({
     type: "answer",
     sdp: answer,
   });

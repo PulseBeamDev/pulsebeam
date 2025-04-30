@@ -1,74 +1,138 @@
-use std::{net::SocketAddr, sync::Arc};
-
-use bytes::{Bytes, BytesMut};
-use dashmap::DashMap;
-use tokio::net::UdpSocket;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use crate::{ice, message::UDPPacket, peer::PeerHandle};
+use bytes::Bytes;
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc::{self, error::SendError},
+    task::JoinHandle,
+};
 
-#[derive(Clone)]
-pub struct Ingress(Arc<IngressState>);
-
-pub struct IngressState {
-    local_addr: SocketAddr,
-    socket: Arc<UdpSocket>,
-    conns: Arc<DashMap<String, PeerHandle>>,
-    mapping: DashMap<SocketAddr, PeerHandle>,
+pub enum IngressMessage {
+    AddPeer(String, PeerHandle),
+    RemovePeer(String),
 }
 
-impl Ingress {
-    pub fn new(
-        local_addr: SocketAddr,
-        socket: Arc<UdpSocket>,
-        conns: Arc<DashMap<String, PeerHandle>>,
-    ) -> Self {
-        let state = IngressState {
-            local_addr,
-            socket,
-            conns,
-            mapping: dashmap::DashMap::new(),
-        };
-        Self(Arc::new(state))
-    }
+pub struct IngressActor {
+    local_addr: SocketAddr,
+    socket: Arc<UdpSocket>,
+    conns: HashMap<String, PeerHandle>,
+    mapping: HashMap<SocketAddr, PeerHandle>,
+    reverse: HashMap<String, Vec<SocketAddr>>,
+}
 
-    pub async fn run(self) {
-        let state = self.0;
+impl IngressActor {
+    pub async fn run(mut self, mut receiver: mpsc::Receiver<IngressMessage>) {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
 
-        while let Ok((size, source)) = state.socket.recv_from(&mut buf).await {
-            let packet = &buf[..size];
-            // let packet = buf.split_to(size).freeze();
+        loop {
+            tokio::select! {
+                biased;
 
-            let peer_handle = if let Some(peer_handle) = state.mapping.get(&source) {
-                tracing::trace!("found connection from mapping: {source}");
-                peer_handle.clone()
-            } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
-                tracing::trace!("found {ufrag} in STUN packet: {:?}", state.conns);
-                if let Some(peer_handle) = state.conns.get(ufrag) {
-                    tracing::trace!("found connection from ufrag: {ufrag} -> {source}");
-                    state.mapping.insert(source, peer_handle.clone());
-                    peer_handle.clone()
-                } else {
-                    tracing::trace!(
-                        "dropped a packet from {source} due to unregistered stun binding"
-                    );
-                    continue;
+                res = self.socket.recv_from(&mut buf) => {
+                    match res {
+                        Ok((size, source)) => self.handle_packet(source, &buf[..size]),
+                        Err(err) => {
+                            tracing::error!("udp socket is failing: {err}");
+                            break;
+                        },
+                    }
                 }
-            } else {
-                tracing::trace!(
-                    "dropped a packet from {source} due to unexpected message flow from an unknown source"
-                );
-                continue;
-            };
 
-            let _ = peer_handle.forward(UDPPacket {
-                raw: Bytes::copy_from_slice(packet),
-                src: source,
-                dst: state.local_addr,
-            });
+                msg = receiver.recv() => {
+                    match msg {
+                        Some(msg) => self.handle_control(msg),
+                        None => {
+                            tracing::info!("all controllers have exited, will gracefully shutdown");
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         tracing::info!("ingress has exited");
+    }
+
+    pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
+        let peer_handle = if let Some(peer_handle) = self.mapping.get(&source) {
+            tracing::trace!("found connection from mapping: {source}");
+            peer_handle.clone()
+        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
+            tracing::trace!("found {ufrag} in STUN packet: {:?}", self.conns);
+            if let Some(peer_handle) = self.conns.get(ufrag) {
+                tracing::trace!("found connection from ufrag: {ufrag} -> {source}");
+                self.mapping.insert(source, peer_handle.clone());
+                self.reverse
+                    .entry(ufrag.to_string())
+                    .or_default()
+                    .push(source);
+                peer_handle.clone()
+            } else {
+                tracing::trace!("dropped a packet from {source} due to unregistered stun binding");
+                return;
+            }
+        } else {
+            tracing::trace!(
+                "dropped a packet from {source} due to unexpected message flow from an unknown source"
+            );
+            return;
+        };
+
+        let _ = peer_handle.forward(UDPPacket {
+            raw: Bytes::copy_from_slice(packet),
+            src: source,
+            dst: self.local_addr,
+        });
+    }
+
+    pub fn handle_control(&mut self, msg: IngressMessage) {
+        match msg {
+            IngressMessage::AddPeer(ufrag, peer) => {
+                self.conns.insert(ufrag, peer);
+            }
+            IngressMessage::RemovePeer(ufrag) => {
+                self.conns.remove(&ufrag);
+                if let Some(addrs) = self.reverse.remove(&ufrag) {
+                    for addr in addrs.iter() {
+                        self.mapping.remove(addr);
+                    }
+                }
+            }
+        };
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IngressHandle {
+    sender: mpsc::Sender<IngressMessage>,
+}
+
+impl IngressHandle {
+    pub fn spawn(local_addr: SocketAddr, socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
+        let actor = IngressActor {
+            local_addr,
+            socket,
+            conns: HashMap::new(),
+            mapping: HashMap::new(),
+            reverse: HashMap::new(),
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        let join = tokio::spawn(actor.run(receiver));
+        let handle = Self { sender };
+        (handle, join)
+    }
+
+    pub async fn add_peer(
+        &self,
+        ufrag: String,
+        peer: PeerHandle,
+    ) -> Result<(), SendError<IngressMessage>> {
+        self.sender.send(IngressMessage::AddPeer(ufrag, peer)).await
+    }
+
+    pub async fn remove_peer(&self, ufrag: String) -> Result<(), SendError<IngressMessage>> {
+        self.sender.send(IngressMessage::RemovePeer(ufrag)).await
     }
 }

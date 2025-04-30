@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use str0m::{Event, Input, Output, Rtc, RtcError, error::SdpError, net};
@@ -8,8 +8,8 @@ use tokio::{
 };
 
 use crate::{
-    controller::Group,
     egress::EgressHandle,
+    group::GroupHandle,
     message::{self, EgressUDPPacket, PeerId},
 };
 
@@ -29,7 +29,7 @@ pub enum PeerMessage {
 
 pub struct PeerActor {
     egress: EgressHandle,
-    group: Group,
+    group: GroupHandle,
     peer_id: Arc<PeerId>,
     rtc: str0m::Rtc,
 }
@@ -109,15 +109,18 @@ impl PeerActor {
                 // Events are mainly incoming media data from the remote
                 // peer, but also data channel data and statistics.
                 Output::Event(v) => {
-                    // Abort if we disconnect.
-                    if v == Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected)
-                    {
-                        return None;
+                    match v {
+                        // Abort if we disconnect.
+                        Event::IceConnectionStateChange(
+                            str0m::IceConnectionState::Disconnected,
+                        ) => return None,
+                        Event::MediaAdded(e) => todo!(),
+                        Event::MediaData(e) => {
+                            todo!()
+                        }
+
+                        _ => continue,
                     }
-
-                    // TODO: handle more cases of v here, such as incoming media data.
-
-                    continue;
                 }
             };
 
@@ -144,7 +147,7 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn spawn(egress: EgressHandle, group: Group, peer_id: Arc<PeerId>, rtc: Rtc) -> Self {
+    pub fn spawn(egress: EgressHandle, group: GroupHandle, peer_id: Arc<PeerId>, rtc: Rtc) -> Self {
         let actor = PeerActor {
             egress,
             group,

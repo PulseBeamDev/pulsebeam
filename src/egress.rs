@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{self, error::TrySendError},
+    task::JoinHandle,
 };
 
 use crate::message;
@@ -37,11 +38,12 @@ pub struct EgressHandle {
 }
 
 impl EgressHandle {
-    pub fn spawn(socket: Arc<UdpSocket>) -> Self {
+    pub fn spawn(socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(8);
         let actor = EgressActor { socket };
-        tokio::spawn(actor.run(receiver));
-        Self { sender }
+        let join = tokio::spawn(actor.run(receiver));
+        let handle = Self { sender };
+        (handle, join)
     }
 
     pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<EgressMessage>> {
