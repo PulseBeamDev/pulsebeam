@@ -3,10 +3,9 @@ use std::sync::Arc;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{self, error::TrySendError},
-    task::JoinHandle,
 };
 
-use crate::message;
+use crate::message::{self, ActorResult};
 
 #[derive(Debug)]
 pub enum EgressMessage {
@@ -15,11 +14,12 @@ pub enum EgressMessage {
 
 pub struct EgressActor {
     socket: Arc<UdpSocket>,
+    receiver: mpsc::Receiver<EgressMessage>,
 }
 
 impl EgressActor {
-    async fn run(self, mut receiver: mpsc::Receiver<EgressMessage>) {
-        while let Some(msg) = receiver.recv().await {
+    pub async fn run(mut self) -> ActorResult {
+        while let Some(msg) = self.receiver.recv().await {
             match msg {
                 EgressMessage::UdpPacket(packet) => {
                     let res = self.socket.send_to(&packet.raw, &packet.dst).await;
@@ -29,6 +29,7 @@ impl EgressActor {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -38,12 +39,11 @@ pub struct EgressHandle {
 }
 
 impl EgressHandle {
-    pub fn spawn(socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
+    pub fn new(socket: Arc<UdpSocket>) -> (Self, EgressActor) {
         let (sender, receiver) = mpsc::channel(8);
-        let actor = EgressActor { socket };
-        let join = tokio::spawn(actor.run(receiver));
         let handle = Self { sender };
-        (handle, join)
+        let actor = EgressActor { socket, receiver };
+        (handle, actor)
     }
 
     pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<EgressMessage>> {

@@ -22,6 +22,14 @@ pub struct EgressUDPPacket {
     pub dst: SocketAddr,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ActorError {
+    #[error("unknown error: {0}")]
+    Unknown(String),
+}
+
+pub type ActorResult = Result<(), ActorError>;
+
 #[derive(Debug, Error)]
 pub enum IdValidationError {
     #[error("ID exceeds maximum length of {0} characters")]

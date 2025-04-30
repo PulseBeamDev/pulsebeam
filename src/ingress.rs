@@ -1,6 +1,10 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use crate::{ice, message::UDPPacket, peer::PeerHandle};
+use crate::{
+    ice,
+    message::{ActorResult, UDPPacket},
+    peer::PeerHandle,
+};
 use bytes::Bytes;
 use tokio::{
     net::UdpSocket,
@@ -14,6 +18,7 @@ pub enum IngressMessage {
 }
 
 pub struct IngressActor {
+    receiver: mpsc::Receiver<IngressMessage>,
     local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     conns: HashMap<String, PeerHandle>,
@@ -22,7 +27,7 @@ pub struct IngressActor {
 }
 
 impl IngressActor {
-    pub async fn run(mut self, mut receiver: mpsc::Receiver<IngressMessage>) {
+    pub async fn run(mut self) -> ActorResult {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
 
@@ -40,7 +45,7 @@ impl IngressActor {
                     }
                 }
 
-                msg = receiver.recv() => {
+                msg = self.receiver.recv() => {
                     match msg {
                         Some(msg) => self.handle_control(msg),
                         None => {
@@ -53,6 +58,7 @@ impl IngressActor {
         }
 
         tracing::info!("ingress has exited");
+        Ok(())
     }
 
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
@@ -90,6 +96,7 @@ impl IngressActor {
     pub fn handle_control(&mut self, msg: IngressMessage) {
         match msg {
             IngressMessage::AddPeer(ufrag, peer) => {
+                tracing::trace!("added {ufrag} to connection map");
                 self.conns.insert(ufrag, peer);
             }
             IngressMessage::RemovePeer(ufrag) => {
@@ -110,18 +117,18 @@ pub struct IngressHandle {
 }
 
 impl IngressHandle {
-    pub fn spawn(local_addr: SocketAddr, socket: Arc<UdpSocket>) -> (Self, JoinHandle<()>) {
+    pub fn new(local_addr: SocketAddr, socket: Arc<UdpSocket>) -> (Self, IngressActor) {
+        let (sender, receiver) = mpsc::channel(1);
+        let handle = Self { sender };
         let actor = IngressActor {
+            receiver,
             local_addr,
             socket,
             conns: HashMap::new(),
             mapping: HashMap::new(),
             reverse: HashMap::new(),
         };
-        let (sender, receiver) = mpsc::channel(1);
-        let join = tokio::spawn(actor.run(receiver));
-        let handle = Self { sender };
-        (handle, join)
+        (handle, actor)
     }
 
     pub async fn add_peer(

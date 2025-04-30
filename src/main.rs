@@ -10,7 +10,8 @@ use std::{
 };
 
 use pulsebeam::{
-    controller::ControllerHandle, egress::EgressHandle, ingress::IngressHandle, signaling,
+    controller::ControllerHandle, egress::EgressHandle, ingress::IngressHandle,
+    message::ActorError, signaling,
 };
 use systemstat::{Platform, System};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -38,15 +39,25 @@ async fn main() {
         .expect("bind to udp socket");
     let socket = Arc::new(socket);
 
-    let (ingress, ingress_join) = IngressHandle::spawn(local_addr, socket.clone());
-    let (egress, egress_join) = EgressHandle::spawn(socket.clone());
-    let (controller, controller_join) = ControllerHandle::spawn(ingress, egress);
+    let (ingress_handle, ingress_actor) = IngressHandle::new(local_addr, socket.clone());
+    let (egress_handle, egress_actor) = EgressHandle::new(socket.clone());
+    let (controller_handle, controller_actor) =
+        ControllerHandle::new(ingress_handle, egress_handle);
 
-    let router = signaling::router(controller).layer(cors);
+    let router = signaling::router(controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    let signaling_join = tokio::spawn(async move { axum::serve(listener, router) });
+    let signaling = async move {
+        axum::serve(listener, router)
+            .await
+            .map_err(|err| ActorError::Unknown(err.to_string()))
+    };
 
-    let res = tokio::try_join!(ingress_join, egress_join, controller_join, signaling_join);
+    let res = tokio::try_join!(
+        ingress_actor.run(),
+        egress_actor.run(),
+        controller_actor.run(),
+        signaling,
+    );
     if let Err(err) = res {
         tracing::error!("pipeline ended with an error: {err}")
     }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use str0m::{Event, Input, Output, Rtc, RtcError, error::SdpError, net};
@@ -28,6 +28,7 @@ pub enum PeerMessage {
 }
 
 pub struct PeerActor {
+    receiver: mpsc::Receiver<PeerMessage>,
     egress: EgressHandle,
     group: GroupHandle,
     peer_id: Arc<PeerId>,
@@ -35,7 +36,7 @@ pub struct PeerActor {
 }
 
 impl PeerActor {
-    async fn run(mut self, mut receiver: mpsc::Receiver<PeerMessage>) {
+    pub async fn run(mut self) {
         // TODO: notify ingress to add self to the routing table
 
         loop {
@@ -50,7 +51,7 @@ impl PeerActor {
                 // prioritze network inputs
                 biased;
 
-                msg = receiver.recv() => {
+                msg = self.receiver.recv() => {
                     match msg {
                         Some(msg) => self.handle_message(msg),
                         None => break,
@@ -147,16 +148,22 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn spawn(egress: EgressHandle, group: GroupHandle, peer_id: Arc<PeerId>, rtc: Rtc) -> Self {
+    pub fn new(
+        egress: EgressHandle,
+        group: GroupHandle,
+        peer_id: Arc<PeerId>,
+        rtc: Rtc,
+    ) -> (Self, PeerActor) {
+        let (sender, receiver) = mpsc::channel(8);
+        let handle = Self { sender };
         let actor = PeerActor {
+            receiver,
             egress,
             group,
             peer_id,
             rtc,
         };
-        let (sender, receiver) = mpsc::channel(8);
-        tokio::spawn(actor.run(receiver));
-        Self { sender }
+        (handle, actor)
     }
 
     pub fn forward(&self, msg: message::UDPPacket) -> Result<(), TrySendError<PeerMessage>> {

@@ -4,13 +4,13 @@ use crate::{
     egress::EgressHandle,
     group::GroupHandle,
     ingress::IngressHandle,
-    message::{GroupId, PeerId},
+    message::{ActorResult, GroupId, PeerId},
     peer::PeerHandle,
 };
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{
     sync::{mpsc, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -44,20 +44,23 @@ pub struct ControllerActor {
     handle: ControllerHandle,
     ingress: IngressHandle,
     egress: EgressHandle,
+    receiver: mpsc::Receiver<ControllerMessage>,
     groups: HashMap<Arc<GroupId>, GroupHandle>,
 
     local_addrs: Vec<SocketAddr>,
+    children: JoinSet<()>,
 }
 
 impl ControllerActor {
-    pub async fn run(mut self, mut receiver: mpsc::Receiver<ControllerMessage>) {
-        while let Some(msg) = receiver.recv().await {
+    pub async fn run(mut self) -> ActorResult {
+        while let Some(msg) = self.receiver.recv().await {
             match msg {
                 ControllerMessage::Allocate(group_id, peer_id, offer, resp) => {
-                    resp.send(self.allocate(group_id, peer_id, offer).await);
+                    let _ = resp.send(self.allocate(group_id, peer_id, offer).await);
                 }
             }
         }
+        Ok(())
     }
 
     pub async fn allocate(
@@ -88,23 +91,45 @@ impl ControllerActor {
         let group_handle = if let Some(handle) = self.groups.get(&group_id) {
             handle.clone()
         } else {
-            let (handle, join) = GroupHandle::spawn(self.handle.clone(), group_id.clone());
+            let (handle, actor) = GroupHandle::new(self.handle.clone(), group_id.clone());
+            // TODO: handle shutdown
+            self.children.spawn(actor.run());
+
             self.groups.insert(group_id, handle.clone());
-            // TODO: handle join
             handle
         };
 
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let peer_id = Arc::new(peer_id);
-        let peer = PeerHandle::spawn(
+        let (peer_handle, peer_actor) = PeerHandle::new(
             self.egress.clone(),
             group_handle.clone(),
             peer_id.clone(),
             rtc,
         );
-        group_handle.add_peer(peer.clone());
-        tracing::trace!("added {ufrag} to connection map");
-        self.ingress.add_peer(ufrag, peer);
+
+        {
+            let ingress = self.ingress.clone();
+            let ufrag = ufrag.clone();
+            let group = group_handle.clone();
+            let peer = peer_handle.clone();
+
+            self.children.spawn(async move {
+                peer_actor.run().await;
+                ingress.remove_peer(ufrag).await;
+                group.remove_peer(peer).await;
+            });
+        }
+
+        // group and peers will self-monitor and hit a timeout to cleanup itself
+        group_handle
+            .add_peer(peer_handle.clone())
+            .await
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
+        self.ingress
+            .add_peer(ufrag, peer_handle)
+            .await
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
 
         Ok(answer.to_sdp_string())
     }
@@ -116,19 +141,20 @@ pub struct ControllerHandle {
 }
 
 impl ControllerHandle {
-    pub fn spawn(ingress: IngressHandle, egress: EgressHandle) -> (Self, JoinHandle<()>) {
+    pub fn new(ingress: IngressHandle, egress: EgressHandle) -> (Self, ControllerActor) {
         let (sender, receiver) = mpsc::channel(1);
         let handle = ControllerHandle { sender };
 
         let actor = ControllerActor {
             handle: handle.clone(),
+            receiver,
             ingress,
             egress,
             groups: HashMap::new(),
             local_addrs: Vec::new(),
+            children: JoinSet::new(),
         };
-        let join = tokio::spawn(actor.run(receiver));
-        (handle, join)
+        (handle, actor)
     }
 
     pub async fn allocate(
