@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt::Display, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use str0m::{Event, Input, Output, Rtc, RtcError, error::SdpError, net};
@@ -144,7 +144,8 @@ impl PeerActor {
 
 #[derive(Clone, Debug)]
 pub struct PeerHandle {
-    sender: mpsc::Sender<PeerMessage>,
+    pub sender: mpsc::Sender<PeerMessage>,
+    pub peer_id: Arc<PeerId>,
 }
 
 impl PeerHandle {
@@ -155,7 +156,10 @@ impl PeerHandle {
         rtc: Rtc,
     ) -> (Self, PeerActor) {
         let (sender, receiver) = mpsc::channel(8);
-        let handle = Self { sender };
+        let handle = Self {
+            sender,
+            peer_id: peer_id.clone(),
+        };
         let actor = PeerActor {
             receiver,
             egress,
@@ -168,5 +172,11 @@ impl PeerHandle {
 
     pub fn forward(&self, msg: message::UDPPacket) -> Result<(), TrySendError<PeerMessage>> {
         self.sender.try_send(PeerMessage::UdpPacket(msg))
+    }
+}
+
+impl Display for PeerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.peer_id.as_str())
     }
 }

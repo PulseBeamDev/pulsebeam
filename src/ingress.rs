@@ -9,7 +9,6 @@ use bytes::Bytes;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{self, error::SendError},
-    task::JoinHandle,
 };
 
 pub enum IngressMessage {
@@ -63,12 +62,13 @@ impl IngressActor {
 
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
         let peer_handle = if let Some(peer_handle) = self.mapping.get(&source) {
-            tracing::trace!("found connection from mapping: {source}");
+            tracing::trace!("found connection from mapping: {source} -> {peer_handle}");
             peer_handle.clone()
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
-            tracing::trace!("found {ufrag} in STUN packet: {:?}", self.conns);
             if let Some(peer_handle) = self.conns.get(ufrag) {
-                tracing::trace!("found connection from ufrag: {ufrag} -> {source}");
+                tracing::trace!(
+                    "found connection from ufrag: {ufrag} -> {source} -> {peer_handle}"
+                );
                 self.mapping.insert(source, peer_handle.clone());
                 self.reverse
                     .entry(ufrag.to_string())

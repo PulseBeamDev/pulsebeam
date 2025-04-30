@@ -10,7 +10,7 @@ use crate::{
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{
     sync::{mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
+    task::JoinSet,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -141,7 +141,11 @@ pub struct ControllerHandle {
 }
 
 impl ControllerHandle {
-    pub fn new(ingress: IngressHandle, egress: EgressHandle) -> (Self, ControllerActor) {
+    pub fn new(
+        ingress: IngressHandle,
+        egress: EgressHandle,
+        local_addrs: Vec<SocketAddr>,
+    ) -> (Self, ControllerActor) {
         let (sender, receiver) = mpsc::channel(1);
         let handle = ControllerHandle { sender };
 
@@ -151,7 +155,7 @@ impl ControllerHandle {
             ingress,
             egress,
             groups: HashMap::new(),
-            local_addrs: Vec::new(),
+            local_addrs,
             children: JoinSet::new(),
         };
         (handle, actor)

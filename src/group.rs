@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use tokio::sync::mpsc::{self, error::SendError};
 
@@ -32,10 +32,12 @@ impl GroupActor {
         }
     }
 
-    async fn handle_message(&self, mut msg: GroupMessage) {
+    async fn handle_message(&mut self, mut msg: GroupMessage) {
         match msg {
+            GroupMessage::AddPeer(peer) => self.peers.insert(peer.peer_id.clone(), peer),
+            GroupMessage::RemovePeer(peer_id) => self.peers.remove(&peer_id),
             _ => todo!(),
-        }
+        };
     }
 }
 
@@ -68,5 +70,11 @@ impl GroupHandle {
 
     pub async fn remove_peer(&self, peer: PeerHandle) -> Result<(), SendError<GroupMessage>> {
         self.sender.send(GroupMessage::AddPeer(peer)).await
+    }
+}
+
+impl Display for GroupHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.group_id.as_str())
     }
 }

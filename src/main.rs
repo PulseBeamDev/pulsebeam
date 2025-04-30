@@ -42,7 +42,7 @@ async fn main() {
     let (ingress_handle, ingress_actor) = IngressHandle::new(local_addr, socket.clone());
     let (egress_handle, egress_actor) = EgressHandle::new(socket.clone());
     let (controller_handle, controller_actor) =
-        ControllerHandle::new(ingress_handle, egress_handle);
+        ControllerHandle::new(ingress_handle, egress_handle, vec![local_addr]);
 
     let router = signaling::router(controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
