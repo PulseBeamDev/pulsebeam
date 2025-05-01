@@ -1,3 +1,5 @@
+import * as sfu from "./sfu.ts";
+
 async function start() {
   const pc = new RTCPeerConnection();
   pc.onconnectionstatechange = () => console.log(pc.connectionState);

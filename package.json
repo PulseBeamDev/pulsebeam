@@ -1,0 +1,25 @@
+{
+  "name": "pulsebeam",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "proto": "protoc --ts_out . --proto_path proto proto/sfu.proto",
+    "dev": "vite"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PulseBeamDev/pulsebeam.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/PulseBeamDev/pulsebeam/issues"
+  },
+  "homepage": "https://github.com/PulseBeamDev/pulsebeam#readme",
+  "description": "",
+  "devDependencies": {
+    "@protobuf-ts/plugin": "^2.10.0",
+    "vite": "^6.3.4"
+  }
+}
