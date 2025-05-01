@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+// protocol between the client and server via a data channel 
+package sfu;
+
+message ClientMessage {
+  oneof message {
+    // client is always impolite
+    RenegotiationOffer offer = 1;
+  }
+}
+
+message ServerMessage {
+  oneof message {
+    RenegotiationOffer offer = 1;
+    RenegotiationAnswer answer = 2;
+  }
+}
+
+message RenegotiationOffer {
+  string sdp = 1;
+}
+
+message RenegotiationAnswer {
+  string sdp = 1;
+}

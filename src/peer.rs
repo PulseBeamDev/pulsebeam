@@ -9,7 +9,7 @@ use bytes::Bytes;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     error::SdpError,
-    media::{MediaAdded, MediaData},
+    media::{Direction, MediaAdded, MediaData},
     net,
 };
 use tokio::{
@@ -19,7 +19,7 @@ use tokio::{
 
 use crate::{
     egress::EgressHandle,
-    group::GroupHandle,
+    group::{GroupHandle, GroupMessage},
     message::{self, EgressUDPPacket, MediaKey, PeerId},
 };
 
@@ -35,11 +35,13 @@ pub enum PeerError {
 #[derive(Debug)]
 pub enum PeerMessage {
     UdpPacket(message::UDPPacket),
-    PublishMedia(MediaKey, MediaAdded),
+    PublishMedia(MediaKey, Arc<MediaAdded>),
+    SubscribeMedia(MediaKey, Arc<MediaAdded>),
     ForwardMedia(MediaKey, Arc<MediaData>),
 }
 
 pub struct PeerActor {
+    handle: PeerHandle,
     receiver: mpsc::Receiver<PeerMessage>,
     egress: EgressHandle,
     group: GroupHandle,
@@ -65,7 +67,7 @@ impl PeerActor {
 
                 msg = self.receiver.recv() => {
                     match msg {
-                        Some(msg) => self.handle_message(msg),
+                        Some(msg) => self.handle_message(msg).await,
                         None => break,
                     }
                 }
@@ -80,7 +82,7 @@ impl PeerActor {
     }
 
     #[inline]
-    fn handle_message(&mut self, msg: PeerMessage) {
+    async fn handle_message(&mut self, msg: PeerMessage) {
         match msg {
             PeerMessage::UdpPacket(packet) => {
                 let now = Instant::now();
@@ -94,6 +96,25 @@ impl PeerActor {
                     },
                 ));
             }
+            PeerMessage::PublishMedia(key, media) => {
+                // TODO: selective based on the client instead of auto subscribing
+
+                self.group
+                    .sender
+                    .send(GroupMessage::SubscribeMedia(key, self.handle.clone()))
+                    .await;
+            }
+            PeerMessage::SubscribeMedia(key, media) => {
+                let mut sdp = self.rtc.sdp_api();
+                let mid = sdp.add_media(
+                    media.kind,
+                    Direction::SendOnly,
+                    Some(key.peer_id.to_string()),
+                    None,
+                    None,
+                );
+            }
+            PeerMessage::ForwardMedia(key, data) => {}
         }
     }
 
@@ -127,7 +148,20 @@ impl PeerActor {
                         Event::IceConnectionStateChange(
                             str0m::IceConnectionState::Disconnected,
                         ) => return None,
-                        Event::MediaAdded(e) => self.publish_media(e).await,
+                        Event::MediaAdded(e) => {
+                            // TODO: handle back pressure by buffering temporarily
+                            self.group
+                                .sender
+                                .send(crate::group::GroupMessage::PublishMedia(
+                                    MediaKey {
+                                        peer_id: self.peer_id.clone(),
+                                        mid: e.mid,
+                                    },
+                                    Arc::new(e),
+                                ))
+                                .await;
+                        }
+                        Event::ChannelOpen(cid, label) => {}
                         Event::MediaData(e) => {
                             todo!()
                         }
@@ -152,17 +186,6 @@ impl PeerActor {
             return Some(duration);
         }
     }
-
-    async fn publish_media(&self, media: MediaAdded) {
-        // TODO: handle back pressure by buffering temporarily
-        self.group
-            .sender
-            .send(crate::group::GroupMessage::PublishMedia(
-                self.peer_id.clone(),
-                media,
-            ))
-            .await;
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +207,7 @@ impl PeerHandle {
             peer_id: peer_id.clone(),
         };
         let actor = PeerActor {
+            handle: handle.clone(),
             receiver,
             egress,
             group,
@@ -217,3 +241,15 @@ impl PartialEq for PeerHandle {
 }
 
 impl Eq for PeerHandle {}
+
+impl PartialOrd for PeerHandle {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PeerHandle {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.peer_id.as_str().cmp(other.peer_id.as_str())
+    }
+}

@@ -24,5 +24,9 @@ systemstat = "0.2.4"
 tower-http = { version = "0.6.2", features = ["cors"] }
 hex = "0.4.3"
 jemallocator = "0.5.4"
+prost = "0.13.5"
 
 [dev-dependencies]
+
+[build-dependencies]
+prost-build = "0.13.5"

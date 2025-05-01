@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     fmt::Display,
     sync::Arc,
 };
@@ -15,11 +15,11 @@ use crate::{
 
 #[derive(Debug)]
 pub enum GroupMessage {
-    PublishMedia(MediaKey, MediaAdded),
+    PublishMedia(MediaKey, Arc<MediaAdded>),
+    UnpublishMedia(MediaKey),
+    SubscribeMedia(MediaKey, PeerHandle),
+    UnsubscribeMedia(MediaKey, PeerHandle),
     ForwardMedia(MediaKey, Arc<MediaData>),
-    UnpublishTrack,
-    SubscribeTrack,
-    UnsubscribeTrack,
     AddPeer(PeerHandle),
     RemovePeer(Arc<PeerId>),
 }
@@ -31,7 +31,7 @@ pub struct GroupActor {
     handle: GroupHandle,
     peers: HashMap<Arc<PeerId>, PeerHandle>,
 
-    medias: HashMap<MediaKey, MediaAdded>,
+    medias: HashMap<MediaKey, Arc<MediaAdded>>,
     subscriptions: HashMap<MediaKey, BTreeSet<PeerHandle>>,
 }
 
@@ -49,19 +49,40 @@ impl GroupActor {
             }
             GroupMessage::RemovePeer(peer_id) => {
                 self.peers.remove(&peer_id);
+                // TODO: clean up subscriptions and published medias
             }
             GroupMessage::PublishMedia(key, media) => {
-                self.medias.insert(key, media);
-                todo!("forward based on subscriptions");
+                self.medias.insert(key.clone(), media.clone());
+                for (_, peer) in self.peers.iter() {
+                    if peer.peer_id == key.peer_id {
+                        continue;
+                    }
+                    peer.sender
+                        .send(PeerMessage::PublishMedia(key.clone(), media.clone()))
+                        .await;
+                }
+            }
+            GroupMessage::SubscribeMedia(key, peer) => {
+                self.subscriptions.entry(key).or_default().insert(peer);
+            }
+            GroupMessage::UnsubscribeMedia(key, peer) => {
+                if let Some(e) = self.subscriptions.get_mut(&key) {
+                    e.remove(&peer);
+
+                    if e.is_empty() {
+                        self.subscriptions.remove(&key);
+                    }
+                }
             }
             GroupMessage::ForwardMedia(key, data) => {
+                // TODO: separate control vs data loop
                 if let Some(interests) = self.subscriptions.get(&key) {
                     for interest in interests.iter() {
-                        if let Err(res) = interest
+                        if let Err(err) = interest
                             .sender
                             .try_send(PeerMessage::ForwardMedia(key.clone(), data.clone()))
                         {
-                            tracing::warn!("dropping a media data to {interest}");
+                            tracing::warn!("dropping a media data to {interest}: {err}");
                         }
                     }
                 }
@@ -91,6 +112,7 @@ impl GroupHandle {
             handle: handle.clone(),
             peers: HashMap::new(),
             medias: HashMap::new(),
+            subscriptions: HashMap::new(),
         };
         (handle, actor)
     }

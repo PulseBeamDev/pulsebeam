@@ -5,4 +5,5 @@ pub mod ice;
 pub mod ingress;
 pub mod message;
 pub mod peer;
+pub mod proto;
 pub mod signaling;
