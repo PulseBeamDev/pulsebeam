@@ -9,8 +9,8 @@ pub mod client_message {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Message {
         /// client is always impolite
-        #[prost(message, tag = "1")]
-        Offer(super::RenegotiationOffer),
+        #[prost(string, tag = "1")]
+        Offer(::prost::alloc::string::String),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -22,19 +22,9 @@ pub struct ServerMessage {
 pub mod server_message {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Message {
-        #[prost(message, tag = "1")]
-        Offer(super::RenegotiationOffer),
-        #[prost(message, tag = "2")]
-        Answer(super::RenegotiationAnswer),
+        #[prost(string, tag = "1")]
+        Offer(::prost::alloc::string::String),
+        #[prost(string, tag = "2")]
+        Answer(::prost::alloc::string::String),
     }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RenegotiationOffer {
-    #[prost(string, tag = "1")]
-    pub sdp: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RenegotiationAnswer {
-    #[prost(string, tag = "1")]
-    pub sdp: ::prost::alloc::string::String,
 }

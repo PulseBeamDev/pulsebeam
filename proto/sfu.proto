@@ -6,21 +6,13 @@ package sfu;
 message ClientMessage {
   oneof message {
     // client is always impolite
-    RenegotiationOffer offer = 1;
+    string offer = 1;
   }
 }
 
 message ServerMessage {
   oneof message {
-    RenegotiationOffer offer = 1;
-    RenegotiationAnswer answer = 2;
+    string offer = 1;
+    string answer = 2;
   }
-}
-
-message RenegotiationOffer {
-  string sdp = 1;
-}
-
-message RenegotiationAnswer {
-  string sdp = 1;
 }

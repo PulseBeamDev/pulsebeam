@@ -6,8 +6,11 @@ use std::{
 };
 
 use bytes::Bytes;
+use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
+    change::SdpOffer,
+    channel::{ChannelData, ChannelId},
     error::SdpError,
     media::{Direction, MediaAdded, MediaData},
     net,
@@ -21,15 +24,30 @@ use crate::{
     egress::EgressHandle,
     group::{GroupHandle, GroupMessage},
     message::{self, EgressUDPPacket, MediaKey, PeerId},
+    proto,
 };
+
+const DATA_CHANNEL_LABEL: &str = "pulsebeam::sfu";
 
 #[derive(thiserror::Error, Debug)]
 pub enum PeerError {
-    #[error("invalid sdp offer format")]
+    #[error("invalid sdp offer format: {0}")]
     InvalidOfferFormat(#[from] SdpError),
 
     #[error(transparent)]
     OfferRejected(RtcError),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RPCError {
+    #[error("invalid rpc format: {0}")]
+    InvalidRPCFormat(#[from] DecodeError),
+
+    #[error("invalid sdp offer format: {0}")]
+    InvalidOfferFormat(#[from] SdpError),
+
+    #[error(transparent)]
+    OfferRejected(#[from] RtcError),
 }
 
 #[derive(Debug)]
@@ -47,6 +65,7 @@ pub struct PeerActor {
     group: GroupHandle,
     peer_id: Arc<PeerId>,
     rtc: str0m::Rtc,
+    cid: Option<ChannelId>,
 }
 
 impl PeerActor {
@@ -161,9 +180,27 @@ impl PeerActor {
                                 ))
                                 .await;
                         }
-                        Event::ChannelOpen(cid, label) => {}
+                        Event::ChannelOpen(cid, label) => {
+                            if label == DATA_CHANNEL_LABEL {
+                                self.cid = Some(cid);
+                            }
+                        }
+                        Event::ChannelData(data) => {
+                            if Some(data.id) == self.cid {
+                                self.handle_rpc(data);
+                            } else {
+                                todo!("forward data channel");
+                            }
+                        }
+                        Event::ChannelClose(cid) => {
+                            if Some(cid) == self.cid {
+                                self.rtc.disconnect();
+                            } else {
+                                todo!("forward data channel");
+                            }
+                        }
                         Event::MediaData(e) => {
-                            todo!()
+                            todo!();
                         }
 
                         _ => continue,
@@ -185,6 +222,34 @@ impl PeerActor {
 
             return Some(duration);
         }
+    }
+
+    fn handle_rpc(&mut self, data: ChannelData) -> Result<(), RPCError> {
+        use proto::sfu::client_message as client;
+        use proto::sfu::server_message as server;
+
+        let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())
+            .map_err(RPCError::InvalidRPCFormat)?;
+
+        let reply: server::Message = match msg.message {
+            Some(client::Message::Offer(sdp)) => {
+                let offer =
+                    SdpOffer::from_sdp_string(&sdp).map_err(RPCError::InvalidOfferFormat)?;
+                let answer = self.rtc.sdp_api().accept_offer(offer)?;
+                server::Message::Answer(answer.to_sdp_string())
+            }
+            _ => todo!(),
+        };
+
+        // TODO: handle when data channel is closed
+        if let Some(mut ch) = self.rtc.channel(data.id) {
+            let encoded = proto::sfu::ServerMessage {
+                message: Some(reply),
+            }
+            .encode_to_vec();
+            ch.write(true, encoded.as_slice());
+        }
+        Ok(())
     }
 }
 
@@ -213,6 +278,7 @@ impl PeerHandle {
             group,
             peer_id,
             rtc,
+            cid: None,
         };
         (handle, actor)
     }
