@@ -27,6 +27,9 @@ use crate::{
     proto,
 };
 
+use proto::sfu::client_message as client;
+use proto::sfu::server_message as server;
+
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::sfu";
 
 #[derive(thiserror::Error, Debug)]
@@ -36,18 +39,9 @@ pub enum PeerError {
 
     #[error(transparent)]
     OfferRejected(RtcError),
-}
 
-#[derive(thiserror::Error, Debug)]
-pub enum RPCError {
     #[error("invalid rpc format: {0}")]
     InvalidRPCFormat(#[from] DecodeError),
-
-    #[error("invalid sdp offer format: {0}")]
-    InvalidOfferFormat(#[from] SdpError),
-
-    #[error(transparent)]
-    OfferRejected(#[from] RtcError),
 }
 
 #[derive(Debug)]
@@ -125,13 +119,14 @@ impl PeerActor {
             }
             PeerMessage::SubscribeMedia(key, media) => {
                 let mut sdp = self.rtc.sdp_api();
-                let mid = sdp.add_media(
+                sdp.add_media(
                     media.kind,
                     Direction::SendOnly,
                     Some(key.peer_id.to_string()),
                     None,
                     None,
                 );
+                self.handle_renegotiate();
             }
             PeerMessage::ForwardMedia(key, data) => {}
         }
@@ -187,7 +182,9 @@ impl PeerActor {
                         }
                         Event::ChannelData(data) => {
                             if Some(data.id) == self.cid {
-                                self.handle_rpc(data);
+                                if let Err(err) = self.handle_rpc(data) {
+                                    tracing::warn!("data channel dropped due to an error: {err}");
+                                }
                             } else {
                                 todo!("forward data channel");
                             }
@@ -200,11 +197,19 @@ impl PeerActor {
                             }
                         }
                         Event::MediaData(e) => {
-                            todo!();
+                            let key = MediaKey {
+                                peer_id: self.peer_id.clone(),
+                                mid: e.mid,
+                            };
+                            self.group
+                                .sender
+                                .send(GroupMessage::ForwardMedia(key, Arc::new(e)))
+                                .await;
                         }
 
-                        _ => continue,
+                        _ => todo!(),
                     }
+                    continue;
                 }
             };
 
@@ -224,32 +229,50 @@ impl PeerActor {
         }
     }
 
-    fn handle_rpc(&mut self, data: ChannelData) -> Result<(), RPCError> {
-        use proto::sfu::client_message as client;
-        use proto::sfu::server_message as server;
-
+    fn handle_rpc(&mut self, data: ChannelData) -> Result<(), PeerError> {
         let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())
-            .map_err(RPCError::InvalidRPCFormat)?;
+            .map_err(PeerError::InvalidRPCFormat)?;
 
-        let reply: server::Message = match msg.message {
+        match msg.message {
             Some(client::Message::Offer(sdp)) => {
-                let offer =
-                    SdpOffer::from_sdp_string(&sdp).map_err(RPCError::InvalidOfferFormat)?;
-                let answer = self.rtc.sdp_api().accept_offer(offer)?;
-                server::Message::Answer(answer.to_sdp_string())
+                self.handle_offer(sdp)?;
             }
             _ => todo!(),
         };
+        Ok(())
+    }
 
+    fn send_server_event(&mut self, msg: proto::sfu::server_message::Message) {
         // TODO: handle when data channel is closed
-        if let Some(mut ch) = self.rtc.channel(data.id) {
-            let encoded = proto::sfu::ServerMessage {
-                message: Some(reply),
-            }
-            .encode_to_vec();
+
+        if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
+            let encoded = proto::sfu::ServerMessage { message: Some(msg) }.encode_to_vec();
             ch.write(true, encoded.as_slice());
         }
+    }
+
+    fn handle_offer(&mut self, offer: String) -> Result<(), PeerError> {
+        let offer = SdpOffer::from_sdp_string(&offer).map_err(PeerError::InvalidOfferFormat)?;
+        let answer = self
+            .rtc
+            .sdp_api()
+            .accept_offer(offer)
+            .map_err(PeerError::OfferRejected)?;
+        self.send_server_event(server::Message::Answer(answer.to_sdp_string()));
         Ok(())
+    }
+
+    fn handle_renegotiate(&mut self) {
+        let sdp = self.rtc.sdp_api();
+        if !sdp.has_changes() {
+            return;
+        }
+
+        let Some((offer, pending)) = sdp.apply() else {
+            return;
+        };
+
+        self.send_server_event(server::Message::Answer(offer.to_sdp_string()));
     }
 }
 
