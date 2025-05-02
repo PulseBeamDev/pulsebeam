@@ -25,7 +25,7 @@ use crate::{
     egress::EgressHandle,
     group::{GroupHandle, GroupMessage},
     ingress::IngressHandle,
-    message::{self, EgressUDPPacket, PeerId, TrackKey},
+    message::{self, EgressUDPPacket, PeerId, TrackIn, TrackKey},
     proto,
     track::TrackHandle,
 };
@@ -149,7 +149,6 @@ impl PeerActor {
             }
             PeerMessage::ForwardMedia(key, data) => {
                 // forwarded media from track
-                self.rtc.writer(mid)
             }
         }
     }
@@ -209,14 +208,17 @@ impl PeerActor {
                             }
                         }
                         Event::MediaData(e) => {
-                            let key = MediaKey {
-                                peer_id: self.peer_id.clone(),
+                            let key = TrackKey {
+                                origin: self.peer_id.clone(),
                                 mid: e.mid,
                             };
-                            self.group
-                                .sender
-                                .send(GroupMessage::ForwardMedia(key, Arc::new(e)))
-                                .await;
+
+                            if let Some(track) = self.published_tracks.get(&e.mid) {
+                                todo!();
+                                // track
+                                //     .send(GroupMessage::ForwardMedia(key, Arc::new(e)))
+                                //     .await;
+                            }
                         }
 
                         _ => todo!(),
@@ -268,11 +270,12 @@ impl PeerActor {
         self.group
             .sender
             .send(crate::group::GroupMessage::PublishMedia(
-                MediaKey {
-                    peer_id: self.peer_id.clone(),
+                self.peer_id.clone(),
+                TrackIn {
+                    kind: media.kind,
                     mid: media.mid,
+                    simulcast: media.simulcast,
                 },
-                Arc::new(media),
             ))
             .await;
     }
@@ -328,6 +331,8 @@ impl PeerHandle {
             group,
             peer_id,
             rtc,
+            published_tracks: HashMap::new(),
+            subscribed_tracks: HashMap::new(),
             cid: None,
         };
         (handle, actor)

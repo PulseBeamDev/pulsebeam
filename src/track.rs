@@ -1,11 +1,10 @@
 use std::{collections::BTreeMap, panic::AssertUnwindSafe, sync::Arc};
 
 use futures::FutureExt;
-use str0m::media::Mid;
 use tokio::sync::mpsc;
 
 use crate::{
-    message::{ActorId, ActorResult, ActorResultWithId, PeerId, TrackIn},
+    message::{ActorResult, PeerId, TrackIn},
     peer::PeerHandle,
 };
 
@@ -30,19 +29,18 @@ pub struct TrackActor {
 }
 
 impl TrackActor {
-    pub async fn run<I: ActorId>(self, id: I) -> I {
+    pub async fn run(self) {
         match AssertUnwindSafe(self.run_inner()).catch_unwind().await {
             Ok(Ok(())) => {
-                tracing::info!(?id, "track actor exited.");
+                tracing::info!("track actor exited.");
             }
             Ok(Err(err)) => {
-                tracing::warn!(?id, "track actor exited with an error: {err}");
+                tracing::warn!("track actor exited with an error: {err}");
             }
             Err(err) => {
-                tracing::error!(?id, "track actor panicked: {:?}", err);
+                tracing::error!("track actor panicked: {:?}", err);
             }
         };
-        id
     }
 
     async fn run_inner(mut self) -> ActorResult {

@@ -29,10 +29,10 @@ pub struct EgressUDPPacket {
 pub struct TrackIn {
     pub mid: Mid,
     pub kind: MediaKind,
-    pub simulcast: Simulcast,
+    pub simulcast: Option<Simulcast>,
 }
 
-#[derive(Hash, PartialEq, Eq, Debug)]
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct TrackKey {
     pub origin: Arc<PeerId>,
     pub mid: Mid,

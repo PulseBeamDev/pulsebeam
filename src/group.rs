@@ -85,8 +85,11 @@ impl GroupActor {
                 } else {
                     let track = Arc::new(track);
                     let (handle, actor) = TrackHandle::new(origin_handle.clone(), track.clone());
-                    self.track_tasks.spawn(actor.run(key));
-                    self.tracks.insert(key, handle);
+                    self.tracks.insert(key.clone(), handle);
+                    self.track_tasks.spawn(async move {
+                        actor.run().await;
+                        key
+                    });
                 }
             }
             _ => todo!(),
