@@ -1,5 +1,6 @@
 pub mod controller;
 pub mod egress;
+pub mod entity;
 pub mod group;
 pub mod ice;
 pub mod ingress;

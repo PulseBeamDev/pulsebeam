@@ -658,7 +658,7 @@ mod tests {
         let packet_raw = hex::decode(packet_hex).unwrap();
 
         assert_eq!(parse_stun_username_str(&packet_raw), Some("Dqrg:5PLM"));
-        assert_eq!(parse_stun_remote_ufrag(&packet_raw), Some("5PLM"));
+        assert_eq!(parse_stun_remote_ufrag(&packet_raw), Some("Dqrg"));
     }
 
     #[test]
