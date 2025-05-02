@@ -52,6 +52,18 @@ pub enum PeerMessage {
     ForwardMedia(MediaKey, Arc<MediaData>),
 }
 
+/// Reponsibilities:
+/// * Manage Client Signaling
+/// * Manage WebRTC PeerConnection
+/// * Interact with Group
+/// * Process Inbound Media
+/// * Route Published Media to Track actor
+/// * Manage Downlink Congestion Control
+/// * Determine Subscription Layers
+/// * Communicate Layer Preferences to Track actor
+/// * Process Outbound Media from Track actor
+/// * Send Outbound Media to Egress
+/// * Route Subscriber RTCP Feedback to origin via Track actor
 pub struct PeerActor {
     handle: PeerHandle,
     receiver: mpsc::Receiver<PeerMessage>,
@@ -163,17 +175,7 @@ impl PeerActor {
                             str0m::IceConnectionState::Disconnected,
                         ) => return None,
                         Event::MediaAdded(e) => {
-                            // TODO: handle back pressure by buffering temporarily
-                            self.group
-                                .sender
-                                .send(crate::group::GroupMessage::PublishMedia(
-                                    MediaKey {
-                                        peer_id: self.peer_id.clone(),
-                                        mid: e.mid,
-                                    },
-                                    Arc::new(e),
-                                ))
-                                .await;
+                            self.handle_new_media(e).await;
                         }
                         Event::ChannelOpen(cid, label) => {
                             if label == DATA_CHANNEL_LABEL {
@@ -229,6 +231,15 @@ impl PeerActor {
         }
     }
 
+    fn send_server_event(&mut self, msg: proto::sfu::server_message::Message) {
+        // TODO: handle when data channel is closed
+
+        if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
+            let encoded = proto::sfu::ServerMessage { message: Some(msg) }.encode_to_vec();
+            ch.write(true, encoded.as_slice());
+        }
+    }
+
     fn handle_rpc(&mut self, data: ChannelData) -> Result<(), PeerError> {
         let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())
             .map_err(PeerError::InvalidRPCFormat)?;
@@ -242,13 +253,18 @@ impl PeerActor {
         Ok(())
     }
 
-    fn send_server_event(&mut self, msg: proto::sfu::server_message::Message) {
-        // TODO: handle when data channel is closed
-
-        if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
-            let encoded = proto::sfu::ServerMessage { message: Some(msg) }.encode_to_vec();
-            ch.write(true, encoded.as_slice());
-        }
+    async fn handle_new_media(&mut self, media: MediaAdded) {
+        // TODO: handle back pressure by buffering temporarily
+        self.group
+            .sender
+            .send(crate::group::GroupMessage::PublishMedia(
+                MediaKey {
+                    peer_id: self.peer_id.clone(),
+                    mid: media.mid,
+                },
+                Arc::new(media),
+            ))
+            .await;
     }
 
     fn handle_offer(&mut self, offer: String) -> Result<(), PeerError> {

@@ -4,26 +4,38 @@ use std::{
     sync::Arc,
 };
 
-use str0m::media::{MediaAdded, MediaData};
+use str0m::media::{MediaAdded, MediaData, MediaKind, Mid};
 use tokio::sync::mpsc::{self, error::SendError};
 
 use crate::{
     controller::ControllerHandle,
-    message::{GroupId, MediaKey, PeerId},
+    message::{GroupId, PeerId},
     peer::{PeerHandle, PeerMessage},
 };
 
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct TrackIn {
+    pub peer_id: Arc<PeerId>,
+    pub mid: Mid,
+    pub kind: MediaKind,
+}
+
 #[derive(Debug)]
 pub enum GroupMessage {
-    PublishMedia(MediaKey, Arc<MediaAdded>),
+    PublishMedia(Arc<PeerId>, Arc<TrackIn>),
     UnpublishMedia(MediaKey),
-    SubscribeMedia(MediaKey, PeerHandle),
-    UnsubscribeMedia(MediaKey, PeerHandle),
     ForwardMedia(MediaKey, Arc<MediaData>),
     AddPeer(PeerHandle),
     RemovePeer(Arc<PeerId>),
 }
 
+/// Reponsibilities:
+/// * Manage Participant Lifecycle
+/// * Manage Track Lifecycle
+/// * Maintain Group State Registry: Keep an up-to-date list of current participants and available tracks
+/// * Broadcast Group Events
+/// * Mediate Subscriptions: Process subscription requests to tracks
+/// * Own & Supervise Track Actors
 pub struct GroupActor {
     receiver: mpsc::Receiver<GroupMessage>,
     controller: ControllerHandle,

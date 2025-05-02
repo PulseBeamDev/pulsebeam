@@ -24,12 +24,6 @@ pub struct EgressUDPPacket {
     pub dst: SocketAddr,
 }
 
-#[derive(Hash, PartialEq, Eq, Debug, Clone)]
-pub struct MediaKey {
-    pub peer_id: Arc<PeerId>,
-    pub mid: Mid,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum ActorError {
     #[error("unknown error: {0}")]
