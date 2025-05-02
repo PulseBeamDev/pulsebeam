@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
     sync::Arc,
@@ -12,7 +13,7 @@ use str0m::{
     change::SdpOffer,
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{Direction, MediaAdded, MediaData},
+    media::{MediaAdded, MediaData, Mid},
     net,
 };
 use tokio::{
@@ -23,8 +24,10 @@ use tokio::{
 use crate::{
     egress::EgressHandle,
     group::{GroupHandle, GroupMessage},
-    message::{self, EgressUDPPacket, MediaKey, PeerId},
+    ingress::IngressHandle,
+    message::{self, EgressUDPPacket, PeerId, TrackKey},
     proto,
+    track::TrackHandle,
 };
 
 use proto::sfu::client_message as client;
@@ -47,9 +50,14 @@ pub enum PeerError {
 #[derive(Debug)]
 pub enum PeerMessage {
     UdpPacket(message::UDPPacket),
-    PublishMedia(MediaKey, Arc<MediaAdded>),
-    SubscribeMedia(MediaKey, Arc<MediaAdded>),
-    ForwardMedia(MediaKey, Arc<MediaData>),
+    NewTrack(TrackKey, TrackHandle),
+    ForwardMedia(TrackKey, Arc<MediaData>),
+}
+
+struct TrackOut {
+    track: TrackHandle,
+    // pending=true means it needs to be negotiated
+    pending: bool,
 }
 
 /// Reponsibilities:
@@ -72,6 +80,9 @@ pub struct PeerActor {
     peer_id: Arc<PeerId>,
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
+
+    published_tracks: HashMap<Mid, TrackHandle>,
+    subscribed_tracks: HashMap<TrackKey, TrackOut>,
 }
 
 impl PeerActor {
@@ -121,26 +132,25 @@ impl PeerActor {
                     },
                 ));
             }
-            PeerMessage::PublishMedia(key, media) => {
-                // TODO: selective based on the client instead of auto subscribing
-
-                self.group
-                    .sender
-                    .send(GroupMessage::SubscribeMedia(key, self.handle.clone()))
-                    .await;
+            PeerMessage::NewTrack(key, track) => {
+                if key.origin == self.peer_id {
+                    // successfully publish a track
+                    self.published_tracks.insert(key.mid, track);
+                } else {
+                    // new tracks from other peers
+                    self.subscribed_tracks.insert(
+                        key,
+                        TrackOut {
+                            track,
+                            pending: true,
+                        },
+                    );
+                }
             }
-            PeerMessage::SubscribeMedia(key, media) => {
-                let mut sdp = self.rtc.sdp_api();
-                sdp.add_media(
-                    media.kind,
-                    Direction::SendOnly,
-                    Some(key.peer_id.to_string()),
-                    None,
-                    None,
-                );
-                self.handle_renegotiate();
+            PeerMessage::ForwardMedia(key, data) => {
+                // forwarded media from track
+                self.rtc.writer(mid)
             }
-            PeerMessage::ForwardMedia(key, data) => {}
         }
     }
 
@@ -300,6 +310,7 @@ pub struct PeerHandle {
 
 impl PeerHandle {
     pub fn new(
+        ingress: IngressHandle,
         egress: EgressHandle,
         group: GroupHandle,
         peer_id: Arc<PeerId>,

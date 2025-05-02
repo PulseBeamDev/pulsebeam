@@ -47,6 +47,7 @@ impl EgressHandle {
     }
 
     pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<EgressMessage>> {
+        // TODO: implement double buffering, https://blog.digital-horror.com/blog/how-to-avoid-over-reliance-on-mpsc/
         // TODO: monitor backpressure and packet dropping
         self.sender.try_send(EgressMessage::UdpPacket(msg))
     }

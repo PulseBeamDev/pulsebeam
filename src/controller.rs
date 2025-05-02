@@ -102,6 +102,7 @@ impl ControllerActor {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let peer_id = Arc::new(peer_id);
         let (peer_handle, peer_actor) = PeerHandle::new(
+            self.ingress.clone(),
             self.egress.clone(),
             group_handle.clone(),
             peer_id.clone(),
@@ -112,12 +113,12 @@ impl ControllerActor {
             let ingress = self.ingress.clone();
             let ufrag = ufrag.clone();
             let group = group_handle.clone();
-            let peer = peer_handle.clone();
+            let peer_id = peer_handle.peer_id.clone();
 
             self.children.spawn(async move {
                 peer_actor.run().await;
                 ingress.remove_peer(ufrag).await;
-                group.remove_peer(peer).await;
+                group.remove_peer(peer_id).await;
             });
         }
 

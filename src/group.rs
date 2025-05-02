@@ -1,6 +1,5 @@
-use std::{collections::HashMap, fmt::Display, panic::AssertUnwindSafe, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use futures::FutureExt;
 use str0m::media::Mid;
 use tokio::{
     sync::mpsc::{self, error::SendError},
@@ -9,22 +8,16 @@ use tokio::{
 
 use crate::{
     controller::ControllerHandle,
-    message::{GroupId, PeerId, TrackIn},
+    message::{ActorId, GroupId, PeerId, TrackIn, TrackKey},
     peer::PeerHandle,
     track::TrackHandle,
 };
 
 #[derive(Debug)]
 pub enum GroupMessage {
-    PublishMedia(PeerHandle, TrackIn),
+    PublishMedia(Arc<PeerId>, TrackIn),
     AddPeer(PeerHandle),
     RemovePeer(Arc<PeerId>),
-}
-
-#[derive(Hash, PartialEq, Eq)]
-struct TrackKey {
-    origin: Arc<PeerId>,
-    mid: Mid,
 }
 
 /// Reponsibilities:
@@ -77,8 +70,12 @@ impl GroupActor {
             }
             GroupMessage::PublishMedia(origin, track) => {
                 let key = TrackKey {
-                    origin: origin.peer_id.clone(),
+                    origin: origin.clone(),
                     mid: track.mid,
+                };
+
+                let Some(origin_handle) = self.peers.get(&origin) else {
+                    return;
                 };
 
                 if let Some(_) = self.tracks.get(&key) {
@@ -87,21 +84,8 @@ impl GroupActor {
                     );
                 } else {
                     let track = Arc::new(track);
-                    let (handle, actor) = TrackHandle::new(origin, track.clone());
-                    self.track_tasks.spawn(async move {
-                        match AssertUnwindSafe(actor.run()).catch_unwind().await {
-                            Ok(Ok(())) => {
-                                tracing::info!(?track, "track actor exited.");
-                            }
-                            Ok(Err(err)) => {
-                                tracing::warn!(?track, "track actor exited with an error: {err}");
-                            }
-                            Err(err) => {
-                                tracing::error!(?track, "track actor panicked: {:?}", err);
-                            }
-                        };
-                        key
-                    });
+                    let (handle, actor) = TrackHandle::new(origin_handle.clone(), track.clone());
+                    self.track_tasks.spawn(actor.run(key));
                     self.tracks.insert(key, handle);
                 }
             }
@@ -138,8 +122,8 @@ impl GroupHandle {
         self.sender.send(GroupMessage::AddPeer(peer)).await
     }
 
-    pub async fn remove_peer(&self, peer: PeerHandle) -> Result<(), SendError<GroupMessage>> {
-        self.sender.send(GroupMessage::AddPeer(peer)).await
+    pub async fn remove_peer(&self, peer_id: Arc<PeerId>) -> Result<(), SendError<GroupMessage>> {
+        self.sender.send(GroupMessage::RemovePeer(peer_id)).await
     }
 }
 

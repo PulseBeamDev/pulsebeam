@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -32,6 +32,13 @@ pub struct TrackIn {
     pub simulcast: Simulcast,
 }
 
+#[derive(Hash, PartialEq, Eq, Debug)]
+pub struct TrackKey {
+    pub origin: Arc<PeerId>,
+    pub mid: Mid,
+}
+impl ActorId for TrackKey {}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ActorError {
     #[error("unknown error: {0}")]
@@ -39,6 +46,8 @@ pub enum ActorError {
 }
 
 pub type ActorResult = Result<(), ActorError>;
+
+pub trait ActorId: Hash + Eq + PartialEq + Debug {}
 
 #[derive(Debug, Error)]
 pub enum IdValidationError {

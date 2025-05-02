@@ -1,12 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, panic::AssertUnwindSafe, sync::Arc};
 
+use futures::FutureExt;
 use str0m::media::Mid;
 use tokio::sync::mpsc;
 
 use crate::{
-    message::{ActorResult, ActorResultWithId, PeerId, TrackIn},
+    message::{ActorId, ActorResult, ActorResultWithId, PeerId, TrackIn},
     peer::PeerHandle,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum TrackError {}
 
 #[derive(Debug)]
 pub enum TrackMessage {}
@@ -26,7 +30,22 @@ pub struct TrackActor {
 }
 
 impl TrackActor {
-    pub async fn run(mut self) -> ActorResult {
+    pub async fn run<I: ActorId>(self, id: I) -> I {
+        match AssertUnwindSafe(self.run_inner()).catch_unwind().await {
+            Ok(Ok(())) => {
+                tracing::info!(?id, "track actor exited.");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(?id, "track actor exited with an error: {err}");
+            }
+            Err(err) => {
+                tracing::error!(?id, "track actor panicked: {:?}", err);
+            }
+        };
+        id
+    }
+
+    async fn run_inner(mut self) -> ActorResult {
         while let Some(msg) = self.receiver.recv().await {
             match msg {}
         }
