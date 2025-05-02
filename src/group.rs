@@ -1,32 +1,30 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    fmt::Display,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Display, panic::AssertUnwindSafe, sync::Arc};
 
-use str0m::media::{MediaAdded, MediaData, MediaKind, Mid};
-use tokio::sync::mpsc::{self, error::SendError};
+use futures::FutureExt;
+use str0m::media::Mid;
+use tokio::{
+    sync::mpsc::{self, error::SendError},
+    task::JoinSet,
+};
 
 use crate::{
     controller::ControllerHandle,
-    message::{GroupId, PeerId},
-    peer::{PeerHandle, PeerMessage},
+    message::{GroupId, PeerId, TrackIn},
+    peer::PeerHandle,
+    track::TrackHandle,
 };
-
-#[derive(Hash, PartialEq, Eq, Debug, Clone)]
-pub struct TrackIn {
-    pub peer_id: Arc<PeerId>,
-    pub mid: Mid,
-    pub kind: MediaKind,
-}
 
 #[derive(Debug)]
 pub enum GroupMessage {
-    PublishMedia(Arc<PeerId>, Arc<TrackIn>),
-    UnpublishMedia(MediaKey),
-    ForwardMedia(MediaKey, Arc<MediaData>),
+    PublishMedia(PeerHandle, TrackIn),
     AddPeer(PeerHandle),
     RemovePeer(Arc<PeerId>),
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct TrackKey {
+    origin: Arc<PeerId>,
+    mid: Mid,
 }
 
 /// Reponsibilities:
@@ -39,18 +37,32 @@ pub enum GroupMessage {
 pub struct GroupActor {
     receiver: mpsc::Receiver<GroupMessage>,
     controller: ControllerHandle,
-    group_id: Arc<GroupId>,
     handle: GroupHandle,
-    peers: HashMap<Arc<PeerId>, PeerHandle>,
 
-    medias: HashMap<MediaKey, Arc<MediaAdded>>,
-    subscriptions: HashMap<MediaKey, BTreeSet<PeerHandle>>,
+    peers: HashMap<Arc<PeerId>, PeerHandle>,
+    tracks: HashMap<TrackKey, TrackHandle>,
+
+    track_tasks: JoinSet<TrackKey>,
 }
 
 impl GroupActor {
     pub async fn run(mut self) {
-        while let Some(msg) = self.receiver.recv().await {
-            self.handle_message(msg).await;
+        loop {
+            tokio::select! {
+                biased;
+
+                res = self.receiver.recv() => {
+                    match res {
+                        Some(msg) => self.handle_message(msg).await,
+                        None => break,
+                    }
+                }
+
+                Some(Ok(key)) = self.track_tasks.join_next() => {
+                    // track actor exited
+                    self.tracks.remove(&key);
+                }
+            }
         }
     }
 
@@ -63,40 +75,34 @@ impl GroupActor {
                 self.peers.remove(&peer_id);
                 // TODO: clean up subscriptions and published medias
             }
-            GroupMessage::PublishMedia(key, media) => {
-                self.medias.insert(key.clone(), media.clone());
-                for (_, peer) in self.peers.iter() {
-                    if peer.peer_id == key.peer_id {
-                        continue;
-                    }
-                    peer.sender
-                        .send(PeerMessage::PublishMedia(key.clone(), media.clone()))
-                        .await;
-                }
-            }
-            GroupMessage::SubscribeMedia(key, peer) => {
-                self.subscriptions.entry(key).or_default().insert(peer);
-            }
-            GroupMessage::UnsubscribeMedia(key, peer) => {
-                if let Some(e) = self.subscriptions.get_mut(&key) {
-                    e.remove(&peer);
+            GroupMessage::PublishMedia(origin, track) => {
+                let key = TrackKey {
+                    origin: origin.peer_id.clone(),
+                    mid: track.mid,
+                };
 
-                    if e.is_empty() {
-                        self.subscriptions.remove(&key);
-                    }
-                }
-            }
-            GroupMessage::ForwardMedia(key, data) => {
-                // TODO: separate control vs data loop
-                if let Some(interests) = self.subscriptions.get(&key) {
-                    for interest in interests.iter() {
-                        if let Err(err) = interest
-                            .sender
-                            .try_send(PeerMessage::ForwardMedia(key.clone(), data.clone()))
-                        {
-                            tracing::warn!("dropping a media data to {interest}: {err}");
-                        }
-                    }
+                if let Some(_) = self.tracks.get(&key) {
+                    tracing::warn!(
+                        "Detected an update to an existing track. This is ignored for now."
+                    );
+                } else {
+                    let track = Arc::new(track);
+                    let (handle, actor) = TrackHandle::new(origin, track.clone());
+                    self.track_tasks.spawn(async move {
+                        match AssertUnwindSafe(actor.run()).catch_unwind().await {
+                            Ok(Ok(())) => {
+                                tracing::info!(?track, "track actor exited.");
+                            }
+                            Ok(Err(err)) => {
+                                tracing::warn!(?track, "track actor exited with an error: {err}");
+                            }
+                            Err(err) => {
+                                tracing::error!(?track, "track actor panicked: {:?}", err);
+                            }
+                        };
+                        key
+                    });
+                    self.tracks.insert(key, handle);
                 }
             }
             _ => todo!(),
@@ -120,11 +126,10 @@ impl GroupHandle {
         let actor = GroupActor {
             receiver,
             controller,
-            group_id,
             handle: handle.clone(),
             peers: HashMap::new(),
-            medias: HashMap::new(),
-            subscriptions: HashMap::new(),
+            tracks: HashMap::new(),
+            track_tasks: JoinSet::new(),
         };
         (handle, actor)
     }

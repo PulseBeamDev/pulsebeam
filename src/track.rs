@@ -4,7 +4,7 @@ use str0m::media::Mid;
 use tokio::sync::mpsc;
 
 use crate::{
-    message::{ActorResult, PeerId},
+    message::{ActorResult, ActorResultWithId, PeerId, TrackIn},
     peer::PeerHandle,
 };
 
@@ -19,9 +19,9 @@ pub enum TrackMessage {}
 /// * Filter & Forward Packet Notifications
 /// * Route Publisher-Bound RTCP: Receive RTCP feedback (PLI, FIR, etc.) from subscriber and forward it to the publisher
 pub struct TrackActor {
+    meta: Arc<TrackIn>,
     receiver: mpsc::Receiver<TrackMessage>,
-    origin: Arc<PeerId>,
-    mid: Mid,
+    origin: PeerHandle,
     subscribers: BTreeMap<Arc<PeerId>, PeerHandle>,
 }
 
@@ -37,16 +37,20 @@ impl TrackActor {
 #[derive(Clone, Debug)]
 pub struct TrackHandle {
     sender: mpsc::Sender<TrackMessage>,
+    meta: Arc<TrackIn>,
 }
 
 impl TrackHandle {
-    pub fn new(origin: Arc<PeerId>, mid: Mid) -> (Self, TrackActor) {
+    pub fn new(origin: PeerHandle, meta: Arc<TrackIn>) -> (Self, TrackActor) {
         let (sender, receiver) = mpsc::channel(8);
-        let handle = Self { sender };
+        let handle = Self {
+            sender,
+            meta: meta.clone(),
+        };
         let actor = TrackActor {
+            meta,
             receiver,
             origin,
-            mid,
             subscribers: BTreeMap::new(),
         };
         (handle, actor)

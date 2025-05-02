@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use str0m::media::Mid;
+use str0m::media::{MediaAdded, MediaKind, Mid, Simulcast};
 use thiserror::Error;
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
@@ -22,6 +23,13 @@ pub struct UDPPacket {
 pub struct EgressUDPPacket {
     pub raw: Bytes,
     pub dst: SocketAddr,
+}
+
+#[derive(Debug)]
+pub struct TrackIn {
+    pub mid: Mid,
+    pub kind: MediaKind,
+    pub simulcast: Simulcast,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -112,7 +120,7 @@ impl AsRef<str> for GroupId {
 }
 
 /// Represents a validated Peer ID.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(try_from = "String")] // Use try_from for deserialization validation
 pub struct PeerId(String);
 
