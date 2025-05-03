@@ -1,11 +1,11 @@
 pub mod controller;
-pub mod egress;
 pub mod entity;
 pub mod ice;
-pub mod ingress;
 pub mod message;
 pub mod participant;
 pub mod proto;
 pub mod room;
 pub mod signaling;
+pub mod sink;
+pub mod source;
 pub mod track;

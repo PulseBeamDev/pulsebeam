@@ -1,11 +1,11 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
-    egress::EgressHandle,
-    ingress::IngressHandle,
     message::{ActorResult, ParticipantId, RoomId},
     participant::ParticipantHandle,
     room::RoomHandle,
+    sink::UdpSinkHandle,
+    source::UdpSourceHandle,
 };
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{
@@ -42,8 +42,8 @@ pub enum ControllerMessage {
 
 pub struct ControllerActor {
     handle: ControllerHandle,
-    ingress: IngressHandle,
-    egress: EgressHandle,
+    source: UdpSourceHandle,
+    sink: UdpSinkHandle,
     receiver: mpsc::Receiver<ControllerMessage>,
     rooms: HashMap<Arc<RoomId>, RoomHandle>,
 
@@ -102,15 +102,15 @@ impl ControllerActor {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let participant_id = Arc::new(participant_id);
         let (participant_handle, participant_actor) = ParticipantHandle::new(
-            self.ingress.clone(),
-            self.egress.clone(),
+            self.source.clone(),
+            self.sink.clone(),
             room_handle.clone(),
             participant_id.clone(),
             rtc,
         );
 
         {
-            let ingress = self.ingress.clone();
+            let ingress = self.source.clone();
             let ufrag = ufrag.clone();
             let room = room_handle.clone();
             let participant_id = participant_handle.participant_id.clone();
@@ -127,7 +127,7 @@ impl ControllerActor {
             .add_participant(participant_handle.clone())
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
-        self.ingress
+        self.source
             .add_participant(ufrag, participant_handle)
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
@@ -143,8 +143,8 @@ pub struct ControllerHandle {
 
 impl ControllerHandle {
     pub fn new(
-        ingress: IngressHandle,
-        egress: EgressHandle,
+        source: UdpSourceHandle,
+        sink: UdpSinkHandle,
         local_addrs: Vec<SocketAddr>,
     ) -> (Self, ControllerActor) {
         let (sender, receiver) = mpsc::channel(1);
@@ -153,8 +153,8 @@ impl ControllerHandle {
         let actor = ControllerActor {
             handle: handle.clone(),
             receiver,
-            ingress,
-            egress,
+            source,
+            sink,
             rooms: HashMap::new(),
             local_addrs,
             children: JoinSet::new(),

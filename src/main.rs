@@ -10,8 +10,8 @@ use std::{
 };
 
 use pulsebeam::{
-    controller::ControllerHandle, egress::EgressHandle, ingress::IngressHandle,
-    message::ActorError, signaling,
+    controller::ControllerHandle, message::ActorError, signaling, sink::UdpSinkHandle,
+    source::UdpSourceHandle,
 };
 use systemstat::{Platform, System};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -39,10 +39,10 @@ async fn main() {
         .expect("bind to udp socket");
     let socket = Arc::new(socket);
 
-    let (ingress_handle, ingress_actor) = IngressHandle::new(local_addr, socket.clone());
-    let (egress_handle, egress_actor) = EgressHandle::new(socket.clone());
+    let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
+    let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
     let (controller_handle, controller_actor) =
-        ControllerHandle::new(ingress_handle, egress_handle, vec![local_addr]);
+        ControllerHandle::new(source_handle, sink_handle, vec![local_addr]);
 
     let router = signaling::router(controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -53,8 +53,8 @@ async fn main() {
     };
 
     let res = tokio::try_join!(
-        ingress_actor.run(),
-        egress_actor.run(),
+        source_actor.run(),
+        sink_actor.run(),
         controller_actor.run(),
         signaling,
     );

@@ -22,11 +22,11 @@ use tokio::{
 };
 
 use crate::{
-    egress::EgressHandle,
-    ingress::IngressHandle,
     message::{self, EgressUDPPacket, ParticipantId, TrackIn, TrackKey},
     proto,
     room::RoomHandle,
+    sink::UdpSinkHandle,
+    source::UdpSourceHandle,
     track::TrackHandle,
 };
 
@@ -75,7 +75,7 @@ struct TrackOut {
 pub struct ParticipantActor {
     handle: ParticipantHandle,
     receiver: mpsc::Receiver<ParticipantMessage>,
-    egress: EgressHandle,
+    sink: UdpSinkHandle,
     room: RoomHandle,
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
@@ -168,7 +168,7 @@ impl ParticipantActor {
                 // agent. It might change during the session.
                 Output::Transmit(v) => {
                     let packet = Bytes::copy_from_slice(&v.contents);
-                    self.egress.send(EgressUDPPacket {
+                    self.sink.send(EgressUDPPacket {
                         raw: packet,
                         dst: v.destination,
                     });
@@ -311,8 +311,8 @@ pub struct ParticipantHandle {
 
 impl ParticipantHandle {
     pub fn new(
-        ingress: IngressHandle,
-        egress: EgressHandle,
+        source: UdpSourceHandle,
+        sink: UdpSinkHandle,
         room: RoomHandle,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
@@ -325,7 +325,7 @@ impl ParticipantHandle {
         let actor = ParticipantActor {
             handle: handle.clone(),
             receiver,
-            egress,
+            sink,
             room,
             participant_id,
             rtc,

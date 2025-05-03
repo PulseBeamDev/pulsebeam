@@ -8,20 +8,20 @@ use tokio::{
 use crate::message::{self, ActorResult};
 
 #[derive(Debug)]
-pub enum EgressMessage {
+pub enum UdpSinkMessage {
     UdpPacket(message::EgressUDPPacket),
 }
 
-pub struct EgressActor {
+pub struct UdpSinkActor {
     socket: Arc<UdpSocket>,
-    receiver: mpsc::Receiver<EgressMessage>,
+    receiver: mpsc::Receiver<UdpSinkMessage>,
 }
 
-impl EgressActor {
+impl UdpSinkActor {
     pub async fn run(mut self) -> ActorResult {
         while let Some(msg) = self.receiver.recv().await {
             match msg {
-                EgressMessage::UdpPacket(packet) => {
+                UdpSinkMessage::UdpPacket(packet) => {
                     let res = self.socket.send_to(&packet.raw, &packet.dst).await;
                     if let Err(err) = res {
                         tracing::warn!("failed to send udp packet to {:?}: {:?}", packet.dst, err);
@@ -34,21 +34,21 @@ impl EgressActor {
 }
 
 #[derive(Clone, Debug)]
-pub struct EgressHandle {
-    sender: mpsc::Sender<EgressMessage>,
+pub struct UdpSinkHandle {
+    sender: mpsc::Sender<UdpSinkMessage>,
 }
 
-impl EgressHandle {
-    pub fn new(socket: Arc<UdpSocket>) -> (Self, EgressActor) {
+impl UdpSinkHandle {
+    pub fn new(socket: Arc<UdpSocket>) -> (Self, UdpSinkActor) {
         let (sender, receiver) = mpsc::channel(8);
         let handle = Self { sender };
-        let actor = EgressActor { socket, receiver };
+        let actor = UdpSinkActor { socket, receiver };
         (handle, actor)
     }
 
-    pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<EgressMessage>> {
+    pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<UdpSinkMessage>> {
         // TODO: implement double buffering, https://blog.digital-horror.com/blog/how-to-avoid-over-reliance-on-mpsc/
         // TODO: monitor backpressure and packet dropping
-        self.sender.try_send(EgressMessage::UdpPacket(msg))
+        self.sender.try_send(UdpSinkMessage::UdpPacket(msg))
     }
 }

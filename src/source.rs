@@ -11,13 +11,13 @@ use tokio::{
     sync::mpsc::{self, error::SendError},
 };
 
-pub enum IngressMessage {
+pub enum UdpSourceMessage {
     AddParticipant(String, ParticipantHandle),
     RemoveParticipant(String),
 }
 
-pub struct IngressActor {
-    receiver: mpsc::Receiver<IngressMessage>,
+pub struct UdpSourceActor {
+    receiver: mpsc::Receiver<UdpSourceMessage>,
     local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     conns: HashMap<String, ParticipantHandle>,
@@ -25,7 +25,7 @@ pub struct IngressActor {
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
-impl IngressActor {
+impl UdpSourceActor {
     pub async fn run(mut self) -> ActorResult {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
@@ -93,13 +93,13 @@ impl IngressActor {
         });
     }
 
-    pub fn handle_control(&mut self, msg: IngressMessage) {
+    pub fn handle_control(&mut self, msg: UdpSourceMessage) {
         match msg {
-            IngressMessage::AddParticipant(ufrag, participant) => {
+            UdpSourceMessage::AddParticipant(ufrag, participant) => {
                 tracing::trace!("added {ufrag} to connection map");
                 self.conns.insert(ufrag, participant);
             }
-            IngressMessage::RemoveParticipant(ufrag) => {
+            UdpSourceMessage::RemoveParticipant(ufrag) => {
                 self.conns.remove(&ufrag);
                 if let Some(addrs) = self.reverse.remove(&ufrag) {
                     for addr in addrs.iter() {
@@ -112,15 +112,15 @@ impl IngressActor {
 }
 
 #[derive(Clone, Debug)]
-pub struct IngressHandle {
-    sender: mpsc::Sender<IngressMessage>,
+pub struct UdpSourceHandle {
+    sender: mpsc::Sender<UdpSourceMessage>,
 }
 
-impl IngressHandle {
-    pub fn new(local_addr: SocketAddr, socket: Arc<UdpSocket>) -> (Self, IngressActor) {
+impl UdpSourceHandle {
+    pub fn new(local_addr: SocketAddr, socket: Arc<UdpSocket>) -> (Self, UdpSourceActor) {
         let (sender, receiver) = mpsc::channel(1);
         let handle = Self { sender };
-        let actor = IngressActor {
+        let actor = UdpSourceActor {
             receiver,
             local_addr,
             socket,
@@ -135,15 +135,18 @@ impl IngressHandle {
         &self,
         ufrag: String,
         participant: ParticipantHandle,
-    ) -> Result<(), SendError<IngressMessage>> {
+    ) -> Result<(), SendError<UdpSourceMessage>> {
         self.sender
-            .send(IngressMessage::AddParticipant(ufrag, participant))
+            .send(UdpSourceMessage::AddParticipant(ufrag, participant))
             .await
     }
 
-    pub async fn remove_participant(&self, ufrag: String) -> Result<(), SendError<IngressMessage>> {
+    pub async fn remove_participant(
+        &self,
+        ufrag: String,
+    ) -> Result<(), SendError<UdpSourceMessage>> {
         self.sender
-            .send(IngressMessage::RemoveParticipant(ufrag))
+            .send(UdpSourceMessage::RemoveParticipant(ufrag))
             .await
     }
 }
