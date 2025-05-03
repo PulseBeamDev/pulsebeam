@@ -1,15 +1,24 @@
-use blake3;
-use bs58;
+use std::io::Read;
+
 use rand::RngCore;
+use sha3::{
+    Shake128,
+    digest::{ExtendableOutput, Update},
+};
 
 pub type EntityId = String;
-pub const E_API_KEY_ID: &str = "kid";
-pub const E_API_PUBLIC_KEY: &str = "pk";
-pub const E_API_SECRET: &str = "sk";
-pub const E_PROJECT_ID: &str = "prj";
-pub const E_GROUP_ID: &str = "grp";
-pub const E_PEER_ID: &str = "peer";
-pub const E_USER_ID: &str = "usr";
+
+pub mod prefix {
+    pub const API_KEY_ID: &str = "kid";
+    pub const API_PUBLIC_KEY: &str = "pk";
+    pub const API_SECRET: &str = "sk";
+    pub const PROJECT_ID: &str = "p";
+    pub const ROOM_ID: &str = "rm";
+    pub const PARTICIPANT_ID: &str = "pa";
+    pub const USER_ID: &str = "u";
+}
+
+const HASH_OUTPUT_BYTES: usize = 16;
 
 /// Generates a new random entity ID with optional prefix and length (in bytes).
 pub fn new_random_id(prefix: &str, length: usize) -> EntityId {
@@ -18,13 +27,13 @@ pub fn new_random_id(prefix: &str, length: usize) -> EntityId {
     encode_with_prefix(prefix, &bytes)
 }
 
-/// Generates a new entity ID by hashing input and encoding the first `length` bytes.
-pub fn new_hashed_id(prefix: &str, input: &str, length: usize) -> EntityId {
-    let mut hasher = blake3::Hasher::new();
+pub fn new_hashed_id(prefix: &str, input: &str) -> EntityId {
+    let mut hasher = Shake128::default();
     hasher.update(input.as_bytes());
-    let mut output = vec![0u8; length];
-    hasher.finalize_xof().fill(&mut output);
-    encode_with_prefix(prefix, &output)
+    let mut xof_reader = hasher.finalize_xof();
+    let mut hash_output = [0u8; HASH_OUTPUT_BYTES];
+    let _ = xof_reader.read(&mut hash_output);
+    encode_with_prefix(prefix, &hash_output)
 }
 
 /// Decodes the base58-encoded part of the ID into raw bytes.
@@ -59,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_random_id_generation() {
-        let id = new_random_id("u", 16);
+        let id = new_random_id(prefix::USER_ID, 16);
         assert!(id.starts_with("u_"));
         let decoded = decode_id(&id).unwrap();
         assert_eq!(decoded.len(), 16);
@@ -67,22 +76,22 @@ mod tests {
 
     #[test]
     fn test_hashed_id_generation() {
-        let id = new_hashed_id("g", "hello world", 8);
-        assert!(id.starts_with("g_"));
+        let id = new_hashed_id(prefix::ROOM_ID, "hello world");
+        assert!(id.starts_with("rm_"));
         let decoded = decode_id(&id).unwrap();
-        assert_eq!(decoded.len(), 8);
+        assert_eq!(decoded.len(), HASH_OUTPUT_BYTES);
     }
 
     #[test]
     fn test_get_prefix_and_encoded() {
-        let id = "p_DEF123";
-        assert_eq!(get_prefix(id), Some("p"));
+        let id = "pa_DEF123";
+        assert_eq!(get_prefix(id), Some("pa"));
         assert_eq!(get_encoded_part(id), Some("DEF123"));
     }
 
     #[test]
     fn test_as_str() {
-        let id: EntityId = "pr_ABCDEFG".to_string();
-        assert_eq!(as_str(&id), "pr_ABCDEFG");
+        let id: EntityId = "p_ABCDEFG".to_string();
+        assert_eq!(as_str(&id), "p_ABCDEFG");
     }
 }
