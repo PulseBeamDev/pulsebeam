@@ -23,10 +23,10 @@ use tokio::{
 
 use crate::{
     egress::EgressHandle,
-    group::{GroupHandle, GroupMessage},
     ingress::IngressHandle,
-    message::{self, EgressUDPPacket, PeerId, TrackIn, TrackKey},
+    message::{self, EgressUDPPacket, ParticipantId, TrackIn, TrackKey},
     proto,
+    room::RoomHandle,
     track::TrackHandle,
 };
 
@@ -36,7 +36,7 @@ use proto::sfu::server_message as server;
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::sfu";
 
 #[derive(thiserror::Error, Debug)]
-pub enum PeerError {
+pub enum ParticipantError {
     #[error("invalid sdp offer format: {0}")]
     InvalidOfferFormat(#[from] SdpError),
 
@@ -48,7 +48,7 @@ pub enum PeerError {
 }
 
 #[derive(Debug)]
-pub enum PeerMessage {
+pub enum ParticipantMessage {
     UdpPacket(message::UDPPacket),
     NewTrack(TrackKey, TrackHandle),
     ForwardMedia(TrackKey, Arc<MediaData>),
@@ -63,7 +63,7 @@ struct TrackOut {
 /// Reponsibilities:
 /// * Manage Client Signaling
 /// * Manage WebRTC PeerConnection
-/// * Interact with Group
+/// * Interact with Room
 /// * Process Inbound Media
 /// * Route Published Media to Track actor
 /// * Manage Downlink Congestion Control
@@ -72,12 +72,12 @@ struct TrackOut {
 /// * Process Outbound Media from Track actor
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
-pub struct PeerActor {
-    handle: PeerHandle,
-    receiver: mpsc::Receiver<PeerMessage>,
+pub struct ParticipantActor {
+    handle: ParticipantHandle,
+    receiver: mpsc::Receiver<ParticipantMessage>,
     egress: EgressHandle,
-    group: GroupHandle,
-    peer_id: Arc<PeerId>,
+    room: RoomHandle,
+    participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
 
@@ -85,7 +85,7 @@ pub struct PeerActor {
     subscribed_tracks: HashMap<TrackKey, TrackOut>,
 }
 
-impl PeerActor {
+impl ParticipantActor {
     pub async fn run(mut self) {
         // TODO: notify ingress to add self to the routing table
 
@@ -114,13 +114,13 @@ impl PeerActor {
             }
         }
 
-        // TODO: cleanup in the group
+        // TODO: cleanup in the room
     }
 
     #[inline]
-    async fn handle_message(&mut self, msg: PeerMessage) {
+    async fn handle_message(&mut self, msg: ParticipantMessage) {
         match msg {
-            PeerMessage::UdpPacket(packet) => {
+            ParticipantMessage::UdpPacket(packet) => {
                 let now = Instant::now();
                 self.rtc.handle_input(Input::Receive(
                     now.into_std(),
@@ -132,12 +132,12 @@ impl PeerActor {
                     },
                 ));
             }
-            PeerMessage::NewTrack(key, track) => {
-                if key.origin == self.peer_id {
+            ParticipantMessage::NewTrack(key, track) => {
+                if key.origin == self.participant_id {
                     // successfully publish a track
                     self.published_tracks.insert(key.mid, track);
                 } else {
-                    // new tracks from other peers
+                    // new tracks from other participants
                     self.subscribed_tracks.insert(
                         key,
                         TrackOut {
@@ -147,7 +147,7 @@ impl PeerActor {
                     );
                 }
             }
-            PeerMessage::ForwardMedia(key, data) => {
+            ParticipantMessage::ForwardMedia(key, data) => {
                 // forwarded media from track
             }
         }
@@ -209,15 +209,12 @@ impl PeerActor {
                         }
                         Event::MediaData(e) => {
                             let key = TrackKey {
-                                origin: self.peer_id.clone(),
+                                origin: self.participant_id.clone(),
                                 mid: e.mid,
                             };
 
                             if let Some(track) = self.published_tracks.get(&e.mid) {
                                 todo!();
-                                // track
-                                //     .send(GroupMessage::ForwardMedia(key, Arc::new(e)))
-                                //     .await;
                             }
                         }
 
@@ -252,9 +249,9 @@ impl PeerActor {
         }
     }
 
-    fn handle_rpc(&mut self, data: ChannelData) -> Result<(), PeerError> {
+    fn handle_rpc(&mut self, data: ChannelData) -> Result<(), ParticipantError> {
         let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())
-            .map_err(PeerError::InvalidRPCFormat)?;
+            .map_err(ParticipantError::InvalidRPCFormat)?;
 
         match msg.message {
             Some(client::Message::Offer(sdp)) => {
@@ -267,10 +264,10 @@ impl PeerActor {
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
         // TODO: handle back pressure by buffering temporarily
-        self.group
+        self.room
             .sender
-            .send(crate::group::GroupMessage::PublishMedia(
-                self.peer_id.clone(),
+            .send(crate::room::RoomMessage::PublishMedia(
+                self.participant_id.clone(),
                 TrackIn {
                     kind: media.kind,
                     mid: media.mid,
@@ -280,13 +277,14 @@ impl PeerActor {
             .await;
     }
 
-    fn handle_offer(&mut self, offer: String) -> Result<(), PeerError> {
-        let offer = SdpOffer::from_sdp_string(&offer).map_err(PeerError::InvalidOfferFormat)?;
+    fn handle_offer(&mut self, offer: String) -> Result<(), ParticipantError> {
+        let offer =
+            SdpOffer::from_sdp_string(&offer).map_err(ParticipantError::InvalidOfferFormat)?;
         let answer = self
             .rtc
             .sdp_api()
             .accept_offer(offer)
-            .map_err(PeerError::OfferRejected)?;
+            .map_err(ParticipantError::OfferRejected)?;
         self.send_server_event(server::Message::Answer(answer.to_sdp_string()));
         Ok(())
     }
@@ -306,30 +304,30 @@ impl PeerActor {
 }
 
 #[derive(Clone, Debug)]
-pub struct PeerHandle {
-    pub sender: mpsc::Sender<PeerMessage>,
-    pub peer_id: Arc<PeerId>,
+pub struct ParticipantHandle {
+    pub sender: mpsc::Sender<ParticipantMessage>,
+    pub participant_id: Arc<ParticipantId>,
 }
 
-impl PeerHandle {
+impl ParticipantHandle {
     pub fn new(
         ingress: IngressHandle,
         egress: EgressHandle,
-        group: GroupHandle,
-        peer_id: Arc<PeerId>,
+        room: RoomHandle,
+        participant_id: Arc<ParticipantId>,
         rtc: Rtc,
-    ) -> (Self, PeerActor) {
+    ) -> (Self, ParticipantActor) {
         let (sender, receiver) = mpsc::channel(8);
         let handle = Self {
             sender,
-            peer_id: peer_id.clone(),
+            participant_id: participant_id.clone(),
         };
-        let actor = PeerActor {
+        let actor = ParticipantActor {
             handle: handle.clone(),
             receiver,
             egress,
-            group,
-            peer_id,
+            room,
+            participant_id,
             rtc,
             published_tracks: HashMap::new(),
             subscribed_tracks: HashMap::new(),
@@ -338,39 +336,41 @@ impl PeerHandle {
         (handle, actor)
     }
 
-    pub fn forward(&self, msg: message::UDPPacket) -> Result<(), TrySendError<PeerMessage>> {
-        self.sender.try_send(PeerMessage::UdpPacket(msg))
+    pub fn forward(&self, msg: message::UDPPacket) -> Result<(), TrySendError<ParticipantMessage>> {
+        self.sender.try_send(ParticipantMessage::UdpPacket(msg))
     }
 }
 
-impl Display for PeerHandle {
+impl Display for ParticipantHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.peer_id.as_str())
+        f.write_str(self.participant_id.as_str())
     }
 }
 
-impl Hash for PeerHandle {
+impl Hash for ParticipantHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.peer_id.hash(state);
+        self.participant_id.hash(state);
     }
 }
 
-impl PartialEq for PeerHandle {
+impl PartialEq for ParticipantHandle {
     fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id
+        self.participant_id == other.participant_id
     }
 }
 
-impl Eq for PeerHandle {}
+impl Eq for ParticipantHandle {}
 
-impl PartialOrd for PeerHandle {
+impl PartialOrd for ParticipantHandle {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PeerHandle {
+impl Ord for ParticipantHandle {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.peer_id.as_str().cmp(other.peer_id.as_str())
+        self.participant_id
+            .as_str()
+            .cmp(other.participant_id.as_str())
     }
 }

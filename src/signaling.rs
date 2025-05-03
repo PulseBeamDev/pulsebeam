@@ -8,7 +8,7 @@ use axum::{
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 
-use crate::message::{GroupId, PeerId};
+use crate::message::{ParticipantId, RoomId};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
@@ -44,14 +44,14 @@ impl IntoResponse for SignalingError {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
-pub struct PeerInfo {
-    group_id: GroupId,
-    peer_id: PeerId,
+pub struct ParticipantInfo {
+    room: RoomId,
+    participant: ParticipantId,
 }
 
 #[axum::debug_handler]
-async fn spawn_peer(
-    Query(peer): Query<PeerInfo>,
+async fn spawn_participant(
+    Query(info): Query<ParticipantInfo>,
     State(controller): State<ControllerHandle>,
     TypedHeader(content_type): TypedHeader<ContentType>,
     raw_offer: String,
@@ -59,7 +59,7 @@ async fn spawn_peer(
     // TODO: validate content_type = "application/sdp"
 
     let answer = controller
-        .allocate(peer.group_id, peer.peer_id, raw_offer)
+        .allocate(info.room, info.participant, raw_offer)
         .await?;
 
     Ok(answer)
@@ -67,6 +67,6 @@ async fn spawn_peer(
 
 pub fn router(controller: ControllerHandle) -> Router {
     Router::new()
-        .route("/", post(spawn_peer))
+        .route("/", post(spawn_participant))
         .with_state(controller)
 }

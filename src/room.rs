@@ -1,6 +1,5 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use str0m::media::Mid;
 use tokio::{
     sync::mpsc::{self, error::SendError},
     task::JoinSet,
@@ -8,37 +7,37 @@ use tokio::{
 
 use crate::{
     controller::ControllerHandle,
-    message::{ActorId, GroupId, PeerId, TrackIn, TrackKey},
-    peer::PeerHandle,
+    message::{ParticipantId, RoomId, TrackIn, TrackKey},
+    participant::ParticipantHandle,
     track::TrackHandle,
 };
 
 #[derive(Debug)]
-pub enum GroupMessage {
-    PublishMedia(Arc<PeerId>, TrackIn),
-    AddPeer(PeerHandle),
-    RemovePeer(Arc<PeerId>),
+pub enum RoomMessage {
+    PublishMedia(Arc<ParticipantId>, TrackIn),
+    AddParticipant(ParticipantHandle),
+    RemoveParticipant(Arc<ParticipantId>),
 }
 
 /// Reponsibilities:
 /// * Manage Participant Lifecycle
 /// * Manage Track Lifecycle
-/// * Maintain Group State Registry: Keep an up-to-date list of current participants and available tracks
-/// * Broadcast Group Events
+/// * Maintain Room State Registry: Keep an up-to-date list of current participants and available tracks
+/// * Broadcast Room Events
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
-pub struct GroupActor {
-    receiver: mpsc::Receiver<GroupMessage>,
+pub struct RoomActor {
+    receiver: mpsc::Receiver<RoomMessage>,
     controller: ControllerHandle,
-    handle: GroupHandle,
+    handle: RoomHandle,
 
-    peers: HashMap<Arc<PeerId>, PeerHandle>,
+    participants: HashMap<Arc<ParticipantId>, ParticipantHandle>,
     tracks: HashMap<TrackKey, TrackHandle>,
 
     track_tasks: JoinSet<TrackKey>,
 }
 
-impl GroupActor {
+impl RoomActor {
     pub async fn run(mut self) {
         loop {
             tokio::select! {
@@ -59,22 +58,23 @@ impl GroupActor {
         }
     }
 
-    async fn handle_message(&mut self, mut msg: GroupMessage) {
+    async fn handle_message(&mut self, mut msg: RoomMessage) {
         match msg {
-            GroupMessage::AddPeer(peer) => {
-                self.peers.insert(peer.peer_id.clone(), peer);
+            RoomMessage::AddParticipant(participant) => {
+                self.participants
+                    .insert(participant.participant_id.clone(), participant);
             }
-            GroupMessage::RemovePeer(peer_id) => {
-                self.peers.remove(&peer_id);
+            RoomMessage::RemoveParticipant(participant_id) => {
+                self.participants.remove(&participant_id);
                 // TODO: clean up subscriptions and published medias
             }
-            GroupMessage::PublishMedia(origin, track) => {
+            RoomMessage::PublishMedia(origin, track) => {
                 let key = TrackKey {
                     origin: origin.clone(),
                     mid: track.mid,
                 };
 
-                let Some(origin_handle) = self.peers.get(&origin) else {
+                let Some(origin_handle) = self.participants.get(&origin) else {
                     return;
                 };
 
@@ -98,40 +98,50 @@ impl GroupActor {
 }
 
 #[derive(Clone)]
-pub struct GroupHandle {
-    pub sender: mpsc::Sender<GroupMessage>,
-    pub group_id: Arc<GroupId>,
+pub struct RoomHandle {
+    pub sender: mpsc::Sender<RoomMessage>,
+    pub room_id: Arc<RoomId>,
 }
 
-impl GroupHandle {
-    pub fn new(controller: ControllerHandle, group_id: Arc<GroupId>) -> (Self, GroupActor) {
+impl RoomHandle {
+    pub fn new(controller: ControllerHandle, room_id: Arc<RoomId>) -> (Self, RoomActor) {
         let (sender, receiver) = mpsc::channel(8);
-        let handle = GroupHandle {
+        let handle = RoomHandle {
             sender,
-            group_id: group_id.clone(),
+            room_id: room_id.clone(),
         };
-        let actor = GroupActor {
+        let actor = RoomActor {
             receiver,
             controller,
             handle: handle.clone(),
-            peers: HashMap::new(),
+            participants: HashMap::new(),
             tracks: HashMap::new(),
             track_tasks: JoinSet::new(),
         };
         (handle, actor)
     }
 
-    pub async fn add_peer(&self, peer: PeerHandle) -> Result<(), SendError<GroupMessage>> {
-        self.sender.send(GroupMessage::AddPeer(peer)).await
+    pub async fn add_participant(
+        &self,
+        participant: ParticipantHandle,
+    ) -> Result<(), SendError<RoomMessage>> {
+        self.sender
+            .send(RoomMessage::AddParticipant(participant))
+            .await
     }
 
-    pub async fn remove_peer(&self, peer_id: Arc<PeerId>) -> Result<(), SendError<GroupMessage>> {
-        self.sender.send(GroupMessage::RemovePeer(peer_id)).await
+    pub async fn remove_participant(
+        &self,
+        participant_id: Arc<ParticipantId>,
+    ) -> Result<(), SendError<RoomMessage>> {
+        self.sender
+            .send(RoomMessage::RemoveParticipant(participant_id))
+            .await
     }
 }
 
-impl Display for GroupHandle {
+impl Display for RoomHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.group_id.as_str())
+        f.write_str(self.room_id.as_str())
     }
 }

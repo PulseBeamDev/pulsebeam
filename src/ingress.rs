@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use crate::{
     ice,
     message::{ActorResult, UDPPacket},
-    peer::PeerHandle,
+    participant::ParticipantHandle,
 };
 use bytes::Bytes;
 use tokio::{
@@ -12,16 +12,16 @@ use tokio::{
 };
 
 pub enum IngressMessage {
-    AddPeer(String, PeerHandle),
-    RemovePeer(String),
+    AddParticipant(String, ParticipantHandle),
+    RemoveParticipant(String),
 }
 
 pub struct IngressActor {
     receiver: mpsc::Receiver<IngressMessage>,
     local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
-    conns: HashMap<String, PeerHandle>,
-    mapping: HashMap<SocketAddr, PeerHandle>,
+    conns: HashMap<String, ParticipantHandle>,
+    mapping: HashMap<SocketAddr, ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
@@ -61,20 +61,20 @@ impl IngressActor {
     }
 
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
-        let peer_handle = if let Some(peer_handle) = self.mapping.get(&source) {
-            tracing::trace!("found connection from mapping: {source} -> {peer_handle}");
-            peer_handle.clone()
+        let participant_handle = if let Some(participant_handle) = self.mapping.get(&source) {
+            tracing::trace!("found connection from mapping: {source} -> {participant_handle}");
+            participant_handle.clone()
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
-            if let Some(peer_handle) = self.conns.get(ufrag) {
+            if let Some(participant_handle) = self.conns.get(ufrag) {
                 tracing::trace!(
-                    "found connection from ufrag: {ufrag} -> {source} -> {peer_handle}"
+                    "found connection from ufrag: {ufrag} -> {source} -> {participant_handle}"
                 );
-                self.mapping.insert(source, peer_handle.clone());
+                self.mapping.insert(source, participant_handle.clone());
                 self.reverse
                     .entry(ufrag.to_string())
                     .or_default()
                     .push(source);
-                peer_handle.clone()
+                participant_handle.clone()
             } else {
                 tracing::trace!("dropped a packet from {source} due to unregistered stun binding");
                 return;
@@ -86,7 +86,7 @@ impl IngressActor {
             return;
         };
 
-        let _ = peer_handle.forward(UDPPacket {
+        let _ = participant_handle.forward(UDPPacket {
             raw: Bytes::copy_from_slice(packet),
             src: source,
             dst: self.local_addr,
@@ -95,11 +95,11 @@ impl IngressActor {
 
     pub fn handle_control(&mut self, msg: IngressMessage) {
         match msg {
-            IngressMessage::AddPeer(ufrag, peer) => {
+            IngressMessage::AddParticipant(ufrag, participant) => {
                 tracing::trace!("added {ufrag} to connection map");
-                self.conns.insert(ufrag, peer);
+                self.conns.insert(ufrag, participant);
             }
-            IngressMessage::RemovePeer(ufrag) => {
+            IngressMessage::RemoveParticipant(ufrag) => {
                 self.conns.remove(&ufrag);
                 if let Some(addrs) = self.reverse.remove(&ufrag) {
                     for addr in addrs.iter() {
@@ -131,15 +131,19 @@ impl IngressHandle {
         (handle, actor)
     }
 
-    pub async fn add_peer(
+    pub async fn add_participant(
         &self,
         ufrag: String,
-        peer: PeerHandle,
+        participant: ParticipantHandle,
     ) -> Result<(), SendError<IngressMessage>> {
-        self.sender.send(IngressMessage::AddPeer(ufrag, peer)).await
+        self.sender
+            .send(IngressMessage::AddParticipant(ufrag, participant))
+            .await
     }
 
-    pub async fn remove_peer(&self, ufrag: String) -> Result<(), SendError<IngressMessage>> {
-        self.sender.send(IngressMessage::RemovePeer(ufrag)).await
+    pub async fn remove_participant(&self, ufrag: String) -> Result<(), SendError<IngressMessage>> {
+        self.sender
+            .send(IngressMessage::RemoveParticipant(ufrag))
+            .await
     }
 }

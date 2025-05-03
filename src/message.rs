@@ -5,7 +5,7 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use str0m::media::{MediaAdded, MediaKind, Mid, Simulcast};
+use str0m::media::{MediaKind, Mid, Simulcast};
 use thiserror::Error;
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
@@ -34,7 +34,7 @@ pub struct TrackIn {
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct TrackKey {
-    pub origin: Arc<PeerId>,
+    pub origin: Arc<ParticipantId>,
     pub mid: Mid,
 }
 impl ActorId for TrackKey {}
@@ -76,18 +76,16 @@ fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> 
     Ok(())
 }
 
-/// Represents a validated Group ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String")] // Use try_from for deserialization validation
-pub struct GroupId(String);
+#[serde(try_from = "String")]
+pub struct RoomId(String);
 
-impl GroupId {
+impl RoomId {
     const MAX_LEN: usize = 20;
 
-    /// Creates a new GroupId from a string, validating it.
     pub fn new(id: String) -> Result<Self, IdValidationError> {
         validate_id_string(&id, Self::MAX_LEN)?;
-        Ok(GroupId(id))
+        Ok(RoomId(id))
     }
 
     /// Returns a reference to the inner string.
@@ -96,85 +94,74 @@ impl GroupId {
     }
 }
 
-// Implement FromStr for parsing from strings (e.g., path segments)
-impl FromStr for GroupId {
+impl FromStr for RoomId {
     type Err = IdValidationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        GroupId::new(s.to_string())
+        RoomId::new(s.to_string())
     }
 }
 
-// Implement Display for easy printing
-impl fmt::Display for GroupId {
+impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-// Implement TryFrom<String> for serde deserialization
-impl TryFrom<String> for GroupId {
+impl TryFrom<String> for RoomId {
     type Error = IdValidationError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        GroupId::new(value)
+        RoomId::new(value)
     }
 }
 
-// Implement AsRef<str> for easy string reference access
-impl AsRef<str> for GroupId {
+impl AsRef<str> for RoomId {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-/// Represents a validated Peer ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-#[serde(try_from = "String")] // Use try_from for deserialization validation
-pub struct PeerId(String);
+#[serde(try_from = "String")]
+pub struct ParticipantId(String);
 
-impl PeerId {
+impl ParticipantId {
     const MAX_LEN: usize = 20;
 
-    /// Creates a new PeerId from a string, validating it.
     pub fn new(id: String) -> Result<Self, IdValidationError> {
         validate_id_string(&id, Self::MAX_LEN)?;
-        Ok(PeerId(id))
+        Ok(ParticipantId(id))
     }
 
-    /// Returns a reference to the inner string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-// Implement FromStr for parsing from strings (e.g., path segments)
-impl FromStr for PeerId {
+impl FromStr for ParticipantId {
     type Err = IdValidationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        PeerId::new(s.to_string())
+        ParticipantId::new(s.to_string())
     }
 }
 
-// Implement Display for easy printing
-impl fmt::Display for PeerId {
+impl fmt::Display for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-// Implement TryFrom<String> for serde deserialization
-impl TryFrom<String> for PeerId {
+impl TryFrom<String> for ParticipantId {
     type Error = IdValidationError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        PeerId::new(value)
+        ParticipantId::new(value)
     }
 }
 
-// Implement AsRef<str> for easy string reference access
-impl AsRef<str> for PeerId {
+impl AsRef<str> for ParticipantId {
     fn as_ref(&self) -> &str {
         &self.0
     }
@@ -185,108 +172,110 @@ mod tests {
     use super::*;
 
     #[test]
-    fn group_id_valid() {
-        assert!(GroupId::new("valid_id-123".to_string()).is_ok());
-        assert!(GroupId::new("a".to_string()).is_ok());
-        assert!(GroupId::new("A".to_string()).is_ok());
-        assert!(GroupId::new("0".to_string()).is_ok());
-        assert!(GroupId::new("_".to_string()).is_ok());
-        assert!(GroupId::new("-".to_string()).is_ok());
-        assert!(GroupId::new("a".repeat(20)).is_ok()); // Max length
+    fn room_id_valid() {
+        assert!(RoomId::new("valid_id-123".to_string()).is_ok());
+        assert!(RoomId::new("a".to_string()).is_ok());
+        assert!(RoomId::new("A".to_string()).is_ok());
+        assert!(RoomId::new("0".to_string()).is_ok());
+        assert!(RoomId::new("_".to_string()).is_ok());
+        assert!(RoomId::new("-".to_string()).is_ok());
+        assert!(RoomId::new("a".repeat(20)).is_ok()); // Max length
     }
 
     #[test]
-    fn group_id_invalid_length() {
-        let err = GroupId::new("a".repeat(21)).unwrap_err(); // Too long
+    fn room_id_invalid_length() {
+        let err = RoomId::new("a".repeat(21)).unwrap_err(); // Too long
         assert!(matches!(err, IdValidationError::TooLong(20)));
     }
 
     #[test]
-    fn group_id_invalid_characters() {
-        let err = GroupId::new("invalid!".to_string()).unwrap_err();
+    fn room_id_invalid_characters() {
+        let err = RoomId::new("invalid!".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::InvalidCharacters));
-        let err = GroupId::new(" space".to_string()).unwrap_err();
+        let err = RoomId::new(" space".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::InvalidCharacters));
-        let err = GroupId::new("ñ_id".to_string()).unwrap_err();
+        let err = RoomId::new("ñ_id".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::InvalidCharacters));
     }
 
     #[test]
-    fn group_id_empty() {
-        let err = GroupId::new("".to_string()).unwrap_err();
+    fn room_id_empty() {
+        let err = RoomId::new("".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::Empty));
     }
 
     #[test]
-    fn peer_id_valid() {
-        assert!(PeerId::new("valid_peer-456".to_string()).is_ok());
-        assert!(PeerId::new("b".to_string()).is_ok());
-        assert!(PeerId::new("B".to_string()).is_ok());
-        assert!(PeerId::new("1".to_string()).is_ok());
-        assert!(PeerId::new("_".to_string()).is_ok());
-        assert!(PeerId::new("-".to_string()).is_ok());
-        assert!(PeerId::new("b".repeat(20)).is_ok()); // Max length
+    fn participant_id_valid() {
+        assert!(ParticipantId::new("valid_peer-456".to_string()).is_ok());
+        assert!(ParticipantId::new("b".to_string()).is_ok());
+        assert!(ParticipantId::new("B".to_string()).is_ok());
+        assert!(ParticipantId::new("1".to_string()).is_ok());
+        assert!(ParticipantId::new("_".to_string()).is_ok());
+        assert!(ParticipantId::new("-".to_string()).is_ok());
+        assert!(ParticipantId::new("b".repeat(20)).is_ok()); // Max length
     }
 
     #[test]
-    fn peer_id_invalid_length() {
-        let err = PeerId::new("b".repeat(21)).unwrap_err(); // Too long
+    fn participant_id_invalid_length() {
+        let err = ParticipantId::new("b".repeat(21)).unwrap_err(); // Too long
         assert!(matches!(err, IdValidationError::TooLong(20)));
     }
 
     #[test]
-    fn peer_id_invalid_characters() {
-        let err = PeerId::new("invalid@".to_string()).unwrap_err();
+    fn participant_id_invalid_characters() {
+        let err = ParticipantId::new("invalid@".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::InvalidCharacters));
-        let err = PeerId::new(" space".to_string()).unwrap_err();
+        let err = ParticipantId::new(" space".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::InvalidCharacters));
-        let err = PeerId::new("ñ_peer".to_string()).unwrap_err();
+        let err = ParticipantId::new("ñ_peer".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::InvalidCharacters));
     }
 
     #[test]
-    fn peer_id_empty() {
-        let err = PeerId::new("".to_string()).unwrap_err();
+    fn participant_id_empty() {
+        let err = ParticipantId::new("".to_string()).unwrap_err();
         assert!(matches!(err, IdValidationError::Empty));
     }
 
     #[test]
-    fn group_id_serde_deserialize() {
+    fn room_id_serde_deserialize() {
         let json = r#""valid_id-123""#;
-        let group_id: Result<GroupId, serde_json::Error> = serde_json::from_str(json);
-        assert!(group_id.is_ok());
-        assert_eq!(group_id.unwrap().as_str(), "valid_id-123");
+        let room_id: Result<RoomId, serde_json::Error> = serde_json::from_str(json);
+        assert!(room_id.is_ok());
+        assert_eq!(room_id.unwrap().as_str(), "valid_id-123");
 
         let invalid_json = r#""invalid!""#;
-        let group_id: Result<GroupId, serde_json::Error> = serde_json::from_str(invalid_json);
-        assert!(group_id.is_err());
-        let err_str = group_id.unwrap_err().to_string();
+        let room_id: Result<RoomId, serde_json::Error> = serde_json::from_str(invalid_json);
+        assert!(room_id.is_err());
+        let err_str = room_id.unwrap_err().to_string();
         assert!(err_str.contains("ID contains invalid characters"));
 
         let too_long_json = format!(r#""{}""#, "a".repeat(21));
-        let group_id: Result<GroupId, serde_json::Error> = serde_json::from_str(&too_long_json);
-        assert!(group_id.is_err());
-        let err_str = group_id.unwrap_err().to_string();
+        let room_id: Result<RoomId, serde_json::Error> = serde_json::from_str(&too_long_json);
+        assert!(room_id.is_err());
+        let err_str = room_id.unwrap_err().to_string();
         assert!(err_str.contains("ID exceeds maximum length of 20 characters"));
     }
 
     #[test]
-    fn peer_id_serde_deserialize() {
+    fn participant_id_serde_deserialize() {
         let json = r#""valid_peer-456""#;
-        let peer_id: Result<PeerId, serde_json::Error> = serde_json::from_str(json);
-        assert!(peer_id.is_ok());
-        assert_eq!(peer_id.unwrap().as_str(), "valid_peer-456");
+        let participant_id: Result<ParticipantId, serde_json::Error> = serde_json::from_str(json);
+        assert!(participant_id.is_ok());
+        assert_eq!(participant_id.unwrap().as_str(), "valid_peer-456");
 
         let invalid_json = r#""invalid@""#;
-        let peer_id: Result<PeerId, serde_json::Error> = serde_json::from_str(invalid_json);
-        assert!(peer_id.is_err());
-        let err_str = peer_id.unwrap_err().to_string();
+        let participant_id: Result<ParticipantId, serde_json::Error> =
+            serde_json::from_str(invalid_json);
+        assert!(participant_id.is_err());
+        let err_str = participant_id.unwrap_err().to_string();
         assert!(err_str.contains("ID contains invalid characters"));
 
         let too_long_json = format!(r#""{}""#, "b".repeat(21));
-        let peer_id: Result<PeerId, serde_json::Error> = serde_json::from_str(&too_long_json);
-        assert!(peer_id.is_err());
-        let err_str = peer_id.unwrap_err().to_string();
+        let participant_id: Result<ParticipantId, serde_json::Error> =
+            serde_json::from_str(&too_long_json);
+        assert!(participant_id.is_err());
+        let err_str = participant_id.unwrap_err().to_string();
         assert!(err_str.contains("ID exceeds maximum length of 20 characters"));
     }
 }

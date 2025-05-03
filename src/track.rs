@@ -4,8 +4,8 @@ use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    message::{ActorResult, PeerId, TrackIn},
-    peer::PeerHandle,
+    message::{ActorResult, ParticipantId, TrackIn},
+    participant::ParticipantHandle,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -24,8 +24,8 @@ pub enum TrackMessage {}
 pub struct TrackActor {
     meta: Arc<TrackIn>,
     receiver: mpsc::Receiver<TrackMessage>,
-    origin: PeerHandle,
-    subscribers: BTreeMap<Arc<PeerId>, PeerHandle>,
+    origin: ParticipantHandle,
+    subscribers: BTreeMap<Arc<ParticipantId>, ParticipantHandle>,
 }
 
 impl TrackActor {
@@ -58,7 +58,7 @@ pub struct TrackHandle {
 }
 
 impl TrackHandle {
-    pub fn new(origin: PeerHandle, meta: Arc<TrackIn>) -> (Self, TrackActor) {
+    pub fn new(origin: ParticipantHandle, meta: Arc<TrackIn>) -> (Self, TrackActor) {
         let (sender, receiver) = mpsc::channel(8);
         let handle = Self {
             sender,

@@ -7,7 +7,7 @@ async function start() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   const answer = await fetch(
-    "http://localhost:3000?group_id=default&peer_id=peerA",
+    "http://localhost:3000?room=default&participant=alice",
     {
       method: "POST",
       body: offer.sdp,

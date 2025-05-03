@@ -2,10 +2,10 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
     egress::EgressHandle,
-    group::GroupHandle,
     ingress::IngressHandle,
-    message::{ActorResult, GroupId, PeerId},
-    peer::PeerHandle,
+    message::{ActorResult, ParticipantId, RoomId},
+    participant::ParticipantHandle,
+    room::RoomHandle,
 };
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{
@@ -33,8 +33,8 @@ pub enum ControllerError {
 
 pub enum ControllerMessage {
     Allocate(
-        GroupId,
-        PeerId,
+        RoomId,
+        ParticipantId,
         String,
         oneshot::Sender<Result<String, ControllerError>>,
     ),
@@ -45,7 +45,7 @@ pub struct ControllerActor {
     ingress: IngressHandle,
     egress: EgressHandle,
     receiver: mpsc::Receiver<ControllerMessage>,
-    groups: HashMap<Arc<GroupId>, GroupHandle>,
+    rooms: HashMap<Arc<RoomId>, RoomHandle>,
 
     local_addrs: Vec<SocketAddr>,
     children: JoinSet<()>,
@@ -55,8 +55,8 @@ impl ControllerActor {
     pub async fn run(mut self) -> ActorResult {
         while let Some(msg) = self.receiver.recv().await {
             match msg {
-                ControllerMessage::Allocate(group_id, peer_id, offer, resp) => {
-                    let _ = resp.send(self.allocate(group_id, peer_id, offer).await);
+                ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
+                    let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
                 }
             }
         }
@@ -65,8 +65,8 @@ impl ControllerActor {
 
     pub async fn allocate(
         &mut self,
-        group_id: GroupId,
-        peer_id: PeerId,
+        room_id: RoomId,
+        participant_id: ParticipantId,
         offer: String,
     ) -> Result<String, ControllerError> {
         let offer = SdpOffer::from_sdp_string(&offer)?;
@@ -87,48 +87,48 @@ impl ControllerActor {
             .accept_offer(offer)
             .map_err(ControllerError::OfferRejected)?;
 
-        let group_id = Arc::new(group_id);
-        let group_handle = if let Some(handle) = self.groups.get(&group_id) {
+        let room_id = Arc::new(room_id);
+        let room_handle = if let Some(handle) = self.rooms.get(&room_id) {
             handle.clone()
         } else {
-            let (handle, actor) = GroupHandle::new(self.handle.clone(), group_id.clone());
+            let (handle, actor) = RoomHandle::new(self.handle.clone(), room_id.clone());
             // TODO: handle shutdown
             self.children.spawn(actor.run());
 
-            self.groups.insert(group_id, handle.clone());
+            self.rooms.insert(room_id, handle.clone());
             handle
         };
 
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
-        let peer_id = Arc::new(peer_id);
-        let (peer_handle, peer_actor) = PeerHandle::new(
+        let participant_id = Arc::new(participant_id);
+        let (participant_handle, participant_actor) = ParticipantHandle::new(
             self.ingress.clone(),
             self.egress.clone(),
-            group_handle.clone(),
-            peer_id.clone(),
+            room_handle.clone(),
+            participant_id.clone(),
             rtc,
         );
 
         {
             let ingress = self.ingress.clone();
             let ufrag = ufrag.clone();
-            let group = group_handle.clone();
-            let peer_id = peer_handle.peer_id.clone();
+            let room = room_handle.clone();
+            let participant_id = participant_handle.participant_id.clone();
 
             self.children.spawn(async move {
-                peer_actor.run().await;
-                ingress.remove_peer(ufrag).await;
-                group.remove_peer(peer_id).await;
+                participant_actor.run().await;
+                ingress.remove_participant(ufrag).await;
+                room.remove_participant(participant_id).await;
             });
         }
 
-        // group and peers will self-monitor and hit a timeout to cleanup itself
-        group_handle
-            .add_peer(peer_handle.clone())
+        // room and participant will self-monitor and hit a timeout to cleanup itself
+        room_handle
+            .add_participant(participant_handle.clone())
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
         self.ingress
-            .add_peer(ufrag, peer_handle)
+            .add_participant(ufrag, participant_handle)
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
@@ -155,7 +155,7 @@ impl ControllerHandle {
             receiver,
             ingress,
             egress,
-            groups: HashMap::new(),
+            rooms: HashMap::new(),
             local_addrs,
             children: JoinSet::new(),
         };
@@ -164,13 +164,18 @@ impl ControllerHandle {
 
     pub async fn allocate(
         &self,
-        group_id: GroupId,
-        peer_id: PeerId,
+        room_id: RoomId,
+        participant_id: ParticipantId,
         offer: String,
     ) -> Result<String, ControllerError> {
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(ControllerMessage::Allocate(group_id, peer_id, offer, tx))
+            .send(ControllerMessage::Allocate(
+                room_id,
+                participant_id,
+                offer,
+                tx,
+            ))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
         rx.await.map_err(|_| ControllerError::ServiceUnavailable)?
