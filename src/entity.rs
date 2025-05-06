@@ -2,7 +2,7 @@ use std::{fmt, hash, str::FromStr, sync::Arc};
 
 use rand::RngCore;
 use sha3::{Digest, Sha3_256};
-use str0m::media::{MediaKind, Mid};
+use str0m::media::Mid;
 
 pub type EntityId = String;
 
@@ -24,6 +24,10 @@ pub fn new_random_id(prefix: &str, length: usize) -> EntityId {
     let mut bytes = vec![0u8; length];
     rand::rng().fill_bytes(&mut bytes);
     encode_with_prefix(prefix, &bytes)
+}
+
+pub fn new_entity_id(prefix: &str) -> EntityId {
+    new_random_id(prefix, HASH_OUTPUT_BYTES)
 }
 
 pub fn new_hashed_id(prefix: &str, input: &str) -> EntityId {
@@ -184,9 +188,8 @@ pub struct ParticipantId {
 }
 
 impl ParticipantId {
-    pub fn new(room_id: &RoomId, external: ExternalParticipantId) -> Self {
-        let internal_id = format!("{}:{}", room_id.as_ref(), external.as_str());
-        let internal = new_hashed_id(prefix::PARTICIPANT_ID, &internal_id);
+    pub fn new(external: ExternalParticipantId) -> Self {
+        let internal = new_entity_id(prefix::PARTICIPANT_ID);
         Self { external, internal }
     }
 }
@@ -278,8 +281,7 @@ pub struct TrackId {
 
 impl TrackId {
     pub fn new(participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
-        let internal_id = format!("{}:{}", participant_id.as_ref(), mid);
-        let internal = new_hashed_id(prefix::TRACK_ID, &internal_id);
+        let internal = new_entity_id(prefix::TRACK_ID);
         Self {
             internal,
             origin_participant: participant_id,

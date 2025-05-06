@@ -60,7 +60,7 @@ async fn spawn_participant(
     // TODO: validate content_type = "application/sdp"
 
     let room_id = RoomId::new(info.room);
-    let participant_id = ParticipantId::new(&room_id, info.participant);
+    let participant_id = ParticipantId::new(info.participant);
     let answer = controller
         .allocate(room_id, participant_id, raw_offer)
         .await?;
