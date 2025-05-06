@@ -2,7 +2,7 @@ use std::{fmt, hash, str::FromStr, sync::Arc};
 
 use rand::RngCore;
 use sha3::{Digest, Sha3_256};
-use str0m::media::Mid;
+use str0m::media::{MediaKind, Mid};
 
 pub type EntityId = String;
 

@@ -54,8 +54,8 @@ impl TrackActor {
 
 #[derive(Clone, Debug)]
 pub struct TrackHandle {
-    sender: mpsc::Sender<TrackMessage>,
-    meta: Arc<TrackIn>,
+    pub sender: mpsc::Sender<TrackMessage>,
+    pub meta: Arc<TrackIn>,
 }
 
 impl TrackHandle {

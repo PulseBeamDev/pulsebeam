@@ -9,7 +9,7 @@ pub use str0m::change::{SdpAnswer, SdpOffer};
 pub use str0m::error::SdpError;
 pub use str0m::{Rtc, RtcError};
 
-use crate::entity::ParticipantId;
+use crate::entity::{ParticipantId, TrackId};
 
 #[derive(Debug)]
 pub struct UDPPacket {
@@ -26,7 +26,7 @@ pub struct EgressUDPPacket {
 
 #[derive(Debug)]
 pub struct TrackIn {
-    pub mid: Mid,
+    pub id: Arc<TrackId>,
     pub kind: MediaKind,
     pub simulcast: Option<Simulcast>,
 }

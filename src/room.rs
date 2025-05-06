@@ -7,15 +7,15 @@ use tokio::{
 
 use crate::{
     controller::ControllerHandle,
-    entity::{ParticipantId, RoomId},
-    message::{TrackIn, TrackKey},
+    entity::{ParticipantId, RoomId, TrackId},
+    message::TrackIn,
     participant::ParticipantHandle,
     track::TrackHandle,
 };
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishMedia(Arc<ParticipantId>, TrackIn),
+    PublishMedia(TrackIn),
     AddParticipant(ParticipantHandle),
     RemoveParticipant(Arc<ParticipantId>),
 }
@@ -33,9 +33,9 @@ pub struct RoomActor {
     handle: RoomHandle,
 
     participants: HashMap<Arc<ParticipantId>, ParticipantHandle>,
-    tracks: HashMap<TrackKey, TrackHandle>,
+    tracks: HashMap<Arc<TrackId>, TrackHandle>,
 
-    track_tasks: JoinSet<TrackKey>,
+    track_tasks: JoinSet<Arc<TrackId>>,
 }
 
 impl RoomActor {
@@ -67,27 +67,24 @@ impl RoomActor {
                 self.participants.remove(&participant_id);
                 // TODO: clean up subscriptions and published medias
             }
-            RoomMessage::PublishMedia(origin, track) => {
-                let key = TrackKey {
-                    origin: origin.clone(),
-                    mid: track.mid,
-                };
-
-                let Some(origin_handle) = self.participants.get(&origin) else {
+            RoomMessage::PublishMedia(track) => {
+                let Some(origin_handle) = self.participants.get(&track.id.origin_participant)
+                else {
                     return;
                 };
 
-                if let Some(_) = self.tracks.get(&key) {
+                if let Some(_) = self.tracks.get(&track.id) {
                     tracing::warn!(
                         "Detected an update to an existing track. This is ignored for now."
                     );
                 } else {
+                    let track_id = track.id.clone();
                     let track = Arc::new(track);
-                    let (handle, actor) = TrackHandle::new(origin_handle.clone(), track.clone());
-                    self.tracks.insert(key.clone(), handle);
+                    let (handle, actor) = TrackHandle::new(origin_handle.clone(), track);
+                    self.tracks.insert(track_id.clone(), handle);
                     self.track_tasks.spawn(async move {
                         actor.run().await;
-                        key
+                        track_id
                     });
                 }
             }

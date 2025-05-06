@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    hash::{Hash, Hasher},
-    ops::Deref,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -23,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    entity::ParticipantId,
+    entity::{ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn, TrackKey},
     proto,
     room::RoomHandle,
@@ -52,8 +45,8 @@ pub enum ParticipantError {
 #[derive(Debug)]
 pub enum ParticipantMessage {
     UdpPacket(message::UDPPacket),
-    NewTrack(TrackKey, TrackHandle),
-    ForwardMedia(TrackKey, Arc<MediaData>),
+    NewTrack(TrackHandle),
+    ForwardMedia(Arc<TrackIn>, Arc<MediaData>),
 }
 
 struct TrackOut {
@@ -84,7 +77,7 @@ pub struct ParticipantActor {
     cid: Option<ChannelId>,
 
     published_tracks: HashMap<Mid, TrackHandle>,
-    subscribed_tracks: HashMap<TrackKey, TrackOut>,
+    subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
 }
 
 impl ParticipantActor {
@@ -134,14 +127,15 @@ impl ParticipantActor {
                     },
                 ));
             }
-            ParticipantMessage::NewTrack(key, track) => {
-                if key.origin == self.participant_id {
+            ParticipantMessage::NewTrack(track) => {
+                if track.meta.id.origin_participant == self.participant_id {
                     // successfully publish a track
-                    self.published_tracks.insert(key.mid, track);
+                    self.published_tracks
+                        .insert(track.meta.id.origin_mid, track);
                 } else {
                     // new tracks from other participants
                     self.subscribed_tracks.insert(
-                        key,
+                        track.meta.id.clone(),
                         TrackOut {
                             track,
                             pending: true,
@@ -266,16 +260,15 @@ impl ParticipantActor {
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
         // TODO: handle back pressure by buffering temporarily
+        let track_id = TrackId::new(self.participant_id.clone(), media.mid);
+        let track_id = Arc::new(track_id);
         self.room
             .sender
-            .send(crate::room::RoomMessage::PublishMedia(
-                self.participant_id.clone(),
-                TrackIn {
-                    kind: media.kind,
-                    mid: media.mid,
-                    simulcast: media.simulcast,
-                },
-            ))
+            .send(crate::room::RoomMessage::PublishMedia(TrackIn {
+                id: track_id,
+                kind: media.kind,
+                simulcast: media.simulcast,
+            }))
             .await;
     }
 
