@@ -59,18 +59,8 @@ async fn spawn_participant(
 ) -> Result<String, SignalingError> {
     // TODO: validate content_type = "application/sdp"
 
-    let internal = new_hashed_id(entity::prefix::ROOM_ID, info.room.as_str());
-    let room_id = RoomId {
-        external: info.room,
-        internal,
-    };
-
-    let internal = new_hashed_id(entity::prefix::PARTICIPANT_ID, info.participant.as_str());
-    let participant_id = ParticipantId {
-        external: info.participant,
-        internal,
-    };
-
+    let room_id = RoomId::new(info.room);
+    let participant_id = ParticipantId::new(&room_id, info.participant);
     let answer = controller
         .allocate(room_id, participant_id, raw_offer)
         .await?;

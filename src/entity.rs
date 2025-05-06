@@ -1,7 +1,8 @@
-use std::{fmt, hash, str::FromStr};
+use std::{fmt, hash, str::FromStr, sync::Arc};
 
 use rand::RngCore;
 use sha3::{Digest, Sha3_256};
+use str0m::media::Mid;
 
 pub type EntityId = String;
 
@@ -13,6 +14,7 @@ pub mod prefix {
     pub const ROOM_ID: &str = "rm";
     pub const PARTICIPANT_ID: &str = "pa";
     pub const USER_ID: &str = "u";
+    pub const TRACK_ID: &str = "tr";
 }
 
 const HASH_OUTPUT_BYTES: usize = 16;
@@ -89,6 +91,13 @@ fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> 
 pub struct RoomId {
     pub external: ExternalRoomId,
     pub internal: EntityId,
+}
+
+impl RoomId {
+    pub fn new(external: ExternalRoomId) -> Self {
+        let internal = new_hashed_id(prefix::PARTICIPANT_ID, external.as_str());
+        Self { external, internal }
+    }
 }
 
 impl hash::Hash for RoomId {
@@ -174,6 +183,14 @@ pub struct ParticipantId {
     pub internal: EntityId,
 }
 
+impl ParticipantId {
+    pub fn new(room_id: &RoomId, external: ExternalParticipantId) -> Self {
+        let internal_id = format!("{}:{}", room_id.as_ref(), external.as_str());
+        let internal = new_hashed_id(prefix::PARTICIPANT_ID, &internal_id);
+        Self { external, internal }
+    }
+}
+
 impl hash::Hash for ParticipantId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.internal.hash(state);
@@ -250,6 +267,56 @@ impl TryFrom<String> for ExternalParticipantId {
 impl AsRef<str> for ExternalParticipantId {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+pub struct TrackId {
+    pub internal: EntityId,
+    pub origin_participant: Arc<ParticipantId>,
+    pub origin_mid: Mid,
+}
+
+impl TrackId {
+    pub fn new(participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
+        let internal_id = format!("{}:{}", participant_id.as_ref(), mid);
+        let internal = new_hashed_id(prefix::TRACK_ID, &internal_id);
+        Self {
+            internal,
+            origin_participant: participant_id,
+            origin_mid: mid,
+        }
+    }
+}
+
+impl hash::Hash for TrackId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.internal.hash(state);
+    }
+}
+
+impl Eq for TrackId {}
+
+impl PartialEq for TrackId {
+    fn eq(&self, other: &Self) -> bool {
+        self.internal.eq(&other.internal)
+    }
+}
+
+impl fmt::Display for TrackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.internal)
+    }
+}
+
+impl fmt::Debug for TrackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.internal)
+    }
+}
+
+impl AsRef<str> for TrackId {
+    fn as_ref(&self) -> &str {
+        &self.internal
     }
 }
 
