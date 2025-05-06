@@ -1,10 +1,5 @@
-use std::io::Read;
-
 use rand::RngCore;
-use sha3::{
-    Shake128,
-    digest::{ExtendableOutput, Update},
-};
+use sha3::{Digest, Sha3_256};
 
 pub type EntityId = String;
 
@@ -28,12 +23,12 @@ pub fn new_random_id(prefix: &str, length: usize) -> EntityId {
 }
 
 pub fn new_hashed_id(prefix: &str, input: &str) -> EntityId {
-    let mut hasher = Shake128::default();
+    let mut hasher = Sha3_256::default();
     hasher.update(input.as_bytes());
-    let mut xof_reader = hasher.finalize_xof();
-    let mut hash_output = [0u8; HASH_OUTPUT_BYTES];
-    let _ = xof_reader.read(&mut hash_output);
-    encode_with_prefix(prefix, &hash_output)
+    let full_hash = hasher.finalize();
+    let hash_output_slice = &full_hash[..HASH_OUTPUT_BYTES];
+
+    encode_with_prefix(prefix, hash_output_slice)
 }
 
 /// Decodes the base58-encoded part of the ID into raw bytes.
