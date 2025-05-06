@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
+    ops::Deref,
     sync::Arc,
     time::Duration,
 };
@@ -22,7 +23,8 @@ use tokio::{
 };
 
 use crate::{
-    message::{self, EgressUDPPacket, ParticipantId, TrackIn, TrackKey},
+    entity::ParticipantId,
+    message::{self, EgressUDPPacket, TrackIn, TrackKey},
     proto,
     room::RoomHandle,
     sink::UdpSinkHandle,
@@ -343,34 +345,6 @@ impl ParticipantHandle {
 
 impl Display for ParticipantHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.participant_id.as_str())
-    }
-}
-
-impl Hash for ParticipantHandle {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.participant_id.hash(state);
-    }
-}
-
-impl PartialEq for ParticipantHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.participant_id == other.participant_id
-    }
-}
-
-impl Eq for ParticipantHandle {}
-
-impl PartialOrd for ParticipantHandle {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ParticipantHandle {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.participant_id
-            .as_str()
-            .cmp(other.participant_id.as_str())
+        f.write_str(self.participant_id.deref().as_ref())
     }
 }

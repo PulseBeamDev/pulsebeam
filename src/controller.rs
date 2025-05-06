@@ -1,7 +1,8 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
-    message::{ActorResult, ParticipantId, RoomId},
+    entity::{ParticipantId, RoomId},
+    message::ActorResult,
     participant::ParticipantHandle,
     room::RoomHandle,
     sink::UdpSinkHandle,

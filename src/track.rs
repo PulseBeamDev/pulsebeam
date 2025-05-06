@@ -4,7 +4,8 @@ use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    message::{ActorResult, ParticipantId, TrackIn},
+    entity::ParticipantId,
+    message::{ActorResult, TrackIn},
     participant::ParticipantHandle,
 };
 

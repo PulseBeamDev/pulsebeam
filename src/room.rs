@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
 use tokio::{
     sync::mpsc::{self, error::SendError},
@@ -7,7 +7,8 @@ use tokio::{
 
 use crate::{
     controller::ControllerHandle,
-    message::{ParticipantId, RoomId, TrackIn, TrackKey},
+    entity::{ParticipantId, RoomId},
+    message::{TrackIn, TrackKey},
     participant::ParticipantHandle,
     track::TrackHandle,
 };
@@ -41,8 +42,6 @@ impl RoomActor {
     pub async fn run(mut self) {
         loop {
             tokio::select! {
-                biased;
-
                 res = self.receiver.recv() => {
                     match res {
                         Some(msg) => self.handle_message(msg).await,
@@ -142,6 +141,6 @@ impl RoomHandle {
 
 impl Display for RoomHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.room_id.as_str())
+        f.write_str(self.room_id.deref().as_ref())
     }
 }

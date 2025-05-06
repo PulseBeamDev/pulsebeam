@@ -1,4 +1,7 @@
-use crate::controller::{ControllerError, ControllerHandle};
+use crate::{
+    controller::{ControllerError, ControllerHandle},
+    entity::{self, ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId, new_hashed_id},
+};
 use axum::{
     Router,
     extract::{Query, State},
@@ -7,8 +10,6 @@ use axum::{
     routing::post,
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-
-use crate::message::{ParticipantId, RoomId};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
@@ -45,8 +46,8 @@ impl IntoResponse for SignalingError {
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct ParticipantInfo {
-    room: RoomId,
-    participant: ParticipantId,
+    room: ExternalRoomId,
+    participant: ExternalParticipantId,
 }
 
 #[axum::debug_handler]
@@ -58,8 +59,20 @@ async fn spawn_participant(
 ) -> Result<String, SignalingError> {
     // TODO: validate content_type = "application/sdp"
 
+    let internal = new_hashed_id(entity::prefix::ROOM_ID, info.room.as_str());
+    let room_id = RoomId {
+        external: info.room,
+        internal,
+    };
+
+    let internal = new_hashed_id(entity::prefix::PARTICIPANT_ID, info.participant.as_str());
+    let participant_id = ParticipantId {
+        external: info.participant,
+        internal,
+    };
+
     let answer = controller
-        .allocate(info.room, info.participant, raw_offer)
+        .allocate(room_id, participant_id, raw_offer)
         .await?;
 
     Ok(answer)

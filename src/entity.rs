@@ -1,3 +1,5 @@
+use std::{fmt, hash, str::FromStr};
+
 use rand::RngCore;
 use sha3::{Digest, Sha3_256};
 
@@ -57,9 +59,204 @@ fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     format!("{}_{}", prefix, encoded)
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum IdValidationError {
+    #[error("ID exceeds maximum length of {0} characters")]
+    TooLong(usize),
+    #[error("ID contains invalid characters")]
+    InvalidCharacters,
+    #[error("ID is empty")]
+    Empty,
+}
+
+fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> {
+    if s.is_empty() {
+        return Err(IdValidationError::Empty);
+    }
+    if s.len() > max_len {
+        return Err(IdValidationError::TooLong(max_len));
+    }
+    // Check if all characters are in the allowed set: 0-9, A-Z, a-z, _, -
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(IdValidationError::InvalidCharacters);
+    }
+    Ok(())
+}
+
+pub struct RoomId {
+    pub external: ExternalRoomId,
+    pub internal: EntityId,
+}
+
+impl hash::Hash for RoomId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.internal.hash(state);
+    }
+}
+
+impl Eq for RoomId {}
+
+impl PartialEq for RoomId {
+    fn eq(&self, other: &Self) -> bool {
+        self.internal.eq(&other.internal)
+    }
+}
+
+impl fmt::Display for RoomId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.internal)
+    }
+}
+
+impl fmt::Debug for RoomId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.internal)
+    }
+}
+
+impl AsRef<str> for RoomId {
+    fn as_ref(&self) -> &str {
+        &self.internal
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct ExternalRoomId(String);
+
+impl ExternalRoomId {
+    const MAX_LEN: usize = 20;
+
+    pub fn new(id: String) -> Result<Self, IdValidationError> {
+        validate_id_string(&id, Self::MAX_LEN)?;
+        Ok(ExternalRoomId(id))
+    }
+
+    /// Returns a reference to the inner string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ExternalRoomId {
+    type Err = IdValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ExternalRoomId::new(s.to_string())
+    }
+}
+
+impl fmt::Display for ExternalRoomId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<String> for ExternalRoomId {
+    type Error = IdValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        ExternalRoomId::new(value)
+    }
+}
+
+impl AsRef<str> for ExternalRoomId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+pub struct ParticipantId {
+    pub external: ExternalParticipantId,
+    pub internal: EntityId,
+}
+
+impl hash::Hash for ParticipantId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.internal.hash(state);
+    }
+}
+
+impl Eq for ParticipantId {}
+
+impl PartialEq for ParticipantId {
+    fn eq(&self, other: &Self) -> bool {
+        self.internal.eq(&other.internal)
+    }
+}
+
+impl fmt::Display for ParticipantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.internal)
+    }
+}
+
+impl fmt::Debug for ParticipantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.internal)
+    }
+}
+
+impl AsRef<str> for ParticipantId {
+    fn as_ref(&self) -> &str {
+        &self.internal
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd, Ord,
+)]
+#[serde(try_from = "String")]
+pub struct ExternalParticipantId(String);
+
+impl ExternalParticipantId {
+    const MAX_LEN: usize = 20;
+
+    pub fn new(id: String) -> Result<Self, IdValidationError> {
+        validate_id_string(&id, Self::MAX_LEN)?;
+        Ok(ExternalParticipantId(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ExternalParticipantId {
+    type Err = IdValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ExternalParticipantId::new(s.to_string())
+    }
+}
+
+impl fmt::Display for ExternalParticipantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<String> for ExternalParticipantId {
+    type Error = IdValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        ExternalParticipantId::new(value)
+    }
+}
+
+impl AsRef<str> for ExternalParticipantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::{Hash, Hasher};
 
     #[test]
     fn test_random_id_generation() {
@@ -88,5 +285,105 @@ mod tests {
     fn test_as_str() {
         let id: EntityId = "p_ABCDEFG".to_string();
         assert_eq!(as_str(&id), "p_ABCDEFG");
+    }
+
+    #[test]
+    fn test_decode_id_invalid_format() {
+        assert_eq!(decode_id("invalidid"), None);
+        assert_eq!(decode_id("no_base58_"), None); // invalid base58
+    }
+
+    #[test]
+    fn test_validate_id_string_success() {
+        let valid = "abc123_-XYZ";
+        assert!(validate_id_string(valid, 20).is_ok());
+    }
+
+    #[test]
+    fn test_validate_id_string_errors() {
+        assert_eq!(
+            validate_id_string("", 10).unwrap_err(),
+            IdValidationError::Empty
+        );
+        assert_eq!(
+            validate_id_string("a".repeat(21).as_str(), 20).unwrap_err(),
+            IdValidationError::TooLong(20)
+        );
+        assert_eq!(
+            validate_id_string("abc$", 10).unwrap_err(),
+            IdValidationError::InvalidCharacters
+        );
+    }
+
+    #[test]
+    fn test_external_room_id_new_and_display() {
+        let id_str = "Room123_valid";
+        let id = ExternalRoomId::new(id_str.to_string()).unwrap();
+        assert_eq!(id.to_string(), id_str);
+        assert_eq!(id.as_str(), id_str);
+    }
+
+    #[test]
+    fn test_external_room_id_try_from() {
+        let id: Result<ExternalRoomId, _> = "validRoom".to_string().try_into();
+        assert!(id.is_ok());
+
+        let too_long: Result<ExternalRoomId, _> = "x".repeat(21).try_into();
+        assert!(matches!(
+            too_long.unwrap_err(),
+            IdValidationError::TooLong(20)
+        ));
+    }
+
+    #[test]
+    fn test_room_id_equality_and_hash() {
+        let internal = "rm_abc123".to_string();
+        let ext = ExternalRoomId::new("external".into()).unwrap();
+        let id1 = RoomId {
+            external: ext.clone(),
+            internal: internal.clone(),
+        };
+        let id2 = RoomId {
+            external: ext,
+            internal,
+        };
+
+        assert_eq!(id1, id2);
+        use std::collections::hash_map::DefaultHasher;
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        id1.hash(&mut h1);
+        id2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn test_external_participant_id() {
+        let valid = "part123";
+        let id = ExternalParticipantId::new(valid.to_string()).unwrap();
+        assert_eq!(id.as_str(), valid);
+        assert_eq!(id.to_string(), valid);
+    }
+
+    #[test]
+    fn test_participant_id_equality_and_hash() {
+        let internal = "pa_xyz987".to_string();
+        let ext = ExternalParticipantId::new("external_pa".into()).unwrap();
+        let id1 = ParticipantId {
+            external: ext.clone(),
+            internal: internal.clone(),
+        };
+        let id2 = ParticipantId {
+            external: ext,
+            internal,
+        };
+
+        assert_eq!(id1, id2);
+        use std::collections::hash_map::DefaultHasher;
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        id1.hash(&mut h1);
+        id2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
     }
 }
