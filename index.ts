@@ -44,3 +44,6 @@ export async function start() {
     sdp: answer,
   });
 }
+
+const startButton = document.getElementById("start");
+startButton?.addEventListener("click", start);
