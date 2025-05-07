@@ -31,7 +31,7 @@ use crate::{
 use proto::sfu::client_message as client;
 use proto::sfu::server_message as server;
 
-const DATA_CHANNEL_LABEL: &str = "pulsebeam::sfu";
+const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParticipantError {
@@ -179,6 +179,7 @@ impl ParticipantActor {
                         state: TrackOutState::ToOpen,
                     };
                     self.subscribed_tracks.insert(track_id, track_out);
+                    self.negotiation_if_needed();
                 }
             }
         }
@@ -276,6 +277,7 @@ impl ParticipantActor {
             Event::ChannelOpen(cid, label) => {
                 if label == DATA_CHANNEL_LABEL {
                     self.cid = Some(cid);
+                    tracing::warn!(label, "data channel is open");
                 }
             }
             Event::ChannelData(data) => {
@@ -358,6 +360,7 @@ impl ParticipantActor {
     }
 
     fn handle_answer(&mut self, answer: String) -> Result<(), ParticipantError> {
+        tracing::info!("handling answer");
         let answer =
             SdpAnswer::from_sdp_string(&answer).map_err(ParticipantError::InvalidSdpFormat)?;
 
@@ -401,6 +404,7 @@ impl ParticipantActor {
             return false;
         }
 
+        tracing::info!("renegotiating");
         let Some((offer, pending)) = sdp.apply() else {
             return false;
         };

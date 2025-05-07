@@ -14,18 +14,34 @@ function generateRandomId(length: number) {
 export async function start() {
   const pc = new RTCPeerConnection();
   pc.onconnectionstatechange = () => console.log(pc.connectionState);
-  const rpcCh = pc.createDataChannel("pulsebeam::sfu");
+  const rpcCh = pc.createDataChannel("pulsebeam::rpc");
 
-  rpcCh.onmessage = (e) => {
-    const msg = sfu.ServerMessage.fromBinary(e.data).message;
+  function sendRpc(msg: sfu.ClientMessage) {
+    console.log("answer", msg);
+    rpcCh.send(sfu.ClientMessage.toBinary(msg));
+  }
+
+  rpcCh.onmessage = async (e) => {
+    const blob = e.data as Blob;
+    const msg = sfu.ServerMessage.fromBinary(await blob.bytes()).message;
     console.log(msg);
     switch (msg.oneofKind) {
       case "offer":
         break;
       case "answer":
+        const answer = await pc.createAnswer();
+        sendRpc({
+          message: {
+            oneofKind: "answer",
+            answer: answer.sdp!,
+          },
+        });
         break;
     }
   };
+
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+  stream.getTracks().forEach((t) => pc.addTrack(t));
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
