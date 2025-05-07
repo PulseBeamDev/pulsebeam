@@ -13,6 +13,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
 };
+use tracing::Instrument;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -53,6 +54,7 @@ pub struct ControllerActor {
 }
 
 impl ControllerActor {
+    #[tracing::instrument(skip(self), fields(controller_id = "root"))]
     pub async fn run(mut self) -> ActorResult {
         while let Some(msg) = self.receiver.recv().await {
             match msg {
@@ -116,11 +118,14 @@ impl ControllerActor {
             let room = room_handle.clone();
             let participant_id = participant_handle.participant_id.clone();
 
-            self.children.spawn(async move {
-                participant_actor.run().await;
-                ingress.remove_participant(ufrag).await;
-                room.remove_participant(participant_id).await;
-            });
+            self.children.spawn(
+                async move {
+                    participant_actor.run().await;
+                    ingress.remove_participant(ufrag).await;
+                    room.remove_participant(participant_id).await;
+                }
+                .in_current_span(),
+            );
         }
 
         // room and participant will self-monitor and hit a timeout to cleanup itself

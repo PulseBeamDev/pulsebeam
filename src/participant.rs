@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display, Pointer},
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -105,7 +111,19 @@ pub struct ParticipantActor {
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
 }
 
+impl fmt::Debug for ParticipantActor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParticipantActor")
+            .field("participant_id", self.participant_id.deref())
+            .finish()
+    }
+}
+
 impl ParticipantActor {
+    #[tracing::instrument(
+        skip(self),
+        fields(participant_id=self.participant_id.deref().as_ref())
+    )]
     pub async fn run(mut self) {
         // TODO: notify ingress to add self to the routing table
 
