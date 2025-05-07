@@ -14,7 +14,8 @@ function generateRandomId(length: number) {
 export async function start() {
   const pc = new RTCPeerConnection();
   pc.onconnectionstatechange = () => console.log(pc.connectionState);
-  const rpcCh = pc.createDataChannel("pulsebeam::rpc");
+  const rpcCh = pc.createDataChannel("pulsebeam::rpc", {});
+  rpcCh.binaryType = "arraybuffer";
 
   function sendRpc(msg: sfu.ClientMessage) {
     console.log("answer", msg);
@@ -22,26 +23,34 @@ export async function start() {
   }
 
   rpcCh.onmessage = async (e) => {
-    const blob = e.data as Blob;
-    const msg = sfu.ServerMessage.fromBinary(await blob.bytes()).message;
+    const msg = sfu.ServerMessage.fromBinary(new Uint8Array(e.data)).message;
     console.log(msg);
     switch (msg.oneofKind) {
       case "offer":
-        break;
-      case "answer":
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.offer });
         const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
         sendRpc({
           message: {
             oneofKind: "answer",
             answer: answer.sdp!,
           },
         });
+        console.log("answered");
+        break;
+      case "answer":
         break;
     }
   };
 
+  pc.ontrack = (track) => {
+    console.log("ontrack", { track });
+  };
+
   const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-  stream.getTracks().forEach((t) => pc.addTrack(t));
+  stream.getTracks().forEach((t) =>
+    pc.addTransceiver(t, { direction: "sendonly" })
+  );
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);

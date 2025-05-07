@@ -23,6 +23,7 @@ use tokio::{
     },
     time::Instant,
 };
+use tracing::instrument;
 
 use crate::{
     entity::{ParticipantId, TrackId},
@@ -111,18 +112,10 @@ pub struct ParticipantActor {
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
 }
 
-impl fmt::Debug for ParticipantActor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParticipantActor")
-            .field("participant_id", self.participant_id.deref())
-            .finish()
-    }
-}
-
 impl ParticipantActor {
     #[tracing::instrument(
         skip(self),
-        fields(participant_id=self.participant_id.deref().as_ref())
+        fields(participant_id=?self.participant_id)
     )]
     pub async fn run(mut self) {
         // TODO: notify ingress to add self to the routing table
@@ -187,10 +180,12 @@ impl ParticipantActor {
             ParticipantControlMessage::NewTrack(track) => {
                 if track.meta.id.origin_participant == self.participant_id {
                     // successfully publish a track
+                    tracing::info!(track_id = ?track.meta.id, "published track");
                     self.published_tracks
                         .insert(track.meta.id.origin_mid, track);
                 } else {
                     // new tracks from other participants
+                    tracing::info!(track_id = ?track.meta.id, state = "to_open", "subscribed track");
                     let track_id = track.meta.id.clone();
                     let track_out = TrackOut {
                         handle: track,
@@ -367,8 +362,9 @@ impl ParticipantActor {
 
         // Keep local track state in sync, cancelling any pending negotiation
         // so we can redo it after this offer is handled.
-        for (_, track) in &mut self.subscribed_tracks {
+        for (track_id, track) in &mut self.subscribed_tracks {
             if let TrackOutState::Negotiating(_) = track.state {
+                tracing::info!(?track_id, state = "to_open", "subscribed track, redoing");
                 track.state = TrackOutState::ToOpen;
             }
         }
@@ -378,7 +374,7 @@ impl ParticipantActor {
     }
 
     fn handle_answer(&mut self, answer: String) -> Result<(), ParticipantError> {
-        tracing::info!("handling answer");
+        tracing::info!("handle_answer");
         let answer =
             SdpAnswer::from_sdp_string(&answer).map_err(ParticipantError::InvalidSdpFormat)?;
 
@@ -388,9 +384,10 @@ impl ParticipantActor {
                 .accept_answer(pending, answer)
                 .expect("answer to be accepted");
 
-            for (_, track) in self.subscribed_tracks.iter_mut() {
+            for (track_id, track) in self.subscribed_tracks.iter_mut() {
                 if let TrackOutState::Negotiating(m) = track.state {
                     track.state = TrackOutState::Open(m);
+                    tracing::info!(?track_id, state = "open", "subscribed track");
                 }
             }
         }
@@ -415,6 +412,7 @@ impl ParticipantActor {
                     None,
                 );
                 track.state = TrackOutState::Negotiating(mid);
+                tracing::info!(?track_id, state = "negotiating", "subscribed track");
             }
         }
 

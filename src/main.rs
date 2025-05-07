@@ -15,10 +15,15 @@ use pulsebeam::{
 };
 use systemstat::{Platform, System};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().compact().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(true)
+        .pretty()
+        .init();
 
     let cors = CorsLayer::very_permissive()
         // https://github.com/tower-rs/tower-http/issues/194
