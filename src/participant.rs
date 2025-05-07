@@ -7,7 +7,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{MediaAdded, MediaData, Mid},
+    media::{Media, MediaAdded, MediaData, Mid},
     net::{self, Transmit},
 };
 use tokio::{
@@ -157,7 +157,7 @@ impl ParticipantActor {
                 }
             }
             ParticipantMessage::ForwardMedia(track, data) => {
-                // forwarded media from track
+                self.handle_forward_media(track, data);
             }
         }
     }
@@ -291,6 +291,25 @@ impl ParticipantActor {
                 simulcast: media.simulcast,
             }))
             .await;
+    }
+
+    fn handle_forward_media(&mut self, track: Arc<TrackIn>, data: Arc<MediaData>) {
+        let Some(track) = self.subscribed_tracks.get(&track.id) else {
+            return;
+        };
+
+        let TrackOutState::Open(mid) = track.state else {
+            return;
+        };
+
+        let Some(writer) = self.rtc.writer(mid) else {
+            return;
+        };
+
+        if let Err(err) = writer.write(data.pt, data.network_time, data.time, data.data.clone()) {
+            tracing::error!("failed to write media: {}", err);
+            self.rtc.disconnect();
+        }
     }
 
     fn handle_offer(&mut self, offer: String) -> Result<(), ParticipantError> {
