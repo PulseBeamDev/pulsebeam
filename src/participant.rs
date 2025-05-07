@@ -1,10 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Display,
-    ops::Deref,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -14,7 +8,7 @@ use str0m::{
     channel::{ChannelData, ChannelId},
     error::SdpError,
     media::{MediaAdded, MediaData, Mid},
-    net,
+    net::{self, Transmit},
 };
 use tokio::{
     sync::mpsc::{self, error::TrySendError},
@@ -23,7 +17,7 @@ use tokio::{
 
 use crate::{
     entity::{ParticipantId, TrackId},
-    message::{self, EgressUDPPacket, TrackIn, TrackKey},
+    message::{self, EgressUDPPacket, TrackIn},
     proto,
     room::RoomHandle,
     sink::UdpSinkHandle,
@@ -116,9 +110,6 @@ impl ParticipantActor {
             };
 
             tokio::select! {
-                // prioritze network inputs
-                biased;
-
                 msg = self.receiver.recv() => {
                     match msg {
                         Some(msg) => self.handle_message(msg).await,
@@ -174,7 +165,7 @@ impl ParticipantActor {
     async fn poll(&mut self) -> Option<Duration> {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
-        loop {
+        while self.rtc.is_alive() {
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
             let timeout = match self.rtc.poll_output().unwrap() {
@@ -185,59 +176,14 @@ impl ParticipantActor {
                 // a UDP socket. The destination IP comes from the ICE
                 // agent. It might change during the session.
                 Output::Transmit(v) => {
-                    let packet = Bytes::copy_from_slice(&v.contents);
-                    self.sink.send(EgressUDPPacket {
-                        raw: packet,
-                        dst: v.destination,
-                    });
+                    self.handle_output_transmit(v);
                     continue;
                 }
 
                 // Events are mainly incoming media data from the remote
                 // peer, but also data channel data and statistics.
                 Output::Event(v) => {
-                    match v {
-                        // Abort if we disconnect.
-                        Event::IceConnectionStateChange(
-                            str0m::IceConnectionState::Disconnected,
-                        ) => return None,
-                        Event::MediaAdded(e) => {
-                            self.handle_new_media(e).await;
-                        }
-                        Event::ChannelOpen(cid, label) => {
-                            if label == DATA_CHANNEL_LABEL {
-                                self.cid = Some(cid);
-                            }
-                        }
-                        Event::ChannelData(data) => {
-                            if Some(data.id) == self.cid {
-                                if let Err(err) = self.handle_rpc(data) {
-                                    tracing::warn!("data channel dropped due to an error: {err}");
-                                }
-                            } else {
-                                todo!("forward data channel");
-                            }
-                        }
-                        Event::ChannelClose(cid) => {
-                            if Some(cid) == self.cid {
-                                self.rtc.disconnect();
-                            } else {
-                                todo!("forward data channel");
-                            }
-                        }
-                        Event::MediaData(e) => {
-                            let key = TrackKey {
-                                origin: self.participant_id.clone(),
-                                mid: e.mid,
-                            };
-
-                            if let Some(track) = self.published_tracks.get(&e.mid) {
-                                todo!();
-                            }
-                        }
-
-                        _ => todo!(),
-                    }
+                    self.handle_output_event(v).await;
                     continue;
                 }
             };
@@ -256,6 +202,8 @@ impl ParticipantActor {
 
             return Some(duration);
         }
+
+        None
     }
 
     fn send_server_event(&mut self, msg: proto::sfu::server_message::Message) {
@@ -281,6 +229,54 @@ impl ParticipantActor {
             _ => todo!(),
         };
         Ok(())
+    }
+
+    fn handle_output_transmit(&mut self, t: Transmit) {
+        let packet = Bytes::copy_from_slice(&t.contents);
+        self.sink.send(EgressUDPPacket {
+            raw: packet,
+            dst: t.destination,
+        });
+    }
+
+    async fn handle_output_event(&mut self, event: Event) {
+        match event {
+            // Abort if we disconnect.
+            Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected) => {
+                self.rtc.disconnect();
+            }
+            Event::MediaAdded(e) => {
+                self.handle_new_media(e).await;
+            }
+            Event::ChannelOpen(cid, label) => {
+                if label == DATA_CHANNEL_LABEL {
+                    self.cid = Some(cid);
+                }
+            }
+            Event::ChannelData(data) => {
+                if Some(data.id) == self.cid {
+                    if let Err(err) = self.handle_rpc(data) {
+                        tracing::warn!("data channel dropped due to an error: {err}");
+                    }
+                } else {
+                    todo!("forward data channel");
+                }
+            }
+            Event::ChannelClose(cid) => {
+                if Some(cid) == self.cid {
+                    self.rtc.disconnect();
+                } else {
+                    todo!("forward data channel");
+                }
+            }
+            Event::MediaData(e) => {
+                if let Some(track) = self.published_tracks.get(&e.mid) {
+                    todo!();
+                }
+            }
+
+            _ => todo!(),
+        }
     }
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
