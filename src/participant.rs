@@ -7,7 +7,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{Media, MediaAdded, MediaData, Mid},
+    media::{MediaAdded, MediaData, Mid},
     net::{self, Transmit},
 };
 use tokio::{
@@ -188,6 +188,8 @@ impl ParticipantActor {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
         while self.rtc.is_alive() {
+            self.negotiation_if_needed();
+
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
             let timeout = match self.rtc.poll_output().unwrap() {
@@ -264,9 +266,10 @@ impl ParticipantActor {
     async fn handle_output_event(&mut self, event: Event) {
         match event {
             // Abort if we disconnect.
-            Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected) => {
-                self.rtc.disconnect();
-            }
+            Event::IceConnectionStateChange(ice_state) => match ice_state {
+                str0m::IceConnectionState::Disconnected => self.rtc.disconnect(),
+                state => tracing::trace!("ice state: {:?}", state),
+            },
             Event::MediaAdded(e) => {
                 self.handle_new_media(e).await;
             }
@@ -288,7 +291,7 @@ impl ParticipantActor {
                 if Some(cid) == self.cid {
                     self.rtc.disconnect();
                 } else {
-                    todo!("forward data channel");
+                    tracing::warn!("channel closed: {:?}", cid);
                 }
             }
             Event::MediaData(e) => {
@@ -296,8 +299,7 @@ impl ParticipantActor {
                     track.forward_media(Arc::new(e));
                 }
             }
-
-            _ => todo!(),
+            event => tracing::warn!("unhandled output event: {:?}", event),
         }
     }
 

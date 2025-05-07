@@ -26,6 +26,12 @@ export interface ClientMessage {
          */
         offer: string;
     } | {
+        oneofKind: "answer";
+        /**
+         * @generated from protobuf field: string answer = 2;
+         */
+        answer: string;
+    } | {
         oneofKind: undefined;
     };
 }
@@ -56,7 +62,8 @@ export interface ServerMessage {
 class ClientMessage$Type extends MessageType<ClientMessage> {
     constructor() {
         super("sfu.ClientMessage", [
-            { no: 1, name: "offer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ }
+            { no: 1, name: "offer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "answer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<ClientMessage>): ClientMessage {
@@ -77,6 +84,12 @@ class ClientMessage$Type extends MessageType<ClientMessage> {
                         offer: reader.string()
                     };
                     break;
+                case /* string answer */ 2:
+                    message.message = {
+                        oneofKind: "answer",
+                        answer: reader.string()
+                    };
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -92,6 +105,9 @@ class ClientMessage$Type extends MessageType<ClientMessage> {
         /* string offer = 1; */
         if (message.message.oneofKind === "offer")
             writer.tag(1, WireType.LengthDelimited).string(message.message.offer);
+        /* string answer = 2; */
+        if (message.message.oneofKind === "answer")
+            writer.tag(2, WireType.LengthDelimited).string(message.message.answer);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

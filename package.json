@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "proto": "protoc --ts_out . --proto_path proto proto/sfu.proto",
-    "dev": "vite"
+    "start": "vite"
   },
   "repository": {
     "type": "git",
