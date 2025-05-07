@@ -1,10 +1,16 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Display,
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
-    change::SdpOffer,
+    change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
     media::{MediaAdded, MediaData, Mid},
@@ -32,8 +38,8 @@ const DATA_CHANNEL_LABEL: &str = "pulsebeam::sfu";
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParticipantError {
-    #[error("invalid sdp offer format: {0}")]
-    InvalidOfferFormat(#[from] SdpError),
+    #[error("invalid sdp format: {0}")]
+    InvalidSdpFormat(#[from] SdpError),
 
     #[error(transparent)]
     OfferRejected(RtcError),
@@ -49,10 +55,26 @@ pub enum ParticipantMessage {
     ForwardMedia(Arc<TrackIn>, Arc<MediaData>),
 }
 
+#[derive(Debug)]
 struct TrackOut {
-    track: TrackHandle,
-    // pending=true means it needs to be negotiated
-    pending: bool,
+    track_in: Arc<TrackIn>,
+    state: TrackOutState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackOutState {
+    ToOpen,
+    Negotiating(Mid),
+    Open(Mid),
+}
+
+impl TrackOut {
+    fn mid(&self) -> Option<Mid> {
+        match self.state {
+            TrackOutState::ToOpen => None,
+            TrackOutState::Negotiating(m) | TrackOutState::Open(m) => Some(m),
+        }
+    }
 }
 
 /// Reponsibilities:
@@ -75,6 +97,7 @@ pub struct ParticipantActor {
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
+    pending: Option<SdpPendingOffer>,
 
     published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
@@ -134,16 +157,15 @@ impl ParticipantActor {
                         .insert(track.meta.id.origin_mid, track);
                 } else {
                     // new tracks from other participants
-                    self.subscribed_tracks.insert(
-                        track.meta.id.clone(),
-                        TrackOut {
-                            track,
-                            pending: true,
-                        },
-                    );
+                    let track_out = TrackOut {
+                        track_in: track.meta.clone(),
+                        state: TrackOutState::ToOpen,
+                    };
+                    self.subscribed_tracks
+                        .insert(track.meta.id.clone(), track_out);
                 }
             }
-            ParticipantMessage::ForwardMedia(key, data) => {
+            ParticipantMessage::ForwardMedia(track, data) => {
                 // forwarded media from track
             }
         }
@@ -253,6 +275,9 @@ impl ParticipantActor {
             Some(client::Message::Offer(sdp)) => {
                 self.handle_offer(sdp)?;
             }
+            Some(client::Message::Answer(sdp)) => {
+                self.handle_answer(sdp)?;
+            }
             _ => todo!(),
         };
         Ok(())
@@ -274,27 +299,77 @@ impl ParticipantActor {
 
     fn handle_offer(&mut self, offer: String) -> Result<(), ParticipantError> {
         let offer =
-            SdpOffer::from_sdp_string(&offer).map_err(ParticipantError::InvalidOfferFormat)?;
+            SdpOffer::from_sdp_string(&offer).map_err(ParticipantError::InvalidSdpFormat)?;
         let answer = self
             .rtc
             .sdp_api()
             .accept_offer(offer)
             .map_err(ParticipantError::OfferRejected)?;
+
+        // Keep local track state in sync, cancelling any pending negotiation
+        // so we can redo it after this offer is handled.
+        for (_, track) in &mut self.subscribed_tracks {
+            if let TrackOutState::Negotiating(_) = track.state {
+                track.state = TrackOutState::ToOpen;
+            }
+        }
+
         self.send_server_event(server::Message::Answer(answer.to_sdp_string()));
         Ok(())
     }
 
-    fn handle_renegotiate(&mut self) {
-        let sdp = self.rtc.sdp_api();
+    fn handle_answer(&mut self, answer: String) -> Result<(), ParticipantError> {
+        let answer =
+            SdpAnswer::from_sdp_string(&answer).map_err(ParticipantError::InvalidSdpFormat)?;
+
+        if let Some(pending) = self.pending.take() {
+            self.rtc
+                .sdp_api()
+                .accept_answer(pending, answer)
+                .expect("answer to be accepted");
+
+            for (_, track) in self.subscribed_tracks.iter_mut() {
+                if let TrackOutState::Negotiating(m) = track.state {
+                    track.state = TrackOutState::Open(m);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn negotiation_if_needed(&mut self) -> bool {
+        if self.cid.is_none() || self.pending.is_some() {
+            // Don't negotiate if there is no data channel, or if we have pending changes already.
+            return false;
+        }
+
+        let mut sdp = self.rtc.sdp_api();
+
+        for (track_id, track) in self.subscribed_tracks.iter_mut() {
+            if track.state == TrackOutState::ToOpen {
+                let mid = sdp.add_media(
+                    track.track_in.kind,
+                    str0m::media::Direction::SendOnly,
+                    Some(track_id.origin_participant.to_string()),
+                    Some(track_id.to_string()),
+                    None,
+                );
+                track.state = TrackOutState::Negotiating(mid);
+            }
+        }
+
         if !sdp.has_changes() {
-            return;
+            return false;
         }
 
         let Some((offer, pending)) = sdp.apply() else {
-            return;
+            return false;
         };
 
-        self.send_server_event(server::Message::Answer(offer.to_sdp_string()));
+        self.pending.replace(pending);
+        self.send_server_event(server::Message::Offer(offer.to_sdp_string()));
+
+        true
     }
 }
 
@@ -327,6 +402,7 @@ impl ParticipantHandle {
             published_tracks: HashMap::new(),
             subscribed_tracks: HashMap::new(),
             cid: None,
+            pending: None,
         };
         (handle, actor)
     }
