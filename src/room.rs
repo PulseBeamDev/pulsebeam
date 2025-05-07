@@ -60,6 +60,9 @@ impl RoomActor {
     async fn handle_message(&mut self, mut msg: RoomMessage) {
         match msg {
             RoomMessage::AddParticipant(participant) => {
+                for (_, track) in &self.tracks {
+                    participant.new_track(track.clone()).await;
+                }
                 self.participants
                     .insert(participant.participant_id.clone(), participant);
             }
@@ -81,11 +84,15 @@ impl RoomActor {
                     let track_id = track.id.clone();
                     let track = Arc::new(track);
                     let (handle, actor) = TrackHandle::new(origin_handle.clone(), track);
-                    self.tracks.insert(track_id.clone(), handle);
+                    self.tracks.insert(track_id.clone(), handle.clone());
                     self.track_tasks.spawn(async move {
                         actor.run().await;
                         track_id
                     });
+
+                    for (_, participant) in &self.participants {
+                        participant.new_track(handle.clone()).await;
+                    }
                 }
             }
             _ => todo!(),

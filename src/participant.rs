@@ -11,7 +11,10 @@ use str0m::{
     net::{self, Transmit},
 };
 use tokio::{
-    sync::mpsc::{self, error::TrySendError},
+    sync::mpsc::{
+        self,
+        error::{SendError, TrySendError},
+    },
     time::Instant,
 };
 
@@ -43,15 +46,19 @@ pub enum ParticipantError {
 }
 
 #[derive(Debug)]
-pub enum ParticipantMessage {
-    UdpPacket(message::UDPPacket),
+pub enum ParticipantControlMessage {
     NewTrack(TrackHandle),
+}
+
+#[derive(Debug)]
+pub enum ParticipantDataMessage {
+    UdpPacket(message::UDPPacket),
     ForwardMedia(Arc<TrackIn>, Arc<MediaData>),
 }
 
 #[derive(Debug)]
 struct TrackOut {
-    track_in: Arc<TrackIn>,
+    handle: TrackHandle,
     state: TrackOutState,
 }
 
@@ -85,7 +92,8 @@ impl TrackOut {
 /// * Route Subscriber RTCP Feedback to origin via Track actor
 pub struct ParticipantActor {
     handle: ParticipantHandle,
-    receiver: mpsc::Receiver<ParticipantMessage>,
+    data_receiver: mpsc::Receiver<ParticipantDataMessage>,
+    control_receiver: mpsc::Receiver<ParticipantControlMessage>,
     sink: UdpSinkHandle,
     room: RoomHandle,
     participant_id: Arc<ParticipantId>,
@@ -110,9 +118,18 @@ impl ParticipantActor {
             };
 
             tokio::select! {
-                msg = self.receiver.recv() => {
+                biased;
+
+                msg = self.data_receiver.recv() => {
                     match msg {
-                        Some(msg) => self.handle_message(msg).await,
+                        Some(msg) => self.handle_data_message(msg).await,
+                        None => break,
+                    }
+                }
+
+                msg = self.control_receiver.recv() => {
+                    match msg {
+                        Some(msg) => self.handle_control_message(msg).await,
                         None => break,
                     }
                 }
@@ -127,9 +144,9 @@ impl ParticipantActor {
     }
 
     #[inline]
-    async fn handle_message(&mut self, msg: ParticipantMessage) {
+    async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
-            ParticipantMessage::UdpPacket(packet) => {
+            ParticipantDataMessage::UdpPacket(packet) => {
                 let now = Instant::now();
                 self.rtc.handle_input(Input::Receive(
                     now.into_std(),
@@ -141,23 +158,28 @@ impl ParticipantActor {
                     },
                 ));
             }
-            ParticipantMessage::NewTrack(track) => {
+            ParticipantDataMessage::ForwardMedia(track, data) => {
+                self.handle_forward_media(track, data);
+            }
+        }
+    }
+
+    async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
+        match msg {
+            ParticipantControlMessage::NewTrack(track) => {
                 if track.meta.id.origin_participant == self.participant_id {
                     // successfully publish a track
                     self.published_tracks
                         .insert(track.meta.id.origin_mid, track);
                 } else {
                     // new tracks from other participants
+                    let track_id = track.meta.id.clone();
                     let track_out = TrackOut {
-                        track_in: track.meta.clone(),
+                        handle: track,
                         state: TrackOutState::ToOpen,
                     };
-                    self.subscribed_tracks
-                        .insert(track.meta.id.clone(), track_out);
+                    self.subscribed_tracks.insert(track_id, track_out);
                 }
-            }
-            ParticipantMessage::ForwardMedia(track, data) => {
-                self.handle_forward_media(track, data);
             }
         }
     }
@@ -271,7 +293,7 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_tracks.get(&e.mid) {
-                    todo!();
+                    track.forward_media(Arc::new(e));
                 }
             }
 
@@ -363,7 +385,7 @@ impl ParticipantActor {
         for (track_id, track) in self.subscribed_tracks.iter_mut() {
             if track.state == TrackOutState::ToOpen {
                 let mid = sdp.add_media(
-                    track.track_in.kind,
+                    track.handle.meta.kind,
                     str0m::media::Direction::SendOnly,
                     Some(track_id.origin_participant.to_string()),
                     Some(track_id.to_string()),
@@ -390,7 +412,8 @@ impl ParticipantActor {
 
 #[derive(Clone, Debug)]
 pub struct ParticipantHandle {
-    pub sender: mpsc::Sender<ParticipantMessage>,
+    pub data_sender: mpsc::Sender<ParticipantDataMessage>,
+    pub control_sender: mpsc::Sender<ParticipantControlMessage>,
     pub participant_id: Arc<ParticipantId>,
 }
 
@@ -402,14 +425,17 @@ impl ParticipantHandle {
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
     ) -> (Self, ParticipantActor) {
-        let (sender, receiver) = mpsc::channel(8);
+        let (data_sender, data_receiver) = mpsc::channel(64);
+        let (control_sender, control_receiver) = mpsc::channel(1);
         let handle = Self {
-            sender,
+            data_sender,
+            control_sender,
             participant_id: participant_id.clone(),
         };
         let actor = ParticipantActor {
             handle: handle.clone(),
-            receiver,
+            data_receiver,
+            control_receiver,
             sink,
             room,
             participant_id,
@@ -422,8 +448,30 @@ impl ParticipantHandle {
         (handle, actor)
     }
 
-    pub fn forward(&self, msg: message::UDPPacket) -> Result<(), TrySendError<ParticipantMessage>> {
-        self.sender.try_send(ParticipantMessage::UdpPacket(msg))
+    pub fn forward(
+        &self,
+        msg: message::UDPPacket,
+    ) -> Result<(), TrySendError<ParticipantDataMessage>> {
+        self.data_sender
+            .try_send(ParticipantDataMessage::UdpPacket(msg))
+    }
+
+    pub async fn new_track(
+        &self,
+        track: TrackHandle,
+    ) -> Result<(), SendError<ParticipantControlMessage>> {
+        self.control_sender
+            .send(ParticipantControlMessage::NewTrack(track))
+            .await
+    }
+
+    pub fn forward_media(
+        &self,
+        track: Arc<TrackIn>,
+        data: Arc<MediaData>,
+    ) -> Result<(), TrySendError<ParticipantDataMessage>> {
+        self.data_sender
+            .try_send(ParticipantDataMessage::ForwardMedia(track, data))
     }
 }
 

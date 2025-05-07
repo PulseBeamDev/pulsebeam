@@ -200,6 +200,18 @@ impl hash::Hash for ParticipantId {
     }
 }
 
+impl PartialOrd for ParticipantId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ParticipantId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.internal.cmp(&other.internal)
+    }
+}
+
 impl Eq for ParticipantId {}
 
 impl PartialEq for ParticipantId {
