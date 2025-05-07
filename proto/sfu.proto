@@ -5,15 +5,14 @@ package sfu;
 
 message ClientMessage {
   oneof message {
-    // client is always impolite
-    string offer = 1;
-    string answer = 2;
+    Empty empty = 1;
   }
 }
 
 message ServerMessage {
   oneof message {
-    string offer = 1;
-    string answer = 2;
+    Empty empty = 1;
   }
 }
+
+message Empty {}

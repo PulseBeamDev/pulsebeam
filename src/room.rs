@@ -141,6 +141,10 @@ impl RoomHandle {
             .send(RoomMessage::RemoveParticipant(participant_id))
             .await
     }
+
+    pub async fn publish(&self, track: TrackIn) -> Result<(), SendError<RoomMessage>> {
+        self.sender.send(RoomMessage::PublishMedia(track)).await
+    }
 }
 
 impl Display for RoomHandle {

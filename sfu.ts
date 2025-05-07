@@ -3,7 +3,6 @@
 // tslint:disable
 import type { BinaryWriteOptions } from "@protobuf-ts/runtime";
 import type { IBinaryWriter } from "@protobuf-ts/runtime";
-import { WireType } from "@protobuf-ts/runtime";
 import type { BinaryReadOptions } from "@protobuf-ts/runtime";
 import type { IBinaryReader } from "@protobuf-ts/runtime";
 import { UnknownFieldHandler } from "@protobuf-ts/runtime";
@@ -14,61 +13,19 @@ import { MessageType } from "@protobuf-ts/runtime";
  * @generated from protobuf message sfu.ClientMessage
  */
 export interface ClientMessage {
-    /**
-     * @generated from protobuf oneof: message
-     */
-    message: {
-        oneofKind: "offer";
-        /**
-         * client is always impolite
-         *
-         * @generated from protobuf field: string offer = 1;
-         */
-        offer: string;
-    } | {
-        oneofKind: "answer";
-        /**
-         * @generated from protobuf field: string answer = 2;
-         */
-        answer: string;
-    } | {
-        oneofKind: undefined;
-    };
 }
 /**
  * @generated from protobuf message sfu.ServerMessage
  */
 export interface ServerMessage {
-    /**
-     * @generated from protobuf oneof: message
-     */
-    message: {
-        oneofKind: "offer";
-        /**
-         * @generated from protobuf field: string offer = 1;
-         */
-        offer: string;
-    } | {
-        oneofKind: "answer";
-        /**
-         * @generated from protobuf field: string answer = 2;
-         */
-        answer: string;
-    } | {
-        oneofKind: undefined;
-    };
 }
 // @generated message type with reflection information, may provide speed optimized methods
 class ClientMessage$Type extends MessageType<ClientMessage> {
     constructor() {
-        super("sfu.ClientMessage", [
-            { no: 1, name: "offer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ },
-            { no: 2, name: "answer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ }
-        ]);
+        super("sfu.ClientMessage", []);
     }
     create(value?: PartialMessage<ClientMessage>): ClientMessage {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.message = { oneofKind: undefined };
         if (value !== undefined)
             reflectionMergePartial<ClientMessage>(this, message, value);
         return message;
@@ -78,18 +35,6 @@ class ClientMessage$Type extends MessageType<ClientMessage> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string offer */ 1:
-                    message.message = {
-                        oneofKind: "offer",
-                        offer: reader.string()
-                    };
-                    break;
-                case /* string answer */ 2:
-                    message.message = {
-                        oneofKind: "answer",
-                        answer: reader.string()
-                    };
-                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -102,12 +47,6 @@ class ClientMessage$Type extends MessageType<ClientMessage> {
         return message;
     }
     internalBinaryWrite(message: ClientMessage, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string offer = 1; */
-        if (message.message.oneofKind === "offer")
-            writer.tag(1, WireType.LengthDelimited).string(message.message.offer);
-        /* string answer = 2; */
-        if (message.message.oneofKind === "answer")
-            writer.tag(2, WireType.LengthDelimited).string(message.message.answer);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -121,14 +60,10 @@ export const ClientMessage = new ClientMessage$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class ServerMessage$Type extends MessageType<ServerMessage> {
     constructor() {
-        super("sfu.ServerMessage", [
-            { no: 1, name: "offer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ },
-            { no: 2, name: "answer", kind: "scalar", oneof: "message", T: 9 /*ScalarType.STRING*/ }
-        ]);
+        super("sfu.ServerMessage", []);
     }
     create(value?: PartialMessage<ServerMessage>): ServerMessage {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.message = { oneofKind: undefined };
         if (value !== undefined)
             reflectionMergePartial<ServerMessage>(this, message, value);
         return message;
@@ -138,18 +73,6 @@ class ServerMessage$Type extends MessageType<ServerMessage> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string offer */ 1:
-                    message.message = {
-                        oneofKind: "offer",
-                        offer: reader.string()
-                    };
-                    break;
-                case /* string answer */ 2:
-                    message.message = {
-                        oneofKind: "answer",
-                        answer: reader.string()
-                    };
-                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -162,12 +85,6 @@ class ServerMessage$Type extends MessageType<ServerMessage> {
         return message;
     }
     internalBinaryWrite(message: ServerMessage, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string offer = 1; */
-        if (message.message.oneofKind === "offer")
-            writer.tag(1, WireType.LengthDelimited).string(message.message.offer);
-        /* string answer = 2; */
-        if (message.message.oneofKind === "answer")
-            writer.tag(2, WireType.LengthDelimited).string(message.message.answer);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

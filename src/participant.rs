@@ -13,7 +13,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{MediaAdded, MediaData, Mid},
+    media::{Direction, MediaAdded, MediaData, Mid},
     net::{self, Transmit},
 };
 use tokio::{
@@ -106,7 +106,6 @@ pub struct ParticipantActor {
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
-    pending: Option<SdpPendingOffer>,
 
     published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
@@ -192,7 +191,6 @@ impl ParticipantActor {
                         state: TrackOutState::ToOpen,
                     };
                     self.subscribed_tracks.insert(track_id, track_out);
-                    self.negotiation_if_needed();
                 }
             }
         }
@@ -202,8 +200,6 @@ impl ParticipantActor {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
         while self.rtc.is_alive() {
-            self.negotiation_if_needed();
-
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
             let timeout = match self.rtc.poll_output().unwrap() {
@@ -258,12 +254,6 @@ impl ParticipantActor {
             .map_err(ParticipantError::InvalidRPCFormat)?;
 
         match msg.message {
-            Some(client::Message::Offer(sdp)) => {
-                self.handle_offer(sdp)?;
-            }
-            Some(client::Message::Answer(sdp)) => {
-                self.handle_answer(sdp)?;
-            }
             _ => todo!(),
         };
         Ok(())
@@ -319,17 +309,25 @@ impl ParticipantActor {
     }
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
-        // TODO: handle back pressure by buffering temporarily
-        let track_id = TrackId::new(self.participant_id.clone(), media.mid);
-        let track_id = Arc::new(track_id);
-        self.room
-            .sender
-            .send(crate::room::RoomMessage::PublishMedia(TrackIn {
-                id: track_id,
-                kind: media.kind,
-                simulcast: media.simulcast,
-            }))
-            .await;
+        match media.direction {
+            Direction::SendOnly => {
+                // TODO: handle back pressure by buffering temporarily
+                let track_id = TrackId::new(self.participant_id.clone(), media.mid);
+                let track_id = Arc::new(track_id);
+                let track = TrackIn {
+                    id: track_id,
+                    kind: media.kind,
+                    simulcast: media.simulcast,
+                };
+                self.room.publish(track).await;
+            }
+            Direction::RecvOnly => {}
+            dir => {
+                tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
+                self.rtc.disconnect();
+                return;
+            }
+        }
     }
 
     fn handle_forward_media(&mut self, track: Arc<TrackIn>, data: Arc<MediaData>) {
@@ -349,86 +347,6 @@ impl ParticipantActor {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();
         }
-    }
-
-    fn handle_offer(&mut self, offer: String) -> Result<(), ParticipantError> {
-        let offer =
-            SdpOffer::from_sdp_string(&offer).map_err(ParticipantError::InvalidSdpFormat)?;
-        let answer = self
-            .rtc
-            .sdp_api()
-            .accept_offer(offer)
-            .map_err(ParticipantError::OfferRejected)?;
-
-        // Keep local track state in sync, cancelling any pending negotiation
-        // so we can redo it after this offer is handled.
-        for (track_id, track) in &mut self.subscribed_tracks {
-            if let TrackOutState::Negotiating(_) = track.state {
-                tracing::info!(?track_id, state = "to_open", "subscribed track, redoing");
-                track.state = TrackOutState::ToOpen;
-            }
-        }
-
-        self.send_server_event(server::Message::Answer(answer.to_sdp_string()));
-        Ok(())
-    }
-
-    fn handle_answer(&mut self, answer: String) -> Result<(), ParticipantError> {
-        tracing::info!("handle_answer");
-        let answer =
-            SdpAnswer::from_sdp_string(&answer).map_err(ParticipantError::InvalidSdpFormat)?;
-
-        if let Some(pending) = self.pending.take() {
-            self.rtc
-                .sdp_api()
-                .accept_answer(pending, answer)
-                .expect("answer to be accepted");
-
-            for (track_id, track) in self.subscribed_tracks.iter_mut() {
-                if let TrackOutState::Negotiating(m) = track.state {
-                    track.state = TrackOutState::Open(m);
-                    tracing::info!(?track_id, state = "open", "subscribed track");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn negotiation_if_needed(&mut self) -> bool {
-        if self.cid.is_none() || self.pending.is_some() {
-            // Don't negotiate if there is no data channel, or if we have pending changes already.
-            return false;
-        }
-
-        let mut sdp = self.rtc.sdp_api();
-
-        for (track_id, track) in self.subscribed_tracks.iter_mut() {
-            if track.state == TrackOutState::ToOpen {
-                let mid = sdp.add_media(
-                    track.handle.meta.kind,
-                    str0m::media::Direction::SendOnly,
-                    Some(track_id.origin_participant.to_string()),
-                    Some(track_id.to_string()),
-                    None,
-                );
-                track.state = TrackOutState::Negotiating(mid);
-                tracing::info!(?track_id, state = "negotiating", "subscribed track");
-            }
-        }
-
-        if !sdp.has_changes() {
-            return false;
-        }
-
-        tracing::info!("renegotiating");
-        let Some((offer, pending)) = sdp.apply() else {
-            return false;
-        };
-
-        self.pending.replace(pending);
-        self.send_server_event(server::Message::Offer(offer.to_sdp_string()));
-
-        true
     }
 }
 
@@ -465,7 +383,6 @@ impl ParticipantHandle {
             published_tracks: HashMap::new(),
             subscribed_tracks: HashMap::new(),
             cid: None,
-            pending: None,
         };
         (handle, actor)
     }

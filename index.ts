@@ -1,5 +1,7 @@
 import * as sfu from "./sfu.ts";
 
+const MAX_DOWNSTREAMS = 16;
+
 function generateRandomId(length: number) {
   const characters =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -18,39 +20,25 @@ export async function start() {
   rpcCh.binaryType = "arraybuffer";
 
   function sendRpc(msg: sfu.ClientMessage) {
-    console.log("answer", msg);
     rpcCh.send(sfu.ClientMessage.toBinary(msg));
   }
 
   rpcCh.onmessage = async (e) => {
     const msg = sfu.ServerMessage.fromBinary(new Uint8Array(e.data)).message;
     console.log(msg);
-    switch (msg.oneofKind) {
-      case "offer":
-        await pc.setRemoteDescription({ type: "offer", sdp: msg.offer });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sendRpc({
-          message: {
-            oneofKind: "answer",
-            answer: answer.sdp!,
-          },
-        });
-        console.log("answered");
-        break;
-      case "answer":
-        break;
-    }
   };
 
   pc.ontrack = (track) => {
     console.log("ontrack", { track });
   };
 
-  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-  stream.getTracks().forEach((t) =>
-    pc.addTransceiver(t, { direction: "sendonly" })
-  );
+  pc.addTransceiver("video", { direction: "sendonly" });
+  pc.addTransceiver("audio", { direction: "sendonly" });
+
+  for (let i = 0; i++; i < MAX_DOWNSTREAMS) {
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+  }
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
