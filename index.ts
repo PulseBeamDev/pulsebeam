@@ -1,7 +1,7 @@
 import * as sfu from "./sfu.ts";
 import "webrtc-adapter";
 
-const MAX_DOWNSTREAMS = 16;
+const MAX_DOWNSTREAMS = 9;
 
 function generateRandomId(length: number) {
   const characters =
