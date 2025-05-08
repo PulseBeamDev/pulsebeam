@@ -2,19 +2,20 @@
 <html lang="en">
 
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pulsebeam</title>
-  <link href="https://cdn.jsdelivr.net/npm/beercss@3.10.8/dist/cdn/beer.min.css" rel="stylesheet">
-  <script type="module" src="https://cdn.jsdelivr.net/npm/beercss@3.10.8/dist/cdn/beer.min.js"></script>
-  <script type="module"
-    src="https://cdn.jsdelivr.net/npm/material-dynamic-colors@1.1.2/dist/cdn/material-dynamic-colors.min.js"></script>
-
+  <title>Clear & Tiny Pulsebeam Demo</title>
 </head>
 
 <body>
-  <button id="start">Start</button>
-  <script type="module" src="./index.ts"></script>
+  <p>State: <span id="connectionStateDisplay">new</span></p>
+  <button id="connectButton">Connect & Publish Local</button>
+  <button id="disconnectButton" disabled>Disconnect</button>
+  <button id="subscribeRemoteButton" disabled>Subscribe to Remote Video</button>
+  <hr>
+  Local: <video id="localVideoElement" autoplay muted playsinline width="160" height="120"
+    style="border:1px solid black; margin:2px;"></video>
+  Remote: <video id="remoteVideoElement" autoplay playsinline width="160" height="120"
+    style="border:1px solid black; margin:2px;"></video>
+  <script type="module" src="index.ts"></script>
 </body>
 
 </html>

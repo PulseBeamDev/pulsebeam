@@ -1,18 +1,79 @@
 syntax = "proto3";
 
-// protocol between the client and server via a data channel 
 package sfu;
 
+// Represents the kind of media track.
+enum TrackKind {
+  TRACK_KIND_UNSPECIFIED = 0;
+  VIDEO = 1;
+  AUDIO = 2;
+}
+
+// --- Client to Server Messages ---
+
+message ClientSubscribePayload {
+  string mid = 1;         // The client's MID (transceiver slot) to use for this track.
+  string track_id = 2;    // The application-level ID of the remote track to subscribe to.
+  TrackKind kind = 3;     // The kind of track (video/audio).
+}
+
+message ClientUnsubscribePayload {
+  string mid = 1;         // The client's MID (transceiver slot) to unsubscribe from.
+}
+
+// ClientMessage encapsulates all possible messages from client to SFU.
 message ClientMessage {
-  oneof message {
-    Empty empty = 1;
+  oneof payload {
+    ClientSubscribePayload subscribe = 1;
+    ClientUnsubscribePayload unsubscribe = 2;
+    // Add other client-initiated actions here if needed
+    // e.g., ChangeSubscriptionQualityPayload change_quality = 3;
   }
 }
 
+
+// --- Server to Client Messages ---
+
+message SubscriptionOfferPayload {
+  string subscription_id = 1; // A unique ID for this subscription attempt, useful for correlation.
+  string mid = 2;             // The client's MID that the SFU will use (confirming client's request).
+  string remote_track_id = 3; // The remote track ID being offered/confirmed.
+  TrackKind kind = 4;         // The kind of track.
+  // uint32 ssrc = 5;         // Optional: SFU could inform client of the SSRC it will send for this track.
+}
+
+message SubscriptionErrorPayload {
+  optional string subscription_id = 1; // Correlates to a subscription attempt.
+  optional string remote_track_id = 2; // Which track failed, if applicable.
+  optional string mid = 3;             // Which client MID failed, if applicable.
+  string message = 4;                 // Error description.
+}
+
+message TrackPublishedPayload {
+  string remote_track_id = 1; // The ID of the newly available remote track.
+  TrackKind kind = 2;         // The kind of track.
+  string participant_id = 3;  // The ID of the participant who published this track.
+  // map<string, string> metadata = 4; // Optional: any other app-specific metadata about the track.
+}
+
+message TrackUnpublishedPayload {
+  string remote_track_id = 1; // The ID of the remote track that is no longer available.
+}
+
+message ErrorPayload {
+  string message = 1;         // General error message from the SFU.
+}
+
+
+// ServerMessage encapsulates all possible messages from SFU to client.
 message ServerMessage {
-  oneof message {
-    Empty empty = 1;
+  oneof payload {
+    SubscriptionOfferPayload subscription_offer = 1;   // SFU confirms/offers a subscription to a track.
+    SubscriptionErrorPayload subscription_error = 2;   // SFU reports an error with a subscription.
+    TrackPublishedPayload track_published = 3;         // SFU informs client a new remote track is available.
+    TrackUnpublishedPayload track_unpublished = 4;     // SFU informs client a remote track is no longer available.
+    ErrorPayload error = 5;                            // General error from SFU.
+    // Add other server-initiated messages here if needed
+    // e.g., ServerForceMutePayload force_mute = 6;
   }
 }
-
-message Empty {}
