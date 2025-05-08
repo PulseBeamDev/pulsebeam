@@ -17,6 +17,9 @@ const MY_PARTICIPANT_ID = generateRandomId(4);
 const REMOTE_TRACK_ID_TO_SUBSCRIBE = "participantB-video"; // SFU must know this track
 
 // --- DOM Elements ---
+const participantInput = document.getElementById(
+  "participant",
+) as HTMLInputElement;
 const connectBtn = document.getElementById(
   "connectButton",
 ) as HTMLButtonElement;
@@ -98,9 +101,10 @@ client.sfuErrorMessage.subscribe((errorMessage) => {
 
 // Connect button action
 connectBtn.onclick = async () => {
-  console.log("Connecting...");
   try {
-    await client.connect(ROOM_NAME, MY_PARTICIPANT_ID);
+    const participantId = participantInput.value;
+    console.log(`Connecting as ${participantId}`);
+    await client.connect(ROOM_NAME, participantId);
     // Once connected, attempt to get and publish local media
     const stream = await navigator.mediaDevices.getUserMedia({
       video: true,

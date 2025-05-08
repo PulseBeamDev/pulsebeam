@@ -77,6 +77,8 @@ impl ControllerActor {
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
             .set_ice_lite(true)
+            .enable_vp9(false)
+            .enable_h264(false)
             .build();
 
         for addr in self.local_addrs.iter() {

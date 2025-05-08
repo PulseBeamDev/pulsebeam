@@ -171,12 +171,12 @@ impl ParticipantActor {
             ParticipantControlMessage::NewTrack(track) => {
                 if track.meta.id.origin_participant == self.participant_id {
                     // successfully publish a track
-                    tracing::info!(track_id = ?track.meta.id, "published track");
+                    tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
                     self.published_tracks
                         .insert(track.meta.id.origin_mid, track);
                 } else {
                     // new tracks from other participants
-                    tracing::info!(track_id = ?track.meta.id, "subscribed track");
+                    tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
                     let track_id = track.meta.id.clone();
                     for (mid, slot) in &mut self.mid_out_slots {
                         if slot.track_id.is_none() {
@@ -238,11 +238,11 @@ impl ParticipantActor {
         None
     }
 
-    fn send_server_event(&mut self, msg: proto::sfu::server_message::Message) {
+    fn send_server_event(&mut self, msg: proto::sfu::server_message::Payload) {
         // TODO: handle when data channel is closed
 
         if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
-            let encoded = proto::sfu::ServerMessage { message: Some(msg) }.encode_to_vec();
+            let encoded = proto::sfu::ServerMessage { payload: Some(msg) }.encode_to_vec();
             ch.write(true, encoded.as_slice());
         }
     }
@@ -251,7 +251,7 @@ impl ParticipantActor {
         let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())
             .map_err(ParticipantError::InvalidRPCFormat)?;
 
-        match msg.message {
+        match msg.payload {
             _ => todo!(),
         };
         Ok(())
