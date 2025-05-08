@@ -180,6 +180,7 @@ impl ParticipantActor {
                     let track_id = track.meta.id.clone();
                     for (mid, slot) in &mut self.mid_out_slots {
                         if slot.track_id.is_none() {
+                            track.subscribe(self.handle.clone()).await;
                             slot.track_id = Some(track_id.clone());
                             let track_out = TrackOut {
                                 handle: track,
@@ -299,6 +300,7 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_tracks.get(&e.mid) {
+                    tracing::debug!("forwarding media data to {}", e.mid);
                     track.forward_media(Arc::new(e));
                 }
             }
@@ -341,6 +343,7 @@ impl ParticipantActor {
     }
 
     fn handle_forward_media(&mut self, track: Arc<TrackIn>, data: Arc<MediaData>) {
+        tracing::debug!("handle forward media data");
         let Some(track) = self.subscribed_tracks.get(&track.id) else {
             return;
         };

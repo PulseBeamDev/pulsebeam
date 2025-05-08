@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, panic::AssertUnwindSafe, sync::Arc};
 
 use futures::FutureExt;
 use str0m::media::MediaData;
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc::{
+    self,
+    error::{SendError, TrySendError},
+};
 
 use crate::{
     entity::ParticipantId,
@@ -39,6 +42,10 @@ pub struct TrackActor {
 }
 
 impl TrackActor {
+    #[tracing::instrument(
+        skip(self),
+        fields(track_id=?self.meta.id)
+    )]
     pub async fn run(self) {
         match AssertUnwindSafe(self.run_inner()).catch_unwind().await {
             Ok(Ok(())) => {
@@ -86,6 +93,7 @@ impl TrackActor {
     fn handle_control_message(&mut self, msg: TrackControlMessage) {
         match msg {
             TrackControlMessage::Subscribe(participant) => {
+                tracing::info!(participant_id=?participant.participant_id, "track subscribed");
                 self.subscribers
                     .insert(participant.participant_id.clone(), participant);
             }
@@ -125,5 +133,14 @@ impl TrackHandle {
     ) -> Result<(), TrySendError<TrackDataMessage>> {
         self.data_sender
             .try_send(TrackDataMessage::ForwardMedia(data))
+    }
+
+    pub async fn subscribe(
+        &self,
+        participant: ParticipantHandle,
+    ) -> Result<(), SendError<TrackControlMessage>> {
+        self.control_sender
+            .send(TrackControlMessage::Subscribe(participant))
+            .await
     }
 }

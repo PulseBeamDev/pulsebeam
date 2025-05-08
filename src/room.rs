@@ -4,6 +4,7 @@ use tokio::{
     sync::mpsc::{self, error::SendError},
     task::JoinSet,
 };
+use tracing::Instrument;
 
 use crate::{
     controller::ControllerHandle,
@@ -85,10 +86,13 @@ impl RoomActor {
                     let track = Arc::new(track);
                     let (handle, actor) = TrackHandle::new(origin_handle.clone(), track);
                     self.tracks.insert(track_id.clone(), handle.clone());
-                    self.track_tasks.spawn(async move {
-                        actor.run().await;
-                        track_id
-                    });
+                    self.track_tasks.spawn(
+                        async move {
+                            actor.run().await;
+                            track_id
+                        }
+                        .in_current_span(),
+                    );
 
                     for (_, participant) in &self.participants {
                         participant.new_track(handle.clone()).await;
