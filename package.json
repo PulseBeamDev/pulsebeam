@@ -21,5 +21,8 @@
   "devDependencies": {
     "@protobuf-ts/plugin": "^2.10.0",
     "vite": "^6.3.4"
+  },
+  "dependencies": {
+    "webrtc-adapter": "^9.0.3"
   }
 }

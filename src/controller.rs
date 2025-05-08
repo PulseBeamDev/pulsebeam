@@ -76,7 +76,7 @@ impl ControllerActor {
         let mut rtc = Rtc::builder()
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            // .set_ice_lite(true)
+            .set_ice_lite(true)
             .build();
 
         for addr in self.local_addrs.iter() {

@@ -1,4 +1,5 @@
 import * as sfu from "./sfu.ts";
+import "webrtc-adapter";
 
 const MAX_DOWNSTREAMS = 16;
 
@@ -19,12 +20,26 @@ export async function start() {
   const rpcCh = pc.createDataChannel("pulsebeam::rpc", {});
   rpcCh.binaryType = "arraybuffer";
 
+  const videoSender = pc.addTransceiver("video", { direction: "sendonly" });
+  const audioSender = pc.addTransceiver("audio", { direction: "sendonly" });
+
+  const videoReceivers: RTCRtpTransceiver[] = [];
+  const audioReceivers: RTCRtpTransceiver[] = [];
+
+  for (let i = 0; i < MAX_DOWNSTREAMS; i++) {
+    const videoReceiver = pc.addTransceiver("video", { direction: "recvonly" });
+    const audioReceiver = pc.addTransceiver("audio", { direction: "recvonly" });
+
+    videoReceivers.push(videoReceiver);
+    audioReceivers.push(audioReceiver);
+  }
+
   function sendRpc(msg: sfu.ClientMessage) {
     rpcCh.send(sfu.ClientMessage.toBinary(msg));
   }
 
   rpcCh.onmessage = async (e) => {
-    const msg = sfu.ServerMessage.fromBinary(new Uint8Array(e.data)).message;
+    const msg = sfu.ServerMessage.fromBinary(new Uint8Array(e.data));
     console.log(msg);
   };
 
@@ -32,13 +47,13 @@ export async function start() {
     console.log("ontrack", { track });
   };
 
-  pc.addTransceiver("video", { direction: "sendonly" });
-  pc.addTransceiver("audio", { direction: "sendonly" });
-
-  for (let i = 0; i++; i < MAX_DOWNSTREAMS) {
-    pc.addTransceiver("video", { direction: "recvonly" });
-    pc.addTransceiver("audio", { direction: "recvonly" });
-  }
+  pc.onconnectionstatechange = async () => {
+    console.log(pc.connectionState);
+    if (pc.connectionState === "connected") {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      videoSender.sender.replaceTrack(stream.getVideoTracks()[0]);
+    }
+  };
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);

@@ -13,7 +13,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{Direction, MediaAdded, MediaData, Mid},
+    media::{Direction, MediaAdded, MediaData, MediaKind, Mid, Simulcast},
     net::{self, Transmit},
 };
 use tokio::{
@@ -66,23 +66,13 @@ pub enum ParticipantDataMessage {
 #[derive(Debug)]
 struct TrackOut {
     handle: TrackHandle,
-    state: TrackOutState,
+    mid: Mid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrackOutState {
-    ToOpen,
-    Negotiating(Mid),
-    Open(Mid),
-}
-
-impl TrackOut {
-    fn mid(&self) -> Option<Mid> {
-        match self.state {
-            TrackOutState::ToOpen => None,
-            TrackOutState::Negotiating(m) | TrackOutState::Open(m) => Some(m),
-        }
-    }
+struct MidOutSlot {
+    kind: MediaKind,
+    simulcast: Option<Simulcast>,
+    track_id: Option<Arc<TrackId>>,
 }
 
 /// Reponsibilities:
@@ -109,6 +99,8 @@ pub struct ParticipantActor {
 
     published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
+
+    mid_out_slots: HashMap<Mid, MidOutSlot>,
 }
 
 impl ParticipantActor {
@@ -184,13 +176,19 @@ impl ParticipantActor {
                         .insert(track.meta.id.origin_mid, track);
                 } else {
                     // new tracks from other participants
-                    tracing::info!(track_id = ?track.meta.id, state = "to_open", "subscribed track");
+                    tracing::info!(track_id = ?track.meta.id, "subscribed track");
                     let track_id = track.meta.id.clone();
-                    let track_out = TrackOut {
-                        handle: track,
-                        state: TrackOutState::ToOpen,
-                    };
-                    self.subscribed_tracks.insert(track_id, track_out);
+                    for (mid, slot) in &mut self.mid_out_slots {
+                        if slot.track_id.is_none() {
+                            slot.track_id = Some(track_id.clone());
+                            let track_out = TrackOut {
+                                handle: track,
+                                mid: *mid,
+                            };
+                            self.subscribed_tracks.insert(track_id, track_out);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -309,8 +307,10 @@ impl ParticipantActor {
     }
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
+        tracing::info!(?media, "handle_new_media");
         match media.direction {
-            Direction::SendOnly => {
+            // client -> SFU
+            Direction::RecvOnly => {
                 // TODO: handle back pressure by buffering temporarily
                 let track_id = TrackId::new(self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
@@ -321,7 +321,17 @@ impl ParticipantActor {
                 };
                 self.room.publish(track).await;
             }
-            Direction::RecvOnly => {}
+            // SFU -> client
+            Direction::SendOnly => {
+                self.mid_out_slots.insert(
+                    media.mid,
+                    MidOutSlot {
+                        kind: media.kind,
+                        simulcast: media.simulcast,
+                        track_id: None,
+                    },
+                );
+            }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
                 self.rtc.disconnect();
@@ -335,11 +345,7 @@ impl ParticipantActor {
             return;
         };
 
-        let TrackOutState::Open(mid) = track.state else {
-            return;
-        };
-
-        let Some(writer) = self.rtc.writer(mid) else {
+        let Some(writer) = self.rtc.writer(track.mid) else {
             return;
         };
 
@@ -382,6 +388,7 @@ impl ParticipantHandle {
             rtc,
             published_tracks: HashMap::new(),
             subscribed_tracks: HashMap::new(),
+            mid_out_slots: HashMap::new(),
             cid: None,
         };
         (handle, actor)
