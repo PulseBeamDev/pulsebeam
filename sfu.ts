@@ -21,37 +21,62 @@ export interface ServerMessage {
 }
 // @generated message type with reflection information, may provide speed optimized methods
 class ClientMessage$Type extends MessageType<ClientMessage> {
-    constructor() {
-        super("sfu.ClientMessage", []);
+  constructor() {
+    super("sfu.ClientMessage", []);
+  }
+  create(value?: PartialMessage<ClientMessage>): ClientMessage {
+    const message = globalThis.Object.create(this.messagePrototype!);
+    if (value !== undefined) {
+      reflectionMergePartial<ClientMessage>(this, message, value);
     }
-    create(value?: PartialMessage<ClientMessage>): ClientMessage {
-        const message = globalThis.Object.create((this.messagePrototype!));
-        if (value !== undefined)
-            reflectionMergePartial<ClientMessage>(this, message, value);
-        return message;
+    return message;
+  }
+  internalBinaryRead(
+    reader: IBinaryReader,
+    length: number,
+    options: BinaryReadOptions,
+    target?: ClientMessage,
+  ): ClientMessage {
+    let message = target ?? this.create(), end = reader.pos + length;
+    while (reader.pos < end) {
+      let [fieldNo, wireType] = reader.tag();
+      switch (fieldNo) {
+        default:
+          let u = options.readUnknownField;
+          if (u === "throw") {
+            throw new globalThis.Error(
+              `Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`,
+            );
+          }
+          let d = reader.skip(wireType);
+          if (u !== false) {
+            (u === true ? UnknownFieldHandler.onRead : u)(
+              this.typeName,
+              message,
+              fieldNo,
+              wireType,
+              d,
+            );
+          }
+      }
     }
-    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ClientMessage): ClientMessage {
-        let message = target ?? this.create(), end = reader.pos + length;
-        while (reader.pos < end) {
-            let [fieldNo, wireType] = reader.tag();
-            switch (fieldNo) {
-                default:
-                    let u = options.readUnknownField;
-                    if (u === "throw")
-                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
-                    let d = reader.skip(wireType);
-                    if (u !== false)
-                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
-            }
-        }
-        return message;
+    return message;
+  }
+  internalBinaryWrite(
+    message: ClientMessage,
+    writer: IBinaryWriter,
+    options: BinaryWriteOptions,
+  ): IBinaryWriter {
+    let u = options.writeUnknownFields;
+    if (u !== false) {
+      (u == true ? UnknownFieldHandler.onWrite : u)(
+        this.typeName,
+        message,
+        writer,
+      );
     }
-    internalBinaryWrite(message: ClientMessage, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        let u = options.writeUnknownFields;
-        if (u !== false)
-            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
-        return writer;
-    }
+    return writer;
+  }
 }
 /**
  * @generated MessageType for protobuf message sfu.ClientMessage
@@ -59,37 +84,62 @@ class ClientMessage$Type extends MessageType<ClientMessage> {
 export const ClientMessage = new ClientMessage$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class ServerMessage$Type extends MessageType<ServerMessage> {
-    constructor() {
-        super("sfu.ServerMessage", []);
+  constructor() {
+    super("sfu.ServerMessage", []);
+  }
+  create(value?: PartialMessage<ServerMessage>): ServerMessage {
+    const message = globalThis.Object.create(this.messagePrototype!);
+    if (value !== undefined) {
+      reflectionMergePartial<ServerMessage>(this, message, value);
     }
-    create(value?: PartialMessage<ServerMessage>): ServerMessage {
-        const message = globalThis.Object.create((this.messagePrototype!));
-        if (value !== undefined)
-            reflectionMergePartial<ServerMessage>(this, message, value);
-        return message;
+    return message;
+  }
+  internalBinaryRead(
+    reader: IBinaryReader,
+    length: number,
+    options: BinaryReadOptions,
+    target?: ServerMessage,
+  ): ServerMessage {
+    let message = target ?? this.create(), end = reader.pos + length;
+    while (reader.pos < end) {
+      let [fieldNo, wireType] = reader.tag();
+      switch (fieldNo) {
+        default:
+          let u = options.readUnknownField;
+          if (u === "throw") {
+            throw new globalThis.Error(
+              `Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`,
+            );
+          }
+          let d = reader.skip(wireType);
+          if (u !== false) {
+            (u === true ? UnknownFieldHandler.onRead : u)(
+              this.typeName,
+              message,
+              fieldNo,
+              wireType,
+              d,
+            );
+          }
+      }
     }
-    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ServerMessage): ServerMessage {
-        let message = target ?? this.create(), end = reader.pos + length;
-        while (reader.pos < end) {
-            let [fieldNo, wireType] = reader.tag();
-            switch (fieldNo) {
-                default:
-                    let u = options.readUnknownField;
-                    if (u === "throw")
-                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
-                    let d = reader.skip(wireType);
-                    if (u !== false)
-                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
-            }
-        }
-        return message;
+    return message;
+  }
+  internalBinaryWrite(
+    message: ServerMessage,
+    writer: IBinaryWriter,
+    options: BinaryWriteOptions,
+  ): IBinaryWriter {
+    let u = options.writeUnknownFields;
+    if (u !== false) {
+      (u == true ? UnknownFieldHandler.onWrite : u)(
+        this.typeName,
+        message,
+        writer,
+      );
     }
-    internalBinaryWrite(message: ServerMessage, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        let u = options.writeUnknownFields;
-        if (u !== false)
-            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
-        return writer;
-    }
+    return writer;
+  }
 }
 /**
  * @generated MessageType for protobuf message sfu.ServerMessage

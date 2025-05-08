@@ -4,7 +4,8 @@
   "main": "index.js",
   "scripts": {
     "proto": "protoc --ts_out . --proto_path proto proto/sfu.proto",
-    "start": "vite"
+    "start": "vite",
+    "build": "vite build"
   },
   "repository": {
     "type": "git",
@@ -23,6 +24,7 @@
     "vite": "^6.3.4"
   },
   "dependencies": {
-    "webrtc-adapter": "^9.0.3"
+    "@protobuf-ts/runtime": "^2.10.0",
+    "nanostores": "^1.0.1"
   }
 }
