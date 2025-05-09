@@ -13,7 +13,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{Direction, MediaAdded, MediaData, MediaKind, Mid, Simulcast},
+    media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid, Simulcast},
     net::{self, Transmit},
 };
 use tokio::{
@@ -61,6 +61,7 @@ pub enum ParticipantControlMessage {
 pub enum ParticipantDataMessage {
     UdpPacket(message::UDPPacket),
     ForwardMedia(Arc<TrackIn>, Arc<MediaData>),
+    KeyframeRequest(Arc<TrackId>, message::KeyframeRequest),
 }
 
 #[derive(Debug)]
@@ -162,6 +163,15 @@ impl ParticipantActor {
             }
             ParticipantDataMessage::ForwardMedia(track, data) => {
                 self.handle_forward_media(track, data);
+            }
+
+            ParticipantDataMessage::KeyframeRequest(track_id, req) => {
+                let Some(mut writer) = self.rtc.writer(track_id.origin_mid) else {
+                    tracing::warn!(mid=?track_id.origin_mid, "mid is not found for regenerating a keyframe");
+                    return;
+                };
+
+                writer.request_keyframe(req.rid, req.kind);
             }
         }
     }
@@ -304,8 +314,25 @@ impl ParticipantActor {
                     track.forward_media(Arc::new(e));
                 }
             }
+            Event::KeyframeRequest(req) => self.handle_keyframe_request(req),
             event => tracing::warn!("unhandled output event: {:?}", event),
         }
+    }
+
+    fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
+        let Some(MidOutSlot {
+            track_id: Some(track_id),
+            ..
+        }) = self.mid_out_slots.get(&req.mid)
+        else {
+            return;
+        };
+
+        let Some(track) = self.subscribed_tracks.get(track_id) else {
+            return;
+        };
+
+        track.handle.request_keyframe(req.into());
     }
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
@@ -421,6 +448,15 @@ impl ParticipantHandle {
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
         self.data_sender
             .try_send(ParticipantDataMessage::ForwardMedia(track, data))
+    }
+
+    pub fn request_keyframe(&self, track_id: Arc<TrackId>, req: message::KeyframeRequest) {
+        if let Err(err) = self
+            .data_sender
+            .try_send(ParticipantDataMessage::KeyframeRequest(track_id, req))
+        {
+            tracing::warn!("keyframe request is dropped by the participant actor: {err}");
+        }
     }
 }
 

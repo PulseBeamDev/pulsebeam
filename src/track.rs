@@ -1,17 +1,22 @@
-use std::{collections::BTreeMap, panic::AssertUnwindSafe, sync::Arc};
+use std::{collections::BTreeMap, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures::FutureExt;
-use str0m::media::MediaData;
-use tokio::sync::mpsc::{
-    self,
-    error::{SendError, TrySendError},
+use str0m::media::{KeyframeRequest, MediaData};
+use tokio::{
+    sync::mpsc::{
+        self,
+        error::{SendError, TrySendError},
+    },
+    time::Instant,
 };
 
 use crate::{
-    entity::ParticipantId,
-    message::{ActorResult, TrackIn},
+    entity::{ParticipantId, TrackId},
+    message::{self, ActorResult, TrackIn},
     participant::ParticipantHandle,
 };
+
+const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrackError {}
@@ -19,6 +24,7 @@ pub enum TrackError {}
 #[derive(Debug)]
 pub enum TrackDataMessage {
     ForwardMedia(Arc<MediaData>),
+    KeyframeRequest(message::KeyframeRequest),
 }
 
 #[derive(Debug)]
@@ -39,6 +45,7 @@ pub struct TrackActor {
     control_receiver: mpsc::Receiver<TrackControlMessage>,
     origin: ParticipantHandle,
     subscribers: BTreeMap<Arc<ParticipantId>, ParticipantHandle>,
+    last_keyframe_request: Instant,
 }
 
 impl TrackActor {
@@ -63,8 +70,6 @@ impl TrackActor {
     async fn run_inner(mut self) -> ActorResult {
         loop {
             tokio::select! {
-                biased;
-
                 Some(msg) = self.data_receiver.recv() => {
                     self.handle_data_message(msg);
                 }
@@ -80,11 +85,19 @@ impl TrackActor {
     }
 
     #[inline]
-    fn handle_data_message(&self, msg: TrackDataMessage) {
+    fn handle_data_message(&mut self, msg: TrackDataMessage) {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
                 for (_, sub) in &self.subscribers {
                     sub.forward_media(self.meta.clone(), data.clone());
+                }
+            }
+            TrackDataMessage::KeyframeRequest(req) => {
+                let now = Instant::now();
+                let elapsed = now.duration_since(self.last_keyframe_request);
+                if elapsed >= KEYFRAME_REQUEST_THROTTLE {
+                    self.origin.request_keyframe(self.meta.id.clone(), req);
+                    self.last_keyframe_request = now;
                 }
             }
         }
@@ -123,6 +136,8 @@ impl TrackHandle {
             control_receiver,
             origin,
             subscribers: BTreeMap::new(),
+            // allow keyframe request immediately
+            last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
         };
         (handle, actor)
     }
@@ -142,5 +157,17 @@ impl TrackHandle {
         self.control_sender
             .send(TrackControlMessage::Subscribe(participant))
             .await
+    }
+
+    pub fn request_keyframe(&self, req: message::KeyframeRequest) {
+        // Keyframe request is lossy. The receiver is responsible in resending.
+        // There can be many in-flight keyframe requests, the track actor may throttle
+        // the requests.
+        if let Err(err) = self
+            .data_sender
+            .try_send(TrackDataMessage::KeyframeRequest(req))
+        {
+            tracing::warn!("keyframe request is dropped by the track actor: {err}");
+        }
     }
 }
