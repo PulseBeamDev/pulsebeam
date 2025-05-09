@@ -195,9 +195,23 @@ impl ParticipantActor {
                                 mid: *mid,
                             };
                             self.subscribed_tracks.insert(track_id, track_out);
-                            break;
+                            return;
                         }
                     }
+
+                    // HACK: test swapping stream
+                    // let Some((mid, slot)) = self.mid_out_slots.iter_mut().next() else {
+                    //     return;
+                    // };
+                    // track.subscribe(self.handle.clone()).await;
+                    // slot.track_id = Some(track_id.clone());
+                    // let track_out = TrackOut {
+                    //     handle: track,
+                    //     mid: *mid,
+                    // };
+                    // self.subscribed_tracks.insert(track_id, track_out);
+                    // tracing::warn!("swapping stream");
+                    // return;
                 }
             }
         }
