@@ -1,23 +1,21 @@
-use std::sync::Arc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
-use tokio::{
-    net::UdpSocket,
-    sync::mpsc::{self, error::TrySendError},
+use crate::{
+    message::{self, ActorResult},
+    net::PacketSocket,
 };
-
-use crate::message::{self, ActorResult};
 
 #[derive(Debug)]
 pub enum UdpSinkMessage {
     UdpPacket(message::EgressUDPPacket),
 }
 
-pub struct UdpSinkActor {
-    socket: Arc<UdpSocket>,
+pub struct UdpSinkActor<S> {
+    socket: S,
     receiver: mpsc::Receiver<UdpSinkMessage>,
 }
 
-impl UdpSinkActor {
+impl<S: PacketSocket> UdpSinkActor<S> {
     pub async fn run(mut self) -> ActorResult {
         let mut buf = Vec::with_capacity(256);
         loop {
@@ -33,7 +31,7 @@ impl UdpSinkActor {
             for msg in buf.iter() {
                 match msg {
                     UdpSinkMessage::UdpPacket(packet) => {
-                        let res = self.socket.send_to(&packet.raw, &packet.dst).await;
+                        let res = self.socket.send_to(&packet.raw, packet.dst).await;
                         if let Err(err) = res {
                             tracing::warn!(
                                 "failed to send udp packet to {:?}: {:?}",
@@ -56,7 +54,7 @@ pub struct UdpSinkHandle {
 }
 
 impl UdpSinkHandle {
-    pub fn new(socket: Arc<UdpSocket>) -> (Self, UdpSinkActor) {
+    pub fn new<S: PacketSocket>(socket: S) -> (Self, UdpSinkActor<S>) {
         let (sender, receiver) = mpsc::channel(2048);
         let handle = Self { sender };
         let actor = UdpSinkActor { socket, receiver };

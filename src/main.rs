@@ -10,8 +10,8 @@ use std::{
 };
 
 use pulsebeam::{
-    controller::ControllerHandle, message::ActorError, signaling, sink::UdpSinkHandle,
-    source::UdpSourceHandle,
+    controller::ControllerHandle, message::ActorError, net::UdpSocket, signaling,
+    sink::UdpSinkHandle, source::UdpSourceHandle,
 };
 use systemstat::{Platform, System};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -35,7 +35,7 @@ async fn main() {
     let socket = tokio::net::UdpSocket::bind(local_addr)
         .await
         .expect("bind to udp socket");
-    let socket = Arc::new(socket);
+    let socket: UdpSocket = Arc::new(socket).into();
 
     let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
     let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
