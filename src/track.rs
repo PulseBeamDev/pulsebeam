@@ -146,8 +146,15 @@ impl TrackHandle {
         &self,
         data: Arc<MediaData>,
     ) -> Result<(), TrySendError<TrackDataMessage>> {
-        self.data_sender
-            .try_send(TrackDataMessage::ForwardMedia(data))
+        let res = self
+            .data_sender
+            .try_send(TrackDataMessage::ForwardMedia(data));
+
+        if let Err(err) = &res {
+            tracing::warn!("media packet is dropped: {err}");
+        }
+
+        res
     }
 
     pub async fn subscribe(

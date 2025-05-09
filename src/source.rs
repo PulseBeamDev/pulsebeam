@@ -32,8 +32,6 @@ impl UdpSourceActor {
 
         loop {
             tokio::select! {
-                biased;
-
                 res = self.socket.recv_from(&mut buf) => {
                     match res {
                         Ok((size, source)) => self.handle_packet(source, &buf[..size]),

@@ -121,8 +121,6 @@ impl ParticipantActor {
             };
 
             tokio::select! {
-                biased;
-
                 msg = self.data_receiver.recv() => {
                     match msg {
                         Some(msg) => self.handle_data_message(msg).await,
@@ -428,8 +426,14 @@ impl ParticipantHandle {
         &self,
         msg: message::UDPPacket,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
-        self.data_sender
-            .try_send(ParticipantDataMessage::UdpPacket(msg))
+        let res = self
+            .data_sender
+            .try_send(ParticipantDataMessage::UdpPacket(msg));
+
+        if let Err(err) = &res {
+            tracing::warn!("raw packet is dropped: {err}");
+        }
+        res
     }
 
     pub async fn new_track(
@@ -446,8 +450,15 @@ impl ParticipantHandle {
         track: Arc<TrackIn>,
         data: Arc<MediaData>,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
-        self.data_sender
-            .try_send(ParticipantDataMessage::ForwardMedia(track, data))
+        let res = self
+            .data_sender
+            .try_send(ParticipantDataMessage::ForwardMedia(track, data));
+
+        if let Err(err) = &res {
+            tracing::warn!("media packet is dropped: {err}");
+        }
+
+        res
     }
 
     pub fn request_keyframe(&self, track_id: Arc<TrackId>, req: message::KeyframeRequest) {
