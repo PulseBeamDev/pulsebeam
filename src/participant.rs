@@ -391,7 +391,12 @@ impl ParticipantActor {
             return;
         };
 
-        if let Err(err) = writer.write(data.pt, data.network_time, data.time, data.data.clone()) {
+        // WebRTC Clients might use different PT for the same codec, e.g. Firefox vs Chrome
+        let Some(pt) = writer.match_params(data.params) else {
+            return;
+        };
+
+        if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();
         }
