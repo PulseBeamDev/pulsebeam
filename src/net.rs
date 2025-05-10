@@ -34,6 +34,16 @@ pub struct SimulatedSocket {
     recv_ch: async_channel::Receiver<Packet>,
 }
 
+impl SimulatedSocket {
+    pub fn new(cap: usize) -> Self {
+        let (tx, rx) = async_channel::bounded(cap);
+        Self {
+            send_ch: tx,
+            recv_ch: rx,
+        }
+    }
+}
+
 impl PacketSocket for SimulatedSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let (src, packet) = self
