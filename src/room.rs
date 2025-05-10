@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
+use rand::RngCore;
 use tokio::{
     sync::mpsc::{self, error::SendError},
     task::JoinSet,
@@ -11,6 +12,7 @@ use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackIn,
     participant::ParticipantHandle,
+    rng::Rng,
     track::TrackHandle,
 };
 
@@ -29,6 +31,7 @@ pub enum RoomMessage {
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
+    rng: Rng,
     receiver: mpsc::Receiver<RoomMessage>,
     controller: ControllerHandle,
     handle: RoomHandle,
@@ -111,13 +114,14 @@ pub struct RoomHandle {
 }
 
 impl RoomHandle {
-    pub fn new(controller: ControllerHandle, room_id: Arc<RoomId>) -> (Self, RoomActor) {
+    pub fn new(rng: Rng, controller: ControllerHandle, room_id: Arc<RoomId>) -> (Self, RoomActor) {
         let (sender, receiver) = mpsc::channel(8);
         let handle = RoomHandle {
             sender,
             room_id: room_id.clone(),
         };
         let actor = RoomActor {
+            rng,
             receiver,
             controller,
             handle: handle.clone(),

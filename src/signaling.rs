@@ -59,10 +59,8 @@ async fn spawn_participant(
 ) -> Result<String, SignalingError> {
     // TODO: validate content_type = "application/sdp"
 
-    let room_id = RoomId::new(info.room);
-    let participant_id = ParticipantId::new(info.participant);
     let answer = controller
-        .allocate(room_id, participant_id, raw_offer)
+        .allocate(info.room, info.participant, raw_offer)
         .await?;
 
     Ok(answer)

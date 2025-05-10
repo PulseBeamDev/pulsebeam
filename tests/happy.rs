@@ -43,9 +43,8 @@ async fn basic() {
     );
     let (offer, pending) = alice_sdp.apply().unwrap();
 
-    let room_id = RoomId::new(ExternalRoomId::new("simulation".to_string()).unwrap());
-    let participant_id =
-        ParticipantId::new(ExternalParticipantId::new("alice".to_string()).unwrap());
+    let room_id = ExternalRoomId::new("simulation".to_string()).unwrap();
+    let participant_id = ExternalParticipantId::new("alice".to_string()).unwrap();
     let answer = controller
         .allocate(room_id, participant_id, offer.to_sdp_string())
         .await

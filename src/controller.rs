@@ -1,9 +1,10 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
-    entity::{ParticipantId, RoomId},
+    entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
     message::ActorResult,
     participant::ParticipantHandle,
+    rng::Rng,
     room::RoomHandle,
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
@@ -35,14 +36,15 @@ pub enum ControllerError {
 
 pub enum ControllerMessage {
     Allocate(
-        RoomId,
-        ParticipantId,
+        ExternalRoomId,
+        ExternalParticipantId,
         String,
         oneshot::Sender<Result<String, ControllerError>>,
     ),
 }
 
 pub struct ControllerActor {
+    rng: Rng,
     handle: ControllerHandle,
     source: UdpSourceHandle,
     sink: UdpSinkHandle,
@@ -59,6 +61,8 @@ impl ControllerActor {
         while let Some(msg) = self.receiver.recv().await {
             match msg {
                 ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
+                    let room_id = RoomId::new(room_id);
+                    let participant_id = ParticipantId::new(&mut self.rng, participant_id);
                     let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
                 }
             }
@@ -96,7 +100,8 @@ impl ControllerActor {
         let room_handle = if let Some(handle) = self.rooms.get(&room_id) {
             handle.clone()
         } else {
-            let (handle, actor) = RoomHandle::new(self.handle.clone(), room_id.clone());
+            let (handle, actor) =
+                RoomHandle::new(self.rng.clone(), self.handle.clone(), room_id.clone());
             // TODO: handle shutdown
             self.children.spawn(actor.run());
 
@@ -107,6 +112,7 @@ impl ControllerActor {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let participant_id = Arc::new(participant_id);
         let (participant_handle, participant_actor) = ParticipantHandle::new(
+            self.rng.clone(),
             self.source.clone(),
             self.sink.clone(),
             room_handle.clone(),
@@ -151,6 +157,7 @@ pub struct ControllerHandle {
 
 impl ControllerHandle {
     pub fn new(
+        rng: Rng,
         source: UdpSourceHandle,
         sink: UdpSinkHandle,
         local_addrs: Vec<SocketAddr>,
@@ -160,6 +167,7 @@ impl ControllerHandle {
 
         let actor = ControllerActor {
             handle: handle.clone(),
+            rng,
             receiver,
             source,
             sink,
@@ -172,8 +180,8 @@ impl ControllerHandle {
 
     pub async fn allocate(
         &self,
-        room_id: RoomId,
-        participant_id: ParticipantId,
+        room_id: ExternalRoomId,
+        participant_id: ExternalParticipantId,
         offer: String,
     ) -> Result<String, ControllerError> {
         let (tx, rx) = oneshot::channel();

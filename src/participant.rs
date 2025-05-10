@@ -29,6 +29,7 @@ use crate::{
     entity::{ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
     proto,
+    rng::Rng,
     room::RoomHandle,
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
@@ -89,6 +90,7 @@ struct MidOutSlot {
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
 pub struct ParticipantActor {
+    rng: Rng,
     handle: ParticipantHandle,
     data_receiver: mpsc::Receiver<ParticipantDataMessage>,
     control_receiver: mpsc::Receiver<ParticipantControlMessage>,
@@ -353,7 +355,7 @@ impl ParticipantActor {
             // client -> SFU
             Direction::RecvOnly => {
                 // TODO: handle back pressure by buffering temporarily
-                let track_id = TrackId::new(self.participant_id.clone(), media.mid);
+                let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
                 let track = TrackIn {
                     id: track_id,
@@ -412,6 +414,7 @@ pub struct ParticipantHandle {
 
 impl ParticipantHandle {
     pub fn new(
+        rng: Rng,
         source: UdpSourceHandle,
         sink: UdpSinkHandle,
         room: RoomHandle,
@@ -426,6 +429,7 @@ impl ParticipantHandle {
             participant_id: participant_id.clone(),
         };
         let actor = ParticipantActor {
+            rng,
             handle: handle.clone(),
             data_receiver,
             control_receiver,

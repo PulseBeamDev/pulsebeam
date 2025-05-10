@@ -3,9 +3,11 @@ use std::{net::SocketAddr, sync::Arc};
 use pulsebeam::{
     controller::{ControllerActor, ControllerHandle},
     net::UdpSocket,
+    rng::Rng,
     sink::{UdpSinkActor, UdpSinkHandle},
     source::{UdpSourceActor, UdpSourceHandle},
 };
+use rand::SeedableRng;
 
 pub struct SimulatedNetwork {
     source: UdpSourceActor,
@@ -21,10 +23,11 @@ impl SimulatedNetwork {
         let local_addr: SocketAddr = "1.2.3.4:3478".parse().unwrap();
         let socket = Arc::new(socket);
 
+        let rng = Rng::seed_from_u64(1);
         let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
         let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
         let (controller_handle, controller_actor) =
-            ControllerHandle::new(source_handle, sink_handle, vec![local_addr]);
+            ControllerHandle::new(rng, source_handle, sink_handle, vec![local_addr]);
 
         let network = Self {
             source: source_actor,

@@ -5,6 +5,7 @@ pub mod message;
 pub mod net;
 pub mod participant;
 pub mod proto;
+pub mod rng;
 pub mod room;
 pub mod signaling;
 pub mod sink;
