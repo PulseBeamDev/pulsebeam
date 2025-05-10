@@ -1,24 +1,25 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use pulsebeam::{
     controller::{ControllerActor, ControllerHandle},
-    entity::{ParticipantId, RoomId},
-    net::SimulatedSocket,
+    net::UdpSocket,
     sink::{UdpSinkActor, UdpSinkHandle},
     source::{UdpSourceActor, UdpSourceHandle},
 };
-use str0m::Candidate;
 
 pub struct SimulatedNetwork {
-    source: UdpSourceActor<SimulatedSocket>,
-    sink: UdpSinkActor<SimulatedSocket>,
+    source: UdpSourceActor,
+    sink: UdpSinkActor,
     controller: ControllerActor,
 }
 
 impl SimulatedNetwork {
-    pub fn new() -> (Self, ControllerHandle) {
+    pub async fn new() -> (Self, ControllerHandle) {
+        // TODO: turmoil doesn't support other addresses other than localhost
+        let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
+        let socket = UdpSocket::bind(local_addr).await.unwrap();
         let local_addr: SocketAddr = "1.2.3.4:3478".parse().unwrap();
-        let socket = SimulatedSocket::new(8192);
+        let socket = Arc::new(socket);
 
         let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
         let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());

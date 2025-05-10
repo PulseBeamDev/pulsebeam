@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::{
     message::{self, ActorResult},
-    net::PacketSocket,
+    net::UdpSocket,
 };
 
 #[derive(Debug)]
@@ -10,12 +12,12 @@ pub enum UdpSinkMessage {
     UdpPacket(message::EgressUDPPacket),
 }
 
-pub struct UdpSinkActor<S> {
-    socket: S,
+pub struct UdpSinkActor {
+    socket: Arc<UdpSocket>,
     receiver: mpsc::Receiver<UdpSinkMessage>,
 }
 
-impl<S: PacketSocket> UdpSinkActor<S> {
+impl UdpSinkActor {
     pub async fn run(mut self) -> ActorResult {
         let mut buf = Vec::with_capacity(256);
         loop {
@@ -54,7 +56,7 @@ pub struct UdpSinkHandle {
 }
 
 impl UdpSinkHandle {
-    pub fn new<S: PacketSocket>(socket: S) -> (Self, UdpSinkActor<S>) {
+    pub fn new(socket: Arc<UdpSocket>) -> (Self, UdpSinkActor) {
         let (sender, receiver) = mpsc::channel(2048);
         let handle = Self { sender };
         let actor = UdpSinkActor { socket, receiver };

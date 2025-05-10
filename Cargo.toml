@@ -3,6 +3,9 @@ name = "pulsebeam"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
@@ -29,10 +32,11 @@ futures = "0.3.31"
 bs58 = "0.5.1"
 sha3 = "0.10.8"
 metrics = "0.24.2"
-flume = "0.11"
 
 [dev-dependencies]
 async-channel = "2.3.1"
+turmoil = "0.6.6"
+flume = "0.11"
 
 [build-dependencies]
 prost-build = "0.13.5"

@@ -6,7 +6,7 @@ mod common;
 
 #[tokio::test]
 async fn basic() {
-    let (network, controller) = SimulatedNetwork::new();
+    let (network, controller) = SimulatedNetwork::new().await;
     tokio::spawn(network.run());
 
     let mut alice = str0m::Rtc::new();
