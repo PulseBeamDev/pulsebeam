@@ -30,13 +30,13 @@ pub type Packet = (SocketAddr, Vec<u8>);
 
 #[derive(Clone)]
 pub struct SimulatedSocket {
-    send_ch: async_channel::Sender<Packet>,
-    recv_ch: async_channel::Receiver<Packet>,
+    send_ch: flume::Sender<Packet>,
+    recv_ch: flume::Receiver<Packet>,
 }
 
 impl SimulatedSocket {
     pub fn new(cap: usize) -> Self {
-        let (tx, rx) = async_channel::bounded(cap);
+        let (tx, rx) = flume::bounded(cap);
         Self {
             send_ch: tx,
             recv_ch: rx,
@@ -48,7 +48,7 @@ impl PacketSocket for SimulatedSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let (src, packet) = self
             .recv_ch
-            .recv()
+            .recv_async()
             .await
             .map_err(|_| io::Error::other("closed"))?;
 
@@ -60,7 +60,7 @@ impl PacketSocket for SimulatedSocket {
 
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         self.send_ch
-            .send((addr, buf.to_vec()))
+            .send_async((addr, buf.to_vec()))
             .await
             .map_err(|_| io::Error::other("closed"))?;
         Ok(buf.len())
