@@ -1,5 +1,5 @@
 #[cfg(test)]
-pub use turmoil::net::UdpSocket;
+pub use turmoil::net::{TcpListener, UdpSocket};
 
 #[cfg(not(test))]
-pub use tokio::net::UdpSocket;
+pub use tokio::net::{TcpListener, UdpSocket};
