@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, net::SocketAddr, ptr::copy_nonoverlapping, sync::Arc, time::Duration};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 mod net;
 
@@ -40,9 +40,9 @@ pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
 
 pub async fn setup_sim(seed: u64) {
     // TODO: use preseed rng
-    let server_addr: SocketAddr = "1.2.3.4:3478".parse().unwrap();
+    let server_addr: SocketAddr = "1.1.1.1:3478".parse().unwrap();
     let vnet = VirtualNetwork::new(Duration::from_millis(0));
-    let socket = VirtualSocket::register(vnet, server_addr).await;
+    let socket = VirtualSocket::register(vnet.clone(), server_addr).await;
 
     let rng = Rng::seed_from_u64(seed);
     let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
@@ -59,8 +59,10 @@ pub async fn setup_sim(seed: u64) {
     let mut event_group = StreamGroup::new();
 
     // TODO: add participants
+    let server_addr: SocketAddr = "1.1.1.2:3478".parse().unwrap();
+    let client_socket = VirtualSocket::register(vnet, server_addr).await;
     let (handle, actor) =
-        ParticipantClientHandle::connect(socket.clone(), controller_handle.clone(), 1, 2).await;
+        ParticipantClientHandle::connect(client_socket, controller_handle.clone(), 1, 2).await;
 
     let event_rx = handle.subscribe();
     let event_rx =
@@ -214,7 +216,7 @@ impl ParticipantClientHandle {
         recv_streams: usize,
     ) -> (Self, ParticipantClientActor<S>) {
         let mut rtc = str0m::Rtc::new();
-        rtc.add_local_candidate(Candidate::host("1.1.1.1:8000".parse().unwrap(), "udp").unwrap());
+        rtc.add_local_candidate(Candidate::host(socket.local_addr().unwrap(), "udp").unwrap());
         let mut change = rtc.sdp_api();
 
         for _ in 0..send_streams {

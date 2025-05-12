@@ -76,3 +76,95 @@ impl PacketSocket for VirtualSocket {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::time::{Duration, Instant, timeout};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[tokio::test]
+    async fn test_socket_registration() {
+        let vn = VirtualNetwork::new(Duration::from_millis(10));
+        let sock = VirtualSocket::register(vn.clone(), addr(10000)).await;
+        assert_eq!(sock.local_addr().unwrap(), addr(10000));
+    }
+
+    #[tokio::test]
+    async fn test_send_and_receive_packet() {
+        let vn = VirtualNetwork::new(Duration::from_millis(0));
+        let a = VirtualSocket::register(vn.clone(), addr(10001)).await;
+        let b = VirtualSocket::register(vn.clone(), addr(10002)).await;
+
+        let msg = b"hello world";
+        a.send_to(msg, b.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (len, from) = b.recv_from(&mut buf).await.unwrap();
+
+        assert_eq!(&buf[..len], msg);
+        assert_eq!(from, a.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_uniform_latency() {
+        let latency = Duration::from_millis(100);
+        let vn = VirtualNetwork::new(latency);
+        let a = VirtualSocket::register(vn.clone(), addr(10003)).await;
+        let b = VirtualSocket::register(vn.clone(), addr(10004)).await;
+
+        let msg = b"latency test";
+        let start = Instant::now();
+        a.send_to(msg, b.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (_len, _from) = b.recv_from(&mut buf).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= latency, "Elapsed: {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_delivery_to_unregistered_socket() {
+        let vn = VirtualNetwork::new(Duration::from_millis(10));
+        let sock = VirtualSocket::register(vn.clone(), addr(10005)).await;
+
+        // Sending to an unregistered address should not panic
+        let result = sock.send_to(b"no target", addr(9999)).await;
+        assert_eq!(result.unwrap(), b"no target".len());
+    }
+
+    #[tokio::test]
+    async fn test_receive_blocks_until_packet_arrives() {
+        let vn = VirtualNetwork::new(Duration::from_millis(50));
+        let a = VirtualSocket::register(
+            vn.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 3478),
+        )
+        .await;
+        let b = VirtualSocket::register(
+            vn.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)), 3478),
+        )
+        .await;
+
+        tokio::spawn({
+            let a = a.clone();
+            let b = b.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = a.send_to(b"delayed", b.local_addr().unwrap()).await;
+            }
+        });
+
+        let mut buf = [0u8; 1024];
+        let timeout_result = timeout(Duration::from_millis(100), b.recv_from(&mut buf)).await;
+        assert!(timeout_result.is_ok());
+        assert_eq!(&buf[..7], b"delayed");
+    }
+}
+
