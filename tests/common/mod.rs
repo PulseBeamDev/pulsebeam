@@ -1,14 +1,15 @@
 use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
+mod net;
+
 use futures::{StreamExt, TryStreamExt};
 use futures_concurrency::stream::StreamGroup;
+use net::{VirtualNetwork, VirtualSocket};
 use pulsebeam::{
     controller::ControllerHandle,
     entity::{ExternalParticipantId, ExternalRoomId},
-    message::ActorError,
-    net::{PacketSocket, SimulatedSocket, UdpSocket},
+    net::PacketSocket,
     rng::Rng,
-    signaling,
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
 };
@@ -39,7 +40,8 @@ pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
 pub async fn setup_sim(seed: u64) {
     // TODO: use preseed rng
     let server_addr: SocketAddr = "1.2.3.4:3478".parse().unwrap();
-    let socket = SimulatedSocket::new(server_addr, 1);
+    let vnet = VirtualNetwork::new(Duration::from_millis(0));
+    let socket = VirtualSocket::register(vnet, server_addr).await;
 
     let rng = Rng::seed_from_u64(seed);
     let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
