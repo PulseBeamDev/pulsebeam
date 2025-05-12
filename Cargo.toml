@@ -31,13 +31,13 @@ futures = "0.3.31"
 bs58 = "0.5.1"
 sha3 = "0.10.8"
 metrics = "0.24.2"
+flume = "0.11"
 
 [dev-dependencies]
 proptest = "1.6.0"
 rand_chacha = "0.9.0"
 async-channel = "2.3.1"
 turmoil = "0.6.6"
-flume = "0.11"
 futures-concurrency = "7.6.3"
 tokio-stream = { version = "0.1", features = ["full"] }
 

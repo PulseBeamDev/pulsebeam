@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{StreamExt, TryStreamExt};
 use futures_concurrency::stream::StreamGroup;
@@ -6,7 +6,7 @@ use pulsebeam::{
     controller::ControllerHandle,
     entity::{ExternalParticipantId, ExternalRoomId},
     message::ActorError,
-    net::{TcpListener, UdpSocket},
+    net::{PacketSocket, SimulatedSocket, UdpSocket},
     rng::Rng,
     signaling,
     sink::UdpSinkHandle,
@@ -19,77 +19,60 @@ use str0m::{
     net::Receive,
 };
 use tokio::{
+    runtime::RngSeed,
     sync::{broadcast, mpsc},
     task::JoinSet,
     time::Instant,
 };
 
-pub fn setup_sim<'a>(seed: u64) -> turmoil::Sim<'a> {
+pub struct Simulation {}
+
+pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
+    let rng = RngSeed::from_bytes(&seed.to_be_bytes());
+    tokio::runtime::Builder::new_current_thread()
+        .rng_seed(rng)
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+pub async fn setup_sim(seed: u64) {
     // TODO: use preseed rng
-    let mut sim = turmoil::Builder::new().build();
     let server_addr: SocketAddr = "1.2.3.4:3478".parse().unwrap();
+    let socket = SimulatedSocket::new(server_addr, 1);
 
-    sim.host("server", move || {
-        async move {
-            // TODO: turmoil doesn't support other addresses other than localhost
-            let socket = UdpSocket::bind("0.0.0.0:3478").await.unwrap();
-            let socket = Arc::new(socket);
+    let rng = Rng::seed_from_u64(seed);
+    let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
+    let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
+    let (controller_handle, controller_actor) =
+        ControllerHandle::new(rng, source_handle, sink_handle, vec![server_addr]);
 
-            let rng = Rng::seed_from_u64(seed);
-            let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
-            let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
-            let (controller_handle, controller_actor) =
-                ControllerHandle::new(rng, source_handle, sink_handle, vec![server_addr]);
+    let mut server_set = JoinSet::new();
+    server_set.spawn(source_actor.run());
+    server_set.spawn(sink_actor.run());
+    server_set.spawn(controller_actor.run());
 
-            let router = signaling::router(controller_handle);
-            let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
-            let signaling = async move {
-                axum::serve(listener, router)
-                    .await
-                    .map_err(|err| ActorError::Unknown(err.to_string()))
-            };
+    let mut client_set = JoinSet::new();
+    let mut event_group = StreamGroup::new();
 
-            let res = tokio::try_join!(
-                source_actor.run(),
-                sink_actor.run(),
-                controller_actor.run(),
-                signaling
-            );
-            if let Err(err) = res {
-                tracing::error!("pipeline ended with an error: {err}")
-            }
-            Ok(())
-        }
-    });
+    // TODO: add participants
+    let (handle, actor) = ParticipantClientHandle::new(socket.clone(), 1, 2);
 
-    sim.client("client", async move {
-        let mut join_set = JoinSet::new();
-        let mut event_group = StreamGroup::new();
+    let event_rx = handle.subscribe();
+    let event_rx =
+        tokio_stream::wrappers::BroadcastStream::new(event_rx).map_ok(move |v| (handle.clone(), v));
 
-        // TODO: add participants
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let (handle, actor) = ParticipantClientHandle::new(socket, 1, 2);
+    event_group.insert(event_rx);
+    client_set.spawn(actor.run());
 
-        let event_rx = handle.subscribe();
-        let event_rx = tokio_stream::wrappers::BroadcastStream::new(event_rx)
-            .map_ok(move |v| (handle.clone(), v));
-
-        event_group.insert(event_rx);
-        join_set.spawn(actor.run());
-
-        loop {
-            let event = event_group.next().await.unwrap().unwrap();
-            match event {
-                (handle, ParticipantClientEvent::IceConnectionState(state)) => {
-                    println!("ice connection state: {:?}", state);
-                }
+    loop {
+        let event = event_group.next().await.unwrap().unwrap();
+        match event {
+            (handle, ParticipantClientEvent::IceConnectionState(state)) => {
+                println!("ice connection state: {:?}", state);
             }
         }
-
-        Ok(())
-    });
-
-    sim
+    }
 }
 
 pub enum ParticipantClientMessage {}
@@ -99,16 +82,16 @@ pub enum ParticipantClientEvent {
     IceConnectionState(IceConnectionState),
 }
 
-pub struct ParticipantClientActor {
+pub struct ParticipantClientActor<S> {
     rtc: str0m::Rtc,
-    socket: UdpSocket,
+    socket: S,
     room_id: Arc<ExternalRoomId>,
     participant_id: Arc<ExternalParticipantId>,
     data_rx: mpsc::Receiver<ParticipantClientMessage>,
     event_tx: broadcast::Sender<ParticipantClientEvent>,
 }
 
-impl ParticipantClientActor {
+impl<S: PacketSocket> ParticipantClientActor<S> {
     pub fn create_offer(&mut self) -> (SdpOffer, SdpPendingOffer) {
         self.rtc.sdp_api().apply().unwrap()
     }
@@ -223,11 +206,11 @@ pub struct ParticipantClientHandle {
 }
 
 impl ParticipantClientHandle {
-    pub fn new(
-        socket: UdpSocket,
+    pub fn new<S: PacketSocket>(
+        socket: S,
         send_streams: usize,
         recv_streams: usize,
-    ) -> (Self, ParticipantClientActor) {
+    ) -> (Self, ParticipantClientActor<S>) {
         let mut rtc = str0m::Rtc::new();
         rtc.add_local_candidate(Candidate::host("1.1.1.1:8000".parse().unwrap(), "udp").unwrap());
         let mut sdp = rtc.sdp_api();

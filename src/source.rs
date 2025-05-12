@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use crate::{
     ice,
     message::{ActorResult, UDPPacket},
-    net::UdpSocket,
+    net::{PacketSocket, UdpSocket},
     participant::ParticipantHandle,
 };
 use bytes::Bytes;
@@ -14,16 +14,16 @@ pub enum UdpSourceMessage {
     RemoveParticipant(String),
 }
 
-pub struct UdpSourceActor {
+pub struct UdpSourceActor<S> {
     receiver: mpsc::Receiver<UdpSourceMessage>,
     local_addr: SocketAddr,
-    socket: Arc<UdpSocket>,
+    socket: S,
     conns: HashMap<String, ParticipantHandle>,
     mapping: HashMap<SocketAddr, ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
-impl UdpSourceActor {
+impl<S: PacketSocket> UdpSourceActor<S> {
     pub async fn run(mut self) -> ActorResult {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
@@ -113,7 +113,7 @@ pub struct UdpSourceHandle {
 }
 
 impl UdpSourceHandle {
-    pub fn new(local_addr: SocketAddr, socket: Arc<UdpSocket>) -> (Self, UdpSourceActor) {
+    pub fn new<S: PacketSocket>(local_addr: SocketAddr, socket: S) -> (Self, UdpSourceActor<S>) {
         let (sender, receiver) = mpsc::channel(1);
         let handle = Self { sender };
         let actor = UdpSourceActor {
