@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{io::ErrorKind, net::SocketAddr, ptr::copy_nonoverlapping, sync::Arc, time::Duration};
 
 mod net;
 
@@ -16,7 +16,7 @@ use pulsebeam::{
 use rand::SeedableRng;
 use str0m::{
     Candidate, Event, IceConnectionState, Input, Output,
-    change::{SdpOffer, SdpPendingOffer},
+    change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     net::Receive,
 };
 use tokio::{
@@ -30,6 +30,7 @@ pub struct Simulation {}
 
 pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
     let rng = RngSeed::from_bytes(&seed.to_be_bytes());
+    tracing_subscriber::fmt().init();
     tokio::runtime::Builder::new_current_thread()
         .rng_seed(rng)
         .start_paused(true)
@@ -58,7 +59,8 @@ pub async fn setup_sim(seed: u64) {
     let mut event_group = StreamGroup::new();
 
     // TODO: add participants
-    let (handle, actor) = ParticipantClientHandle::new(socket.clone(), 1, 2);
+    let (handle, actor) =
+        ParticipantClientHandle::connect(socket.clone(), controller_handle.clone(), 1, 2).await;
 
     let event_rx = handle.subscribe();
     let event_rx =
@@ -67,11 +69,12 @@ pub async fn setup_sim(seed: u64) {
     event_group.insert(event_rx);
     client_set.spawn(actor.run());
 
+    tracing::info!("running");
     loop {
         let event = event_group.next().await.unwrap().unwrap();
         match event {
             (handle, ParticipantClientEvent::IceConnectionState(state)) => {
-                println!("ice connection state: {:?}", state);
+                tracing::info!("ice connection state: {:?}", state);
             }
         }
     }
@@ -94,10 +97,6 @@ pub struct ParticipantClientActor<S> {
 }
 
 impl<S: PacketSocket> ParticipantClientActor<S> {
-    pub fn create_offer(&mut self) -> (SdpOffer, SdpPendingOffer) {
-        self.rtc.sdp_api().apply().unwrap()
-    }
-
     pub async fn run(mut self) {
         let mut buf = vec![0; 2000];
 
@@ -208,24 +207,25 @@ pub struct ParticipantClientHandle {
 }
 
 impl ParticipantClientHandle {
-    pub fn new<S: PacketSocket>(
+    pub async fn connect<S: PacketSocket>(
         socket: S,
+        controller: ControllerHandle,
         send_streams: usize,
         recv_streams: usize,
     ) -> (Self, ParticipantClientActor<S>) {
         let mut rtc = str0m::Rtc::new();
         rtc.add_local_candidate(Candidate::host("1.1.1.1:8000".parse().unwrap(), "udp").unwrap());
-        let mut sdp = rtc.sdp_api();
+        let mut change = rtc.sdp_api();
 
         for _ in 0..send_streams {
-            sdp.add_media(
+            change.add_media(
                 str0m::media::MediaKind::Video,
                 str0m::media::Direction::SendOnly,
                 None,
                 None,
                 None,
             );
-            sdp.add_media(
+            change.add_media(
                 str0m::media::MediaKind::Audio,
                 str0m::media::Direction::SendOnly,
                 None,
@@ -235,14 +235,14 @@ impl ParticipantClientHandle {
         }
 
         for _ in 0..recv_streams {
-            sdp.add_media(
+            change.add_media(
                 str0m::media::MediaKind::Video,
                 str0m::media::Direction::RecvOnly,
                 None,
                 None,
                 None,
             );
-            sdp.add_media(
+            change.add_media(
                 str0m::media::MediaKind::Audio,
                 str0m::media::Direction::RecvOnly,
                 None,
@@ -252,8 +252,22 @@ impl ParticipantClientHandle {
         }
 
         let room_id = ExternalRoomId::new("simulation".to_string()).unwrap();
-        let room_id = Arc::new(room_id);
         let participant_id = ExternalParticipantId::new("alice".to_string()).unwrap();
+
+        let (offer, pending) = change.apply().unwrap();
+        let answer = controller
+            .allocate(
+                room_id.clone(),
+                participant_id.clone(),
+                offer.to_sdp_string(),
+            )
+            .await
+            .unwrap();
+
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        rtc.sdp_api().accept_answer(pending, answer).unwrap();
+
+        let room_id = Arc::new(room_id);
         let participant_id = Arc::new(participant_id);
 
         let (data_tx, data_rx) = mpsc::channel(1);
