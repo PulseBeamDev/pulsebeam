@@ -1,7 +1,8 @@
 use common::setup_sim;
 mod common;
 
-#[tokio::test]
-async fn basic() {
-    setup_sim(1);
+#[test]
+fn basic() {
+    let mut sim = setup_sim(1);
+    sim.run().unwrap();
 }
