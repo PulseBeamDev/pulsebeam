@@ -26,6 +26,9 @@ async fn main() {
         .pretty()
         .init();
 
+    std::panic::set_hook(Box::new(|panic_info| {
+        tracing::error!("GLOBAL_PANIC_HOOK: {}", panic_info);
+    }));
     let cors = CorsLayer::very_permissive()
         // https://github.com/tower-rs/tower-http/issues/194
         .allow_origin(AllowOrigin::mirror_request())
