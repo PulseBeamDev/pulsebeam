@@ -72,7 +72,9 @@ impl<S: PacketSocket> UdpSourceActor<S> {
                     .push(source);
                 participant_handle.clone()
             } else {
-                tracing::trace!("dropped a packet from {source} due to unregistered stun binding");
+                tracing::trace!(
+                    "dropped a packet from {source} due to unregistered stun binding: {ufrag}"
+                );
                 return;
             }
         } else {
@@ -96,6 +98,7 @@ impl<S: PacketSocket> UdpSourceActor<S> {
                 self.conns.insert(ufrag, participant);
             }
             UdpSourceMessage::RemoveParticipant(ufrag) => {
+                tracing::trace!("removed {ufrag} to connection map");
                 self.conns.remove(&ufrag);
                 if let Some(addrs) = self.reverse.remove(&ufrag) {
                     for addr in addrs.iter() {

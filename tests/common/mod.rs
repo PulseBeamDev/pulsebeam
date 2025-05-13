@@ -2,6 +2,7 @@ use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 mod net;
 
+use console_subscriber::ConsoleLayer;
 use futures::{StreamExt, TryStreamExt};
 use futures_concurrency::stream::StreamGroup;
 use net::{VirtualNetwork, VirtualSocket};
@@ -25,12 +26,24 @@ use tokio::{
     task::JoinSet,
     time::Instant,
 };
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
 pub struct Simulation {}
 
 pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
     let rng = RngSeed::from_bytes(&seed.to_be_bytes());
-    tracing_subscriber::fmt().init();
+
+    let subscriber = Registry::default()
+        .with(ConsoleLayer::builder().spawn())
+        .with(EnvFilter::from_default_env())
+        .with(fmt::layer().pretty());
+
+    // Set the subscriber as the global default
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("Failed to set global default subscriber: {}", e);
+        // Optionally, fall back to a simple logger if console setup fails
+        // tracing_subscriber::fmt::init();
+    }
     tokio::runtime::Builder::new_current_thread()
         .rng_seed(rng)
         .start_paused(true)
@@ -100,14 +113,71 @@ pub struct ParticipantClientActor<S> {
 
 impl<S: PacketSocket> ParticipantClientActor<S> {
     pub async fn run(mut self) {
+        loop {
+            let deadline = if let Some(deadline) = self.poll_output().await {
+                deadline
+            } else {
+                // Rtc timeout
+                break;
+            };
+
+            tokio::select! {
+                _ = self.poll_input() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    // explicit empty, next loop polls again
+                }
+            }
+        }
+    }
+
+    async fn poll_input(&mut self) {
         let mut buf = vec![0; 2000];
 
-        loop {
+        // Try to receive. Because we have a timeout on the socket,
+        // we will either receive a packet, or timeout.
+        // This is where having an async loop shines. We can await multiple things to
+        // happen such as outgoing media data, the timeout and incoming network traffic.
+        // When using async there is no need to set timeout on the socket.
+        let input = match self.socket.recv_from(&mut buf).await {
+            Ok((n, source)) => {
+                // UDP data received.
+                buf.truncate(n);
+                Input::Receive(
+                    Instant::now().into_std(),
+                    Receive {
+                        proto: str0m::net::Protocol::Udp,
+                        source,
+                        destination: self.socket.local_addr().unwrap(),
+                        contents: buf.as_slice().try_into().unwrap(),
+                    },
+                )
+            }
+
+            Err(e) => match e.kind() {
+                // Expected error for set_read_timeout().
+                // One for windows, one for the rest.
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                    Input::Timeout(Instant::now().into_std())
+                }
+
+                e => {
+                    eprintln!("Error: {:?}", e);
+                    return; // abort
+                }
+            },
+        };
+
+        // Input is either a Timeout or Receive of data. Both drive the state forward.
+        self.rtc.handle_input(input).unwrap();
+    }
+
+    async fn poll_output(&mut self) -> Option<Instant> {
+        while self.rtc.is_alive() {
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
-            let timeout = match self.rtc.poll_output().unwrap() {
+            match self.rtc.poll_output().unwrap() {
                 // Stop polling when we get the timeout.
-                Output::Timeout(v) => Instant::from_std(v),
+                Output::Timeout(v) => return Some(Instant::from_std(v)),
 
                 // Transmit this data to the remote peer. Typically via
                 // a UDP socket. The destination IP comes from the ICE
@@ -117,7 +187,6 @@ impl<S: PacketSocket> ParticipantClientActor<S> {
                         .send_to(&v.contents, v.destination)
                         .await
                         .unwrap();
-                    continue;
                 }
 
                 // Events are mainly incoming media data from the remote
@@ -127,7 +196,7 @@ impl<S: PacketSocket> ParticipantClientActor<S> {
                         Event::IceConnectionStateChange(state) => {
                             // Abort if we disconnect.
                             if state == str0m::IceConnectionState::Disconnected {
-                                return;
+                                self.rtc.disconnect();
                             }
 
                             let _ = self
@@ -138,65 +207,10 @@ impl<S: PacketSocket> ParticipantClientActor<S> {
                     }
 
                     // TODO: handle more cases of v here, such as incoming media data.
-
-                    continue;
                 }
             };
-
-            // Duration until timeout.
-            let duration = timeout - Instant::now();
-
-            // socket.set_read_timeout(Some(0)) is not ok
-            if duration.is_zero() {
-                // Drive time forwards in rtc straight away.
-                self.rtc
-                    .handle_input(Input::Timeout(Instant::now().into_std()))
-                    .unwrap();
-                continue;
-            }
-
-            tokio::time::sleep(duration).await;
-
-            // Scale up buffer to receive an entire UDP packet.
-            buf.resize(2000, 0);
-
-            // Try to receive. Because we have a timeout on the socket,
-            // we will either receive a packet, or timeout.
-            // This is where having an async loop shines. We can await multiple things to
-            // happen such as outgoing media data, the timeout and incoming network traffic.
-            // When using async there is no need to set timeout on the socket.
-            let input = match self.socket.recv_from(&mut buf).await {
-                Ok((n, source)) => {
-                    // UDP data received.
-                    buf.truncate(n);
-                    Input::Receive(
-                        Instant::now().into_std(),
-                        Receive {
-                            proto: str0m::net::Protocol::Udp,
-                            source,
-                            destination: self.socket.local_addr().unwrap(),
-                            contents: buf.as_slice().try_into().unwrap(),
-                        },
-                    )
-                }
-
-                Err(e) => match e.kind() {
-                    // Expected error for set_read_timeout().
-                    // One for windows, one for the rest.
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                        Input::Timeout(Instant::now().into_std())
-                    }
-
-                    e => {
-                        eprintln!("Error: {:?}", e);
-                        return; // abort
-                    }
-                },
-            };
-
-            // Input is either a Timeout or Receive of data. Both drive the state forward.
-            self.rtc.handle_input(input).unwrap();
         }
+        None
     }
 }
 

@@ -114,6 +114,7 @@ impl ParticipantActor {
     pub async fn run(mut self) {
         // TODO: notify ingress to add self to the routing table
 
+        tracing::info!("created");
         loop {
             let deadline = if let Some(deadline) = self.poll().await {
                 deadline
@@ -137,19 +138,21 @@ impl ParticipantActor {
                     }
                 }
 
-                _ = tokio::time::sleep(deadline) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     // explicit empty, next loop polls again
                 }
             }
         }
 
         // TODO: cleanup in the room
+        tracing::info!("exited");
     }
 
     #[inline]
     async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
             ParticipantDataMessage::UdpPacket(packet) => {
+                tracing::debug!("received UDP Packet");
                 let now = Instant::now();
                 self.rtc.handle_input(Input::Receive(
                     now.into_std(),
@@ -219,45 +222,29 @@ impl ParticipantActor {
         }
     }
 
-    async fn poll(&mut self) -> Option<Duration> {
+    async fn poll(&mut self) -> Option<Instant> {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
         while self.rtc.is_alive() {
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
-            let timeout = match self.rtc.poll_output().unwrap() {
+            match self.rtc.poll_output().unwrap() {
                 // Stop polling when we get the timeout.
-                Output::Timeout(v) => Instant::from_std(v),
+                Output::Timeout(v) => return Some(Instant::from_std(v)),
 
                 // Transmit this data to the remote peer. Typically via
                 // a UDP socket. The destination IP comes from the ICE
                 // agent. It might change during the session.
                 Output::Transmit(v) => {
                     self.handle_output_transmit(v);
-                    continue;
                 }
 
                 // Events are mainly incoming media data from the remote
                 // peer, but also data channel data and statistics.
                 Output::Event(v) => {
                     self.handle_output_event(v).await;
-                    continue;
                 }
-            };
-
-            // Duration until timeout.
-            let now = Instant::now();
-            let duration = timeout - now;
-
-            if duration.is_zero() {
-                // Drive time forwards in rtc straight away.
-                self.rtc
-                    .handle_input(Input::Timeout(now.into_std()))
-                    .unwrap();
-                continue;
             }
-
-            return Some(duration);
         }
 
         None
