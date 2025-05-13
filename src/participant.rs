@@ -1,16 +1,9 @@
-use std::{
-    collections::HashMap,
-    fmt::{self, Display, Pointer},
-    ops::Deref,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
-    change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     channel::{ChannelData, ChannelId},
     error::SdpError,
     media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid, Simulcast},
@@ -23,7 +16,6 @@ use tokio::{
     },
     time::Instant,
 };
-use tracing::instrument;
 
 use crate::{
     entity::{ParticipantId, TrackId},
@@ -35,9 +27,6 @@ use crate::{
     source::UdpSourceHandle,
     track::TrackHandle,
 };
-
-use proto::sfu::client_message as client;
-use proto::sfu::server_message as server;
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -152,9 +141,8 @@ impl ParticipantActor {
     async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
             ParticipantDataMessage::UdpPacket(packet) => {
-                tracing::debug!("received UDP Packet");
                 let now = Instant::now();
-                self.rtc.handle_input(Input::Receive(
+                let res = self.rtc.handle_input(Input::Receive(
                     now.into_std(),
                     net::Receive {
                         proto: net::Protocol::Udp,
@@ -163,6 +151,10 @@ impl ParticipantActor {
                         contents: (&*packet.raw).try_into().unwrap(),
                     },
                 ));
+
+                if let Err(err) = res {
+                    tracing::warn!("dropped a UDP packet: {err}");
+                }
             }
             ParticipantDataMessage::ForwardMedia(track, data) => {
                 self.handle_forward_media(track, data);

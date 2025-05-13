@@ -29,44 +29,12 @@ pub mod client_message {
     pub enum Payload {
         #[prost(message, tag = "1")]
         Subscribe(super::ClientSubscribePayload),
-        /// Add other client-initiated actions here if needed
-        /// e.g., ChangeSubscriptionQualityPayload change_quality = 3;
         #[prost(message, tag = "2")]
         Unsubscribe(super::ClientUnsubscribePayload),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SubscriptionOfferPayload {
-    /// A unique ID for this subscription attempt, useful for correlation.
-    #[prost(string, tag = "1")]
-    pub subscription_id: ::prost::alloc::string::String,
-    /// The client's MID that the SFU will use (confirming client's request).
-    #[prost(string, tag = "2")]
-    pub mid: ::prost::alloc::string::String,
-    /// The remote track ID being offered/confirmed.
-    #[prost(string, tag = "3")]
-    pub remote_track_id: ::prost::alloc::string::String,
-    /// The kind of track.
-    #[prost(enumeration = "TrackKind", tag = "4")]
-    pub kind: i32,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SubscriptionErrorPayload {
-    /// Correlates to a subscription attempt.
-    #[prost(string, optional, tag = "1")]
-    pub subscription_id: ::core::option::Option<::prost::alloc::string::String>,
-    /// Which track failed, if applicable.
-    #[prost(string, optional, tag = "2")]
-    pub remote_track_id: ::core::option::Option<::prost::alloc::string::String>,
-    /// Which client MID failed, if applicable.
-    #[prost(string, optional, tag = "3")]
-    pub mid: ::core::option::Option<::prost::alloc::string::String>,
-    /// Error description.
-    #[prost(string, tag = "4")]
-    pub message: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TrackPublishedPayload {
+pub struct TrackInfo {
     /// The ID of the newly available remote track.
     #[prost(string, tag = "1")]
     pub remote_track_id: ::prost::alloc::string::String,
@@ -78,6 +46,12 @@ pub struct TrackPublishedPayload {
     pub participant_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TrackPublishedPayload {
+    /// A list of all currently published tracks.
+    #[prost(message, repeated, tag = "1")]
+    pub tracks: ::prost::alloc::vec::Vec<TrackInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TrackUnpublishedPayload {
     /// The ID of the remote track that is no longer available.
     #[prost(string, tag = "1")]
@@ -87,33 +61,27 @@ pub struct TrackUnpublishedPayload {
 pub struct ErrorPayload {
     /// General error message from the SFU.
     #[prost(string, tag = "1")]
-    pub message: ::prost::alloc::string::String,
+    pub description: ::prost::alloc::string::String,
 }
 /// ServerMessage encapsulates all possible messages from SFU to client.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerMessage {
-    #[prost(oneof = "server_message::Payload", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "server_message::Payload", tags = "1, 2, 3")]
     pub payload: ::core::option::Option<server_message::Payload>,
 }
 /// Nested message and enum types in `ServerMessage`.
 pub mod server_message {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
-        /// SFU confirms/offers a subscription to a track.
+        /// General error from SFU.
         #[prost(message, tag = "1")]
-        SubscriptionOffer(super::SubscriptionOfferPayload),
-        /// SFU reports an error with a subscription.
-        #[prost(message, tag = "2")]
-        SubscriptionError(super::SubscriptionErrorPayload),
+        Error(super::ErrorPayload),
         /// SFU informs client a new remote track is available.
-        #[prost(message, tag = "3")]
+        #[prost(message, tag = "2")]
         TrackPublished(super::TrackPublishedPayload),
         /// SFU informs client a remote track is no longer available.
-        #[prost(message, tag = "4")]
+        #[prost(message, tag = "3")]
         TrackUnpublished(super::TrackUnpublishedPayload),
-        /// General error from SFU.
-        #[prost(message, tag = "5")]
-        Error(super::ErrorPayload),
     }
 }
 /// Represents the kind of media track.
