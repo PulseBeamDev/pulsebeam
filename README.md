@@ -8,6 +8,21 @@
 
 Simple, Scalable, Self-Hosted & Open Source WebRTC SFU. The Cost-Effective Alternative to CPaaS.
 
+## Running
+
+`RUST_LOG=info cargo run`
+
+## Testing
+
+Unit tests:
+
+`cargo test --lib`
+
+Deterministic Simulation Testing (dst), think of this like a [Chaos Monkey](https://github.com/Netflix/chaosmonkey) but running in a simulation:
+
+`cargo test --test sim`
+
+
 ## Architecture Overview
 
 This project implements a WebRTC Selective Forwarding Unit (SFU) in Rust, utilizing the Tokio asynchronous runtime and its multi-threaded work-stealing scheduler. The design prioritizes performance and concurrency management through specific architectural choices.
@@ -33,19 +48,4 @@ This project implements a WebRTC Selective Forwarding Unit (SFU) in Rust, utiliz
 *   **Scalability:** The message-passing architecture is intended to distribute work effectively, allowing the SFU to scale with available CPU cores.
 *   **Concurrency Management:** The actor-like model and message passing help manage concurrent operations. However, debugging and ensuring correctness in highly concurrent, message-driven systems require diligent design and testing strategies (like our simulation testing).
 *   **Maintainability:** Isolating logic into components can improve modularity. However, understanding the flow of messages and overall system state can present its own complexities compared to monolithic designs.
-
-
-## Running
-
-`RUST_LOG=info cargo run`
-
-## Testing
-
-Unit tests:
-
-`cargo test --lib`
-
-Deterministic Simulation Testing (dst), think of this like a [Chaos Monkey](https://github.com/Netflix/chaosmonkey) but running in a simulation:
-
-`cargo test --test sim`
 
