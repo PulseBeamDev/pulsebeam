@@ -12,9 +12,8 @@ enum TrackKind {
 // --- Client to Server Messages ---
 
 message ClientSubscribePayload {
-  string mid = 1;         // The client's MID (transceiver slot) to use for this track.
-  string track_id = 2;    // The application-level ID of the remote track to subscribe to.
-  TrackKind kind = 3;     // The kind of track (video/audio).
+  string mid = 1;                 // The client's MID (transceiver slot) to use for this track.
+  string remote_track_id = 2;     // The application-level ID of the remote track to subscribe to.
 }
 
 message ClientUnsubscribePayload {
@@ -33,18 +32,27 @@ message ClientMessage {
 // --- Server to Client Messages ---
 
 message TrackInfo {
-  string remote_track_id = 1; // The ID of the newly available remote track.
+  string track_id = 1; // The ID of the newly available remote track.
   TrackKind kind = 2;         // The kind of track.
   string participant_id = 3;  // The ID of the participant who published this track.
   // map<string, string> metadata = 4; // Optional: any other app-specific metadata about the track.
 }
 
+message TrackSwitchInfo {
+  string mid = 2;             // The client's MID that the SFU will use (confirming client's request).
+  optional TrackInfo remote_track = 3;
+}
+
 message TrackPublishedPayload {
-  repeated TrackInfo tracks = 1; // A list of all currently published tracks.
+  TrackInfo remote_track = 1;
 }
 
 message TrackUnpublishedPayload {
   string remote_track_id = 1; // The ID of the remote track that is no longer available.
+}
+
+message TrackSwitchedPayload {
+  repeated TrackSwitchInfo switches = 1;
 }
 
 message ErrorPayload {
@@ -57,5 +65,6 @@ message ServerMessage {
     ErrorPayload error = 1;                            // General error from SFU.
     TrackPublishedPayload track_published = 2;         // SFU informs client a new remote track is available.
     TrackUnpublishedPayload track_unpublished = 3;     // SFU informs client a remote track is no longer available.
+    TrackSwitchedPayload track_switched = 4;           // SFU confirms track switching for a mid
   }
 }

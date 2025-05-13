@@ -6,10 +6,7 @@ pub struct ClientSubscribePayload {
     pub mid: ::prost::alloc::string::String,
     /// The application-level ID of the remote track to subscribe to.
     #[prost(string, tag = "2")]
-    pub track_id: ::prost::alloc::string::String,
-    /// The kind of track (video/audio).
-    #[prost(enumeration = "TrackKind", tag = "3")]
-    pub kind: i32,
+    pub remote_track_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientUnsubscribePayload {
@@ -37,7 +34,7 @@ pub mod client_message {
 pub struct TrackInfo {
     /// The ID of the newly available remote track.
     #[prost(string, tag = "1")]
-    pub remote_track_id: ::prost::alloc::string::String,
+    pub track_id: ::prost::alloc::string::String,
     /// The kind of track.
     #[prost(enumeration = "TrackKind", tag = "2")]
     pub kind: i32,
@@ -46,16 +43,28 @@ pub struct TrackInfo {
     pub participant_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TrackSwitchInfo {
+    /// The client's MID that the SFU will use (confirming client's request).
+    #[prost(string, tag = "2")]
+    pub mid: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub remote_track: ::core::option::Option<TrackInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TrackPublishedPayload {
-    /// A list of all currently published tracks.
-    #[prost(message, repeated, tag = "1")]
-    pub tracks: ::prost::alloc::vec::Vec<TrackInfo>,
+    #[prost(message, optional, tag = "1")]
+    pub remote_track: ::core::option::Option<TrackInfo>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TrackUnpublishedPayload {
     /// The ID of the remote track that is no longer available.
     #[prost(string, tag = "1")]
     pub remote_track_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TrackSwitchedPayload {
+    #[prost(message, repeated, tag = "1")]
+    pub switches: ::prost::alloc::vec::Vec<TrackSwitchInfo>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorPayload {
@@ -66,7 +75,7 @@ pub struct ErrorPayload {
 /// ServerMessage encapsulates all possible messages from SFU to client.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerMessage {
-    #[prost(oneof = "server_message::Payload", tags = "1, 2, 3")]
+    #[prost(oneof = "server_message::Payload", tags = "1, 2, 3, 4")]
     pub payload: ::core::option::Option<server_message::Payload>,
 }
 /// Nested message and enum types in `ServerMessage`.
@@ -82,6 +91,9 @@ pub mod server_message {
         /// SFU informs client a remote track is no longer available.
         #[prost(message, tag = "3")]
         TrackUnpublished(super::TrackUnpublishedPayload),
+        /// SFU confirms track switching for a mid
+        #[prost(message, tag = "4")]
+        TrackSwitched(super::TrackSwitchedPayload),
     }
 }
 /// Represents the kind of media track.
