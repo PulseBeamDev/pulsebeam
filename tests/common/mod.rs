@@ -1,11 +1,8 @@
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
 
 mod net;
 
 use console_subscriber::ConsoleLayer;
-use futures::{StreamExt, TryStreamExt};
-use futures_concurrency::stream::StreamGroup;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use net::{VirtualTcpListener, VirtualUdpSocket};
 use pulsebeam::{
     controller::ControllerHandle,
@@ -18,13 +15,8 @@ use pulsebeam::{
     source::UdpSourceHandle,
 };
 use rand::SeedableRng;
-use str0m::{
-    Candidate, Event, IceConnectionState, Input, Output,
-    change::{SdpAnswer, SdpOffer, SdpPendingOffer},
-    net::Receive,
-};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, change::SdpAnswer, net::Receive};
 use tokio::{
-    runtime::RngSeed,
     sync::{broadcast, mpsc},
     time::Instant,
 };
@@ -91,23 +83,17 @@ pub fn setup_sim(seed: u64) {
 
         let join = tokio::spawn(actor.run());
 
-        let mut event_group = StreamGroup::new();
-
-        let event_rx = handle.subscribe();
-        let event_rx = tokio_stream::wrappers::BroadcastStream::new(event_rx)
-            .map_ok(move |v| (handle.clone(), v));
-
-        event_group.insert(event_rx);
-
+        let mut event_rx = handle.subscribe();
         tracing::info!("running");
-        loop {
-            let event = event_group.next().await.unwrap().unwrap();
+        while let Ok(event) = event_rx.recv().await {
             match event {
-                (handle, ParticipantClientEvent::IceConnectionState(state)) => {
+                ParticipantClientEvent::IceConnectionState(state) => {
                     tracing::info!("ice connection state: {:?}", state);
                 }
             }
         }
+
+        join.await?;
         Ok(())
     });
 
