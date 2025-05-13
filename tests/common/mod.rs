@@ -5,7 +5,7 @@ mod net;
 use console_subscriber::ConsoleLayer;
 use futures::{StreamExt, TryStreamExt};
 use futures_concurrency::stream::StreamGroup;
-use net::{VirtualNetwork, VirtualSocket, VirtualUDPSocket};
+use net::{VirtualTcpListener, VirtualUdpSocket};
 use pulsebeam::{
     controller::ControllerHandle,
     entity::{ExternalParticipantId, ExternalRoomId},
@@ -25,17 +25,14 @@ use str0m::{
 use tokio::{
     runtime::RngSeed,
     sync::{broadcast, mpsc},
-    task::JoinSet,
     time::Instant,
 };
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
-use turmoil::net::UdpSocket;
+use turmoil::net::{TcpListener, UdpSocket};
 
 pub struct Simulation {}
 
-pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
-    let rng = RngSeed::from_bytes(&seed.to_be_bytes());
-
+pub fn setup_sim(seed: u64) {
     let subscriber = Registry::default()
         .with(ConsoleLayer::builder().spawn())
         .with(EnvFilter::from_default_env())
@@ -47,30 +44,15 @@ pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
         // Optionally, fall back to a simple logger if console setup fails
         // tracing_subscriber::fmt::init();
     }
-    tokio::runtime::Builder::new_current_thread()
-        .rng_seed(rng)
-        .start_paused(true)
-        .build()
-        .unwrap()
-}
-
-pub fn setup_sim(seed: u64) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
 
     let mut sim = turmoil::Builder::new().build();
 
     sim.host("server", || {
         async move {
             // TODO: use preseed rng
-            let socket = UdpSocket::bind("127.0.0.1:3478").await.unwrap();
+            let socket = UdpSocket::bind("0.0.0.0:3478").await.unwrap();
             let server_addr = socket.local_addr().unwrap();
-            let socket = VirtualUDPSocket(Arc::new(socket));
+            let socket = VirtualUdpSocket(Arc::new(socket));
 
             let rng = Rng::seed_from_u64(seed);
             let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
@@ -78,9 +60,9 @@ pub fn setup_sim(seed: u64) {
             let (controller_handle, controller_actor) =
                 ControllerHandle::new(rng, source_handle, sink_handle, vec![server_addr]);
             let router = signaling::router(controller_handle);
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:3000").await?;
             let signaling = async move {
-                axum::serve(listener, router)
+                axum::serve(VirtualTcpListener(listener), router)
                     .await
                     .map_err(|err| ActorError::Unknown(err.to_string()))
             };
@@ -96,11 +78,13 @@ pub fn setup_sim(seed: u64) {
         }
     });
 
+    let server_addr = sim.lookup("server");
+    tracing::info!("server addr: {}", server_addr);
     sim.client("client", async move {
         // TODO: add participants
-        let server_addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let server_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket = VirtualUDPSocket(Arc::new(socket));
+        let socket = VirtualUdpSocket(Arc::new(socket));
         let (handle, actor) = ParticipantClientHandle::connect(socket, 1, 2).await;
 
         let join = tokio::spawn(actor.run());
@@ -124,6 +108,8 @@ pub fn setup_sim(seed: u64) {
         }
         Ok(())
     });
+
+    sim.run().unwrap();
 }
 
 pub enum ParticipantClientMessage {}
