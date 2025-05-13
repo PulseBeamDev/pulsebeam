@@ -1783,6 +1783,7 @@ dependencies = [
 name = "pulsebeam"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel",
  "axum 0.8.4",
  "axum-extra",
@@ -1795,8 +1796,12 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jemallocator",
  "metrics",
+ "pin-project-lite",
  "proptest",
  "prost",
  "prost-build",
@@ -1811,6 +1816,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "tower 0.5.2",
  "tower-http",
  "tracing",
  "tracing-subscriber",

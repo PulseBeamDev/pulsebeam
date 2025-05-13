@@ -5,6 +5,7 @@ mod net;
 use console_subscriber::ConsoleLayer;
 use futures::{StreamExt, TryStreamExt};
 use futures_concurrency::stream::StreamGroup;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use net::{VirtualTcpListener, VirtualUdpSocket};
 use pulsebeam::{
     controller::ControllerHandle,
@@ -51,7 +52,7 @@ pub fn setup_sim(seed: u64) {
         async move {
             // TODO: use preseed rng
             let socket = UdpSocket::bind("0.0.0.0:3478").await.unwrap();
-            let server_addr = socket.local_addr().unwrap();
+            let server_addr = "192.168.1.1:3478".parse().unwrap();
             let socket = VirtualUdpSocket(Arc::new(socket));
 
             let rng = Rng::seed_from_u64(seed);
@@ -60,7 +61,7 @@ pub fn setup_sim(seed: u64) {
             let (controller_handle, controller_actor) =
                 ControllerHandle::new(rng, source_handle, sink_handle, vec![server_addr]);
             let router = signaling::router(controller_handle);
-            let listener = TcpListener::bind("127.0.0.1:3000").await?;
+            let listener = TcpListener::bind("0.0.0.0:3000").await?;
             let signaling = async move {
                 axum::serve(VirtualTcpListener(listener), router)
                     .await
@@ -79,13 +80,14 @@ pub fn setup_sim(seed: u64) {
     });
 
     let server_addr = sim.lookup("server");
+    let addr = format!("{}:{}", sim.lookup("server"), 3000);
     tracing::info!("server addr: {}", server_addr);
     sim.client("client", async move {
         // TODO: add participants
         let server_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket = VirtualUdpSocket(Arc::new(socket));
-        let (handle, actor) = ParticipantClientHandle::connect(socket, 1, 2).await;
+        let (handle, actor) = ParticipantClientHandle::connect(socket, addr, 1, 2).await;
 
         let join = tokio::spawn(actor.run());
 
@@ -251,11 +253,12 @@ pub struct ParticipantClientHandle {
 impl ParticipantClientHandle {
     pub async fn connect<S: PacketSocket>(
         socket: S,
+        server_addr: String,
         send_streams: usize,
         recv_streams: usize,
     ) -> (Self, ParticipantClientActor<S>) {
         let mut rtc = str0m::Rtc::new();
-        rtc.add_local_candidate(Candidate::host(socket.local_addr().unwrap(), "udp").unwrap());
+        rtc.add_local_candidate(Candidate::host("127.0.0.1:3478".parse().unwrap(), "udp").unwrap());
         let mut change = rtc.sdp_api();
 
         for _ in 0..send_streams {
@@ -295,11 +298,16 @@ impl ParticipantClientHandle {
         let room_id = ExternalRoomId::new("simulation".to_string()).unwrap();
         let participant_id = ExternalParticipantId::new("alice".to_string()).unwrap();
 
-        // TODO:
-        // let (offer, pending) = change.apply().unwrap();
-        //
-        // let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
-        // rtc.sdp_api().accept_answer(pending, answer).unwrap();
+        let (offer, pending) = change.apply().unwrap();
+        let answer = net::offer(
+            format!("http://{}/?room=simulation&participant=alice", server_addr),
+            offer.to_sdp_string(),
+        )
+        .await
+        .unwrap();
+
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        rtc.sdp_api().accept_answer(pending, answer).unwrap();
 
         let room_id = Arc::new(room_id);
         let participant_id = Arc::new(participant_id);
