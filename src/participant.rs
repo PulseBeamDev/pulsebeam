@@ -230,7 +230,16 @@ impl ParticipantActor {
             // are either awaiting UDP socket input or the timeout to happen.
             match self.rtc.poll_output().unwrap() {
                 // Stop polling when we get the timeout.
-                Output::Timeout(v) => return Some(Instant::from_std(v)),
+                Output::Timeout(v) => {
+                    let now = Instant::now();
+                    let rtc_now = Instant::from_std(v);
+                    if now != rtc_now {
+                        return Some(Instant::from_std(v));
+                    }
+
+                    // forward clock never fails
+                    self.rtc.handle_input(Input::Timeout(v)).unwrap();
+                }
 
                 // Transmit this data to the remote peer. Typically via
                 // a UDP socket. The destination IP comes from the ICE

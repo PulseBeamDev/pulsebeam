@@ -7,7 +7,6 @@ edition = "2024"
 default = []
 
 [dependencies]
-anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.15", features = ["toml"] }

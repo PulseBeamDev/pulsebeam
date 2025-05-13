@@ -1783,7 +1783,6 @@ dependencies = [
 name = "pulsebeam"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-channel",
  "axum 0.8.4",
  "axum-extra",

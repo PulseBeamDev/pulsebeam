@@ -5,6 +5,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::{io, sync::Mutex, time::Instant};
 
+#[derive(Clone)]
+pub struct VirtualUDPSocket(pub Arc<turmoil::net::UdpSocket>);
+
+impl PacketSocket for VirtualUDPSocket {
+    fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.0.local_addr()
+    }
+
+    fn send_to(
+        &self,
+        buf: &[u8],
+        addr: SocketAddr,
+    ) -> impl Future<Output = std::io::Result<usize>> {
+        self.0.send_to(buf, addr)
+    }
+
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> {
+        self.0.recv_from(buf)
+    }
+}
+
 pub type Packet = (SocketAddr, Vec<u8>, Instant);
 
 /// Hub that holds all inboxes and injects uniform latency
@@ -167,4 +191,3 @@ mod tests {
         assert_eq!(&buf[..7], b"delayed");
     }
 }
-

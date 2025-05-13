@@ -5,12 +5,14 @@ mod net;
 use console_subscriber::ConsoleLayer;
 use futures::{StreamExt, TryStreamExt};
 use futures_concurrency::stream::StreamGroup;
-use net::{VirtualNetwork, VirtualSocket};
+use net::{VirtualNetwork, VirtualSocket, VirtualUDPSocket};
 use pulsebeam::{
     controller::ControllerHandle,
     entity::{ExternalParticipantId, ExternalRoomId},
+    message::ActorError,
     net::PacketSocket,
     rng::Rng,
+    signaling,
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
 };
@@ -27,6 +29,7 @@ use tokio::{
     time::Instant,
 };
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
+use turmoil::net::UdpSocket;
 
 pub struct Simulation {}
 
@@ -51,48 +54,76 @@ pub fn new_rt(seed: u64) -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-pub async fn setup_sim(seed: u64) {
-    // TODO: use preseed rng
-    let server_addr: SocketAddr = "1.1.1.1:3478".parse().unwrap();
-    let vnet = VirtualNetwork::new(Duration::from_millis(0));
-    let socket = VirtualSocket::register(vnet.clone(), server_addr).await;
+pub fn setup_sim(seed: u64) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
 
-    let rng = Rng::seed_from_u64(seed);
-    let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
-    let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
-    let (controller_handle, controller_actor) =
-        ControllerHandle::new(rng, source_handle, sink_handle, vec![server_addr]);
+    let mut sim = turmoil::Builder::new().build();
 
-    let mut server_set = JoinSet::new();
-    server_set.spawn(source_actor.run());
-    server_set.spawn(sink_actor.run());
-    server_set.spawn(controller_actor.run());
+    sim.host("server", || {
+        async move {
+            // TODO: use preseed rng
+            let socket = UdpSocket::bind("127.0.0.1:3478").await.unwrap();
+            let server_addr = socket.local_addr().unwrap();
+            let socket = VirtualUDPSocket(Arc::new(socket));
 
-    let mut client_set = JoinSet::new();
-    let mut event_group = StreamGroup::new();
+            let rng = Rng::seed_from_u64(seed);
+            let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
+            let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
+            let (controller_handle, controller_actor) =
+                ControllerHandle::new(rng, source_handle, sink_handle, vec![server_addr]);
+            let router = signaling::router(controller_handle);
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+            let signaling = async move {
+                axum::serve(listener, router)
+                    .await
+                    .map_err(|err| ActorError::Unknown(err.to_string()))
+            };
 
-    // TODO: add participants
-    let server_addr: SocketAddr = "1.1.1.2:3478".parse().unwrap();
-    let client_socket = VirtualSocket::register(vnet, server_addr).await;
-    let (handle, actor) =
-        ParticipantClientHandle::connect(client_socket, controller_handle.clone(), 1, 2).await;
+            let res = tokio::try_join!(
+                source_actor.run(),
+                sink_actor.run(),
+                controller_actor.run(),
+                signaling,
+            );
 
-    let event_rx = handle.subscribe();
-    let event_rx =
-        tokio_stream::wrappers::BroadcastStream::new(event_rx).map_ok(move |v| (handle.clone(), v));
+            res.map(|_| ()).map_err(|err| err.into())
+        }
+    });
 
-    event_group.insert(event_rx);
-    client_set.spawn(actor.run());
+    sim.client("client", async move {
+        // TODO: add participants
+        let server_addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = VirtualUDPSocket(Arc::new(socket));
+        let (handle, actor) = ParticipantClientHandle::connect(socket, 1, 2).await;
 
-    tracing::info!("running");
-    loop {
-        let event = event_group.next().await.unwrap().unwrap();
-        match event {
-            (handle, ParticipantClientEvent::IceConnectionState(state)) => {
-                tracing::info!("ice connection state: {:?}", state);
+        let join = tokio::spawn(actor.run());
+
+        let mut event_group = StreamGroup::new();
+
+        let event_rx = handle.subscribe();
+        let event_rx = tokio_stream::wrappers::BroadcastStream::new(event_rx)
+            .map_ok(move |v| (handle.clone(), v));
+
+        event_group.insert(event_rx);
+
+        tracing::info!("running");
+        loop {
+            let event = event_group.next().await.unwrap().unwrap();
+            match event {
+                (handle, ParticipantClientEvent::IceConnectionState(state)) => {
+                    tracing::info!("ice connection state: {:?}", state);
+                }
             }
         }
-    }
+        Ok(())
+    });
 }
 
 pub enum ParticipantClientMessage {}
@@ -177,7 +208,16 @@ impl<S: PacketSocket> ParticipantClientActor<S> {
             // are either awaiting UDP socket input or the timeout to happen.
             match self.rtc.poll_output().unwrap() {
                 // Stop polling when we get the timeout.
-                Output::Timeout(v) => return Some(Instant::from_std(v)),
+                Output::Timeout(v) => {
+                    let now = Instant::now();
+                    let rtc_now = Instant::from_std(v);
+                    if now != rtc_now {
+                        return Some(Instant::from_std(v));
+                    }
+
+                    // forward clock never fails
+                    self.rtc.handle_input(Input::Timeout(v)).unwrap();
+                }
 
                 // Transmit this data to the remote peer. Typically via
                 // a UDP socket. The destination IP comes from the ICE
@@ -225,7 +265,6 @@ pub struct ParticipantClientHandle {
 impl ParticipantClientHandle {
     pub async fn connect<S: PacketSocket>(
         socket: S,
-        controller: ControllerHandle,
         send_streams: usize,
         recv_streams: usize,
     ) -> (Self, ParticipantClientActor<S>) {
@@ -270,18 +309,11 @@ impl ParticipantClientHandle {
         let room_id = ExternalRoomId::new("simulation".to_string()).unwrap();
         let participant_id = ExternalParticipantId::new("alice".to_string()).unwrap();
 
-        let (offer, pending) = change.apply().unwrap();
-        let answer = controller
-            .allocate(
-                room_id.clone(),
-                participant_id.clone(),
-                offer.to_sdp_string(),
-            )
-            .await
-            .unwrap();
-
-        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
-        rtc.sdp_api().accept_answer(pending, answer).unwrap();
+        // TODO:
+        // let (offer, pending) = change.apply().unwrap();
+        //
+        // let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        // rtc.sdp_api().accept_answer(pending, answer).unwrap();
 
         let room_id = Arc::new(room_id);
         let participant_id = Arc::new(participant_id);
