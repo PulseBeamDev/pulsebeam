@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 mod net;
 
@@ -128,7 +128,7 @@ impl<S: PacketSocket> ParticipantClientActor<S> {
 
             tokio::select! {
                 _ = self.poll_input() => {}
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = tokio::time::sleep(deadline) => {
                     // explicit empty, next loop polls again
                 }
             }
@@ -176,21 +176,21 @@ impl<S: PacketSocket> ParticipantClientActor<S> {
         self.rtc.handle_input(input).unwrap();
     }
 
-    async fn poll_output(&mut self) -> Option<Instant> {
+    async fn poll_output(&mut self) -> Option<Duration> {
         while self.rtc.is_alive() {
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
             match self.rtc.poll_output().unwrap() {
                 // Stop polling when we get the timeout.
-                Output::Timeout(v) => {
-                    let now = Instant::now();
-                    let rtc_now = Instant::from_std(v);
-                    if now != rtc_now {
-                        return Some(Instant::from_std(v));
+                Output::Timeout(deadline) => {
+                    let now = Instant::now().into_std();
+                    let duration = deadline - now;
+                    if !duration.is_zero() {
+                        return Some(duration);
                     }
 
                     // forward clock never fails
-                    self.rtc.handle_input(Input::Timeout(v)).unwrap();
+                    self.rtc.handle_input(Input::Timeout(now)).unwrap();
                 }
 
                 // Transmit this data to the remote peer. Typically via

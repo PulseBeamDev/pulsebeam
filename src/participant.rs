@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -127,7 +127,7 @@ impl ParticipantActor {
                     }
                 }
 
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = tokio::time::sleep(deadline) => {
                     // explicit empty, next loop polls again
                 }
             }
@@ -214,7 +214,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn poll(&mut self) -> Option<Instant> {
+    async fn poll(&mut self) -> Option<Duration> {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
         while self.rtc.is_alive() {
@@ -222,15 +222,18 @@ impl ParticipantActor {
             // are either awaiting UDP socket input or the timeout to happen.
             match self.rtc.poll_output().unwrap() {
                 // Stop polling when we get the timeout.
-                Output::Timeout(v) => {
-                    let now = Instant::now();
-                    let rtc_now = Instant::from_std(v);
-                    if now != rtc_now {
-                        return Some(Instant::from_std(v));
+                Output::Timeout(deadline) => {
+                    // WARN: be careful in mixing tokio vs std Instant. str0m expects std Instant
+                    // Every conversion can be lossy and can create a spin loop here if not
+                    // precise.
+                    let now = Instant::now().into_std();
+                    let duration = deadline - now;
+                    if !duration.is_zero() {
+                        return Some(duration);
                     }
 
                     // forward clock never fails
-                    self.rtc.handle_input(Input::Timeout(v)).unwrap();
+                    self.rtc.handle_input(Input::Timeout(now)).unwrap();
                 }
 
                 // Transmit this data to the remote peer. Typically via
