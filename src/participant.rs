@@ -105,18 +105,22 @@ impl ParticipantActor {
 
         tracing::info!("created");
         loop {
-            let deadline = if let Some(deadline) = self.poll().await {
-                deadline
+            let delay = if let Some(delay) = self.poll().await {
+                delay
             } else {
                 // Rtc timeout
                 break;
             };
 
+            let mut buf = Vec::with_capacity(64);
             tokio::select! {
-                msg = self.data_receiver.recv() => {
-                    match msg {
-                        Some(msg) => self.handle_data_message(msg).await,
-                        None => break,
+                biased;
+                size = self.data_receiver.recv_many(&mut buf, 64) => {
+                    if size == 0 {
+                        break;
+                    }
+                    for msg in buf.into_iter() {
+                        self.handle_data_message(msg).await;
                     }
                 }
 
@@ -127,8 +131,9 @@ impl ParticipantActor {
                     }
                 }
 
-                _ = tokio::time::sleep(deadline) => {
+                _ = tokio::time::sleep(delay) => {
                     // explicit empty, next loop polls again
+                    // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
                 }
             }
         }
@@ -412,7 +417,7 @@ impl ParticipantHandle {
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
     ) -> (Self, ParticipantActor) {
-        let (data_sender, data_receiver) = mpsc::channel(64);
+        let (data_sender, data_receiver) = mpsc::channel(128);
         let (control_sender, control_receiver) = mpsc::channel(1);
         let handle = Self {
             data_sender,
