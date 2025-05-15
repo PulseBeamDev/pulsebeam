@@ -30,6 +30,7 @@ impl<S: PacketSocket> UdpSinkActor<S> {
             // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
             //
             // tokio/mio doesn't support batching: https://github.com/tokio-rs/mio/issues/185
+            // TODO: use quinn-udp optimizations, https://github.com/quinn-rs/quinn/blob/4f8a0f13cf7931ef9be573af5089c7a4a49387ae//quinn/src/runtime/tokio.rs#L1-L102
             for msg in buf.iter() {
                 match msg {
                     UdpSinkMessage::UdpPacket(packet) => {
@@ -64,7 +65,6 @@ impl UdpSinkHandle {
     }
 
     pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<UdpSinkMessage>> {
-        // TODO: implement double buffering, https://blog.digital-horror.com/blog/how-to-avoid-over-reliance-on-mpsc/
         // TODO: monitor backpressure and packet dropping
         let res = self.sender.try_send(UdpSinkMessage::UdpPacket(msg));
 
