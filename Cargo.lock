@@ -1799,6 +1799,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "itertools",
  "jemallocator",
  "metrics",
  "pin-project-lite",

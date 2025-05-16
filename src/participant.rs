@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use itertools::Itertools;
 use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
@@ -57,7 +58,7 @@ pub enum ParticipantDataMessage {
 #[derive(Debug)]
 struct TrackOut {
     handle: TrackHandle,
-    mid: Mid,
+    mid: Option<Mid>,
 }
 
 struct MidOutSlot {
@@ -91,7 +92,6 @@ pub struct ParticipantActor {
 
     published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
-
     mid_out_slots: HashMap<Mid, MidOutSlot>,
 }
 
@@ -102,6 +102,8 @@ impl ParticipantActor {
     )]
     pub async fn run(mut self) {
         // TODO: notify ingress to add self to the routing table
+        // WARN: be careful with spending too much time in this loop.
+        // We should yield back to the scheduler based on some heuristic here.
 
         tracing::info!("created");
         loop {
@@ -114,7 +116,6 @@ impl ParticipantActor {
 
             let mut buf = Vec::with_capacity(64);
             tokio::select! {
-                biased;
                 size = self.data_receiver.recv_many(&mut buf, 64) => {
                     if size == 0 {
                         break;
@@ -171,7 +172,9 @@ impl ParticipantActor {
                     return;
                 };
 
-                writer.request_keyframe(req.rid, req.kind);
+                if let Err(err) = writer.request_keyframe(req.rid, req.kind) {
+                    tracing::warn!("failed to request a keyframe from the publisher: {err}");
+                }
             }
         }
     }
@@ -188,40 +191,21 @@ impl ParticipantActor {
                     // new tracks from other participants
                     tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
                     let track_id = track.meta.id.clone();
-                    for (mid, slot) in &mut self.mid_out_slots {
-                        if slot.track_id.is_none() {
-                            track.subscribe(self.handle.clone()).await;
-                            slot.track_id = Some(track_id.clone());
-                            let track_out = TrackOut {
-                                handle: track,
-                                mid: *mid,
-                            };
-                            self.subscribed_tracks.insert(track_id, track_out);
-                            return;
-                        }
-                    }
 
-                    // HACK: test swapping stream
-                    // let Some((mid, slot)) = self.mid_out_slots.iter_mut().next() else {
-                    //     return;
-                    // };
-                    // track.subscribe(self.handle.clone()).await;
-                    // slot.track_id = Some(track_id.clone());
-                    // let track_out = TrackOut {
-                    //     handle: track,
-                    //     mid: *mid,
-                    // };
-                    // self.subscribed_tracks.insert(track_id, track_out);
-                    // tracing::warn!("swapping stream");
-                    // return;
+                    self.subscribed_tracks.insert(
+                        track_id,
+                        TrackOut {
+                            handle: track,
+                            mid: None,
+                        },
+                    );
+                    self.reconfigure_downstreams().await;
                 }
             }
         }
     }
 
     async fn poll(&mut self) -> Option<Duration> {
-        // WARN: be careful with spending too much time in this loop.
-        // We should yield back to the scheduler based on some heuristic here.
         while self.rtc.is_alive() {
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
@@ -320,11 +304,13 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_tracks.get(&e.mid) {
-                    tracing::debug!("forwarding media data to {}", e.mid);
                     track.forward_media(Arc::new(e));
                 }
             }
             Event::KeyframeRequest(req) => self.handle_keyframe_request(req),
+            Event::Connected => {
+                tracing::info!("connected");
+            }
             event => tracing::warn!("unhandled output event: {:?}", event),
         }
     }
@@ -346,10 +332,10 @@ impl ParticipantActor {
     }
 
     async fn handle_new_media(&mut self, media: MediaAdded) {
-        tracing::info!(?media, "handle_new_media");
         match media.direction {
             // client -> SFU
             Direction::RecvOnly => {
+                tracing::info!(?media, "handle_new_media from client");
                 // TODO: handle back pressure by buffering temporarily
                 let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
@@ -358,10 +344,14 @@ impl ParticipantActor {
                     kind: media.kind,
                     simulcast: media.simulcast,
                 };
-                self.room.publish(track).await;
+                if let Err(err) = self.room.publish(track).await {
+                    // this participant should get cleaned up by the supervisor
+                    tracing::warn!("failed to publish track to room: {err}");
+                }
             }
             // SFU -> client
             Direction::SendOnly => {
+                tracing::info!(?media, "handle_new_media from other participant");
                 self.mid_out_slots.insert(
                     media.mid,
                     MidOutSlot {
@@ -370,6 +360,8 @@ impl ParticipantActor {
                         track_id: None,
                     },
                 );
+
+                self.reconfigure_downstreams().await;
             }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
@@ -385,7 +377,11 @@ impl ParticipantActor {
             return;
         };
 
-        let Some(writer) = self.rtc.writer(track.mid) else {
+        let Some(mid) = track.mid else {
+            return;
+        };
+
+        let Some(writer) = self.rtc.writer(mid) else {
             return;
         };
 
@@ -397,6 +393,27 @@ impl ParticipantActor {
         if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();
+        }
+    }
+
+    async fn reconfigure_downstreams(&mut self) {
+        for (mid, mid_slot) in &mut self.mid_out_slots {
+            if mid_slot.track_id.is_some() {
+                continue;
+            }
+
+            for (track_id, track) in &mut self.subscribed_tracks {
+                if track.mid.is_some() {
+                    continue;
+                }
+
+                if track.handle.meta.kind == mid_slot.kind {
+                    track.mid = Some(*mid);
+                    mid_slot.track_id = Some(track_id.clone());
+                    track.handle.subscribe(self.handle.clone()).await;
+                    break;
+                }
+            }
         }
     }
 }

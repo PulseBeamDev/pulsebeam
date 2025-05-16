@@ -65,7 +65,7 @@ impl RoomActor {
         match msg {
             RoomMessage::AddParticipant(participant) => {
                 for (_, track) in &self.tracks {
-                    participant.new_track(track.clone()).await;
+                    let _ = participant.new_track(track.clone()).await;
                 }
                 self.participants
                     .insert(participant.participant_id.clone(), participant);
@@ -98,7 +98,7 @@ impl RoomActor {
                     );
 
                     for (_, participant) in &self.participants {
-                        participant.new_track(handle.clone()).await;
+                        let _ = participant.new_track(handle.clone()).await;
                     }
                 }
             }
