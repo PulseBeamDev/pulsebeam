@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use itertools::Itertools;
 use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
@@ -408,9 +407,11 @@ impl ParticipantActor {
                 }
 
                 if track.handle.meta.kind == mid_slot.kind {
+                    let Ok(_) = track.handle.subscribe(self.handle.clone()).await else {
+                        continue;
+                    };
                     track.mid = Some(*mid);
                     mid_slot.track_id = Some(track_id.clone());
-                    track.handle.subscribe(self.handle.clone()).await;
                     break;
                 }
             }

@@ -72,7 +72,6 @@ impl RoomActor {
             }
             RoomMessage::RemoveParticipant(participant_id) => {
                 self.participants.remove(&participant_id);
-                // TODO: clean up subscriptions and published medias
             }
             RoomMessage::PublishMedia(track) => {
                 let Some(origin_handle) = self.participants.get(&track.id.origin_participant)
