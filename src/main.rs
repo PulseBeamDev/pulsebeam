@@ -10,17 +10,12 @@ use std::{
 };
 
 use pulsebeam::{
-    actor::{self, ActorError},
-    controller::ControllerHandle,
-    entity::{new_entity_id, prefix::PROJECT_ID},
-    net::UdpSocket,
-    rng::Rng,
-    signaling,
-    sink::UdpSinkHandle,
+    actor, controller::ControllerHandle, net::UdpSocket, rng::Rng, signaling, sink::UdpSinkHandle,
     source::UdpSourceHandle,
 };
 use rand::SeedableRng;
 use systemstat::{Platform, System};
+use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -55,32 +50,27 @@ async fn run() {
     let rng = Rng::from_os_rng();
     let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
     let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
-    let project_id = Arc::new(new_entity_id(&mut rng, PROJECT_ID));
     let (controller_handle, controller_actor) = ControllerHandle::new(
         rng,
         source_handle,
         sink_handle,
         vec![local_addr],
-        project_id,
+        Arc::new("root".to_string()),
     );
 
     let router = signaling::router(controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     let signaling = async move {
-        axum::serve(listener, router)
-            .await
-            .map_err(|err| ActorError::Custom(err.into()))
+        let _ = axum::serve(listener, router).await;
     };
 
-    let res = tokio::try_join!(
-        actor::run(source_actor),
-        actor::run(sink_actor),
-        actor::run(controller_actor),
-        signaling,
-    );
-    if let Err(err) = res {
-        tracing::error!("pipeline ended with an error: {err}")
-    }
+    let mut join_set = JoinSet::new();
+    join_set.spawn(actor::run(source_actor));
+    join_set.spawn(actor::run(sink_actor));
+    join_set.spawn(actor::run(controller_actor));
+    join_set.spawn(signaling);
+
+    while let Some(_) = join_set.join_next().await {}
 }
 
 pub fn select_host_address() -> IpAddr {

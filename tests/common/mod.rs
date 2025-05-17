@@ -7,8 +7,7 @@ use net::{VirtualTcpListener, VirtualUdpSocket};
 use pulsebeam::{
     actor::{self, ActorError},
     controller::ControllerHandle,
-    entity::{ExternalParticipantId, ExternalRoomId, new_entity_id, prefix::PROJECT_ID},
-    message::ActorError,
+    entity::{ExternalParticipantId, ExternalRoomId},
     net::PacketSocket,
     rng::Rng,
     signaling,
@@ -19,6 +18,7 @@ use rand::SeedableRng;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, change::SdpAnswer, net::Receive};
 use tokio::{
     sync::{broadcast, mpsc},
+    task::JoinSet,
     time::Instant,
 };
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
@@ -51,29 +51,30 @@ pub fn setup_sim(seed: u64) {
             let rng = Rng::seed_from_u64(seed);
             let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
             let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
+
             let (controller_handle, controller_actor) = ControllerHandle::new(
                 rng,
                 source_handle,
                 sink_handle,
                 vec![server_addr],
-                Arc::new(new_entity_id(&mut rng, PROJECT_ID)),
+                Arc::new("root".to_string()),
             );
             let router = signaling::router(controller_handle);
             let listener = TcpListener::bind("0.0.0.0:3000").await?;
             let signaling = async move {
-                axum::serve(VirtualTcpListener(listener), router)
+                let _ = axum::serve(VirtualTcpListener(listener), router)
                     .await
-                    .map_err(|err| ActorError::Custom(err.into()))
+                    .map_err(|err| ActorError::Custom(err.into()));
             };
 
-            let res = tokio::try_join!(
-                actor::run(source_actor),
-                actor::run(sink_actor),
-                actor::run(controller_actor),
-                signaling,
-            );
+            let mut join_set = JoinSet::new();
+            join_set.spawn(actor::run(source_actor));
+            join_set.spawn(actor::run(sink_actor));
+            join_set.spawn(actor::run(controller_actor));
+            join_set.spawn(signaling);
 
-            res.map(|_| ()).map_err(|err| err.into())
+            while let Some(_) = join_set.join_next().await {}
+            Ok(())
         }
     });
 
