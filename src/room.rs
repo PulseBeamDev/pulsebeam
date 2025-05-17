@@ -1,16 +1,10 @@
 use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
-use rand::RngCore;
-use tokio::{
-    sync::mpsc::{self, error::SendError},
-    task::JoinSet,
-};
-use tracing::Instrument;
+use tokio::sync::mpsc::{self, error::SendError};
 
 use crate::{
     controller::ControllerHandle,
     entity::{ParticipantId, RoomId, TrackId},
-    message::TrackIn,
     participant::ParticipantHandle,
     rng::Rng,
     track::TrackHandle,
@@ -18,9 +12,14 @@ use crate::{
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishMedia(TrackIn),
+    PublishMedia(TrackHandle),
     AddParticipant(ParticipantHandle),
     RemoveParticipant(Arc<ParticipantId>),
+}
+
+pub struct ParticipantMeta {
+    handle: ParticipantHandle,
+    tracks: HashMap<Arc<TrackId>, TrackHandle>,
 }
 
 /// Reponsibilities:
@@ -36,10 +35,7 @@ pub struct RoomActor {
     controller: ControllerHandle,
     handle: RoomHandle,
 
-    participants: HashMap<Arc<ParticipantId>, ParticipantHandle>,
-    tracks: HashMap<Arc<TrackId>, TrackHandle>,
-
-    track_tasks: JoinSet<Arc<TrackId>>,
+    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
 }
 
 impl RoomActor {
@@ -52,11 +48,6 @@ impl RoomActor {
                         None => break,
                     }
                 }
-
-                Some(Ok(key)) = self.track_tasks.join_next() => {
-                    // track actor exited
-                    self.tracks.remove(&key);
-                }
             }
         }
     }
@@ -64,41 +55,25 @@ impl RoomActor {
     async fn handle_message(&mut self, mut msg: RoomMessage) {
         match msg {
             RoomMessage::AddParticipant(participant) => {
-                for (_, track) in &self.tracks {
-                    let _ = participant.new_track(track.clone()).await;
+                for (_, meta) in &self.participants {
+                    for (_, track) in &meta.tracks {
+                        let _ = participant.new_track(track.clone()).await;
+                    }
                 }
-                self.participants
-                    .insert(participant.participant_id.clone(), participant);
+                self.participants.insert(
+                    participant.participant_id.clone(),
+                    ParticipantMeta {
+                        handle: participant,
+                        tracks: HashMap::new(),
+                    },
+                );
             }
             RoomMessage::RemoveParticipant(participant_id) => {
                 self.participants.remove(&participant_id);
             }
             RoomMessage::PublishMedia(track) => {
-                let Some(origin_handle) = self.participants.get(&track.id.origin_participant)
-                else {
-                    return;
-                };
-
-                if let Some(_) = self.tracks.get(&track.id) {
-                    tracing::warn!(
-                        "Detected an update to an existing track. This is ignored for now."
-                    );
-                } else {
-                    let track_id = track.id.clone();
-                    let track = Arc::new(track);
-                    let (handle, actor) = TrackHandle::new(origin_handle.clone(), track);
-                    self.tracks.insert(track_id.clone(), handle.clone());
-                    self.track_tasks.spawn(
-                        async move {
-                            actor.run().await;
-                            track_id
-                        }
-                        .in_current_span(),
-                    );
-
-                    for (_, participant) in &self.participants {
-                        let _ = participant.new_track(handle.clone()).await;
-                    }
+                for (_, participant) in &self.participants {
+                    let _ = participant.handle.new_track(track.clone()).await;
                 }
             }
             _ => todo!(),
@@ -125,8 +100,6 @@ impl RoomHandle {
             controller,
             handle: handle.clone(),
             participants: HashMap::new(),
-            tracks: HashMap::new(),
-            track_tasks: JoinSet::new(),
         };
         (handle, actor)
     }
@@ -149,7 +122,7 @@ impl RoomHandle {
             .await
     }
 
-    pub async fn publish(&self, track: TrackIn) -> Result<(), SendError<RoomMessage>> {
+    pub async fn publish(&self, track: TrackHandle) -> Result<(), SendError<RoomMessage>> {
         self.sender.send(RoomMessage::PublishMedia(track)).await
     }
 }

@@ -1,9 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr};
 
 use crate::{
     ice,
     message::{ActorResult, UDPPacket},
-    net::{PacketSocket, UdpSocket},
+    net::PacketSocket,
     participant::ParticipantHandle,
 };
 use bytes::Bytes;

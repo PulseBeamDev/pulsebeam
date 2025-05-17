@@ -14,8 +14,10 @@ use tokio::{
         self,
         error::{SendError, TrySendError},
     },
+    task::JoinSet,
     time::Instant,
 };
+use tracing::Instrument;
 
 use crate::{
     entity::{ParticipantId, TrackId},
@@ -88,6 +90,7 @@ pub struct ParticipantActor {
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
+    track_tasks: JoinSet<Arc<TrackId>>,
 
     published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
@@ -128,6 +131,10 @@ impl ParticipantActor {
                 _ = tokio::time::sleep(delay) => {
                     // explicit empty, next loop polls again
                     // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
+                }
+
+                Some(Ok(key)) = self.track_tasks.join_next() => {
+                    // TODO: clean up track
                 }
 
                 else => break,
@@ -335,11 +342,20 @@ impl ParticipantActor {
                 let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
                 let track = TrackIn {
-                    id: track_id,
+                    id: track_id.clone(),
                     kind: media.kind,
                     simulcast: media.simulcast,
                 };
-                if let Err(err) = self.room.publish(track).await {
+
+                let (handle, actor) = TrackHandle::new(self.handle.clone(), Arc::new(track));
+                self.track_tasks.spawn(
+                    async move {
+                        actor.run().await;
+                        track_id
+                    }
+                    .in_current_span(),
+                );
+                if let Err(err) = self.room.publish(handle).await {
                     // this participant should get cleaned up by the supervisor
                     tracing::warn!("failed to publish track to room: {err}");
                 }
@@ -447,6 +463,7 @@ impl ParticipantHandle {
             room,
             participant_id,
             rtc,
+            track_tasks: JoinSet::new(),
             published_tracks: HashMap::new(),
             subscribed_tracks: HashMap::new(),
             mid_out_slots: HashMap::new(),
