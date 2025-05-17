@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::{
     message::{self, ActorResult},
-    net::{PacketSocket, UdpSocket},
+    net::PacketSocket,
 };
 
 #[derive(Debug)]
@@ -19,33 +17,20 @@ pub struct UdpSinkActor<S> {
 
 impl<S: PacketSocket> UdpSinkActor<S> {
     pub async fn run(mut self) -> ActorResult {
-        let mut buf = Vec::with_capacity(256);
-        loop {
-            let size = self.receiver.recv_many(&mut buf, 256).await;
-            if size == 0 {
-                break;
-            }
-
-            // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
-            // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
-            //
-            // tokio/mio doesn't support batching: https://github.com/tokio-rs/mio/issues/185
-            // TODO: use quinn-udp optimizations, https://github.com/quinn-rs/quinn/blob/4f8a0f13cf7931ef9be573af5089c7a4a49387ae//quinn/src/runtime/tokio.rs#L1-L102
-            for msg in buf.iter() {
-                match msg {
-                    UdpSinkMessage::UdpPacket(packet) => {
-                        let res = self.socket.send_to(&packet.raw, packet.dst).await;
-                        if let Err(err) = res {
-                            tracing::warn!(
-                                "failed to send udp packet to {:?}: {:?}",
-                                packet.dst,
-                                err
-                            );
-                        }
+        // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
+        // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
+        //
+        // tokio/mio doesn't support batching: https://github.com/tokio-rs/mio/issues/185
+        // TODO: use quinn-udp optimizations, https://github.com/quinn-rs/quinn/blob/4f8a0f13cf7931ef9be573af5089c7a4a49387ae//quinn/src/runtime/tokio.rs#L1-L102
+        while let Some(msg) = self.receiver.recv().await {
+            match msg {
+                UdpSinkMessage::UdpPacket(packet) => {
+                    let res = self.socket.send_to(&packet.raw, packet.dst).await;
+                    if let Err(err) = res {
+                        tracing::warn!("failed to send udp packet to {:?}: {:?}", packet.dst, err);
                     }
                 }
             }
-            buf.clear();
         }
         Ok(())
     }

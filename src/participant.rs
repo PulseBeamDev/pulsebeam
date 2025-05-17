@@ -113,15 +113,9 @@ impl ParticipantActor {
                 break;
             };
 
-            let mut buf = Vec::with_capacity(64);
             tokio::select! {
-                size = self.data_receiver.recv_many(&mut buf, 64) => {
-                    if size == 0 {
-                        break;
-                    }
-                    for msg in buf.into_iter() {
-                        self.handle_data_message(msg).await;
-                    }
+                Some(msg) = self.data_receiver.recv() => {
+                    self.handle_data_message(msg).await;
                 }
 
                 msg = self.control_receiver.recv() => {
@@ -135,6 +129,8 @@ impl ParticipantActor {
                     // explicit empty, next loop polls again
                     // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
                 }
+
+                else => break,
             }
         }
 
