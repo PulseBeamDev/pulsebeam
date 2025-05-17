@@ -1,11 +1,14 @@
 use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
-use tokio::sync::mpsc::{self, error::SendError};
+use tokio::{
+    sync::mpsc::{self, error::SendError},
+    task::JoinSet,
+};
+use tracing::Instrument;
 
 use crate::{
-    controller::ControllerHandle,
     entity::{ParticipantId, RoomId, TrackId},
-    participant::ParticipantHandle,
+    participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
     track::TrackHandle,
 };
@@ -13,8 +16,7 @@ use crate::{
 #[derive(Debug)]
 pub enum RoomMessage {
     PublishMedia(TrackHandle),
-    AddParticipant(ParticipantHandle),
-    RemoveParticipant(Arc<ParticipantId>),
+    AddParticipant(ParticipantHandle, ParticipantActor),
 }
 
 pub struct ParticipantMeta {
@@ -32,10 +34,10 @@ pub struct ParticipantMeta {
 pub struct RoomActor {
     rng: Rng,
     receiver: mpsc::Receiver<RoomMessage>,
-    controller: ControllerHandle,
     handle: RoomHandle,
 
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
+    participant_tasks: JoinSet<Arc<ParticipantId>>,
 }
 
 impl RoomActor {
@@ -48,28 +50,41 @@ impl RoomActor {
                         None => break,
                     }
                 }
+
+                Some(Ok(participant_id)) = self.participant_tasks.join_next() => {
+                    // TODO: notify participant leaving
+                    self.participants.remove(&participant_id);
+                }
+
+                else => break,
             }
         }
     }
 
-    async fn handle_message(&mut self, mut msg: RoomMessage) {
+    async fn handle_message(&mut self, msg: RoomMessage) {
         match msg {
-            RoomMessage::AddParticipant(participant) => {
-                for (_, meta) in &self.participants {
-                    for (_, track) in &meta.tracks {
-                        let _ = participant.new_track(track.clone()).await;
-                    }
-                }
+            RoomMessage::AddParticipant(handle, actor) => {
+                let participant_id = handle.participant_id.clone();
                 self.participants.insert(
-                    participant.participant_id.clone(),
+                    handle.participant_id.clone(),
                     ParticipantMeta {
-                        handle: participant,
+                        handle: handle.clone(),
                         tracks: HashMap::new(),
                     },
                 );
-            }
-            RoomMessage::RemoveParticipant(participant_id) => {
-                self.participants.remove(&participant_id);
+                self.participant_tasks.spawn(
+                    async move {
+                        actor.run().await;
+                        participant_id
+                    }
+                    .in_current_span(),
+                );
+
+                for (_, meta) in &self.participants {
+                    for (_, track) in &meta.tracks {
+                        let _ = handle.new_track(track.clone()).await;
+                    }
+                }
             }
             RoomMessage::PublishMedia(track) => {
                 for (_, participant) in &self.participants {
@@ -88,7 +103,7 @@ pub struct RoomHandle {
 }
 
 impl RoomHandle {
-    pub fn new(rng: Rng, controller: ControllerHandle, room_id: Arc<RoomId>) -> (Self, RoomActor) {
+    pub fn new(rng: Rng, room_id: Arc<RoomId>) -> (Self, RoomActor) {
         let (sender, receiver) = mpsc::channel(8);
         let handle = RoomHandle {
             sender,
@@ -97,28 +112,20 @@ impl RoomHandle {
         let actor = RoomActor {
             rng,
             receiver,
-            controller,
             handle: handle.clone(),
             participants: HashMap::new(),
+            participant_tasks: JoinSet::new(),
         };
         (handle, actor)
     }
 
     pub async fn add_participant(
         &self,
-        participant: ParticipantHandle,
+        handle: ParticipantHandle,
+        actor: ParticipantActor,
     ) -> Result<(), SendError<RoomMessage>> {
         self.sender
-            .send(RoomMessage::AddParticipant(participant))
-            .await
-    }
-
-    pub async fn remove_participant(
-        &self,
-        participant_id: Arc<ParticipantId>,
-    ) -> Result<(), SendError<RoomMessage>> {
-        self.sender
-            .send(RoomMessage::RemoveParticipant(participant_id))
+            .send(RoomMessage::AddParticipant(handle, actor))
             .await
     }
 

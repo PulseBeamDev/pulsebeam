@@ -49,22 +49,33 @@ pub struct ControllerActor {
     source: UdpSourceHandle,
     sink: UdpSinkHandle,
     receiver: mpsc::Receiver<ControllerMessage>,
-    rooms: HashMap<Arc<RoomId>, RoomHandle>,
-
     local_addrs: Vec<SocketAddr>,
-    children: JoinSet<()>,
+
+    rooms: HashMap<Arc<RoomId>, RoomHandle>,
+    room_tasks: JoinSet<Arc<RoomId>>,
 }
 
 impl ControllerActor {
     #[tracing::instrument(skip(self), fields(controller_id = "root"))]
     pub async fn run(mut self) -> ActorResult {
-        while let Some(msg) = self.receiver.recv().await {
-            match msg {
-                ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
-                    let room_id = RoomId::new(room_id);
-                    let participant_id = ParticipantId::new(&mut self.rng, participant_id);
-                    let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
+        loop {
+            tokio::select! {
+                Some(msg) = self.receiver.recv() => {
+                    match msg {
+                        ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
+                            let room_id = RoomId::new(room_id);
+                            let participant_id = ParticipantId::new(&mut self.rng, participant_id);
+                            let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
+                        }
+                    }
                 }
+
+                Some(Ok(participant_id)) = self.room_tasks.join_next() => {
+                    // TODO: notify participant leaving
+                    self.rooms.remove(&participant_id);
+                }
+
+                else => break,
             }
         }
         Ok(())
@@ -97,56 +108,40 @@ impl ControllerActor {
             .map_err(ControllerError::OfferRejected)?;
 
         let room_id = Arc::new(room_id);
-        let room_handle = if let Some(handle) = self.rooms.get(&room_id) {
-            handle.clone()
-        } else {
-            let (handle, actor) =
-                RoomHandle::new(self.rng.clone(), self.handle.clone(), room_id.clone());
-            // TODO: handle shutdown
-            self.children.spawn(actor.run());
-
-            self.rooms.insert(room_id, handle.clone());
-            handle
-        };
-
-        let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
-        let participant_id = Arc::new(participant_id);
-        let (participant_handle, participant_actor) = ParticipantHandle::new(
+        let room_handle = self.get_or_create_room(room_id);
+        let participant = ParticipantHandle::new(
             self.rng.clone(),
             self.source.clone(),
             self.sink.clone(),
             room_handle.clone(),
-            participant_id.clone(),
+            Arc::new(participant_id),
             rtc,
         );
 
-        {
-            let ingress = self.source.clone();
-            let ufrag = ufrag.clone();
-            let room = room_handle.clone();
-            let participant_id = participant_handle.participant_id.clone();
-
-            self.children.spawn(
-                async move {
-                    participant_actor.run().await;
-                    ingress.remove_participant(ufrag).await;
-                    room.remove_participant(participant_id).await;
-                }
-                .in_current_span(),
-            );
-        }
-
-        // room and participant will self-monitor and hit a timeout to cleanup itself
+        // TODO: probably retry? Or, let the client to retry instead?
+        // Each room will always have a graceful timeout before closing.
+        // But, a data race can still occur nonetheless
         room_handle
-            .add_participant(participant_handle.clone())
-            .await
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
-        self.source
-            .add_participant(ufrag, participant_handle)
+            .add_participant(participant.0, participant.1)
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
         Ok(answer.to_sdp_string())
+    }
+
+    fn get_or_create_room(&mut self, room_id: Arc<RoomId>) -> RoomHandle {
+        if let Some(handle) = self.rooms.get(&room_id) {
+            handle.clone()
+        } else {
+            let (handle, actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
+            self.rooms.insert(room_id.clone(), handle.clone());
+            self.room_tasks.spawn(async move {
+                actor.run().await;
+                room_id
+            });
+
+            handle
+        }
     }
 }
 
@@ -171,9 +166,9 @@ impl ControllerHandle {
             receiver,
             source,
             sink,
-            rooms: HashMap::new(),
             local_addrs,
-            children: JoinSet::new(),
+            rooms: HashMap::new(),
+            room_tasks: JoinSet::new(),
         };
         (handle, actor)
     }

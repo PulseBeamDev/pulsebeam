@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -83,6 +89,7 @@ struct MidOutSlot {
 pub struct ParticipantActor {
     rng: Rng,
     handle: ParticipantHandle,
+    source: UdpSourceHandle,
     data_receiver: mpsc::Receiver<ParticipantDataMessage>,
     control_receiver: mpsc::Receiver<ParticipantControlMessage>,
     sink: UdpSinkHandle,
@@ -97,6 +104,14 @@ pub struct ParticipantActor {
     mid_out_slots: HashMap<Mid, MidOutSlot>,
 }
 
+impl fmt::Debug for ParticipantActor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParticipantActor")
+            .field("participant_id", &self.participant_id)
+            .finish()
+    }
+}
+
 impl ParticipantActor {
     #[tracing::instrument(
         skip(self),
@@ -108,6 +123,15 @@ impl ParticipantActor {
         // We should yield back to the scheduler based on some heuristic here.
 
         tracing::info!("created");
+        let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
+        if let Err(_) = self
+            .source
+            .add_participant(ufrag.clone(), self.handle.clone())
+            .await
+        {
+            return;
+        }
+
         loop {
             let delay = if let Some(delay) = self.poll().await {
                 delay
@@ -143,6 +167,7 @@ impl ParticipantActor {
 
         // TODO: cleanup in the room
         tracing::info!("exited");
+        let _ = self.source.remove_participant(ufrag).await;
     }
 
     #[inline]
@@ -456,6 +481,7 @@ impl ParticipantHandle {
         };
         let actor = ParticipantActor {
             rng,
+            source,
             handle: handle.clone(),
             data_receiver,
             control_receiver,
