@@ -5,7 +5,7 @@ mod net;
 use console_subscriber::ConsoleLayer;
 use net::{VirtualTcpListener, VirtualUdpSocket};
 use pulsebeam::{
-    actor::{self, ActorError},
+    actor,
     controller::ControllerHandle,
     entity::{ExternalParticipantId, ExternalRoomId},
     net::PacketSocket,
@@ -62,9 +62,7 @@ pub fn setup_sim(seed: u64) {
             let router = signaling::router(controller_handle);
             let listener = TcpListener::bind("0.0.0.0:3000").await?;
             let signaling = async move {
-                let _ = axum::serve(VirtualTcpListener(listener), router)
-                    .await
-                    .map_err(|err| ActorError::Custom(err.into()));
+                let _ = axum::serve(VirtualTcpListener(listener), router).await;
             };
 
             let mut join_set = JoinSet::new();

@@ -1,7 +1,7 @@
-extern crate jemallocator;
+use mimalloc::MiMalloc;
 
 #[global_allocator]
-static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 use std::{
     net::{IpAddr, SocketAddr},

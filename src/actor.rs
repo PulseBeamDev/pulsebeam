@@ -15,7 +15,7 @@ pub enum ActorError {
     #[error("Post-stop cleanup failed: {0}")]
     PostStopFailed(String),
     #[error("Custom actor error: {0}")]
-    Custom(#[from] anyhow::Error), // Allow easy conversion from anyhow for more specific errors
+    Custom(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
