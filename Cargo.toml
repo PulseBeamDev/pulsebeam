@@ -39,6 +39,7 @@ bs58 = "0.5.1"
 sha3 = "0.10.8"
 metrics = "0.24.2"
 itertools = "0.14.0"
+anyhow = "1.0.98"
 
 [dev-dependencies]
 kanal = "0.1.1"

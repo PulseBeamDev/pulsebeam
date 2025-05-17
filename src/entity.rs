@@ -121,13 +121,13 @@ impl PartialEq for RoomId {
 
 impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.internal)
+        fmt::Display::fmt(&self.internal, f)
     }
 }
 
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.internal)
+        fmt::Debug::fmt(&self.internal, f)
     }
 }
 
@@ -165,7 +165,7 @@ impl FromStr for ExternalRoomId {
 
 impl fmt::Display for ExternalRoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -223,13 +223,13 @@ impl PartialEq for ParticipantId {
 
 impl fmt::Display for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.internal)
+        fmt::Display::fmt(&self.internal, f)
     }
 }
 
 impl fmt::Debug for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.internal)
+        fmt::Debug::fmt(&self.internal, f)
     }
 }
 
@@ -268,7 +268,7 @@ impl FromStr for ExternalParticipantId {
 
 impl fmt::Display for ExternalParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -319,13 +319,13 @@ impl PartialEq for TrackId {
 
 impl fmt::Display for TrackId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.internal)
+        fmt::Display::fmt(&self.internal, f)
     }
 }
 
 impl fmt::Debug for TrackId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.internal)
+        fmt::Debug::fmt(&self.internal, f)
     }
 }
 

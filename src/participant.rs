@@ -26,6 +26,7 @@ use tokio::{
 use tracing::Instrument;
 
 use crate::{
+    actor::{self, Actor, ActorError},
     entity::{ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
     proto,
@@ -112,25 +113,29 @@ impl fmt::Debug for ParticipantActor {
     }
 }
 
-impl ParticipantActor {
-    #[tracing::instrument(
-        skip(self),
-        fields(participant_id=?self.participant_id)
-    )]
-    pub async fn run(mut self) {
+impl Actor for ParticipantActor {
+    type ID = Arc<ParticipantId>;
+
+    fn kind(&self) -> &'static str {
+        "participant"
+    }
+
+    fn id(&self) -> Self::ID {
+        self.participant_id.clone()
+    }
+
+    async fn pre_start(&mut self) -> Result<(), crate::actor::ActorError> {
+        let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
+        self.source
+            .add_participant(ufrag, self.handle.clone())
+            .await
+            .map_err(|_| ActorError::PreStartFailed("source is closed".to_string()))
+    }
+
+    async fn run(&mut self) -> Result<(), crate::actor::ActorError> {
         // TODO: notify ingress to add self to the routing table
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
-
-        tracing::info!("created");
-        let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
-        if let Err(_) = self
-            .source
-            .add_participant(ufrag.clone(), self.handle.clone())
-            .await
-        {
-            return;
-        }
 
         loop {
             let delay = if let Some(delay) = self.poll().await {
@@ -165,11 +170,19 @@ impl ParticipantActor {
             }
         }
 
-        // TODO: cleanup in the room
-        tracing::info!("exited");
-        let _ = self.source.remove_participant(ufrag).await;
+        Ok(())
     }
 
+    async fn post_stop(&mut self) -> Result<(), ActorError> {
+        let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
+        self.source
+            .remove_participant(ufrag)
+            .await
+            .map_err(|_| ActorError::PostStopFailed("source is closed".to_string()))
+    }
+}
+
+impl ParticipantActor {
     #[inline]
     async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
@@ -375,7 +388,7 @@ impl ParticipantActor {
                 let (handle, actor) = TrackHandle::new(self.handle.clone(), Arc::new(track));
                 self.track_tasks.spawn(
                     async move {
-                        actor.run().await;
+                        actor::run(actor).await;
                         track_id
                     }
                     .in_current_span(),

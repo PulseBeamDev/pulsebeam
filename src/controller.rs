@@ -1,8 +1,8 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
+    actor::{self, Actor, ActorError},
     entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
-    message::ActorResult,
     participant::ParticipantHandle,
     rng::Rng,
     room::RoomHandle,
@@ -45,6 +45,7 @@ pub enum ControllerMessage {
 
 pub struct ControllerActor {
     rng: Rng,
+    id: Arc<String>,
     handle: ControllerHandle,
     source: UdpSourceHandle,
     sink: UdpSinkHandle,
@@ -55,9 +56,18 @@ pub struct ControllerActor {
     room_tasks: JoinSet<Arc<RoomId>>,
 }
 
-impl ControllerActor {
-    #[tracing::instrument(skip(self), fields(controller_id = "root"))]
-    pub async fn run(mut self) -> ActorResult {
+impl Actor for ControllerActor {
+    type ID = Arc<String>;
+
+    fn kind(&self) -> &'static str {
+        "controller"
+    }
+
+    fn id(&self) -> Self::ID {
+        self.id.clone()
+    }
+
+    async fn run(&mut self) -> Result<(), ActorError> {
         loop {
             tokio::select! {
                 Some(msg) = self.receiver.recv() => {
@@ -80,7 +90,9 @@ impl ControllerActor {
         }
         Ok(())
     }
+}
 
+impl ControllerActor {
     pub async fn allocate(
         &mut self,
         room_id: RoomId,
@@ -133,14 +145,17 @@ impl ControllerActor {
         if let Some(handle) = self.rooms.get(&room_id) {
             handle.clone()
         } else {
-            let (handle, actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
-            self.rooms.insert(room_id.clone(), handle.clone());
-            self.room_tasks.spawn(async move {
-                actor.run().await;
-                room_id
-            });
+            let (room_handle, room_actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
+            self.rooms.insert(room_id.clone(), room_handle.clone());
+            self.room_tasks.spawn(
+                async move {
+                    actor::run(room_actor).await;
+                    room_id
+                }
+                .in_current_span(),
+            );
 
-            handle
+            room_handle
         }
     }
 }
@@ -156,12 +171,14 @@ impl ControllerHandle {
         source: UdpSourceHandle,
         sink: UdpSinkHandle,
         local_addrs: Vec<SocketAddr>,
+        id: Arc<String>,
     ) -> (Self, ControllerActor) {
         let (sender, receiver) = mpsc::channel(1);
         let handle = ControllerHandle { sender };
 
         let actor = ControllerActor {
             handle: handle.clone(),
+            id,
             rng,
             receiver,
             source,

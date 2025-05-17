@@ -7,6 +7,7 @@ use tokio::{
 use tracing::Instrument;
 
 use crate::{
+    actor::{self, Actor, ActorError},
     entity::{ParticipantId, RoomId, TrackId},
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
@@ -40,8 +41,18 @@ pub struct RoomActor {
     participant_tasks: JoinSet<Arc<ParticipantId>>,
 }
 
-impl RoomActor {
-    pub async fn run(mut self) {
+impl Actor for RoomActor {
+    type ID = Arc<RoomId>;
+
+    fn kind(&self) -> &'static str {
+        "room"
+    }
+
+    fn id(&self) -> Self::ID {
+        self.handle.room_id.clone()
+    }
+
+    async fn run(&mut self) -> Result<(), ActorError> {
         loop {
             tokio::select! {
                 res = self.receiver.recv() => {
@@ -59,22 +70,26 @@ impl RoomActor {
                 else => break,
             }
         }
-    }
 
+        Ok(())
+    }
+}
+
+impl RoomActor {
     async fn handle_message(&mut self, msg: RoomMessage) {
         match msg {
-            RoomMessage::AddParticipant(handle, actor) => {
-                let participant_id = handle.participant_id.clone();
+            RoomMessage::AddParticipant(participant_handle, participant_actor) => {
+                let participant_id = participant_handle.participant_id.clone();
                 self.participants.insert(
-                    handle.participant_id.clone(),
+                    participant_handle.participant_id.clone(),
                     ParticipantMeta {
-                        handle: handle.clone(),
+                        handle: participant_handle.clone(),
                         tracks: HashMap::new(),
                     },
                 );
                 self.participant_tasks.spawn(
                     async move {
-                        actor.run().await;
+                        actor::run(participant_actor).await;
                         participant_id
                     }
                     .in_current_span(),
@@ -82,7 +97,7 @@ impl RoomActor {
 
                 for (_, meta) in &self.participants {
                     for (_, track) in &meta.tracks {
-                        let _ = handle.new_track(track.clone()).await;
+                        let _ = participant_handle.new_track(track.clone()).await;
                     }
                 }
             }

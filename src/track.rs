@@ -11,8 +11,9 @@ use tokio::{
 };
 
 use crate::{
+    actor::Actor,
     entity::{ParticipantId, TrackId},
-    message::{self, ActorResult, TrackIn},
+    message::{self, TrackIn},
     participant::ParticipantHandle,
 };
 
@@ -48,26 +49,18 @@ pub struct TrackActor {
     last_keyframe_request: Instant,
 }
 
-impl TrackActor {
-    #[tracing::instrument(
-        skip(self),
-        fields(track_id=?self.meta.id)
-    )]
-    pub async fn run(self) {
-        match AssertUnwindSafe(self.run_inner()).catch_unwind().await {
-            Ok(Ok(())) => {
-                tracing::info!("track actor exited.");
-            }
-            Ok(Err(err)) => {
-                tracing::warn!("track actor exited with an error: {err}");
-            }
-            Err(err) => {
-                tracing::error!("track actor panicked: {:?}", err);
-            }
-        };
+impl Actor for TrackActor {
+    type ID = Arc<TrackId>;
+
+    fn kind(&self) -> &'static str {
+        "track"
     }
 
-    async fn run_inner(mut self) -> ActorResult {
+    fn id(&self) -> Self::ID {
+        self.meta.id.clone()
+    }
+
+    async fn run(&mut self) -> Result<(), crate::actor::ActorError> {
         loop {
             let mut buf = Vec::with_capacity(64);
             tokio::select! {
@@ -89,7 +82,9 @@ impl TrackActor {
         }
         Ok(())
     }
+}
 
+impl TrackActor {
     #[inline]
     fn handle_data_message(&mut self, msg: TrackDataMessage) {
         match msg {

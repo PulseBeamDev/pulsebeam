@@ -10,8 +10,14 @@ use std::{
 };
 
 use pulsebeam::{
-    controller::ControllerHandle, message::ActorError, net::UdpSocket, rng::Rng, signaling,
-    sink::UdpSinkHandle, source::UdpSourceHandle,
+    actor::{self, ActorError},
+    controller::ControllerHandle,
+    entity::{new_entity_id, prefix::PROJECT_ID},
+    net::UdpSocket,
+    rng::Rng,
+    signaling,
+    sink::UdpSinkHandle,
+    source::UdpSourceHandle,
 };
 use rand::SeedableRng;
 use systemstat::{Platform, System};
@@ -34,9 +40,6 @@ async fn run() {
         .pretty()
         .init();
 
-    std::panic::set_hook(Box::new(|panic_info| {
-        tracing::error!("GLOBAL_PANIC_HOOK: {}", panic_info);
-    }));
     let cors = CorsLayer::very_permissive()
         // https://github.com/tower-rs/tower-http/issues/194
         .allow_origin(AllowOrigin::mirror_request())
@@ -52,21 +55,27 @@ async fn run() {
     let rng = Rng::from_os_rng();
     let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
     let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
-    let (controller_handle, controller_actor) =
-        ControllerHandle::new(rng, source_handle, sink_handle, vec![local_addr]);
+    let project_id = Arc::new(new_entity_id(&mut rng, PROJECT_ID));
+    let (controller_handle, controller_actor) = ControllerHandle::new(
+        rng,
+        source_handle,
+        sink_handle,
+        vec![local_addr],
+        project_id,
+    );
 
     let router = signaling::router(controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     let signaling = async move {
         axum::serve(listener, router)
             .await
-            .map_err(|err| ActorError::Unknown(err.to_string()))
+            .map_err(|err| ActorError::Custom(err.into()))
     };
 
     let res = tokio::try_join!(
-        source_actor.run(),
-        sink_actor.run(),
-        controller_actor.run(),
+        actor::run(source_actor),
+        actor::run(sink_actor),
+        actor::run(controller_actor),
         signaling,
     );
     if let Err(err) = res {

@@ -1,9 +1,8 @@
 use bytes::Bytes;
 use std::fmt::Debug;
-use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use str0m::media::{self, KeyframeRequestKind, MediaKind, Rid, Simulcast};
+use str0m::media::{KeyframeRequestKind, MediaKind, Rid, Simulcast};
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
 pub use str0m::error::SdpError;
@@ -45,13 +44,3 @@ impl Into<KeyframeRequest> for str0m::media::KeyframeRequest {
         }
     }
 }
-
-#[derive(thiserror::Error, Debug)]
-pub enum ActorError {
-    #[error("unknown error: {0}")]
-    Unknown(String),
-}
-
-pub type ActorResult = Result<(), ActorError>;
-
-pub trait ActorId: Hash + Eq + PartialEq + Debug {}

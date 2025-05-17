@@ -1,8 +1,9 @@
 use std::{collections::HashMap, net::SocketAddr};
 
 use crate::{
+    actor::{Actor, ActorError},
     ice,
-    message::{ActorResult, UDPPacket},
+    message::UDPPacket,
     net::PacketSocket,
     participant::ParticipantHandle,
 };
@@ -23,8 +24,18 @@ pub struct UdpSourceActor<S> {
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
-impl<S: PacketSocket> UdpSourceActor<S> {
-    pub async fn run(mut self) -> ActorResult {
+impl<S: PacketSocket> Actor for UdpSourceActor<S> {
+    type ID = usize;
+
+    fn kind(&self) -> &'static str {
+        "udp_source"
+    }
+
+    fn id(&self) -> Self::ID {
+        0
+    }
+
+    async fn run(&mut self) -> Result<(), ActorError> {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
 
@@ -55,7 +66,9 @@ impl<S: PacketSocket> UdpSourceActor<S> {
         tracing::info!("ingress has exited");
         Ok(())
     }
+}
 
+impl<S: PacketSocket> UdpSourceActor<S> {
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
         let participant_handle = if let Some(participant_handle) = self.mapping.get(&source) {
             tracing::trace!("found connection from mapping: {source} -> {participant_handle}");

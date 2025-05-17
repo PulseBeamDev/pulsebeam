@@ -1,7 +1,8 @@
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::{
-    message::{self, ActorResult},
+    actor::{Actor, ActorError},
+    message,
     net::PacketSocket,
 };
 
@@ -15,8 +16,18 @@ pub struct UdpSinkActor<S> {
     receiver: mpsc::Receiver<UdpSinkMessage>,
 }
 
-impl<S: PacketSocket> UdpSinkActor<S> {
-    pub async fn run(mut self) -> ActorResult {
+impl<S: PacketSocket> Actor for UdpSinkActor<S> {
+    type ID = usize;
+
+    fn kind(&self) -> &'static str {
+        "udp_source"
+    }
+
+    fn id(&self) -> Self::ID {
+        0
+    }
+
+    async fn run(&mut self) -> Result<(), ActorError> {
         // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
         // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
         //
