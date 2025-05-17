@@ -1808,7 +1808,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "itertools",
  "kanal",
  "metrics",
  "mimalloc",
