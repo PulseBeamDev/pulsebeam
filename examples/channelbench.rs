@@ -298,6 +298,16 @@ async fn bench_tokio_mpsc_fan_out() -> u64 {
         let handle = task::spawn(async move {
             let mut count = 0;
             for _ in 0..MESSAGES_BY_PUBLISHER_FAN_OUT {
+                // let mut buf = Vec::new();
+                // let size = rx.recv_many(&mut buf, 32).await;
+                // if size == 0 {
+                //     break;
+                // }
+                // for _packet in buf.into_iter() {
+                //     simulate_packet_processing_work().await;
+                //     count += 1;
+                // }
+
                 if let Some(_packet) = rx.recv().await {
                     simulate_packet_processing_work().await;
                     count += 1;
