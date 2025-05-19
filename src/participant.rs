@@ -53,7 +53,8 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    NewTrack(TrackHandle),
+    TrackAdded(TrackHandle),
+    TrackRemoved(Arc<TrackId>),
 }
 
 #[derive(Debug)]
@@ -101,7 +102,7 @@ pub struct ParticipantActor {
     track_tasks: JoinSet<Arc<TrackId>>,
 
     published_tracks: HashMap<Mid, TrackHandle>,
-    subscribed_tracks: HashMap<Arc<TrackId>, TrackOut>,
+    available_tracks: HashMap<Arc<TrackId>, TrackOut>,
     mid_out_slots: HashMap<Mid, MidOutSlot>,
 }
 
@@ -221,7 +222,7 @@ impl ParticipantActor {
 
     async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
         match msg {
-            ParticipantControlMessage::NewTrack(track) => {
+            ParticipantControlMessage::TrackAdded(track) => {
                 if track.meta.id.origin_participant == self.participant_id {
                     // successfully publish a track
                     tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
@@ -232,7 +233,7 @@ impl ParticipantActor {
                     tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
                     let track_id = track.meta.id.clone();
 
-                    self.subscribed_tracks.insert(
+                    self.available_tracks.insert(
                         track_id,
                         TrackOut {
                             handle: track,
@@ -241,6 +242,19 @@ impl ParticipantActor {
                     );
                     self.reconfigure_downstreams().await;
                 }
+            }
+            ParticipantControlMessage::TrackRemoved(track_id) => {
+                let Some(track) = self.available_tracks.remove(&track_id) else {
+                    return;
+                };
+
+                let Some(mid) = track.mid else {
+                    return;
+                };
+
+                // We don't reconfigure downstreams here because the client will
+                // likely rearrange their layout and subscribe for new streams.
+                self.mid_out_slots.remove(&mid);
             }
         }
     }
@@ -364,7 +378,7 @@ impl ParticipantActor {
             return;
         };
 
-        let Some(track) = self.subscribed_tracks.get(track_id) else {
+        let Some(track) = self.available_tracks.get(track_id) else {
             return;
         };
 
@@ -422,7 +436,7 @@ impl ParticipantActor {
 
     fn handle_forward_media(&mut self, track: Arc<TrackIn>, data: Arc<MediaData>) {
         tracing::debug!("handle forward media data");
-        let Some(track) = self.subscribed_tracks.get(&track.id) else {
+        let Some(track) = self.available_tracks.get(&track.id) else {
             return;
         };
 
@@ -451,7 +465,7 @@ impl ParticipantActor {
                 continue;
             }
 
-            for (track_id, track) in &mut self.subscribed_tracks {
+            for (track_id, track) in &mut self.available_tracks {
                 if track.mid.is_some() {
                     continue;
                 }
@@ -486,7 +500,7 @@ impl ParticipantHandle {
         rtc: Rtc,
     ) -> (Self, ParticipantActor) {
         let (data_sender, data_receiver) = mpsc::channel(128);
-        let (control_sender, control_receiver) = mpsc::channel(1);
+        let (control_sender, control_receiver) = mpsc::channel(8);
         let handle = Self {
             data_sender,
             control_sender,
@@ -504,7 +518,7 @@ impl ParticipantHandle {
             rtc,
             track_tasks: JoinSet::new(),
             published_tracks: HashMap::new(),
-            subscribed_tracks: HashMap::new(),
+            available_tracks: HashMap::new(),
             mid_out_slots: HashMap::new(),
             cid: None,
         };
@@ -525,12 +539,21 @@ impl ParticipantHandle {
         res
     }
 
-    pub async fn new_track(
+    pub async fn add_track(
         &self,
         track: TrackHandle,
     ) -> Result<(), SendError<ParticipantControlMessage>> {
         self.control_sender
-            .send(ParticipantControlMessage::NewTrack(track))
+            .send(ParticipantControlMessage::TrackAdded(track))
+            .await
+    }
+
+    pub async fn remove_track(
+        &self,
+        track_id: Arc<TrackId>,
+    ) -> Result<(), SendError<ParticipantControlMessage>> {
+        self.control_sender
+            .send(ParticipantControlMessage::TrackRemoved(track_id))
             .await
     }
 

@@ -16,7 +16,7 @@ use crate::{
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishMedia(TrackHandle),
+    PublishTrack(TrackHandle),
     AddParticipant(ParticipantHandle, ParticipantActor),
 }
 
@@ -97,13 +97,23 @@ impl RoomActor {
 
                 for (_, meta) in &self.participants {
                     for (_, track) in &meta.tracks {
-                        let _ = participant_handle.new_track(track.clone()).await;
+                        let _ = participant_handle.add_track(track.clone()).await;
                     }
                 }
             }
-            RoomMessage::PublishMedia(track) => {
+            RoomMessage::PublishTrack(track) => {
+                let Some(origin) = self.participants.get_mut(&track.meta.id.origin_participant)
+                else {
+                    tracing::warn!(
+                        "{} is missing from participants, ignoring track",
+                        track.meta.id
+                    );
+                    return;
+                };
+
+                origin.tracks.insert(track.meta.id.clone(), track.clone());
                 for (_, participant) in &self.participants {
-                    let _ = participant.handle.new_track(track.clone()).await;
+                    let _ = participant.handle.add_track(track.clone()).await;
                 }
             }
             _ => todo!(),
@@ -145,7 +155,7 @@ impl RoomHandle {
     }
 
     pub async fn publish(&self, track: TrackHandle) -> Result<(), SendError<RoomMessage>> {
-        self.sender.send(RoomMessage::PublishMedia(track)).await
+        self.sender.send(RoomMessage::PublishTrack(track)).await
     }
 }
 

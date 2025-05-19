@@ -62,15 +62,9 @@ impl Actor for TrackActor {
 
     async fn run(&mut self) -> Result<(), crate::actor::ActorError> {
         loop {
-            let mut buf = Vec::with_capacity(64);
             tokio::select! {
-                size = self.data_receiver.recv_many(&mut buf, 64) => {
-                    if size == 0 {
-                        break;
-                    }
-                    for msg in buf.into_iter() {
-                        self.handle_data_message(msg);
-                    }
+                Some(msg) = self.data_receiver.recv() => {
+                    self.handle_data_message(msg);
                 }
 
                 Some(msg) = self.control_receiver.recv() => {
@@ -125,7 +119,7 @@ pub struct TrackHandle {
 impl TrackHandle {
     pub fn new(origin: ParticipantHandle, meta: Arc<TrackIn>) -> (Self, TrackActor) {
         let (data_sender, data_receiver) = mpsc::channel(64);
-        let (control_sender, control_receiver) = mpsc::channel(1);
+        let (control_sender, control_receiver) = mpsc::channel(8);
         let handle = Self {
             data_sender,
             control_sender,
