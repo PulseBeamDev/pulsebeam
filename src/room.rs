@@ -63,8 +63,7 @@ impl Actor for RoomActor {
                 }
 
                 Some(Ok(participant_id)) = self.participant_tasks.join_next() => {
-                    // TODO: notify participant leaving
-                    self.participants.remove(&participant_id);
+                    self.handle_participant_left(participant_id).await;
                 }
 
                 else => break,
@@ -95,11 +94,11 @@ impl RoomActor {
                     .in_current_span(),
                 );
 
+                let mut tracks = Vec::with_capacity(self.participants.len());
                 for (_, meta) in &self.participants {
-                    for (_, track) in &meta.tracks {
-                        let _ = participant_handle.add_track(track.clone()).await;
-                    }
+                    tracks.extend(meta.tracks.values().cloned());
                 }
+                let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
             }
             RoomMessage::PublishTrack(track) => {
                 let Some(origin) = self.participants.get_mut(&track.meta.id.origin_participant)
@@ -112,12 +111,30 @@ impl RoomActor {
                 };
 
                 origin.tracks.insert(track.meta.id.clone(), track.clone());
+                let new_tracks = Arc::new(vec![track]);
                 for (_, participant) in &self.participants {
-                    let _ = participant.handle.add_track(track.clone()).await;
+                    let _ = participant.handle.add_tracks(new_tracks.clone()).await;
                 }
             }
             _ => todo!(),
         };
+    }
+
+    async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
+        // TODO: notify participant leaving
+        let Some(participant) = self.participants.remove(&participant_id) else {
+            return;
+        };
+
+        let tracks: Vec<Arc<TrackId>> = participant
+            .tracks
+            .into_values()
+            .map(|t| t.meta.id.clone())
+            .collect();
+        let tracks = Arc::new(tracks);
+        for (_, participant) in &self.participants {
+            let _ = participant.handle.remove_tracks(tracks.clone()).await;
+        }
     }
 }
 

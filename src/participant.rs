@@ -53,8 +53,8 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    TrackAdded(TrackHandle),
-    TrackRemoved(Arc<TrackId>),
+    TracksAdded(Arc<Vec<TrackHandle>>),
+    TracksRemoved(Arc<Vec<Arc<TrackId>>>),
 }
 
 #[derive(Debug)]
@@ -222,39 +222,48 @@ impl ParticipantActor {
 
     async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
         match msg {
-            ParticipantControlMessage::TrackAdded(track) => {
-                if track.meta.id.origin_participant == self.participant_id {
-                    // successfully publish a track
-                    tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
-                    self.published_tracks
-                        .insert(track.meta.id.origin_mid, track);
-                } else {
-                    // new tracks from other participants
-                    tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
-                    let track_id = track.meta.id.clone();
+            ParticipantControlMessage::TracksAdded(tracks) => {
+                let mut should_reconfigure: bool = false;
+                for track in tracks.iter() {
+                    if track.meta.id.origin_participant == self.participant_id {
+                        // successfully publish a track
+                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
+                        self.published_tracks
+                            .insert(track.meta.id.origin_mid, track.clone());
+                    } else {
+                        // new tracks from other participants
+                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
+                        let track_id = track.meta.id.clone();
 
-                    self.available_tracks.insert(
-                        track_id,
-                        TrackOut {
-                            handle: track,
-                            mid: None,
-                        },
-                    );
+                        self.available_tracks.insert(
+                            track_id,
+                            TrackOut {
+                                handle: track.clone(),
+                                mid: None,
+                            },
+                        );
+                        should_reconfigure = true;
+                    }
+                }
+
+                if should_reconfigure {
                     self.reconfigure_downstreams().await;
                 }
             }
-            ParticipantControlMessage::TrackRemoved(track_id) => {
-                let Some(track) = self.available_tracks.remove(&track_id) else {
-                    return;
-                };
+            ParticipantControlMessage::TracksRemoved(track_ids) => {
+                for track_id in track_ids.iter() {
+                    let Some(track) = self.available_tracks.remove(track_id) else {
+                        return;
+                    };
 
-                let Some(mid) = track.mid else {
-                    return;
-                };
+                    let Some(mid) = track.mid else {
+                        return;
+                    };
 
-                // We don't reconfigure downstreams here because the client will
-                // likely rearrange their layout and subscribe for new streams.
-                self.mid_out_slots.remove(&mid);
+                    // We don't reconfigure downstreams here because the client will
+                    // likely rearrange their layout and subscribe for new streams.
+                    self.mid_out_slots.remove(&mid);
+                }
             }
         }
     }
@@ -539,21 +548,21 @@ impl ParticipantHandle {
         res
     }
 
-    pub async fn add_track(
+    pub async fn add_tracks(
         &self,
-        track: TrackHandle,
+        tracks: Arc<Vec<TrackHandle>>,
     ) -> Result<(), SendError<ParticipantControlMessage>> {
         self.control_sender
-            .send(ParticipantControlMessage::TrackAdded(track))
+            .send(ParticipantControlMessage::TracksAdded(tracks))
             .await
     }
 
-    pub async fn remove_track(
+    pub async fn remove_tracks(
         &self,
-        track_id: Arc<TrackId>,
+        track_ids: Arc<Vec<Arc<TrackId>>>,
     ) -> Result<(), SendError<ParticipantControlMessage>> {
         self.control_sender
-            .send(ParticipantControlMessage::TrackRemoved(track_id))
+            .send(ParticipantControlMessage::TracksRemoved(track_ids))
             .await
     }
 
