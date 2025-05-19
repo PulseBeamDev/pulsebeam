@@ -44,11 +44,11 @@ message TrackSwitchInfo {
 }
 
 message TrackPublishedPayload {
-  TrackInfo remote_track = 1;
+  repeated TrackInfo remote_tracks = 1;
 }
 
 message TrackUnpublishedPayload {
-  string remote_track_id = 1; // The ID of the remote track that is no longer available.
+  repeated string remote_track_ids = 1; // The ID of the remote track that is no longer available.
 }
 
 message TrackSwitchedPayload {

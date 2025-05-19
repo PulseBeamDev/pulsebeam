@@ -52,14 +52,14 @@ pub struct TrackSwitchInfo {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TrackPublishedPayload {
-    #[prost(message, optional, tag = "1")]
-    pub remote_track: ::core::option::Option<TrackInfo>,
+    #[prost(message, repeated, tag = "1")]
+    pub remote_tracks: ::prost::alloc::vec::Vec<TrackInfo>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TrackUnpublishedPayload {
     /// The ID of the remote track that is no longer available.
-    #[prost(string, tag = "1")]
-    pub remote_track_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "1")]
+    pub remote_track_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TrackSwitchedPayload {

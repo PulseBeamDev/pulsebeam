@@ -27,9 +27,9 @@ use tracing::Instrument;
 
 use crate::{
     actor::{self, Actor, ActorError},
-    entity::{ParticipantId, TrackId},
+    entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
-    proto,
+    proto::sfu,
     rng::Rng,
     room::RoomHandle,
     sink::UdpSinkHandle,
@@ -102,7 +102,8 @@ pub struct ParticipantActor {
     track_tasks: JoinSet<Arc<TrackId>>,
 
     published_tracks: HashMap<Mid, TrackHandle>,
-    available_tracks: HashMap<Arc<TrackId>, TrackOut>,
+    // InternalTrackId -> TrackOut
+    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
     mid_out_slots: HashMap<Mid, MidOutSlot>,
 }
 
@@ -221,9 +222,13 @@ impl ParticipantActor {
     }
 
     async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
+        use sfu::server_message::Payload;
+
         match msg {
             ParticipantControlMessage::TracksAdded(tracks) => {
                 let mut should_reconfigure: bool = false;
+                let mut new_tracks = Vec::new();
+
                 for track in tracks.iter() {
                     if track.meta.id.origin_participant == self.participant_id {
                         // successfully publish a track
@@ -236,23 +241,37 @@ impl ParticipantActor {
                         let track_id = track.meta.id.clone();
 
                         self.available_tracks.insert(
-                            track_id,
+                            track_id.internal.clone(),
                             TrackOut {
                                 handle: track.clone(),
                                 mid: None,
                             },
                         );
+                        let kind = if track.meta.kind.is_video() {
+                            sfu::TrackKind::Video
+                        } else {
+                            sfu::TrackKind::Audio
+                        };
+
+                        new_tracks.push(sfu::TrackInfo {
+                            track_id: track.meta.id.to_string(),
+                            kind: kind as i32,
+                            participant_id: track.meta.id.origin_participant.to_string(),
+                        });
                         should_reconfigure = true;
                     }
                 }
 
                 if should_reconfigure {
+                    self.send_server_event(Payload::TrackPublished(sfu::TrackPublishedPayload {
+                        remote_tracks: new_tracks,
+                    }));
                     self.reconfigure_downstreams().await;
                 }
             }
             ParticipantControlMessage::TracksRemoved(track_ids) => {
                 for track_id in track_ids.iter() {
-                    let Some(track) = self.available_tracks.remove(track_id) else {
+                    let Some(track) = self.available_tracks.remove(&track_id.internal) else {
                         return;
                     };
 
@@ -264,6 +283,9 @@ impl ParticipantActor {
                     // likely rearrange their layout and subscribe for new streams.
                     self.mid_out_slots.remove(&mid);
                 }
+                self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
+                    remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
+                }));
             }
         }
     }
@@ -306,22 +328,58 @@ impl ParticipantActor {
         None
     }
 
-    fn send_server_event(&mut self, msg: proto::sfu::server_message::Payload) {
+    fn send_server_event(&mut self, msg: sfu::server_message::Payload) {
         // TODO: handle when data channel is closed
 
         if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
-            let encoded = proto::sfu::ServerMessage { payload: Some(msg) }.encode_to_vec();
-            ch.write(true, encoded.as_slice());
+            let encoded = sfu::ServerMessage { payload: Some(msg) }.encode_to_vec();
+            if let Err(err) = ch.write(true, encoded.as_slice()) {
+                tracing::warn!("failed to send rpc via data channel: {err}");
+            }
         }
     }
 
-    fn handle_rpc(&mut self, data: ChannelData) -> Result<(), ParticipantError> {
-        let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())
+    async fn handle_rpc(&mut self, data: ChannelData) -> Result<(), ParticipantError> {
+        let msg = sfu::ClientMessage::decode(data.data.as_slice())
             .map_err(ParticipantError::InvalidRPCFormat)?;
 
-        match msg.payload {
-            _ => todo!(),
+        let Some(payload) = msg.payload else {
+            return Ok(());
         };
+
+        match payload {
+            sfu::client_message::Payload::Subscribe(subscribe) => {
+                let mid = Mid::from(subscribe.mid.as_str());
+                if let Some(track) = self.available_tracks.get_mut(&subscribe.remote_track_id) {
+                    if let Some(slot) = self.mid_out_slots.get_mut(&mid) {
+                        track.mid.replace(mid);
+                        if let Some(last_track) =
+                            slot.track_id.replace(track.handle.meta.id.clone())
+                        {
+                            self.handle_unsubscribe(last_track).await;
+                        }
+                    }
+                }
+            }
+            sfu::client_message::Payload::Unsubscribe(unsubscribe) => {
+                let mid = Mid::from(unsubscribe.mid.as_str());
+                if let Some(slot) = self.mid_out_slots.get_mut(&mid) {
+                    if let Some(last_track) = slot.track_id.take() {
+                        self.handle_unsubscribe(last_track).await;
+                    }
+                }
+            }
+        };
+
+        Ok(())
+    }
+
+    async fn handle_unsubscribe(&mut self, track_id: Arc<TrackId>) {
+        // TODO: handle unsubscribe
+        // let Some(track) = self.available_tracks.get(&track_id.internal) else {
+        //     return;
+        // };
+        // track.handle.subscribe(participant)
     }
 
     fn handle_output_transmit(&mut self, t: Transmit) {
@@ -350,7 +408,7 @@ impl ParticipantActor {
             }
             Event::ChannelData(data) => {
                 if Some(data.id) == self.cid {
-                    if let Err(err) = self.handle_rpc(data) {
+                    if let Err(err) = self.handle_rpc(data).await {
                         tracing::warn!("data channel dropped due to an error: {err}");
                     }
                 } else {
@@ -386,7 +444,7 @@ impl ParticipantActor {
             return;
         };
 
-        let Some(track) = self.available_tracks.get(track_id) else {
+        let Some(track) = self.available_tracks.get(&track_id.internal) else {
             return;
         };
 
@@ -443,8 +501,7 @@ impl ParticipantActor {
     }
 
     fn handle_forward_media(&mut self, track: Arc<TrackIn>, data: Arc<MediaData>) {
-        tracing::debug!("handle forward media data");
-        let Some(track) = self.available_tracks.get(&track.id) else {
+        let Some(track) = self.available_tracks.get(&track.id.internal) else {
             return;
         };
 
@@ -473,7 +530,7 @@ impl ParticipantActor {
                 continue;
             }
 
-            for (track_id, track) in &mut self.available_tracks {
+            for (_, track) in &mut self.available_tracks {
                 if track.mid.is_some() {
                     continue;
                 }
@@ -483,7 +540,7 @@ impl ParticipantActor {
                         continue;
                     };
                     track.mid = Some(*mid);
-                    mid_slot.track_id = Some(track_id.clone());
+                    mid_slot.track_id = Some(track.handle.meta.id.clone());
                     break;
                 }
             }

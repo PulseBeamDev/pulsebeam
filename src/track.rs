@@ -30,6 +30,7 @@ pub enum TrackDataMessage {
 #[derive(Debug)]
 pub enum TrackControlMessage {
     Subscribe(ParticipantHandle),
+    Unsubscribe(Arc<ParticipantId>),
 }
 
 /// Responsibilities:
@@ -103,6 +104,9 @@ impl TrackActor {
                 tracing::info!(participant_id=?participant.participant_id, "track subscribed");
                 self.subscribers
                     .insert(participant.participant_id.clone(), participant);
+            }
+            TrackControlMessage::Unsubscribe(participant_id) => {
+                // TODO: handle unsubscribe
             }
         }
     }

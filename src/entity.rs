@@ -287,7 +287,7 @@ impl AsRef<str> for ExternalParticipantId {
 }
 
 pub struct TrackId {
-    pub internal: EntityId,
+    pub internal: Arc<EntityId>,
     pub origin_participant: Arc<ParticipantId>,
     pub origin_mid: Mid,
 }
@@ -296,7 +296,7 @@ impl TrackId {
     pub fn new(rng: &mut Rng, participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
         let internal = new_entity_id(rng, prefix::TRACK_ID);
         Self {
-            internal,
+            internal: Arc::new(internal),
             origin_participant: participant_id,
             origin_mid: mid,
         }
