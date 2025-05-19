@@ -322,12 +322,11 @@ impl ParticipantActor {
         match msg.payload {
             _ => todo!(),
         };
-        Ok(())
     }
 
     fn handle_output_transmit(&mut self, t: Transmit) {
         let packet = Bytes::copy_from_slice(&t.contents);
-        self.sink.send(EgressUDPPacket {
+        let _ = self.sink.send(EgressUDPPacket {
             raw: packet,
             dst: t.destination,
         });
@@ -367,7 +366,7 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_tracks.get(&e.mid) {
-                    track.forward_media(Arc::new(e));
+                    let _ = track.forward_media(Arc::new(e));
                 }
             }
             Event::KeyframeRequest(req) => self.handle_keyframe_request(req),

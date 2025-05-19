@@ -1,7 +1,6 @@
-use std::{collections::BTreeMap, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use futures::FutureExt;
-use str0m::media::{KeyframeRequest, MediaData};
+use str0m::media::MediaData;
 use tokio::{
     sync::mpsc::{
         self,
@@ -84,7 +83,7 @@ impl TrackActor {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
                 for (_, sub) in &self.subscribers {
-                    sub.forward_media(self.meta.clone(), data.clone());
+                    let _ = sub.forward_media(self.meta.clone(), data.clone());
                 }
             }
             TrackDataMessage::KeyframeRequest(req) => {

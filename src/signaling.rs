@@ -1,6 +1,6 @@
 use crate::{
     controller::{ControllerError, ControllerHandle},
-    entity::{self, ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId, new_hashed_id},
+    entity::{ExternalParticipantId, ExternalRoomId},
 };
 use axum::{
     Router,
@@ -54,7 +54,7 @@ pub struct ParticipantInfo {
 async fn spawn_participant(
     Query(info): Query<ParticipantInfo>,
     State(controller): State<ControllerHandle>,
-    TypedHeader(content_type): TypedHeader<ContentType>,
+    TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<String, SignalingError> {
     // TODO: validate content_type = "application/sdp"

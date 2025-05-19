@@ -116,7 +116,6 @@ impl RoomActor {
                     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
                 }
             }
-            _ => todo!(),
         };
     }
 

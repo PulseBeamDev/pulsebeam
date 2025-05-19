@@ -46,7 +46,6 @@ pub enum ControllerMessage {
 pub struct ControllerActor {
     rng: Rng,
     id: Arc<String>,
-    handle: ControllerHandle,
     source: UdpSourceHandle,
     sink: UdpSinkHandle,
     receiver: mpsc::Receiver<ControllerMessage>,
@@ -177,7 +176,6 @@ impl ControllerHandle {
         let handle = ControllerHandle { sender };
 
         let actor = ControllerActor {
-            handle: handle.clone(),
             id,
             rng,
             receiver,
