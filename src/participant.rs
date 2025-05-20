@@ -314,7 +314,7 @@ impl ParticipantActor {
                 // a UDP socket. The destination IP comes from the ICE
                 // agent. It might change during the session.
                 Output::Transmit(v) => {
-                    self.handle_output_transmit(v);
+                    self.handle_output_transmit(v).await;
                 }
 
                 // Events are mainly incoming media data from the remote
@@ -382,12 +382,15 @@ impl ParticipantActor {
         // track.handle.subscribe(participant)
     }
 
-    fn handle_output_transmit(&mut self, t: Transmit) {
+    async fn handle_output_transmit(&mut self, t: Transmit) {
         let packet = Bytes::copy_from_slice(&t.contents);
-        let _ = self.sink.send(EgressUDPPacket {
-            raw: packet,
-            dst: t.destination,
-        });
+        let _ = self
+            .sink
+            .send(EgressUDPPacket {
+                raw: packet,
+                dst: t.destination,
+            })
+            .await;
     }
 
     async fn handle_output_event(&mut self, event: Event) {
@@ -424,7 +427,7 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_tracks.get(&e.mid) {
-                    let _ = track.forward_media(Arc::new(e));
+                    let _ = track.forward_media(Arc::new(e)).await;
                 }
             }
             Event::KeyframeRequest(req) => self.handle_keyframe_request(req),

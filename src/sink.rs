@@ -1,4 +1,4 @@
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc::{self, error::SendError};
 
 use crate::{
     actor::{Actor, ActorError},
@@ -60,14 +60,12 @@ impl UdpSinkHandle {
         (handle, actor)
     }
 
-    pub fn send(&self, msg: message::EgressUDPPacket) -> Result<(), TrySendError<UdpSinkMessage>> {
+    pub async fn send(
+        &self,
+        msg: message::EgressUDPPacket,
+    ) -> Result<(), SendError<UdpSinkMessage>> {
         // TODO: monitor backpressure and packet dropping
-        let res = self.sender.try_send(UdpSinkMessage::UdpPacket(msg));
-
-        if let Err(err) = &res {
-            tracing::warn!("sink raw packet is dropped: {err}");
-        }
-
-        res
+        // Await because we want the producer to slow down when a backpressure occurs
+        self.sender.send(UdpSinkMessage::UdpPacket(msg)).await
     }
 }

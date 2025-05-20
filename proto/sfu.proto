@@ -11,6 +11,7 @@ enum TrackKind {
 
 // --- Client to Server Messages ---
 
+// Subscribe a remote_track_id to the mid slot
 message ClientSubscribePayload {
   string mid = 1;                 // The client's MID (transceiver slot) to use for this track.
   string remote_track_id = 2;     // The application-level ID of the remote track to subscribe to.
@@ -43,6 +44,7 @@ message TrackSwitchInfo {
   optional TrackInfo remote_track = 3;
 }
 
+// New tracks available from other participants to subscribe
 message TrackPublishedPayload {
   repeated TrackInfo remote_tracks = 1;
 }

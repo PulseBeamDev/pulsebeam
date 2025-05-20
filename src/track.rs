@@ -2,10 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use str0m::media::MediaData;
 use tokio::{
-    sync::mpsc::{
-        self,
-        error::{SendError, TrySendError},
-    },
+    sync::mpsc::{self, error::SendError},
     time::Instant,
 };
 
@@ -140,19 +137,14 @@ impl TrackHandle {
         (handle, actor)
     }
 
-    pub fn forward_media(
+    pub async fn forward_media(
         &self,
         data: Arc<MediaData>,
-    ) -> Result<(), TrySendError<TrackDataMessage>> {
-        let res = self
-            .data_sender
-            .try_send(TrackDataMessage::ForwardMedia(data));
-
-        if let Err(err) = &res {
-            tracing::warn!("media packet is dropped: {err}");
-        }
-
-        res
+    ) -> Result<(), SendError<TrackDataMessage>> {
+        // Await because we want the producer to slow down when a backpressure occurs
+        self.data_sender
+            .send(TrackDataMessage::ForwardMedia(data))
+            .await
     }
 
     pub async fn subscribe(
