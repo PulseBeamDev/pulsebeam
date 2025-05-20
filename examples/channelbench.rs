@@ -118,6 +118,8 @@ async fn main() {
     );
     let fan_out_header = "--- Scenario: Fan-Out (1 Publisher -> N Subscribers) ---".to_string();
 
+    // https://github.com/smol-rs/async-channel/issues?q=is%3Aissue%20state%3Aopen
+    // async-channel tends to be unfair
     benchmarks.push(BenchTask {
         id: "fan_out-async_channel".to_string(),
         scenario_name: "Fan-Out".to_string(),
