@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::process::exit;
@@ -18,7 +23,7 @@ const NUM_SUBSCRIBERS_FAN_OUT: usize = 5; // N: Number of subscribers for the si
 const MESSAGES_BY_PUBLISHER_FAN_OUT: usize = 1_000_000; // Messages the single publisher sends (cloned N times)
 
 // --- Fan-In (M:1) Specific Configuration ---
-const NUM_PUBLISHERS_FAN_IN: usize = 5; // M: Number of publishers sending to one subscriber
+const NUM_PUBLISHERS_FAN_IN: usize = 10; // M: Number of publishers sending to one subscriber
 const MESSAGES_PER_PUBLISHER_FAN_IN: usize = 1_000_000; // Messages each of M publishers sends
 
 #[derive(Clone)]
