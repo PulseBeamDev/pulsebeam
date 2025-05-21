@@ -8,6 +8,7 @@ pub mod participant;
 pub mod proto;
 pub mod rng;
 pub mod room;
+pub mod router;
 pub mod signaling;
 pub mod sink;
 pub mod source;

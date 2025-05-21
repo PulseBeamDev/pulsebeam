@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    ops::Deref,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
 use tokio::{
     sync::mpsc::{self, error::SendError},
@@ -20,37 +15,30 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub enum RoomMessage {
-    PublishTrack(Arc<TrackId>),
+pub enum RouterMessage {
+    PublishTrack(TrackHandle),
     AddParticipant(ParticipantHandle, ParticipantActor),
 }
 
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
-    tracks: HashSet<Arc<TrackId>>,
+    tracks: HashMap<Arc<TrackId>, TrackHandle>,
 }
 
-/// Reponsibilities:
-/// * Manage Participant Lifecycle
-/// * Manage Track Lifecycle
-/// * Maintain Room State Registry: Keep an up-to-date list of current participants and available tracks
-/// * Broadcast Room Events
-/// * Mediate Subscriptions: Process subscription requests to tracks
-/// * Own & Supervise Track Actors
-pub struct RoomActor {
+pub struct RouterActor {
     rng: Rng,
-    receiver: mpsc::Receiver<RoomMessage>,
-    handle: RoomHandle,
+    receiver: mpsc::Receiver<RouterMessage>,
+    handle: RouterHandle,
 
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
 }
 
-impl Actor for RoomActor {
+impl Actor for RouterActor {
     type ID = Arc<RoomId>;
 
     fn kind(&self) -> &'static str {
-        "room"
+        "router"
     }
 
     fn id(&self) -> Self::ID {
@@ -79,16 +67,16 @@ impl Actor for RoomActor {
     }
 }
 
-impl RoomActor {
-    async fn handle_message(&mut self, msg: RoomMessage) {
+impl RouterActor {
+    async fn handle_message(&mut self, msg: RouterMessage) {
         match msg {
-            RoomMessage::AddParticipant(participant_handle, participant_actor) => {
+            RouterMessage::AddParticipant(participant_handle, participant_actor) => {
                 let participant_id = participant_handle.participant_id.clone();
                 self.participants.insert(
                     participant_handle.participant_id.clone(),
                     ParticipantMeta {
                         handle: participant_handle.clone(),
-                        tracks: HashSet::new(),
+                        tracks: HashMap::new(),
                     },
                 );
                 self.participant_tasks.spawn(
@@ -101,18 +89,22 @@ impl RoomActor {
 
                 let mut tracks = Vec::with_capacity(self.participants.len());
                 for (_, meta) in &self.participants {
-                    tracks.extend(meta.tracks.cloned());
+                    tracks.extend(meta.tracks.values().cloned());
                 }
                 let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
             }
-            RoomMessage::PublishTrack(track_id) => {
-                let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
-                    tracing::warn!("{} is missing from participants, ignoring track", track_id);
+            RouterMessage::PublishTrack(track) => {
+                let Some(origin) = self.participants.get_mut(&track.meta.id.origin_participant)
+                else {
+                    tracing::warn!(
+                        "{} is missing from participants, ignoring track",
+                        track.meta.id
+                    );
                     return;
                 };
 
-                origin.tracks.insert(track_id.clone(), track_id.clone());
-                let new_tracks = Arc::new(vec![track_id]);
+                origin.tracks.insert(track.meta.id.clone(), track.clone());
+                let new_tracks = Arc::new(vec![track]);
                 for (_, participant) in &self.participants {
                     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
                 }
@@ -139,19 +131,19 @@ impl RoomActor {
 }
 
 #[derive(Clone)]
-pub struct RoomHandle {
-    pub sender: mpsc::Sender<RoomMessage>,
+pub struct RouterHandle {
+    pub sender: mpsc::Sender<RouterMessage>,
     pub room_id: Arc<RoomId>,
 }
 
-impl RoomHandle {
-    pub fn new(rng: Rng, room_id: Arc<RoomId>) -> (Self, RoomActor) {
+impl RouterHandle {
+    pub fn new(rng: Rng, room_id: Arc<RoomId>) -> (Self, RouterActor) {
         let (sender, receiver) = mpsc::channel(8);
-        let handle = RoomHandle {
+        let handle = RouterHandle {
             sender,
             room_id: room_id.clone(),
         };
-        let actor = RoomActor {
+        let actor = RouterActor {
             rng,
             receiver,
             handle: handle.clone(),
@@ -165,18 +157,18 @@ impl RoomHandle {
         &self,
         handle: ParticipantHandle,
         actor: ParticipantActor,
-    ) -> Result<(), SendError<RoomMessage>> {
+    ) -> Result<(), SendError<RouterMessage>> {
         self.sender
-            .send(RoomMessage::AddParticipant(handle, actor))
+            .send(RouterMessage::AddParticipant(handle, actor))
             .await
     }
 
-    pub async fn publish(&self, track_id: Arc<TrackId>) -> Result<(), SendError<RoomMessage>> {
-        self.sender.send(RoomMessage::PublishTrack(track)).await
+    pub async fn publish(&self, track: TrackHandle) -> Result<(), SendError<RouterMessage>> {
+        self.sender.send(RouterMessage::PublishTrack(track)).await
     }
 }
 
-impl Display for RoomHandle {
+impl Display for RouterHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.room_id.deref().as_ref())
     }

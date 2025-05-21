@@ -101,7 +101,7 @@ pub struct ParticipantActor {
     cid: Option<ChannelId>,
     track_tasks: JoinSet<Arc<TrackId>>,
 
-    published_tracks: HashMap<Mid, TrackHandle>,
+    published_tracks: HashMap<Mid, Arc<TrackId>>,
     // InternalTrackId -> TrackOut
     available_tracks: HashMap<Arc<EntityId>, TrackOut>,
     mid_out_slots: HashMap<Mid, MidOutSlot>,
@@ -230,36 +230,29 @@ impl ParticipantActor {
                 let mut new_tracks = Vec::new();
 
                 for track in tracks.iter() {
-                    if track.meta.id.origin_participant == self.participant_id {
-                        // successfully publish a track
-                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
-                        self.published_tracks
-                            .insert(track.meta.id.origin_mid, track.clone());
+                    // new tracks from other participants
+                    tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
+                    let track_id = track.meta.id.clone();
+
+                    self.available_tracks.insert(
+                        track_id.internal.clone(),
+                        TrackOut {
+                            handle: track.clone(),
+                            mid: None,
+                        },
+                    );
+                    let kind = if track.meta.kind.is_video() {
+                        sfu::TrackKind::Video
                     } else {
-                        // new tracks from other participants
-                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
-                        let track_id = track.meta.id.clone();
+                        sfu::TrackKind::Audio
+                    };
 
-                        self.available_tracks.insert(
-                            track_id.internal.clone(),
-                            TrackOut {
-                                handle: track.clone(),
-                                mid: None,
-                            },
-                        );
-                        let kind = if track.meta.kind.is_video() {
-                            sfu::TrackKind::Video
-                        } else {
-                            sfu::TrackKind::Audio
-                        };
-
-                        new_tracks.push(sfu::TrackInfo {
-                            track_id: track.meta.id.to_string(),
-                            kind: kind as i32,
-                            participant_id: track.meta.id.origin_participant.to_string(),
-                        });
-                        should_reconfigure = true;
-                    }
+                    new_tracks.push(sfu::TrackInfo {
+                        track_id: track.meta.id.to_string(),
+                        kind: kind as i32,
+                        participant_id: track.meta.id.origin_participant.to_string(),
+                    });
+                    should_reconfigure = true;
                 }
 
                 if should_reconfigure {
@@ -462,20 +455,8 @@ impl ParticipantActor {
                 // TODO: handle back pressure by buffering temporarily
                 let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
-                let track = TrackIn {
-                    id: track_id.clone(),
-                    kind: media.kind,
-                    simulcast: media.simulcast,
-                };
+                self.published_tracks.insert(media.mid, track_id);
 
-                let (handle, actor) = TrackHandle::new(self.handle.clone(), Arc::new(track));
-                self.track_tasks.spawn(
-                    async move {
-                        actor::run(actor).await;
-                        track_id
-                    }
-                    .in_current_span(),
-                );
                 if let Err(err) = self.room.publish(handle).await {
                     // this participant should get cleaned up by the supervisor
                     tracing::warn!("failed to publish track to room: {err}");
