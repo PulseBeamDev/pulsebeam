@@ -14,6 +14,7 @@ use tracing::Instrument;
 use crate::{
     actor::{self, Actor, ActorError},
     entity::{ParticipantId, RoomId, TrackId},
+    message::TrackIn,
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
     track::TrackHandle,
@@ -171,7 +172,7 @@ impl RoomHandle {
             .await
     }
 
-    pub async fn publish(&self, track_id: Arc<TrackId>) -> Result<(), SendError<RoomMessage>> {
+    pub async fn publish(&self, track: Arc<TrackIn>) -> Result<(), SendError<RoomMessage>> {
         self.sender.send(RoomMessage::PublishTrack(track)).await
     }
 }

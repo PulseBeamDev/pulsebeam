@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
+use str0m::media::MediaData;
 use tokio::{
     sync::mpsc::{self, error::SendError},
     task::JoinSet,
@@ -11,14 +12,18 @@ use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
+    room::RoomHandle,
     track::TrackHandle,
 };
 
 #[derive(Debug)]
-pub enum RouterMessage {
-    PublishTrack(TrackHandle),
-    AddParticipant(ParticipantHandle, ParticipantActor),
+pub enum RouterDataMessage {
+    ForwardVideo(Arc<TrackId>, Arc<MediaData>),
+    ForwardAudio(Arc<TrackId>, Arc<MediaData>),
 }
+
+#[derive(Debug)]
+pub enum RouterControlMessage {}
 
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
@@ -26,39 +31,32 @@ pub struct ParticipantMeta {
 }
 
 pub struct RouterActor {
-    rng: Rng,
-    receiver: mpsc::Receiver<RouterMessage>,
-    handle: RouterHandle,
+    data_rx: mpsc::Receiver<RouterDataMessage>,
+    control_rx: mpsc::Receiver<RouterControlMessage>,
 
-    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
-    participant_tasks: JoinSet<Arc<ParticipantId>>,
+    participants: Vec<ParticipantHandle>,
 }
 
 impl Actor for RouterActor {
-    type ID = Arc<RoomId>;
+    type ID = &'static str;
 
     fn kind(&self) -> &'static str {
         "router"
     }
 
     fn id(&self) -> Self::ID {
-        self.handle.room_id.clone()
+        "0"
     }
 
     async fn run(&mut self) -> Result<(), ActorError> {
         loop {
             tokio::select! {
-                res = self.receiver.recv() => {
+                res = self.data_rx.recv() => {
                     match res {
                         Some(msg) => self.handle_message(msg).await,
                         None => break,
                     }
                 }
-
-                Some(Ok(participant_id)) = self.participant_tasks.join_next() => {
-                    self.handle_participant_left(participant_id).await;
-                }
-
                 else => break,
             }
         }
@@ -68,108 +66,56 @@ impl Actor for RouterActor {
 }
 
 impl RouterActor {
-    async fn handle_message(&mut self, msg: RouterMessage) {
+    async fn handle_message(&mut self, msg: RouterDataMessage) {
         match msg {
-            RouterMessage::AddParticipant(participant_handle, participant_actor) => {
-                let participant_id = participant_handle.participant_id.clone();
-                self.participants.insert(
-                    participant_handle.participant_id.clone(),
-                    ParticipantMeta {
-                        handle: participant_handle.clone(),
-                        tracks: HashMap::new(),
-                    },
-                );
-                self.participant_tasks.spawn(
-                    async move {
-                        actor::run(participant_actor).await;
-                        participant_id
-                    }
-                    .in_current_span(),
-                );
-
-                let mut tracks = Vec::with_capacity(self.participants.len());
-                for (_, meta) in &self.participants {
-                    tracks.extend(meta.tracks.values().cloned());
-                }
-                let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
-            }
-            RouterMessage::PublishTrack(track) => {
-                let Some(origin) = self.participants.get_mut(&track.meta.id.origin_participant)
-                else {
-                    tracing::warn!(
-                        "{} is missing from participants, ignoring track",
-                        track.meta.id
-                    );
-                    return;
-                };
-
-                origin.tracks.insert(track.meta.id.clone(), track.clone());
-                let new_tracks = Arc::new(vec![track]);
-                for (_, participant) in &self.participants {
-                    let _ = participant.handle.add_tracks(new_tracks.clone()).await;
+            RouterDataMessage::ForwardVideo(track_id, media) => {}
+            RouterDataMessage::ForwardAudio(track_id, media) => {
+                for participant in &self.participants {
+                    participant.forward_media(track, data)
                 }
             }
         };
-    }
-
-    async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
-        // TODO: notify participant leaving
-        let Some(participant) = self.participants.remove(&participant_id) else {
-            return;
-        };
-
-        let tracks: Vec<Arc<TrackId>> = participant
-            .tracks
-            .into_values()
-            .map(|t| t.meta.id.clone())
-            .collect();
-        let tracks = Arc::new(tracks);
-        for (_, participant) in &self.participants {
-            let _ = participant.handle.remove_tracks(tracks.clone()).await;
-        }
     }
 }
 
 #[derive(Clone)]
 pub struct RouterHandle {
-    pub sender: mpsc::Sender<RouterMessage>,
-    pub room_id: Arc<RoomId>,
+    pub data_tx: mpsc::Sender<RouterDataMessage>,
+    pub control_tx: mpsc::Sender<RouterControlMessage>,
 }
 
 impl RouterHandle {
-    pub fn new(rng: Rng, room_id: Arc<RoomId>) -> (Self, RouterActor) {
-        let (sender, receiver) = mpsc::channel(8);
+    pub fn new(room: RoomHandle) -> (Self, RouterActor) {
+        let (data_tx, data_rx) = mpsc::channel(128);
+        let (control_tx, control_rx) = mpsc::channel(8);
         let handle = RouterHandle {
-            sender,
-            room_id: room_id.clone(),
+            data_tx,
+            control_tx,
         };
         let actor = RouterActor {
-            rng,
-            receiver,
-            handle: handle.clone(),
-            participants: HashMap::new(),
-            participant_tasks: JoinSet::new(),
+            data_rx,
+            control_rx,
         };
         (handle, actor)
     }
 
-    pub async fn add_participant(
+    pub async fn forward_video(
         &self,
-        handle: ParticipantHandle,
-        actor: ParticipantActor,
-    ) -> Result<(), SendError<RouterMessage>> {
-        self.sender
-            .send(RouterMessage::AddParticipant(handle, actor))
+        track_id: Arc<TrackId>,
+        media: Arc<MediaData>,
+    ) -> Result<(), SendError<RouterDataMessage>> {
+        self.data_tx
+            .send(RouterDataMessage::ForwardVideo(track_id, media))
             .await
     }
 
-    pub async fn publish(&self, track: TrackHandle) -> Result<(), SendError<RouterMessage>> {
-        self.sender.send(RouterMessage::PublishTrack(track)).await
-    }
-}
-
-impl Display for RouterHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.room_id.deref().as_ref())
+    pub async fn forward_audio(
+        &self,
+        track_id: Arc<TrackId>,
+        media: Arc<MediaData>,
+    ) -> Result<(), SendError<RouterDataMessage>> {
+        self.data_tx
+            .send(RouterDataMessage::ForwardAudio(track_id, media))
+            .await
     }
 }
