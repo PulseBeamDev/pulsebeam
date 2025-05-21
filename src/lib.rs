@@ -13,3 +13,4 @@ pub mod signaling;
 pub mod sink;
 pub mod source;
 pub mod track;
+pub mod voice_ranker;
