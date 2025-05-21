@@ -2,8 +2,8 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
     actor::{self, Actor, ActorError},
+    context,
     entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
-    participant::ParticipantHandle,
     rng::Rng,
     room::RoomHandle,
     sink::UdpSinkHandle,
@@ -44,10 +44,8 @@ pub enum ControllerMessage {
 }
 
 pub struct ControllerActor {
-    rng: Rng,
     id: Arc<String>,
-    source: UdpSourceHandle,
-    sink: UdpSinkHandle,
+    ctx: context::Context,
     receiver: mpsc::Receiver<ControllerMessage>,
     local_addrs: Vec<SocketAddr>,
 
@@ -73,7 +71,7 @@ impl Actor for ControllerActor {
                     match msg {
                         ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
                             let room_id = RoomId::new(room_id);
-                            let participant_id = ParticipantId::new(&mut self.rng, participant_id);
+                            let participant_id = ParticipantId::new(&mut self.ctx.rng, participant_id);
                             let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
                         }
                     }
@@ -120,20 +118,11 @@ impl ControllerActor {
 
         let room_id = Arc::new(room_id);
         let room_handle = self.get_or_create_room(room_id);
-        let participant = ParticipantHandle::new(
-            self.rng.clone(),
-            self.source.clone(),
-            self.sink.clone(),
-            room_handle.clone(),
-            Arc::new(participant_id),
-            rtc,
-        );
-
         // TODO: probably retry? Or, let the client to retry instead?
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .add_participant(participant.0, participant.1)
+            .add_participant(Arc::new(participant_id), rtc)
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
@@ -144,7 +133,7 @@ impl ControllerActor {
         if let Some(handle) = self.rooms.get(&room_id) {
             handle.clone()
         } else {
-            let (room_handle, room_actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
+            let (room_handle, room_actor) = RoomHandle::new(self.ctx.clone(), room_id.clone());
             self.rooms.insert(room_id.clone(), room_handle.clone());
             self.room_tasks.spawn(
                 async move {
@@ -166,9 +155,7 @@ pub struct ControllerHandle {
 
 impl ControllerHandle {
     pub fn new(
-        rng: Rng,
-        source: UdpSourceHandle,
-        sink: UdpSinkHandle,
+        ctx: context::Context,
         local_addrs: Vec<SocketAddr>,
         id: Arc<String>,
     ) -> (Self, ControllerActor) {
@@ -177,10 +164,8 @@ impl ControllerHandle {
 
         let actor = ControllerActor {
             id,
-            rng,
+            ctx,
             receiver,
-            source,
-            sink,
             local_addrs,
             rooms: HashMap::new(),
             room_tasks: JoinSet::new(),

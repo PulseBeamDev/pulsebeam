@@ -1,20 +1,16 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
-
-use str0m::{media::MediaData, rtp::ExtensionValues};
-use tokio::{
-    sync::mpsc::{self, error::SendError},
-    task::JoinSet,
-    time::Instant,
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
 };
-use tracing::Instrument;
+
+use str0m::media::{MediaData, Rid};
+use tokio::sync::mpsc::{self, error::SendError};
 
 use crate::{
-    actor::{self, Actor, ActorError},
-    entity::{ParticipantId, RoomId, TrackId},
-    participant::{ParticipantActor, ParticipantHandle},
-    rng::Rng,
+    actor::{Actor, ActorError},
+    entity::TrackId,
+    participant::ParticipantHandle,
     room::RoomHandle,
-    track::TrackHandle,
     voice_ranker::VoiceRanker,
 };
 
@@ -27,17 +23,13 @@ pub enum RouterDataMessage {
 #[derive(Debug)]
 pub enum RouterControlMessage {}
 
-pub struct ParticipantMeta {
-    handle: ParticipantHandle,
-    tracks: HashMap<Arc<TrackId>, TrackHandle>,
-}
-
 pub struct RouterActor {
     data_rx: mpsc::Receiver<RouterDataMessage>,
     control_rx: mpsc::Receiver<RouterControlMessage>,
 
     voice_ranker: VoiceRanker,
     participants: Vec<ParticipantHandle>,
+    video_forwarding_rules: HashMap<(Arc<TrackId>, Option<Rid>), VecDeque<ParticipantHandle>>,
 }
 
 impl Actor for RouterActor {
@@ -72,7 +64,14 @@ impl RouterActor {
     async fn handle_message(&mut self, msg: RouterDataMessage) {
         match msg {
             RouterDataMessage::ForwardVideo(track_id, media) => {
-                for participant in &self.participants {
+                let Some(participants) = self
+                    .video_forwarding_rules
+                    .get(&(track_id.clone(), media.rid))
+                else {
+                    return;
+                };
+
+                for participant in participants {
                     let _ = participant.forward_video(track_id.clone(), media.clone());
                 }
             }
@@ -126,6 +125,9 @@ impl RouterHandle {
         let actor = RouterActor {
             data_rx,
             control_rx,
+            participants: Vec::new(),
+            voice_ranker: VoiceRanker::default(),
+            video_forwarding_rules: HashMap::new(),
         };
         (handle, actor)
     }

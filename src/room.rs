@@ -1,10 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    ops::Deref,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
 
+use str0m::Rtc;
 use tokio::{
     sync::mpsc::{self, error::SendError},
     task::JoinSet,
@@ -13,22 +9,23 @@ use tracing::Instrument;
 
 use crate::{
     actor::{self, Actor, ActorError},
+    context,
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackIn,
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
-    track::TrackHandle,
+    router::RouterHandle,
 };
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishTrack(Arc<TrackId>),
-    AddParticipant(ParticipantHandle, ParticipantActor),
+    PublishTrack(Arc<TrackIn>),
+    AddParticipant(Arc<ParticipantId>, Rtc),
 }
 
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
-    tracks: HashSet<Arc<TrackId>>,
+    tracks: HashMap<Arc<TrackId>, Arc<TrackIn>>,
 }
 
 /// Reponsibilities:
@@ -39,9 +36,10 @@ pub struct ParticipantMeta {
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
-    rng: Rng,
+    ctx: context::Context,
     receiver: mpsc::Receiver<RoomMessage>,
     handle: RoomHandle,
+    router: RouterHandle,
 
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
@@ -83,13 +81,28 @@ impl Actor for RoomActor {
 impl RoomActor {
     async fn handle_message(&mut self, msg: RoomMessage) {
         match msg {
-            RoomMessage::AddParticipant(participant_handle, participant_actor) => {
+            RoomMessage::AddParticipant(participant_id, rtc) => {
+                let mut tracks = Vec::new();
+                for meta in self.participants.values() {
+                    for (track_id, _) in &meta.tracks {
+                        tracks.push(track_id.clone());
+                    }
+                }
+
+                let (participant_handle, participant_actor) = ParticipantHandle::new(
+                    self.ctx.clone(),
+                    self.handle.clone(),
+                    self.router.clone(),
+                    participant_id.clone(),
+                    rtc,
+                    tracks,
+                );
                 let participant_id = participant_handle.participant_id.clone();
                 self.participants.insert(
                     participant_handle.participant_id.clone(),
                     ParticipantMeta {
                         handle: participant_handle.clone(),
-                        tracks: HashSet::new(),
+                        tracks: HashMap::new(),
                     },
                 );
                 self.participant_tasks.spawn(
@@ -99,12 +112,6 @@ impl RoomActor {
                     }
                     .in_current_span(),
                 );
-
-                let mut tracks = Vec::with_capacity(self.participants.len());
-                for (_, meta) in &self.participants {
-                    tracks.extend(meta.tracks.cloned());
-                }
-                let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
             }
             RoomMessage::PublishTrack(track_id) => {
                 let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
@@ -146,14 +153,14 @@ pub struct RoomHandle {
 }
 
 impl RoomHandle {
-    pub fn new(rng: Rng, room_id: Arc<RoomId>) -> (Self, RoomActor) {
+    pub fn new(ctx: context::Context, room_id: Arc<RoomId>) -> (Self, RoomActor) {
         let (sender, receiver) = mpsc::channel(8);
         let handle = RoomHandle {
             sender,
             room_id: room_id.clone(),
         };
         let actor = RoomActor {
-            rng,
+            ctx,
             receiver,
             handle: handle.clone(),
             participants: HashMap::new(),
@@ -164,11 +171,11 @@ impl RoomHandle {
 
     pub async fn add_participant(
         &self,
-        handle: ParticipantHandle,
-        actor: ParticipantActor,
+        participant_id: Arc<ParticipantId>,
+        rtc: Rtc,
     ) -> Result<(), SendError<RoomMessage>> {
         self.sender
-            .send(RoomMessage::AddParticipant(handle, actor))
+            .send(RoomMessage::AddParticipant(participant_id, rtc))
             .await
     }
 

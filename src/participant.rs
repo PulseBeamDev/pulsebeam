@@ -27,6 +27,7 @@ use tracing::Instrument;
 
 use crate::{
     actor::{self, Actor, ActorError},
+    context,
     entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
     proto::sfu,
@@ -66,12 +67,6 @@ pub enum ParticipantDataMessage {
     KeyframeRequest(Arc<TrackId>, message::KeyframeRequest),
 }
 
-#[derive(Debug)]
-struct TrackOut {
-    handle: TrackHandle,
-    mid: Option<Mid>,
-}
-
 struct MidOutSlot {
     kind: MediaKind,
     simulcast: Option<Simulcast>,
@@ -103,12 +98,11 @@ struct AudioSlot {
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
 pub struct ParticipantActor {
-    rng: Rng,
+    ctx: context::Context,
+
     handle: ParticipantHandle,
-    source: UdpSourceHandle,
     data_receiver: mpsc::Receiver<ParticipantDataMessage>,
     control_receiver: mpsc::Receiver<ParticipantControlMessage>,
-    sink: UdpSinkHandle,
     room: RoomHandle,
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
@@ -119,8 +113,8 @@ pub struct ParticipantActor {
     published_tracks: HashMap<Mid, PublishedTrackMeta>,
 
     // video handling
-    // InternalTrackId -> TrackOut
-    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
+    // InternalTrackId -> Mid
+    available_tracks: HashMap<Arc<EntityId>, Option<Mid>>,
     video_slots: HashMap<Mid, MidOutSlot>,
 
     // audio handling
@@ -148,7 +142,8 @@ impl Actor for ParticipantActor {
 
     async fn pre_start(&mut self) -> Result<(), crate::actor::ActorError> {
         let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
-        self.source
+        self.ctx
+            .source
             .add_participant(ufrag, self.handle.clone())
             .await
             .map_err(|_| ActorError::PreStartFailed("source is closed".to_string()))
@@ -193,7 +188,8 @@ impl Actor for ParticipantActor {
 
     async fn post_stop(&mut self) -> Result<(), ActorError> {
         let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
-        self.source
+        self.ctx
+            .source
             .remove_participant(ufrag)
             .await
             .map_err(|_| ActorError::PostStopFailed("source is closed".to_string()))
@@ -605,12 +601,12 @@ pub struct ParticipantHandle {
 
 impl ParticipantHandle {
     pub fn new(
-        rng: Rng,
-        source: UdpSourceHandle,
-        sink: UdpSinkHandle,
+        ctx: context::Context,
         room: RoomHandle,
+        router: RouterHandle,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
+        available_tracks: Vec<Arc<TrackId>>,
     ) -> (Self, ParticipantActor) {
         let (data_sender, data_receiver) = mpsc::channel(128);
         let (control_sender, control_receiver) = mpsc::channel(8);
@@ -619,19 +615,24 @@ impl ParticipantHandle {
             control_sender,
             participant_id: participant_id.clone(),
         };
+
+        let mut available_tracks_map = HashMap::new();
+        for track in available_tracks.into_iter() {
+            available_tracks_map.insert(track.internal.clone(), None);
+        }
+
         let actor = ParticipantActor {
-            rng,
-            source,
+            ctx,
+            router,
+            audio_slots: Vec::new(),
             handle: handle.clone(),
             data_receiver,
             control_receiver,
-            sink,
             room,
             participant_id,
             rtc,
-            track_tasks: JoinSet::new(),
             published_tracks: HashMap::new(),
-            available_tracks: HashMap::new(),
+            available_tracks: available_tracks_map,
             video_slots: HashMap::new(),
             cid: None,
         };

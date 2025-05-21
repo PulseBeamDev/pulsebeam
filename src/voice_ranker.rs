@@ -17,6 +17,14 @@ pub struct VoiceRanker {
     now: Instant,
 }
 
+impl Default for VoiceRanker {
+    fn default() -> Self {
+        // higher = more stable/less flapping
+        // lower = more responsive
+        Self::new(Duration::from_millis(600))
+    }
+}
+
 impl VoiceRanker {
     pub fn new(decay_half_life: Duration) -> Self {
         Self {
