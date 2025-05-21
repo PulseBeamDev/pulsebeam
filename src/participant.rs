@@ -670,17 +670,33 @@ impl ParticipantHandle {
             .await
     }
 
-    pub fn forward_media(
+    pub fn forward_video(
         &self,
-        track: Arc<TrackIn>,
+        track_id: Arc<TrackId>,
         data: Arc<MediaData>,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
         let res = self
             .data_sender
-            .try_send(ParticipantDataMessage::ForwardVideo(track, data));
+            .try_send(ParticipantDataMessage::ForwardVideo(track_id, data));
 
         if let Err(err) = &res {
-            tracing::warn!("media packet is dropped: {err}");
+            tracing::warn!("video packet is dropped: {err}");
+        }
+
+        res
+    }
+
+    pub fn forward_audio(
+        &self,
+        track_id: Arc<TrackId>,
+        data: Arc<MediaData>,
+    ) -> Result<(), TrySendError<ParticipantDataMessage>> {
+        let res = self
+            .data_sender
+            .try_send(ParticipantDataMessage::ForwardAudio(track_id, data));
+
+        if let Err(err) = &res {
+            tracing::warn!("audio packet is dropped: {err}");
         }
 
         res
