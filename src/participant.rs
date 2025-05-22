@@ -16,13 +16,9 @@ use str0m::{
     net::{self, Transmit},
 };
 use tokio::{
-    sync::mpsc::{
-        self,
-        error::{SendError, TrySendError},
-    },
+    sync::mpsc::{self, error::TrySendError},
     time::Instant,
 };
-use tracing::Instrument;
 
 use crate::{
     actor::{Actor, ActorError},
@@ -48,11 +44,6 @@ pub enum ParticipantError {
 }
 
 #[derive(Debug)]
-pub enum ParticipantControlMessage {
-    RoomEvent,
-}
-
-#[derive(Debug)]
 pub enum ParticipantDataMessage {
     UdpPacket(message::UDPPacket),
     ForwardVideo(Arc<TrackId>, Arc<MediaData>),
@@ -70,6 +61,7 @@ struct PublishedTrackMeta {
     track_id: Arc<TrackId>,
     kind: MediaKind,
     simulcast: Option<Simulcast>,
+    last_keyframe_request: Instant,
 }
 
 struct AudioSlot {
@@ -94,8 +86,8 @@ pub struct ParticipantActor {
     ctx: context::Context,
 
     handle: ParticipantHandle,
-    data_receiver: mpsc::Receiver<ParticipantDataMessage>,
-    control_receiver: mpsc::Receiver<ParticipantControlMessage>,
+    data_rx: mpsc::Receiver<ParticipantDataMessage>,
+    control_rx: mpsc::Receiver<RoomEvent>,
     room: RoomHandle,
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
@@ -106,7 +98,7 @@ pub struct ParticipantActor {
 
     // video handling
     // InternalTrackId -> Mid
-    available_tracks: HashMap<Arc<EntityId>, Option<Mid>>,
+    available_tracks: HashMap<Arc<TrackId>, Option<Mid>>,
     video_slots: HashMap<Mid, MidOutSlot>,
 
     // audio handling
@@ -142,10 +134,6 @@ impl Actor for ParticipantActor {
     }
 
     async fn run(&mut self) -> Result<(), crate::actor::ActorError> {
-        // TODO: notify ingress to add self to the routing table
-        // WARN: be careful with spending too much time in this loop.
-        // We should yield back to the scheduler based on some heuristic here.
-
         loop {
             let delay = if let Some(delay) = self.poll().await {
                 delay
@@ -155,15 +143,12 @@ impl Actor for ParticipantActor {
             };
 
             tokio::select! {
-                Some(msg) = self.data_receiver.recv() => {
+                Some(msg) = self.data_rx.recv() => {
                     self.handle_data_message(msg).await;
                 }
 
-                msg = self.control_receiver.recv() => {
-                    match msg {
-                        Some(msg) => self.handle_control_message(msg).await,
-                        None => break,
-                    }
+                Some(msg) = self.control_rx.recv() => {
+                    self.handle_control_message(msg).await;
                 }
 
                 _ = tokio::time::sleep(delay) => {
@@ -209,15 +194,11 @@ impl ParticipantActor {
                 }
             }
             ParticipantDataMessage::ForwardVideo(track_id, data) => {
-                let Some(track) = self.available_tracks.get(&track_id.internal) else {
+                let Some(Some(mid)) = self.available_tracks.get(&track_id) else {
                     return;
                 };
 
-                let Some(mid) = track.mid else {
-                    return;
-                };
-
-                self.handle_forward_media(mid, data);
+                self.handle_forward_media(*mid, data);
             }
 
             ParticipantDataMessage::ForwardAudio(track_id, data) => {
@@ -246,6 +227,15 @@ impl ParticipantActor {
             }
 
             ParticipantDataMessage::KeyframeRequest(track_id, req) => {
+                let Some(meta) = self.published_tracks.get_mut(&track_id.origin_mid) else {
+                    return;
+                };
+
+                if meta.last_keyframe_request.elapsed() > Duration::from_secs(1) {
+                    return;
+                }
+
+                meta.last_keyframe_request = Instant::now();
                 let Some(mut writer) = self.rtc.writer(track_id.origin_mid) else {
                     tracing::warn!(mid=?track_id.origin_mid, "mid is not found for regenerating a keyframe");
                     return;
@@ -258,43 +248,13 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
+    async fn handle_control_message(&mut self, msg: RoomEvent) {
         use sfu::server_message::Payload;
 
         match msg {
-            ParticipantControlMessage::TrackAdded(track) => {
-                // let mut new_tracks = Vec::new();
-                //
-                // // new tracks from other participants
-                // tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
-                // let track_id = track.meta.id.clone();
-                //
-                // self.available_tracks.insert(
-                //     track_id.internal.clone(),
-                //     TrackOut {
-                //         handle: track.clone(),
-                //         mid: None,
-                //     },
-                // );
-                // let kind = if track.meta.kind.is_video() {
-                //     sfu::TrackKind::Video
-                // } else {
-                //     sfu::TrackKind::Audio
-                // };
-                //
-                // new_tracks.push(sfu::TrackInfo {
-                //     track_id: track.meta.id.to_string(),
-                //     kind: kind as i32,
-                //     participant_id: track.meta.id.origin_participant.to_string(),
-                // });
-                //
-                // self.send_server_event(Payload::TrackPublished(sfu::TrackPublishedPayload {
-                //     remote_tracks: new_tracks,
-                // }));
-                // self.reconfigure_downstreams().await;
-            }
-            ParticipantControlMessage::TrackRemoved(track_id) => {
-                let Some(Some(mid)) = self.available_tracks.remove(&track_id.internal) else {
+            RoomEvent::TrackAdded(track) => self.handle_track_added(track).await,
+            RoomEvent::TrackRemoved(track_id) => {
+                let Some(Some(mid)) = self.available_tracks.remove(&track_id) else {
                     return;
                 };
 
@@ -302,11 +262,34 @@ impl ParticipantActor {
                 // likely rearrange their layout and subscribe for new streams.
                 self.video_slots.remove(&mid);
 
-                // self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
-                //     remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
-                // }));
+                self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
+                    remote_track_id: track_id.to_string(),
+                }));
             }
         }
+    }
+
+    async fn handle_track_added(&mut self, track: Arc<TrackIn>) {
+        use sfu::server_message::Payload;
+
+        // new tracks from other participants
+        tracing::info!(track_id = ?track, origin = ?track.id.origin_participant, "subscribed track");
+
+        self.available_tracks.insert(track.id.clone(), None);
+        let kind = if track.kind.is_video() {
+            sfu::TrackKind::Video
+        } else {
+            sfu::TrackKind::Audio
+        };
+
+        self.send_server_event(Payload::TrackPublished(sfu::TrackPublishedPayload {
+            remote_track: Some(sfu::TrackInfo {
+                track_id: track.id.to_string(),
+                kind: kind as i32,
+                participant_id: track.id.origin_participant.to_string(),
+            }),
+        }));
+        self.reconfigure_downstreams().await;
     }
 
     async fn poll(&mut self) -> Option<Duration> {
@@ -487,7 +470,8 @@ impl ParticipantActor {
             Direction::RecvOnly => {
                 tracing::info!(?media, "handle_new_media from client");
                 // TODO: handle back pressure by buffering temporarily
-                let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
+                let track_id =
+                    TrackId::new(&mut self.ctx.rng, self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
                 self.published_tracks.insert(
                     media.mid,
@@ -495,6 +479,7 @@ impl ParticipantActor {
                         track_id,
                         kind: media.kind,
                         simulcast: media.simulcast,
+                        last_keyframe_request: Instant::now(),
                     },
                 );
 
@@ -555,19 +540,21 @@ impl ParticipantActor {
                 continue;
             }
 
-            for (_, track) in &mut self.available_tracks {
-                if track.mid.is_some() {
+            for (track_id, track_mid) in &mut self.available_tracks {
+                if track_mid.is_some() {
                     continue;
-                }
+                };
 
-                if track.handle.meta.kind == mid_slot.kind {
-                    let Ok(_) = track.handle.subscribe(self.handle.clone()).await else {
-                        continue;
-                    };
-                    track.mid = Some(*mid);
-                    mid_slot.track_id = Some(track.handle.meta.id.clone());
-                    break;
-                }
+                track_mid.replace(*mid);
+                mid_slot.track_id = Some(track_id.clone());
+
+                // TODO: subscribe to room
+                // self.room
+                //     .control_tx
+                //     .send(crate::room::RoomControlMessage::Subscribe(track_id))
+                //     .await;
+
+                break;
             }
         }
     }
@@ -575,7 +562,7 @@ impl ParticipantActor {
 
 #[derive(Clone, Debug)]
 pub struct ParticipantHandle {
-    pub data_sender: mpsc::Sender<ParticipantDataMessage>,
+    pub data_tx: mpsc::Sender<ParticipantDataMessage>,
     pub control_tx: mpsc::Sender<RoomEvent>,
     pub participant_id: Arc<ParticipantId>,
 }
@@ -591,22 +578,22 @@ impl ParticipantHandle {
         let (data_sender, data_receiver) = mpsc::channel(128);
         let (control_sender, control_receiver) = mpsc::channel(8);
         let handle = Self {
-            data_sender,
+            data_tx: data_sender,
             control_tx: control_sender,
             participant_id: participant_id.clone(),
         };
 
         let mut available_tracks_map = HashMap::new();
         for track in available_tracks.into_iter() {
-            available_tracks_map.insert(track.internal.clone(), None);
+            available_tracks_map.insert(track, None);
         }
 
         let actor = ParticipantActor {
             ctx,
             audio_slots: Vec::new(),
             handle: handle.clone(),
-            data_receiver,
-            control_receiver,
+            data_rx: data_receiver,
+            control_rx: control_receiver,
             room,
             participant_id,
             rtc,
@@ -623,7 +610,7 @@ impl ParticipantHandle {
         msg: message::UDPPacket,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
         let res = self
-            .data_sender
+            .data_tx
             .try_send(ParticipantDataMessage::UdpPacket(msg));
 
         if let Err(err) = &res {
@@ -638,7 +625,7 @@ impl ParticipantHandle {
         data: Arc<MediaData>,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
         let res = self
-            .data_sender
+            .data_tx
             .try_send(ParticipantDataMessage::ForwardVideo(track_id, data));
 
         if let Err(err) = &res {
@@ -654,7 +641,7 @@ impl ParticipantHandle {
         data: Arc<MediaData>,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
         let res = self
-            .data_sender
+            .data_tx
             .try_send(ParticipantDataMessage::ForwardAudio(track_id, data));
 
         if let Err(err) = &res {
@@ -666,7 +653,7 @@ impl ParticipantHandle {
 
     pub fn request_keyframe(&self, track_id: Arc<TrackId>, req: message::KeyframeRequest) {
         if let Err(err) = self
-            .data_sender
+            .data_tx
             .try_send(ParticipantDataMessage::KeyframeRequest(track_id, req))
         {
             tracing::warn!("keyframe request is dropped by the participant actor: {err}");

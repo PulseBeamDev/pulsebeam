@@ -32,13 +32,14 @@ use crate::{
 
 #[derive(Debug)]
 pub enum RoomControlMessage {
-    PublishTrack(Arc<TrackIn>),
     AddParticipant(Arc<ParticipantId>, Rtc),
+    Subscribe(Arc<TrackId>),
+    RoomEvent,
 }
 
 #[derive(Debug, Clone)]
 pub enum RoomEvent {
-    TrackAdded(Arc<TrackId>),
+    TrackAdded(Arc<TrackIn>),
     TrackRemoved(Arc<TrackId>),
 }
 
@@ -155,7 +156,7 @@ impl RoomActor {
                     .in_current_span(),
                 );
             }
-            RoomControlMessage::PublishTrack(track_id) => {
+            RoomControlMessage::RoomEvent(RoomEvent::TrackAdded(track)) => {
                 todo!();
                 // let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
                 //     tracing::warn!("{} is missing from participants, ignoring track", track_id);
@@ -297,6 +298,7 @@ impl RoomHandle {
             participant_tasks: JoinSet::new(),
             voice_ranker: VoiceRanker::default(),
             video_forwarding_rules: HashMap::new(),
+            event_queue: FuturesUnordered::new(),
         };
         (handle, actor)
     }
