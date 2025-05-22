@@ -20,23 +20,17 @@ use tokio::{
         self,
         error::{SendError, TrySendError},
     },
-    task::JoinSet,
     time::Instant,
 };
 use tracing::Instrument;
 
 use crate::{
-    actor::{self, Actor, ActorError},
+    actor::{Actor, ActorError},
     context,
     entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
     proto::sfu,
-    rng::Rng,
-    room::RoomHandle,
-    router::RouterHandle,
-    sink::UdpSinkHandle,
-    source::UdpSourceHandle,
-    track::TrackHandle,
+    room::{RoomEvent, RoomHandle},
 };
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
@@ -55,8 +49,7 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    TracksAdded(Arc<Vec<TrackHandle>>),
-    TracksRemoved(Arc<Vec<Arc<TrackId>>>),
+    RoomEvent,
 }
 
 #[derive(Debug)]
@@ -107,7 +100,6 @@ pub struct ParticipantActor {
     participant_id: Arc<ParticipantId>,
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
-    router: RouterHandle,
 
     // video/audio meta handling
     published_tracks: HashMap<Mid, PublishedTrackMeta>,
@@ -270,60 +262,49 @@ impl ParticipantActor {
         use sfu::server_message::Payload;
 
         match msg {
-            ParticipantControlMessage::TracksAdded(tracks) => {
-                let mut should_reconfigure: bool = false;
-                let mut new_tracks = Vec::new();
-
-                for track in tracks.iter() {
-                    // new tracks from other participants
-                    tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
-                    let track_id = track.meta.id.clone();
-
-                    self.available_tracks.insert(
-                        track_id.internal.clone(),
-                        TrackOut {
-                            handle: track.clone(),
-                            mid: None,
-                        },
-                    );
-                    let kind = if track.meta.kind.is_video() {
-                        sfu::TrackKind::Video
-                    } else {
-                        sfu::TrackKind::Audio
-                    };
-
-                    new_tracks.push(sfu::TrackInfo {
-                        track_id: track.meta.id.to_string(),
-                        kind: kind as i32,
-                        participant_id: track.meta.id.origin_participant.to_string(),
-                    });
-                    should_reconfigure = true;
-                }
-
-                if should_reconfigure {
-                    self.send_server_event(Payload::TrackPublished(sfu::TrackPublishedPayload {
-                        remote_tracks: new_tracks,
-                    }));
-                    self.reconfigure_downstreams().await;
-                }
+            ParticipantControlMessage::TrackAdded(track) => {
+                // let mut new_tracks = Vec::new();
+                //
+                // // new tracks from other participants
+                // tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
+                // let track_id = track.meta.id.clone();
+                //
+                // self.available_tracks.insert(
+                //     track_id.internal.clone(),
+                //     TrackOut {
+                //         handle: track.clone(),
+                //         mid: None,
+                //     },
+                // );
+                // let kind = if track.meta.kind.is_video() {
+                //     sfu::TrackKind::Video
+                // } else {
+                //     sfu::TrackKind::Audio
+                // };
+                //
+                // new_tracks.push(sfu::TrackInfo {
+                //     track_id: track.meta.id.to_string(),
+                //     kind: kind as i32,
+                //     participant_id: track.meta.id.origin_participant.to_string(),
+                // });
+                //
+                // self.send_server_event(Payload::TrackPublished(sfu::TrackPublishedPayload {
+                //     remote_tracks: new_tracks,
+                // }));
+                // self.reconfigure_downstreams().await;
             }
-            ParticipantControlMessage::TracksRemoved(track_ids) => {
-                for track_id in track_ids.iter() {
-                    let Some(track) = self.available_tracks.remove(&track_id.internal) else {
-                        return;
-                    };
+            ParticipantControlMessage::TrackRemoved(track_id) => {
+                let Some(Some(mid)) = self.available_tracks.remove(&track_id.internal) else {
+                    return;
+                };
 
-                    let Some(mid) = track.mid else {
-                        return;
-                    };
+                // We don't reconfigure downstreams here because the client will
+                // likely rearrange their layout and subscribe for new streams.
+                self.video_slots.remove(&mid);
 
-                    // We don't reconfigure downstreams here because the client will
-                    // likely rearrange their layout and subscribe for new streams.
-                    self.video_slots.remove(&mid);
-                }
-                self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
-                    remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
-                }));
+                // self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
+                //     remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
+                // }));
             }
         }
     }
@@ -595,7 +576,7 @@ impl ParticipantActor {
 #[derive(Clone, Debug)]
 pub struct ParticipantHandle {
     pub data_sender: mpsc::Sender<ParticipantDataMessage>,
-    pub control_sender: mpsc::Sender<ParticipantControlMessage>,
+    pub control_tx: mpsc::Sender<RoomEvent>,
     pub participant_id: Arc<ParticipantId>,
 }
 
@@ -603,7 +584,6 @@ impl ParticipantHandle {
     pub fn new(
         ctx: context::Context,
         room: RoomHandle,
-        router: RouterHandle,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
         available_tracks: Vec<Arc<TrackId>>,
@@ -612,7 +592,7 @@ impl ParticipantHandle {
         let (control_sender, control_receiver) = mpsc::channel(8);
         let handle = Self {
             data_sender,
-            control_sender,
+            control_tx: control_sender,
             participant_id: participant_id.clone(),
         };
 
@@ -623,7 +603,6 @@ impl ParticipantHandle {
 
         let actor = ParticipantActor {
             ctx,
-            router,
             audio_slots: Vec::new(),
             handle: handle.clone(),
             data_receiver,
@@ -651,24 +630,6 @@ impl ParticipantHandle {
             tracing::warn!("raw packet is dropped: {err}");
         }
         res
-    }
-
-    pub async fn add_tracks(
-        &self,
-        tracks: Arc<Vec<TrackHandle>>,
-    ) -> Result<(), SendError<ParticipantControlMessage>> {
-        self.control_sender
-            .send(ParticipantControlMessage::TracksAdded(tracks))
-            .await
-    }
-
-    pub async fn remove_tracks(
-        &self,
-        track_ids: Arc<Vec<Arc<TrackId>>>,
-    ) -> Result<(), SendError<ParticipantControlMessage>> {
-        self.control_sender
-            .send(ParticipantControlMessage::TracksRemoved(track_ids))
-            .await
     }
 
     pub fn forward_video(

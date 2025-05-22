@@ -2,16 +2,22 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::Display,
     ops::Deref,
+    pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
+use futures::{StreamExt, stream::FuturesUnordered};
 use str0m::{
     Rtc,
     media::{MediaData, Rid},
 };
 use tokio::{
-    sync::mpsc::{self, error::SendError},
-    task::{JoinSet, LocalSet},
+    sync::mpsc::{
+        self,
+        error::{SendError, SendTimeoutError, TrySendError},
+    },
+    task::JoinSet,
 };
 use tracing::Instrument;
 
@@ -20,9 +26,7 @@ use crate::{
     context,
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackIn,
-    participant::{ParticipantActor, ParticipantHandle},
-    rng::Rng,
-    router::RouterHandle,
+    participant::ParticipantHandle,
     voice_ranker::VoiceRanker,
 };
 
@@ -32,6 +36,13 @@ pub enum RoomControlMessage {
     AddParticipant(Arc<ParticipantId>, Rtc),
 }
 
+#[derive(Debug, Clone)]
+pub enum RoomEvent {
+    TrackAdded(Arc<TrackId>),
+    TrackRemoved(Arc<TrackId>),
+}
+
+#[derive(Debug)]
 pub enum RoomDataMessage {
     ForwardVideo(Arc<TrackId>, Arc<MediaData>),
     ForwardAudio(Arc<TrackId>, Arc<MediaData>),
@@ -42,6 +53,8 @@ pub struct ParticipantMeta {
     tracks: HashMap<Arc<TrackId>, Arc<TrackIn>>,
 }
 
+type BroadcastEventFuture = Pin<Box<dyn Future<Output = Option<Arc<ParticipantId>>> + Send>>;
+
 /// Reponsibilities:
 /// * Manage Participant Lifecycle
 /// * Manage Track Lifecycle
@@ -50,16 +63,19 @@ pub struct ParticipantMeta {
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
+    // Actor Loop
     ctx: context::Context,
     control_rx: mpsc::Receiver<RoomControlMessage>,
     data_rx: mpsc::Receiver<RoomDataMessage>,
     handle: RoomHandle,
 
+    // Control Plane
+    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
+    event_queue: FuturesUnordered<BroadcastEventFuture>,
 
-    // Data plane
+    // Data Plane
     voice_ranker: VoiceRanker,
-    participants: Vec<ParticipantHandle>,
     video_forwarding_rules: HashMap<(Arc<TrackId>, Option<Rid>), VecDeque<ParticipantHandle>>,
 }
 
@@ -77,15 +93,24 @@ impl Actor for RoomActor {
     async fn run(&mut self) -> Result<(), ActorError> {
         loop {
             tokio::select! {
-                res = self.receiver.recv() => {
-                    match res {
-                        Some(msg) => self.handle_control_message(msg).await,
-                        None => break,
+                Some(msg) = self.control_rx.recv() => {
+                    self.handle_control_message(msg);
+                }
+
+                Some(msg) = self.data_rx.recv() => {
+                    self.handle_data_message(msg);
+                }
+
+                res = self.participant_tasks.join_next() => {
+                    if let Some(Ok(participant_id)) = res {
+                        self.handle_participant_left(participant_id);
                     }
                 }
 
-                Some(Ok(participant_id)) = self.participant_tasks.join_next() => {
-                    self.handle_participant_left(participant_id).await;
+                Some(res) = self.event_queue.next() => {
+                    if let Some(participant_id) = res {
+                        // TODO: participant_id must be closed forcefully
+                    }
                 }
 
                 else => break,
@@ -97,7 +122,7 @@ impl Actor for RoomActor {
 }
 
 impl RoomActor {
-    async fn handle_control_message(&mut self, msg: RoomControlMessage) {
+    fn handle_control_message(&mut self, msg: RoomControlMessage) {
         match msg {
             RoomControlMessage::AddParticipant(participant_id, rtc) => {
                 let mut tracks = Vec::new();
@@ -110,7 +135,6 @@ impl RoomActor {
                 let (participant_handle, participant_actor) = ParticipantHandle::new(
                     self.ctx.clone(),
                     self.handle.clone(),
-                    self.router.clone(),
                     participant_id.clone(),
                     rtc,
                     tracks,
@@ -132,38 +156,76 @@ impl RoomActor {
                 );
             }
             RoomControlMessage::PublishTrack(track_id) => {
-                let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
-                    tracing::warn!("{} is missing from participants, ignoring track", track_id);
-                    return;
-                };
-
-                origin.tracks.insert(track_id.clone(), track_id.clone());
-                let new_tracks = Arc::new(vec![track_id]);
-                for (_, participant) in &self.participants {
-                    let _ = participant.handle.add_tracks(new_tracks.clone()).await;
-                }
+                todo!();
+                // let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
+                //     tracing::warn!("{} is missing from participants, ignoring track", track_id);
+                //     return;
+                // };
+                //
+                // origin.tracks.insert(track_id.clone(), track_id.clone());
+                // let new_tracks = Arc::new(vec![track_id]);
+                // for (_, participant) in &self.participants {
+                //     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
+                // }
             }
         };
     }
 
-    async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
-        // TODO: notify participant leaving
-        let Some(participant) = self.participants.remove(&participant_id) else {
-            return;
-        };
+    fn broadcast_event(&mut self, from: Arc<ParticipantId>, event: RoomEvent) {
+        for (participant_id, meta) in &self.participants {
+            // don't loopback to the sender, this will cause a deadlock!
+            if *participant_id == from {
+                continue;
+            }
 
-        let tracks: Vec<Arc<TrackId>> = participant
-            .tracks
-            .into_values()
-            .map(|t| t.meta.id.clone())
-            .collect();
-        let tracks = Arc::new(tracks);
-        for (_, participant) in &self.participants {
-            let _ = participant.handle.remove_tracks(tracks.clone()).await;
+            let event = match meta.handle.control_tx.try_send(event.clone()) {
+                Ok(_) => continue,
+                Err(TrySendError::Closed(_)) => {
+                    // the join task loop will run and cleanup
+                    continue;
+                }
+                Err(TrySendError::Full(event)) => event,
+            };
+
+            let event = event.clone();
+            let handle = meta.handle.clone();
+            let participant_id = participant_id.clone();
+            let task = Box::pin(async move {
+                // TODO: pick a better timeout here
+                let res = handle
+                    .control_tx
+                    .send_timeout(event, Duration::from_secs(1))
+                    .await;
+
+                match res {
+                    Ok(_) => None,
+                    // the join task loop will run and cleanup
+                    Err(SendTimeoutError::Closed(_)) => None,
+                    Err(SendTimeoutError::Timeout(_)) => Some(participant_id),
+                }
+            });
+            self.event_queue.push(task);
         }
     }
 
-    async fn handle_data_message(&mut self, msg: RoomDataMessage) {
+    fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
+        // TODO: notify participant leaving
+        // let Some(participant) = self.participants.remove(&participant_id) else {
+        //     return;
+        // };
+        //
+        // let tracks: Vec<Arc<TrackId>> = participant
+        //     .tracks
+        //     .into_values()
+        //     .map(|t| t.meta.id.clone())
+        //     .collect();
+        // let tracks = Arc::new(tracks);
+        // for (_, participant) in &self.participants {
+        //     let _ = participant.handle.remove_tracks(tracks.clone()).await;
+        // }
+    }
+
+    fn handle_data_message(&mut self, msg: RoomDataMessage) {
         match msg {
             RoomDataMessage::ForwardVideo(track_id, media) => {
                 let Some(participants) = self
@@ -199,11 +261,11 @@ impl RoomActor {
                 }
 
                 // If we reach here, the packet is dominant and should be forwarded.
-                for participant in &self.participants {
-                    if track_id.origin_participant == participant.participant_id {
+                for (participant_id, meta) in &self.participants {
+                    if track_id.origin_participant == *participant_id {
                         continue;
                     }
-                    let _ = participant.forward_audio(track_id.clone(), media.clone());
+                    let _ = meta.handle.forward_audio(track_id.clone(), media.clone());
                 }
             }
         };
@@ -231,7 +293,7 @@ impl RoomHandle {
             control_rx,
             data_rx,
             handle: handle.clone(),
-            participants: Vec::new(),
+            participants: HashMap::new(),
             participant_tasks: JoinSet::new(),
             voice_ranker: VoiceRanker::default(),
             video_forwarding_rules: HashMap::new(),
