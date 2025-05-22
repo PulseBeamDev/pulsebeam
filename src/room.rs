@@ -1,9 +1,17 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Display,
+    ops::Deref,
+    sync::Arc,
+};
 
-use str0m::Rtc;
+use str0m::{
+    Rtc,
+    media::{MediaData, Rid},
+};
 use tokio::{
     sync::mpsc::{self, error::SendError},
-    task::JoinSet,
+    task::{JoinSet, LocalSet},
 };
 use tracing::Instrument;
 
@@ -15,12 +23,18 @@ use crate::{
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
     router::RouterHandle,
+    voice_ranker::VoiceRanker,
 };
 
 #[derive(Debug)]
-pub enum RoomMessage {
+pub enum RoomControlMessage {
     PublishTrack(Arc<TrackIn>),
     AddParticipant(Arc<ParticipantId>, Rtc),
+}
+
+pub enum RoomDataMessage {
+    ForwardVideo(Arc<TrackId>, Arc<MediaData>),
+    ForwardAudio(Arc<TrackId>, Arc<MediaData>),
 }
 
 pub struct ParticipantMeta {
@@ -37,12 +51,16 @@ pub struct ParticipantMeta {
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
     ctx: context::Context,
-    receiver: mpsc::Receiver<RoomMessage>,
+    control_rx: mpsc::Receiver<RoomControlMessage>,
+    data_rx: mpsc::Receiver<RoomDataMessage>,
     handle: RoomHandle,
-    router: RouterHandle,
 
-    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
+
+    // Data plane
+    voice_ranker: VoiceRanker,
+    participants: Vec<ParticipantHandle>,
+    video_forwarding_rules: HashMap<(Arc<TrackId>, Option<Rid>), VecDeque<ParticipantHandle>>,
 }
 
 impl Actor for RoomActor {
@@ -61,7 +79,7 @@ impl Actor for RoomActor {
             tokio::select! {
                 res = self.receiver.recv() => {
                     match res {
-                        Some(msg) => self.handle_message(msg).await,
+                        Some(msg) => self.handle_control_message(msg).await,
                         None => break,
                     }
                 }
@@ -79,9 +97,9 @@ impl Actor for RoomActor {
 }
 
 impl RoomActor {
-    async fn handle_message(&mut self, msg: RoomMessage) {
+    async fn handle_control_message(&mut self, msg: RoomControlMessage) {
         match msg {
-            RoomMessage::AddParticipant(participant_id, rtc) => {
+            RoomControlMessage::AddParticipant(participant_id, rtc) => {
                 let mut tracks = Vec::new();
                 for meta in self.participants.values() {
                     for (track_id, _) in &meta.tracks {
@@ -113,7 +131,7 @@ impl RoomActor {
                     .in_current_span(),
                 );
             }
-            RoomMessage::PublishTrack(track_id) => {
+            RoomControlMessage::PublishTrack(track_id) => {
                 let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
                     tracing::warn!("{} is missing from participants, ignoring track", track_id);
                     return;
@@ -144,27 +162,79 @@ impl RoomActor {
             let _ = participant.handle.remove_tracks(tracks.clone()).await;
         }
     }
+
+    async fn handle_data_message(&mut self, msg: RoomDataMessage) {
+        match msg {
+            RoomDataMessage::ForwardVideo(track_id, media) => {
+                let Some(participants) = self
+                    .video_forwarding_rules
+                    .get(&(track_id.clone(), media.rid))
+                else {
+                    return;
+                };
+
+                for participant in participants {
+                    let _ = participant.forward_video(track_id.clone(), media.clone());
+                }
+            }
+            RoomDataMessage::ForwardAudio(track_id, media) => {
+                let audio_level_val =
+                    match (media.ext_vals.audio_level, media.ext_vals.voice_activity) {
+                        (Some(level), Some(true)) => level, // VAD is true, and we have an audio level
+                        _ => {
+                            // No VAD, or no audio level, or VAD is false.
+                            tracing::trace!(
+                                "Audio packet for track {:?} without VAD/level, not ranking.",
+                                track_id
+                            );
+                            return; // Don't process or forward
+                        }
+                    };
+
+                if !self
+                    .voice_ranker
+                    .process_packet(track_id.clone(), audio_level_val)
+                {
+                    return; // Not dominant
+                }
+
+                // If we reach here, the packet is dominant and should be forwarded.
+                for participant in &self.participants {
+                    if track_id.origin_participant == participant.participant_id {
+                        continue;
+                    }
+                    let _ = participant.forward_audio(track_id.clone(), media.clone());
+                }
+            }
+        };
+    }
 }
 
 #[derive(Clone)]
 pub struct RoomHandle {
-    pub sender: mpsc::Sender<RoomMessage>,
+    pub control_tx: mpsc::Sender<RoomControlMessage>,
+    pub data_tx: mpsc::Sender<RoomDataMessage>,
     pub room_id: Arc<RoomId>,
 }
 
 impl RoomHandle {
     pub fn new(ctx: context::Context, room_id: Arc<RoomId>) -> (Self, RoomActor) {
-        let (sender, receiver) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let (data_tx, data_rx) = mpsc::channel(128);
         let handle = RoomHandle {
-            sender,
+            control_tx,
+            data_tx,
             room_id: room_id.clone(),
         };
         let actor = RoomActor {
             ctx,
-            receiver,
+            control_rx,
+            data_rx,
             handle: handle.clone(),
-            participants: HashMap::new(),
+            participants: Vec::new(),
             participant_tasks: JoinSet::new(),
+            voice_ranker: VoiceRanker::default(),
+            video_forwarding_rules: HashMap::new(),
         };
         (handle, actor)
     }
@@ -173,14 +243,36 @@ impl RoomHandle {
         &self,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
-    ) -> Result<(), SendError<RoomMessage>> {
-        self.sender
-            .send(RoomMessage::AddParticipant(participant_id, rtc))
+    ) -> Result<(), SendError<RoomControlMessage>> {
+        self.control_tx
+            .send(RoomControlMessage::AddParticipant(participant_id, rtc))
             .await
     }
 
-    pub async fn publish(&self, track: Arc<TrackIn>) -> Result<(), SendError<RoomMessage>> {
-        self.sender.send(RoomMessage::PublishTrack(track)).await
+    pub async fn publish(&self, track: Arc<TrackIn>) -> Result<(), SendError<RoomControlMessage>> {
+        self.control_tx
+            .send(RoomControlMessage::PublishTrack(track))
+            .await
+    }
+
+    pub async fn forward_video(
+        &self,
+        track_id: Arc<TrackId>,
+        media: Arc<MediaData>,
+    ) -> Result<(), SendError<RoomDataMessage>> {
+        self.data_tx
+            .send(RoomDataMessage::ForwardVideo(track_id, media))
+            .await
+    }
+
+    pub async fn forward_audio(
+        &self,
+        track_id: Arc<TrackId>,
+        media: Arc<MediaData>,
+    ) -> Result<(), SendError<RoomDataMessage>> {
+        self.data_tx
+            .send(RoomDataMessage::ForwardAudio(track_id, media))
+            .await
     }
 }
 
