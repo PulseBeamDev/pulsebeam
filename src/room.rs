@@ -34,7 +34,8 @@ use crate::{
 pub enum RoomControlMessage {
     AddParticipant(Arc<ParticipantId>, Rtc),
     Subscribe(Arc<TrackId>),
-    RoomEvent,
+    TrackAdded(Arc<TrackIn>),
+    TrackRemoved(Arc<TrackId>),
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +157,7 @@ impl RoomActor {
                     .in_current_span(),
                 );
             }
-            RoomControlMessage::RoomEvent(RoomEvent::TrackAdded(track)) => {
+            RoomControlMessage::TrackAdded(track) => {
                 todo!();
                 // let Some(origin) = self.participants.get_mut(&track_id.origin_participant) else {
                 //     tracing::warn!("{} is missing from participants, ignoring track", track_id);
@@ -169,6 +170,7 @@ impl RoomActor {
                 //     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
                 // }
             }
+            _ => todo!(),
         };
     }
 
@@ -315,7 +317,16 @@ impl RoomHandle {
 
     pub async fn publish(&self, track: Arc<TrackIn>) -> Result<(), SendError<RoomControlMessage>> {
         self.control_tx
-            .send(RoomControlMessage::PublishTrack(track))
+            .send(RoomControlMessage::TrackAdded(track))
+            .await
+    }
+
+    pub async fn unpublish(
+        &self,
+        track_id: Arc<TrackId>,
+    ) -> Result<(), SendError<RoomControlMessage>> {
+        self.control_tx
+            .send(RoomControlMessage::TrackRemoved(track_id))
             .await
     }
 

@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::{self, Display},
-    ops::Deref,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -51,17 +45,22 @@ pub enum ParticipantDataMessage {
     KeyframeRequest(Arc<TrackId>, message::KeyframeRequest),
 }
 
-struct MidOutSlot {
-    kind: MediaKind,
-    simulcast: Option<Simulcast>,
-    track_id: Option<Arc<TrackId>>,
-}
-
 struct PublishedTrackMeta {
     track_id: Arc<TrackId>,
     kind: MediaKind,
     simulcast: Option<Simulcast>,
     last_keyframe_request: Instant,
+}
+
+struct VideoTrackMeta {
+    track_id: Arc<TrackId>,
+    mid: Option<Mid>,
+}
+
+struct VideoSlot {
+    kind: MediaKind,
+    simulcast: Option<Simulcast>,
+    track_id: Option<Arc<TrackId>>,
 }
 
 struct AudioSlot {
@@ -98,19 +97,11 @@ pub struct ParticipantActor {
 
     // video handling
     // InternalTrackId -> Mid
-    available_tracks: HashMap<Arc<TrackId>, Option<Mid>>,
-    video_slots: HashMap<Mid, MidOutSlot>,
+    available_video_tracks: HashMap<Arc<EntityId>, VideoTrackMeta>,
+    video_slots: HashMap<Mid, VideoSlot>,
 
     // audio handling
     audio_slots: Vec<AudioSlot>,
-}
-
-impl fmt::Debug for ParticipantActor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParticipantActor")
-            .field("participant_id", &self.participant_id)
-            .finish()
-    }
 }
 
 impl Actor for ParticipantActor {
@@ -194,11 +185,15 @@ impl ParticipantActor {
                 }
             }
             ParticipantDataMessage::ForwardVideo(track_id, data) => {
-                let Some(Some(mid)) = self.available_tracks.get(&track_id) else {
+                let Some(meta) = self.available_video_tracks.get(&track_id.internal) else {
                     return;
                 };
 
-                self.handle_forward_media(*mid, data);
+                let Some(mid) = meta.mid else {
+                    return;
+                };
+
+                self.handle_forward_media(mid, data);
             }
 
             ParticipantDataMessage::ForwardAudio(track_id, data) => {
@@ -254,7 +249,11 @@ impl ParticipantActor {
         match msg {
             RoomEvent::TrackAdded(track) => self.handle_track_added(track).await,
             RoomEvent::TrackRemoved(track_id) => {
-                let Some(Some(mid)) = self.available_tracks.remove(&track_id) else {
+                let Some(meta) = self.available_video_tracks.remove(&track_id.internal) else {
+                    return;
+                };
+
+                let Some(mid) = meta.mid else {
                     return;
                 };
 
@@ -275,7 +274,8 @@ impl ParticipantActor {
         // new tracks from other participants
         tracing::info!(track_id = ?track, origin = ?track.id.origin_participant, "subscribed track");
 
-        self.available_tracks.insert(track.id.clone(), None);
+        self.available_video_tracks
+            .insert(track.id.internal.clone(), None);
         let kind = if track.kind.is_video() {
             sfu::TrackKind::Video
         } else {
@@ -352,7 +352,10 @@ impl ParticipantActor {
         match payload {
             sfu::client_message::Payload::Subscribe(subscribe) => {
                 let mid = Mid::from(subscribe.mid.as_str());
-                if let Some(track) = self.available_tracks.get_mut(&subscribe.remote_track_id) {
+                if let Some(track) = self
+                    .available_video_tracks
+                    .get_mut(&subscribe.remote_track_id)
+                {
                     if let Some(slot) = self.video_slots.get_mut(&mid) {
                         track.mid.replace(mid);
                         if let Some(last_track) =
@@ -449,7 +452,7 @@ impl ParticipantActor {
     }
 
     fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
-        let Some(MidOutSlot {
+        let Some(VideoSlot {
             track_id: Some(track_id),
             ..
         }) = self.video_slots.get(&req.mid)
@@ -457,7 +460,7 @@ impl ParticipantActor {
             return;
         };
 
-        let Some(track) = self.available_tracks.get(&track_id.internal) else {
+        let Some(track) = self.available_video_tracks.get(&track_id.internal) else {
             return;
         };
 
@@ -484,10 +487,7 @@ impl ParticipantActor {
                 );
 
                 if media.kind.is_video() {
-                    if let Err(err) = self.room.publish(handle).await {
-                        // this participant should get cleaned up by the supervisor
-                        tracing::warn!("failed to publish track to room: {err}");
-                    }
+                    todo!()
                 } else {
                     self.audio_slots.push(AudioSlot {
                         mid: media.mid,
@@ -501,7 +501,7 @@ impl ParticipantActor {
                 tracing::info!(?media, "handle_new_media from other participant");
                 self.video_slots.insert(
                     media.mid,
-                    MidOutSlot {
+                    VideoSlot {
                         kind: media.kind,
                         simulcast: media.simulcast,
                         track_id: None,
@@ -540,7 +540,7 @@ impl ParticipantActor {
                 continue;
             }
 
-            for (track_id, track_mid) in &mut self.available_tracks {
+            for (track_id, track_mid) in &mut self.available_video_tracks {
                 if track_mid.is_some() {
                     continue;
                 };
@@ -548,7 +548,6 @@ impl ParticipantActor {
                 track_mid.replace(*mid);
                 mid_slot.track_id = Some(track_id.clone());
 
-                // TODO: subscribe to room
                 // self.room
                 //     .control_tx
                 //     .send(crate::room::RoomControlMessage::Subscribe(track_id))
@@ -585,7 +584,7 @@ impl ParticipantHandle {
 
         let mut available_tracks_map = HashMap::new();
         for track in available_tracks.into_iter() {
-            available_tracks_map.insert(track, None);
+            available_tracks_map.insert(track.internal.clone(), None);
         }
 
         let actor = ParticipantActor {
@@ -598,7 +597,7 @@ impl ParticipantHandle {
             participant_id,
             rtc,
             published_tracks: HashMap::new(),
-            available_tracks: available_tracks_map,
+            available_video_tracks: available_tracks_map,
             video_slots: HashMap::new(),
             cid: None,
         };
