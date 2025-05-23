@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     ops::Deref,
     pin::Pin,
@@ -24,7 +24,7 @@ use tracing::Instrument;
 use crate::{
     actor::{self, Actor, ActorError},
     context,
-    entity::{ParticipantId, RoomId, TrackId},
+    entity::{ExternalParticipantId, ParticipantId, RoomId, TrackId},
     message::TrackIn,
     participant::ParticipantHandle,
     voice_ranker::VoiceRanker,
@@ -72,6 +72,7 @@ pub struct RoomActor {
     handle: RoomHandle,
 
     // Control Plane
+    external_participants: HashSet<Arc<ExternalParticipantId>>,
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
     event_queue: FuturesUnordered<BroadcastEventFuture>,
@@ -156,6 +157,8 @@ impl RoomActor {
                     }
                     .in_current_span(),
                 );
+
+                // TODO: kill older participant based on external id if exists
             }
             RoomControlMessage::TrackAdded(track) => {
                 todo!();

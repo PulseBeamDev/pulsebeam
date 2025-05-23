@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fmt::Display, ops::Deref, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -17,7 +23,7 @@ use tokio::{
 use crate::{
     actor::{Actor, ActorError},
     context,
-    entity::{EntityId, ParticipantId, TrackId},
+    entity::{EntityId, ExternalParticipantId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
     proto::sfu,
     room::{RoomEvent, RoomHandle},

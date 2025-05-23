@@ -2,71 +2,139 @@ syntax = "proto3";
 
 package sfu;
 
-// Represents the kind of media track.
-enum TrackKind {
-  TRACK_KIND_UNSPECIFIED = 0;
-  VIDEO = 1;
-  AUDIO = 2;
+// ---------------
+// Common Definitions
+// ---------------
+
+// Specifies which fundamental media kinds are active or desired.
+message MediaKindConfiguration {
+  bool audio_enabled = 1; // True if audio is intended to be active.
+  bool video_enabled = 2; // True if video is intended to be active.
 }
 
-// --- Client to Server Messages ---
+// Hints from the client to the SFU on how it prefers to receive a specific remote video stream.
+// The SFU uses these as strong suggestions for optimizing media delivery (e.g., simulcast layer selection).
+message VideoSubscriptionPreferences {
+  // Is this video stream currently rendered prominently in the client's UI?
+  // e.g., main speaker view, pinned video.
+  bool is_prioritized_for_display = 1;
 
-// Subscribe a remote_track_id to the mid slot
-message ClientSubscribePayload {
-  string mid = 1;                 // The client's MID (transceiver slot) to use for this track.
-  string remote_track_id = 2;     // The application-level ID of the remote track to subscribe to.
+  // Client's suggested quality tier for this video stream.
+  // The SFU will attempt to provide this quality or lower, based on various factors.
+  enum QualityPreference {
+    // Optimized for minimal bandwidth, suitable for thumbnails or severely constrained networks.
+    // This is the default
+    QUALITY_PREFERENCE_LOW = 0;
+    // Balanced quality and bandwidth, suitable for standard-sized video elements.
+    QUALITY_PREFERENCE_MEDIUM = 1;
+    // Prioritizes visual fidelity, requesting the highest quality the publisher and network can support.
+    QUALITY_PREFERENCE_HIGH = 2;
+  }
+  QualityPreference preferred_quality = 2;
 }
 
-message ClientUnsubscribePayload {
-  string mid = 1;         // The client's MID (transceiver slot) to unsubscribe from.
+// Describes the media kinds a participant is currently publishing to the SFU.
+message ParticipantPublishedMedia {
+  string external_participant_id = 1;     // Developer-provided ID for the participant.
+  MediaKindConfiguration active_media = 2; // Which media kinds are currently being sent by this participant.
 }
 
-// ClientMessage encapsulates all possible messages from client to SFU.
-message ClientMessage {
+
+// ---------------
+// Client -> Server: Signals from the client application to the SFU
+// ---------------
+
+message ClientSignal {
   oneof payload {
-    ClientSubscribePayload subscribe = 1;
-    ClientUnsubscribePayload unsubscribe = 2;
+    // Client declares the desired state of its own published media streams.
+    // The SFU will then orchestrate the necessary WebRTC uplink changes (out-of-band).
+    UpdatePublishedMediaIntent update_published_media = 1;
+
+    // Client requests to subscribe to specified media kinds from a remote participant.
+    // The SFU will orchestrate WebRTC downlink changes for available streams (out-of-band).
+    // This is used for initial subscription and to change which *kinds* of media are desired.
+    UpdateSubscriptionIntent update_subscription = 2;
+
+    // Client updates its display and quality preferences for a specific remote video stream
+    // it is already subscribed to. This guides SFU's simulcast/SVC layer selection.
+    UpdateRequestStreamPreferencesIntent update_request_stream_preferences = 3;
+
+    // Client requests to stop receiving all media streams from a specific remote participant.
+    // The SFU will orchestrate WebRTC downlink termination (out-of-band).
+    UnsubscribeFromParticipantIntent unsubscribe_from_participant = 4;
   }
 }
 
-
-// --- Server to Client Messages ---
-
-message TrackInfo {
-  string track_id = 1; // The ID of the newly available remote track.
-  TrackKind kind = 2;         // The kind of track.
-  string participant_id = 3;  // The ID of the participant who published this track.
-  // map<string, string> metadata = 4; // Optional: any other app-specific metadata about the track.
+message UpdatePublishedMediaIntent {
+  // The complete desired state for the client's outgoing media.
+  // e.g., {audio_enabled: true, video_enabled: false} means "publish audio, unpublish video".
+  MediaKindConfiguration desired_media_to_publish = 1;
 }
 
-message TrackSwitchInfo {
-  string mid = 2;             // The client's MID that the SFU will use (confirming client's request).
-  optional TrackInfo remote_track = 3;
+message UpdateSubscriptionIntent {
+  string target_external_participant_id = 1;
+  // The complete set of media kinds the client wishes to receive from this participant.
+  // e.g., {audio_enabled: true, video_enabled: false} means "I only want their audio."
+  MediaKindConfiguration desired_media_to_receive = 2;
 }
 
-// New tracks available from other participants to subscribe
-message TrackPublishedPayload {
-  TrackInfo remote_track = 1;
+message UpdateRequestStreamPreferencesIntent {
+  string target_external_participant_id = 1;
+  // This field specifically targets video preferences. Audio is typically not layered in the same way.
+  VideoSubscriptionPreferences video_preferences = 2;
 }
 
-message TrackUnpublishedPayload {
-  string remote_track_id = 1; // The ID of the remote track that is no longer available.
+message UnsubscribeFromParticipantIntent {
+  string target_external_participant_id = 1;
 }
 
-message TrackSwitchedPayload {
-  TrackSwitchInfo switch = 1;
-}
 
-message ErrorPayload {
-  string description = 1;         // General error message from the SFU.
-}
+// ---------------
+// Server -> Client: Notifications and state updates from the SFU
+// ---------------
 
-// ServerMessage encapsulates all possible messages from SFU to client.
-message ServerMessage {
+message ServerSignal {
   oneof payload {
-    ErrorPayload error = 1;                            // General error from SFU.
-    TrackPublishedPayload track_published = 2;         // SFU informs client a new remote track is available.
-    TrackUnpublishedPayload track_unpublished = 3;     // SFU informs client a remote track is no longer available.
-    TrackSwitchedPayload track_switched = 4;           // SFU confirms track switching for a mid
+    // Sent once upon successful DataChannel readiness, providing the initial room state.
+    RoomStateNotification room_state = 1;
+
+    // A new participant has joined the room.
+    ParticipantJoinedNotification participant_joined = 2;
+
+    // A participant has left the room.
+    ParticipantLeftNotification participant_left = 3;
+
+    // A participant (local or remote) has updated the state of their published media streams
+    // (e.g., started/stopped sending audio or video to the SFU).
+    ParticipantMediaPublicationUpdate participant_media_publication_update = 4;
+
+    // Reports an error in processing a client's signal or an issue within the SFU.
+    ErrorNotification error_notification = 5;
   }
+}
+
+message RoomStateNotification {
+  string self_external_participant_id = 1;
+  repeated ParticipantPublishedMedia current_participants = 2;
+}
+
+message ParticipantJoinedNotification {
+  ParticipantPublishedMedia participant_info = 1;
+}
+
+message ParticipantLeftNotification {
+  string external_participant_id = 1;
+}
+
+// Notifies clients about changes to what a participant is publishing to the SFU.
+// If a client is subscribed to these kinds, the SFU will (out-of-band) adjust media flow.
+message ParticipantMediaPublicationUpdate {
+  // The new, complete published media state for the participant whose streams changed.
+  ParticipantPublishedMedia updated_media_publication = 1;
+}
+
+message ErrorNotification {
+  string message = 1;                  // User-friendly error message.
+  optional int32 error_code = 2;       // Optional: SFU-specific error code for programmatic handling.
+  optional string correlation_id = 3; // Optional: If client signals include a correlation ID, SFU can echo it back.
 }
