@@ -1,140 +1,128 @@
 syntax = "proto3";
-
 package sfu;
 
-// ---------------
-// Common Definitions
-// ---------------
+// -------------------------------------
+// Common Types
+// -------------------------------------
 
-// Specifies which fundamental media kinds are active or desired.
-message MediaKindConfiguration {
-  bool audio_enabled = 1; // True if audio is intended to be active.
-  bool video_enabled = 2; // True if video is intended to be active.
+// Media configuration for a participant's stream
+message MediaConfig {
+  bool audio = 1; // True if audio is active
+  bool video = 2; // True if video is active
 }
 
-// Hints from the client to the SFU on how it prefers to receive a specific remote video stream.
-// The SFU uses these as strong suggestions for optimizing media delivery (e.g., simulcast layer selection).
-message VideoSubscriptionPreferences {
-  // Is this video stream currently rendered prominently in the client's UI?
-  // e.g., main speaker view, pinned video.
-  bool is_prioritized_for_display = 1;
-
-  // Client's suggested quality tier for this video stream.
-  // The SFU will attempt to provide this quality or lower, based on various factors.
-  enum QualityPreference {
-    // Optimized for minimal bandwidth, suitable for thumbnails or severely constrained networks.
-    // This is the default
-    QUALITY_PREFERENCE_LOW = 0;
-    // Balanced quality and bandwidth, suitable for standard-sized video elements.
-    QUALITY_PREFERENCE_MEDIUM = 1;
-    // Prioritizes visual fidelity, requesting the highest quality the publisher and network can support.
-    QUALITY_PREFERENCE_HIGH = 2;
-  }
-  QualityPreference preferred_quality = 2;
+// Video quality preferences
+message VideoSettings {
+  int32 max_height = 1; // Maximum height for the video stream
 }
 
-// Describes the media kinds a participant is currently publishing to the SFU.
-message ParticipantPublishedMedia {
-  string external_participant_id = 1;     // Developer-provided ID for the participant.
-  MediaKindConfiguration active_media = 2; // Which media kinds are currently being sent by this participant.
+// State of a participant's stream
+message ParticipantStream {
+  string participant_id = 1;          // Unique SFU-internal ID
+  string external_participant_id = 2; // Developer-provided user ID
+  optional MediaConfig media = 3;     // Media state (if unset, participant has left)
 }
 
+// -------------------------------------
+// Client → Server
+// -------------------------------------
 
-// ---------------
-// Client -> Server: Signals from the client application to the SFU
-// ---------------
-
-message ClientSignal {
-  oneof payload {
-    // Client declares the desired state of its own published media streams.
-    // The SFU will then orchestrate the necessary WebRTC uplink changes (out-of-band).
-    UpdatePublishedMediaIntent update_published_media = 1;
-
-    // Client requests to subscribe to specified media kinds from a remote participant.
-    // The SFU will orchestrate WebRTC downlink changes for available streams (out-of-band).
-    // This is used for initial subscription and to change which *kinds* of media are desired.
-    UpdateSubscriptionIntent update_subscription = 2;
-
-    // Client updates its display and quality preferences for a specific remote video stream
-    // it is already subscribed to. This guides SFU's simulcast/SVC layer selection.
-    UpdateRequestStreamPreferencesIntent update_request_stream_preferences = 3;
-
-    // Client requests to stop receiving all media streams from a specific remote participant.
-    // The SFU will orchestrate WebRTC downlink termination (out-of-band).
-    UnsubscribeFromParticipantIntent unsubscribe_from_participant = 4;
+// Client message wrapper with sequence number for reliability
+message ClientMessage {
+  uint32 sequence = 1; // Sequence number for message ordering/acknowledgment
+  oneof msg {
+    PublishIntent publish_intent = 2;
+    VideoSubscription video_subscription = 3;
   }
 }
 
-message UpdatePublishedMediaIntent {
-  // The complete desired state for the client's outgoing media.
-  // e.g., {audio_enabled: true, video_enabled: false} means "publish audio, unpublish video".
-  MediaKindConfiguration desired_media_to_publish = 1;
+// Intent to publish media
+message PublishIntent {
+  MediaConfig media = 1; // Media to publish (audio/video)
 }
 
-message UpdateSubscriptionIntent {
-  string target_external_participant_id = 1;
-  // The complete set of media kinds the client wishes to receive from this participant.
-  // e.g., {audio_enabled: true, video_enabled: false} means "I only want their audio."
-  MediaKindConfiguration desired_media_to_receive = 2;
+// Subscriptions for receiving media from specific participants
+message VideoSubscription {
+  repeated ParticipantSubscription subscriptions = 1;
 }
 
-message UpdateRequestStreamPreferencesIntent {
-  string target_external_participant_id = 1;
-  // This field specifically targets video preferences. Audio is typically not layered in the same way.
-  VideoSubscriptionPreferences video_preferences = 2;
+// Subscription for a specific participant's video
+message ParticipantSubscription {
+  string participant_id = 1;
+  VideoSettings video_settings = 2;
 }
 
-message UnsubscribeFromParticipantIntent {
-  string target_external_participant_id = 1;
-}
+// -------------------------------------
+// Server → Client
+// -------------------------------------
 
-
-// ---------------
-// Server -> Client: Notifications and state updates from the SFU
-// ---------------
-
-message ServerSignal {
-  oneof payload {
-    // Sent once upon successful DataChannel readiness, providing the initial room state.
-    RoomStateNotification room_state = 1;
-
-    // A new participant has joined the room.
-    ParticipantJoinedNotification participant_joined = 2;
-
-    // A participant has left the room.
-    ParticipantLeftNotification participant_left = 3;
-
-    // A participant (local or remote) has updated the state of their published media streams
-    // (e.g., started/stopped sending audio or video to the SFU).
-    ParticipantMediaPublicationUpdate participant_media_publication_update = 4;
-
-    // Reports an error in processing a client's signal or an issue within the SFU.
-    ErrorNotification error_notification = 5;
+// Server message wrapper
+message ServerMessage {
+  oneof msg {
+    RoomSnapshot room_snapshot = 1;
+    StreamStateUpdate stream_update = 2;
+    ActiveSpeakersUpdate active_speakers = 3;
+    MessageAck message_ack = 4;
+    ConnectionQuality connection_quality = 5;
+    ErrorNotification error = 6;
   }
 }
 
-message RoomStateNotification {
-  string self_external_participant_id = 1;
-  repeated ParticipantPublishedMedia current_participants = 2;
+// Full snapshot of the room state
+message RoomSnapshot {
+  repeated ParticipantStream participants = 1;
+  string room_id = 2; // Room identifier for verification
 }
 
-message ParticipantJoinedNotification {
-  ParticipantPublishedMedia participant_info = 1;
+// Incremental update of a participant's stream
+message StreamStateUpdate {
+  ParticipantStream participant_stream = 1;
 }
 
-message ParticipantLeftNotification {
-  string external_participant_id = 1;
+// Current active speakers in the room
+message ActiveSpeakersUpdate {
+  repeated string participant_ids = 1; // Ordered by speaking activity (most active first)
+  uint64 timestamp = 2; // Server timestamp for this update
 }
 
-// Notifies clients about changes to what a participant is publishing to the SFU.
-// If a client is subscribed to these kinds, the SFU will (out-of-band) adjust media flow.
-message ParticipantMediaPublicationUpdate {
-  // The new, complete published media state for the participant whose streams changed.
-  ParticipantPublishedMedia updated_media_publication = 1;
+// Connection quality metrics for adaptive streaming
+message ConnectionQuality {
+  string participant_id = 1; // Which participant this applies to (empty = self)
+  Quality quality = 2;       // Connection quality level
+  optional uint32 rtt_ms = 3; // Round-trip time in milliseconds
 }
 
+// Message acknowledgment (only for client message processing)
+message MessageAck {
+  uint32 sequence = 1;        // Sequence number being acknowledged
+  bool success = 2;           // Whether the message was processed successfully
+  optional string message = 3; // Error details if success is false
+}
+
+// Server-initiated error notification
 message ErrorNotification {
-  string message = 1;                  // User-friendly error message.
-  optional int32 error_code = 2;       // Optional: SFU-specific error code for programmatic handling.
-  optional string correlation_id = 3; // Optional: If client signals include a correlation ID, SFU can echo it back.
+  ErrorType type = 1;         // Type of error
+  string message = 2;         // Human-readable error message
+  bool fatal = 3;             // Whether client should disconnect
+}
+
+// Connection quality levels
+enum Quality {
+  EXCELLENT = 0;
+  GOOD = 1;
+  FAIR = 2;
+  POOR = 3;
+  DISCONNECTED = 4;
+}
+
+// Server-initiated error types
+enum ErrorType {
+  ROOM_CLOSED = 0;           // Room was closed by moderator/system
+  PARTICIPANT_KICKED = 1;    // Participant was removed from room
+  SERVER_SHUTDOWN = 2;       // Server is shutting down
+  ROOM_CAPACITY_CHANGED = 3; // Room capacity reduced, participant removed
+  AUTHENTICATION_EXPIRED = 4; // Auth token expired
+  DUPLICATE_CONNECTION = 5;   // Same participant connected elsewhere
+  PROTOCOL_VIOLATION = 6;    // Client sent malformed/invalid messages
+  UNKNOWN_ERROR = 7;
 }
