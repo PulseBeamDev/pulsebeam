@@ -1,10 +1,10 @@
 [build]
-rustflags = ["-C", "link-arg=-fuse-ld=mold", "--cfg", "tracing_unstable" , "--cfg", "tokio_unstable"]
+rustflags = ["--cfg", "tracing_unstable" , "--cfg", "tokio_unstable"]
 
 [target.x86_64-unknown-linux-musl]
 # needed for tracing valuable feature
 # https://github.com/tokio-rs/tracing/issues/1570
-rustflags = ["-C", "link-arg=-fuse-ld=mold", "--cfg", "tracing_unstable" , "--cfg", "tokio_unstable"]
+rustflags = ["--cfg", "tracing_unstable" , "--cfg", "tokio_unstable"]
 
 # [unstable]
 # codegen-backend = true
