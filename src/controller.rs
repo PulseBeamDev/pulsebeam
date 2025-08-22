@@ -36,8 +36,8 @@ pub enum ControllerError {
 
 pub enum ControllerMessage {
     Allocate(
-        ExternalRoomId,
-        ExternalParticipantId,
+        RoomId,
+        ParticipantId,
         String,
         oneshot::Sender<Result<String, ControllerError>>,
     ),
@@ -72,8 +72,6 @@ impl Actor for ControllerActor {
                 Some(msg) = self.receiver.recv() => {
                     match msg {
                         ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
-                            let room_id = RoomId::new(room_id);
-                            let participant_id = ParticipantId::new(&mut self.rng, participant_id);
                             let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
                         }
                     }
@@ -102,7 +100,9 @@ impl ControllerActor {
         let mut rtc = Rtc::builder()
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            .set_ice_lite(true)
+            // Some WHIP client like OBS WHIP doesn't actively send a binding request,
+            // we need this to keep the timeout refreshed.
+            .set_ice_lite(false)
             .enable_vp9(false)
             .enable_h264(false)
             .build();
@@ -190,8 +190,8 @@ impl ControllerHandle {
 
     pub async fn allocate(
         &self,
-        room_id: ExternalRoomId,
-        participant_id: ExternalParticipantId,
+        room_id: RoomId,
+        participant_id: ParticipantId,
         offer: String,
     ) -> Result<String, ControllerError> {
         let (tx, rx) = oneshot::channel();

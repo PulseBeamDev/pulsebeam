@@ -51,14 +51,14 @@ async fn run() {
     let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
     let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
     let (controller_handle, controller_actor) = ControllerHandle::new(
-        rng,
+        rng.clone(),
         source_handle,
         sink_handle,
         vec![local_addr],
         Arc::new("root".to_string()),
     );
 
-    let router = signaling::router(controller_handle).layer(cors);
+    let router = signaling::router(rng, controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     let signaling = async move {
         let _ = axum::serve(listener, router).await;
@@ -70,7 +70,7 @@ async fn run() {
     join_set.spawn(actor::run(controller_actor));
     join_set.spawn(signaling);
 
-    while let Some(_) = join_set.join_next().await {}
+    while (join_set.join_next().await).is_some() {}
 }
 
 pub fn select_host_address() -> IpAddr {

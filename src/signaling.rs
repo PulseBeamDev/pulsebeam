@@ -1,3 +1,5 @@
+use crate::entity::{ParticipantId, RoomId};
+use crate::rng::Rng;
 use crate::{
     controller::{ControllerError, ControllerHandle},
     entity::{ExternalParticipantId, ExternalRoomId},
@@ -7,9 +9,11 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{delete, post},
 };
 use axum_extra::{TypedHeader, headers::ContentType};
+use hyper::HeaderMap;
+use hyper::header::LOCATION;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
@@ -53,21 +57,38 @@ pub struct ParticipantInfo {
 #[axum::debug_handler]
 async fn spawn_participant(
     Query(info): Query<ParticipantInfo>,
-    State(controller): State<ControllerHandle>,
+    State((mut rng, controller)): State<(Rng, ControllerHandle)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
-) -> Result<String, SignalingError> {
+) -> Result<impl IntoResponse, SignalingError> {
     // TODO: validate content_type = "application/sdp"
 
+    let room_id = RoomId::new(info.room);
+    let participant_id = ParticipantId::new(&mut rng, info.participant);
+
+    // TODO: better unique ID to handle session.
+    let location_url = format!("/rooms/{}/participants/{}", &room_id, &participant_id,);
     let answer = controller
-        .allocate(info.room, info.participant, raw_offer)
+        .allocate(room_id, participant_id, raw_offer)
         .await?;
 
-    Ok(answer)
+    let mut headers = HeaderMap::new();
+    headers.insert(LOCATION, location_url.parse().unwrap());
+    let resp = (StatusCode::CREATED, headers, answer);
+    Ok(resp)
 }
 
-pub fn router(controller: ControllerHandle) -> Router {
+#[axum::debug_handler]
+async fn delete_participant(
+    State(_state): State<(Rng, ControllerHandle)>,
+) -> Result<impl IntoResponse, SignalingError> {
+    // TODO: delete participant from the room
+    Ok(StatusCode::OK)
+}
+
+pub fn router(rng: Rng, controller: ControllerHandle) -> Router {
     Router::new()
         .route("/", post(spawn_participant))
-        .with_state(controller)
+        .route("/", delete(delete_participant))
+        .with_state((rng, controller))
 }

@@ -2243,8 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "str0m"
-version = "0.8.0"
-source = "git+https://github.com/algesten/str0m.git?rev=b8b07f8ce4ccdb16b7208043def0100c9a400fba#b8b07f8ce4ccdb16b7208043def0100c9a400fba"
+version = "0.10.0"
 dependencies = [
  "combine",
  "crc",

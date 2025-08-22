@@ -185,7 +185,6 @@ impl Actor for ParticipantActor {
 }
 
 impl ParticipantActor {
-    #[inline]
     async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
             ParticipantDataMessage::UdpPacket(packet) => {
