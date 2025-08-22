@@ -77,9 +77,8 @@ impl Actor for ControllerActor {
                     }
                 }
 
-                Some(Ok(participant_id)) = self.room_tasks.join_next() => {
-                    // TODO: notify participant leaving
-                    self.rooms.remove(&participant_id);
+                Some(Ok(room_id)) = self.room_tasks.join_next() => {
+                    self.rooms.remove(&room_id);
                 }
 
                 else => break,

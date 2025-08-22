@@ -29,7 +29,7 @@ use crate::{
     actor::{self, Actor, ActorError},
     entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackIn},
-    proto::sfu,
+    proto::{self, sfu},
     rng::Rng,
     room::RoomHandle,
     sink::UdpSinkHandle,
@@ -105,6 +105,11 @@ pub struct ParticipantActor {
     // InternalTrackId -> TrackOut
     available_tracks: HashMap<Arc<EntityId>, TrackOut>,
     mid_out_slots: HashMap<Mid, MidOutSlot>,
+
+    // State sync with client
+    pending_published_tracks: Vec<proto::sfu::TrackPublishedPayload>,
+    pending_unpublished_tracks: Vec<proto::sfu::TrackUnpublishedPayload>,
+    pending_switched_tracks: Vec<proto::sfu::TrackSwitchedPayload>,
 }
 
 impl fmt::Debug for ParticipantActor {
@@ -588,6 +593,10 @@ impl ParticipantHandle {
             available_tracks: HashMap::new(),
             mid_out_slots: HashMap::new(),
             cid: None,
+
+            pending_published_tracks: Vec::new(),
+            pending_unpublished_tracks: Vec::new(),
+            pending_switched_tracks: Vec::new(),
         };
         (handle, actor)
     }
