@@ -20,21 +20,19 @@ use tokio::{
         self,
         error::{SendError, TrySendError},
     },
-    task::JoinSet,
     time::Instant,
 };
-use tracing::Instrument;
 
 use crate::{
-    actor::{self, Actor, ActorError},
+    actor::{Actor, ActorError},
     entity::{EntityId, ParticipantId, TrackId},
-    message::{self, EgressUDPPacket, TrackIn},
+    message::{self, EgressUDPPacket, TrackMeta},
     proto::{self, sfu},
     rng::Rng,
     room::RoomHandle,
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
-    track::Track,
+    track::TrackHandle,
 };
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
@@ -53,20 +51,23 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    TracksPublished(Arc<Vec<Track>>),
+    TracksPublished(Arc<Vec<TrackHandle>>),
     TracksUnpublished(Arc<Vec<Arc<TrackId>>>),
+
+    TrackPublishAccepted(TrackHandle),
+    TrackPublishRejected(TrackHandle),
 }
 
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
     UdpPacket(message::UDPPacket),
-    ForwardMedia(Arc<TrackIn>, Arc<MediaData>),
+    ForwardMedia(Arc<TrackMeta>, Arc<MediaData>),
     KeyframeRequest(Arc<TrackId>, message::KeyframeRequest),
 }
 
 #[derive(Debug)]
 struct TrackOut {
-    handle: Track,
+    handle: TrackHandle,
     mid: Option<Mid>,
 }
 
@@ -103,13 +104,12 @@ pub struct ParticipantActor {
     // Engine
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
-    track_tasks: JoinSet<Arc<TrackId>>,
 
     // Metadata
     participant_id: Arc<ParticipantId>,
 
     // Current local state
-    published_tracks: HashMap<Mid, Track>,
+    published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Mid, MidOutSlot>,
 
     // State sync with client
@@ -123,6 +123,7 @@ pub struct ParticipantActor {
     pending_published_tracks: Vec<proto::sfu::TrackPublishedPayload>,
     pending_unpublished_tracks: Vec<proto::sfu::TrackUnpublishedPayload>,
     pending_switched_tracks: Vec<proto::sfu::TrackSwitchedPayload>,
+    should_resync: bool,
 }
 
 impl fmt::Debug for ParticipantActor {
@@ -180,10 +181,6 @@ impl Actor for ParticipantActor {
                 _ = tokio::time::sleep(delay) => {
                     // explicit empty, next loop polls again
                     // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
-                }
-
-                Some(Ok(key)) = self.track_tasks.join_next() => {
-                    // TODO: clean up track
                 }
 
                 else => break,
@@ -304,11 +301,17 @@ impl ParticipantActor {
                     remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
                 }));
             }
+            ParticipantControlMessage::TrackPublishAccepted(track_handle) => {}
+            ParticipantControlMessage::TrackPublishRejected(track_handle) => {}
         }
     }
 
     async fn poll(&mut self) -> Option<Duration> {
         while self.rtc.is_alive() {
+            if self.should_resync {
+                self.resync();
+            }
+
             // Poll output until we get a timeout. The timeout means we
             // are either awaiting UDP socket input or the timeout to happen.
             match self.rtc.poll_output().unwrap() {
@@ -343,6 +346,13 @@ impl ParticipantActor {
         }
 
         None
+    }
+
+    fn resync(&mut self) {
+        // resync all pending states with client
+        // TODO: check pending states and resync
+
+        self.should_resync = false;
     }
 
     fn send_server_event(&mut self, msg: sfu::server_message::Payload) {
@@ -479,21 +489,17 @@ impl ParticipantActor {
                 // TODO: handle back pressure by buffering temporarily
                 let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
-                let track = TrackIn {
+                let track = TrackMeta {
                     id: track_id.clone(),
                     kind: media.kind,
                     simulcast: media.simulcast,
                 };
 
-                let (handle, actor) = Track::new(self.handle.clone(), Arc::new(track));
-                self.track_tasks.spawn(
-                    async move {
-                        actor::run(actor).await;
-                        track_id
-                    }
-                    .in_current_span(),
-                );
-                if let Err(err) = self.room.publish(handle).await {
+                if let Err(err) = self
+                    .room
+                    .publish(self.handle.clone(), Arc::new(track))
+                    .await
+                {
                     // this participant should get cleaned up by the supervisor
                     tracing::warn!("failed to publish track to room: {err}");
                 }
@@ -520,7 +526,7 @@ impl ParticipantActor {
         }
     }
 
-    fn handle_forward_media(&mut self, track: Arc<TrackIn>, data: Arc<MediaData>) {
+    fn handle_forward_media(&mut self, track: Arc<TrackMeta>, data: Arc<MediaData>) {
         let Some(track) = self.available_tracks.get(&track.id.internal) else {
             return;
         };
@@ -601,7 +607,6 @@ impl ParticipantHandle {
             room,
             participant_id,
             rtc,
-            track_tasks: JoinSet::new(),
             published_tracks: HashMap::new(),
             available_tracks: HashMap::new(),
             subscribed_tracks: HashMap::new(),
@@ -610,6 +615,7 @@ impl ParticipantHandle {
             pending_published_tracks: Vec::new(),
             pending_unpublished_tracks: Vec::new(),
             pending_switched_tracks: Vec::new(),
+            should_resync: false,
         };
         (handle, actor)
     }
@@ -630,7 +636,7 @@ impl ParticipantHandle {
 
     pub async fn add_tracks(
         &self,
-        tracks: Arc<Vec<Track>>,
+        tracks: Arc<Vec<TrackHandle>>,
     ) -> Result<(), SendError<ParticipantControlMessage>> {
         self.control_sender
             .send(ParticipantControlMessage::TracksPublished(tracks))
@@ -648,7 +654,7 @@ impl ParticipantHandle {
 
     pub fn forward_media(
         &self,
-        track: Arc<TrackIn>,
+        track: Arc<TrackMeta>,
         data: Arc<MediaData>,
     ) -> Result<(), TrySendError<ParticipantDataMessage>> {
         let res = self

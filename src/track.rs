@@ -9,7 +9,7 @@ use tokio::{
 use crate::{
     actor::Actor,
     entity::{ParticipantId, TrackId},
-    message::{self, TrackIn},
+    message::{self, TrackMeta},
     participant::ParticipantHandle,
 };
 
@@ -38,7 +38,7 @@ pub enum TrackControlMessage {
 /// * Filter & Forward Packet Notifications
 /// * Route Publisher-Bound RTCP: Receive RTCP feedback (PLI, FIR, etc.) from subscriber and forward it to the publisher
 pub struct TrackActor {
-    meta: Arc<TrackIn>,
+    meta: Arc<TrackMeta>,
     data_receiver: mpsc::Receiver<TrackDataMessage>,
     control_receiver: mpsc::Receiver<TrackControlMessage>,
     origin: ParticipantHandle,
@@ -113,11 +113,11 @@ impl TrackActor {
 pub struct TrackHandle {
     pub data_sender: mpsc::Sender<TrackDataMessage>,
     pub control_sender: mpsc::Sender<TrackControlMessage>,
-    pub meta: Arc<TrackIn>,
+    pub meta: Arc<TrackMeta>,
 }
 
 impl TrackHandle {
-    pub fn new(origin: ParticipantHandle, meta: Arc<TrackIn>) -> (Self, TrackActor) {
+    pub fn new(origin: ParticipantHandle, meta: Arc<TrackMeta>) -> (Self, TrackActor) {
         let (data_sender, data_receiver) = mpsc::channel(64);
         let (control_sender, control_receiver) = mpsc::channel(8);
         let handle = Self {

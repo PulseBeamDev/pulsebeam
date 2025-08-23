@@ -24,7 +24,7 @@ pub struct EgressUDPPacket {
 }
 
 #[derive(Debug)]
-pub struct TrackIn {
+pub struct TrackMeta {
     pub id: Arc<TrackId>,
     pub kind: MediaKind,
     pub simulcast: Option<Simulcast>,

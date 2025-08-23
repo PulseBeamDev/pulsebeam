@@ -9,20 +9,21 @@ use tracing::Instrument;
 use crate::{
     actor::{self, Actor, ActorError},
     entity::{ParticipantId, RoomId, TrackId},
+    message::TrackMeta,
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
-    track::Track,
+    track::TrackHandle,
 };
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishTrack(Track),
+    PublishTrack(ParticipantHandle, Arc<TrackMeta>),
     AddParticipant(ParticipantHandle, ParticipantActor),
 }
 
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
-    tracks: HashMap<Arc<TrackId>, Track>,
+    tracks: HashMap<Arc<TrackId>, TrackHandle>,
 }
 
 /// Reponsibilities:
@@ -39,6 +40,7 @@ pub struct RoomActor {
 
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
+    track_tasks: JoinSet<Arc<TrackId>>,
 }
 
 impl Actor for RoomActor {
@@ -64,6 +66,10 @@ impl Actor for RoomActor {
 
                 Some(Ok(participant_id)) = self.participant_tasks.join_next() => {
                     self.handle_participant_left(participant_id).await;
+                }
+
+                Some(Ok(track_id)) = self.track_tasks.join_next() => {
+                    // TODO: handle track lifecycle
                 }
 
                 else => break,
@@ -95,24 +101,34 @@ impl RoomActor {
                 );
 
                 let mut tracks = Vec::with_capacity(self.participants.len());
-                for (_, meta) in &self.participants {
+                for meta in self.participants.values() {
                     tracks.extend(meta.tracks.values().cloned());
                 }
                 let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
             }
-            RoomMessage::PublishTrack(track) => {
-                let Some(origin) = self.participants.get_mut(&track.meta.id.origin_participant)
+            RoomMessage::PublishTrack(participant_handle, track_meta) => {
+                let Some(origin) = self.participants.get_mut(&track_meta.id.origin_participant)
                 else {
                     tracing::warn!(
                         "{} is missing from participants, ignoring track",
-                        track.meta.id
+                        track_meta.id
                     );
                     return;
                 };
 
-                origin.tracks.insert(track.meta.id.clone(), track.clone());
-                let new_tracks = Arc::new(vec![track]);
-                for (_, participant) in &self.participants {
+                let (handle, track_actor) =
+                    TrackHandle::new(participant_handle.clone(), track_meta.clone());
+                let track_id = track_meta.id.clone();
+                self.track_tasks.spawn(
+                    async move {
+                        actor::run(track_actor).await;
+                        track_id
+                    }
+                    .in_current_span(),
+                );
+                origin.tracks.insert(track_meta.id.clone(), handle.clone());
+                let new_tracks = Arc::new(vec![handle]);
+                for participant in self.participants.values() {
                     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
                 }
             }
@@ -156,6 +172,7 @@ impl RoomHandle {
             handle: handle.clone(),
             participants: HashMap::new(),
             participant_tasks: JoinSet::new(),
+            track_tasks: JoinSet::new(),
         };
         (handle, actor)
     }
@@ -170,8 +187,14 @@ impl RoomHandle {
             .await
     }
 
-    pub async fn publish(&self, track: Track) -> Result<(), SendError<RoomMessage>> {
-        self.sender.send(RoomMessage::PublishTrack(track)).await
+    pub async fn publish(
+        &self,
+        participant_handle: ParticipantHandle,
+        track_meta: Arc<TrackMeta>,
+    ) -> Result<(), SendError<RoomMessage>> {
+        self.sender
+            .send(RoomMessage::PublishTrack(participant_handle, track_meta))
+            .await
     }
 }
 
