@@ -11,18 +11,18 @@ use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
-    track::TrackHandle,
+    track::Track,
 };
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishTrack(TrackHandle),
+    PublishTrack(Track),
     AddParticipant(ParticipantHandle, ParticipantActor),
 }
 
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
-    tracks: HashMap<Arc<TrackId>, TrackHandle>,
+    tracks: HashMap<Arc<TrackId>, Track>,
 }
 
 /// Reponsibilities:
@@ -170,7 +170,7 @@ impl RoomHandle {
             .await
     }
 
-    pub async fn publish(&self, track: TrackHandle) -> Result<(), SendError<RoomMessage>> {
+    pub async fn publish(&self, track: Track) -> Result<(), SendError<RoomMessage>> {
         self.sender.send(RoomMessage::PublishTrack(track)).await
     }
 }

@@ -34,7 +34,7 @@ use crate::{
     room::RoomHandle,
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
-    track::TrackHandle,
+    track::Track,
 };
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
@@ -53,8 +53,8 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    TracksAdded(Arc<Vec<TrackHandle>>),
-    TracksRemoved(Arc<Vec<Arc<TrackId>>>),
+    TracksPublished(Arc<Vec<Track>>),
+    TracksUnpublished(Arc<Vec<Arc<TrackId>>>),
 }
 
 #[derive(Debug)]
@@ -66,7 +66,7 @@ pub enum ParticipantDataMessage {
 
 #[derive(Debug)]
 struct TrackOut {
-    handle: TrackHandle,
+    handle: Track,
     mid: Option<Mid>,
 }
 
@@ -89,19 +89,27 @@ struct MidOutSlot {
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
 pub struct ParticipantActor {
+    // System Dependencies
     rng: Rng,
     handle: ParticipantHandle,
     source: UdpSourceHandle,
-    data_receiver: mpsc::Receiver<ParticipantDataMessage>,
-    control_receiver: mpsc::Receiver<ParticipantControlMessage>,
     sink: UdpSinkHandle,
     room: RoomHandle,
-    participant_id: Arc<ParticipantId>,
+
+    // IO
+    data_receiver: mpsc::Receiver<ParticipantDataMessage>,
+    control_receiver: mpsc::Receiver<ParticipantControlMessage>,
+
+    // Engine
     rtc: str0m::Rtc,
     cid: Option<ChannelId>,
     track_tasks: JoinSet<Arc<TrackId>>,
 
-    published_tracks: HashMap<Mid, TrackHandle>,
+    // Metadata
+    participant_id: Arc<ParticipantId>,
+
+    // Current local state
+    published_tracks: HashMap<Mid, Track>,
     // InternalTrackId -> TrackOut
     available_tracks: HashMap<Arc<EntityId>, TrackOut>,
     mid_out_slots: HashMap<Mid, MidOutSlot>,
@@ -229,7 +237,7 @@ impl ParticipantActor {
         use sfu::server_message::Payload;
 
         match msg {
-            ParticipantControlMessage::TracksAdded(tracks) => {
+            ParticipantControlMessage::TracksPublished(tracks) => {
                 let mut should_reconfigure: bool = false;
                 let mut new_tracks = Vec::new();
 
@@ -273,7 +281,7 @@ impl ParticipantActor {
                     self.reconfigure_downstreams().await;
                 }
             }
-            ParticipantControlMessage::TracksRemoved(track_ids) => {
+            ParticipantControlMessage::TracksUnpublished(track_ids) => {
                 for track_id in track_ids.iter() {
                     let Some(track) = self.available_tracks.remove(&track_id.internal) else {
                         return;
@@ -472,7 +480,7 @@ impl ParticipantActor {
                     simulcast: media.simulcast,
                 };
 
-                let (handle, actor) = TrackHandle::new(self.handle.clone(), Arc::new(track));
+                let (handle, actor) = Track::new(self.handle.clone(), Arc::new(track));
                 self.track_tasks.spawn(
                     async move {
                         actor::run(actor).await;
@@ -617,10 +625,10 @@ impl ParticipantHandle {
 
     pub async fn add_tracks(
         &self,
-        tracks: Arc<Vec<TrackHandle>>,
+        tracks: Arc<Vec<Track>>,
     ) -> Result<(), SendError<ParticipantControlMessage>> {
         self.control_sender
-            .send(ParticipantControlMessage::TracksAdded(tracks))
+            .send(ParticipantControlMessage::TracksPublished(tracks))
             .await
     }
 
@@ -629,7 +637,7 @@ impl ParticipantHandle {
         track_ids: Arc<Vec<Arc<TrackId>>>,
     ) -> Result<(), SendError<ParticipantControlMessage>> {
         self.control_sender
-            .send(ParticipantControlMessage::TracksRemoved(track_ids))
+            .send(ParticipantControlMessage::TracksUnpublished(track_ids))
             .await
     }
 
