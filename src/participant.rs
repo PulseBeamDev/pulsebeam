@@ -110,11 +110,16 @@ pub struct ParticipantActor {
 
     // Current local state
     published_tracks: HashMap<Mid, Track>,
-    // InternalTrackId -> TrackOut
-    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
-    mid_out_slots: HashMap<Mid, MidOutSlot>,
+    subscribed_tracks: HashMap<Mid, MidOutSlot>,
 
     // State sync with client
+    //
+    // TODO: merge available_tracks and pending_published_tracks. Participant actor
+    // should not hold all published tracks in the room, only Room actor and the client
+    // will have the full list.
+    //
+    // InternalTrackId -> TrackOut
+    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
     pending_published_tracks: Vec<proto::sfu::TrackPublishedPayload>,
     pending_unpublished_tracks: Vec<proto::sfu::TrackUnpublishedPayload>,
     pending_switched_tracks: Vec<proto::sfu::TrackSwitchedPayload>,
@@ -293,7 +298,7 @@ impl ParticipantActor {
 
                     // We don't reconfigure downstreams here because the client will
                     // likely rearrange their layout and subscribe for new streams.
-                    self.mid_out_slots.remove(&mid);
+                    self.subscribed_tracks.remove(&mid);
                 }
                 self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
                     remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
@@ -363,7 +368,7 @@ impl ParticipantActor {
             sfu::client_message::Payload::Subscribe(subscribe) => {
                 let mid = Mid::from(subscribe.mid.as_str());
                 if let Some(track) = self.available_tracks.get_mut(&subscribe.remote_track_id) {
-                    if let Some(slot) = self.mid_out_slots.get_mut(&mid) {
+                    if let Some(slot) = self.subscribed_tracks.get_mut(&mid) {
                         track.mid.replace(mid);
                         if let Some(last_track) =
                             slot.track_id.replace(track.handle.meta.id.clone())
@@ -375,7 +380,7 @@ impl ParticipantActor {
             }
             sfu::client_message::Payload::Unsubscribe(unsubscribe) => {
                 let mid = Mid::from(unsubscribe.mid.as_str());
-                if let Some(slot) = self.mid_out_slots.get_mut(&mid) {
+                if let Some(slot) = self.subscribed_tracks.get_mut(&mid) {
                     if let Some(last_track) = slot.track_id.take() {
                         self.handle_unsubscribe(last_track).await;
                     }
@@ -454,7 +459,7 @@ impl ParticipantActor {
         let Some(MidOutSlot {
             track_id: Some(track_id),
             ..
-        }) = self.mid_out_slots.get(&req.mid)
+        }) = self.subscribed_tracks.get(&req.mid)
         else {
             return;
         };
@@ -496,7 +501,7 @@ impl ParticipantActor {
             // SFU -> client
             Direction::SendOnly => {
                 tracing::info!(?media, "handle_new_media from other participant");
-                self.mid_out_slots.insert(
+                self.subscribed_tracks.insert(
                     media.mid,
                     MidOutSlot {
                         kind: media.kind,
@@ -540,7 +545,7 @@ impl ParticipantActor {
     }
 
     async fn reconfigure_downstreams(&mut self) {
-        for (mid, mid_slot) in &mut self.mid_out_slots {
+        for (mid, mid_slot) in &mut self.subscribed_tracks {
             if mid_slot.track_id.is_some() {
                 continue;
             }
@@ -599,7 +604,7 @@ impl ParticipantHandle {
             track_tasks: JoinSet::new(),
             published_tracks: HashMap::new(),
             available_tracks: HashMap::new(),
-            mid_out_slots: HashMap::new(),
+            subscribed_tracks: HashMap::new(),
             cid: None,
 
             pending_published_tracks: Vec::new(),
