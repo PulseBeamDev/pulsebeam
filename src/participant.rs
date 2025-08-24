@@ -112,17 +112,24 @@ pub struct ParticipantActor {
     published_tracks: HashMap<Mid, TrackHandle>,
     subscribed_tracks: HashMap<Mid, MidOutSlot>,
 
+    // Global view of available tracks. This participant view is mirrored
+    // 1:1 to the client. Thus, it's possible to be slightly different than the
+    // room's global view of avalable tracks.
+    //
+    // This participant may also only have access to a segmented view of the available tracks
+    // due to a lack of permission.
+    //
+    // InternalTrackId -> TrackOut
+    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
+
     // State sync with client
     //
     // TODO: merge available_tracks and pending_published_tracks. Participant actor
     // should not hold all published tracks in the room, only Room actor and the client
     // will have the full list.
-    //
-    // InternalTrackId -> TrackOut
-    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
-    pending_published_tracks: Vec<proto::sfu::TrackPublishedPayload>,
-    pending_unpublished_tracks: Vec<proto::sfu::TrackUnpublishedPayload>,
-    pending_switched_tracks: Vec<proto::sfu::TrackSwitchedPayload>,
+    pending_published_tracks: Vec<proto::sfu::TrackInfo>,
+    pending_unpublished_tracks: Vec<Arc<EntityId>>,
+    pending_switched_tracks: Vec<proto::sfu::TrackSwitchInfo>,
     should_resync: bool,
 }
 
@@ -238,9 +245,9 @@ impl ParticipantActor {
     async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
         use sfu::server_message::Payload;
 
+        self.should_resync = true;
         match msg {
             ParticipantControlMessage::TracksPublished(tracks) => {
-                let mut should_reconfigure: bool = false;
                 let mut new_tracks = Vec::new();
 
                 for track in tracks.iter() {
@@ -272,15 +279,7 @@ impl ParticipantActor {
                             kind: kind as i32,
                             participant_id: track.meta.id.origin_participant.to_string(),
                         });
-                        should_reconfigure = true;
                     }
-                }
-
-                if should_reconfigure {
-                    self.send_server_event(Payload::TrackPublished(sfu::TrackPublishedPayload {
-                        remote_tracks: new_tracks,
-                    }));
-                    self.reconfigure_downstreams().await;
                 }
             }
             ParticipantControlMessage::TracksUnpublished(track_ids) => {
@@ -297,9 +296,6 @@ impl ParticipantActor {
                     // likely rearrange their layout and subscribe for new streams.
                     self.subscribed_tracks.remove(&mid);
                 }
-                self.send_server_event(Payload::TrackUnpublished(sfu::TrackUnpublishedPayload {
-                    remote_track_ids: track_ids.iter().map(|t| t.to_string()).collect(),
-                }));
             }
             ParticipantControlMessage::TrackPublishAccepted(track_handle) => {}
             ParticipantControlMessage::TrackPublishRejected(track_handle) => {}
