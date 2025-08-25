@@ -546,7 +546,7 @@ impl ParticipantActor {
                     ),
                 };
 
-                self.reconfigure_downstreams().await;
+                // self.reconfigure_downstreams().await;
             }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
@@ -603,11 +603,17 @@ impl ParticipantActor {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ParticipantHandle {
     pub data_sender: mpsc::Sender<ParticipantDataMessage>,
     pub control_sender: mpsc::Sender<ParticipantControlMessage>,
     pub participant_id: Arc<ParticipantId>,
+}
+
+impl fmt::Debug for ParticipantHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.participant_id.internal)
+    }
 }
 
 impl ParticipantHandle {

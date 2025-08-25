@@ -138,14 +138,10 @@ impl RoomActor {
                     .in_current_span(),
                 );
                 origin.tracks.insert(track_meta.id.clone(), handle.clone());
+                tracing::info!("current tracks: {:?}", self.participants.values());
                 let new_tracks = Arc::new(vec![handle]);
                 for participant in self.participants.values() {
                     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
-                    tracing::info!(
-                        "current tracks: {} -> {:?}",
-                        participant.handle.participant_id,
-                        participant.tracks
-                    );
                 }
             }
         };
@@ -219,3 +215,47 @@ impl Display for RoomHandle {
         f.write_str(self.room_id.deref().as_ref())
     }
 }
+
+// #[cfg(test)]
+// mod test {
+//     use std::sync::Arc;
+//
+//     use rand::SeedableRng;
+//
+//     use crate::{
+//         entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
+//         net::VirtualUdpSocket,
+//         participant::ParticipantHandle,
+//         rng::Rng,
+//         room::RoomHandle,
+//         sink::UdpSinkHandle,
+//         source::UdpSourceHandle,
+//     };
+//
+//     #[tokio::test]
+//     async fn name() {
+//         let socket = turmoil::net::UdpSocket::bind("0.0.0.0:3478").await.unwrap();
+//         let socket: VirtualUdpSocket = Arc::new(socket).into();
+//         let server_addr = "192.168.1.1:3478".parse().unwrap();
+//
+//         let rng = Rng::seed_from_u64(1);
+//         let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
+//         let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
+//
+//         let room_id = RoomId::new(ExternalRoomId::new("test".to_string()).unwrap());
+//         let participant_id = ParticipantId::new(
+//             &mut rng,
+//             ExternalParticipantId::new("a".to_string()).unwrap(),
+//         );
+//         let (room_handle, room_actor) = RoomHandle::new(rng, Arc::new(room_id));
+//         ParticipantHandle::new(
+//             rng,
+//             source_handle,
+//             sink_handle,
+//             room_handle,
+//             participant_id,
+//             rtc,
+//         );
+//         handle.add_participant(handle, actor)
+//     }
+// }

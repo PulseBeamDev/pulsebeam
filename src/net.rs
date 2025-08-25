@@ -11,9 +11,9 @@ pub trait PacketSocket: Send + Sync + Clone + 'static {
 #[derive(Clone)]
 pub struct UdpSocket(Arc<tokio::net::UdpSocket>);
 
-impl Into<UdpSocket> for Arc<tokio::net::UdpSocket> {
-    fn into(self) -> UdpSocket {
-        UdpSocket(self)
+impl From<Arc<tokio::net::UdpSocket>> for UdpSocket {
+    fn from(value: Arc<tokio::net::UdpSocket>) -> Self {
+        UdpSocket(value)
     }
 }
 

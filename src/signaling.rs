@@ -65,6 +65,7 @@ async fn spawn_participant(
 
     let room_id = RoomId::new(info.room);
     let participant_id = ParticipantId::new(&mut rng, info.participant);
+    tracing::info!("allocated {} to {}", participant_id, room_id);
 
     // TODO: better unique ID to handle session.
     let location_url = format!("/rooms/{}/participants/{}", &room_id, &participant_id,);

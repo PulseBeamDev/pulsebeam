@@ -101,7 +101,7 @@ where
     tracing::debug!("Starting actor...");
 
     let mut current_status = ActorStatus::Starting;
-    span.record("status", tracing::field::display(current_status));
+    // span.record("status", tracing::field::display(current_status));
 
     // 1. Pre-start Hook
     match actor.pre_start().await {
@@ -115,7 +115,7 @@ where
             // Fall through to post_stop
         }
     }
-    span.record("status", tracing::field::display(current_status));
+    // span.record("status", tracing::field::display(current_status));
 
     // 2. Run Main Actor Logic (only if pre_start was OK)
     if current_status == ActorStatus::Running {
@@ -145,7 +145,7 @@ where
                 );
             }
         };
-        span.record("status", tracing::field::display(current_status));
+        // span.record("status", tracing::field::display(current_status));
     }
 
     // 3. Unified Post-stop Hook

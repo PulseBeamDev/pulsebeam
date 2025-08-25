@@ -9,6 +9,7 @@ pub mod proto;
 pub mod rng;
 pub mod room;
 pub mod signaling;
+pub mod sim;
 pub mod sink;
 pub mod source;
 pub mod track;

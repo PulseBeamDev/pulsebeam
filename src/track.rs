@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use str0m::media::MediaData;
@@ -109,11 +110,17 @@ impl TrackActor {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TrackHandle {
     pub data_sender: mpsc::Sender<TrackDataMessage>,
     pub control_sender: mpsc::Sender<TrackControlMessage>,
     pub meta: Arc<TrackMeta>,
+}
+
+impl fmt::Debug for TrackHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.meta.id.fmt(f)
+    }
 }
 
 impl TrackHandle {

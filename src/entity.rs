@@ -21,14 +21,15 @@ pub mod prefix {
 const HASH_OUTPUT_BYTES: usize = 16;
 
 /// Generates a new random entity ID with optional prefix and length (in bytes).
-pub fn new_random_id(rng: &mut Rng, prefix: &str, length: usize) -> EntityId {
+pub fn new_random_id(prefix: &str, length: usize) -> EntityId {
     let mut bytes = vec![0u8; length];
+    let mut rng = rand::rng();
     rng.fill_bytes(&mut bytes);
     encode_with_prefix(prefix, &bytes)
 }
 
-pub fn new_entity_id(rng: &mut Rng, prefix: &str) -> EntityId {
-    new_random_id(rng, prefix, HASH_OUTPUT_BYTES)
+pub fn new_entity_id(prefix: &str) -> EntityId {
+    new_random_id(prefix, HASH_OUTPUT_BYTES)
 }
 
 pub fn new_hashed_id(prefix: &str, input: &str) -> EntityId {
@@ -190,7 +191,7 @@ pub struct ParticipantId {
 
 impl ParticipantId {
     pub fn new(rng: &mut Rng, external: ExternalParticipantId) -> Self {
-        let internal = new_entity_id(rng, prefix::PARTICIPANT_ID);
+        let internal = new_entity_id(prefix::PARTICIPANT_ID);
         Self { external, internal }
     }
 }
@@ -294,7 +295,7 @@ pub struct TrackId {
 
 impl TrackId {
     pub fn new(rng: &mut Rng, participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
-        let internal = new_entity_id(rng, prefix::TRACK_ID);
+        let internal = new_entity_id(prefix::TRACK_ID);
         Self {
             internal: Arc::new(internal),
             origin_participant: participant_id,
@@ -344,8 +345,7 @@ mod tests {
 
     #[test]
     fn test_random_id_generation() {
-        let mut rng = Rng::seed_from_u64(1);
-        let id = new_random_id(&mut rng, prefix::USER_ID, 16);
+        let id = new_random_id(prefix::USER_ID, 16);
         assert!(id.starts_with("u_"));
         let decoded = decode_id(&id).unwrap();
         assert_eq!(decoded.len(), 16);
@@ -470,5 +470,14 @@ mod tests {
         id1.hash(&mut h1);
         id2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn test_participant_id_equality_multiple() {
+        let ext = ExternalParticipantId::new("external_pa".into()).unwrap();
+        let mut rng = Rng::from_os_rng();
+        let participant_id1 = ParticipantId::new(&mut rng, ext.clone());
+        let participant_id2 = ParticipantId::new(&mut rng, ext);
+        assert_ne!(participant_id1, participant_id2);
     }
 }
