@@ -54,7 +54,6 @@ pub enum ParticipantControlMessage {
     TracksPublished(Arc<Vec<TrackHandle>>),
     TracksUnpublished(Arc<Vec<Arc<TrackId>>>),
 
-    TrackPublishAccepted(TrackHandle),
     TrackPublishRejected(TrackHandle),
 }
 
@@ -109,8 +108,11 @@ pub struct ParticipantActor {
     participant_id: Arc<ParticipantId>,
 
     // Current local state
-    published_tracks: HashMap<Mid, TrackHandle>,
-    subscribed_tracks: HashMap<Mid, MidOutSlot>,
+    published_video_tracks: HashMap<Mid, TrackHandle>,
+    published_audio_tracks: HashMap<Mid, TrackHandle>,
+    subscribed_video_tracks: HashMap<Mid, MidOutSlot>,
+    subscribed_audio_tracks: HashMap<Mid, MidOutSlot>,
+    initialized: bool,
 
     // Global view of available tracks. This participant view is mirrored
     // 1:1 to the client. Thus, it's possible to be slightly different than the
@@ -120,7 +122,8 @@ pub struct ParticipantActor {
     // due to a lack of permission.
     //
     // InternalTrackId -> TrackOut
-    available_tracks: HashMap<Arc<EntityId>, TrackOut>,
+    available_video_tracks: HashMap<Arc<EntityId>, TrackOut>,
+    available_audio_tracks: HashMap<Arc<EntityId>, TrackOut>,
 
     // State sync with client
     //
@@ -128,7 +131,7 @@ pub struct ParticipantActor {
     // should not hold all published tracks in the room, only Room actor and the client
     // will have the full list.
     pending_published_tracks: Vec<proto::sfu::TrackInfo>,
-    pending_unpublished_tracks: Vec<Arc<EntityId>>,
+    pending_unpublished_tracks: Vec<EntityId>,
     pending_switched_tracks: Vec<proto::sfu::TrackSwitchInfo>,
     should_resync: bool,
 }
@@ -248,20 +251,26 @@ impl ParticipantActor {
         self.should_resync = true;
         match msg {
             ParticipantControlMessage::TracksPublished(tracks) => {
-                let mut new_tracks = Vec::new();
-
                 for track in tracks.iter() {
                     if track.meta.id.origin_participant == self.participant_id {
+                        // don't include to pending published tracks to prevent loopback on client
                         // successfully publish a track
                         tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
-                        self.published_tracks
-                            .insert(track.meta.id.origin_mid, track.clone());
+
+                        match track.meta.kind {
+                            MediaKind::Video => self
+                                .published_video_tracks
+                                .insert(track.meta.id.origin_mid, track.clone()),
+                            MediaKind::Audio => self
+                                .published_audio_tracks
+                                .insert(track.meta.id.origin_mid, track.clone()),
+                        };
                     } else {
                         // new tracks from other participants
                         tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
                         let track_id = track.meta.id.clone();
 
-                        self.available_tracks.insert(
+                        self.available_video_tracks.insert(
                             track_id.internal.clone(),
                             TrackOut {
                                 handle: track.clone(),
@@ -274,17 +283,21 @@ impl ParticipantActor {
                             sfu::TrackKind::Audio
                         };
 
-                        new_tracks.push(sfu::TrackInfo {
+                        self.pending_published_tracks.push(sfu::TrackInfo {
                             track_id: track.meta.id.to_string(),
                             kind: kind as i32,
                             participant_id: track.meta.id.origin_participant.to_string(),
                         });
                     }
                 }
+
+                if !self.initialized {
+                    self.init_subscriptions().await;
+                }
             }
             ParticipantControlMessage::TracksUnpublished(track_ids) => {
                 for track_id in track_ids.iter() {
-                    let Some(track) = self.available_tracks.remove(&track_id.internal) else {
+                    let Some(track) = self.available_video_tracks.remove(&track_id.internal) else {
                         return;
                     };
 
@@ -292,14 +305,34 @@ impl ParticipantActor {
                         return;
                     };
 
-                    // We don't reconfigure downstreams here because the client will
-                    // likely rearrange their layout and subscribe for new streams.
-                    self.subscribed_tracks.remove(&mid);
+                    match track.handle.meta.kind {
+                        MediaKind::Video => self.subscribed_video_tracks.remove(&mid),
+                        MediaKind::Audio => self.subscribed_audio_tracks.remove(&mid),
+                    };
+
+                    self.pending_unpublished_tracks.push(track_id.to_string());
                 }
             }
-            ParticipantControlMessage::TrackPublishAccepted(track_handle) => {}
-            ParticipantControlMessage::TrackPublishRejected(track_handle) => {}
+            ParticipantControlMessage::TrackPublishRejected(track_handle) => {
+                // TODO: notify rejection to client
+            }
         }
+    }
+
+    async fn init_subscriptions(&mut self) {
+        // auto subscribe
+        let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
+        let mut available_tracks_iter = self.available_video_tracks.iter();
+
+        while let (Some(sub), Some(available)) =
+            (subscribed_tracks_iter.next(), available_tracks_iter.next())
+        {
+            let meta = &available.1.handle.meta;
+            sub.1.track_id.replace(meta.id.clone());
+            available.1.handle.subscribe(self.handle.clone()).await;
+            tracing::info!("replaced track");
+        }
+        self.initialized = true
     }
 
     async fn poll(&mut self) -> Option<Duration> {
@@ -373,24 +406,13 @@ impl ParticipantActor {
         match payload {
             sfu::client_message::Payload::Subscribe(subscribe) => {
                 let mid = Mid::from(subscribe.mid.as_str());
-                if let Some(track) = self.available_tracks.get_mut(&subscribe.remote_track_id) {
-                    if let Some(slot) = self.subscribed_tracks.get_mut(&mid) {
-                        track.mid.replace(mid);
-                        if let Some(last_track) =
-                            slot.track_id.replace(track.handle.meta.id.clone())
-                        {
-                            self.handle_unsubscribe(last_track).await;
-                        }
-                    }
-                }
+
+                // TODO: handle subscribe
             }
             sfu::client_message::Payload::Unsubscribe(unsubscribe) => {
                 let mid = Mid::from(unsubscribe.mid.as_str());
-                if let Some(slot) = self.subscribed_tracks.get_mut(&mid) {
-                    if let Some(last_track) = slot.track_id.take() {
-                        self.handle_unsubscribe(last_track).await;
-                    }
-                }
+
+                // TODO: handle unsubscribe
             }
         };
 
@@ -449,7 +471,9 @@ impl ParticipantActor {
                 }
             }
             Event::MediaData(e) => {
-                if let Some(track) = self.published_tracks.get(&e.mid) {
+                if let Some(track) = self.published_video_tracks.get(&e.mid) {
+                    let _ = track.forward_media(Arc::new(e)).await;
+                } else if let Some(track) = self.published_audio_tracks.get(&e.mid) {
                     let _ = track.forward_media(Arc::new(e)).await;
                 }
             }
@@ -465,12 +489,12 @@ impl ParticipantActor {
         let Some(MidOutSlot {
             track_id: Some(track_id),
             ..
-        }) = self.subscribed_tracks.get(&req.mid)
+        }) = self.subscribed_video_tracks.get(&req.mid)
         else {
             return;
         };
 
-        let Some(track) = self.available_tracks.get(&track_id.internal) else {
+        let Some(track) = self.available_video_tracks.get(&track_id.internal) else {
             return;
         };
 
@@ -503,27 +527,36 @@ impl ParticipantActor {
             // SFU -> client
             Direction::SendOnly => {
                 tracing::info!(?media, "handle_new_media from other participant");
-                self.subscribed_tracks.insert(
-                    media.mid,
-                    MidOutSlot {
-                        kind: media.kind,
-                        simulcast: media.simulcast,
-                        track_id: None,
-                    },
-                );
+                match media.kind {
+                    MediaKind::Video => self.subscribed_video_tracks.insert(
+                        media.mid,
+                        MidOutSlot {
+                            kind: media.kind,
+                            simulcast: media.simulcast,
+                            track_id: None,
+                        },
+                    ),
+                    MediaKind::Audio => self.subscribed_audio_tracks.insert(
+                        media.mid,
+                        MidOutSlot {
+                            kind: media.kind,
+                            simulcast: media.simulcast,
+                            track_id: None,
+                        },
+                    ),
+                };
 
                 self.reconfigure_downstreams().await;
             }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
                 self.rtc.disconnect();
-                return;
             }
         }
     }
 
     fn handle_forward_media(&mut self, track: Arc<TrackMeta>, data: Arc<MediaData>) {
-        let Some(track) = self.available_tracks.get(&track.id.internal) else {
+        let Some(track) = self.available_video_tracks.get(&track.id.internal) else {
             return;
         };
 
@@ -547,12 +580,12 @@ impl ParticipantActor {
     }
 
     async fn reconfigure_downstreams(&mut self) {
-        for (mid, mid_slot) in &mut self.subscribed_tracks {
+        for (mid, mid_slot) in &mut self.subscribed_video_tracks {
             if mid_slot.track_id.is_some() {
                 continue;
             }
 
-            for (_, track) in &mut self.available_tracks {
+            for (_, track) in &mut self.available_video_tracks {
                 if track.mid.is_some() {
                     continue;
                 }
@@ -603,9 +636,14 @@ impl ParticipantHandle {
             room,
             participant_id,
             rtc,
-            published_tracks: HashMap::new(),
-            available_tracks: HashMap::new(),
-            subscribed_tracks: HashMap::new(),
+
+            initialized: false,
+            published_video_tracks: HashMap::new(),
+            published_audio_tracks: HashMap::new(),
+            available_video_tracks: HashMap::new(),
+            available_audio_tracks: HashMap::new(),
+            subscribed_video_tracks: HashMap::new(),
+            subscribed_audio_tracks: HashMap::new(),
             cid: None,
 
             pending_published_tracks: Vec::new(),

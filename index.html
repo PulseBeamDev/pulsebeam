@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple WHEP Player (No Dependencies)</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 2em;
+            background-color: #f0f0f0;
+        }
+        #player-container {
+            width: 80%;
+            max-width: 800px;
+            background-color: black;
+        }
+        video {
+            width: 100%;
+            display: block;
+        }
+        input, button {
+            padding: 0.75em;
+            margin-bottom: 1em;
+            width: 80%;
+            max-width: 800px;
+            box-sizing: border-box; /* Ensures padding doesn't affect width */
+        }
+        button {
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>WHEP Player (No Dependencies)</h2>
+    <p><strong>Note:</strong> This may not work if you are behind a complex NAT without a STUN server.</p>
+
+    <input type="text" id="whepURL" placeholder="Enter WHEP Endpoint URL" value="https://wrtc-edge.lab.sto.eyevinn.technology:8443/whep/channel/sthlm">
+    <button id="connectButton">Connect</button>
+
+    <div id="player-container">
+        <video id="videoPlayer" autoplay playsinline controls muted></video>
+    </div>
+
+    <script>
+        const connectButton = document.getElementById('connectButton');
+        const whepURLInput = document.getElementById('whepURL');
+        const videoPlayer = document.getElementById('videoPlayer');
+
+        let peerConnection;
+
+        // When the connect button is clicked, start the WHEP playback
+        connectButton.addEventListener('click', async () => {
+            await startPlayback();
+        });
+
+        async function startPlayback() {
+            console.log("Starting WHEP playback...");
+
+            // Create a new RTCPeerConnection.
+            // No STUN/TURN servers are provided in the configuration.
+            peerConnection = new RTCPeerConnection({
+                iceServers: [],
+                bundlePolicy: 'max-bundle'
+            });
+
+            // This event handler is called when the browser needs to send a new ICE candidate.
+            // In WHEP, we don't send candidates this way, so we can leave it empty.
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log("ICE Candidate:", event.candidate);
+                }
+            };
+
+            // This event handler is called when media starts arriving from the other peer.
+            peerConnection.ontrack = (event) => {
+                console.log("Track received:", event.track);
+                if (videoPlayer.srcObject !== event.streams[0]) {
+                    videoPlayer.srcObject = event.streams[0];
+                    console.log("Assigned stream to video player.");
+                }
+            };
+            
+            // Add transceivers to receive video and audio.
+            // This tells the PeerConnection what kind of media to expect.
+            peerConnection.addTransceiver('video', { 'direction': 'recvonly' });
+            peerConnection.addTransceiver('audio', { 'direction': 'recvonly' });
+
+            // Create an SDP offer. This describes the media we want to receive.
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            // Now, we perform the HTTP POST request to the WHEP endpoint.
+            try {
+                const whepUrl = whepURLInput.value;
+                const response = await fetch(whepUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/sdp'
+                    },
+                    body: peerConnection.localDescription.sdp
+                });
+
+                if (!response.ok) {
+                    throw new Error(`WHEP request failed with status ${response.status}`);
+                }
+                
+                // The response from the WHEP endpoint is the SDP answer.
+                const answerSdp = await response.text();
+                
+                // Set the remote description with the answer from the server.
+                await peerConnection.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                console.log("Connection established successfully!");
+
+            } catch (error) {
+                console.error("Failed to connect to WHEP endpoint:", error);
+                alert("Could not connect to the WHEP endpoint. See console for details.");
+            }
+        }
+    </script>
+
+</body>
+</html>
