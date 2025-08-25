@@ -98,15 +98,15 @@ where
     A: Actor + Send + 'static,
 {
     let span = tracing::Span::current();
-    tracing::info!("Starting actor...");
+    tracing::debug!("Starting actor...");
 
     let mut current_status = ActorStatus::Starting;
-    span.record("status", &tracing::field::display(current_status));
+    span.record("status", tracing::field::display(current_status));
 
     // 1. Pre-start Hook
     match actor.pre_start().await {
         Ok(()) => {
-            tracing::info!("pre_start successful.");
+            tracing::debug!("pre_start successful.");
             current_status = ActorStatus::Running;
         }
         Err(err) => {
@@ -115,7 +115,7 @@ where
             // Fall through to post_stop
         }
     }
-    span.record("status", &tracing::field::display(current_status));
+    span.record("status", tracing::field::display(current_status));
 
     // 2. Run Main Actor Logic (only if pre_start was OK)
     if current_status == ActorStatus::Running {
@@ -127,7 +127,7 @@ where
 
         match run_result {
             Ok(Ok(())) => {
-                tracing::info!("Exited gracefully from run_actor_logic.");
+                tracing::debug!("Exited gracefully from run_actor_logic.");
                 current_status = ActorStatus::ExitedGracefully;
             }
             Ok(Err(err)) => {
@@ -145,15 +145,15 @@ where
                 );
             }
         };
-        span.record("status", &tracing::field::display(current_status));
+        span.record("status", tracing::field::display(current_status));
     }
 
     // 3. Unified Post-stop Hook
     // Called if pre_start failed OR after run_actor_logic (regardless of its outcome, including panic)
-    tracing::info!("Attempting post_stop...");
+    tracing::debug!("Attempting post_stop...");
     match actor.post_stop().await {
         Ok(()) => {
-            tracing::info!("post_stop successful.");
+            tracing::debug!("post_stop successful.");
             // Determine final status based on previous state
             match current_status {
                 ActorStatus::PreStartFailed
@@ -185,8 +185,8 @@ where
         }
     }
 
-    span.record("status", &tracing::field::display(current_status));
-    tracing::info!("Fully shut down with final status: {}", current_status);
+    span.record("status", tracing::field::display(current_status));
+    tracing::debug!("Fully shut down with final status: {}", current_status);
 }
 
 fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {

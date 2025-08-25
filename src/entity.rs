@@ -100,7 +100,7 @@ pub struct RoomId {
 
 impl RoomId {
     pub fn new(external: ExternalRoomId) -> Self {
-        let internal = new_hashed_id(prefix::PARTICIPANT_ID, external.as_str());
+        let internal = new_hashed_id(prefix::ROOM_ID, external.as_str());
         Self { external, internal }
     }
 }

@@ -21,6 +21,7 @@ pub enum RoomMessage {
     AddParticipant(ParticipantHandle, ParticipantActor),
 }
 
+#[derive(Debug)]
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, TrackHandle>,
@@ -104,6 +105,11 @@ impl RoomActor {
                 for meta in self.participants.values() {
                     tracks.extend(meta.tracks.values().cloned());
                 }
+                tracing::info!(
+                    "{} joined, adding tracks: {:?}",
+                    participant_handle.participant_id,
+                    self.participants,
+                );
                 let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
             }
             RoomMessage::PublishTrack(participant_handle, track_meta) => {
@@ -119,6 +125,11 @@ impl RoomActor {
                 let (handle, track_actor) =
                     TrackHandle::new(participant_handle.clone(), track_meta.clone());
                 let track_id = track_meta.id.clone();
+                tracing::info!(
+                    "{} published a track, added: {}",
+                    origin.handle.participant_id,
+                    track_id
+                );
                 self.track_tasks.spawn(
                     async move {
                         actor::run(track_actor).await;
@@ -130,6 +141,11 @@ impl RoomActor {
                 let new_tracks = Arc::new(vec![handle]);
                 for participant in self.participants.values() {
                     let _ = participant.handle.add_tracks(new_tracks.clone()).await;
+                    tracing::info!(
+                        "current tracks: {} -> {:?}",
+                        participant.handle.participant_id,
+                        participant.tracks
+                    );
                 }
             }
         };

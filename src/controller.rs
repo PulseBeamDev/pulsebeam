@@ -5,7 +5,7 @@ use crate::{
     entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
     participant::ParticipantHandle,
     rng::Rng,
-    room::RoomHandle,
+    room::{self, RoomHandle},
     sink::UdpSinkHandle,
     source::UdpSourceHandle,
 };
@@ -141,8 +141,10 @@ impl ControllerActor {
 
     fn get_or_create_room(&mut self, room_id: Arc<RoomId>) -> RoomHandle {
         if let Some(handle) = self.rooms.get(&room_id) {
+            tracing::info!("get_room: {}", room_id);
             handle.clone()
         } else {
+            tracing::info!("create_room: {}", room_id);
             let (room_handle, room_actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
             self.rooms.insert(room_id.clone(), room_handle.clone());
             self.room_tasks.spawn(
