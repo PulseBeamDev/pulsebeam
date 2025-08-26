@@ -3,18 +3,25 @@ use tokio::{sync::mpsc, task::JoinSet};
 pub trait Actor: Send + 'static {
     type HighPriorityMessage: Send + 'static;
     type LowPriorityMessage: Send + 'static;
-    type ActorId: AsRef<str>;
+    type ActorId: std::fmt::Debug
+        + std::fmt::Display
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static;
 
-    fn id() -> Self::ActorId;
+    fn id(&self) -> Self::ActorId;
 
     fn run(
         &mut self,
         hi_rx: mpsc::Receiver<Self::HighPriorityMessage>,
         lo_rx: mpsc::Receiver<Self::LowPriorityMessage>,
-    ) -> impl Future<Output = ()>;
+    ) -> impl Future<Output = ()> + Send + Sync;
 }
 
-pub trait ActorRef<A: Actor>: std::fmt::Debug + Clone {
+pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone {
     fn lo_send(
         &self,
         message: A::LowPriorityMessage,
@@ -36,36 +43,13 @@ pub trait ActorRef<A: Actor>: std::fmt::Debug + Clone {
     ) -> Result<(), mpsc::error::TrySendError<A::HighPriorityMessage>>;
 }
 
-pub enum RoomHighPriorityMessage {}
-
-pub enum RoomLowPriorityMessage {}
-
-pub struct Room {}
-
-impl Actor for Room {
-    type HighPriorityMessage = RoomHighPriorityMessage;
-    type LowPriorityMessage = RoomLowPriorityMessage;
-    type ActorId = &'static str;
-
-    fn id() -> Self::ActorId {
-        "room"
-    }
-
-    async fn run(
-        &mut self,
-        hi_rx: mpsc::Receiver<Self::HighPriorityMessage>,
-        lo_rx: mpsc::Receiver<Self::LowPriorityMessage>,
-    ) -> () {
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct BaseActorRef<A: Actor> {
+pub struct BaseActorHandle<A: Actor> {
     hi_tx: mpsc::Sender<A::HighPriorityMessage>,
     lo_tx: mpsc::Sender<A::LowPriorityMessage>,
 }
 
-impl<A: Actor> BaseActorRef<A> {
+impl<A: Actor> BaseActorHandle<A> {
     pub async fn lo_send(
         &self,
         message: A::LowPriorityMessage,
@@ -96,15 +80,18 @@ impl<A: Actor> BaseActorRef<A> {
 }
 
 pub fn spawn<A: Actor>(
-    spawner: JoinSet<A::ActorId>,
+    mut spawner: JoinSet<A::ActorId>,
     mut actor: A,
     lo_cap: usize,
     hi_cap: usize,
-) -> BaseActorRef<A> {
+) -> BaseActorHandle<A> {
     let (lo_tx, lo_rx) = mpsc::channel::<A::LowPriorityMessage>(lo_cap);
     let (hi_tx, hi_rx) = mpsc::channel::<A::HighPriorityMessage>(hi_cap);
+    let actor_id = actor.id();
 
-    // tokio::spawn(actor.run(lo_rx, hi_rx));
-
-    BaseActorRef { lo_tx, hi_tx }
+    spawner.spawn(async move {
+        actor.run(hi_rx, lo_rx).await;
+        actor_id
+    });
+    BaseActorHandle { lo_tx, hi_tx }
 }
