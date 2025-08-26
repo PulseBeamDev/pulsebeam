@@ -17,17 +17,11 @@ strip = "debuginfo"
 
 [workspace.dependencies]
 anyhow = "1"
-bytes = "1"
 serde = { version = "1", features = ["derive"]}
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-hex = "0.4.3"
 futures = "0.3.31"
-bs58 = "0.5.1"
-sha3 = "0.10.8"
-metrics = "0.24.2"
 
 [workspace]
 resolver = "2"

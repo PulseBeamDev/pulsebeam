@@ -93,13 +93,13 @@ impl RoomActor {
                         tracks: HashMap::new(),
                     },
                 );
-                self.participant_tasks.spawn(
-                    async move {
-                        actor::run(participant_actor).await;
-                        participant_id
-                    }
-                    .in_current_span(),
-                );
+                let task = async move {
+                    actor::run(participant_actor).await;
+                    participant_id
+                }
+                .in_current_span();
+
+                self.participant_tasks.spawn(task);
 
                 let mut tracks = Vec::with_capacity(self.participants.len());
                 for meta in self.participants.values() {

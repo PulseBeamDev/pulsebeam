@@ -36,6 +36,7 @@ metrics = "0.24.2"
 mimalloc = "0.1.46"
 hyper = "1.6.0"
 turmoil = "0.6.6"
+pulsebeam-actor = { version = "0.1.0", path = "../pulsebeam-actor" }
 
 [build-dependencies]
 prost-build = "0.13.5"
