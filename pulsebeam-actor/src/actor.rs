@@ -171,10 +171,6 @@ pub fn spawn<A: Actor>(
     BaseActorHandle { lo_tx, hi_tx }
 }
 
-async fn test() -> ActorStatus {
-    ActorStatus::Starting
-}
-
 #[tracing::instrument(
     name = "actor_run",
     skip_all,

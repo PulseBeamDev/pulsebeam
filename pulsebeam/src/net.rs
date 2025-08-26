@@ -3,8 +3,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub trait PacketSocket: Send + Sync + Clone + 'static {
-    fn recv_from(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<(usize, SocketAddr)>>;
-    fn send_to(&self, buf: &[u8], addr: SocketAddr) -> impl Future<Output = io::Result<usize>>;
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send + Sync;
+    fn send_to(
+        &self,
+        buf: &[u8],
+        addr: SocketAddr,
+    ) -> impl Future<Output = io::Result<usize>> + Send + Sync;
     fn local_addr(&self) -> Result<SocketAddr, io::Error>;
 }
 
