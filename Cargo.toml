@@ -1,7 +1,11 @@
-[package]
-name = "pulsebeam"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+homepage = "https://pulsebeam.dev/"
+documentation = "https://pulsebeam.dev/"
+repository = "https://github.com/PulseBeamDev/pulsebeam"
+authors = ["Lukas Herman <lukas@pulsebeam.dev>"]
+license = "AGPL-3.0"
 
 [profile.release]
 opt-level = 3
@@ -11,10 +15,8 @@ panic = "unwind"
 debug = 1
 strip = "debuginfo"
 
-[features]
-default = []
-
-[dependencies]
+[workspace.dependencies]
+anyhow = "1"
 bytes = "1"
 serde = { version = "1", features = ["derive"]}
 thiserror = "2.0"
@@ -30,6 +32,6 @@ metrics = "0.24.2"
 [workspace]
 resolver = "2"
 members = [
-  "pulsebeam-actors",
-  "pulsebeam-sfu",
+  "pulsebeam-actor",
+  "pulsebeam",
 ]

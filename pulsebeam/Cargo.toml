@@ -1,5 +1,5 @@
 [package]
-name = "pulsebeam-actor"
+name = "pulsebeam"
 
 version.workspace = true
 edition.workspace = true
@@ -11,13 +11,8 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-async-trait = { workspace = true }
-flume = { workspace = true }
 futures = { workspace = true }
-once_cell = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-sync_wrapper = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
