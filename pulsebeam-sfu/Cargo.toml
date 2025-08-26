@@ -1,0 +1,52 @@
+[package]
+name = "pulsebeam-actor"
+
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sync_wrapper = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+config = { version = "0.15", features = ["toml"] }
+rand = "0.9"
+toml = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "75977cef4c058b52934a11ec1620a382e507e65c" }
+axum = { version = "0.8.3", features = ["macros"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
+systemstat = "0.2.4"
+tower-http = { version = "0.6.2", features = ["cors"] }
+hex = "0.4.3"
+prost = "0.13.5"
+bs58 = "0.5.1"
+sha3 = "0.10.8"
+metrics = "0.24.2"
+mimalloc = "0.1.46"
+hyper = "1.6.0"
+turmoil = "0.6.6"
+
+[build-dependencies]
+prost-build = "0.13.5"
+
+# [patch.crates-io]
+# str0m = { path = "../str0m" }
+[patch."https://github.com/algesten/str0m.git"]
+str0m = { path = "../str0m" }
+
