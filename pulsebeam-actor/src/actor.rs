@@ -66,21 +66,27 @@ pub trait Actor: Send + Sized + 'static {
     fn kind(&self) -> &'static str;
     fn id(&self) -> Self::ID;
 
+    // Marking Send + Sync because of Rust compiler can't determine if the implementation is
+    // Send safe:
+    //  * https://blog.rust-lang.org/inside-rust/2023/05/03/stabilizing-async-fn-in-trait/
+    //  * https://github.com/rust-lang/rust/issues/103854
+    //  * https://users.rust-lang.org/t/why-is-the-future-not-implemented-send/89238
+    //  * https://www.reddit.com/r/rust/comments/1mvasiv/generics_with_tokiotaskspawn/
     fn run(
         &mut self,
         hi_rx: mpsc::Receiver<Self::HighPriorityMessage>,
         lo_rx: mpsc::Receiver<Self::LowPriorityMessage>,
-    ) -> impl Future<Output = Result<(), ActorError>>;
+    ) -> impl Future<Output = Result<(), ActorError>> + Send + Sync;
 
     /// Called once before the main `run` loop starts.
-    fn pre_start(&mut self) -> impl Future<Output = Result<(), ActorError>> {
+    fn pre_start(&mut self) -> impl Future<Output = Result<(), ActorError>> + Send + Sync {
         async { Ok(()) }
     }
 
     /// Called once after `run` completes (Ok or Err),
     /// OR if `pre_start` fails, OR if `run_actor_logic` panics.
     /// This function MUST be panic-safe if it's to be called after a panic.
-    fn post_stop(&mut self) -> impl Future<Output = Result<(), ActorError>> {
+    fn post_stop(&mut self) -> impl Future<Output = Result<(), ActorError>> + Send + Sync {
         async { Ok(()) }
     }
 }
@@ -154,14 +160,19 @@ pub fn spawn<A: Actor>(
     let actor_kind = actor.kind();
     let actor_id = actor.id();
 
-    spawner.spawn(
-        async move {
-            let status = run_instrumented(actor, hi_rx, lo_rx, actor_kind, &actor_id).await;
-            (actor_id, status)
-        }
-        .in_current_span(),
-    );
+    let task = async move {
+        let status = run_instrumented(actor, hi_rx, lo_rx, actor_kind, &actor_id).await;
+        (actor_id, status)
+    }
+    .in_current_span();
+
+    spawner.spawn(task);
+
     BaseActorHandle { lo_tx, hi_tx }
+}
+
+async fn test() -> ActorStatus {
+    ActorStatus::Starting
 }
 
 #[tracing::instrument(
