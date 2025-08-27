@@ -1,20 +1,20 @@
-use pulsebeam_runtime::{Actor, ActorError, mailbox};
-use tokio::sync::mpsc::{self, error::SendError};
+use pulsebeam_runtime::actor;
+use pulsebeam_runtime::mailbox;
+use pulsebeam_runtime::net;
 
-use crate::{message, net::PacketSocket};
+use crate::message;
 
 #[derive(Debug)]
-pub enum UdpSinkMessage {
-    UdpPacket(message::EgressUDPPacket),
+pub enum SinkMessage {
+    Packet(message::EgressUDPPacket),
 }
 
-pub struct UdpSinkActor<S> {
-    socket: S,
-    receiver: mpsc::Receiver<UdpSinkMessage>,
+pub struct SinkActor {
+    socket: net::UnifiedSocket,
 }
 
-impl<S: PacketSocket + Send + Sync + 'static> Actor for UdpSinkActor<S> {
-    type LowPriorityMessage = UdpSinkMessage;
+impl actor::Actor for SinkActor {
+    type LowPriorityMessage = SinkMessage;
     type HighPriorityMessage = ();
     type ID = usize;
 
@@ -30,7 +30,7 @@ impl<S: PacketSocket + Send + Sync + 'static> Actor for UdpSinkActor<S> {
         &mut self,
         hi_rx: mailbox::Receiver<Self::HighPriorityMessage>,
         mut lo_rx: mailbox::Receiver<Self::LowPriorityMessage>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), actor::ActorError> {
         // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
         // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
         //
@@ -38,7 +38,7 @@ impl<S: PacketSocket + Send + Sync + 'static> Actor for UdpSinkActor<S> {
         // TODO: use quinn-udp optimizations, https://github.com/quinn-rs/quinn/blob/4f8a0f13cf7931ef9be573af5089c7a4a49387ae//quinn/src/runtime/tokio.rs#L1-L102
         while let Some(msg) = lo_rx.recv().await {
             match msg {
-                UdpSinkMessage::UdpPacket(packet) => {
+                SinkMessage::Packet(packet) => {
                     let res = self.socket.send_to(&packet.raw, packet.dst).await;
                     if let Err(err) = res {
                         tracing::warn!("failed to send udp packet to {:?}: {:?}", packet.dst, err);
@@ -50,25 +50,10 @@ impl<S: PacketSocket + Send + Sync + 'static> Actor for UdpSinkActor<S> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct UdpSinkHandle {
-    sender: mpsc::Sender<UdpSinkMessage>,
-}
-
-impl UdpSinkHandle {
-    pub fn new<S: PacketSocket>(socket: S) -> (Self, UdpSinkActor<S>) {
-        let (sender, receiver) = mpsc::channel(2048);
-        let handle = Self { sender };
-        let actor = UdpSinkActor { socket, receiver };
-        (handle, actor)
-    }
-
-    pub async fn send(
-        &self,
-        msg: message::EgressUDPPacket,
-    ) -> Result<(), SendError<UdpSinkMessage>> {
-        // TODO: monitor backpressure and packet dropping
-        // Await because we want the producer to slow down when a backpressure occurs
-        self.sender.send(UdpSinkMessage::UdpPacket(msg)).await
+impl SinkActor {
+    pub fn new(socket: net::UnifiedSocket) -> Self {
+        Self { socket }
     }
 }
+
+pub type SinkHandle = actor::LocalActorHandle<SinkActor>;

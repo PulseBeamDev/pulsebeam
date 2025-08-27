@@ -30,7 +30,7 @@ use crate::{
     proto::{self, sfu},
     rng::Rng,
     room::RoomHandle,
-    sink::UdpSinkHandle,
+    sink::{SinkHandle, SinkMessage},
     source::UdpSourceHandle,
     track::TrackHandle,
 };
@@ -93,7 +93,7 @@ pub struct ParticipantActor {
     rng: Rng,
     handle: ParticipantHandle,
     source: UdpSourceHandle,
-    sink: UdpSinkHandle,
+    sink: SinkHandle,
     room: RoomHandle,
 
     // IO
@@ -431,10 +431,10 @@ impl ParticipantActor {
         let packet = Bytes::copy_from_slice(&t.contents);
         let _ = self
             .sink
-            .send(EgressUDPPacket {
+            .lo_send(SinkMessage::Packet(EgressUDPPacket {
                 raw: packet,
                 dst: t.destination,
-            })
+            }))
             .await;
     }
 
@@ -620,7 +620,7 @@ impl ParticipantHandle {
     pub fn new(
         rng: Rng,
         source: UdpSourceHandle,
-        sink: UdpSinkHandle,
+        sink: SinkHandle,
         room: RoomHandle,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,

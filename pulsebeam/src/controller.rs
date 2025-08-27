@@ -1,14 +1,14 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
-    actor::{self, Actor, ActorError},
-    entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
+    entity::{ParticipantId, RoomId},
     participant::ParticipantHandle,
     rng::Rng,
-    room::{self, RoomHandle},
-    sink::UdpSinkHandle,
+    room::RoomHandle,
+    sink::{SinkActor, SinkHandle},
     source::UdpSourceHandle,
 };
+use pulsebeam_runtime::actor;
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -47,7 +47,7 @@ pub struct ControllerActor {
     rng: Rng,
     id: Arc<String>,
     source: UdpSourceHandle,
-    sink: UdpSinkHandle,
+    sink: Box<impl actor::ActorHandle<SinkActor>>,
     receiver: mpsc::Receiver<ControllerMessage>,
     local_addrs: Vec<SocketAddr>,
 

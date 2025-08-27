@@ -10,7 +10,7 @@ use std::{
 };
 
 use pulsebeam::{
-    actor, controller::ControllerHandle, net::UdpSocket, rng::Rng, signaling, sink::UdpSinkHandle,
+    actor, controller::ControllerHandle, net::UdpSocket, rng::Rng, signaling, sink::SinkHandle,
     source::UdpSourceHandle,
 };
 use rand::SeedableRng;
@@ -49,7 +49,7 @@ async fn run() {
 
     let rng = Rng::from_os_rng();
     let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
-    let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
+    let (sink_handle, sink_actor) = SinkHandle::new(socket.clone());
     let (controller_handle, controller_actor) = ControllerHandle::new(
         rng.clone(),
         source_handle,
