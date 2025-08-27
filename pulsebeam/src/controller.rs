@@ -51,8 +51,8 @@ pub struct ControllerActor<Source, Sink> {
 
 impl<Source, Sink> actor::Actor for ControllerActor<Source, Sink>
 where
-    Source: actor::ActorHandle<source::SourceActor>,
-    Sink: actor::ActorHandle<sink::SinkActor>,
+    Source: actor::ActorHandle<source::SourceActor> + 'static,
+    Sink: actor::ActorHandle<sink::SinkActor> + 'static,
 {
     type HighPriorityMessage = ControllerMessage;
     type LowPriorityMessage = ();
@@ -66,18 +66,14 @@ where
         self.id.clone()
     }
 
-    async fn run(
-        &mut self,
-        mut hi_rx: pulsebeam_runtime::mailbox::Receiver<Self::HighPriorityMessage>,
-        lo_rx: pulsebeam_runtime::mailbox::Receiver<Self::LowPriorityMessage>,
-    ) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 biased;
-                Some(msg) = hi_rx.recv() => {
+                Some(msg) = ctx.hi_rx.recv() => {
                     match msg {
                         ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
-                            let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
+                            let _ = resp.send(self.allocate(&mut ctx, room_id, participant_id, offer).await);
                         }
                     }
                 }
@@ -93,9 +89,14 @@ where
     }
 }
 
-impl ControllerActor {
+impl<Source, Sink> ControllerActor<Source, Sink>
+where
+    Source: actor::ActorHandle<source::SourceActor>,
+    Sink: actor::ActorHandle<sink::SinkActor>,
+{
     pub async fn allocate(
         &mut self,
+        ctx: &mut actor::ActorContext<Self>,
         room_id: RoomId,
         participant_id: ParticipantId,
         offer: String,

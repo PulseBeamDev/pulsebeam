@@ -30,19 +30,15 @@ impl actor::Actor for SourceActor {
         0
     }
 
-    async fn run(
-        &mut self,
-        mut hi_rx: pulsebeam_runtime::mailbox::Receiver<Self::HighPriorityMessage>,
-        lo_rx: pulsebeam_runtime::mailbox::Receiver<Self::LowPriorityMessage>,
-    ) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
-        drop(lo_rx); // unused channel
+        drop(ctx.lo_rx); // unused channel
 
         loop {
             tokio::select! {
                 biased;
-                msg = hi_rx.recv() => {
+                msg = ctx.hi_rx.recv() => {
                     match msg {
                         Some(msg) => self.handle_control(msg),
                         None => {

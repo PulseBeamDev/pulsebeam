@@ -46,9 +46,16 @@ impl<T> From<SendError<T>> for TrySendError<T> {
 }
 
 /// A handle to send messages to an actor's mailbox.
-#[derive(Clone)]
 pub struct Sender<T> {
     sender: mpsc::Sender<T>,
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
 }
 
 impl<T> Sender<T> {

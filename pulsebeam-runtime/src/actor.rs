@@ -51,6 +51,12 @@ impl Display for ActorStatus {
     }
 }
 
+pub struct ActorContext<A: Actor> {
+    pub hi_rx: mailbox::Receiver<A::HighPriorityMessage>,
+    pub lo_rx: mailbox::Receiver<A::LowPriorityMessage>,
+    pub handle: LocalActorHandle<A>,
+}
+
 pub trait Actor: Send + Sized + 'static {
     type HighPriorityMessage: Send + 'static;
     type LowPriorityMessage: Send + 'static;
@@ -76,8 +82,7 @@ pub trait Actor: Send + Sized + 'static {
     //  * https://www.reddit.com/r/rust/comments/1mvasiv/generics_with_tokiotaskspawn/
     fn run(
         &mut self,
-        hi_rx: mailbox::Receiver<Self::HighPriorityMessage>,
-        lo_rx: mailbox::Receiver<Self::LowPriorityMessage>,
+        ctx: ActorContext<Self>,
     ) -> impl Future<Output = Result<(), ActorError>> + Send + Sync;
 
     /// Called once before the main `run` loop starts.
@@ -115,10 +120,18 @@ pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone + Send + Sync {
     ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>>;
 }
 
-#[derive(Clone)]
 pub struct LocalActorHandle<A: Actor> {
     hi_tx: mailbox::Sender<A::HighPriorityMessage>,
     lo_tx: mailbox::Sender<A::LowPriorityMessage>,
+}
+
+impl<A: Actor> Clone for LocalActorHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            hi_tx: self.hi_tx.clone(),
+            lo_tx: self.lo_tx.clone(),
+        }
+    }
 }
 
 impl<A: Actor> LocalActorHandle<A> {
@@ -162,19 +175,26 @@ pub fn spawn<A: Actor>(
     let actor_kind = actor.kind();
     let actor_id = actor.id();
 
+    let handle = LocalActorHandle { lo_tx, hi_tx };
+
+    let ctx = ActorContext {
+        hi_rx,
+        lo_rx,
+        handle: handle.clone(),
+    };
+
     let task = async move {
-        let status = run_instrumented(actor, hi_rx, lo_rx, actor_kind, &actor_id).await;
+        let status = run_instrumented(actor, ctx, actor_kind, &actor_id).await;
         (actor_id, status)
     }
     .in_current_span();
 
     spawner.spawn(task);
-
-    LocalActorHandle { lo_tx, hi_tx }
+    handle
 }
 
 #[tracing::instrument(
-    name = "actor_run",
+    name = "run_instrumented",
     skip_all,
     fields(
         actor.kind = %actor_kind,
@@ -184,8 +204,7 @@ pub fn spawn<A: Actor>(
 )]
 async fn run_instrumented<A>(
     mut actor: A,
-    hi_rx: mailbox::Receiver<A::HighPriorityMessage>,
-    lo_rx: mailbox::Receiver<A::LowPriorityMessage>,
+    ctx: ActorContext<A>,
     actor_kind: &'static str,
     actor_id: &A::ID,
 ) -> ActorStatus
@@ -208,9 +227,7 @@ where
     tracing::debug!("pre_start successful. Running main logic.");
 
     // 2. Main Actor Logic
-    let run_result = AssertUnwindSafe(actor.run(hi_rx, lo_rx))
-        .catch_unwind()
-        .await;
+    let run_result = AssertUnwindSafe(actor.run(ctx)).catch_unwind().await;
 
     let status_after_run = match run_result {
         Ok(Ok(())) => {
