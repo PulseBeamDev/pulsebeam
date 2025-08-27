@@ -1,4 +1,4 @@
-use futures::FutureExt;
+use futures_lite::FutureExt;
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
