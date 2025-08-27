@@ -73,31 +73,31 @@ impl<T> Sender<T> {
 }
 
 /// An actor's mailbox for receiving messages.
-pub struct Mailbox<T> {
+pub struct Receiver<T> {
     receiver: mpsc::Receiver<T>,
 }
 
-impl<T> Mailbox<T> {
-    /// Creates a new mailbox and a corresponding sender handle.
-    pub fn new(buffer: usize) -> (Sender<T>, Self) {
-        let (sender, receiver) = mpsc::channel(buffer);
-        (Sender { sender }, Self { receiver })
-    }
-
+impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
         self.receiver.recv().await
     }
 }
 
+/// Creates a new mailbox and a corresponding sender handle.
+pub fn new<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
+    let (sender, receiver) = mpsc::channel(buffer);
+    (Sender { sender }, Receiver { receiver })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*; // Import the mailbox implementation
+    use crate::mailbox;
     use std::time::Duration;
 
     #[tokio::test]
     async fn send_and_recv_single_message() {
-        let (sender, mut mailbox) = Mailbox::new(10);
+        let (sender, mut mailbox) = mailbox::new(10);
         let message = "hello".to_string();
 
         sender.send(message.clone()).await.unwrap();
@@ -108,7 +108,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_none_when_all_senders_are_dropped() {
-        let (sender, mut mailbox) = Mailbox::<i32>::new(10);
+        let (sender, mut mailbox) = mailbox::new::<i32>(10);
         sender.send(1).await.unwrap();
         sender.send(2).await.unwrap();
 
@@ -125,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_send_fails_when_receiver_is_dropped() {
-        let (sender, mailbox) = Mailbox::<String>::new(10);
+        let (sender, mailbox) = mailbox::new::<String>(10);
 
         // Drop the mailbox immediately
         drop(mailbox);
@@ -134,7 +134,7 @@ mod tests {
         assert!(result.is_err());
 
         // Check that the error is our custom SendError and we can get the message back
-        if let Err(SendError(msg)) = result {
+        if let Err(mailbox::SendError(msg)) = result {
             assert_eq!(msg, "should fail");
         } else {
             panic!("Expected a SendError");
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn try_send_success_on_capacity() {
-        let (sender, _mailbox) = Mailbox::<i32>::new(1);
+        let (sender, _mailbox) = mailbox::new::<i32>(1);
         let result = sender.try_send(123);
         assert!(result.is_ok());
     }
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn try_send_fails_when_full() {
         // Create a mailbox with a buffer of 1
-        let (sender, _mailbox) = Mailbox::<i32>::new(1);
+        let (sender, _mailbox) = mailbox::new::<i32>(1);
 
         // The first send succeeds and fills the buffer
         sender.try_send(1).unwrap();
@@ -162,14 +162,14 @@ mod tests {
 
         // Check that the error is TrySendError::Full and contains the failed message
         match result {
-            Err(TrySendError::Full(msg)) => assert_eq!(msg, 2),
+            Err(mailbox::TrySendError::Full(msg)) => assert_eq!(msg, 2),
             _ => panic!("Expected a TrySendError::Full"),
         }
     }
 
     #[test]
     fn try_send_fails_when_receiver_is_dropped() {
-        let (sender, mailbox) = Mailbox::<i32>::new(1);
+        let (sender, mailbox) = mailbox::new::<i32>(1);
 
         // Drop the receiver
         drop(mailbox);
@@ -179,14 +179,14 @@ mod tests {
 
         // Check for the correct error variant
         match result {
-            Err(TrySendError::Closed(msg)) => assert_eq!(msg, 42),
+            Err(mailbox::TrySendError::Closed(msg)) => assert_eq!(msg, 42),
             _ => panic!("Expected a TrySendError::Closed"),
         }
     }
 
     #[tokio::test]
     async fn async_send_waits_when_full() {
-        let (sender, mut mailbox) = Mailbox::<i32>::new(1);
+        let (sender, mut mailbox) = mailbox::new::<i32>(1);
 
         // Fill the buffer
         sender.send(1).await.unwrap();
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_sender_works_and_channel_stays_open() {
-        let (sender1, mut mailbox) = Mailbox::<i32>::new(10);
+        let (sender1, mut mailbox) = mailbox::new::<i32>(10);
         let sender2 = sender1.clone();
 
         sender1.send(1).await.unwrap();

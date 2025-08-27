@@ -3,8 +3,10 @@ use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::task::JoinSet;
 use tracing::Instrument;
+
+use crate::mailbox;
 
 #[derive(Error, Debug)]
 pub enum ActorError {
@@ -74,8 +76,8 @@ pub trait Actor: Send + Sized + 'static {
     //  * https://www.reddit.com/r/rust/comments/1mvasiv/generics_with_tokiotaskspawn/
     fn run(
         &mut self,
-        hi_rx: mpsc::Receiver<Self::HighPriorityMessage>,
-        lo_rx: mpsc::Receiver<Self::LowPriorityMessage>,
+        hi_rx: mailbox::Receiver<Self::HighPriorityMessage>,
+        lo_rx: mailbox::Receiver<Self::LowPriorityMessage>,
     ) -> impl Future<Output = Result<(), ActorError>> + Send + Sync;
 
     /// Called once before the main `run` loop starts.
@@ -95,56 +97,56 @@ pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone {
     fn lo_send(
         &self,
         message: A::LowPriorityMessage,
-    ) -> impl Future<Output = Result<(), mpsc::error::SendError<A::LowPriorityMessage>>>;
+    ) -> impl Future<Output = Result<(), mailbox::SendError<A::LowPriorityMessage>>>;
 
     fn lo_try_send(
         &self,
         message: A::LowPriorityMessage,
-    ) -> Result<(), mpsc::error::TrySendError<A::LowPriorityMessage>>;
+    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMessage>>;
 
     fn hi_send(
         &self,
         message: A::HighPriorityMessage,
-    ) -> impl Future<Output = Result<(), mpsc::error::SendError<A::HighPriorityMessage>>>;
+    ) -> impl Future<Output = Result<(), mailbox::SendError<A::HighPriorityMessage>>>;
 
     fn hi_try_send(
         &self,
         message: A::HighPriorityMessage,
-    ) -> Result<(), mpsc::error::TrySendError<A::HighPriorityMessage>>;
+    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BaseActorHandle<A: Actor> {
-    hi_tx: mpsc::Sender<A::HighPriorityMessage>,
-    lo_tx: mpsc::Sender<A::LowPriorityMessage>,
+    hi_tx: mailbox::Sender<A::HighPriorityMessage>,
+    lo_tx: mailbox::Sender<A::LowPriorityMessage>,
 }
 
 impl<A: Actor> BaseActorHandle<A> {
     pub async fn lo_send(
         &self,
         message: A::LowPriorityMessage,
-    ) -> Result<(), mpsc::error::SendError<A::LowPriorityMessage>> {
+    ) -> Result<(), mailbox::SendError<A::LowPriorityMessage>> {
         self.lo_tx.send(message).await
     }
 
     pub fn lo_try_send(
         &self,
         message: A::LowPriorityMessage,
-    ) -> Result<(), mpsc::error::TrySendError<A::LowPriorityMessage>> {
+    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMessage>> {
         self.lo_tx.try_send(message)
     }
 
     pub async fn hi_send(
         &self,
         message: A::HighPriorityMessage,
-    ) -> Result<(), mpsc::error::SendError<A::HighPriorityMessage>> {
+    ) -> Result<(), mailbox::SendError<A::HighPriorityMessage>> {
         self.hi_tx.send(message).await
     }
 
     pub fn hi_try_send(
         &self,
         message: A::HighPriorityMessage,
-    ) -> Result<(), mpsc::error::TrySendError<A::HighPriorityMessage>> {
+    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>> {
         self.hi_tx.try_send(message)
     }
 }
@@ -155,8 +157,8 @@ pub fn spawn<A: Actor>(
     lo_cap: usize,
     hi_cap: usize,
 ) -> BaseActorHandle<A> {
-    let (lo_tx, lo_rx) = mpsc::channel::<A::LowPriorityMessage>(lo_cap);
-    let (hi_tx, hi_rx) = mpsc::channel::<A::HighPriorityMessage>(hi_cap);
+    let (lo_tx, lo_rx) = mailbox::new::<A::LowPriorityMessage>(lo_cap);
+    let (hi_tx, hi_rx) = mailbox::new::<A::HighPriorityMessage>(hi_cap);
     let actor_kind = actor.kind();
     let actor_id = actor.id();
 
@@ -182,8 +184,8 @@ pub fn spawn<A: Actor>(
 )]
 async fn run_instrumented<A>(
     mut actor: A,
-    hi_rx: mpsc::Receiver<A::HighPriorityMessage>,
-    lo_rx: mpsc::Receiver<A::LowPriorityMessage>,
+    hi_rx: mailbox::Receiver<A::HighPriorityMessage>,
+    lo_rx: mailbox::Receiver<A::LowPriorityMessage>,
     actor_kind: &'static str,
     actor_id: &A::ID,
 ) -> ActorStatus
