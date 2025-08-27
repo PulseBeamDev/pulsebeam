@@ -1,4 +1,4 @@
-use pulsebeam_actor::{Actor, ActorError};
+use pulsebeam_runtime::{Actor, ActorError, mailbox};
 use tokio::sync::mpsc::{self, error::SendError};
 
 use crate::{message, net::PacketSocket};
@@ -28,8 +28,8 @@ impl<S: PacketSocket + Send + Sync + 'static> Actor for UdpSinkActor<S> {
 
     async fn run(
         &mut self,
-        hi_rx: mpsc::Receiver<Self::HighPriorityMessage>,
-        mut lo_rx: mpsc::Receiver<Self::LowPriorityMessage>,
+        hi_rx: mailbox::Receiver<Self::HighPriorityMessage>,
+        mut lo_rx: mailbox::Receiver<Self::LowPriorityMessage>,
     ) -> Result<(), ActorError> {
         // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
         // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
