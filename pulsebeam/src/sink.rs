@@ -19,7 +19,7 @@ impl actor::Actor for SinkActor {
     type ID = usize;
 
     fn kind(&self) -> &'static str {
-        "udp_sink"
+        "sink"
     }
 
     fn id(&self) -> Self::ID {
@@ -31,6 +31,7 @@ impl actor::Actor for SinkActor {
         hi_rx: mailbox::Receiver<Self::HighPriorityMessage>,
         mut lo_rx: mailbox::Receiver<Self::LowPriorityMessage>,
     ) -> Result<(), actor::ActorError> {
+        drop(hi_rx); // unused for now
         // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
         // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
         //
@@ -41,7 +42,7 @@ impl actor::Actor for SinkActor {
                 SinkMessage::Packet(packet) => {
                     let res = self.socket.send_to(&packet.raw, packet.dst).await;
                     if let Err(err) = res {
-                        tracing::warn!("failed to send udp packet to {:?}: {:?}", packet.dst, err);
+                        tracing::warn!("failed to send packet to {:?}: {:?}", packet.dst, err);
                     }
                 }
             }

@@ -93,7 +93,7 @@ pub trait Actor: Send + Sized + 'static {
     }
 }
 
-pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone {
+pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone + Send + Sync {
     fn lo_send(
         &self,
         message: A::LowPriorityMessage,

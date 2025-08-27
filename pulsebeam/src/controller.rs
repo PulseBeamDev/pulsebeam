@@ -5,16 +5,11 @@ use crate::{
     participant::ParticipantHandle,
     rng::Rng,
     room::RoomHandle,
-    sink::{SinkActor, SinkHandle},
-    source::UdpSourceHandle,
+    sink, source,
 };
 use pulsebeam_runtime::actor;
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinSet,
-};
-use tracing::Instrument;
+use tokio::{sync::oneshot, task::JoinSet};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -43,19 +38,24 @@ pub enum ControllerMessage {
     ),
 }
 
-pub struct ControllerActor {
+pub struct ControllerActor<Source, Sink> {
     rng: Rng,
     id: Arc<String>,
-    source: UdpSourceHandle,
-    sink: Box<impl actor::ActorHandle<SinkActor>>,
-    receiver: mpsc::Receiver<ControllerMessage>,
+    source: Source,
+    sink: Sink,
     local_addrs: Vec<SocketAddr>,
 
     rooms: HashMap<Arc<RoomId>, RoomHandle>,
     room_tasks: JoinSet<Arc<RoomId>>,
 }
 
-impl Actor for ControllerActor {
+impl<Source, Sink> actor::Actor for ControllerActor<Source, Sink>
+where
+    Source: actor::ActorHandle<source::SourceActor>,
+    Sink: actor::ActorHandle<sink::SinkActor>,
+{
+    type HighPriorityMessage = ControllerMessage;
+    type LowPriorityMessage = ();
     type ID = Arc<String>;
 
     fn kind(&self) -> &'static str {
@@ -66,10 +66,15 @@ impl Actor for ControllerActor {
         self.id.clone()
     }
 
-    async fn run(&mut self) -> Result<(), ActorError> {
+    async fn run(
+        &mut self,
+        mut hi_rx: pulsebeam_runtime::mailbox::Receiver<Self::HighPriorityMessage>,
+        lo_rx: pulsebeam_runtime::mailbox::Receiver<Self::LowPriorityMessage>,
+    ) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
-                Some(msg) = self.receiver.recv() => {
+                biased;
+                Some(msg) = hi_rx.recv() => {
                     match msg {
                         ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
                             let _ = resp.send(self.allocate(room_id, participant_id, offer).await);
@@ -147,64 +152,33 @@ impl ControllerActor {
             tracing::info!("create_room: {}", room_id);
             let (room_handle, room_actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
             self.rooms.insert(room_id.clone(), room_handle.clone());
-            self.room_tasks.spawn(
-                async move {
-                    actor::run(room_actor).await;
-                    room_id
-                }
-                .in_current_span(),
-            );
+            let room_handle = actor::spawn(&mut self.room_tasks, room_actor, 1, 1);
 
             room_handle
         }
     }
 }
 
-#[derive(Clone)]
-pub struct ControllerHandle {
-    sender: mpsc::Sender<ControllerMessage>,
-}
-
-impl ControllerHandle {
+impl<Source, Sink> ControllerActor<Source, Sink>
+where
+    Source: actor::ActorHandle<source::SourceActor>,
+    Sink: actor::ActorHandle<sink::SinkActor>,
+{
     pub fn new(
         rng: Rng,
-        source: UdpSourceHandle,
-        sink: UdpSinkHandle,
+        source: Source,
+        sink: Sink,
         local_addrs: Vec<SocketAddr>,
         id: Arc<String>,
-    ) -> (Self, ControllerActor) {
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = ControllerHandle { sender };
-
-        let actor = ControllerActor {
+    ) -> Self {
+        Self {
             id,
             rng,
-            receiver,
             source,
             sink,
             local_addrs,
             rooms: HashMap::new(),
             room_tasks: JoinSet::new(),
         };
-        (handle, actor)
-    }
-
-    pub async fn allocate(
-        &self,
-        room_id: RoomId,
-        participant_id: ParticipantId,
-        offer: String,
-    ) -> Result<String, ControllerError> {
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(ControllerMessage::Allocate(
-                room_id,
-                participant_id,
-                offer,
-                tx,
-            ))
-            .await
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
-        rx.await.map_err(|_| ControllerError::ServiceUnavailable)?
     }
 }

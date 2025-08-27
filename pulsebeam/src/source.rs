@@ -1,46 +1,56 @@
 use std::{collections::HashMap, net::SocketAddr};
 
-use crate::{
-    actor::{Actor, ActorError},
-    ice,
-    message::UDPPacket,
-    net::PacketSocket,
-    participant::ParticipantHandle,
-};
+use crate::{ice, message::UDPPacket, net::PacketSocket, participant::ParticipantHandle};
 use bytes::Bytes;
-use tokio::sync::mpsc::{self, error::SendError};
+use pulsebeam_runtime::{actor, net};
 
-pub enum UdpSourceMessage {
+pub enum SourceControlMessage {
     AddParticipant(String, ParticipantHandle),
     RemoveParticipant(String),
 }
 
-pub struct UdpSourceActor<S> {
-    receiver: mpsc::Receiver<UdpSourceMessage>,
+pub struct SourceActor {
     local_addr: SocketAddr,
-    socket: S,
+    socket: net::UnifiedSocket,
     conns: HashMap<String, ParticipantHandle>,
     mapping: HashMap<SocketAddr, ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
-impl<S: PacketSocket> Actor for UdpSourceActor<S> {
+impl actor::Actor for SourceActor {
+    type HighPriorityMessage = SourceControlMessage;
+    type LowPriorityMessage = ();
     type ID = usize;
 
     fn kind(&self) -> &'static str {
-        "udp_source"
+        "source"
     }
 
     fn id(&self) -> Self::ID {
         0
     }
 
-    async fn run(&mut self) -> Result<(), ActorError> {
+    async fn run(
+        &mut self,
+        mut hi_rx: pulsebeam_runtime::mailbox::Receiver<Self::HighPriorityMessage>,
+        lo_rx: pulsebeam_runtime::mailbox::Receiver<Self::LowPriorityMessage>,
+    ) -> Result<(), actor::ActorError> {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
+        drop(lo_rx); // unused channel
 
         loop {
             tokio::select! {
+                biased;
+                msg = hi_rx.recv() => {
+                    match msg {
+                        Some(msg) => self.handle_control(msg),
+                        None => {
+                            tracing::info!("all controllers have exited, will gracefully shutdown");
+                            break;
+                        }
+                    }
+                }
                 res = self.socket.recv_from(&mut buf) => {
                     match res {
                         Ok((size, source)) => self.handle_packet(source, &buf[..size]),
@@ -48,16 +58,6 @@ impl<S: PacketSocket> Actor for UdpSourceActor<S> {
                             tracing::error!("udp socket is failing: {err}");
                             break;
                         },
-                    }
-                }
-
-                msg = self.receiver.recv() => {
-                    match msg {
-                        Some(msg) => self.handle_control(msg),
-                        None => {
-                            tracing::info!("all controllers have exited, will gracefully shutdown");
-                            break;
-                        }
                     }
                 }
             }
@@ -68,7 +68,7 @@ impl<S: PacketSocket> Actor for UdpSourceActor<S> {
     }
 }
 
-impl<S: PacketSocket> UdpSourceActor<S> {
+impl SourceActor {
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
         let participant_handle = if let Some(participant_handle) = self.mapping.get(&source) {
             tracing::trace!("found connection from mapping: {source} -> {participant_handle}");
@@ -104,13 +104,13 @@ impl<S: PacketSocket> UdpSourceActor<S> {
         });
     }
 
-    pub fn handle_control(&mut self, msg: UdpSourceMessage) {
+    pub fn handle_control(&mut self, msg: SourceControlMessage) {
         match msg {
-            UdpSourceMessage::AddParticipant(ufrag, participant) => {
+            SourceControlMessage::AddParticipant(ufrag, participant) => {
                 tracing::trace!("added {ufrag} to connection map");
                 self.conns.insert(ufrag, participant);
             }
-            UdpSourceMessage::RemoveParticipant(ufrag) => {
+            SourceControlMessage::RemoveParticipant(ufrag) => {
                 tracing::trace!("removed {ufrag} to connection map");
                 self.conns.remove(&ufrag);
                 if let Some(addrs) = self.reverse.remove(&ufrag) {
@@ -123,42 +123,16 @@ impl<S: PacketSocket> UdpSourceActor<S> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct UdpSourceHandle {
-    sender: mpsc::Sender<UdpSourceMessage>,
-}
-
-impl UdpSourceHandle {
-    pub fn new<S: PacketSocket>(local_addr: SocketAddr, socket: S) -> (Self, UdpSourceActor<S>) {
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = Self { sender };
-        let actor = UdpSourceActor {
-            receiver,
+impl SourceActor {
+    fn new(local_addr: SocketAddr, socket: net::UnifiedSocket) -> Self {
+        let actor = SourceActor {
             local_addr,
             socket,
             conns: HashMap::new(),
             mapping: HashMap::new(),
             reverse: HashMap::new(),
         };
-        (handle, actor)
-    }
-
-    pub async fn add_participant(
-        &self,
-        ufrag: String,
-        participant: ParticipantHandle,
-    ) -> Result<(), SendError<UdpSourceMessage>> {
-        self.sender
-            .send(UdpSourceMessage::AddParticipant(ufrag, participant))
-            .await
-    }
-
-    pub async fn remove_participant(
-        &self,
-        ufrag: String,
-    ) -> Result<(), SendError<UdpSourceMessage>> {
-        self.sender
-            .send(UdpSourceMessage::RemoveParticipant(ufrag))
-            .await
     }
 }
+
+pub type SourceHandle = actor::LocalActorHandle<SourceActor>;
