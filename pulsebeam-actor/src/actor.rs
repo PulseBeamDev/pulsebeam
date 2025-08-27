@@ -93,7 +93,7 @@ pub trait Actor: Send + Sized + 'static {
     }
 }
 
-pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone {
+pub trait ActorRef<A: Actor>: std::fmt::Debug + Clone {
     fn lo_send(
         &self,
         message: A::LowPriorityMessage,
@@ -116,12 +116,12 @@ pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone {
 }
 
 #[derive(Clone)]
-pub struct BaseActorHandle<A: Actor> {
+pub struct LocalActorRef<A: Actor> {
     hi_tx: mailbox::Sender<A::HighPriorityMessage>,
     lo_tx: mailbox::Sender<A::LowPriorityMessage>,
 }
 
-impl<A: Actor> BaseActorHandle<A> {
+impl<A: Actor> LocalActorRef<A> {
     pub async fn lo_send(
         &self,
         message: A::LowPriorityMessage,
@@ -156,7 +156,7 @@ pub fn spawn<A: Actor>(
     actor: A,
     lo_cap: usize,
     hi_cap: usize,
-) -> BaseActorHandle<A> {
+) -> LocalActorRef<A> {
     let (lo_tx, lo_rx) = mailbox::new::<A::LowPriorityMessage>(lo_cap);
     let (hi_tx, hi_rx) = mailbox::new::<A::HighPriorityMessage>(hi_cap);
     let actor_kind = actor.kind();
@@ -170,7 +170,7 @@ pub fn spawn<A: Actor>(
 
     spawner.spawn(task);
 
-    BaseActorHandle { lo_tx, hi_tx }
+    LocalActorRef { lo_tx, hi_tx }
 }
 
 #[tracing::instrument(
