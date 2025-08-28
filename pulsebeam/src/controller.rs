@@ -7,7 +7,7 @@ use crate::{
     room::RoomHandle,
     sink, source,
 };
-use pulsebeam_runtime::actor;
+use pulsebeam_runtime::actor::{self, ActorHandle};
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{sync::oneshot, task::JoinSet};
 
@@ -183,3 +183,6 @@ where
         };
     }
 }
+
+pub type ControllerHandle =
+    actor::LocalActorHandle<ControllerActor<source::SourceHandle, sink::SinkHandle>>;

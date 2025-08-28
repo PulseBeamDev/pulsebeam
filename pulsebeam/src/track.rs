@@ -1,18 +1,14 @@
-use core::fmt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use str0m::media::MediaData;
-use tokio::{
-    sync::mpsc::{self, error::SendError},
-    time::Instant,
-};
+use tokio::time::Instant;
 
 use crate::{
-    actor::Actor,
     entity::{ParticipantId, TrackId},
     message::{self, TrackMeta},
     participant::ParticipantHandle,
 };
+use pulsebeam_runtime::actor;
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
@@ -40,14 +36,14 @@ pub enum TrackControlMessage {
 /// * Route Publisher-Bound RTCP: Receive RTCP feedback (PLI, FIR, etc.) from subscriber and forward it to the publisher
 pub struct TrackActor {
     meta: Arc<TrackMeta>,
-    data_receiver: mpsc::Receiver<TrackDataMessage>,
-    control_receiver: mpsc::Receiver<TrackControlMessage>,
     origin: ParticipantHandle,
     subscribers: BTreeMap<Arc<ParticipantId>, ParticipantHandle>,
     last_keyframe_request: Instant,
 }
 
-impl Actor for TrackActor {
+impl actor::Actor for TrackActor {
+    type HighPriorityMessage = TrackControlMessage;
+    type LowPriorityMessage = TrackDataMessage;
     type ID = Arc<TrackId>;
 
     fn kind(&self) -> &'static str {
@@ -58,15 +54,16 @@ impl Actor for TrackActor {
         self.meta.id.clone()
     }
 
-    async fn run(&mut self) -> Result<(), crate::actor::ActorError> {
+    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
-                Some(msg) = self.data_receiver.recv() => {
-                    self.handle_data_message(msg);
+                biased;
+                Some(msg) = ctx.hi_rx.recv() => {
+                    self.handle_control_message(msg);
                 }
 
-                Some(msg) = self.control_receiver.recv() => {
-                    self.handle_control_message(msg);
+                Some(msg) = ctx.lo_rx.recv() => {
+                    self.handle_data_message(msg);
                 }
 
                 else => break,
@@ -77,6 +74,16 @@ impl Actor for TrackActor {
 }
 
 impl TrackActor {
+    fn new(origin: ParticipantHandle, meta: Arc<TrackMeta>) -> Self {
+        Self {
+            meta,
+            origin,
+            subscribers: BTreeMap::new(),
+            // allow keyframe request immediately
+            last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
+        }
+    }
+
     #[inline]
     fn handle_data_message(&mut self, msg: TrackDataMessage) {
         match msg {
@@ -110,68 +117,4 @@ impl TrackActor {
     }
 }
 
-#[derive(Clone)]
-pub struct TrackHandle {
-    pub data_sender: mpsc::Sender<TrackDataMessage>,
-    pub control_sender: mpsc::Sender<TrackControlMessage>,
-    pub meta: Arc<TrackMeta>,
-}
-
-impl fmt::Debug for TrackHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.meta.id.fmt(f)
-    }
-}
-
-impl TrackHandle {
-    pub fn new(origin: ParticipantHandle, meta: Arc<TrackMeta>) -> (Self, TrackActor) {
-        let (data_sender, data_receiver) = mpsc::channel(64);
-        let (control_sender, control_receiver) = mpsc::channel(8);
-        let handle = Self {
-            data_sender,
-            control_sender,
-            meta: meta.clone(),
-        };
-        let actor = TrackActor {
-            meta,
-            data_receiver,
-            control_receiver,
-            origin,
-            subscribers: BTreeMap::new(),
-            // allow keyframe request immediately
-            last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
-        };
-        (handle, actor)
-    }
-
-    pub async fn forward_media(
-        &self,
-        data: Arc<MediaData>,
-    ) -> Result<(), SendError<TrackDataMessage>> {
-        // Await because we want the producer to slow down when a backpressure occurs
-        self.data_sender
-            .send(TrackDataMessage::ForwardMedia(data))
-            .await
-    }
-
-    pub async fn subscribe(
-        &self,
-        participant: ParticipantHandle,
-    ) -> Result<(), SendError<TrackControlMessage>> {
-        self.control_sender
-            .send(TrackControlMessage::Subscribe(participant))
-            .await
-    }
-
-    pub fn request_keyframe(&self, req: message::KeyframeRequest) {
-        // Keyframe request is lossy. The receiver is responsible in resending.
-        // There can be many in-flight keyframe requests, the track actor may throttle
-        // the requests.
-        if let Err(err) = self
-            .data_sender
-            .try_send(TrackDataMessage::KeyframeRequest(req))
-        {
-            tracing::warn!("keyframe request is dropped by the track actor: {err}");
-        }
-    }
-}
+pub type TrackHandle = actor::LocalActorHandle<TrackActor>;

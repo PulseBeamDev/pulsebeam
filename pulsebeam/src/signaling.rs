@@ -1,9 +1,10 @@
 use crate::entity::{ParticipantId, RoomId};
 use crate::rng::Rng;
 use crate::{
-    controller::{ControllerError, ControllerHandle},
+    controller,
     entity::{ExternalParticipantId, ExternalRoomId},
 };
+use crate::{sink, source};
 use axum::{
     Router,
     extract::{Query, State},
@@ -18,7 +19,7 @@ use hyper::header::LOCATION;
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
     #[error("join failed: {0}")]
-    JoinError(#[from] ControllerError),
+    JoinError(#[from] controller::ControllerError),
 
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
@@ -30,15 +31,19 @@ pub enum SignalingError {
 impl IntoResponse for SignalingError {
     fn into_response(self) -> Response {
         let status = match self {
-            SignalingError::JoinError(ControllerError::OfferInvalid(_)) => StatusCode::BAD_REQUEST,
-            SignalingError::JoinError(ControllerError::OfferRejected(_)) => StatusCode::BAD_REQUEST,
-            SignalingError::JoinError(ControllerError::ServiceUnavailable) => {
+            SignalingError::JoinError(controller::ControllerError::OfferInvalid(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            SignalingError::JoinError(controller::ControllerError::OfferRejected(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            SignalingError::JoinError(controller::ControllerError::ServiceUnavailable) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            SignalingError::JoinError(ControllerError::Unknown(_)) => {
+            SignalingError::JoinError(controller::ControllerError::Unknown(_)) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            SignalingError::JoinError(ControllerError::IOError(_)) => {
+            SignalingError::JoinError(controller::ControllerError::IOError(_)) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             SignalingError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -57,7 +62,10 @@ pub struct ParticipantInfo {
 #[axum::debug_handler]
 async fn spawn_participant(
     Query(info): Query<ParticipantInfo>,
-    State((mut rng, controller)): State<(Rng, ControllerHandle)>,
+    State((mut rng, controller)): State<(
+        Rng,
+        controller::ControllerHandle<source::SourceHandle, sink::SinkHandle>,
+    )>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<impl IntoResponse, SignalingError> {

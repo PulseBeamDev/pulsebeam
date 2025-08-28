@@ -30,8 +30,7 @@ use crate::{
     proto::{self, sfu},
     rng::Rng,
     room::RoomHandle,
-    sink::{SinkHandle, SinkMessage},
-    source::UdpSourceHandle,
+    sink, source,
     track::TrackHandle,
 };
 
@@ -92,8 +91,8 @@ pub struct ParticipantActor {
     // System Dependencies
     rng: Rng,
     handle: ParticipantHandle,
-    source: UdpSourceHandle,
-    sink: SinkHandle,
+    source: source::SourceHandle,
+    sink: sink::SinkHandle,
     room: RoomHandle,
 
     // IO
