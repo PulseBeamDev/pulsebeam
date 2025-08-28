@@ -98,7 +98,7 @@ pub trait Actor: Send + Sized + 'static {
     }
 }
 
-pub trait ActorHandle<A: Actor>: std::fmt::Debug + Clone + Send + Sync + 'static {
+pub trait ActorHandle<A: Actor>: Clone + Send + Sync + 'static {
     fn lo_send(
         &self,
         message: A::LowPriorityMessage,
@@ -134,29 +134,29 @@ impl<A: Actor> Clone for LocalActorHandle<A> {
     }
 }
 
-impl<A: Actor> LocalActorHandle<A> {
-    pub async fn lo_send(
+impl<A: Actor> ActorHandle<A> for LocalActorHandle<A> {
+    async fn lo_send(
         &self,
         message: A::LowPriorityMessage,
     ) -> Result<(), mailbox::SendError<A::LowPriorityMessage>> {
         self.lo_tx.send(message).await
     }
 
-    pub fn lo_try_send(
+    fn lo_try_send(
         &self,
         message: A::LowPriorityMessage,
     ) -> Result<(), mailbox::TrySendError<A::LowPriorityMessage>> {
         self.lo_tx.try_send(message)
     }
 
-    pub async fn hi_send(
+    async fn hi_send(
         &self,
         message: A::HighPriorityMessage,
     ) -> Result<(), mailbox::SendError<A::HighPriorityMessage>> {
         self.hi_tx.send(message).await
     }
 
-    pub fn hi_try_send(
+    fn hi_try_send(
         &self,
         message: A::HighPriorityMessage,
     ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>> {

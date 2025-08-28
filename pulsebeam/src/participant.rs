@@ -33,6 +33,7 @@ use crate::{
     track::TrackHandle,
 };
 use pulsebeam_runtime::actor;
+use pulsebeam_runtime::prelude::*;
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -48,7 +49,6 @@ pub enum ParticipantError {
     InvalidRPCFormat(#[from] DecodeError),
 }
 
-#[derive(Debug)]
 pub enum ParticipantControlMessage {
     TracksPublished(Arc<Vec<TrackHandle>>),
     TracksUnpublished(Arc<Vec<Arc<TrackId>>>),
@@ -63,7 +63,6 @@ pub enum ParticipantDataMessage {
     KeyframeRequest(Arc<TrackId>, message::KeyframeRequest),
 }
 
-#[derive(Debug)]
 struct TrackOut {
     handle: TrackHandle,
     mid: Option<Mid>,
@@ -152,7 +151,7 @@ where
         self.participant_id.clone()
     }
 
-    async fn pre_start(&mut self) -> Result<(), crate::actor::ActorError> {
+    async fn pre_start(&mut self) -> Result<(), actor::ActorError> {
         let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
         self.source
             .hi_send(source::SourceControlMessage::AddParticipant(

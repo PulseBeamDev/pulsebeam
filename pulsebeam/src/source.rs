@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr};
 
-use crate::{ice, message::UDPPacket, net::PacketSocket, participant::ParticipantHandle};
+use crate::{ice, message::UDPPacket, participant::ParticipantHandle};
 use bytes::Bytes;
 use pulsebeam_runtime::{actor, net};
 
@@ -121,13 +121,13 @@ impl SourceActor {
 
 impl SourceActor {
     fn new(local_addr: SocketAddr, socket: net::UnifiedSocket) -> Self {
-        let actor = SourceActor {
+        SourceActor {
             local_addr,
             socket,
             conns: HashMap::new(),
             mapping: HashMap::new(),
             reverse: HashMap::new(),
-        };
+        }
     }
 }
 

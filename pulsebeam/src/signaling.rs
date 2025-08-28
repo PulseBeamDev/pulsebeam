@@ -4,7 +4,6 @@ use crate::{
     controller,
     entity::{ExternalParticipantId, ExternalRoomId},
 };
-use crate::{sink, source};
 use axum::{
     Router,
     extract::{Query, State},
@@ -15,6 +14,7 @@ use axum::{
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::HeaderMap;
 use hyper::header::LOCATION;
+use pulsebeam_runtime::prelude::*;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
@@ -62,10 +62,7 @@ pub struct ParticipantInfo {
 #[axum::debug_handler]
 async fn spawn_participant(
     Query(info): Query<ParticipantInfo>,
-    State((mut rng, controller)): State<(
-        Rng,
-        controller::ControllerHandle<source::SourceHandle, sink::SinkHandle>,
-    )>,
+    State((mut rng, con)): State<(Rng, controller::ControllerHandle)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<impl IntoResponse, SignalingError> {
@@ -77,9 +74,18 @@ async fn spawn_participant(
 
     // TODO: better unique ID to handle session.
     let location_url = format!("/rooms/{}/participants/{}", &room_id, &participant_id,);
-    let answer = controller
-        .allocate(room_id, participant_id, raw_offer)
-        .await?;
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    con.hi_send(controller::ControllerMessage::Allocate(
+        room_id,
+        participant_id,
+        raw_offer,
+        answer_tx,
+    ))
+    .await
+    .map_err(|_| controller::ControllerError::ServiceUnavailable)?;
+    let answer = answer_rx
+        .await
+        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
     let mut headers = HeaderMap::new();
     headers.insert(LOCATION, location_url.parse().unwrap());
@@ -89,13 +95,13 @@ async fn spawn_participant(
 
 #[axum::debug_handler]
 async fn delete_participant(
-    State(_state): State<(Rng, ControllerHandle)>,
+    State(_state): State<(Rng, controller::ControllerHandle)>,
 ) -> Result<impl IntoResponse, SignalingError> {
     // TODO: delete participant from the room
     Ok(StatusCode::OK)
 }
 
-pub fn router(rng: Rng, controller: ControllerHandle) -> Router {
+pub fn router(rng: Rng, controller: controller::ControllerHandle) -> Router {
     Router::new()
         .route("/", post(spawn_participant))
         .route("/", delete(delete_participant))

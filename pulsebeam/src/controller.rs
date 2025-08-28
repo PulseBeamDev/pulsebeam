@@ -4,10 +4,10 @@ use crate::{
     entity::{ParticipantId, RoomId},
     participant::ParticipantHandle,
     rng::Rng,
-    room::RoomHandle,
-    sink, source,
+    room, sink, source,
 };
-use pulsebeam_runtime::actor::{self, ActorHandle};
+use pulsebeam_runtime::actor;
+use pulsebeam_runtime::prelude::*;
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
 use tokio::{sync::oneshot, task::JoinSet};
 
@@ -45,14 +45,14 @@ pub struct ControllerActor<Source, Sink> {
     sink: Sink,
     local_addrs: Vec<SocketAddr>,
 
-    rooms: HashMap<Arc<RoomId>, RoomHandle>,
-    room_tasks: JoinSet<Arc<RoomId>>,
+    rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
+    room_tasks: JoinSet<(Arc<RoomId>, actor::ActorStatus)>,
 }
 
 impl<Source, Sink> actor::Actor for ControllerActor<Source, Sink>
 where
-    Source: actor::ActorHandle<source::SourceActor> + 'static,
-    Sink: actor::ActorHandle<sink::SinkActor> + 'static,
+    Source: actor::ActorHandle<source::SourceActor>,
+    Sink: actor::ActorHandle<sink::SinkActor>,
 {
     type HighPriorityMessage = ControllerMessage;
     type LowPriorityMessage = ();
@@ -78,7 +78,7 @@ where
                     }
                 }
 
-                Some(Ok(room_id)) = self.room_tasks.join_next() => {
+                Some(Ok((room_id, _))) = self.room_tasks.join_next() => {
                     self.rooms.remove(&room_id);
                 }
 
@@ -138,22 +138,26 @@ where
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .add_participant(participant.0, participant.1)
+            .hi_send(room::RoomMessage::AddParticipant(
+                participant.0,
+                participant.1,
+            ))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
         Ok(answer.to_sdp_string())
     }
 
-    fn get_or_create_room(&mut self, room_id: Arc<RoomId>) -> RoomHandle {
+    fn get_or_create_room(&mut self, room_id: Arc<RoomId>) -> room::RoomHandle {
         if let Some(handle) = self.rooms.get(&room_id) {
             tracing::info!("get_room: {}", room_id);
             handle.clone()
         } else {
             tracing::info!("create_room: {}", room_id);
-            let (room_handle, room_actor) = RoomHandle::new(self.rng.clone(), room_id.clone());
-            self.rooms.insert(room_id.clone(), room_handle.clone());
+            let room_actor = room::RoomActor::new(self.rng.clone(), room_id.clone());
+
             let room_handle = actor::spawn(&mut self.room_tasks, room_actor, 1, 1);
+            self.rooms.insert(room_id.clone(), room_handle.clone());
 
             room_handle
         }
@@ -180,7 +184,7 @@ where
             local_addrs,
             rooms: HashMap::new(),
             room_tasks: JoinSet::new(),
-        };
+        }
     }
 }
 
