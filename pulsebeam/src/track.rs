@@ -72,7 +72,7 @@ impl actor::Actor for TrackActor {
 }
 
 impl TrackActor {
-    fn new(origin: ParticipantHandle, meta: Arc<TrackMeta>) -> Self {
+    pub fn new(origin: ParticipantHandle, meta: Arc<TrackMeta>) -> Self {
         Self {
             meta,
             origin,

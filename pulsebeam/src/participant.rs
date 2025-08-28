@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::{self, Display},
-    ops::Deref,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -15,13 +9,7 @@ use str0m::{
     media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid, Simulcast},
     net::{self, Transmit},
 };
-use tokio::{
-    sync::mpsc::{
-        self,
-        error::{SendError, TrySendError},
-    },
-    time::Instant,
-};
+use tokio::time::Instant;
 
 use crate::{
     entity::{EntityId, ParticipantId, TrackId},
@@ -29,7 +17,7 @@ use crate::{
     proto::{self, sfu},
     rng::Rng,
     room::{self, RoomHandle},
-    sink, source, system,
+    system,
     track::TrackHandle,
 };
 use pulsebeam_runtime::actor;
@@ -487,7 +475,10 @@ impl ParticipantActor {
 
                 if let Err(err) = self
                     .room_handle
-                    .publish(self.handle.clone(), Arc::new(track))
+                    .hi_send(room::RoomMessage::PublishTrack(
+                        self.handle.clone(),
+                        Arc::new(track),
+                    ))
                     .await
                 {
                     // this participant should get cleaned up by the supervisor
@@ -548,29 +539,6 @@ impl ParticipantActor {
             self.rtc.disconnect();
         }
     }
-
-    async fn reconfigure_downstreams(&mut self) {
-        for (mid, mid_slot) in &mut self.subscribed_video_tracks {
-            if mid_slot.track_id.is_some() {
-                continue;
-            }
-
-            for (_, track) in &mut self.available_video_tracks {
-                if track.mid.is_some() {
-                    continue;
-                }
-
-                if track.handle.meta.kind == mid_slot.kind {
-                    let Ok(_) = track.handle.subscribe(self.handle.clone()).await else {
-                        continue;
-                    };
-                    track.mid = Some(*mid);
-                    mid_slot.track_id = Some(track.handle.meta.id.clone());
-                    break;
-                }
-            }
-        }
-    }
 }
 
 impl ParticipantActor {
@@ -615,5 +583,4 @@ impl std::fmt::Display for ParticipantHandle {
     }
 }
 
-pub type SpawnParticipantFn =
-    FnOnce(participant::ParticipantActor) -> participant::ParticipantHandle;
+pub type SpawnParticipantFn = fn(ParticipantActor) -> ParticipantHandle;

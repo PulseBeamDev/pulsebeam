@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use str0m::Rtc;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
@@ -8,18 +9,16 @@ use crate::{
     message::TrackMeta,
     participant::{self, ParticipantActor, ParticipantHandle},
     rng::Rng,
-    sink, source, system,
-    track::TrackHandle,
+    system,
+    track::{self, TrackHandle},
 };
 use pulsebeam_runtime::actor;
 
-#[derive(Debug)]
 pub enum RoomMessage {
     PublishTrack(ParticipantHandle, Arc<TrackMeta>),
-    AddParticipant(ParticipantHandle, ParticipantActor),
+    AddParticipant(Arc<ParticipantId>, Rtc),
 }
 
-#[derive(Debug)]
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, TrackHandle>,
@@ -38,8 +37,8 @@ pub struct RoomActor {
 
     room_id: Arc<RoomId>,
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
-    participant_tasks: JoinSet<Arc<ParticipantId>>,
-    track_tasks: JoinSet<Arc<TrackId>>,
+    participant_tasks: JoinSet<(Arc<ParticipantId>, actor::ActorStatus)>,
+    track_tasks: JoinSet<(Arc<TrackId>, actor::ActorStatus)>,
 }
 
 impl actor::Actor for RoomActor {
@@ -60,16 +59,16 @@ impl actor::Actor for RoomActor {
             tokio::select! {
                 res = ctx.hi_rx.recv() => {
                     match res {
-                        Some(msg) => self.handle_message(msg).await,
+                        Some(msg) => self.handle_message(&mut ctx, msg).await,
                         None => break,
                     }
                 }
 
-                Some(Ok(participant_id)) = self.participant_tasks.join_next() => {
+                Some(Ok((participant_id, _))) = self.participant_tasks.join_next() => {
                     self.handle_participant_left(participant_id).await;
                 }
 
-                Some(Ok(track_id)) = self.track_tasks.join_next() => {
+                Some(Ok((track_id, _))) = self.track_tasks.join_next() => {
                     // TODO: handle track lifecycle
                 }
 
@@ -97,10 +96,11 @@ impl RoomActor {
         }
     }
 
-    async fn handle_message(&mut self, msg: RoomMessage) {
+    async fn handle_message(&mut self, ctx: &mut actor::ActorContext<Self>, msg: RoomMessage) {
         match msg {
-            RoomMessage::AddParticipant(participant_handle, participant_actor) => {
-                self.handle_participant_joined(participant_id)
+            RoomMessage::AddParticipant(participant_id, rtc) => {
+                self.handle_participant_joined(ctx, participant_id, rtc)
+                    .await
             }
             RoomMessage::PublishTrack(participant_handle, track_meta) => {
                 let Some(origin) = self.participants.get_mut(&track_meta.id.origin_participant)
@@ -112,22 +112,20 @@ impl RoomActor {
                     return;
                 };
 
-                let (handle, track_actor) =
-                    TrackHandle::new(participant_handle.clone(), track_meta.clone());
+                let track_actor =
+                    track::TrackActor::new(participant_handle.clone(), track_meta.clone());
                 let track_id = track_meta.id.clone();
                 tracing::info!(
                     "{} published a track, added: {}",
                     origin.handle.participant_id,
                     track_id
                 );
-                self.track_tasks.spawn(
-                    async move {
-                        actor::run(track_actor).await;
-                        track_id
-                    }
-                    .in_current_span(),
-                );
-                origin.tracks.insert(track_meta.id.clone(), handle.clone());
+
+                // TODO: update capacities
+                let track_handle = actor::spawn(&mut self.track_tasks, track_actor, 8, 8);
+                origin
+                    .tracks
+                    .insert(track_meta.id.clone(), track_handle.clone());
                 tracing::info!("current tracks: {:?}", self.participants.values());
                 let new_tracks = Arc::new(vec![handle]);
                 for participant in self.participants.values() {
@@ -137,11 +135,16 @@ impl RoomActor {
         };
     }
 
-    async fn handle_participant_joined(&mut self, participant_id: Arc<ParticipantId>) {
+    async fn handle_participant_joined(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+        participant_id: Arc<ParticipantId>,
+        rtc: str0m::Rtc,
+    ) {
         let participant = ParticipantActor::new(
             self.system_ctx.clone(),
-            room_handle.clone(),
-            Arc::new(participant_id),
+            ctx.handle.clone(),
+            participant_id,
             rtc,
         );
         self.participant_factory(participant);
