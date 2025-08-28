@@ -28,8 +28,8 @@ use crate::{
     message::{self, EgressUDPPacket, TrackMeta},
     proto::{self, sfu},
     rng::Rng,
-    room::RoomHandle,
-    sink, source,
+    room::{self, RoomHandle},
+    sink, source, system,
     track::TrackHandle,
 };
 use pulsebeam_runtime::actor;
@@ -86,17 +86,10 @@ struct MidOutSlot {
 /// * Process Outbound Media from Track actor
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
-pub struct ParticipantActor<Source, Sink> {
-    // System Dependencies
-    rng: Rng,
-    handle: ParticipantHandle,
-    source: Source,
-    sink: Sink,
-    room: RoomHandle,
-
-    // IO
-    data_receiver: mpsc::Receiver<ParticipantDataMessage>,
-    control_receiver: mpsc::Receiver<ParticipantControlMessage>,
+pub struct ParticipantActor {
+    // Dependencies
+    system_ctx: system::SystemContext,
+    room_handle: room::RoomHandle,
 
     // Engine
     rtc: str0m::Rtc,
@@ -134,11 +127,7 @@ pub struct ParticipantActor<Source, Sink> {
     should_resync: bool,
 }
 
-impl<Source, Sink> actor::Actor for ParticipantActor<Source, Sink>
-where
-    Source: actor::ActorHandle<source::SourceActor>,
-    Sink: actor::ActorHandle<sink::SinkActor>,
-{
+impl actor::Actor for ParticipantActor {
     type HighPriorityMessage = ParticipantControlMessage;
     type LowPriorityMessage = ParticipantDataMessage;
     type ID = Arc<ParticipantId>;
@@ -149,17 +138,6 @@ where
 
     fn id(&self) -> Self::ID {
         self.participant_id.clone()
-    }
-
-    async fn pre_start(&mut self) -> Result<(), actor::ActorError> {
-        let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
-        self.source
-            .hi_send(source::SourceControlMessage::AddParticipant(
-                ufrag,
-                self.handle.clone(),
-            ))
-            .await
-            .map_err(|_| actor::ActorError::PreStartFailed("source is closed".to_string()))
     }
 
     async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
@@ -199,21 +177,9 @@ where
 
         Ok(())
     }
-
-    async fn post_stop(&mut self) -> Result<(), actor::ActorError> {
-        let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
-        self.source
-            .hi_send(source::SourceControlMessage::RemoveParticipant(ufrag))
-            .await
-            .map_err(|_| actor::ActorError::PostStopFailed("source is closed".to_string()))
-    }
 }
 
-impl<Source, Sink> ParticipantActor<Source, Sink>
-where
-    Source: actor::ActorHandle<source::SourceActor>,
-    Sink: actor::ActorHandle<sink::SinkActor>,
-{
+impl ParticipantActor {
     async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
             ParticipantDataMessage::UdpPacket(packet) => {
@@ -434,7 +400,7 @@ where
     async fn handle_output_transmit(&mut self, t: Transmit) {
         let packet = Bytes::copy_from_slice(&t.contents);
         let _ = self
-            .sink
+            .sink_handle
             .lo_send(SinkMessage::Packet(EgressUDPPacket {
                 raw: packet,
                 dst: t.destination,
@@ -520,7 +486,7 @@ where
                 };
 
                 if let Err(err) = self
-                    .room
+                    .room_handle
                     .publish(self.handle.clone(), Arc::new(track))
                     .await
                 {
@@ -607,43 +573,16 @@ where
     }
 }
 
-#[derive(Clone)]
-pub struct ParticipantHandle {
-    pub data_sender: mpsc::Sender<ParticipantDataMessage>,
-    pub control_sender: mpsc::Sender<ParticipantControlMessage>,
-    pub participant_id: Arc<ParticipantId>,
-}
-
-impl fmt::Debug for ParticipantHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.participant_id.internal)
-    }
-}
-
-impl ParticipantHandle {
+impl ParticipantActor {
     pub fn new(
-        rng: Rng,
-        source: UdpSourceHandle,
-        sink: SinkHandle,
-        room: RoomHandle,
+        system_ctx: system::SystemContext,
+        room_handle: RoomHandle,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
-    ) -> (Self, ParticipantActor) {
-        let (data_sender, data_receiver) = mpsc::channel(128);
-        let (control_sender, control_receiver) = mpsc::channel(8);
-        let handle = Self {
-            data_sender,
-            control_sender,
-            participant_id: participant_id.clone(),
-        };
-        let actor = ParticipantActor {
-            rng,
-            source,
-            handle: handle.clone(),
-            data_receiver,
-            control_receiver,
-            sink,
-            room,
+    ) -> Self {
+        Self {
+            system_ctx,
+            room_handle,
             participant_id,
             rtc,
 
@@ -660,70 +599,30 @@ impl ParticipantHandle {
             pending_unpublished_tracks: Vec::new(),
             pending_switched_tracks: Vec::new(),
             should_resync: false,
-        };
-        (handle, actor)
-    }
-
-    pub fn forward(
-        &self,
-        msg: message::UDPPacket,
-    ) -> Result<(), TrySendError<ParticipantDataMessage>> {
-        let res = self
-            .data_sender
-            .try_send(ParticipantDataMessage::UdpPacket(msg));
-
-        if let Err(err) = &res {
-            tracing::warn!("raw packet is dropped: {err}");
-        }
-        res
-    }
-
-    pub async fn add_tracks(
-        &self,
-        tracks: Arc<Vec<TrackHandle>>,
-    ) -> Result<(), SendError<ParticipantControlMessage>> {
-        self.control_sender
-            .send(ParticipantControlMessage::TracksPublished(tracks))
-            .await
-    }
-
-    pub async fn remove_tracks(
-        &self,
-        track_ids: Arc<Vec<Arc<TrackId>>>,
-    ) -> Result<(), SendError<ParticipantControlMessage>> {
-        self.control_sender
-            .send(ParticipantControlMessage::TracksUnpublished(track_ids))
-            .await
-    }
-
-    pub fn forward_media(
-        &self,
-        track: Arc<TrackMeta>,
-        data: Arc<MediaData>,
-    ) -> Result<(), TrySendError<ParticipantDataMessage>> {
-        let res = self
-            .data_sender
-            .try_send(ParticipantDataMessage::ForwardMedia(track, data));
-
-        if let Err(err) = &res {
-            tracing::warn!("media packet is dropped: {err}");
-        }
-
-        res
-    }
-
-    pub fn request_keyframe(&self, track_id: Arc<TrackId>, req: message::KeyframeRequest) {
-        if let Err(err) = self
-            .data_sender
-            .try_send(ParticipantDataMessage::KeyframeRequest(track_id, req))
-        {
-            tracing::warn!("keyframe request is dropped by the participant actor: {err}");
         }
     }
 }
 
-impl Display for ParticipantHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.participant_id.deref().as_ref())
+#[derive(Clone)]
+pub struct ParticipantHandle {
+    pub handle: actor::LocalActorHandle<ParticipantActor>,
+    pub participant_id: Arc<ParticipantId>,
+}
+
+impl ParticipantHandle {
+    pub fn new(
+        rng: Rng,
+        source: UdpSourceHandle,
+        sink: SinkHandle,
+        room: RoomHandle,
+        participant_id: Arc<ParticipantId>,
+        rtc: Rtc,
+    ) -> (Self, ParticipantActor) {
+        let (data_sender, data_receiver) = mpsc::channel(128);
+        let (control_sender, control_receiver) = mpsc::channel(8);
+        let handle = self {
+            participant_id: participant_id.clone(),
+        };
+        (handle, actor)
     }
 }

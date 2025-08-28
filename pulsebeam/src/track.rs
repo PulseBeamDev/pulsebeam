@@ -117,4 +117,8 @@ impl TrackActor {
     }
 }
 
-pub type TrackHandle = actor::LocalActorHandle<TrackActor>;
+#[derive(Clone)]
+pub struct TrackHandle {
+    pub handle: actor::LocalActorHandle<TrackActor>,
+    pub meta: Arc<TrackMeta>,
+}

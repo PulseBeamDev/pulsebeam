@@ -4,7 +4,7 @@ use crate::{
     entity::{ParticipantId, RoomId},
     participant::ParticipantHandle,
     rng::Rng,
-    room, sink, source,
+    room, sink, source, system,
 };
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::prelude::*;
@@ -38,22 +38,17 @@ pub enum ControllerMessage {
     ),
 }
 
-pub struct ControllerActor<Source, Sink> {
-    rng: Rng,
+pub struct ControllerActor {
+    system_ctx: system::SystemContext,
+
     id: Arc<String>,
-    source: Source,
-    sink: Sink,
     local_addrs: Vec<SocketAddr>,
 
     rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
     room_tasks: JoinSet<(Arc<RoomId>, actor::ActorStatus)>,
 }
 
-impl<Source, Sink> actor::Actor for ControllerActor<Source, Sink>
-where
-    Source: actor::ActorHandle<source::SourceActor>,
-    Sink: actor::ActorHandle<sink::SinkActor>,
-{
+impl actor::Actor for ControllerActor {
     type HighPriorityMessage = ControllerMessage;
     type LowPriorityMessage = ();
     type ID = Arc<String>;
@@ -89,11 +84,7 @@ where
     }
 }
 
-impl<Source, Sink> ControllerActor<Source, Sink>
-where
-    Source: actor::ActorHandle<source::SourceActor>,
-    Sink: actor::ActorHandle<sink::SinkActor>,
-{
+impl ControllerActor {
     pub async fn allocate(
         &mut self,
         ctx: &mut actor::ActorContext<Self>,
@@ -125,14 +116,6 @@ where
 
         let room_id = Arc::new(room_id);
         let room_handle = self.get_or_create_room(room_id);
-        let participant = ParticipantHandle::new(
-            self.rng.clone(),
-            self.source.clone(),
-            self.sink.clone(),
-            room_handle.clone(),
-            Arc::new(participant_id),
-            rtc,
-        );
 
         // TODO: probably retry? Or, let the client to retry instead?
         // Each room will always have a graceful timeout before closing.
@@ -154,7 +137,7 @@ where
             handle.clone()
         } else {
             tracing::info!("create_room: {}", room_id);
-            let room_actor = room::RoomActor::new(self.rng.clone(), room_id.clone());
+            let room_actor = room::RoomActor::new(self.system_ctx.clone(), room_id.clone());
 
             let room_handle = actor::spawn(&mut self.room_tasks, room_actor, 1, 1);
             self.rooms.insert(room_id.clone(), room_handle.clone());
@@ -164,23 +147,15 @@ where
     }
 }
 
-impl<Source, Sink> ControllerActor<Source, Sink>
-where
-    Source: actor::ActorHandle<source::SourceActor>,
-    Sink: actor::ActorHandle<sink::SinkActor>,
-{
+impl ControllerActor {
     pub fn new(
-        rng: Rng,
-        source: Source,
-        sink: Sink,
+        system_ctx: system::SystemContext,
         local_addrs: Vec<SocketAddr>,
         id: Arc<String>,
     ) -> Self {
         Self {
             id,
-            rng,
-            source,
-            sink,
+            system_ctx,
             local_addrs,
             rooms: HashMap::new(),
             room_tasks: JoinSet::new(),
@@ -188,5 +163,4 @@ where
     }
 }
 
-pub type ControllerHandle =
-    actor::LocalActorHandle<ControllerActor<source::SourceHandle, sink::SinkHandle>>;
+pub type ControllerHandle = actor::LocalActorHandle<ControllerActor>;

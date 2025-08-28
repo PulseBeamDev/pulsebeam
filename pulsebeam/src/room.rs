@@ -8,6 +8,7 @@ use crate::{
     message::TrackMeta,
     participant::{ParticipantActor, ParticipantHandle},
     rng::Rng,
+    sink, source, system,
     track::TrackHandle,
 };
 use pulsebeam_runtime::actor;
@@ -32,9 +33,9 @@ pub struct ParticipantMeta {
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
-    rng: Rng,
-    room_id: Arc<RoomId>,
+    system_ctx: system::SystemContext,
 
+    room_id: Arc<RoomId>,
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<Arc<ParticipantId>>,
     track_tasks: JoinSet<Arc<TrackId>>,
@@ -80,9 +81,9 @@ impl actor::Actor for RoomActor {
 }
 
 impl RoomActor {
-    pub fn new(rng: Rng, room_id: Arc<RoomId>) -> Self {
+    pub fn new(system_ctx: system::SystemContext, room_id: Arc<RoomId>) -> Self {
         Self {
-            rng,
+            system_ctx,
             room_id,
             participants: HashMap::new(),
             participant_tasks: JoinSet::new(),
@@ -93,32 +94,7 @@ impl RoomActor {
     async fn handle_message(&mut self, msg: RoomMessage) {
         match msg {
             RoomMessage::AddParticipant(participant_handle, participant_actor) => {
-                let participant_id = participant_handle.participant_id.clone();
-                self.participants.insert(
-                    participant_handle.participant_id.clone(),
-                    ParticipantMeta {
-                        handle: participant_handle.clone(),
-                        tracks: HashMap::new(),
-                    },
-                );
-                let task = async move {
-                    actor::run(participant_actor).await;
-                    participant_id
-                }
-                .in_current_span();
-
-                self.participant_tasks.spawn(task);
-
-                let mut tracks = Vec::with_capacity(self.participants.len());
-                for meta in self.participants.values() {
-                    tracks.extend(meta.tracks.values().cloned());
-                }
-                tracing::info!(
-                    "{} joined, adding tracks: {:?}",
-                    participant_handle.participant_id,
-                    self.participants,
-                );
-                let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
+                self.handle_participant_joined(participant_id)
             }
             RoomMessage::PublishTrack(participant_handle, track_meta) => {
                 let Some(origin) = self.participants.get_mut(&track_meta.id.origin_participant)
@@ -153,6 +129,52 @@ impl RoomActor {
                 }
             }
         };
+    }
+
+    async fn handle_participant_joined(&mut self, participant_id: Arc<ParticipantId>) {
+        let participant = ParticipantHandle::new(
+            self.rng.clone(),
+            self.source_handle.clone(),
+            self.sink_handle.clone(),
+            room_handle.clone(),
+            Arc::new(participant_id),
+            rtc,
+        );
+
+        // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
+        // self.source
+        //     .hi_send(source::SourceControlMessage::AddParticipant(
+        //         ufrag,
+        //         self.handle.clone(),
+        //     ))
+        //     .await
+        //     .map_err(|_| ControllerError::ServiceUnavailable)?;
+        let participant_id = participant_handle.participant_id.clone();
+        self.participants.insert(
+            participant_handle.participant_id.clone(),
+            ParticipantMeta {
+                handle: participant_handle.clone(),
+                tracks: HashMap::new(),
+            },
+        );
+        let task = async move {
+            actor::run(participant_actor).await;
+            participant_id
+        }
+        .in_current_span();
+
+        self.participant_tasks.spawn(task);
+
+        let mut tracks = Vec::with_capacity(self.participants.len());
+        for meta in self.participants.values() {
+            tracks.extend(meta.tracks.values().cloned());
+        }
+        tracing::info!(
+            "{} joined, adding tracks: {:?}",
+            participant_handle.participant_id,
+            self.participants,
+        );
+        let _ = participant_handle.add_tracks(Arc::new(tracks)).await;
     }
 
     async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {

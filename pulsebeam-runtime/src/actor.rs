@@ -10,12 +10,8 @@ use crate::mailbox;
 
 #[derive(Error, Debug)]
 pub enum ActorError {
-    #[error("Pre-start initialization failed: {0}")]
-    PreStartFailed(String),
     #[error("Actor logic encountered an error: {0}")]
     LogicError(String),
-    #[error("Post-stop cleanup failed: {0}")]
-    PostStopFailed(String),
     #[error("Custom actor error: {0}")]
     Custom(String),
 }
@@ -23,13 +19,11 @@ pub enum ActorError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorStatus {
     Starting,
-    PreStartFailed,
     Running,
     ExitedGracefully, // run_actor_logic returned Ok
     ExitedWithError,  // run_actor_logic returned Err
     Panicked,
-    PostStopFailed, // post_stop itself failed
-    ShutDown,       // Successfully completed all stages it attempted
+    ShutDown, // Successfully completed all stages it attempted
 }
 
 impl Display for ActorStatus {
@@ -39,12 +33,10 @@ impl Display for ActorStatus {
             "{}",
             match self {
                 ActorStatus::Starting => "starting",
-                ActorStatus::PreStartFailed => "pre_start_failed",
                 ActorStatus::Running => "running",
                 ActorStatus::ExitedGracefully => "exited_gracefully",
                 ActorStatus::ExitedWithError => "exited_with_error",
                 ActorStatus::Panicked => "panicked",
-                ActorStatus::PostStopFailed => "post_stop_failed",
                 ActorStatus::ShutDown => "shut_down",
             }
         )
@@ -84,18 +76,6 @@ pub trait Actor: Send + Sized + 'static {
         &mut self,
         ctx: ActorContext<Self>,
     ) -> impl Future<Output = Result<(), ActorError>> + Send + Sync;
-
-    /// Called once before the main `run` loop starts.
-    fn pre_start(&mut self) -> impl Future<Output = Result<(), ActorError>> + Send + Sync {
-        async { Ok(()) }
-    }
-
-    /// Called once after `run` completes (Ok or Err),
-    /// OR if `pre_start` fails, OR if `run_actor_logic` panics.
-    /// This function MUST be panic-safe if it's to be called after a panic.
-    fn post_stop(&mut self) -> impl Future<Output = Result<(), ActorError>> + Send + Sync {
-        async { Ok(()) }
-    }
 }
 
 pub trait ActorHandle<A: Actor>: Clone + Send + Sync + 'static {
@@ -213,20 +193,6 @@ where
 {
     tracing::debug!("Starting actor...");
 
-    // 1. Pre-start Hook
-    if let Err(err) = actor.pre_start().await {
-        tracing::error!(error = %err, "pre_start failed. Proceeding to post_stop.");
-        // If pre_start fails, we still must attempt cleanup.
-        if let Err(post_err) = actor.post_stop().await {
-            tracing::error!(error = %post_err, "post_stop also failed after pre_start failure.");
-            return ActorStatus::PostStopFailed;
-        }
-        return ActorStatus::PreStartFailed;
-    }
-
-    tracing::debug!("pre_start successful. Running main logic.");
-
-    // 2. Main Actor Logic
     let run_result = AssertUnwindSafe(actor.run(ctx)).catch_unwind().await;
 
     let status_after_run = match run_result {
@@ -244,14 +210,6 @@ where
             ActorStatus::Panicked
         }
     };
-
-    // 3. Post-stop Hook (guaranteed to run if pre_start succeeded)
-    tracing::debug!("Attempting post_stop cleanup...");
-    if let Err(err) = actor.post_stop().await {
-        tracing::error!(error = %err, "post_stop failed.");
-        // Failure in cleanup is a critical error that overrides any previous status.
-        return ActorStatus::PostStopFailed;
-    }
 
     tracing::debug!("post_stop successful.");
     tracing::info!(status = %status_after_run, "Actor fully shut down.");
