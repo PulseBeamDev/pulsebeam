@@ -13,14 +13,15 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-bytes = "1.10.1"
-futures-lite = "2.6.1"
-rustls = "0.23.31"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = "0.26.2"
 tracing = { workspace = true }
+rand = { workspace = true }
+tokio-rustls = "0.26.2"
+bytes = "1.10.1"
+futures-lite = "2.6.1"
+rustls = "0.23.31"
 
 [dev-dependencies]
 rcgen = "0.14.3"

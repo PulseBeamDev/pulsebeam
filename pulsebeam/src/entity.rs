@@ -1,7 +1,8 @@
 use std::{fmt, hash, str::FromStr, sync::Arc};
 
 use crate::rng::Rng;
-use rand::RngCore;
+use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::rand;
 use sha3::{Digest, Sha3_256};
 use str0m::media::Mid;
 
@@ -338,8 +339,6 @@ impl AsRef<str> for TrackId {
 
 #[cfg(test)]
 mod tests {
-    use rand::SeedableRng;
-
     use super::*;
     use std::hash::{Hash, Hasher};
 

@@ -609,20 +609,11 @@ pub struct ParticipantHandle {
     pub participant_id: Arc<ParticipantId>,
 }
 
-impl ParticipantHandle {
-    pub fn new(
-        rng: Rng,
-        source: UdpSourceHandle,
-        sink: SinkHandle,
-        room: RoomHandle,
-        participant_id: Arc<ParticipantId>,
-        rtc: Rtc,
-    ) -> (Self, ParticipantActor) {
-        let (data_sender, data_receiver) = mpsc::channel(128);
-        let (control_sender, control_receiver) = mpsc::channel(8);
-        let handle = self {
-            participant_id: participant_id.clone(),
-        };
-        (handle, actor)
+impl std::fmt::Display for ParticipantHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.participant_id.fmt(f)
     }
 }
+
+pub type SpawnParticipantFn =
+    FnOnce(participant::ParticipantActor) -> participant::ParticipantHandle;

@@ -6,22 +6,20 @@ use tokio::time::Instant;
 use crate::{
     entity::{ParticipantId, TrackId},
     message::{self, TrackMeta},
-    participant::ParticipantHandle,
+    participant::{self, ParticipantHandle},
 };
-use pulsebeam_runtime::actor;
+use pulsebeam_runtime::actor::{self, ActorHandle};
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrackError {}
 
-#[derive(Debug)]
 pub enum TrackDataMessage {
     ForwardMedia(Arc<MediaData>),
     KeyframeRequest(message::KeyframeRequest),
 }
 
-#[derive(Debug)]
 pub enum TrackControlMessage {
     Subscribe(ParticipantHandle),
     Unsubscribe(Arc<ParticipantId>),
@@ -89,14 +87,24 @@ impl TrackActor {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
                 for (_, sub) in &self.subscribers {
-                    let _ = sub.forward_media(self.meta.clone(), data.clone());
+                    let _ =
+                        sub.handle
+                            .lo_try_send(participant::ParticipantDataMessage::ForwardMedia(
+                                self.meta.clone(),
+                                data.clone(),
+                            ));
                 }
             }
             TrackDataMessage::KeyframeRequest(req) => {
                 let now = Instant::now();
                 let elapsed = now.duration_since(self.last_keyframe_request);
                 if elapsed >= KEYFRAME_REQUEST_THROTTLE {
-                    self.origin.request_keyframe(self.meta.id.clone(), req);
+                    self.origin.handle.lo_try_send(
+                        participant::ParticipantDataMessage::KeyframeRequest(
+                            self.meta.id.clone(),
+                            req,
+                        ),
+                    );
                     self.last_keyframe_request = now;
                 }
             }

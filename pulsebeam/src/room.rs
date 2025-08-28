@@ -6,7 +6,7 @@ use tracing::Instrument;
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackMeta,
-    participant::{ParticipantActor, ParticipantHandle},
+    participant::{self, ParticipantActor, ParticipantHandle},
     rng::Rng,
     sink, source, system,
     track::TrackHandle,
@@ -34,6 +34,7 @@ pub struct ParticipantMeta {
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
     system_ctx: system::SystemContext,
+    spawn_participant: participant::SpawnParticipantFn,
 
     room_id: Arc<RoomId>,
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
@@ -81,9 +82,14 @@ impl actor::Actor for RoomActor {
 }
 
 impl RoomActor {
-    pub fn new(system_ctx: system::SystemContext, room_id: Arc<RoomId>) -> Self {
+    pub fn new(
+        system_ctx: system::SystemContext,
+        spawn_participant: participant::SpawnParticipantFn,
+        room_id: Arc<RoomId>,
+    ) -> Self {
         Self {
             system_ctx,
+            spawn_participant,
             room_id,
             participants: HashMap::new(),
             participant_tasks: JoinSet::new(),
@@ -132,14 +138,13 @@ impl RoomActor {
     }
 
     async fn handle_participant_joined(&mut self, participant_id: Arc<ParticipantId>) {
-        let participant = ParticipantHandle::new(
-            self.rng.clone(),
-            self.source_handle.clone(),
-            self.sink_handle.clone(),
+        let participant = ParticipantActor::new(
+            self.system_ctx.clone(),
             room_handle.clone(),
             Arc::new(participant_id),
             rtc,
         );
+        self.participant_factory(participant);
 
         // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         // self.source

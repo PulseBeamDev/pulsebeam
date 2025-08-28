@@ -20,7 +20,6 @@ tracing = { workspace = true }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.15", features = ["toml"] }
-rand = "0.9"
 toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 str0m = { git = "https://github.com/algesten/str0m.git", rev = "75977cef4c058b52934a11ec1620a382e507e65c" }

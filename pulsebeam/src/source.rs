@@ -1,19 +1,22 @@
 use std::{collections::HashMap, net::SocketAddr};
 
-use crate::{ice, message::UDPPacket, participant::ParticipantHandle};
+use crate::{ice, message::UDPPacket, participant};
 use bytes::Bytes;
-use pulsebeam_runtime::{actor, net};
+use pulsebeam_runtime::{
+    actor::{self, ActorHandle},
+    net,
+};
 
 pub enum SourceControlMessage {
-    AddParticipant(String, ParticipantHandle),
+    AddParticipant(String, participant::ParticipantHandle),
     RemoveParticipant(String),
 }
 
 pub struct SourceActor {
     local_addr: SocketAddr,
     socket: net::UnifiedSocket,
-    conns: HashMap<String, ParticipantHandle>,
-    mapping: HashMap<SocketAddr, ParticipantHandle>,
+    conns: HashMap<String, participant::ParticipantHandle>,
+    mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
@@ -93,11 +96,14 @@ impl SourceActor {
             return;
         };
 
-        let _ = participant_handle.forward(UDPPacket {
-            raw: Bytes::copy_from_slice(packet),
-            src: source,
-            dst: self.local_addr,
-        });
+        let _ =
+            participant_handle
+                .handle
+                .lo_try_send(participant::ParticipantDataMessage::UdpPacket(UDPPacket {
+                    raw: Bytes::copy_from_slice(packet),
+                    src: source,
+                    dst: self.local_addr,
+                }));
     }
 
     pub fn handle_control(&mut self, msg: SourceControlMessage) {
