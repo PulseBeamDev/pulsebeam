@@ -24,7 +24,6 @@ use tokio::{
 };
 
 use crate::{
-    actor::{Actor, ActorError},
     entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackMeta},
     proto::{self, sfu},
@@ -33,6 +32,7 @@ use crate::{
     sink, source,
     track::TrackHandle,
 };
+use pulsebeam_runtime::actor;
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -87,12 +87,12 @@ struct MidOutSlot {
 /// * Process Outbound Media from Track actor
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
-pub struct ParticipantActor {
+pub struct ParticipantActor<Source, Sink> {
     // System Dependencies
     rng: Rng,
     handle: ParticipantHandle,
-    source: source::SourceHandle,
-    sink: sink::SinkHandle,
+    source: Source,
+    sink: Sink,
     room: RoomHandle,
 
     // IO
@@ -135,15 +135,13 @@ pub struct ParticipantActor {
     should_resync: bool,
 }
 
-impl fmt::Debug for ParticipantActor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParticipantActor")
-            .field("participant_id", &self.participant_id)
-            .finish()
-    }
-}
-
-impl Actor for ParticipantActor {
+impl<Source, Sink> actor::Actor for ParticipantActor<Source, Sink>
+where
+    Source: actor::ActorHandle<source::SourceActor>,
+    Sink: actor::ActorHandle<sink::SinkActor>,
+{
+    type HighPriorityMessage = ParticipantControlMessage;
+    type LowPriorityMessage = ParticipantDataMessage;
     type ID = Arc<ParticipantId>;
 
     fn kind(&self) -> &'static str {
@@ -157,12 +155,15 @@ impl Actor for ParticipantActor {
     async fn pre_start(&mut self) -> Result<(), crate::actor::ActorError> {
         let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
         self.source
-            .add_participant(ufrag, self.handle.clone())
+            .hi_send(source::SourceControlMessage::AddParticipant(
+                ufrag,
+                self.handle.clone(),
+            ))
             .await
-            .map_err(|_| ActorError::PreStartFailed("source is closed".to_string()))
+            .map_err(|_| actor::ActorError::PreStartFailed("source is closed".to_string()))
     }
 
-    async fn run(&mut self) -> Result<(), crate::actor::ActorError> {
+    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // TODO: notify ingress to add self to the routing table
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
@@ -176,15 +177,16 @@ impl Actor for ParticipantActor {
             };
 
             tokio::select! {
-                Some(msg) = self.data_receiver.recv() => {
-                    self.handle_data_message(msg).await;
-                }
-
-                msg = self.control_receiver.recv() => {
+                biased;
+                msg = ctx.hi_rx.recv() => {
                     match msg {
                         Some(msg) => self.handle_control_message(msg).await,
                         None => break,
                     }
+                }
+
+                Some(msg) = ctx.lo_rx.recv() => {
+                    self.handle_data_message(msg).await;
                 }
 
                 _ = tokio::time::sleep(delay) => {
@@ -199,16 +201,20 @@ impl Actor for ParticipantActor {
         Ok(())
     }
 
-    async fn post_stop(&mut self) -> Result<(), ActorError> {
+    async fn post_stop(&mut self) -> Result<(), actor::ActorError> {
         let ufrag = self.rtc.direct_api().local_ice_credentials().ufrag;
         self.source
-            .remove_participant(ufrag)
+            .hi_send(source::SourceControlMessage::RemoveParticipant(ufrag))
             .await
-            .map_err(|_| ActorError::PostStopFailed("source is closed".to_string()))
+            .map_err(|_| actor::ActorError::PostStopFailed("source is closed".to_string()))
     }
 }
 
-impl ParticipantActor {
+impl<Source, Sink> ParticipantActor<Source, Sink>
+where
+    Source: actor::ActorHandle<source::SourceActor>,
+    Sink: actor::ActorHandle<sink::SinkActor>,
+{
     async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
         match msg {
             ParticipantDataMessage::UdpPacket(packet) => {
