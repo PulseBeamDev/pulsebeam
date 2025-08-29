@@ -10,8 +10,7 @@ use std::{
     time::Duration,
 };
 
-use pulsebeam_runtime::{actor, prelude::*};
-use pulsebeam_runtime::{net, rand};
+use pulsebeam_runtime::{actor, net, prelude::*, rand, rt};
 use systemstat::{Platform, System};
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -58,8 +57,10 @@ async fn run() {
         vec![local_addr],
         Arc::new("root".to_string()),
     );
+
+    // TODO: handle join
     let controller_handle = actor::spawn(
-        &mut join_set,
+        &mut rt::current(),
         controller_actor,
         actor::SpawnConfig::default(),
     );
