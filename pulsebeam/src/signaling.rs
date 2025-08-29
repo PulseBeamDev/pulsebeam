@@ -1,5 +1,4 @@
 use crate::entity::{ParticipantId, RoomId};
-use crate::rng::Rng;
 use crate::{
     controller,
     entity::{ExternalParticipantId, ExternalRoomId},
@@ -15,6 +14,7 @@ use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::HeaderMap;
 use hyper::header::LOCATION;
 use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::rand;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
@@ -62,7 +62,7 @@ pub struct ParticipantInfo {
 #[axum::debug_handler]
 async fn spawn_participant(
     Query(info): Query<ParticipantInfo>,
-    State((mut rng, con)): State<(Rng, controller::ControllerHandle)>,
+    State((mut rng, con)): State<(rand::Rng, controller::ControllerHandle)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<impl IntoResponse, SignalingError> {
@@ -95,13 +95,13 @@ async fn spawn_participant(
 
 #[axum::debug_handler]
 async fn delete_participant(
-    State(_state): State<(Rng, controller::ControllerHandle)>,
+    State(_state): State<(rand::Rng, controller::ControllerHandle)>,
 ) -> Result<impl IntoResponse, SignalingError> {
     // TODO: delete participant from the room
     Ok(StatusCode::OK)
 }
 
-pub fn router(rng: Rng, controller: controller::ControllerHandle) -> Router {
+pub fn router(rng: rand::Rng, controller: controller::ControllerHandle) -> Router {
     Router::new()
         .route("/", post(spawn_participant))
         .route("/", delete(delete_participant))

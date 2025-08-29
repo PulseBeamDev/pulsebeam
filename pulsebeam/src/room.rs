@@ -8,7 +8,6 @@ use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackMeta,
     participant::{self, ParticipantActor, ParticipantHandle},
-    rng::Rng,
     system,
     track::{self, TrackHandle},
 };
@@ -126,7 +125,6 @@ impl RoomActor {
                 origin
                     .tracks
                     .insert(track_meta.id.clone(), track_handle.clone());
-                tracing::info!("current tracks: {:?}", self.participants.values());
                 let new_tracks = Arc::new(vec![handle]);
                 for participant in self.participants.values() {
                     let _ = participant.handle.add_tracks(new_tracks.clone()).await;

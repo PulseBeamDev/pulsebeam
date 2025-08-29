@@ -1,6 +1,5 @@
 use std::{fmt, hash, str::FromStr, sync::Arc};
 
-use crate::rng::Rng;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::rand;
 use sha3::{Digest, Sha3_256};
@@ -191,7 +190,7 @@ pub struct ParticipantId {
 }
 
 impl ParticipantId {
-    pub fn new(rng: &mut Rng, external: ExternalParticipantId) -> Self {
+    pub fn new(rng: &mut rand::Rng, external: ExternalParticipantId) -> Self {
         let internal = new_entity_id(prefix::PARTICIPANT_ID);
         Self { external, internal }
     }
@@ -295,7 +294,7 @@ pub struct TrackId {
 }
 
 impl TrackId {
-    pub fn new(rng: &mut Rng, participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
+    pub fn new(rng: &mut rand::Rng, participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
         let internal = new_entity_id(prefix::TRACK_ID);
         Self {
             internal: Arc::new(internal),
@@ -474,7 +473,7 @@ mod tests {
     #[test]
     fn test_participant_id_equality_multiple() {
         let ext = ExternalParticipantId::new("external_pa".into()).unwrap();
-        let mut rng = Rng::from_os_rng();
+        let mut rng = rand::Rng::from_os_rng();
         let participant_id1 = ParticipantId::new(&mut rng, ext.clone());
         let participant_id2 = ParticipantId::new(&mut rng, ext);
         assert_ne!(participant_id1, participant_id2);

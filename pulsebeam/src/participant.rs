@@ -15,10 +15,8 @@ use crate::{
     entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackMeta},
     proto::{self, sfu},
-    rng::Rng,
-    room::{self, RoomHandle},
-    system,
-    track::TrackHandle,
+    room, sink, system,
+    track::{self, TrackHandle},
 };
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::prelude::*;
@@ -52,7 +50,7 @@ pub enum ParticipantDataMessage {
 }
 
 struct TrackOut {
-    handle: TrackHandle,
+    track: TrackHandle,
     mid: Option<Mid>,
 }
 
@@ -134,7 +132,7 @@ impl actor::Actor for ParticipantActor {
         // We should yield back to the scheduler based on some heuristic here.
 
         loop {
-            let delay = if let Some(delay) = self.poll().await {
+            let delay = if let Some(delay) = self.poll(&mut ctx).await {
                 delay
             } else {
                 // Rtc timeout
@@ -145,7 +143,7 @@ impl actor::Actor for ParticipantActor {
                 biased;
                 msg = ctx.hi_rx.recv() => {
                     match msg {
-                        Some(msg) => self.handle_control_message(msg).await,
+                        Some(msg) => self.handle_control_message(&mut ctx, msg).await,
                         None => break,
                     }
                 }
@@ -203,7 +201,11 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
+    async fn handle_control_message(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+        msg: ParticipantControlMessage,
+    ) {
         use sfu::server_message::Payload;
 
         self.should_resync = true;
@@ -231,7 +233,7 @@ impl ParticipantActor {
                         self.available_video_tracks.insert(
                             track_id.internal.clone(),
                             TrackOut {
-                                handle: track.clone(),
+                                track: track.clone(),
                                 mid: None,
                             },
                         );
@@ -250,7 +252,7 @@ impl ParticipantActor {
                 }
 
                 if !self.initialized {
-                    self.init_subscriptions().await;
+                    self.init_subscriptions(ctx).await;
                 }
             }
             ParticipantControlMessage::TracksUnpublished(track_ids) => {
@@ -263,7 +265,7 @@ impl ParticipantActor {
                         return;
                     };
 
-                    match track.handle.meta.kind {
+                    match track.track.meta.kind {
                         MediaKind::Video => self.subscribed_video_tracks.remove(&mid),
                         MediaKind::Audio => self.subscribed_audio_tracks.remove(&mid),
                     };
@@ -277,7 +279,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn init_subscriptions(&mut self) {
+    async fn init_subscriptions(&mut self, ctx: &mut actor::ActorContext<Self>) {
         // auto subscribe
         let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
         let mut available_tracks_iter = self.available_video_tracks.iter();
@@ -285,15 +287,23 @@ impl ParticipantActor {
         while let (Some(sub), Some(available)) =
             (subscribed_tracks_iter.next(), available_tracks_iter.next())
         {
-            let meta = &available.1.handle.meta;
+            let meta = &available.1.track.meta;
             sub.1.track_id.replace(meta.id.clone());
-            available.1.handle.subscribe(self.handle.clone()).await;
+            available
+                .1
+                .track
+                .handle
+                .hi_send(track::TrackControlMessage::Subscribe(ParticipantHandle {
+                    participant_id: self.participant_id.clone(),
+                    handle: ctx.handle.clone(),
+                }))
+                .await;
             tracing::info!("replaced track");
         }
         self.initialized = true
     }
 
-    async fn poll(&mut self) -> Option<Duration> {
+    async fn poll(&mut self, ctx: &mut actor::ActorContext<Self>) -> Option<Duration> {
         while self.rtc.is_alive() {
             if self.should_resync {
                 self.resync();
@@ -327,7 +337,7 @@ impl ParticipantActor {
                 // Events are mainly incoming media data from the remote
                 // peer, but also data channel data and statistics.
                 Output::Event(v) => {
-                    self.handle_output_event(v).await;
+                    self.handle_output_event(ctx, v).await;
                 }
             }
         }
@@ -388,15 +398,16 @@ impl ParticipantActor {
     async fn handle_output_transmit(&mut self, t: Transmit) {
         let packet = Bytes::copy_from_slice(&t.contents);
         let _ = self
+            .system_ctx
             .sink_handle
-            .lo_send(SinkMessage::Packet(EgressUDPPacket {
+            .lo_send(sink::SinkMessage::Packet(EgressUDPPacket {
                 raw: packet,
                 dst: t.destination,
             }))
             .await;
     }
 
-    async fn handle_output_event(&mut self, event: Event) {
+    async fn handle_output_event(&mut self, ctx: &mut actor::ActorContext<Self>, event: Event) {
         match event {
             // Abort if we disconnect.
             Event::IceConnectionStateChange(ice_state) => match ice_state {
@@ -404,7 +415,7 @@ impl ParticipantActor {
                 state => tracing::trace!("ice state: {:?}", state),
             },
             Event::MediaAdded(e) => {
-                self.handle_new_media(e).await;
+                self.handle_new_media(ctx, e).await;
             }
             Event::ChannelOpen(cid, label) => {
                 if label == DATA_CHANNEL_LABEL {
@@ -430,9 +441,15 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_video_tracks.get(&e.mid) {
-                    let _ = track.forward_media(Arc::new(e)).await;
+                    let _ = track
+                        .handle
+                        .lo_send(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
+                        .await;
                 } else if let Some(track) = self.published_audio_tracks.get(&e.mid) {
-                    let _ = track.forward_media(Arc::new(e)).await;
+                    let _ = track
+                        .handle
+                        .lo_send(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
+                        .await;
                 }
             }
             Event::KeyframeRequest(req) => self.handle_keyframe_request(req),
@@ -456,16 +473,23 @@ impl ParticipantActor {
             return;
         };
 
-        track.handle.request_keyframe(req.into());
+        track
+            .track
+            .handle
+            .lo_try_send(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
-    async fn handle_new_media(&mut self, media: MediaAdded) {
+    async fn handle_new_media(&mut self, ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
         match media.direction {
             // client -> SFU
             Direction::RecvOnly => {
                 tracing::info!(?media, "handle_new_media from client");
                 // TODO: handle back pressure by buffering temporarily
-                let track_id = TrackId::new(&mut self.rng, self.participant_id.clone(), media.mid);
+                let track_id = TrackId::new(
+                    &mut self.system_ctx.rng,
+                    self.participant_id.clone(),
+                    media.mid,
+                );
                 let track_id = Arc::new(track_id);
                 let track = TrackMeta {
                     id: track_id.clone(),
@@ -476,7 +500,10 @@ impl ParticipantActor {
                 if let Err(err) = self
                     .room_handle
                     .hi_send(room::RoomMessage::PublishTrack(
-                        self.handle.clone(),
+                        ParticipantHandle {
+                            participant_id: self.participant_id.clone(),
+                            handle: ctx.handle.clone(),
+                        },
                         Arc::new(track),
                     ))
                     .await
@@ -544,7 +571,7 @@ impl ParticipantActor {
 impl ParticipantActor {
     pub fn new(
         system_ctx: system::SystemContext,
-        room_handle: RoomHandle,
+        room_handle: room::RoomHandle,
         participant_id: Arc<ParticipantId>,
         rtc: Rtc,
     ) -> Self {
