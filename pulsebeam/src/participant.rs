@@ -126,13 +126,13 @@ impl actor::Actor for ParticipantActor {
         self.participant_id.clone()
     }
 
-    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // TODO: notify ingress to add self to the routing table
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
 
         loop {
-            let delay = if let Some(delay) = self.poll(&mut ctx).await {
+            let delay = if let Some(delay) = self.poll(ctx).await {
                 delay
             } else {
                 // Rtc timeout
@@ -143,7 +143,7 @@ impl actor::Actor for ParticipantActor {
                 biased;
                 msg = ctx.hi_rx.recv() => {
                     match msg {
-                        Some(msg) => self.handle_control_message(&mut ctx, msg).await,
+                        Some(msg) => self.handle_control_message(ctx, msg).await,
                         None => break,
                     }
                 }

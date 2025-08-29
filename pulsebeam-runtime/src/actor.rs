@@ -74,7 +74,7 @@ pub trait Actor: Send + Sized + 'static {
     //  * https://www.reddit.com/r/rust/comments/1mvasiv/generics_with_tokiotaskspawn/
     fn run(
         &mut self,
-        ctx: ActorContext<Self>,
+        ctx: &mut ActorContext<Self>,
     ) -> impl Future<Output = Result<(), ActorError>> + Send + Sync;
 }
 
@@ -103,6 +103,24 @@ pub trait ActorHandle<A: Actor>: Clone + Send + Sync + 'static {
 pub struct LocalActorHandle<A: Actor> {
     hi_tx: mailbox::Sender<A::HighPriorityMessage>,
     lo_tx: mailbox::Sender<A::LowPriorityMessage>,
+}
+
+impl<A: Actor> LocalActorHandle<A> {
+    pub fn new(actor: A, config: RunnerConfig) -> (Self, Runner<A>) {
+        let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
+        let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
+
+        let handle = LocalActorHandle { lo_tx, hi_tx };
+
+        let ctx = ActorContext {
+            hi_rx,
+            lo_rx,
+            handle: handle.clone(),
+        };
+        let runner = Runner { actor, ctx };
+
+        (handle, runner)
+    }
 }
 
 impl<A: Actor> Clone for LocalActorHandle<A> {
@@ -168,12 +186,12 @@ impl<A: Actor> Spawner<A> for JoinSet<(A::ID, ActorStatus)> {
     }
 }
 
-pub struct SpawnConfig {
+pub struct RunnerConfig {
     pub lo_cap: usize,
     pub hi_cap: usize,
 }
 
-impl Default for SpawnConfig {
+impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             lo_cap: 1,
@@ -182,7 +200,7 @@ impl Default for SpawnConfig {
     }
 }
 
-impl SpawnConfig {
+impl RunnerConfig {
     pub fn new() -> Self {
         Self::default()
     }
@@ -198,78 +216,53 @@ impl SpawnConfig {
     }
 }
 
-pub fn spawn<A, S>(spawner: &mut S, actor: A, config: SpawnConfig) -> LocalActorHandle<A>
-where
-    A: Actor + 'static,
-    S: Spawner<A>,
-{
-    let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
-    let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
-
-    let actor_kind = actor.kind();
-    let actor_id = actor.id();
-
-    let handle = LocalActorHandle { lo_tx, hi_tx };
-
-    let ctx = ActorContext {
-        hi_rx,
-        lo_rx,
-        handle: handle.clone(),
-    };
-
-    let fut = async move {
-        let status = run_instrumented(actor, ctx, actor_kind, &actor_id).await;
-        (actor_id, status)
-    }
-    .in_current_span();
-
-    spawner.spawn(fut);
-    handle
+pub struct Runner<A: Actor> {
+    actor: A,
+    ctx: ActorContext<A>,
 }
 
-#[tracing::instrument(
-    name = "run_instrumented",
-    skip_all,
-    fields(
-        actor.kind = %actor_kind,
-        actor.id = %actor_id,
-        status = tracing::field::Empty,
-    )
-)]
-async fn run_instrumented<A>(
-    mut actor: A,
-    ctx: ActorContext<A>,
-    actor_kind: &'static str,
-    actor_id: &A::ID,
-) -> ActorStatus
-where
-    A: Actor + Send + 'static,
-{
-    tracing::debug!("Starting actor...");
+impl<A: Actor> Runner<A> {
+    pub async fn run(self) -> (A::ID, ActorStatus) {
+        let actor_kind = self.actor.kind();
+        let actor_id = self.actor.id();
 
-    let run_result = AssertUnwindSafe(actor.run(ctx)).catch_unwind().await;
-
-    let status_after_run = match run_result {
-        Ok(Ok(())) => {
-            tracing::debug!("Main logic exited gracefully.");
-            ActorStatus::ExitedGracefully
+        let fut = async move {
+            let status = self.run_instrumented().await;
+            (actor_id, status)
         }
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "Main logic exited with an error.");
-            ActorStatus::ExitedWithError
-        }
-        Err(panic_payload) => {
-            let panic_msg = extract_panic_message(&panic_payload);
-            tracing::error!(panic.message = %panic_msg, "Actor panicked!");
-            ActorStatus::Panicked
-        }
-    };
+        .in_current_span();
+        fut.await
+    }
 
-    tracing::debug!("post_stop successful.");
-    tracing::info!(status = %status_after_run, "Actor fully shut down.");
+    async fn run_instrumented(mut self) -> ActorStatus {
+        tracing::debug!("Starting actor...");
 
-    // If post_stop was successful, the status is determined by the outcome of the run logic.
-    status_after_run
+        let run_result = AssertUnwindSafe(self.actor.run(&mut self.ctx))
+            .catch_unwind()
+            .await;
+
+        let status_after_run = match run_result {
+            Ok(Ok(())) => {
+                tracing::debug!("Main logic exited gracefully.");
+                ActorStatus::ExitedGracefully
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "Main logic exited with an error.");
+                ActorStatus::ExitedWithError
+            }
+            Err(panic_payload) => {
+                let panic_msg = extract_panic_message(&panic_payload);
+                tracing::error!(panic.message = %panic_msg, "Actor panicked!");
+                ActorStatus::Panicked
+            }
+        };
+
+        tracing::debug!("post_stop successful.");
+        tracing::info!(status = %status_after_run, "Actor fully shut down.");
+
+        // If post_stop was successful, the status is determined by the outcome of the run logic.
+        status_after_run
+    }
 }
 
 fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {

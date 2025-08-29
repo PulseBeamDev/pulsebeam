@@ -52,7 +52,7 @@ impl actor::Actor for TrackActor {
         self.meta.id.clone()
     }
 
-    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 biased;

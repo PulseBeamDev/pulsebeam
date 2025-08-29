@@ -49,8 +49,8 @@ async fn run() {
     let sink_actor = sink::SinkActor::new(socket.clone());
     let system_ctx = system::SystemContext {
         rng: rng.clone(),
-        source_handle: actor::spawn(&mut join_set, source_actor, actor::SpawnConfig::default()),
-        sink_handle: actor::spawn(&mut join_set, sink_actor, actor::SpawnConfig::default()),
+        source_handle: actor::spawn(&mut join_set, source_actor, actor::RunnerConfig::default()),
+        sink_handle: actor::spawn(&mut join_set, sink_actor, actor::RunnerConfig::default()),
     };
     let controller_actor = controller::ControllerActor::new(
         system_ctx,
@@ -62,7 +62,7 @@ async fn run() {
     let controller_handle = actor::spawn(
         &mut rt::current(),
         controller_actor,
-        actor::SpawnConfig::default(),
+        actor::RunnerConfig::default(),
     );
 
     let router = signaling::router(rng, controller_handle).layer(cors);

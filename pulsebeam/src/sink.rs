@@ -25,8 +25,7 @@ impl actor::Actor for SinkActor {
         0
     }
 
-    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        drop(ctx.hi_rx); // unused for now
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // TODO: this is far from ideal. sendmmsg can be used to reduce the syscalls.
         // In the future, we'll rewrite the source and sink with a dedicated thread of io-uring.
         //

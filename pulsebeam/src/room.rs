@@ -52,12 +52,12 @@ impl actor::Actor for RoomActor {
         self.room_id.clone()
     }
 
-    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 res = ctx.hi_rx.recv() => {
                     match res {
-                        Some(msg) => self.handle_message(&mut ctx, msg).await,
+                        Some(msg) => self.handle_message(ctx, msg).await,
                         None => break,
                     }
                 }
@@ -115,11 +115,9 @@ impl RoomActor {
                 );
 
                 // TODO: update capacities
-                let track_handle = actor::spawn(
-                    &mut self.track_tasks,
-                    track_actor,
-                    actor::SpawnConfig::default(),
-                );
+                let (track_handle, track_runner) =
+                    actor::LocalActorHandle::new(track_actor, actor::RunnerConfig::default());
+                self.track_tasks.spawn(track_runner.run());
                 let track_handle = track::TrackHandle {
                     handle: track_handle,
                     meta: track_meta,
@@ -152,11 +150,9 @@ impl RoomActor {
             rtc,
         );
         // TODO: capacity
-        let participant_handle = actor::spawn(
-            &mut self.participant_tasks,
-            participant_actor,
-            actor::SpawnConfig::default(),
-        );
+        let (participant_handle, participant_runner) =
+            actor::LocalActorHandle::new(participant_actor, actor::RunnerConfig::default());
+        self.participant_tasks.spawn(participant_runner.run());
 
         // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         // self.source

@@ -59,14 +59,14 @@ impl actor::Actor for ControllerActor {
         self.id.clone()
     }
 
-    async fn run(&mut self, mut ctx: actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => {
                     match msg {
                         ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
-                            let _ = resp.send(self.allocate(&mut ctx, room_id, participant_id, offer).await);
+                            let _ = resp.send(self.allocate(ctx, room_id, participant_id, offer).await);
                         }
                     }
                 }
@@ -136,12 +136,10 @@ impl ControllerActor {
         } else {
             tracing::info!("create_room: {}", room_id);
             let room_actor = room::RoomActor::new(self.system_ctx.clone(), room_id.clone());
+            let (room_handle, room_runner) =
+                actor::LocalActorHandle::new(room_actor, actor::RunnerConfig::default());
+            self.room_tasks.spawn(room_runner.run());
 
-            let room_handle = actor::spawn(
-                &mut self.room_tasks,
-                room_actor,
-                actor::SpawnConfig::default(),
-            );
             self.rooms.insert(room_id.clone(), room_handle.clone());
 
             room_handle
