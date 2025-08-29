@@ -609,5 +609,3 @@ impl std::fmt::Display for ParticipantHandle {
         self.participant_id.fmt(f)
     }
 }
-
-pub type SpawnParticipantFn = fn(ParticipantActor) -> ParticipantHandle;

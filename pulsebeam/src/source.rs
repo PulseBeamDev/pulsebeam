@@ -126,7 +126,7 @@ impl SourceActor {
 }
 
 impl SourceActor {
-    fn new(local_addr: SocketAddr, socket: net::UnifiedSocket) -> Self {
+    pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket) -> Self {
         SourceActor {
             local_addr,
             socket,

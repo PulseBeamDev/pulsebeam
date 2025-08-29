@@ -2,9 +2,7 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
     entity::{ParticipantId, RoomId},
-    participant::ParticipantHandle,
-    rng::Rng,
-    room, sink, source, system,
+    room, system,
 };
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::prelude::*;
@@ -122,8 +120,8 @@ impl ControllerActor {
         // But, a data race can still occur nonetheless
         room_handle
             .hi_send(room::RoomMessage::AddParticipant(
-                participant.0,
-                participant.1,
+                Arc::new(participant_id),
+                rtc,
             ))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;

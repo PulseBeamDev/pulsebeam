@@ -14,6 +14,7 @@ pub enum Transport {
 }
 
 // ======================== UDP ========================
+#[derive(Clone)]
 pub struct UdpSocketImpl {
     socket: Arc<UdpSocket>,
 }
@@ -47,6 +48,7 @@ impl UdpSocketImpl {
 // * Passive: Yes
 // * Active: No
 // * SO: No
+#[derive(Clone)]
 pub struct TcpSocketImpl {}
 
 struct TcpConnection {
@@ -72,6 +74,7 @@ impl TcpSocketImpl {
 }
 
 // ======================== TLS ========================
+#[derive(Clone)]
 pub struct TlsSocketImpl {}
 
 struct TlsConnection {}
@@ -95,6 +98,7 @@ impl TlsSocketImpl {
 }
 
 // ======================== UnifiedSocket ========================
+#[derive(Clone)]
 pub enum UnifiedSocket {
     Udp(UdpSocketImpl),
     Tcp(TcpSocketImpl),

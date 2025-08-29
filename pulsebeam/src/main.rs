@@ -1,4 +1,5 @@
 use mimalloc::MiMalloc;
+use pulsebeam::{controller, signaling, sink, source, system};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -9,11 +10,8 @@ use std::{
     time::Duration,
 };
 
-use pulsebeam::{
-    actor, controller::ControllerHandle, net::UdpSocket, rng::Rng, signaling, sink::SinkHandle,
-    source::UdpSourceHandle,
-};
-use rand::SeedableRng;
+use pulsebeam_runtime::{actor, prelude::*};
+use pulsebeam_runtime::{net, rand};
 use systemstat::{Platform, System};
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -42,33 +40,31 @@ async fn run() {
 
     let ip = select_host_address();
     let local_addr: SocketAddr = format!("{ip}:3478").parse().expect("valid bind addr");
-    let socket = tokio::net::UdpSocket::bind(local_addr)
+    let socket = net::UnifiedSocket::bind(local_addr, net::Transport::Udp)
         .await
         .expect("bind to udp socket");
-    let socket: UdpSocket = Arc::new(socket).into();
 
-    let rng = Rng::from_os_rng();
-    let (source_handle, source_actor) = UdpSourceHandle::new(local_addr, socket.clone());
-    let (sink_handle, sink_actor) = SinkHandle::new(socket.clone());
-    let (controller_handle, controller_actor) = ControllerHandle::new(
-        rng.clone(),
-        source_handle,
-        sink_handle,
+    let mut join_set = JoinSet::new();
+    let rng = rand::Rng::from_os_rng();
+    let source_actor = source::SourceActor::new(local_addr, socket.clone());
+    let sink_actor = sink::SinkActor::new(socket.clone());
+    let system_ctx = system::SystemContext {
+        rng: rng.clone(),
+        source_handle: actor::spawn(&mut join_set, source_actor, 1024, 1024),
+        sink_handle: actor::spawn(&mut join_set, sink_actor, 1024, 1024),
+    };
+    let controller_actor = controller::ControllerActor::new(
+        system_ctx,
         vec![local_addr],
         Arc::new("root".to_string()),
     );
+    let controller_handle = actor::spawn(&mut join_set, controller_actor, 1024, 1024);
 
     let router = signaling::router(rng, controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     let signaling = async move {
         let _ = axum::serve(listener, router).await;
     };
-
-    let mut join_set = JoinSet::new();
-    join_set.spawn(actor::run(source_actor));
-    join_set.spawn(actor::run(sink_actor));
-    join_set.spawn(actor::run(controller_actor));
-    join_set.spawn(signaling);
 
     while (join_set.join_next().await).is_some() {}
 }
