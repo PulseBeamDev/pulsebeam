@@ -115,7 +115,11 @@ impl RoomActor {
                 );
 
                 // TODO: update capacities
-                let track_handle = actor::spawn(&mut self.track_tasks, track_actor, 8, 8);
+                let track_handle = actor::spawn(
+                    &mut self.track_tasks,
+                    track_actor,
+                    actor::SpawnConfig::default(),
+                );
                 let track_handle = track::TrackHandle {
                     handle: track_handle,
                     meta: track_meta,
@@ -148,7 +152,11 @@ impl RoomActor {
             rtc,
         );
         // TODO: capacity
-        let participant_handle = actor::spawn(&mut self.participant_tasks, participant_actor, 4, 4);
+        let participant_handle = actor::spawn(
+            &mut self.participant_tasks,
+            participant_actor,
+            actor::SpawnConfig::default(),
+        );
 
         // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         // self.source

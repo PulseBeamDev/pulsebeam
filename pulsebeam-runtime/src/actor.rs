@@ -144,14 +144,68 @@ impl<A: Actor> ActorHandle<A> for LocalActorHandle<A> {
     }
 }
 
-pub fn spawn<A: Actor>(
-    spawner: &mut JoinSet<(A::ID, ActorStatus)>,
-    actor: A,
-    lo_cap: usize,
-    hi_cap: usize,
-) -> LocalActorHandle<A> {
-    let (lo_tx, lo_rx) = mailbox::new::<A::LowPriorityMessage>(lo_cap);
-    let (hi_tx, hi_rx) = mailbox::new::<A::HighPriorityMessage>(hi_cap);
+pub trait Spawner<A: Actor> {
+    fn spawn<F>(&mut self, fut: F)
+    where
+        F: Future<Output = (A::ID, ActorStatus)> + Send + 'static;
+}
+
+impl<A: Actor> Spawner<A> for tokio::runtime::Handle {
+    fn spawn<F>(&mut self, fut: F)
+    where
+        F: Future<Output = (A::ID, ActorStatus)> + Send + 'static,
+    {
+        tokio::spawn(fut);
+    }
+}
+
+impl<A: Actor> Spawner<A> for JoinSet<(A::ID, ActorStatus)> {
+    fn spawn<F>(&mut self, fut: F)
+    where
+        F: Future<Output = (A::ID, ActorStatus)> + Send + 'static,
+    {
+        self.spawn(fut);
+    }
+}
+
+pub struct SpawnConfig {
+    pub lo_cap: usize,
+    pub hi_cap: usize,
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        Self {
+            lo_cap: 1,
+            hi_cap: 1,
+        }
+    }
+}
+
+impl SpawnConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_lo(mut self, cap: usize) -> Self {
+        self.lo_cap = cap;
+        self
+    }
+
+    pub fn with_hi(mut self, cap: usize) -> Self {
+        self.hi_cap = cap;
+        self
+    }
+}
+
+pub fn spawn<A, S>(spawner: &mut S, actor: A, config: SpawnConfig) -> LocalActorHandle<A>
+where
+    A: Actor + 'static,
+    S: Spawner<A>,
+{
+    let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
+    let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
+
     let actor_kind = actor.kind();
     let actor_id = actor.id();
 
@@ -163,13 +217,13 @@ pub fn spawn<A: Actor>(
         handle: handle.clone(),
     };
 
-    let task = async move {
+    let fut = async move {
         let status = run_instrumented(actor, ctx, actor_kind, &actor_id).await;
         (actor_id, status)
     }
     .in_current_span();
 
-    spawner.spawn(task);
+    spawner.spawn(fut);
     handle
 }
 

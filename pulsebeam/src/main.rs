@@ -50,15 +50,19 @@ async fn run() {
     let sink_actor = sink::SinkActor::new(socket.clone());
     let system_ctx = system::SystemContext {
         rng: rng.clone(),
-        source_handle: actor::spawn(&mut join_set, source_actor, 1024, 1024),
-        sink_handle: actor::spawn(&mut join_set, sink_actor, 1024, 1024),
+        source_handle: actor::spawn(&mut join_set, source_actor, actor::SpawnConfig::default()),
+        sink_handle: actor::spawn(&mut join_set, sink_actor, actor::SpawnConfig::default()),
     };
     let controller_actor = controller::ControllerActor::new(
         system_ctx,
         vec![local_addr],
         Arc::new("root".to_string()),
     );
-    let controller_handle = actor::spawn(&mut join_set, controller_actor, 1024, 1024);
+    let controller_handle = actor::spawn(
+        &mut join_set,
+        controller_actor,
+        actor::SpawnConfig::default(),
+    );
 
     let router = signaling::router(rng, controller_handle).layer(cors);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
