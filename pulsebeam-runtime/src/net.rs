@@ -3,8 +3,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+#[cfg(not(test))]
+use tokio::net::UdpSocket;
+#[cfg(test)]
+use turmoil::net::UdpSocket;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {

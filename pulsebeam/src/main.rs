@@ -10,13 +10,18 @@ use std::{
     time::Duration,
 };
 
-use pulsebeam_runtime::{actor, net, prelude::*, rand, rt};
+use pulsebeam_runtime::{actor, net, rt};
 use systemstat::{Platform, System};
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(true)
+        .pretty()
+        .init();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -26,53 +31,40 @@ fn main() {
 }
 
 async fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(true)
-        .pretty()
-        .init();
-
-    let cors = CorsLayer::very_permissive()
-        // https://github.com/tower-rs/tower-http/issues/194
-        .allow_origin(AllowOrigin::mirror_request())
-        .max_age(Duration::from_secs(86400));
-
-    let ip = select_host_address();
-    let local_addr: SocketAddr = format!("{ip}:3478").parse().expect("valid bind addr");
-    let socket = net::UnifiedSocket::bind(local_addr, net::Transport::Udp)
-        .await
-        .expect("bind to udp socket");
-
-    // TODO: spawn IO actors in a separate single-threaded runtime
-    let mut join_set = JoinSet::new();
-    let rng = rand::Rng::from_os_rng();
-    let source_actor = source::SourceActor::new(local_addr, socket.clone());
-    let sink_actor = sink::SinkActor::new(socket.clone());
-    let system_ctx = system::SystemContext {
-        rng: rng.clone(),
-        source_handle: actor::spawn(&mut join_set, source_actor, actor::RunnerConfig::default()),
-        sink_handle: actor::spawn(&mut join_set, sink_actor, actor::RunnerConfig::default()),
-    };
-    let controller_actor = controller::ControllerActor::new(
-        system_ctx,
-        vec![local_addr],
-        Arc::new("root".to_string()),
-    );
-
-    // TODO: handle join
-    let controller_handle = actor::spawn(
-        &mut rt::current(),
-        controller_actor,
-        actor::RunnerConfig::default(),
-    );
-
-    let router = signaling::router(rng, controller_handle).layer(cors);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    let signaling = async move {
-        let _ = axum::serve(listener, router).await;
-    };
-
-    while (join_set.join_next().await).is_some() {}
+    todo!();
+    // let cors = CorsLayer::very_permissive()
+    //     // https://github.com/tower-rs/tower-http/issues/194
+    //     .allow_origin(AllowOrigin::mirror_request())
+    //     .max_age(Duration::from_secs(86400));
+    //
+    // let ip = select_host_address();
+    // let local_addr: SocketAddr = format!("{ip}:3478").parse().expect("valid bind addr");
+    // let socket = net::UnifiedSocket::bind(local_addr, net::Transport::Udp)
+    //     .await
+    //     .expect("bind to udp socket");
+    //
+    // // TODO: spawn IO actors in a separate single-threaded runtime
+    // let mut join_set = JoinSet::new();
+    // let controller_actor = controller::ControllerActor::new(
+    //     system_ctx,
+    //     vec![local_addr],
+    //     Arc::new("root".to_string()),
+    // );
+    //
+    // // TODO: handle join
+    // let controller_handle = actor::spawn(
+    //     &mut rt::current(),
+    //     controller_actor,
+    //     actor::RunnerConfig::default(),
+    // );
+    //
+    // let router = signaling::router(rng, controller_handle).layer(cors);
+    // let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    // let signaling = async move {
+    //     let _ = axum::serve(listener, router).await;
+    // };
+    //
+    // while (join_set.join_next().await).is_some() {}
 }
 
 pub fn select_host_address() -> IpAddr {

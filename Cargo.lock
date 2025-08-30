@@ -1547,6 +1547,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "turmoil",
 ]
 
 [[package]]
