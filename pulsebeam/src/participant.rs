@@ -118,10 +118,6 @@ impl actor::Actor for ParticipantActor {
     type LowPriorityMessage = ParticipantDataMessage;
     type ID = Arc<ParticipantId>;
 
-    fn kind(&self) -> &'static str {
-        "participant"
-    }
-
     fn id(&self) -> Self::ID {
         self.participant_id.clone()
     }

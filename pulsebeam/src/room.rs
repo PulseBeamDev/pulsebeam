@@ -11,7 +11,8 @@ use crate::{
     system,
     track::{self, TrackHandle},
 };
-use pulsebeam_runtime::actor::{self, ActorHandle};
+use pulsebeam_runtime::actor::{self, LocalActorHandle};
+use pulsebeam_runtime::prelude::*;
 
 pub enum RoomMessage {
     PublishTrack(ParticipantHandle, Arc<TrackMeta>),
@@ -37,16 +38,13 @@ pub struct RoomActor {
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<(Arc<ParticipantId>, actor::ActorStatus)>,
     track_tasks: JoinSet<(Arc<TrackId>, actor::ActorStatus)>,
+    participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
 }
 
 impl actor::Actor for RoomActor {
     type ID = Arc<RoomId>;
     type HighPriorityMessage = RoomMessage;
     type LowPriorityMessage = ();
-
-    fn kind(&self) -> &'static str {
-        "room"
-    }
 
     fn id(&self) -> Self::ID {
         self.room_id.clone()
@@ -86,6 +84,7 @@ impl RoomActor {
             participants: HashMap::new(),
             participant_tasks: JoinSet::new(),
             track_tasks: JoinSet::new(),
+            participant_factory: Box::new(()),
         }
     }
 
@@ -149,9 +148,11 @@ impl RoomActor {
             participant_id.clone(),
             rtc,
         );
+
         // TODO: capacity
-        let (participant_handle, participant_runner) =
-            actor::LocalActorHandle::new(participant_actor, actor::RunnerConfig::default());
+        let (participant_handle, participant_runner) = self
+            .participant_factory
+            .prepare(participant_actor, actor::RunnerConfig::default());
         self.participant_tasks.spawn(participant_runner.run());
 
         // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
