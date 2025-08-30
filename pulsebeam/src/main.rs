@@ -43,6 +43,7 @@ async fn run() {
         .await
         .expect("bind to udp socket");
 
+    // TODO: spawn IO actors in a separate single-threaded runtime
     let mut join_set = JoinSet::new();
     let rng = rand::Rng::from_os_rng();
     let source_actor = source::SourceActor::new(local_addr, socket.clone());
