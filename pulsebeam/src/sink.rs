@@ -17,10 +17,6 @@ impl actor::Actor for SinkActor {
     type HighPriorityMessage = ();
     type ID = usize;
 
-    fn kind(&self) -> &'static str {
-        "sink"
-    }
-
     fn id(&self) -> Self::ID {
         0
     }

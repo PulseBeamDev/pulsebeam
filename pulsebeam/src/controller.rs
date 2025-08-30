@@ -51,10 +51,6 @@ impl actor::Actor for ControllerActor {
     type LowPriorityMessage = ();
     type ID = Arc<String>;
 
-    fn kind(&self) -> &'static str {
-        "controller"
-    }
-
     fn id(&self) -> Self::ID {
         self.id.clone()
     }

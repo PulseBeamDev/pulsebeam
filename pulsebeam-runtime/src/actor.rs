@@ -1,7 +1,8 @@
 use futures_lite::FutureExt;
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
-use std::panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
+use std::hash::Hash;
+use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 use tracing::Instrument;
 
@@ -51,7 +52,7 @@ pub struct ActorContext<A: Actor> {
 pub trait Actor: Sized {
     type HighPriorityMessage: Send;
     type LowPriorityMessage: Send;
-    type ID: Eq + std::hash::Hash + Display + Debug + Clone + Send + UnwindSafe + RefUnwindSafe;
+    type ID: Eq + Hash + Debug + Clone + Send;
 
     fn id(&self) -> Self::ID;
 
@@ -59,7 +60,7 @@ pub trait Actor: Sized {
     -> impl Future<Output = Result<(), ActorError>>;
 }
 
-pub trait ActorHandle<A: Actor>: Clone + Send + Sync {
+pub trait ActorHandle<A: Actor>: Clone {
     fn lo_send(
         &self,
         message: A::LowPriorityMessage,
@@ -81,14 +82,14 @@ pub trait ActorHandle<A: Actor>: Clone + Send + Sync {
     ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>>;
 }
 
-pub trait ActorFactory<A: Actor>: Send + 'static {
+pub trait ActorFactory<A: Actor>: Send + Sync + 'static {
     fn prepare(&self, actor: A, config: RunnerConfig) -> (LocalActorHandle<A>, Runner<A>);
 }
 
 impl<A, F> ActorFactory<A> for F
 where
     A: Actor,
-    F: Fn(A, RunnerConfig) -> (LocalActorHandle<A>, Runner<A>) + Send + 'static,
+    F: Fn(A, RunnerConfig) -> (LocalActorHandle<A>, Runner<A>) + Send + Sync + 'static,
 {
     fn prepare(&self, actor: A, config: RunnerConfig) -> (LocalActorHandle<A>, Runner<A>) {
         self(actor, config)

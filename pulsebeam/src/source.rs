@@ -25,10 +25,6 @@ impl actor::Actor for SourceActor {
     type LowPriorityMessage = ();
     type ID = usize;
 
-    fn kind(&self) -> &'static str {
-        "source"
-    }
-
     fn id(&self) -> Self::ID {
         0
     }

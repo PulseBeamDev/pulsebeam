@@ -44,10 +44,6 @@ impl actor::Actor for TrackActor {
     type LowPriorityMessage = TrackDataMessage;
     type ID = Arc<TrackId>;
 
-    fn kind(&self) -> &'static str {
-        "track"
-    }
-
     fn id(&self) -> Self::ID {
         self.meta.id.clone()
     }
