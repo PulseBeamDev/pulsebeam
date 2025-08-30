@@ -117,7 +117,7 @@ impl ControllerActor {
         room_handle
             .hi_send(room::RoomMessage::AddParticipant(
                 Arc::new(participant_id),
-                rtc,
+                Box::new(rtc),
             ))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;

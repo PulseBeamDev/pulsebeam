@@ -16,7 +16,7 @@ use pulsebeam_runtime::prelude::*;
 
 pub enum RoomMessage {
     PublishTrack(ParticipantHandle, Arc<TrackMeta>),
-    AddParticipant(Arc<ParticipantId>, Rtc),
+    AddParticipant(Arc<ParticipantId>, Box<Rtc>),
 }
 
 pub struct ParticipantMeta {
@@ -140,7 +140,7 @@ impl RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<Self>,
         participant_id: Arc<ParticipantId>,
-        rtc: str0m::Rtc,
+        rtc: Box<str0m::Rtc>,
     ) {
         let participant_actor = ParticipantActor::new(
             self.system_ctx.clone(),
