@@ -1,9 +1,11 @@
-use futures_lite::FutureExt;
+use futures::FutureExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::mailbox;
@@ -57,7 +59,7 @@ pub struct ActorContext<A: Actor> {
     pub handle: ActorHandle<A>,
 }
 
-pub trait Actor: Sized {
+pub trait Actor: Sized + Send + 'static {
     /// The type of high-priority messages this actor processes.
     type HighPriorityMsg: Send + 'static;
     /// The type of low-priority messages this actor processes.
@@ -83,7 +85,7 @@ pub trait Actor: Sized {
     fn run(
         &mut self,
         ctx: &mut ActorContext<Self>,
-    ) -> impl Future<Output = Result<(), ActorError>> {
+    ) -> impl Future<Output = Result<(), ActorError>> + Send {
         async {
             loop {
                 tokio::select! {
@@ -114,8 +116,8 @@ pub trait Actor: Sized {
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: SystemMsg<Self::ObservableState>,
-    ) -> impl Future<Output = ()> {
-        async {
+    ) -> impl Future<Output = ()> + Send {
+        async move {
             match msg {
                 SystemMsg::GetState(responder) => {
                     // The actor provides its state, and we send it back.
@@ -132,7 +134,7 @@ pub trait Actor: Sized {
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: Self::HighPriorityMsg,
-    ) -> impl Future<Output = ()> {
+    ) -> impl Future<Output = ()> + Send {
         async {
             todo!("unimplemented!");
         }
@@ -144,33 +146,45 @@ pub trait Actor: Sized {
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: Self::LowPriorityMsg,
-    ) -> impl Future<Output = ()> {
+    ) -> impl Future<Output = ()> + Send {
         async {
             todo!("unimplemented!");
         }
     }
 }
 
-pub trait ActorFactory<A: Actor>: Send + Sync + 'static {
-    fn prepare(&self, actor: A, config: RunnerConfig) -> (ActorHandle<A>, Runner<A>);
-}
-
-impl<A, F> ActorFactory<A> for F
-where
-    A: Actor,
-    F: Fn(A, RunnerConfig) -> (ActorHandle<A>, Runner<A>) + Send + Sync + 'static,
-{
-    fn prepare(&self, actor: A, config: RunnerConfig) -> (ActorHandle<A>, Runner<A>) {
-        self(actor, config)
-    }
-}
-
-// Default implementation using LocalActorHandle::new
-impl<A: Actor> ActorFactory<A> for () {
-    fn prepare(&self, actor: A, config: RunnerConfig) -> (ActorHandle<A>, Runner<A>) {
-        ActorHandle::new(actor, config)
-    }
-}
+// pub trait ActorFactory<A: Actor> {
+//     fn prepare(
+//         &self,
+//         actor: A,
+//         config: RunnerConfig,
+//     ) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>);
+// }
+//
+// impl<A, F> ActorFactory<A> for F
+// where
+//     A: Actor,
+//     F: Fn(A, RunnerConfig) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>),
+// {
+//     fn prepare(
+//         &self,
+//         actor: A,
+//         config: RunnerConfig,
+//     ) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>) {
+//         self(actor, config)
+//     }
+// }
+//
+// // Default implementation using LocalActorHandle::new
+// impl<A: Actor> ActorFactory<A> for () {
+//     fn prepare(
+//         &self,
+//         actor: A,
+//         config: RunnerConfig,
+//     ) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>) {
+//         spawn(actor, config)
+//     }
+// }
 
 /// A handle for sending high- and low-priority messages to an actor.
 pub struct ActorHandle<A: Actor> {
@@ -180,33 +194,6 @@ pub struct ActorHandle<A: Actor> {
 }
 
 impl<A: Actor> ActorHandle<A> {
-    pub fn new(actor: A, config: RunnerConfig) -> (Self, Runner<A>) {
-        let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
-        let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
-        let (sys_tx, sys_rx) = mailbox::new(1);
-
-        let handle = ActorHandle {
-            hi_tx,
-            lo_tx,
-            sys_tx,
-        };
-
-        let ctx = ActorContext {
-            sys_rx,
-            hi_rx,
-            lo_rx,
-            handle: handle.clone(),
-        };
-
-        let runner = Runner { actor, ctx };
-
-        (handle, runner)
-    }
-
-    pub fn new_default(actor: A) -> (Self, Runner<A>) {
-        Self::new(actor, RunnerConfig::default())
-    }
-
     /// Sends a high-priority message asynchronously.
     ///
     /// Returns an error if the actor's mailbox is closed.
@@ -306,52 +293,81 @@ impl RunnerConfig {
     }
 }
 
-pub struct Runner<A: Actor> {
-    pub actor: A,
-    pub ctx: ActorContext<A>,
+pub fn spawn<A: Actor>(
+    a: A,
+    config: RunnerConfig,
+) -> (
+    ActorHandle<A>,
+    impl Future<Output = (A::ActorId, ActorStatus)>,
+) {
+    let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
+    let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
+    let (sys_tx, sys_rx) = mailbox::new(1);
+
+    let handle = ActorHandle {
+        hi_tx,
+        lo_tx,
+        sys_tx,
+    };
+
+    let ctx = ActorContext {
+        sys_rx,
+        hi_rx,
+        lo_rx,
+        handle: handle.clone(),
+    };
+
+    let actor_id1 = a.id();
+    let actor_id2 = actor_id1.clone();
+
+    let fut = async move {
+        let status = run_instrumented(a, ctx).await;
+        (actor_id1, status)
+    }
+    .in_current_span();
+
+    let join = tokio::spawn(fut).map(|res| match res {
+        Ok(ret) => ret,
+        Err(_) => (actor_id2, ActorStatus::ShutDown),
+    });
+    (handle, join)
 }
 
-impl<A: Actor> Runner<A> {
-    pub async fn run(self) -> (A::ActorId, ActorStatus) {
-        let actor_id = self.actor.id();
+pub fn spawn_default<A: Actor>(
+    a: A,
+) -> (
+    ActorHandle<A>,
+    impl Future<Output = (A::ActorId, ActorStatus)>,
+) {
+    spawn(a, RunnerConfig::default())
+}
 
-        let fut = async move {
-            let status = self.run_instrumented().await;
-            (actor_id, status)
+async fn run_instrumented<A: Actor>(mut a: A, mut ctx: ActorContext<A>) -> ActorStatus {
+    tracing::debug!("Starting actor...");
+
+    let run_result = AssertUnwindSafe(a.run(&mut ctx)).catch_unwind().await;
+
+    let status_after_run = match run_result {
+        Ok(Ok(())) => {
+            tracing::debug!("Main logic exited gracefully.");
+            ActorStatus::ExitedGracefully
         }
-        .in_current_span();
-        fut.await
-    }
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "Main logic exited with an error.");
+            ActorStatus::ExitedWithError
+        }
+        Err(panic_payload) => {
+            let panic_msg = extract_panic_message(&panic_payload);
 
-    async fn run_instrumented(mut self) -> ActorStatus {
-        tracing::debug!("Starting actor...");
+            tracing::error!(panic.message = %panic_msg, "Actor panicked!");
+            ActorStatus::Panicked
+        }
+    };
 
-        let run_result = AssertUnwindSafe(self.actor.run(&mut self.ctx))
-            .catch_unwind()
-            .await;
+    tracing::debug!("post_stop successful.");
+    tracing::info!(status = %status_after_run, "Actor fully shut down.");
 
-        let status_after_run = match run_result {
-            Ok(Ok(())) => {
-                tracing::debug!("Main logic exited gracefully.");
-                ActorStatus::ExitedGracefully
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "Main logic exited with an error.");
-                ActorStatus::ExitedWithError
-            }
-            Err(panic_payload) => {
-                let panic_msg = extract_panic_message(&panic_payload);
-
-                tracing::error!(panic.message = %panic_msg, "Actor panicked!");
-                ActorStatus::Panicked
-            }
-        };
-
-        tracing::debug!("post_stop successful.");
-        tracing::info!(status = %status_after_run, "Actor fully shut down.");
-
-        status_after_run
-    }
+    status_after_run
 }
 
 fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
@@ -364,47 +380,25 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
     }
 }
 
-pub struct ObserverActor<A: Actor> {
-    pub high_priority_msgs: Vec<A::HighPriorityMsg>,
-    pub low_priority_msgs: Vec<A::LowPriorityMsg>,
-    pub inner: A,
+struct TaskManager<T> {
+    futures: FuturesUnordered<JoinHandle<T>>,
 }
 
-impl<A: Actor> ObserverActor<A> {
-    pub fn wrap(inner: A) -> ObserverActor<A> {
-        Self {
-            high_priority_msgs: Vec::new(),
-            low_priority_msgs: Vec::new(),
-            inner,
+impl<T: std::fmt::Debug + Send + 'static> TaskManager<T> {
+    // Create a new TaskManager
+    pub fn new() -> Self {
+        TaskManager {
+            futures: FuturesUnordered::new(),
         }
     }
-}
 
-impl<A: Actor> Actor for ObserverActor<A> {
-    type HighPriorityMsg = A::HighPriorityMsg;
-    type LowPriorityMsg = A::LowPriorityMsg;
-    type ActorId = A::ActorId;
-    type ObservableState = ();
-
-    fn id(&self) -> Self::ActorId {
-        self.inner.id()
+    // Add a new task
+    pub fn add_task(&mut self, handle: JoinHandle<T>) {
+        self.futures.push(handle);
     }
 
-    fn get_observable_state(&self) -> Self::ObservableState {}
-
-    async fn on_high_priority(
-        &mut self,
-        _ctx: &mut ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
-    ) -> () {
-        self.high_priority_msgs.push(msg);
-    }
-
-    async fn on_low_priority(
-        &mut self,
-        _ctx: &mut ActorContext<Self>,
-        msg: Self::LowPriorityMsg,
-    ) -> () {
-        self.low_priority_msgs.push(msg);
+    // Process the next completed task
+    pub async fn join_next(&mut self) -> Option<T> {
+        self.futures.next().map(f)
     }
 }

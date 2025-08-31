@@ -37,3 +37,10 @@ pub fn create_runner<A: actor::Actor>(a: A) -> actor::Runner<A> {
     let (_, runner) = actor::ActorHandle::new_default(a);
     runner
 }
+
+pub fn spawn<A: actor::Actor>(a: A) -> actor::ActorHandle<A> {
+    let (handle, runner) = actor::ActorHandle::new_default(a);
+    let fut = runner.run();
+    tokio::spawn(fut);
+    handle
+}

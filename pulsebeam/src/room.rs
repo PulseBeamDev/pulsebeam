@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use str0m::Rtc;
 use tokio::task::JoinSet;
 
@@ -32,9 +33,9 @@ pub struct ParticipantMeta {
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
     system_ctx: system::SystemContext,
-    participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
+    // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
-    participant_tasks: JoinSet<(Arc<ParticipantId>, actor::ActorStatus)>,
+    participant_tasks: FuturesUnordered<(Arc<ParticipantId>, actor::ActorStatus)>,
     track_tasks: JoinSet<(Arc<TrackId>, actor::ActorStatus)>,
     state: RoomState,
 }
@@ -65,7 +66,7 @@ impl actor::Actor for RoomActor {
                     self.on_high_priority(ctx, msg).await;
                 }
 
-                Some(Ok((participant_id, _))) = self.participant_tasks.join_next() => {
+                Some(Ok((participant_id, _))) = self.participant_tasks.next() => {
                     self.handle_participant_left(participant_id).await;
                 }
 
@@ -141,7 +142,7 @@ impl RoomActor {
             system_ctx,
             room_id,
             state: RoomState::default(),
-            participant_tasks: JoinSet::new(),
+            participant_tasks: FuturesUnordered::new(),
             track_tasks: JoinSet::new(),
             participant_factory: Box::new(()),
         }
@@ -161,10 +162,9 @@ impl RoomActor {
         );
 
         // TODO: capacity
-        let (participant_handle, participant_runner) = self
+        let participant_handle = self
             .participant_factory
             .prepare(participant_actor, actor::RunnerConfig::default());
-        self.participant_tasks.spawn(participant_runner.run());
 
         // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         // self.source
@@ -238,32 +238,28 @@ mod test {
 
         sim.client("test", async {
             let system_ctx = test_utils::create_system_ctx().await;
-            let mut room = test_utils::create_runner(RoomActor::new(
-                system_ctx,
-                test_utils::create_room("roomA"),
-            ));
+            let room =
+                actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
             let (participant_id, participant_rtc) = test_utils::create_participant();
 
-            room.actor
-                .on_high_priority(
-                    &mut room.ctx,
-                    RoomMessage::AddParticipant(participant_id.clone(), participant_rtc),
-                )
-                .await;
+            room.send_high(RoomMessage::AddParticipant(
+                participant_id.clone(),
+                participant_rtc,
+            ))
+            .await;
 
             let track = TrackMeta {
                 id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
                 kind: str0m::media::MediaKind::Video,
                 simulcast: None,
             };
-            room.actor
-                .on_high_priority(&mut room.ctx, RoomMessage::PublishTrack(Arc::new(track)))
+            room.send_high(RoomMessage::PublishTrack(Arc::new(track)))
                 .await;
 
-            assert_eq!(room.actor.state.participants.len(), 1);
+            let state = room.get_state().await.unwrap();
+            assert_eq!(state.participants.len(), 1);
             assert_eq!(
-                room.actor
-                    .state
+                state
                     .participants
                     .get(&participant_id)
                     .unwrap()

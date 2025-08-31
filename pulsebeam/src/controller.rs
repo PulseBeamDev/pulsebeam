@@ -4,10 +4,11 @@ use crate::{
     entity::{ParticipantId, RoomId},
     room, system,
 };
+use futures::stream::FuturesUnordered;
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::prelude::*;
 use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
-use tokio::{sync::oneshot, task::JoinSet};
+use tokio::sync::oneshot;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -43,7 +44,7 @@ pub struct ControllerActor {
     local_addrs: Vec<SocketAddr>,
 
     rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
-    room_tasks: JoinSet<(Arc<RoomId>, actor::ActorStatus)>,
+    room_tasks: FuturesUnordered<(Arc<RoomId>, actor::ActorStatus)>,
 }
 
 impl actor::Actor for ControllerActor {
@@ -66,7 +67,7 @@ impl actor::Actor for ControllerActor {
                     self.on_high_priority(ctx, msg).await;
                 }
 
-                Some(Ok((room_id, _))) = self.room_tasks.join_next() => {
+                Some(Ok((room_id, _))) = self.room_tasks.next() => {
                     self.rooms.remove(&room_id);
                 }
 
@@ -143,9 +144,8 @@ impl ControllerActor {
         } else {
             tracing::info!("create_room: {}", room_id);
             let room_actor = room::RoomActor::new(self.system_ctx.clone(), room_id.clone());
-            let (room_handle, room_runner) =
-                actor::ActorHandle::new(room_actor, actor::RunnerConfig::default());
-            self.room_tasks.spawn(room_runner.run());
+            let (room_handle, room_join) = actor::spawn(room_actor, actor::RunnerConfig::default());
+            self.room_tasks.push(room_join);
 
             self.rooms.insert(room_id.clone(), room_handle.clone());
 
@@ -165,7 +165,7 @@ impl ControllerActor {
             system_ctx,
             local_addrs,
             rooms: HashMap::new(),
-            room_tasks: JoinSet::new(),
+            room_tasks: FuturesUnordered::new(),
         }
     }
 }
