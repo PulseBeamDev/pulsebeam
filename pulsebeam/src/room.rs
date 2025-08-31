@@ -50,10 +50,7 @@ impl actor::Actor for RoomActor {
         self.room_id.clone()
     }
 
-    async fn process(
-        &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-    ) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 Some(msg) = ctx.hi_rx.recv() => {
@@ -183,7 +180,6 @@ impl RoomActor {
             tracks.extend(meta.tracks.values().cloned());
         }
 
-        todo!();
         // let _ = participant_handle
         //     .hi_send(participant::ParticipantControlMessage::TracksUnpublished(
         //         Arc::new(tracks.clone()),
@@ -219,28 +215,43 @@ pub type RoomHandle = actor::LocalActorHandle<RoomActor>;
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::net::Ipv4Addr;
 
     use super::*;
-    use crate::entity;
     use crate::room::RoomActor;
     use crate::system;
+    use crate::test_utils;
     use pulsebeam_runtime::actor;
     use pulsebeam_runtime::net;
-    use pulsebeam_runtime::prelude::*;
 
-    #[tokio::test]
-    async fn name() {
-        let external_addr = "192.168.1.1:3478".parse().unwrap();
-        let socket = net::UnifiedSocket::bind(external_addr, net::Transport::Udp)
-            .await
-            .unwrap();
-        let (system_ctx, system_handle) = system::SystemContext::spawn(external_addr, socket);
+    #[test]
+    fn name() {
+        let mut sim = test_utils::create_sim();
 
-        let room_id = entity::RoomId::try_from("roomA").unwrap();
-        let room_actor = RoomActor::new(system_ctx, Arc::new(room_id));
-        let (room_handle, room_runner) = actor::LocalActorHandle::new_default(room_actor);
+        sim.client("test", async {
+            let external_addr = "192.168.1.1:3478".parse().unwrap();
+            let socket =
+                net::UnifiedSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), net::Transport::SimUdp)
+                    .await
+                    .unwrap();
+            let (system_ctx, _) = system::SystemContext::spawn(external_addr, socket);
 
-        room_actor.on_high_priority(&mut room_runner.ctx, RoomMessage::AddParticipant((), ()));
+            let room_actor = RoomActor::new(system_ctx, test_utils::create_room("roomA"));
+            let (_, mut room_runner) = actor::LocalActorHandle::new_default(room_actor);
+            let (participant_id, participant_rtc) = test_utils::create_participant();
+
+            room_runner
+                .actor
+                .on_high_priority(
+                    &mut room_runner.ctx,
+                    RoomMessage::AddParticipant(participant_id, participant_rtc),
+                )
+                .await;
+
+            assert_eq!(room_runner.actor.participants.len(), 1);
+            Ok(())
+        });
+
+        sim.run().unwrap();
     }
 }

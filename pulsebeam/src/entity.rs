@@ -199,9 +199,18 @@ pub struct ParticipantId {
 }
 
 impl ParticipantId {
-    pub fn new(rng: &mut rand::Rng, external: ExternalParticipantId) -> Self {
+    pub fn new(external: ExternalParticipantId) -> Self {
         let internal = new_entity_id(prefix::PARTICIPANT_ID);
         Self { external, internal }
+    }
+}
+
+impl TryFrom<&str> for ParticipantId {
+    type Error = IdValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let external = ExternalParticipantId::from_str(value)?;
+        Ok(Self::new(external))
     }
 }
 
@@ -482,9 +491,8 @@ mod tests {
     #[test]
     fn test_participant_id_equality_multiple() {
         let ext = ExternalParticipantId::new("external_pa".into()).unwrap();
-        let mut rng = rand::Rng::from_os_rng();
-        let participant_id1 = ParticipantId::new(&mut rng, ext.clone());
-        let participant_id2 = ParticipantId::new(&mut rng, ext);
+        let participant_id1 = ParticipantId::new(ext.clone());
+        let participant_id2 = ParticipantId::new(ext);
         assert_ne!(participant_id1, participant_id2);
     }
 }

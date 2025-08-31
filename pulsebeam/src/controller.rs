@@ -55,10 +55,7 @@ impl actor::Actor for ControllerActor {
         self.id.clone()
     }
 
-    async fn process(
-        &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-    ) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 biased;

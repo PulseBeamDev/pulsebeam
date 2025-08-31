@@ -65,7 +65,7 @@ pub trait Actor: Sized {
     /// The default implementation processes high-priority messages before low-priority ones
     /// using `tokio::select!` with biased polling. Implementors may override this method
     /// for custom behavior.
-    fn process(
+    fn run(
         &mut self,
         ctx: &mut ActorContext<Self>,
     ) -> impl Future<Output = Result<(), ActorError>> {
@@ -290,7 +290,7 @@ impl<A: Actor> Runner<A> {
     async fn run_instrumented(mut self) -> ActorStatus {
         tracing::debug!("Starting actor...");
 
-        let run_result = AssertUnwindSafe(self.actor.process(&mut self.ctx))
+        let run_result = AssertUnwindSafe(self.actor.run(&mut self.ctx))
             .catch_unwind()
             .await;
 

@@ -62,14 +62,14 @@ pub struct ParticipantInfo {
 #[axum::debug_handler]
 async fn spawn_participant(
     Query(info): Query<ParticipantInfo>,
-    State((mut rng, con)): State<(rand::Rng, controller::ControllerHandle)>,
+    State(con): State<controller::ControllerHandle>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<impl IntoResponse, SignalingError> {
     // TODO: validate content_type = "application/sdp"
 
     let room_id = RoomId::new(info.room);
-    let participant_id = ParticipantId::new(&mut rng, info.participant);
+    let participant_id = ParticipantId::new(info.participant);
     tracing::info!("allocated {} to {}", participant_id, room_id);
 
     // TODO: better unique ID to handle session.
@@ -95,15 +95,15 @@ async fn spawn_participant(
 
 #[axum::debug_handler]
 async fn delete_participant(
-    State(_state): State<(rand::Rng, controller::ControllerHandle)>,
+    State(_state): State<controller::ControllerHandle>,
 ) -> Result<impl IntoResponse, SignalingError> {
     // TODO: delete participant from the room
     Ok(StatusCode::OK)
 }
 
-pub fn router(rng: rand::Rng, controller: controller::ControllerHandle) -> Router {
+pub fn router(controller: controller::ControllerHandle) -> Router {
     Router::new()
         .route("/", post(spawn_participant))
         .route("/", delete(delete_participant))
-        .with_state((rng, controller))
+        .with_state(controller)
 }

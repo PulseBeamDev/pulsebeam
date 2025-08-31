@@ -122,10 +122,7 @@ impl actor::Actor for ParticipantActor {
         self.participant_id.clone()
     }
 
-    async fn process(
-        &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-    ) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // TODO: notify ingress to add self to the routing table
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.

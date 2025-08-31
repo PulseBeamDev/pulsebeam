@@ -29,10 +29,7 @@ impl actor::Actor for SourceActor {
         0
     }
 
-    async fn process(
-        &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-    ) -> Result<(), actor::ActorError> {
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
 
