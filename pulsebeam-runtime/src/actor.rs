@@ -191,6 +191,10 @@ impl<A: Actor> LocalActorHandle<A> {
 
         (handle, runner)
     }
+
+    pub fn new_default(actor: A) -> (Self, Runner<A>) {
+        Self::new(actor, RunnerConfig::default())
+    }
 }
 
 impl<A: Actor> Clone for LocalActorHandle<A> {
@@ -267,8 +271,8 @@ impl RunnerConfig {
 }
 
 pub struct Runner<A: Actor> {
-    actor: A,
-    ctx: ActorContext<A>,
+    pub actor: A,
+    pub ctx: ActorContext<A>,
 }
 
 impl<A: Actor> Runner<A> {

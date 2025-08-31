@@ -217,46 +217,30 @@ impl RoomActor {
 
 pub type RoomHandle = actor::LocalActorHandle<RoomActor>;
 
-// #[cfg(test)]
-// mod test {
-//     use std::sync::Arc;
-//
-//     use rand::SeedableRng;
-//
-//     use crate::{
-//         entity::{ExternalParticipantId, ExternalRoomId, ParticipantId, RoomId},
-//         net::VirtualUdpSocket,
-//         participant::ParticipantHandle,
-//         rng::Rng,
-//         room::RoomHandle,
-//         sink::UdpSinkHandle,
-//         source::UdpSourceHandle,
-//     };
-//
-//     #[tokio::test]
-//     async fn name() {
-//         let socket = turmoil::net::UdpSocket::bind("0.0.0.0:3478").await.unwrap();
-//         let socket: VirtualUdpSocket = Arc::new(socket).into();
-//         let server_addr = "192.168.1.1:3478".parse().unwrap();
-//
-//         let rng = Rng::seed_from_u64(1);
-//         let (source_handle, source_actor) = UdpSourceHandle::new(server_addr, socket.clone());
-//         let (sink_handle, sink_actor) = UdpSinkHandle::new(socket.clone());
-//
-//         let room_id = RoomId::new(ExternalRoomId::new("test".to_string()).unwrap());
-//         let participant_id = ParticipantId::new(
-//             &mut rng,
-//             ExternalParticipantId::new("a".to_string()).unwrap(),
-//         );
-//         let (room_handle, room_actor) = RoomHandle::new(rng, Arc::new(room_id));
-//         ParticipantHandle::new(
-//             rng,
-//             source_handle,
-//             sink_handle,
-//             room_handle,
-//             participant_id,
-//             rtc,
-//         );
-//         handle.add_participant(handle, actor)
-//     }
-// }
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::entity;
+    use crate::room::RoomActor;
+    use crate::system;
+    use pulsebeam_runtime::actor;
+    use pulsebeam_runtime::net;
+    use pulsebeam_runtime::prelude::*;
+
+    #[tokio::test]
+    async fn name() {
+        let external_addr = "192.168.1.1:3478".parse().unwrap();
+        let socket = net::UnifiedSocket::bind(external_addr, net::Transport::Udp)
+            .await
+            .unwrap();
+        let (system_ctx, system_handle) = system::SystemContext::spawn(external_addr, socket);
+
+        let room_id = entity::RoomId::try_from("roomA").unwrap();
+        let room_actor = RoomActor::new(system_ctx, Arc::new(room_id));
+        let (room_handle, room_runner) = actor::LocalActorHandle::new_default(room_actor);
+
+        room_actor.on_high_priority(&mut room_runner.ctx, RoomMessage::AddParticipant((), ()));
+    }
+}

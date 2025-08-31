@@ -106,6 +106,15 @@ impl RoomId {
     }
 }
 
+impl TryFrom<&str> for RoomId {
+    type Error = IdValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let external = ExternalRoomId::from_str(value)?;
+        Ok(Self::new(external))
+    }
+}
+
 impl hash::Hash for RoomId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.internal.hash(state);
