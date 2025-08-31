@@ -1,14 +1,15 @@
 use futures::FutureExt;
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use thiserror::Error;
-use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::mailbox;
+
+pub type JoinHandle<A: Actor> = Pin<Box<dyn Future<Output = (A::ActorId, ActorStatus)> + Send>>;
 
 #[derive(Error, Debug)]
 pub enum ActorError {
@@ -61,9 +62,9 @@ pub struct ActorContext<A: Actor> {
 
 pub trait Actor: Sized + Send + 'static {
     /// The type of high-priority messages this actor processes.
-    type HighPriorityMsg: Send + 'static;
+    type HighPriorityMsg: Debug + Send + 'static;
     /// The type of low-priority messages this actor processes.
-    type LowPriorityMsg: Send + 'static;
+    type LowPriorityMsg: Debug + Send + 'static;
     /// The unique identifier for this actor.
     type ActorId: Eq + Hash + Debug + Clone + Send;
 
@@ -293,13 +294,7 @@ impl RunnerConfig {
     }
 }
 
-pub fn spawn<A: Actor>(
-    a: A,
-    config: RunnerConfig,
-) -> (
-    ActorHandle<A>,
-    impl Future<Output = (A::ActorId, ActorStatus)>,
-) {
+pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandle<A>) {
     let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
     let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
     let (sys_tx, sys_rx) = mailbox::new(1);
@@ -326,10 +321,12 @@ pub fn spawn<A: Actor>(
     }
     .in_current_span();
 
-    let join = tokio::spawn(fut).map(|res| match res {
-        Ok(ret) => ret,
-        Err(_) => (actor_id2, ActorStatus::ShutDown),
-    });
+    let join = tokio::spawn(fut)
+        .map(|res| match res {
+            Ok(ret) => ret,
+            Err(_) => (actor_id2, ActorStatus::ShutDown),
+        })
+        .boxed();
     (handle, join)
 }
 
@@ -377,28 +374,5 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
         s.clone()
     } else {
         format!("{:?}", payload)
-    }
-}
-
-struct TaskManager<T> {
-    futures: FuturesUnordered<JoinHandle<T>>,
-}
-
-impl<T: std::fmt::Debug + Send + 'static> TaskManager<T> {
-    // Create a new TaskManager
-    pub fn new() -> Self {
-        TaskManager {
-            futures: FuturesUnordered::new(),
-        }
-    }
-
-    // Add a new task
-    pub fn add_task(&mut self, handle: JoinHandle<T>) {
-        self.futures.push(handle);
-    }
-
-    // Process the next completed task
-    pub async fn join_next(&mut self) -> Option<T> {
-        self.futures.next().map(f)
     }
 }

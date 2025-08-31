@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use crate::{entity, system};
-use pulsebeam_runtime::{actor, net};
+use pulsebeam_runtime::net;
 
 pub fn create_participant() -> (Arc<entity::ParticipantId>, Box<str0m::Rtc>) {
     let external = entity::ExternalParticipantId::new(entity::new_random_id("tp", 10)).unwrap();
@@ -31,16 +31,4 @@ pub async fn create_system_ctx() -> system::SystemContext {
         .unwrap();
     let (system_ctx, _) = system::SystemContext::spawn(external_addr, socket);
     system_ctx
-}
-
-pub fn create_runner<A: actor::Actor>(a: A) -> actor::Runner<A> {
-    let (_, runner) = actor::ActorHandle::new_default(a);
-    runner
-}
-
-pub fn spawn<A: actor::Actor>(a: A) -> actor::ActorHandle<A> {
-    let (handle, runner) = actor::ActorHandle::new_default(a);
-    let fut = runner.run();
-    tokio::spawn(fut);
-    handle
 }

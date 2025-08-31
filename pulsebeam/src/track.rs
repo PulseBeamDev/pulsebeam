@@ -8,18 +8,20 @@ use crate::{
     message::{self, TrackMeta},
     participant::{self, ParticipantHandle},
 };
-use pulsebeam_runtime::actor::{self, ActorHandle};
+use pulsebeam_runtime::actor;
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrackError {}
 
+#[derive(Debug)]
 pub enum TrackDataMessage {
     ForwardMedia(Arc<MediaData>),
     KeyframeRequest(message::KeyframeRequest),
 }
 
+#[derive(Debug)]
 pub enum TrackControlMessage {
     Subscribe(ParticipantHandle),
     Unsubscribe(Arc<ParticipantId>),

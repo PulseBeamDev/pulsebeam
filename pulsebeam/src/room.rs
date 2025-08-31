@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use str0m::Rtc;
-use tokio::task::JoinSet;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
@@ -13,6 +12,7 @@ use crate::{
 };
 use pulsebeam_runtime::actor;
 
+#[derive(Debug)]
 pub enum RoomMessage {
     PublishTrack(Arc<TrackMeta>),
     AddParticipant(Arc<ParticipantId>, Box<Rtc>),
@@ -35,8 +35,8 @@ pub struct RoomActor {
     system_ctx: system::SystemContext,
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
-    participant_tasks: FuturesUnordered<(Arc<ParticipantId>, actor::ActorStatus)>,
-    track_tasks: JoinSet<(Arc<TrackId>, actor::ActorStatus)>,
+    participant_tasks: FuturesUnordered<actor::JoinHandle<participant::ParticipantActor>>,
+    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
     state: RoomState,
 }
 
@@ -62,15 +62,18 @@ impl actor::Actor for RoomActor {
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
+                Some(msg) = ctx.sys_rx.recv() => {
+                    self.on_system(ctx, msg).await;
+                }
                 Some(msg) = ctx.hi_rx.recv() => {
                     self.on_high_priority(ctx, msg).await;
                 }
 
-                Some(Ok((participant_id, _))) = self.participant_tasks.next() => {
+                Some((participant_id, _)) = self.participant_tasks.next() => {
                     self.handle_participant_left(participant_id).await;
                 }
 
-                Some(Ok((track_id, _))) = self.track_tasks.join_next() => {
+                Some((track_id, _)) = self.track_tasks.next() => {
                     // TODO: handle track lifecycle
                 }
 
@@ -113,9 +116,9 @@ impl actor::Actor for RoomActor {
                 );
 
                 // TODO: update capacities
-                let (track_handle, track_runner) =
-                    actor::ActorHandle::new(track_actor, actor::RunnerConfig::default());
-                self.track_tasks.spawn(track_runner.run());
+                let (track_handle, track_join) =
+                    actor::spawn(track_actor, actor::RunnerConfig::default());
+                self.track_tasks.push(track_join);
                 let track_handle = track::TrackHandle {
                     handle: track_handle,
                     meta: track_meta,
@@ -143,8 +146,7 @@ impl RoomActor {
             room_id,
             state: RoomState::default(),
             participant_tasks: FuturesUnordered::new(),
-            track_tasks: JoinSet::new(),
-            participant_factory: Box::new(()),
+            track_tasks: FuturesUnordered::new(),
         }
     }
 
@@ -162,9 +164,9 @@ impl RoomActor {
         );
 
         // TODO: capacity
-        let participant_handle = self
-            .participant_factory
-            .prepare(participant_actor, actor::RunnerConfig::default());
+        let (participant_handle, participant_join) =
+            actor::spawn(participant_actor, actor::RunnerConfig::default());
+        self.participant_tasks.push(participant_join);
 
         // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         // self.source
@@ -230,7 +232,7 @@ mod test {
     use super::*;
     use crate::room::RoomActor;
     use crate::test_utils;
-    use pulsebeam_runtime::prelude::*;
+    use pulsebeam_runtime::{prelude::*, rt};
 
     #[test]
     fn name() {
@@ -238,25 +240,30 @@ mod test {
 
         sim.client("test", async {
             let system_ctx = test_utils::create_system_ctx().await;
-            let room =
+            let (room_handle, _) =
                 actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
             let (participant_id, participant_rtc) = test_utils::create_participant();
 
-            room.send_high(RoomMessage::AddParticipant(
-                participant_id.clone(),
-                participant_rtc,
-            ))
-            .await;
+            room_handle
+                .send_high(RoomMessage::AddParticipant(
+                    participant_id.clone(),
+                    participant_rtc,
+                ))
+                .await
+                .unwrap();
 
             let track = TrackMeta {
                 id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
                 kind: str0m::media::MediaKind::Video,
                 simulcast: None,
             };
-            room.send_high(RoomMessage::PublishTrack(Arc::new(track)))
-                .await;
+            room_handle
+                .send_high(RoomMessage::PublishTrack(Arc::new(track)))
+                .await
+                .unwrap();
 
-            let state = room.get_state().await.unwrap();
+            rt::yield_now().await;
+            let state = room_handle.get_state().await.unwrap();
             assert_eq!(state.participants.len(), 1);
             assert_eq!(
                 state

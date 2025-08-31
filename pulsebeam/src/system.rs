@@ -19,13 +19,12 @@ impl SystemContext {
         let sink_actor = sink::SinkActor::new(socket.clone());
 
         // TODO: tune capacity
-        let (source_handle, source_runner) =
-            actor::ActorHandle::new(source_actor, actor::RunnerConfig::default());
-        let (sink_handle, sink_runner) =
-            actor::ActorHandle::new(sink_actor, actor::RunnerConfig::default());
+        let (source_handle, source_join) =
+            actor::spawn(source_actor, actor::RunnerConfig::default());
+        let (sink_handle, sink_join) = actor::spawn(sink_actor, actor::RunnerConfig::default());
 
         let task = tokio::spawn(async {
-            tokio::join!(source_runner.run(), sink_runner.run());
+            tokio::join!(source_join, sink_join);
         });
         let ctx = SystemContext {
             rng,

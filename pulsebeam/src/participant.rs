@@ -35,6 +35,7 @@ pub enum ParticipantError {
     InvalidRPCFormat(#[from] DecodeError),
 }
 
+#[derive(Debug)]
 pub enum ParticipantControlMessage {
     TracksPublished(Arc<Vec<TrackHandle>>),
     TracksUnpublished(Arc<Vec<Arc<TrackId>>>),

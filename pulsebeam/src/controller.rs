@@ -28,6 +28,7 @@ pub enum ControllerError {
     Unknown(String),
 }
 
+#[derive(Debug)]
 pub enum ControllerMessage {
     Allocate(
         RoomId,
@@ -44,7 +45,7 @@ pub struct ControllerActor {
     local_addrs: Vec<SocketAddr>,
 
     rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
-    room_tasks: FuturesUnordered<(Arc<RoomId>, actor::ActorStatus)>,
+    room_tasks: FuturesUnordered<actor::JoinHandle<room::RoomActor>>,
 }
 
 impl actor::Actor for ControllerActor {
@@ -67,7 +68,7 @@ impl actor::Actor for ControllerActor {
                     self.on_high_priority(ctx, msg).await;
                 }
 
-                Some(Ok((room_id, _))) = self.room_tasks.next() => {
+                Some((room_id, _)) = self.room_tasks.next() => {
                     self.rooms.remove(&room_id);
                 }
 
