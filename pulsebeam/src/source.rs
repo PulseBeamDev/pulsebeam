@@ -21,29 +21,26 @@ pub struct SourceActor {
 }
 
 impl actor::Actor for SourceActor {
-    type HighPriorityMessage = SourceControlMessage;
-    type LowPriorityMessage = ();
-    type ID = usize;
+    type HighPriorityMsg = SourceControlMessage;
+    type LowPriorityMsg = ();
+    type ActorId = usize;
 
-    fn id(&self) -> Self::ID {
+    fn id(&self) -> Self::ActorId {
         0
     }
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn process(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+    ) -> Result<(), actor::ActorError> {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
 
         loop {
             tokio::select! {
                 biased;
-                msg = ctx.hi_rx.recv() => {
-                    match msg {
-                        Some(msg) => self.handle_control(msg),
-                        None => {
-                            tracing::info!("all controllers have exited, will gracefully shutdown");
-                            break;
-                        }
-                    }
+                Some(msg) = ctx.hi_rx.recv() => {
+                    self.on_high_priority(ctx, msg).await;
                 }
                 res = self.socket.recv_from(&mut buf) => {
                     match res {
@@ -59,6 +56,28 @@ impl actor::Actor for SourceActor {
 
         tracing::info!("ingress has exited");
         Ok(())
+    }
+
+    async fn on_high_priority(
+        &mut self,
+        _ctx: &mut actor::ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> () {
+        match msg {
+            SourceControlMessage::AddParticipant(ufrag, participant) => {
+                tracing::trace!("added {ufrag} to connection map");
+                self.conns.insert(ufrag, participant);
+            }
+            SourceControlMessage::RemoveParticipant(ufrag) => {
+                tracing::trace!("removed {ufrag} to connection map");
+                self.conns.remove(&ufrag);
+                if let Some(addrs) = self.reverse.remove(&ufrag) {
+                    for addr in addrs.iter() {
+                        self.mapping.remove(addr);
+                    }
+                }
+            }
+        };
     }
 }
 
@@ -94,29 +113,11 @@ impl SourceActor {
         let _ =
             participant_handle
                 .handle
-                .lo_try_send(participant::ParticipantDataMessage::UdpPacket(UDPPacket {
+                .try_send_low(participant::ParticipantDataMessage::UdpPacket(UDPPacket {
                     raw: Bytes::copy_from_slice(packet),
                     src: source,
                     dst: self.local_addr,
                 }));
-    }
-
-    pub fn handle_control(&mut self, msg: SourceControlMessage) {
-        match msg {
-            SourceControlMessage::AddParticipant(ufrag, participant) => {
-                tracing::trace!("added {ufrag} to connection map");
-                self.conns.insert(ufrag, participant);
-            }
-            SourceControlMessage::RemoveParticipant(ufrag) => {
-                tracing::trace!("removed {ufrag} to connection map");
-                self.conns.remove(&ufrag);
-                if let Some(addrs) = self.reverse.remove(&ufrag) {
-                    for addr in addrs.iter() {
-                        self.mapping.remove(addr);
-                    }
-                }
-            }
-        };
     }
 }
 

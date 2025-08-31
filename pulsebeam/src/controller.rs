@@ -47,24 +47,23 @@ pub struct ControllerActor {
 }
 
 impl actor::Actor for ControllerActor {
-    type HighPriorityMessage = ControllerMessage;
-    type LowPriorityMessage = ();
-    type ID = Arc<String>;
+    type HighPriorityMsg = ControllerMessage;
+    type LowPriorityMsg = ();
+    type ActorId = Arc<String>;
 
-    fn id(&self) -> Self::ID {
+    fn id(&self) -> Self::ActorId {
         self.id.clone()
     }
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn process(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+    ) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => {
-                    match msg {
-                        ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
-                            let _ = resp.send(self.allocate(ctx, room_id, participant_id, offer).await);
-                        }
-                    }
+                    self.on_high_priority(ctx, msg).await;
                 }
 
                 Some(Ok((room_id, _))) = self.room_tasks.join_next() => {
@@ -75,6 +74,18 @@ impl actor::Actor for ControllerActor {
             }
         }
         Ok(())
+    }
+
+    async fn on_high_priority(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> () {
+        match msg {
+            ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
+                let _ = resp.send(self.allocate(ctx, room_id, participant_id, offer).await);
+            }
+        }
     }
 }
 
@@ -115,7 +126,7 @@ impl ControllerActor {
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .hi_send(room::RoomMessage::AddParticipant(
+            .send_high(room::RoomMessage::AddParticipant(
                 Arc::new(participant_id),
                 Box::new(rtc),
             ))

@@ -42,22 +42,22 @@ pub struct RoomActor {
 }
 
 impl actor::Actor for RoomActor {
-    type ID = Arc<RoomId>;
-    type HighPriorityMessage = RoomMessage;
-    type LowPriorityMessage = ();
+    type ActorId = Arc<RoomId>;
+    type HighPriorityMsg = RoomMessage;
+    type LowPriorityMsg = ();
 
-    fn id(&self) -> Self::ID {
+    fn id(&self) -> Self::ActorId {
         self.room_id.clone()
     }
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn process(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+    ) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
-                res = ctx.hi_rx.recv() => {
-                    match res {
-                        Some(msg) => self.handle_message(ctx, msg).await,
-                        None => break,
-                    }
+                Some(msg) = ctx.hi_rx.recv() => {
+                    self.on_high_priority(ctx, msg).await;
                 }
 
                 Some(Ok((participant_id, _))) = self.participant_tasks.join_next() => {
@@ -74,21 +74,12 @@ impl actor::Actor for RoomActor {
 
         Ok(())
     }
-}
 
-impl RoomActor {
-    pub fn new(system_ctx: system::SystemContext, room_id: Arc<RoomId>) -> Self {
-        Self {
-            system_ctx,
-            room_id,
-            participants: HashMap::new(),
-            participant_tasks: JoinSet::new(),
-            track_tasks: JoinSet::new(),
-            participant_factory: Box::new(()),
-        }
-    }
-
-    async fn handle_message(&mut self, ctx: &mut actor::ActorContext<Self>, msg: RoomMessage) {
+    async fn on_high_priority(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> () {
         match msg {
             RoomMessage::AddParticipant(participant_id, rtc) => {
                 self.handle_participant_joined(ctx, participant_id, rtc)
@@ -127,13 +118,26 @@ impl RoomActor {
                     let _ = participant
                         .handle
                         .handle
-                        .hi_send(participant::ParticipantControlMessage::TracksPublished(
+                        .send_high(participant::ParticipantControlMessage::TracksPublished(
                             new_tracks.clone(),
                         ))
                         .await;
                 }
             }
         };
+    }
+}
+
+impl RoomActor {
+    pub fn new(system_ctx: system::SystemContext, room_id: Arc<RoomId>) -> Self {
+        Self {
+            system_ctx,
+            room_id,
+            participants: HashMap::new(),
+            participant_tasks: JoinSet::new(),
+            track_tasks: JoinSet::new(),
+            participant_factory: Box::new(()),
+        }
     }
 
     async fn handle_participant_joined(
@@ -203,7 +207,7 @@ impl RoomActor {
             let _ = p
                 .handle
                 .handle
-                .hi_send(participant::ParticipantControlMessage::TracksUnpublished(
+                .send_high(participant::ParticipantControlMessage::TracksUnpublished(
                     tracks.clone(),
                 ))
                 .await;

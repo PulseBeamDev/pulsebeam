@@ -114,15 +114,18 @@ pub struct ParticipantActor {
 }
 
 impl actor::Actor for ParticipantActor {
-    type HighPriorityMessage = ParticipantControlMessage;
-    type LowPriorityMessage = ParticipantDataMessage;
-    type ID = Arc<ParticipantId>;
+    type HighPriorityMsg = ParticipantControlMessage;
+    type LowPriorityMsg = ParticipantDataMessage;
+    type ActorId = Arc<ParticipantId>;
 
-    fn id(&self) -> Self::ID {
+    fn id(&self) -> Self::ActorId {
         self.participant_id.clone()
     }
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn process(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+    ) -> Result<(), actor::ActorError> {
         // TODO: notify ingress to add self to the routing table
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
@@ -139,13 +142,13 @@ impl actor::Actor for ParticipantActor {
                 biased;
                 msg = ctx.hi_rx.recv() => {
                     match msg {
-                        Some(msg) => self.handle_control_message(ctx, msg).await,
+                        Some(msg) => self.on_high_priority(ctx, msg).await,
                         None => break,
                     }
                 }
 
                 Some(msg) = ctx.lo_rx.recv() => {
-                    self.handle_data_message(msg).await;
+                    self.on_low_priority(ctx, msg).await;
                 }
 
                 _ = tokio::time::sleep(delay) => {
@@ -159,49 +162,12 @@ impl actor::Actor for ParticipantActor {
 
         Ok(())
     }
-}
 
-impl ParticipantActor {
-    async fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
-        match msg {
-            ParticipantDataMessage::UdpPacket(packet) => {
-                let now = Instant::now();
-                let res = self.rtc.handle_input(Input::Receive(
-                    now.into_std(),
-                    net::Receive {
-                        proto: net::Protocol::Udp,
-                        source: packet.src,
-                        destination: packet.dst,
-                        contents: (&*packet.raw).try_into().unwrap(),
-                    },
-                ));
-
-                if let Err(err) = res {
-                    tracing::warn!("dropped a UDP packet: {err}");
-                }
-            }
-            ParticipantDataMessage::ForwardMedia(track, data) => {
-                self.handle_forward_media(track, data);
-            }
-
-            ParticipantDataMessage::KeyframeRequest(track_id, req) => {
-                let Some(mut writer) = self.rtc.writer(track_id.origin_mid) else {
-                    tracing::warn!(mid=?track_id.origin_mid, "mid is not found for regenerating a keyframe");
-                    return;
-                };
-
-                if let Err(err) = writer.request_keyframe(req.rid, req.kind) {
-                    tracing::warn!("failed to request a keyframe from the publisher: {err}");
-                }
-            }
-        }
-    }
-
-    async fn handle_control_message(
+    async fn on_high_priority(
         &mut self,
         ctx: &mut actor::ActorContext<Self>,
-        msg: ParticipantControlMessage,
-    ) {
+        msg: Self::HighPriorityMsg,
+    ) -> () {
         use sfu::server_message::Payload;
 
         self.should_resync = true;
@@ -275,6 +241,47 @@ impl ParticipantActor {
         }
     }
 
+    async fn on_low_priority(
+        &mut self,
+        _ctx: &mut actor::ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) -> () {
+        match msg {
+            ParticipantDataMessage::UdpPacket(packet) => {
+                let now = Instant::now();
+                let res = self.rtc.handle_input(Input::Receive(
+                    now.into_std(),
+                    net::Receive {
+                        proto: net::Protocol::Udp,
+                        source: packet.src,
+                        destination: packet.dst,
+                        contents: (&*packet.raw).try_into().unwrap(),
+                    },
+                ));
+
+                if let Err(err) = res {
+                    tracing::warn!("dropped a UDP packet: {err}");
+                }
+            }
+            ParticipantDataMessage::ForwardMedia(track, data) => {
+                self.handle_forward_media(track, data);
+            }
+
+            ParticipantDataMessage::KeyframeRequest(track_id, req) => {
+                let Some(mut writer) = self.rtc.writer(track_id.origin_mid) else {
+                    tracing::warn!(mid=?track_id.origin_mid, "mid is not found for regenerating a keyframe");
+                    return;
+                };
+
+                if let Err(err) = writer.request_keyframe(req.rid, req.kind) {
+                    tracing::warn!("failed to request a keyframe from the publisher: {err}");
+                }
+            }
+        }
+    }
+}
+
+impl ParticipantActor {
     async fn init_subscriptions(&mut self, ctx: &mut actor::ActorContext<Self>) {
         // auto subscribe
         let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
@@ -289,7 +296,7 @@ impl ParticipantActor {
                 .1
                 .track
                 .handle
-                .hi_send(track::TrackControlMessage::Subscribe(ParticipantHandle {
+                .send_high(track::TrackControlMessage::Subscribe(ParticipantHandle {
                     participant_id: self.participant_id.clone(),
                     handle: ctx.handle.clone(),
                 }))
@@ -396,7 +403,7 @@ impl ParticipantActor {
         let _ = self
             .system_ctx
             .sink_handle
-            .lo_send(sink::SinkMessage::Packet(EgressUDPPacket {
+            .send_low(sink::SinkMessage::Packet(EgressUDPPacket {
                 raw: packet,
                 dst: t.destination,
             }))
@@ -439,12 +446,12 @@ impl ParticipantActor {
                 if let Some(track) = self.published_video_tracks.get(&e.mid) {
                     let _ = track
                         .handle
-                        .lo_send(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
+                        .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
                 } else if let Some(track) = self.published_audio_tracks.get(&e.mid) {
                     let _ = track
                         .handle
-                        .lo_send(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
+                        .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
                 }
             }
@@ -472,7 +479,7 @@ impl ParticipantActor {
         track
             .track
             .handle
-            .lo_try_send(track::TrackDataMessage::KeyframeRequest(req.into()));
+            .try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
     async fn handle_new_media(&mut self, ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
@@ -495,7 +502,7 @@ impl ParticipantActor {
 
                 if let Err(err) = self
                     .room_handle
-                    .hi_send(room::RoomMessage::PublishTrack(
+                    .send_high(room::RoomMessage::PublishTrack(
                         ParticipantHandle {
                             participant_id: self.participant_id.clone(),
                             handle: ctx.handle.clone(),

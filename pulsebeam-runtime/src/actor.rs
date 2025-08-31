@@ -44,42 +44,108 @@ impl Display for ActorStatus {
 }
 
 pub struct ActorContext<A: Actor> {
-    pub hi_rx: mailbox::Receiver<A::HighPriorityMessage>,
-    pub lo_rx: mailbox::Receiver<A::LowPriorityMessage>,
+    pub hi_rx: mailbox::Receiver<A::HighPriorityMsg>,
+    pub lo_rx: mailbox::Receiver<A::LowPriorityMsg>,
     pub handle: LocalActorHandle<A>,
 }
 
 pub trait Actor: Sized {
-    type HighPriorityMessage: Send;
-    type LowPriorityMessage: Send;
-    type ID: Eq + Hash + Debug + Clone + Send;
+    /// The type of high-priority messages this actor processes.
+    type HighPriorityMsg: Send + 'static;
+    /// The type of low-priority messages this actor processes.
+    type LowPriorityMsg: Send + 'static;
+    /// The unique identifier for this actor.
+    type ActorId: Eq + Hash + Debug + Clone + Send;
 
-    fn id(&self) -> Self::ID;
+    /// Returns the actor's unique identifier.
+    fn id(&self) -> Self::ActorId;
 
-    fn run(&mut self, ctx: &mut ActorContext<Self>)
-    -> impl Future<Output = Result<(), ActorError>>;
+    /// Runs the actor's main message-processing loop.
+    ///
+    /// The default implementation processes high-priority messages before low-priority ones
+    /// using `tokio::select!` with biased polling. Implementors may override this method
+    /// for custom behavior.
+    fn process(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = Result<(), ActorError>> {
+        async {
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(msg) = ctx.hi_rx.recv() => {
+                        self.on_high_priority(ctx, msg).await;
+                    }
+
+                    Some(msg) = ctx.lo_rx.recv() => {
+                        self.on_low_priority(ctx, msg).await;
+                    }
+
+                    else => break,
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Handles a high-priority message.
+    #[allow(unused_variables)]
+    fn on_high_priority(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> impl Future<Output = ()> {
+        async {
+            todo!("unimplemented!");
+        }
+    }
+
+    /// Handles a low-priority message.
+    #[allow(unused_variables)]
+    fn on_low_priority(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) -> impl Future<Output = ()> {
+        async {
+            todo!("unimplemented!");
+        }
+    }
 }
 
+/// A handle for sending high- and low-priority messages to an actor.
 pub trait ActorHandle<A: Actor>: Clone {
-    fn lo_send(
+    /// Sends a high-priority message asynchronously.
+    ///
+    /// Returns an error if the actor's mailbox is closed.
+    fn send_high(
         &self,
-        message: A::LowPriorityMessage,
-    ) -> impl Future<Output = Result<(), mailbox::SendError<A::LowPriorityMessage>>>;
+        message: A::HighPriorityMsg,
+    ) -> impl Future<Output = Result<(), mailbox::SendError<A::HighPriorityMsg>>>;
 
-    fn lo_try_send(
+    /// Attempts to send a high-priority message synchronously.
+    ///
+    /// Returns an error if the mailbox is full or closed.
+    fn try_send_high(
         &self,
-        message: A::LowPriorityMessage,
-    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMessage>>;
+        message: A::HighPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMsg>>;
 
-    fn hi_send(
+    /// Sends a low-priority message asynchronously.
+    ///
+    /// Returns an error if the actor's mailbox is closed.
+    fn send_low(
         &self,
-        message: A::HighPriorityMessage,
-    ) -> impl Future<Output = Result<(), mailbox::SendError<A::HighPriorityMessage>>>;
+        message: A::LowPriorityMsg,
+    ) -> impl Future<Output = Result<(), mailbox::SendError<A::LowPriorityMsg>>>;
 
-    fn hi_try_send(
+    /// Attempts to send a low-priority message synchronously.
+    ///
+    /// Returns an error if the mailbox is full or closed.
+    fn try_send_low(
         &self,
-        message: A::HighPriorityMessage,
-    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>>;
+        message: A::LowPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>>;
 }
 
 pub trait ActorFactory<A: Actor>: Send + Sync + 'static {
@@ -104,8 +170,8 @@ impl<A: Actor> ActorFactory<A> for () {
 }
 
 pub struct LocalActorHandle<A: Actor> {
-    hi_tx: mailbox::Sender<A::HighPriorityMessage>,
-    lo_tx: mailbox::Sender<A::LowPriorityMessage>,
+    hi_tx: mailbox::Sender<A::HighPriorityMsg>,
+    lo_tx: mailbox::Sender<A::LowPriorityMsg>,
 }
 
 impl<A: Actor> LocalActorHandle<A> {
@@ -138,34 +204,34 @@ impl<A: Actor> Clone for LocalActorHandle<A> {
 
 impl<A: Actor> ActorHandle<A> for LocalActorHandle<A> {
     #[inline]
-    async fn lo_send(
+    async fn send_low(
         &self,
-        message: A::LowPriorityMessage,
-    ) -> Result<(), mailbox::SendError<A::LowPriorityMessage>> {
+        message: A::LowPriorityMsg,
+    ) -> Result<(), mailbox::SendError<A::LowPriorityMsg>> {
         self.lo_tx.send(message).await
     }
 
     #[inline]
-    fn lo_try_send(
+    fn try_send_low(
         &self,
-        message: A::LowPriorityMessage,
-    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMessage>> {
+        message: A::LowPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>> {
         self.lo_tx.try_send(message)
     }
 
     #[inline]
-    async fn hi_send(
+    async fn send_high(
         &self,
-        message: A::HighPriorityMessage,
-    ) -> Result<(), mailbox::SendError<A::HighPriorityMessage>> {
+        message: A::HighPriorityMsg,
+    ) -> Result<(), mailbox::SendError<A::HighPriorityMsg>> {
         self.hi_tx.send(message).await
     }
 
     #[inline]
-    fn hi_try_send(
+    fn try_send_high(
         &self,
-        message: A::HighPriorityMessage,
-    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMessage>> {
+        message: A::HighPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMsg>> {
         self.hi_tx.try_send(message)
     }
 }
@@ -206,7 +272,7 @@ pub struct Runner<A: Actor> {
 }
 
 impl<A: Actor> Runner<A> {
-    pub async fn run(self) -> (A::ID, ActorStatus) {
+    pub async fn run(self) -> (A::ActorId, ActorStatus) {
         let actor_id = self.actor.id();
 
         let fut = async move {
@@ -220,7 +286,7 @@ impl<A: Actor> Runner<A> {
     async fn run_instrumented(mut self) -> ActorStatus {
         tracing::debug!("Starting actor...");
 
-        let run_result = AssertUnwindSafe(self.actor.run(&mut self.ctx))
+        let run_result = AssertUnwindSafe(self.actor.process(&mut self.ctx))
             .catch_unwind()
             .await;
 

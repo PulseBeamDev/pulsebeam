@@ -40,30 +40,61 @@ pub struct TrackActor {
 }
 
 impl actor::Actor for TrackActor {
-    type HighPriorityMessage = TrackControlMessage;
-    type LowPriorityMessage = TrackDataMessage;
-    type ID = Arc<TrackId>;
+    type HighPriorityMsg = TrackControlMessage;
+    type LowPriorityMsg = TrackDataMessage;
+    type ActorId = Arc<TrackId>;
 
-    fn id(&self) -> Self::ID {
+    fn id(&self) -> Self::ActorId {
         self.meta.id.clone()
     }
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        loop {
-            tokio::select! {
-                biased;
-                Some(msg) = ctx.hi_rx.recv() => {
-                    self.handle_control_message(msg);
-                }
-
-                Some(msg) = ctx.lo_rx.recv() => {
-                    self.handle_data_message(msg);
-                }
-
-                else => break,
+    async fn on_high_priority(
+        &mut self,
+        _ctx: &mut actor::ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> () {
+        match msg {
+            TrackControlMessage::Subscribe(participant) => {
+                tracing::info!(participant_id=?participant.participant_id, "track subscribed");
+                self.subscribers
+                    .insert(participant.participant_id.clone(), participant);
+            }
+            TrackControlMessage::Unsubscribe(participant_id) => {
+                // TODO: handle unsubscribe
             }
         }
-        Ok(())
+    }
+
+    async fn on_low_priority(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) -> () {
+        match msg {
+            TrackDataMessage::ForwardMedia(data) => {
+                for (_, sub) in &self.subscribers {
+                    let _ =
+                        sub.handle
+                            .try_send_low(participant::ParticipantDataMessage::ForwardMedia(
+                                self.meta.clone(),
+                                data.clone(),
+                            ));
+                }
+            }
+            TrackDataMessage::KeyframeRequest(req) => {
+                let now = Instant::now();
+                let elapsed = now.duration_since(self.last_keyframe_request);
+                if elapsed >= KEYFRAME_REQUEST_THROTTLE {
+                    self.origin.handle.try_send_low(
+                        participant::ParticipantDataMessage::KeyframeRequest(
+                            self.meta.id.clone(),
+                            req,
+                        ),
+                    );
+                    self.last_keyframe_request = now;
+                }
+            }
+        }
     }
 }
 
@@ -75,48 +106,6 @@ impl TrackActor {
             subscribers: BTreeMap::new(),
             // allow keyframe request immediately
             last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
-        }
-    }
-
-    #[inline]
-    fn handle_data_message(&mut self, msg: TrackDataMessage) {
-        match msg {
-            TrackDataMessage::ForwardMedia(data) => {
-                for (_, sub) in &self.subscribers {
-                    let _ =
-                        sub.handle
-                            .lo_try_send(participant::ParticipantDataMessage::ForwardMedia(
-                                self.meta.clone(),
-                                data.clone(),
-                            ));
-                }
-            }
-            TrackDataMessage::KeyframeRequest(req) => {
-                let now = Instant::now();
-                let elapsed = now.duration_since(self.last_keyframe_request);
-                if elapsed >= KEYFRAME_REQUEST_THROTTLE {
-                    self.origin.handle.lo_try_send(
-                        participant::ParticipantDataMessage::KeyframeRequest(
-                            self.meta.id.clone(),
-                            req,
-                        ),
-                    );
-                    self.last_keyframe_request = now;
-                }
-            }
-        }
-    }
-
-    fn handle_control_message(&mut self, msg: TrackControlMessage) {
-        match msg {
-            TrackControlMessage::Subscribe(participant) => {
-                tracing::info!(participant_id=?participant.participant_id, "track subscribed");
-                self.subscribers
-                    .insert(participant.participant_id.clone(), participant);
-            }
-            TrackControlMessage::Unsubscribe(participant_id) => {
-                // TODO: handle unsubscribe
-            }
         }
     }
 }

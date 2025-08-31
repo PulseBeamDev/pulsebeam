@@ -75,7 +75,7 @@ async fn spawn_participant(
     // TODO: better unique ID to handle session.
     let location_url = format!("/rooms/{}/participants/{}", &room_id, &participant_id,);
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    con.hi_send(controller::ControllerMessage::Allocate(
+    con.send_high(controller::ControllerMessage::Allocate(
         room_id,
         participant_id,
         raw_offer,
