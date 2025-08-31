@@ -485,11 +485,7 @@ impl ParticipantActor {
             Direction::RecvOnly => {
                 tracing::info!(?media, "handle_new_media from client");
                 // TODO: handle back pressure by buffering temporarily
-                let track_id = TrackId::new(
-                    &mut self.system_ctx.rng,
-                    self.participant_id.clone(),
-                    media.mid,
-                );
+                let track_id = TrackId::new(self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
                 let track = TrackMeta {
                     id: track_id.clone(),
@@ -499,13 +495,7 @@ impl ParticipantActor {
 
                 if let Err(err) = self
                     .room_handle
-                    .send_high(room::RoomMessage::PublishTrack(
-                        ParticipantHandle {
-                            participant_id: self.participant_id.clone(),
-                            handle: ctx.handle.clone(),
-                        },
-                        Arc::new(track),
-                    ))
+                    .send_high(room::RoomMessage::PublishTrack(Arc::new(track)))
                     .await
                 {
                     // this participant should get cleaned up by the supervisor

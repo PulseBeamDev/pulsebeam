@@ -15,7 +15,7 @@ use pulsebeam_runtime::actor::{self, LocalActorHandle};
 use pulsebeam_runtime::prelude::*;
 
 pub enum RoomMessage {
-    PublishTrack(ParticipantHandle, Arc<TrackMeta>),
+    PublishTrack(Arc<TrackMeta>),
     AddParticipant(Arc<ParticipantId>, Box<Rtc>),
 }
 
@@ -82,7 +82,7 @@ impl actor::Actor for RoomActor {
                 self.handle_participant_joined(ctx, participant_id, rtc)
                     .await
             }
-            RoomMessage::PublishTrack(participant_handle, track_meta) => {
+            RoomMessage::PublishTrack(track_meta) => {
                 let Some(origin) = self.participants.get_mut(&track_meta.id.origin_participant)
                 else {
                     tracing::warn!(
@@ -92,8 +92,7 @@ impl actor::Actor for RoomActor {
                     return;
                 };
 
-                let track_actor =
-                    track::TrackActor::new(participant_handle.clone(), track_meta.clone());
+                let track_actor = track::TrackActor::new(origin.handle.clone(), track_meta.clone());
                 let track_id = track_meta.id.clone();
                 tracing::info!(
                     "{} published a track, added: {}",
@@ -199,7 +198,7 @@ impl RoomActor {
             .map(|t| t.meta.id.clone())
             .collect();
         let tracks = Arc::new(tracks);
-        for (_, p) in &self.participants {
+        for p in self.participants.values() {
             let _ = p
                 .handle
                 .handle
@@ -215,40 +214,50 @@ pub type RoomHandle = actor::LocalActorHandle<RoomActor>;
 
 #[cfg(test)]
 mod test {
-    use std::net::Ipv4Addr;
+    use str0m::media::Mid;
 
     use super::*;
     use crate::room::RoomActor;
-    use crate::system;
     use crate::test_utils;
-    use pulsebeam_runtime::actor;
-    use pulsebeam_runtime::net;
 
     #[test]
     fn name() {
         let mut sim = test_utils::create_sim();
 
         sim.client("test", async {
-            let external_addr = "192.168.1.1:3478".parse().unwrap();
-            let socket =
-                net::UnifiedSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), net::Transport::SimUdp)
-                    .await
-                    .unwrap();
-            let (system_ctx, _) = system::SystemContext::spawn(external_addr, socket);
-
-            let room_actor = RoomActor::new(system_ctx, test_utils::create_room("roomA"));
-            let (_, mut room_runner) = actor::LocalActorHandle::new_default(room_actor);
+            let system_ctx = test_utils::create_system_ctx().await;
+            let mut room = test_utils::create_runner(RoomActor::new(
+                system_ctx,
+                test_utils::create_room("roomA"),
+            ));
             let (participant_id, participant_rtc) = test_utils::create_participant();
 
-            room_runner
-                .actor
+            room.actor
                 .on_high_priority(
-                    &mut room_runner.ctx,
-                    RoomMessage::AddParticipant(participant_id, participant_rtc),
+                    &mut room.ctx,
+                    RoomMessage::AddParticipant(participant_id.clone(), participant_rtc),
                 )
                 .await;
 
-            assert_eq!(room_runner.actor.participants.len(), 1);
+            let track = TrackMeta {
+                id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
+                kind: str0m::media::MediaKind::Video,
+                simulcast: None,
+            };
+            room.actor
+                .on_high_priority(&mut room.ctx, RoomMessage::PublishTrack(Arc::new(track)))
+                .await;
+
+            assert_eq!(room.actor.participants.len(), 1);
+            assert_eq!(
+                room.actor
+                    .participants
+                    .get(&participant_id)
+                    .unwrap()
+                    .tracks
+                    .len(),
+                1
+            );
             Ok(())
         });
 

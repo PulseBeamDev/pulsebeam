@@ -312,7 +312,7 @@ pub struct TrackId {
 }
 
 impl TrackId {
-    pub fn new(rng: &mut rand::Rng, participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
+    pub fn new(participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
         let internal = new_entity_id(prefix::TRACK_ID);
         Self {
             internal: Arc::new(internal),
