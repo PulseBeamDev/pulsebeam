@@ -50,10 +50,13 @@ impl actor::Actor for ControllerActor {
     type HighPriorityMsg = ControllerMessage;
     type LowPriorityMsg = ();
     type ActorId = Arc<String>;
+    type ObservableState = ();
 
     fn id(&self) -> Self::ActorId {
         self.id.clone()
     }
+
+    fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
@@ -141,7 +144,7 @@ impl ControllerActor {
             tracing::info!("create_room: {}", room_id);
             let room_actor = room::RoomActor::new(self.system_ctx.clone(), room_id.clone());
             let (room_handle, room_runner) =
-                actor::LocalActorHandle::new(room_actor, actor::RunnerConfig::default());
+                actor::ActorHandle::new(room_actor, actor::RunnerConfig::default());
             self.room_tasks.spawn(room_runner.run());
 
             self.rooms.insert(room_id.clone(), room_handle.clone());
@@ -167,4 +170,4 @@ impl ControllerActor {
     }
 }
 
-pub type ControllerHandle = actor::LocalActorHandle<ControllerActor>;
+pub type ControllerHandle = actor::ActorHandle<ControllerActor>;

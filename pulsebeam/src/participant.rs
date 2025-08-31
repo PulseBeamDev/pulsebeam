@@ -117,10 +117,13 @@ impl actor::Actor for ParticipantActor {
     type HighPriorityMsg = ParticipantControlMessage;
     type LowPriorityMsg = ParticipantDataMessage;
     type ActorId = Arc<ParticipantId>;
+    type ObservableState = ();
 
     fn id(&self) -> Self::ActorId {
         self.participant_id.clone()
     }
+
+    fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // TODO: notify ingress to add self to the routing table
@@ -590,11 +593,11 @@ impl ParticipantActor {
 
 #[derive(Clone)]
 pub struct ParticipantHandle {
-    pub handle: actor::LocalActorHandle<ParticipantActor>,
+    pub handle: actor::ActorHandle<ParticipantActor>,
     pub participant_id: Arc<ParticipantId>,
 }
 
-impl std::fmt::Display for ParticipantHandle {
+impl std::fmt::Debug for ParticipantHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.participant_id.fmt(f)
     }

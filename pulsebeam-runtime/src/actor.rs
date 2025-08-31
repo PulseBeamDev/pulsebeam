@@ -14,6 +14,8 @@ pub enum ActorError {
     LogicError(String),
     #[error("Custom actor error: {0}")]
     Custom(String),
+    #[error("Failed to receive state from actor, it may have shut down")]
+    StateReceiverError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,10 +45,16 @@ impl Display for ActorStatus {
     }
 }
 
+#[derive(Debug)]
+pub enum SystemMsg<S> {
+    GetState(tokio::sync::oneshot::Sender<S>),
+}
+
 pub struct ActorContext<A: Actor> {
+    pub sys_rx: mailbox::Receiver<SystemMsg<A::ObservableState>>,
     pub hi_rx: mailbox::Receiver<A::HighPriorityMsg>,
     pub lo_rx: mailbox::Receiver<A::LowPriorityMsg>,
-    pub handle: LocalActorHandle<A>,
+    pub handle: ActorHandle<A>,
 }
 
 pub trait Actor: Sized {
@@ -57,8 +65,15 @@ pub trait Actor: Sized {
     /// The unique identifier for this actor.
     type ActorId: Eq + Hash + Debug + Clone + Send;
 
+    /// ObservableState is a state snapshot of an actor. This is mainly used
+    /// for testing.
+    type ObservableState: std::fmt::Debug + Send + Sync + Clone;
+
     /// Returns the actor's unique identifier.
     fn id(&self) -> Self::ActorId;
+
+    // Each actor implementor is responsible for defining what state is observable.
+    fn get_observable_state(&self) -> Self::ObservableState;
 
     /// Runs the actor's main message-processing loop.
     ///
@@ -73,6 +88,11 @@ pub trait Actor: Sized {
             loop {
                 tokio::select! {
                     biased;
+
+                    Some(msg) = ctx.sys_rx.recv() => {
+                        self.on_system(ctx, msg).await;
+                    }
+
                     Some(msg) = ctx.hi_rx.recv() => {
                         self.on_high_priority(ctx, msg).await;
                     }
@@ -85,6 +105,24 @@ pub trait Actor: Sized {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// Handles a syste message
+    #[allow(unused_variables)]
+    fn on_system(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        msg: SystemMsg<Self::ObservableState>,
+    ) -> impl Future<Output = ()> {
+        async {
+            match msg {
+                SystemMsg::GetState(responder) => {
+                    // The actor provides its state, and we send it back.
+                    // We ignore the result of the send; if the requester is gone, that's okay.
+                    let _ = responder.send(self.get_observable_state());
+                }
+            }
         }
     }
 
@@ -113,75 +151,48 @@ pub trait Actor: Sized {
     }
 }
 
-/// A handle for sending high- and low-priority messages to an actor.
-pub trait ActorHandle<A: Actor>: Clone {
-    /// Sends a high-priority message asynchronously.
-    ///
-    /// Returns an error if the actor's mailbox is closed.
-    fn send_high(
-        &self,
-        message: A::HighPriorityMsg,
-    ) -> impl Future<Output = Result<(), mailbox::SendError<A::HighPriorityMsg>>>;
-
-    /// Attempts to send a high-priority message synchronously.
-    ///
-    /// Returns an error if the mailbox is full or closed.
-    fn try_send_high(
-        &self,
-        message: A::HighPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMsg>>;
-
-    /// Sends a low-priority message asynchronously.
-    ///
-    /// Returns an error if the actor's mailbox is closed.
-    fn send_low(
-        &self,
-        message: A::LowPriorityMsg,
-    ) -> impl Future<Output = Result<(), mailbox::SendError<A::LowPriorityMsg>>>;
-
-    /// Attempts to send a low-priority message synchronously.
-    ///
-    /// Returns an error if the mailbox is full or closed.
-    fn try_send_low(
-        &self,
-        message: A::LowPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>>;
-}
-
 pub trait ActorFactory<A: Actor>: Send + Sync + 'static {
-    fn prepare(&self, actor: A, config: RunnerConfig) -> (LocalActorHandle<A>, Runner<A>);
+    fn prepare(&self, actor: A, config: RunnerConfig) -> (ActorHandle<A>, Runner<A>);
 }
 
 impl<A, F> ActorFactory<A> for F
 where
     A: Actor,
-    F: Fn(A, RunnerConfig) -> (LocalActorHandle<A>, Runner<A>) + Send + Sync + 'static,
+    F: Fn(A, RunnerConfig) -> (ActorHandle<A>, Runner<A>) + Send + Sync + 'static,
 {
-    fn prepare(&self, actor: A, config: RunnerConfig) -> (LocalActorHandle<A>, Runner<A>) {
+    fn prepare(&self, actor: A, config: RunnerConfig) -> (ActorHandle<A>, Runner<A>) {
         self(actor, config)
     }
 }
 
 // Default implementation using LocalActorHandle::new
 impl<A: Actor> ActorFactory<A> for () {
-    fn prepare(&self, actor: A, config: RunnerConfig) -> (LocalActorHandle<A>, Runner<A>) {
-        LocalActorHandle::new(actor, config)
+    fn prepare(&self, actor: A, config: RunnerConfig) -> (ActorHandle<A>, Runner<A>) {
+        ActorHandle::new(actor, config)
     }
 }
 
-pub struct LocalActorHandle<A: Actor> {
+/// A handle for sending high- and low-priority messages to an actor.
+pub struct ActorHandle<A: Actor> {
+    sys_tx: mailbox::Sender<SystemMsg<A::ObservableState>>,
     hi_tx: mailbox::Sender<A::HighPriorityMsg>,
     lo_tx: mailbox::Sender<A::LowPriorityMsg>,
 }
 
-impl<A: Actor> LocalActorHandle<A> {
+impl<A: Actor> ActorHandle<A> {
     pub fn new(actor: A, config: RunnerConfig) -> (Self, Runner<A>) {
         let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
         let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
+        let (sys_tx, sys_rx) = mailbox::new(1);
 
-        let handle = LocalActorHandle { hi_tx, lo_tx };
+        let handle = ActorHandle {
+            hi_tx,
+            lo_tx,
+            sys_tx,
+        };
 
         let ctx = ActorContext {
+            sys_rx,
             hi_rx,
             lo_rx,
             handle: handle.clone(),
@@ -195,48 +206,73 @@ impl<A: Actor> LocalActorHandle<A> {
     pub fn new_default(actor: A) -> (Self, Runner<A>) {
         Self::new(actor, RunnerConfig::default())
     }
-}
 
-impl<A: Actor> Clone for LocalActorHandle<A> {
-    fn clone(&self) -> Self {
-        Self {
-            hi_tx: self.hi_tx.clone(),
-            lo_tx: self.lo_tx.clone(),
-        }
-    }
-}
-
-impl<A: Actor> ActorHandle<A> for LocalActorHandle<A> {
+    /// Sends a high-priority message asynchronously.
+    ///
+    /// Returns an error if the actor's mailbox is closed.
     #[inline]
-    async fn send_low(
-        &self,
-        message: A::LowPriorityMsg,
-    ) -> Result<(), mailbox::SendError<A::LowPriorityMsg>> {
-        self.lo_tx.send(message).await
-    }
-
-    #[inline]
-    fn try_send_low(
-        &self,
-        message: A::LowPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>> {
-        self.lo_tx.try_send(message)
-    }
-
-    #[inline]
-    async fn send_high(
+    pub async fn send_high(
         &self,
         message: A::HighPriorityMsg,
     ) -> Result<(), mailbox::SendError<A::HighPriorityMsg>> {
         self.hi_tx.send(message).await
     }
 
+    /// Attempts to send a high-priority message synchronously.
+    ///
+    /// Returns an error if the mailbox is full or closed.
     #[inline]
-    fn try_send_high(
+    pub fn try_send_high(
         &self,
         message: A::HighPriorityMsg,
     ) -> Result<(), mailbox::TrySendError<A::HighPriorityMsg>> {
         self.hi_tx.try_send(message)
+    }
+
+    /// Sends a low-priority message asynchronously.
+    ///
+    /// Returns an error if the actor's mailbox is closed.
+    #[inline]
+    pub async fn send_low(
+        &self,
+        message: A::LowPriorityMsg,
+    ) -> Result<(), mailbox::SendError<A::LowPriorityMsg>> {
+        self.lo_tx.send(message).await
+    }
+
+    /// Attempts to send a low-priority message synchronously.
+    ///
+    /// Returns an error if the mailbox is full or closed.
+    #[inline]
+    pub fn try_send_low(
+        &self,
+        message: A::LowPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>> {
+        self.lo_tx.try_send(message)
+    }
+
+    pub async fn get_state(&self) -> Result<A::ObservableState, ActorError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg = SystemMsg::GetState(tx);
+
+        // Send the request. If it fails, the actor is gone.
+        self.sys_tx
+            .send(msg)
+            .await
+            .map_err(|_| ActorError::StateReceiverError)?;
+
+        // Await the response. If it fails, the actor might have panicked or been terminated.
+        rx.await.map_err(|_| ActorError::StateReceiverError)
+    }
+}
+
+impl<A: Actor> Clone for ActorHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            hi_tx: self.hi_tx.clone(),
+            lo_tx: self.lo_tx.clone(),
+            sys_tx: self.sys_tx.clone(),
+        }
     }
 }
 
@@ -325,5 +361,50 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
         s.clone()
     } else {
         format!("{:?}", payload)
+    }
+}
+
+pub struct ObserverActor<A: Actor> {
+    pub high_priority_msgs: Vec<A::HighPriorityMsg>,
+    pub low_priority_msgs: Vec<A::LowPriorityMsg>,
+    pub inner: A,
+}
+
+impl<A: Actor> ObserverActor<A> {
+    pub fn wrap(inner: A) -> ObserverActor<A> {
+        Self {
+            high_priority_msgs: Vec::new(),
+            low_priority_msgs: Vec::new(),
+            inner,
+        }
+    }
+}
+
+impl<A: Actor> Actor for ObserverActor<A> {
+    type HighPriorityMsg = A::HighPriorityMsg;
+    type LowPriorityMsg = A::LowPriorityMsg;
+    type ActorId = A::ActorId;
+    type ObservableState = ();
+
+    fn id(&self) -> Self::ActorId {
+        self.inner.id()
+    }
+
+    fn get_observable_state(&self) -> Self::ObservableState {}
+
+    async fn on_high_priority(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> () {
+        self.high_priority_msgs.push(msg);
+    }
+
+    async fn on_low_priority(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) -> () {
+        self.low_priority_msgs.push(msg);
     }
 }

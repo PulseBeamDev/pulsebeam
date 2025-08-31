@@ -24,10 +24,13 @@ impl actor::Actor for SourceActor {
     type HighPriorityMsg = SourceControlMessage;
     type LowPriorityMsg = ();
     type ActorId = usize;
+    type ObservableState = ();
 
     fn id(&self) -> Self::ActorId {
         0
     }
+
+    fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
@@ -81,12 +84,12 @@ impl actor::Actor for SourceActor {
 impl SourceActor {
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
         let participant_handle = if let Some(participant_handle) = self.mapping.get(&source) {
-            tracing::trace!("found connection from mapping: {source} -> {participant_handle}");
+            tracing::trace!("found connection from mapping: {source} -> {participant_handle:?}");
             participant_handle.clone()
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
             if let Some(participant_handle) = self.conns.get(ufrag) {
                 tracing::trace!(
-                    "found connection from ufrag: {ufrag} -> {source} -> {participant_handle}"
+                    "found connection from ufrag: {ufrag} -> {source} -> {participant_handle:?}"
                 );
                 self.mapping.insert(source, participant_handle.clone());
                 self.reverse
@@ -130,4 +133,4 @@ impl SourceActor {
     }
 }
 
-pub type SourceHandle = actor::LocalActorHandle<SourceActor>;
+pub type SourceHandle = actor::ActorHandle<SourceActor>;

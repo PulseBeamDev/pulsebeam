@@ -34,6 +34,6 @@ pub async fn create_system_ctx() -> system::SystemContext {
 }
 
 pub fn create_runner<A: actor::Actor>(a: A) -> actor::Runner<A> {
-    let (_, runner) = actor::LocalActorHandle::new_default(a);
+    let (_, runner) = actor::ActorHandle::new_default(a);
     runner
 }

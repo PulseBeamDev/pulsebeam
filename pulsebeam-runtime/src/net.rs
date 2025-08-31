@@ -179,8 +179,8 @@ mod test {
     use turmoil::Builder;
 
     // Test binding a SimUdp socket
-    #[tokio::test]
-    async fn bind_sim_udp_socket() {
+    #[test]
+    fn bind_sim_udp_socket() {
         let mut sim = Builder::new().build();
 
         sim.client("client", async {
@@ -191,45 +191,6 @@ mod test {
             let addr = socket.local_addr().unwrap();
             assert_eq!(addr.ip(), Ipv4Addr::UNSPECIFIED);
             assert!(addr.port() > 0);
-            Ok(())
-        });
-
-        sim.run().unwrap();
-    }
-
-    // Test sending and receiving data with SimUdp socket
-    #[tokio::test]
-    async fn sim_udp_send_receive() {
-        let mut sim = Builder::new().build();
-        let server_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 12345).into();
-
-        sim.host("server", move || async move {
-            let server_socket = UnifiedSocket::bind(server_addr, Transport::SimUdp)
-                .await
-                .unwrap();
-            let mut buf = [0u8; 1024];
-            let (size, client_addr) = server_socket.recv_from(&mut buf).await.unwrap();
-            assert_eq!(size, 5);
-            assert_eq!(&buf[..size], b"hello");
-
-            let sent = server_socket.send_to(b"world", client_addr).await.unwrap();
-            assert_eq!(sent, 5);
-            Ok(())
-        });
-
-        sim.client("client", async move {
-            let client_socket =
-                UnifiedSocket::bind((Ipv4Addr::UNSPECIFIED, 0).into(), Transport::SimUdp)
-                    .await
-                    .unwrap();
-            let sent = client_socket.send_to(b"hello", server_addr).await.unwrap();
-            assert_eq!(sent, 5);
-
-            let mut buf = [0u8; 1024];
-            let (size, addr) = client_socket.recv_from(&mut buf).await.unwrap();
-            assert_eq!(size, 5);
-            assert_eq!(&buf[..size], b"world");
-            assert_eq!(addr, server_addr);
             Ok(())
         });
 

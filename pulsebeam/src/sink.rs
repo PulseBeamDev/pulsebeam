@@ -21,10 +21,13 @@ impl actor::Actor for SinkActor {
     type LowPriorityMsg = SinkMessage;
     type HighPriorityMsg = ();
     type ActorId = usize;
+    type ObservableState = ();
 
     fn id(&self) -> Self::ActorId {
         0
     }
+
+    fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn on_low_priority(
         &mut self,
@@ -48,4 +51,4 @@ impl SinkActor {
     }
 }
 
-pub type SinkHandle = actor::LocalActorHandle<SinkActor>;
+pub type SinkHandle = actor::ActorHandle<SinkActor>;

@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use str0m::Rtc;
 use tokio::task::JoinSet;
-use tracing::Instrument;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
@@ -11,14 +10,14 @@ use crate::{
     system,
     track::{self, TrackHandle},
 };
-use pulsebeam_runtime::actor::{self, LocalActorHandle};
-use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::actor;
 
 pub enum RoomMessage {
     PublishTrack(Arc<TrackMeta>),
     AddParticipant(Arc<ParticipantId>, Box<Rtc>),
 }
 
+#[derive(Clone, Debug)]
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, TrackHandle>,
@@ -33,21 +32,30 @@ pub struct ParticipantMeta {
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
     system_ctx: system::SystemContext,
-
+    participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
-    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
     participant_tasks: JoinSet<(Arc<ParticipantId>, actor::ActorStatus)>,
     track_tasks: JoinSet<(Arc<TrackId>, actor::ActorStatus)>,
-    participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
+    state: RoomState,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct RoomState {
+    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
 }
 
 impl actor::Actor for RoomActor {
     type ActorId = Arc<RoomId>;
     type HighPriorityMsg = RoomMessage;
     type LowPriorityMsg = ();
+    type ObservableState = RoomState;
 
     fn id(&self) -> Self::ActorId {
         self.room_id.clone()
+    }
+
+    fn get_observable_state(&self) -> Self::ObservableState {
+        self.state.clone()
     }
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
@@ -83,7 +91,10 @@ impl actor::Actor for RoomActor {
                     .await
             }
             RoomMessage::PublishTrack(track_meta) => {
-                let Some(origin) = self.participants.get_mut(&track_meta.id.origin_participant)
+                let Some(origin) = self
+                    .state
+                    .participants
+                    .get_mut(&track_meta.id.origin_participant)
                 else {
                     tracing::warn!(
                         "{} is missing from participants, ignoring track",
@@ -102,7 +113,7 @@ impl actor::Actor for RoomActor {
 
                 // TODO: update capacities
                 let (track_handle, track_runner) =
-                    actor::LocalActorHandle::new(track_actor, actor::RunnerConfig::default());
+                    actor::ActorHandle::new(track_actor, actor::RunnerConfig::default());
                 self.track_tasks.spawn(track_runner.run());
                 let track_handle = track::TrackHandle {
                     handle: track_handle,
@@ -110,7 +121,7 @@ impl actor::Actor for RoomActor {
                 };
                 origin.tracks.insert(track_id, track_handle.clone());
                 let new_tracks = Arc::new(vec![track_handle]);
-                for participant in self.participants.values() {
+                for participant in self.state.participants.values() {
                     let _ = participant
                         .handle
                         .handle
@@ -129,7 +140,7 @@ impl RoomActor {
         Self {
             system_ctx,
             room_id,
-            participants: HashMap::new(),
+            state: RoomState::default(),
             participant_tasks: JoinSet::new(),
             track_tasks: JoinSet::new(),
             participant_factory: Box::new(()),
@@ -163,7 +174,7 @@ impl RoomActor {
         //     ))
         //     .await
         //     .map_err(|_| ControllerError::ServiceUnavailable)?;
-        self.participants.insert(
+        self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {
                 handle: ParticipantHandle {
@@ -174,8 +185,8 @@ impl RoomActor {
             },
         );
 
-        let mut tracks = Vec::with_capacity(self.participants.len());
-        for meta in self.participants.values() {
+        let mut tracks = Vec::with_capacity(self.state.participants.len());
+        for meta in self.state.participants.values() {
             tracks.extend(meta.tracks.values().cloned());
         }
 
@@ -188,7 +199,7 @@ impl RoomActor {
 
     async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
         // TODO: notify participant leaving
-        let Some(participant) = self.participants.remove(&participant_id) else {
+        let Some(participant) = self.state.participants.remove(&participant_id) else {
             return;
         };
 
@@ -198,7 +209,7 @@ impl RoomActor {
             .map(|t| t.meta.id.clone())
             .collect();
         let tracks = Arc::new(tracks);
-        for p in self.participants.values() {
+        for p in self.state.participants.values() {
             let _ = p
                 .handle
                 .handle
@@ -210,7 +221,7 @@ impl RoomActor {
     }
 }
 
-pub type RoomHandle = actor::LocalActorHandle<RoomActor>;
+pub type RoomHandle = actor::ActorHandle<RoomActor>;
 
 #[cfg(test)]
 mod test {
@@ -219,6 +230,7 @@ mod test {
     use super::*;
     use crate::room::RoomActor;
     use crate::test_utils;
+    use pulsebeam_runtime::prelude::*;
 
     #[test]
     fn name() {
@@ -248,9 +260,10 @@ mod test {
                 .on_high_priority(&mut room.ctx, RoomMessage::PublishTrack(Arc::new(track)))
                 .await;
 
-            assert_eq!(room.actor.participants.len(), 1);
+            assert_eq!(room.actor.state.participants.len(), 1);
             assert_eq!(
                 room.actor
+                    .state
                     .participants
                     .get(&participant_id)
                     .unwrap()
