@@ -304,21 +304,18 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
         handle: handle.clone(),
     };
 
-    let actor_id1 = a.meta();
-    let actor_id2 = actor_id1.clone();
+    let actor_id = a.meta().clone();
+    let join = tokio::spawn(run(a, ctx).instrument(tracing::span!(
+        tracing::Level::INFO,
+        "run",
+        ?actor_id
+    )))
+    .map(|res| match res {
+        Ok(ret) => (actor_id, ret),
+        Err(_) => (actor_id, ActorStatus::ShutDown),
+    })
+    .boxed();
 
-    let fut = async move {
-        let status = run_instrumented(a, ctx).await;
-        (actor_id1, status)
-    }
-    .in_current_span();
-
-    let join = tokio::spawn(fut)
-        .map(|res| match res {
-            Ok(ret) => ret,
-            Err(_) => (actor_id2, ActorStatus::ShutDown),
-        })
-        .boxed();
     (handle, join)
 }
 
@@ -328,7 +325,7 @@ pub fn spawn_default<A: Actor>(
     spawn(a, RunnerConfig::default())
 }
 
-async fn run_instrumented<A: Actor>(mut a: A, mut ctx: ActorContext<A>) -> ActorStatus {
+async fn run<A: Actor>(mut a: A, mut ctx: ActorContext<A>) -> ActorStatus {
     tracing::debug!("Starting actor...");
 
     let run_result = AssertUnwindSafe(a.run(&mut ctx)).catch_unwind().await;

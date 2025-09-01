@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.15", features = ["toml"] }
 toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-str0m = { git = "https://github.com/algesten/str0m.git", rev = "75977cef4c058b52934a11ec1620a382e507e65c" }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "783b020ff7c859372884889e205c5c838792e97a" }
 axum = { version = "0.8.3", features = ["macros"] }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
 systemstat = "0.2.4"
@@ -43,5 +43,5 @@ prost-build = "0.13.5"
 # [patch.crates-io]
 # str0m = { path = "../str0m" }
 [patch."https://github.com/algesten/str0m.git"]
-str0m = { path = "../str0m" }
+str0m = { path = "../../str0m" }
 
