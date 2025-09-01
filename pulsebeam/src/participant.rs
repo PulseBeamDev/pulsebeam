@@ -33,7 +33,7 @@ pub enum ParticipantError {
     InvalidRPCFormat(#[from] DecodeError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ParticipantControlMessage {
     TracksSnapshot(HashMap<Arc<TrackId>, track::TrackHandle>),
     TracksPublished(Arc<HashMap<Arc<TrackId>, track::TrackHandle>>),

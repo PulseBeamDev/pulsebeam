@@ -72,8 +72,8 @@ impl actor::Actor for RoomActor {
                     self.handle_participant_left(participant_id).await;
                 }
 
-                Some((track_id, _)) = self.track_tasks.next() => {
-                    // TODO: handle track lifecycle
+                Some((track_meta, _)) = self.track_tasks.next() => {
+                    self.handle_track_unpublished(track_meta).await;
                 }
 
                 else => break,
@@ -94,45 +94,7 @@ impl actor::Actor for RoomActor {
                     .await
             }
             RoomMessage::PublishTrack(track_meta) => {
-                let Some(origin) = self
-                    .state
-                    .participants
-                    .get_mut(&track_meta.id.origin_participant)
-                else {
-                    tracing::warn!(
-                        "{} is missing from participants, ignoring track",
-                        track_meta.id
-                    );
-                    return;
-                };
-
-                let track_actor = track::TrackActor::new(origin.handle.clone(), track_meta.clone());
-                let track_id = track_meta.id.clone();
-                tracing::info!(
-                    "{} published a track, added: {}",
-                    origin.handle.meta,
-                    track_id
-                );
-
-                // TODO: update capacities
-                let (track_handle, track_join) =
-                    actor::spawn(track_actor, actor::RunnerConfig::default());
-                self.track_tasks.push(track_join);
-                origin.tracks.insert(track_id.clone(), track_handle.clone());
-
-                // TODO: handle large scale room by batching with a fixed interval driven by the
-                // room instead of reactive.
-                let mut new_tracks = HashMap::new();
-                new_tracks.insert(track_id, track_handle.clone());
-                let new_tracks = Arc::new(new_tracks);
-                for participant in self.state.participants.values() {
-                    let _ = participant
-                        .handle
-                        .send_high(participant::ParticipantControlMessage::TracksPublished(
-                            new_tracks.clone(),
-                        ))
-                        .await;
-                }
+                self.handle_track_published(track_meta).await;
             }
         };
     }
@@ -203,13 +165,61 @@ impl RoomActor {
 
         // mark this tracks to be shared and immutable
         let tracks = Arc::new(participant.tracks);
-        for p in self.state.participants.values() {
-            let _ = p
-                .handle
-                .send_high(participant::ParticipantControlMessage::TracksUnpublished(
-                    tracks.clone(),
-                ))
-                .await;
+        let msg = participant::ParticipantControlMessage::TracksUnpublished(tracks);
+        self.broadcast_message(msg).await;
+    }
+
+    async fn handle_track_published(&mut self, track_meta: Arc<TrackMeta>) {
+        let Some(origin) = self
+            .state
+            .participants
+            .get_mut(&track_meta.id.origin_participant)
+        else {
+            tracing::warn!(
+                "{} is missing from participants, ignoring track",
+                track_meta.id
+            );
+            return;
+        };
+
+        let track_actor = track::TrackActor::new(origin.handle.clone(), track_meta.clone());
+        let track_id = track_meta.id.clone();
+        tracing::info!(
+            "{} published a track, added: {}",
+            origin.handle.meta,
+            track_id
+        );
+
+        // TODO: update capacities
+        let (track_handle, track_join) = actor::spawn(track_actor, actor::RunnerConfig::default());
+        self.track_tasks.push(track_join);
+        origin.tracks.insert(track_id.clone(), track_handle.clone());
+
+        let mut new_tracks = HashMap::new();
+        new_tracks.insert(track_id, track_handle.clone());
+        let new_tracks = Arc::new(new_tracks);
+        let msg = participant::ParticipantControlMessage::TracksPublished(new_tracks);
+        self.broadcast_message(msg).await;
+    }
+
+    async fn handle_track_unpublished(&mut self, track_meta: Arc<TrackMeta>) {
+        let track_handle = if let Some(track_handle) = self.state.tracks.remove(&track_meta.id) {
+            track_handle
+        } else {
+            return;
+        };
+        let mut removed_tracks = HashMap::new();
+        removed_tracks.insert(track_meta.id.clone(), track_handle);
+        let removed_tracks = Arc::new(removed_tracks);
+        let msg = participant::ParticipantControlMessage::TracksUnpublished(removed_tracks);
+        self.broadcast_message(msg).await;
+    }
+
+    async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {
+        // TODO: handle large scale room by batching with a fixed interval driven by the
+        // room instead of reactive.
+        for participant in self.state.participants.values() {
+            let _ = participant.handle.send_high(msg.clone()).await;
         }
     }
 }
