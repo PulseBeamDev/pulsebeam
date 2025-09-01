@@ -61,6 +61,8 @@ impl actor::Actor for RoomActor {
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         loop {
             tokio::select! {
+                biased;
+
                 Some(msg) = ctx.sys_rx.recv() => {
                     self.on_system(ctx, msg).await;
                 }
@@ -147,7 +149,9 @@ impl RoomActor {
         );
 
         // TODO: remove tracks that the participant doesn't have access to
-        participant_handle
+        // if we failed to send a message, this means that participant has exited. The cleanup
+        // step will remove this participant from internal state.
+        let _ = participant_handle
             .send_high(participant::ParticipantControlMessage::TracksSnapshot(
                 self.state.tracks.clone(),
             ))
