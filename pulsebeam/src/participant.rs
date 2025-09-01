@@ -229,6 +229,34 @@ impl actor::Actor for ParticipantActor {
 }
 
 impl ParticipantActor {
+    pub fn new(
+        system_ctx: system::SystemContext,
+        room_handle: room::RoomHandle,
+        participant_id: Arc<ParticipantId>,
+        rtc: Box<Rtc>,
+    ) -> Self {
+        Self {
+            system_ctx,
+            room_handle,
+            participant_id,
+            rtc,
+
+            initialized: false,
+            published_video_tracks: HashMap::new(),
+            published_audio_tracks: HashMap::new(),
+            available_video_tracks: HashMap::new(),
+            available_audio_tracks: HashMap::new(),
+            subscribed_video_tracks: HashMap::new(),
+            subscribed_audio_tracks: HashMap::new(),
+            cid: None,
+
+            pending_published_tracks: Vec::new(),
+            pending_unpublished_tracks: Vec::new(),
+            pending_switched_tracks: Vec::new(),
+            should_resync: false,
+        }
+    }
+
     async fn init_subscriptions(&mut self, ctx: &mut actor::ActorContext<Self>) {
         // auto subscribe
         let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
@@ -544,36 +572,6 @@ impl ParticipantActor {
         if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();
-        }
-    }
-}
-
-impl ParticipantActor {
-    pub fn new(
-        system_ctx: system::SystemContext,
-        room_handle: room::RoomHandle,
-        participant_id: Arc<ParticipantId>,
-        rtc: Box<Rtc>,
-    ) -> Self {
-        Self {
-            system_ctx,
-            room_handle,
-            participant_id,
-            rtc,
-
-            initialized: false,
-            published_video_tracks: HashMap::new(),
-            published_audio_tracks: HashMap::new(),
-            available_video_tracks: HashMap::new(),
-            available_audio_tracks: HashMap::new(),
-            subscribed_video_tracks: HashMap::new(),
-            subscribed_audio_tracks: HashMap::new(),
-            cid: None,
-
-            pending_published_tracks: Vec::new(),
-            pending_unpublished_tracks: Vec::new(),
-            pending_switched_tracks: Vec::new(),
-            should_resync: false,
         }
     }
 }
