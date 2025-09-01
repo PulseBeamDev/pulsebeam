@@ -118,8 +118,13 @@ impl actor::Actor for RoomActor {
                 let (track_handle, track_join) =
                     actor::spawn(track_actor, actor::RunnerConfig::default());
                 self.track_tasks.push(track_join);
-                origin.tracks.insert(track_id, track_handle.clone());
-                let new_tracks = Arc::new(vec![track_handle]);
+                origin.tracks.insert(track_id.clone(), track_handle.clone());
+
+                // TODO: handle large scale room by batching with a fixed interval driven by the
+                // room instead of reactive.
+                let mut new_tracks = HashMap::new();
+                new_tracks.insert(track_id, track_handle.clone());
+                let new_tracks = Arc::new(new_tracks);
                 for participant in self.state.participants.values() {
                     let _ = participant
                         .handle
@@ -174,29 +179,30 @@ impl RoomActor {
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {
-                handle: participant_handle,
+                handle: participant_handle.clone(),
                 tracks: HashMap::new(),
             },
         );
 
-        let mut tracks = Vec::with_capacity(self.state.participants.len());
-        for meta in self.state.participants.values() {
-            tracks.extend(meta.tracks.values().cloned());
-        }
+        // TODO: remove tracks that the participant doesn't have access to
+        participant_handle
+            .send_high(participant::ParticipantControlMessage::TracksSnapshot(
+                self.state.tracks.clone(),
+            ))
+            .await;
     }
 
     async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
-        // TODO: notify participant leaving
         let Some(participant) = self.state.participants.remove(&participant_id) else {
             return;
         };
 
-        let tracks: Vec<Arc<TrackId>> = participant
-            .tracks
-            .into_values()
-            .map(|t| t.meta.id.clone())
-            .collect();
-        let tracks = Arc::new(tracks);
+        for track_id in participant.tracks.keys() {
+            self.state.tracks.remove(track_id);
+        }
+
+        // mark this tracks to be shared and immutable
+        let tracks = Arc::new(participant.tracks);
         for p in self.state.participants.values() {
             let _ = p
                 .handle

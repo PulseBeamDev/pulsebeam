@@ -35,9 +35,9 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    TracksPublished(Arc<Vec<track::TrackHandle>>),
-    TracksUnpublished(Arc<Vec<Arc<TrackId>>>),
-
+    TracksSnapshot(HashMap<Arc<TrackId>, track::TrackHandle>),
+    TracksPublished(Arc<HashMap<Arc<TrackId>, track::TrackHandle>>),
+    TracksUnpublished(Arc<HashMap<Arc<TrackId>, track::TrackHandle>>),
     TrackPublishRejected(track::TrackHandle),
 }
 
@@ -171,53 +171,14 @@ impl actor::Actor for ParticipantActor {
 
         self.should_resync = true;
         match msg {
+            ParticipantControlMessage::TracksSnapshot(tracks) => {
+                self.handle_published_tracks(ctx, &tracks);
+            }
             ParticipantControlMessage::TracksPublished(tracks) => {
-                for track in tracks.iter() {
-                    if track.meta.id.origin_participant == self.participant_id {
-                        // don't include to pending published tracks to prevent loopback on client
-                        // successfully publish a track
-                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
-
-                        match track.meta.kind {
-                            MediaKind::Video => self
-                                .published_video_tracks
-                                .insert(track.meta.id.origin_mid, track.clone()),
-                            MediaKind::Audio => self
-                                .published_audio_tracks
-                                .insert(track.meta.id.origin_mid, track.clone()),
-                        };
-                    } else {
-                        // new tracks from other participants
-                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
-                        let track_id = track.meta.id.clone();
-
-                        self.available_video_tracks.insert(
-                            track_id.internal.clone(),
-                            TrackOut {
-                                track: track.clone(),
-                                mid: None,
-                            },
-                        );
-                        let kind = if track.meta.kind.is_video() {
-                            sfu::TrackKind::Video
-                        } else {
-                            sfu::TrackKind::Audio
-                        };
-
-                        self.pending_published_tracks.push(sfu::TrackInfo {
-                            track_id: track.meta.id.to_string(),
-                            kind: kind as i32,
-                            participant_id: track.meta.id.origin_participant.to_string(),
-                        });
-                    }
-                }
-
-                if !self.initialized {
-                    self.init_subscriptions(ctx).await;
-                }
+                self.handle_published_tracks(ctx, tracks.as_ref());
             }
             ParticipantControlMessage::TracksUnpublished(track_ids) => {
-                for track_id in track_ids.iter() {
+                for track_id in track_ids.keys() {
                     let Some(track) = self.available_video_tracks.remove(&track_id.internal) else {
                         return;
                     };
@@ -383,6 +344,52 @@ impl ParticipantActor {
         };
 
         Ok(())
+    }
+
+    fn handle_published_tracks(
+        &mut self,
+        _ctx: &mut actor::ActorContext<Self>,
+        tracks: &HashMap<Arc<TrackId>, track::TrackHandle>,
+    ) {
+        for track in tracks.values() {
+            if track.meta.id.origin_participant == self.participant_id {
+                // don't include to pending published tracks to prevent loopback on client
+                // successfully publish a track
+                tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
+
+                match track.meta.kind {
+                    MediaKind::Video => self
+                        .published_video_tracks
+                        .insert(track.meta.id.origin_mid, track.clone()),
+                    MediaKind::Audio => self
+                        .published_audio_tracks
+                        .insert(track.meta.id.origin_mid, track.clone()),
+                };
+            } else {
+                // new tracks from other participants
+                tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
+                let track_id = track.meta.id.clone();
+
+                self.available_video_tracks.insert(
+                    track_id.internal.clone(),
+                    TrackOut {
+                        track: track.clone(),
+                        mid: None,
+                    },
+                );
+                let kind = if track.meta.kind.is_video() {
+                    sfu::TrackKind::Video
+                } else {
+                    sfu::TrackKind::Audio
+                };
+
+                self.pending_published_tracks.push(sfu::TrackInfo {
+                    track_id: track.meta.id.to_string(),
+                    kind: kind as i32,
+                    participant_id: track.meta.id.origin_participant.to_string(),
+                });
+            }
+        }
     }
 
     async fn handle_unsubscribe(&mut self, track_id: Arc<TrackId>) {
