@@ -15,8 +15,7 @@ use crate::{
     entity::{EntityId, ParticipantId, TrackId},
     message::{self, EgressUDPPacket, TrackMeta},
     proto::{self, sfu},
-    room, sink, system,
-    track::{self, TrackHandle},
+    room, sink, system, track,
 };
 use pulsebeam_runtime::actor;
 
@@ -36,10 +35,10 @@ pub enum ParticipantError {
 
 #[derive(Debug)]
 pub enum ParticipantControlMessage {
-    TracksPublished(Arc<Vec<TrackHandle>>),
+    TracksPublished(Arc<Vec<track::TrackHandle>>),
     TracksUnpublished(Arc<Vec<Arc<TrackId>>>),
 
-    TrackPublishRejected(TrackHandle),
+    TrackPublishRejected(track::TrackHandle),
 }
 
 #[derive(Debug)]
@@ -50,7 +49,7 @@ pub enum ParticipantDataMessage {
 }
 
 struct TrackOut {
-    track: TrackHandle,
+    track: track::TrackHandle,
     mid: Option<Mid>,
 }
 
@@ -85,8 +84,8 @@ pub struct ParticipantActor {
     participant_id: Arc<ParticipantId>,
 
     // Current local state
-    published_video_tracks: HashMap<Mid, TrackHandle>,
-    published_audio_tracks: HashMap<Mid, TrackHandle>,
+    published_video_tracks: HashMap<Mid, track::TrackHandle>,
+    published_audio_tracks: HashMap<Mid, track::TrackHandle>,
     subscribed_video_tracks: HashMap<Mid, MidOutSlot>,
     subscribed_audio_tracks: HashMap<Mid, MidOutSlot>,
     initialized: bool,
@@ -174,23 +173,23 @@ impl actor::Actor for ParticipantActor {
         match msg {
             ParticipantControlMessage::TracksPublished(tracks) => {
                 for track in tracks.iter() {
-                    if track.meta.id.origin_participant == self.participant_id {
+                    if track.actor_id.id.origin_participant == self.participant_id {
                         // don't include to pending published tracks to prevent loopback on client
                         // successfully publish a track
-                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
+                        tracing::info!(track_id = ?track.actor_id.id, origin = ?track.actor_id.id.origin_participant, "published track");
 
-                        match track.meta.kind {
+                        match track.actor_id.kind {
                             MediaKind::Video => self
                                 .published_video_tracks
-                                .insert(track.meta.id.origin_mid, track.clone()),
+                                .insert(track.actor_id.id.origin_mid, track.clone()),
                             MediaKind::Audio => self
                                 .published_audio_tracks
-                                .insert(track.meta.id.origin_mid, track.clone()),
+                                .insert(track.actor_id.id.origin_mid, track.clone()),
                         };
                     } else {
                         // new tracks from other participants
-                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
-                        let track_id = track.meta.id.clone();
+                        tracing::info!(track_id = ?track.actor_id.id, origin = ?track.actor_id.id.origin_participant, "subscribed track");
+                        let track_id = track.actor_id.id.clone();
 
                         self.available_video_tracks.insert(
                             track_id.internal.clone(),
@@ -199,16 +198,16 @@ impl actor::Actor for ParticipantActor {
                                 mid: None,
                             },
                         );
-                        let kind = if track.meta.kind.is_video() {
+                        let kind = if track.actor_id.kind.is_video() {
                             sfu::TrackKind::Video
                         } else {
                             sfu::TrackKind::Audio
                         };
 
                         self.pending_published_tracks.push(sfu::TrackInfo {
-                            track_id: track.meta.id.to_string(),
+                            track_id: track.actor_id.id.to_string(),
                             kind: kind as i32,
-                            participant_id: track.meta.id.origin_participant.to_string(),
+                            participant_id: track.actor_id.id.origin_participant.to_string(),
                         });
                     }
                 }
@@ -227,7 +226,7 @@ impl actor::Actor for ParticipantActor {
                         return;
                     };
 
-                    match track.track.meta.kind {
+                    match track.track.actor_id.kind {
                         MediaKind::Video => self.subscribed_video_tracks.remove(&mid),
                         MediaKind::Audio => self.subscribed_audio_tracks.remove(&mid),
                     };
@@ -290,12 +289,11 @@ impl ParticipantActor {
         while let (Some(sub), Some(available)) =
             (subscribed_tracks_iter.next(), available_tracks_iter.next())
         {
-            let meta = &available.1.track.meta;
+            let meta = &available.1.track.actor_id;
             sub.1.track_id.replace(meta.id.clone());
             available
                 .1
                 .track
-                .handle
                 .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
                 .await;
             tracing::info!("replaced track");
@@ -442,12 +440,10 @@ impl ParticipantActor {
             Event::MediaData(e) => {
                 if let Some(track) = self.published_video_tracks.get(&e.mid) {
                     let _ = track
-                        .handle
                         .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
                 } else if let Some(track) = self.published_audio_tracks.get(&e.mid) {
                     let _ = track
-                        .handle
                         .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
                 }
@@ -473,9 +469,8 @@ impl ParticipantActor {
             return;
         };
 
-        track
+        let _ = track
             .track
-            .handle
             .try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
@@ -490,7 +485,8 @@ impl ParticipantActor {
                 let track = TrackMeta {
                     id: track_id.clone(),
                     kind: media.kind,
-                    simulcast: media.simulcast,
+                    // TODO: double check the simulcast directions.
+                    simulcast_rids: media.simulcast.map(|s| s.recv),
                 };
 
                 if let Err(err) = self

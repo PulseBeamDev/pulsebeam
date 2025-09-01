@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use str0m::media::{KeyframeRequestKind, MediaKind, Rid, Simulcast};
+use str0m::media::{KeyframeRequestKind, MediaKind, Rid};
 
 pub use str0m::change::{SdpAnswer, SdpOffer};
 pub use str0m::error::SdpError;
@@ -23,11 +23,11 @@ pub struct EgressUDPPacket {
     pub dst: SocketAddr,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub struct TrackMeta {
     pub id: Arc<TrackId>,
     pub kind: MediaKind,
-    pub simulcast: Option<Simulcast>,
+    pub simulcast_rids: Option<Vec<Rid>>,
 }
 
 #[derive(Debug)]

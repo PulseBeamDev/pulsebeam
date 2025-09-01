@@ -44,11 +44,11 @@ pub struct TrackActor {
 impl actor::Actor for TrackActor {
     type HighPriorityMsg = TrackControlMessage;
     type LowPriorityMsg = TrackDataMessage;
-    type ActorId = Arc<TrackId>;
+    type ActorId = Arc<TrackMeta>;
     type ObservableState = ();
 
     fn id(&self) -> Self::ActorId {
-        self.meta.id.clone()
+        self.meta.clone()
     }
 
     fn get_observable_state(&self) -> Self::ObservableState {}
@@ -113,14 +113,4 @@ impl TrackActor {
     }
 }
 
-#[derive(Clone)]
-pub struct TrackHandle {
-    pub handle: actor::ActorHandle<TrackActor>,
-    pub meta: Arc<TrackMeta>,
-}
-
-impl std::fmt::Debug for TrackHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.meta.fmt(f)
-    }
-}
+pub type TrackHandle = actor::ActorHandle<TrackActor>;

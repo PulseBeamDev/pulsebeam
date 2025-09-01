@@ -4,12 +4,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use str0m::Rtc;
 
 use crate::{
-    controller,
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackMeta,
     participant::{self, ParticipantActor, ParticipantHandle},
-    source, system,
-    track::{self, TrackHandle},
+    source, system, track,
 };
 use pulsebeam_runtime::actor;
 
@@ -22,7 +20,7 @@ pub enum RoomMessage {
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
     handle: ParticipantHandle,
-    tracks: HashMap<Arc<TrackId>, TrackHandle>,
+    tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
 }
 
 /// Reponsibilities:
@@ -120,10 +118,6 @@ impl actor::Actor for RoomActor {
                 let (track_handle, track_join) =
                     actor::spawn(track_actor, actor::RunnerConfig::default());
                 self.track_tasks.push(track_join);
-                let track_handle = track::TrackHandle {
-                    handle: track_handle,
-                    meta: track_meta,
-                };
                 origin.tracks.insert(track_id, track_handle.clone());
                 let new_tracks = Arc::new(vec![track_handle]);
                 for participant in self.state.participants.values() {
@@ -206,7 +200,7 @@ impl RoomActor {
         let tracks: Vec<Arc<TrackId>> = participant
             .tracks
             .into_values()
-            .map(|t| t.meta.id.clone())
+            .map(|t| t.actor_id.id.clone())
             .collect();
         let tracks = Arc::new(tracks);
         for p in self.state.participants.values() {
@@ -252,7 +246,7 @@ mod test {
             let track = TrackMeta {
                 id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
                 kind: str0m::media::MediaKind::Video,
-                simulcast: None,
+                simulcast_rids: None,
             };
             room_handle
                 .send_high(RoomMessage::PublishTrack(Arc::new(track)))
