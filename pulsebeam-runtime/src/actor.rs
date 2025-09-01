@@ -1,3 +1,4 @@
+use crate::actor_loop;
 use futures::FutureExt;
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
@@ -51,6 +52,7 @@ impl Display for ActorStatus {
 #[derive(Debug)]
 pub enum SystemMsg<S> {
     GetState(tokio::sync::oneshot::Sender<S>),
+    Terminate,
 }
 
 pub struct ActorContext<A: Actor> {
@@ -88,25 +90,7 @@ pub trait Actor: Sized + Send + 'static {
         ctx: &mut ActorContext<Self>,
     ) -> impl Future<Output = Result<(), ActorError>> + Send {
         async {
-            loop {
-                tokio::select! {
-                    biased;
-
-                    Some(msg) = ctx.sys_rx.recv() => {
-                        self.on_system(ctx, msg).await;
-                    }
-
-                    Some(msg) = ctx.hi_rx.recv() => {
-                        self.on_high_priority(ctx, msg).await;
-                    }
-
-                    Some(msg) = ctx.lo_rx.recv() => {
-                        self.on_low_priority(ctx, msg).await;
-                    }
-
-                    else => break,
-                }
-            }
+            actor_loop!(self, ctx,);
             Ok(())
         }
     }
@@ -118,15 +102,7 @@ pub trait Actor: Sized + Send + 'static {
         ctx: &mut ActorContext<Self>,
         msg: SystemMsg<Self::ObservableState>,
     ) -> impl Future<Output = ()> + Send {
-        async move {
-            match msg {
-                SystemMsg::GetState(responder) => {
-                    // The actor provides its state, and we send it back.
-                    // We ignore the result of the send; if the requester is gone, that's okay.
-                    let _ = responder.send(self.get_observable_state());
-                }
-            }
-        }
+        async move {}
     }
 
     /// Handles a high-priority message.
@@ -381,4 +357,53 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
     } else {
         format!("{:?}", payload)
     }
+}
+
+#[macro_export]
+macro_rules! actor_loop {
+    (
+        $actor:ident, $ctx:ident, $($extra:tt)*
+    ) => {
+        loop {
+            tokio::select! {
+                biased;
+
+                res = $ctx.hi_rx.recv() => {
+                    match res {
+                        Some(msg) => $actor.on_high_priority($ctx, msg).await,
+                        None => break, // hi channel closed
+                    }
+                }
+
+                res = $ctx.lo_rx.recv() => {
+                    match res {
+                        Some(msg) => $actor.on_low_priority($ctx, msg).await,
+                        None => break, // lo channel closed
+                    }
+                }
+
+                res = $ctx.sys_rx.recv() => {
+                    match res {
+                        Some(msg) => {
+                            match msg {
+                                $crate::actor::SystemMsg::GetState(responder) => {
+                                    // The actor provides its state, and we send it back.
+                                    // We ignore the result of the send; if the requester is gone, that's okay.
+                                    let _ = responder.send($actor.get_observable_state());
+                                }
+                                $crate::actor::SystemMsg::Terminate => {
+                                    break;
+                                }
+                            }
+                        }
+                        None => break, // sys channel closed
+                    }
+                }
+
+                $($extra)*
+
+                else => break,
+            }
+        }
+    };
 }

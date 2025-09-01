@@ -129,35 +129,20 @@ impl actor::Actor for ParticipantActor {
         // WARN: be careful with spending too much time in this loop.
         // We should yield back to the scheduler based on some heuristic here.
 
-        loop {
-            let delay = if let Some(delay) = self.poll(ctx).await {
-                delay
-            } else {
-                // Rtc timeout
-                break;
-            };
-
-            tokio::select! {
-                biased;
-                msg = ctx.hi_rx.recv() => {
-                    match msg {
-                        Some(msg) => self.on_high_priority(ctx, msg).await,
-                        None => break,
-                    }
-                }
-
-                Some(msg) = ctx.lo_rx.recv() => {
-                    self.on_low_priority(ctx, msg).await;
-                }
-
-                _ = tokio::time::sleep(delay) => {
-                    // explicit empty, next loop polls again
-                    // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
-                }
-
-                else => break,
+        pulsebeam_runtime::actor_loop!(self, ctx,
+            _ = {
+                let delay = if let Some(delay) = self.poll(ctx).await {
+                    delay
+                } else {
+                    // Rtc timeout
+                    break;
+                };
+                tokio::time::sleep(delay)
+            } => {
+                // explicit empty, next loop polls again
+                // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
             }
-        }
+        );
 
         Ok(())
     }

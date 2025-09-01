@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub use tokio::runtime::Handle;
 pub use tokio::task::JoinSet;
 
@@ -7,4 +9,8 @@ pub fn current() -> Handle {
 
 pub async fn yield_now() {
     tokio::task::yield_now().await;
+}
+
+pub async fn sleep(duration: Duration) {
+    tokio::time::sleep(duration).await
 }

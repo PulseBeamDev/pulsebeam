@@ -59,28 +59,15 @@ impl actor::Actor for RoomActor {
     }
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        loop {
-            tokio::select! {
-                biased;
-
-                Some(msg) = ctx.sys_rx.recv() => {
-                    self.on_system(ctx, msg).await;
-                }
-                Some(msg) = ctx.hi_rx.recv() => {
-                    self.on_high_priority(ctx, msg).await;
-                }
-
-                Some((participant_id, _)) = self.participant_tasks.next() => {
-                    self.handle_participant_left(participant_id).await;
-                }
-
-                Some((track_meta, _)) = self.track_tasks.next() => {
-                    self.handle_track_unpublished(track_meta).await;
-                }
-
-                else => break,
+        pulsebeam_runtime::actor_loop!(self, ctx,
+            Some((participant_id, _)) = self.participant_tasks.next() => {
+                self.handle_participant_left(participant_id).await;
             }
-        }
+
+            Some((track_meta, _)) = self.track_tasks.next() => {
+                self.handle_track_unpublished(track_meta).await;
+            }
+        );
 
         Ok(())
     }
@@ -249,6 +236,7 @@ mod test {
     use crate::room::RoomActor;
     use crate::test_utils;
     use pulsebeam_runtime::rt;
+    use std::time::Duration;
 
     #[test]
     fn publish_tracks_correctly() {
@@ -290,6 +278,200 @@ mod test {
                     .len(),
                 1
             );
+            Ok(())
+        });
+
+        sim.run().unwrap();
+    }
+
+    // Test that a participant's departure cleans up their tracks and updates room state.
+    #[test]
+    fn participant_leave_cleans_up_tracks() {
+        let mut sim = test_utils::create_sim();
+
+        sim.client("test", async {
+            // Setup: Create a room and add a participant with a track.
+            let system_ctx = test_utils::create_system_ctx().await;
+            let (room_handle, _) =
+                actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
+            let (participant_id, participant_rtc) = test_utils::create_participant();
+
+            room_handle
+                .send_high(RoomMessage::AddParticipant(
+                    participant_id.clone(),
+                    participant_rtc,
+                ))
+                .await
+                .unwrap();
+
+            let track = TrackMeta {
+                id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
+                kind: str0m::media::MediaKind::Video,
+                simulcast_rids: None,
+            };
+            room_handle
+                .send_high(RoomMessage::PublishTrack(Arc::new(track)))
+                .await
+                .unwrap();
+
+            rt::yield_now().await;
+
+            // Simulate participant leaving by dropping their actor.
+            let state = room_handle.get_state().await.unwrap();
+            let participant_handle = state
+                .participants
+                .get(&participant_id)
+                .unwrap()
+                .handle
+                .clone();
+            participant_handle.terminate().await;
+
+            // Allow time for the RoomActor to process the participant leaving.
+            rt::sleep(Duration::from_millis(100)).await;
+
+            // Verify: The participant and their tracks should be removed from the room state.
+            let state = room_handle.get_state().await.unwrap();
+            assert_eq!(state.participants.len(), 0, "Participant should be removed");
+            assert_eq!(state.tracks.len(), 0, "Tracks should be removed");
+
+            Ok(())
+        });
+
+        sim.run().unwrap();
+    }
+
+    // Test that publishing a track for an unknown participant is ignored.
+    #[test]
+    fn publish_track_for_unknown_participant() {
+        let mut sim = test_utils::create_sim();
+
+        sim.client("test", async {
+            // Setup: Create a room without any participants.
+            let system_ctx = test_utils::create_system_ctx().await;
+            let (room_handle, _) =
+                actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
+            let (participant_id, _) = test_utils::create_participant();
+
+            // Attempt to publish a track for a participant that doesn't exist.
+            let track = TrackMeta {
+                id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
+                kind: str0m::media::MediaKind::Video,
+                simulcast_rids: None,
+            };
+            room_handle
+                .send_high(RoomMessage::PublishTrack(Arc::new(track)))
+                .await
+                .unwrap();
+
+            rt::yield_now().await;
+
+            // Verify: The track should not be added to the room state.
+            let state = room_handle.get_state().await.unwrap();
+            assert_eq!(state.participants.len(), 0, "No participants should exist");
+            assert_eq!(state.tracks.len(), 0, "No tracks should be added");
+
+            Ok(())
+        });
+
+        sim.run().unwrap();
+    }
+
+    // Test that concurrent participant joins are handled correctly.
+    #[test]
+    fn concurrent_participant_joins() {
+        let mut sim = test_utils::create_sim();
+
+        sim.client("test", async {
+            // Setup: Create a room.
+            let system_ctx = test_utils::create_system_ctx().await;
+            let (room_handle, _) =
+                actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
+
+            // Create multiple participants.
+            let participants: Vec<_> = (0..3).map(|_| test_utils::create_participant()).collect();
+
+            // Send AddParticipant messages concurrently.
+            let mut join_futures = FuturesUnordered::new();
+            for (participant_id, participant_rtc) in participants {
+                join_futures.push(room_handle.send_high(RoomMessage::AddParticipant(
+                    participant_id.clone(),
+                    participant_rtc,
+                )));
+            }
+
+            // Wait for all join messages to be processed.
+            while join_futures.next().await.is_some() {}
+            rt::yield_now().await;
+
+            // Verify: All participants should be added to the room state.
+            let state = room_handle.get_state().await.unwrap();
+            assert_eq!(
+                state.participants.len(),
+                3,
+                "All participants should be added"
+            );
+
+            Ok(())
+        });
+
+        sim.run().unwrap();
+    }
+
+    // Test that a failed message send to a participant is handled gracefully.
+    #[test]
+    fn handle_failed_message_send() {
+        let mut sim = test_utils::create_sim();
+
+        sim.client("test", async {
+            // Setup: Create a room and add a participant.
+            let system_ctx = test_utils::create_system_ctx().await;
+            let (room_handle, _) =
+                actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
+            let (participant_id, participant_rtc) = test_utils::create_participant();
+
+            room_handle
+                .send_high(RoomMessage::AddParticipant(
+                    participant_id.clone(),
+                    participant_rtc,
+                ))
+                .await
+                .unwrap();
+
+            rt::yield_now().await;
+
+            // Simulate a participant becoming unresponsive by terminating it.
+            let state = room_handle.get_state().await.unwrap();
+            let participant_handle = state
+                .participants
+                .get(&participant_id)
+                .unwrap()
+                .handle
+                .clone();
+            participant_handle.terminate().await;
+
+            // Publish a track, which triggers a broadcast to all participants.
+            let track = TrackMeta {
+                id: Arc::new(TrackId::new(participant_id.clone(), Mid::new())),
+                kind: str0m::media::MediaKind::Video,
+                simulcast_rids: None,
+            };
+            room_handle
+                .send_high(RoomMessage::PublishTrack(Arc::new(track)))
+                .await
+                .unwrap();
+
+            // Allow time for the broadcast to attempt sending to the terminated participant.
+            rt::sleep(Duration::from_millis(100)).await;
+
+            // Verify: The room should still be in a consistent state, even if the broadcast fails.
+            let state = room_handle.get_state().await.unwrap();
+            assert_eq!(
+                state.participants.len(),
+                0,
+                "Participant should be removed due to termination"
+            );
+            assert_eq!(state.tracks.len(), 0, "No tracks should be added");
+
             Ok(())
         });
 
