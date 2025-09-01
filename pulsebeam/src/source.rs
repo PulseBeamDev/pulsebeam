@@ -108,14 +108,13 @@ impl SourceActor {
             return;
         };
 
-        let _ =
-            participant_handle
-                .handle
-                .try_send_low(participant::ParticipantDataMessage::UdpPacket(UDPPacket {
-                    raw: Bytes::copy_from_slice(packet),
-                    src: source,
-                    dst: self.local_addr,
-                }));
+        let _ = participant_handle.try_send_low(participant::ParticipantDataMessage::UdpPacket(
+            UDPPacket {
+                raw: Bytes::copy_from_slice(packet),
+                src: source,
+                dst: self.local_addr,
+            },
+        ));
     }
 }
 

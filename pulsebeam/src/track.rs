@@ -60,9 +60,9 @@ impl actor::Actor for TrackActor {
     ) -> () {
         match msg {
             TrackControlMessage::Subscribe(participant) => {
-                tracing::info!(participant_id=?participant.participant_id, "track subscribed");
+                tracing::info!(participant_id=?participant, "track subscribed");
                 self.subscribers
-                    .insert(participant.participant_id.clone(), participant);
+                    .insert(participant.actor_id.clone(), participant);
             }
             TrackControlMessage::Unsubscribe(participant_id) => {
                 // TODO: handle unsubscribe
@@ -72,25 +72,23 @@ impl actor::Actor for TrackActor {
 
     async fn on_low_priority(
         &mut self,
-        ctx: &mut actor::ActorContext<Self>,
+        _ctx: &mut actor::ActorContext<Self>,
         msg: Self::LowPriorityMsg,
     ) -> () {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
-                for (_, sub) in &self.subscribers {
-                    let _ =
-                        sub.handle
-                            .try_send_low(participant::ParticipantDataMessage::ForwardMedia(
-                                self.meta.clone(),
-                                data.clone(),
-                            ));
+                for sub in self.subscribers.values() {
+                    let _ = sub.try_send_low(participant::ParticipantDataMessage::ForwardMedia(
+                        self.meta.clone(),
+                        data.clone(),
+                    ));
                 }
             }
             TrackDataMessage::KeyframeRequest(req) => {
                 let now = Instant::now();
                 let elapsed = now.duration_since(self.last_keyframe_request);
                 if elapsed >= KEYFRAME_REQUEST_THROTTLE {
-                    self.origin.handle.try_send_low(
+                    let _ = self.origin.try_send_low(
                         participant::ParticipantDataMessage::KeyframeRequest(
                             self.meta.id.clone(),
                             req,

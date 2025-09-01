@@ -192,6 +192,24 @@ pub struct ActorHandle<A: Actor> {
     sys_tx: mailbox::Sender<SystemMsg<A::ObservableState>>,
     hi_tx: mailbox::Sender<A::HighPriorityMsg>,
     lo_tx: mailbox::Sender<A::LowPriorityMsg>,
+    pub actor_id: A::ActorId,
+}
+
+impl<A: Actor> Clone for ActorHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            sys_tx: self.sys_tx.clone(),
+            hi_tx: self.hi_tx.clone(),
+            lo_tx: self.lo_tx.clone(),
+            actor_id: self.actor_id.clone(),
+        }
+    }
+}
+
+impl<A: Actor> std::fmt::Debug for ActorHandle<A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.actor_id.fmt(f)
+    }
 }
 
 impl<A: Actor> ActorHandle<A> {
@@ -254,16 +272,6 @@ impl<A: Actor> ActorHandle<A> {
     }
 }
 
-impl<A: Actor> Clone for ActorHandle<A> {
-    fn clone(&self) -> Self {
-        Self {
-            hi_tx: self.hi_tx.clone(),
-            lo_tx: self.lo_tx.clone(),
-            sys_tx: self.sys_tx.clone(),
-        }
-    }
-}
-
 pub struct RunnerConfig {
     pub lo_cap: usize,
     pub hi_cap: usize,
@@ -303,6 +311,7 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
         hi_tx,
         lo_tx,
         sys_tx,
+        actor_id: a.id(),
     };
 
     let ctx = ActorContext {

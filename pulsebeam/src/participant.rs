@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use prost::{DecodeError, Message};
@@ -19,7 +19,6 @@ use crate::{
     track::{self, TrackHandle},
 };
 use pulsebeam_runtime::actor;
-use pulsebeam_runtime::prelude::*;
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -297,10 +296,7 @@ impl ParticipantActor {
                 .1
                 .track
                 .handle
-                .send_high(track::TrackControlMessage::Subscribe(ParticipantHandle {
-                    participant_id: self.participant_id.clone(),
-                    handle: ctx.handle.clone(),
-                }))
+                .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
                 .await;
             tracing::info!("replaced track");
         }
@@ -592,14 +588,4 @@ impl ParticipantActor {
     }
 }
 
-#[derive(Clone)]
-pub struct ParticipantHandle {
-    pub handle: actor::ActorHandle<ParticipantActor>,
-    pub participant_id: Arc<ParticipantId>,
-}
-
-impl std::fmt::Debug for ParticipantHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.participant_id.fmt(f)
-    }
-}
+pub type ParticipantHandle = actor::ActorHandle<ParticipantActor>;

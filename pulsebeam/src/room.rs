@@ -4,10 +4,11 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use str0m::Rtc;
 
 use crate::{
+    controller,
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackMeta,
     participant::{self, ParticipantActor, ParticipantHandle},
-    system,
+    source, system,
     track::{self, TrackHandle},
 };
 use pulsebeam_runtime::actor;
@@ -111,7 +112,7 @@ impl actor::Actor for RoomActor {
                 let track_id = track_meta.id.clone();
                 tracing::info!(
                     "{} published a track, added: {}",
-                    origin.handle.participant_id,
+                    origin.handle.actor_id,
                     track_id
                 );
 
@@ -127,7 +128,6 @@ impl actor::Actor for RoomActor {
                 let new_tracks = Arc::new(vec![track_handle]);
                 for participant in self.state.participants.values() {
                     let _ = participant
-                        .handle
                         .handle
                         .send_high(participant::ParticipantControlMessage::TracksPublished(
                             new_tracks.clone(),
@@ -154,8 +154,9 @@ impl RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<Self>,
         participant_id: Arc<ParticipantId>,
-        rtc: Box<str0m::Rtc>,
+        mut rtc: Box<str0m::Rtc>,
     ) {
+        let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let participant_actor = ParticipantActor::new(
             self.system_ctx.clone(),
             ctx.handle.clone(),
@@ -168,21 +169,18 @@ impl RoomActor {
             actor::spawn(participant_actor, actor::RunnerConfig::default());
         self.participant_tasks.push(participant_join);
 
-        // let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
-        // self.source
-        //     .hi_send(source::SourceControlMessage::AddParticipant(
-        //         ufrag,
-        //         self.handle.clone(),
-        //     ))
-        //     .await
-        //     .map_err(|_| ControllerError::ServiceUnavailable)?;
+        self.system_ctx
+            .source_handle
+            .send_high(source::SourceControlMessage::AddParticipant(
+                ufrag,
+                participant_handle.clone(),
+            ))
+            .await
+            .expect("todo: handle error");
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {
-                handle: ParticipantHandle {
-                    handle: participant_handle.clone(),
-                    participant_id: participant_id.clone(),
-                },
+                handle: participant_handle,
                 tracks: HashMap::new(),
             },
         );
@@ -214,7 +212,6 @@ impl RoomActor {
         for p in self.state.participants.values() {
             let _ = p
                 .handle
-                .handle
                 .send_high(participant::ParticipantControlMessage::TracksUnpublished(
                     tracks.clone(),
                 ))
@@ -232,10 +229,10 @@ mod test {
     use super::*;
     use crate::room::RoomActor;
     use crate::test_utils;
-    use pulsebeam_runtime::{prelude::*, rt};
+    use pulsebeam_runtime::rt;
 
     #[test]
-    fn name() {
+    fn publish_tracks_correctly() {
         let mut sim = test_utils::create_sim();
 
         sim.client("test", async {
