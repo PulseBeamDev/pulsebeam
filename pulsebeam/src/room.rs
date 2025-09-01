@@ -326,7 +326,7 @@ mod test {
                 .unwrap()
                 .handle
                 .clone();
-            participant_handle.terminate().await;
+            participant_handle.terminate().await.unwrap();
 
             // Allow time for the RoomActor to process the participant leaving.
             rt::sleep(Duration::from_millis(100)).await;
@@ -449,7 +449,7 @@ mod test {
                 .unwrap()
                 .handle
                 .clone();
-            participant_handle.terminate().await;
+            participant_handle.terminate().await.unwrap();
 
             // Publish a track, which triggers a broadcast to all participants.
             let track = TrackMeta {
