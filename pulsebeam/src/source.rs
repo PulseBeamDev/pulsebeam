@@ -34,23 +34,18 @@ impl actor::Actor for SourceActor {
         // let mut buf = BytesMut::with_capacity(128 * 1024);
         let mut buf = vec![0; 2000];
 
-        loop {
-            tokio::select! {
-                biased;
-                Some(msg) = ctx.hi_rx.recv() => {
-                    self.on_high_priority(ctx, msg).await;
-                }
-                res = self.socket.recv_from(&mut buf) => {
-                    match res {
-                        Ok((size, source)) => self.handle_packet(source, &buf[..size]),
-                        Err(err) => {
-                            tracing::error!("udp socket is failing: {err}");
-                            break;
-                        },
-                    }
+        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
+        select: {
+            res = self.socket.recv_from(&mut buf) => {
+                match res {
+                    Ok((size, source)) => self.handle_packet(source, &buf[..size]),
+                    Err(err) => {
+                        tracing::error!("udp socket is failing: {err}");
+                        break;
+                    },
                 }
             }
-        }
+        });
 
         tracing::info!("ingress has exited");
         Ok(())

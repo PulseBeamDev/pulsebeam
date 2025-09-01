@@ -18,8 +18,8 @@ pub enum ActorError {
     LogicError(String),
     #[error("Custom actor error: {0}")]
     Custom(String),
-    #[error("Failed to receive state from actor, it may have shut down")]
-    StateReceiverError,
+    #[error("Failed to send a system message, it may have shut down")]
+    SystemError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +90,7 @@ pub trait Actor: Sized + Send + 'static {
         ctx: &mut ActorContext<Self>,
     ) -> impl Future<Output = Result<(), ActorError>> + Send {
         async {
-            actor_loop!(self, ctx,);
+            actor_loop!(self, ctx);
             Ok(())
         }
     }
@@ -241,10 +241,17 @@ impl<A: Actor> ActorHandle<A> {
         self.sys_tx
             .send(msg)
             .await
-            .map_err(|_| ActorError::StateReceiverError)?;
+            .map_err(|_| ActorError::SystemError)?;
 
         // Await the response. If it fails, the actor might have panicked or been terminated.
-        rx.await.map_err(|_| ActorError::StateReceiverError)
+        rx.await.map_err(|_| ActorError::SystemError)
+    }
+
+    pub async fn terminate(&self) -> Result<(), ActorError> {
+        self.sys_tx
+            .send(SystemMsg::Terminate)
+            .await
+            .map_err(|_| ActorError::SystemError)
     }
 }
 
@@ -361,34 +368,29 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
 
 #[macro_export]
 macro_rules! actor_loop {
-    (
-        $actor:ident, $ctx:ident, $($extra:tt)*
-    ) => {
+    // Simple case - just actor and context
+    ($actor:ident, $ctx:ident) => {
+        actor_loop!($actor, $ctx, pre_select: {}, select: {})
+    };
+
+    // With only pre_select
+    ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => {
+        actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {})
+    };
+
+    // Full form with both pre_select and select
+    ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }, select: { $($extra:tt)* }) => {
+
         loop {
+            $($pre_select)*
+
             tokio::select! {
                 biased;
-
-                res = $ctx.hi_rx.recv() => {
-                    match res {
-                        Some(msg) => $actor.on_high_priority($ctx, msg).await,
-                        None => break, // hi channel closed
-                    }
-                }
-
-                res = $ctx.lo_rx.recv() => {
-                    match res {
-                        Some(msg) => $actor.on_low_priority($ctx, msg).await,
-                        None => break, // lo channel closed
-                    }
-                }
-
                 res = $ctx.sys_rx.recv() => {
                     match res {
                         Some(msg) => {
                             match msg {
                                 $crate::actor::SystemMsg::GetState(responder) => {
-                                    // The actor provides its state, and we send it back.
-                                    // We ignore the result of the send; if the requester is gone, that's okay.
                                     let _ = responder.send($actor.get_observable_state());
                                 }
                                 $crate::actor::SystemMsg::Terminate => {
@@ -396,12 +398,22 @@ macro_rules! actor_loop {
                                 }
                             }
                         }
-                        None => break, // sys channel closed
+                        None => break,
                     }
                 }
-
+                res = $ctx.hi_rx.recv() => {
+                    match res {
+                        Some(msg) => $actor.on_high_priority($ctx, msg).await,
+                        None => break,
+                    }
+                }
+                res = $ctx.lo_rx.recv() => {
+                    match res {
+                        Some(msg) => $actor.on_low_priority($ctx, msg).await,
+                        None => break,
+                    }
+                }
                 $($extra)*
-
                 else => break,
             }
         }

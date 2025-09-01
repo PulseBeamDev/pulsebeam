@@ -61,20 +61,13 @@ impl actor::Actor for ControllerActor {
     fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        loop {
-            tokio::select! {
-                biased;
-                Some(msg) = ctx.hi_rx.recv() => {
-                    self.on_high_priority(ctx, msg).await;
-                }
-
+        pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
+            select: {
                 Some((room_id, _)) = self.room_tasks.next() => {
                     self.rooms.remove(&room_id);
                 }
-
-                else => break,
             }
-        }
+        );
         Ok(())
     }
 

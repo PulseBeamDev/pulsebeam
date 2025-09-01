@@ -59,13 +59,15 @@ impl actor::Actor for RoomActor {
     }
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx,
-            Some((participant_id, _)) = self.participant_tasks.next() => {
-                self.handle_participant_left(participant_id).await;
-            }
+        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
+            select: {
+                Some((participant_id, _)) = self.participant_tasks.next() => {
+                    self.handle_participant_left(participant_id).await;
+                },
 
-            Some((track_meta, _)) = self.track_tasks.next() => {
-                self.handle_track_unpublished(track_meta).await;
+                Some((track_meta, _)) = self.track_tasks.next() => {
+                    self.handle_track_unpublished(track_meta).await;
+                }
             }
         );
 

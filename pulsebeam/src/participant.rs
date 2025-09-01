@@ -130,17 +130,19 @@ impl actor::Actor for ParticipantActor {
         // We should yield back to the scheduler based on some heuristic here.
 
         pulsebeam_runtime::actor_loop!(self, ctx,
-            _ = {
+            pre_select: {
                 let delay = if let Some(delay) = self.poll(ctx).await {
                     delay
                 } else {
                     // Rtc timeout
                     break;
                 };
-                tokio::time::sleep(delay)
-            } => {
-                // explicit empty, next loop polls again
-                // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
+            },
+            select: {
+                _ = tokio::time::sleep(delay) => {
+                    // explicit empty, next loop polls again
+                    // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
+                }
             }
         );
 
