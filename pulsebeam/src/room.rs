@@ -6,8 +6,7 @@ use str0m::Rtc;
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     message::TrackMeta,
-    participant::{self, ParticipantActor, ParticipantHandle},
-    source, system, track,
+    participant, source, system, track,
 };
 use pulsebeam_runtime::actor;
 
@@ -19,7 +18,7 @@ pub enum RoomMessage {
 
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
-    handle: ParticipantHandle,
+    handle: participant::ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
 }
 
@@ -42,6 +41,7 @@ pub struct RoomActor {
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
+    tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
 }
 
 impl actor::Actor for RoomActor {
@@ -151,7 +151,7 @@ impl RoomActor {
         mut rtc: Box<str0m::Rtc>,
     ) {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
-        let participant_actor = ParticipantActor::new(
+        let participant_actor = participant::ParticipantActor::new(
             self.system_ctx.clone(),
             ctx.handle.clone(),
             participant_id.clone(),
@@ -170,7 +170,7 @@ impl RoomActor {
                 participant_handle.clone(),
             ))
             .await
-            .expect("todo: handle error");
+            .expect("TODO: handle error");
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {
@@ -183,12 +183,6 @@ impl RoomActor {
         for meta in self.state.participants.values() {
             tracks.extend(meta.tracks.values().cloned());
         }
-
-        // let _ = participant_handle
-        //     .hi_send(participant::ParticipantControlMessage::TracksUnpublished(
-        //         Arc::new(tracks.clone()),
-        //     ))
-        //     .await;
     }
 
     async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
