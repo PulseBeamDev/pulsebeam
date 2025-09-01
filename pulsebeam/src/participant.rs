@@ -115,10 +115,10 @@ pub struct ParticipantActor {
 impl actor::Actor for ParticipantActor {
     type HighPriorityMsg = ParticipantControlMessage;
     type LowPriorityMsg = ParticipantDataMessage;
-    type ActorId = Arc<ParticipantId>;
+    type Meta = Arc<ParticipantId>;
     type ObservableState = ();
 
-    fn id(&self) -> Self::ActorId {
+    fn meta(&self) -> Self::Meta {
         self.participant_id.clone()
     }
 
@@ -173,23 +173,23 @@ impl actor::Actor for ParticipantActor {
         match msg {
             ParticipantControlMessage::TracksPublished(tracks) => {
                 for track in tracks.iter() {
-                    if track.actor_id.id.origin_participant == self.participant_id {
+                    if track.meta.id.origin_participant == self.participant_id {
                         // don't include to pending published tracks to prevent loopback on client
                         // successfully publish a track
-                        tracing::info!(track_id = ?track.actor_id.id, origin = ?track.actor_id.id.origin_participant, "published track");
+                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "published track");
 
-                        match track.actor_id.kind {
+                        match track.meta.kind {
                             MediaKind::Video => self
                                 .published_video_tracks
-                                .insert(track.actor_id.id.origin_mid, track.clone()),
+                                .insert(track.meta.id.origin_mid, track.clone()),
                             MediaKind::Audio => self
                                 .published_audio_tracks
-                                .insert(track.actor_id.id.origin_mid, track.clone()),
+                                .insert(track.meta.id.origin_mid, track.clone()),
                         };
                     } else {
                         // new tracks from other participants
-                        tracing::info!(track_id = ?track.actor_id.id, origin = ?track.actor_id.id.origin_participant, "subscribed track");
-                        let track_id = track.actor_id.id.clone();
+                        tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
+                        let track_id = track.meta.id.clone();
 
                         self.available_video_tracks.insert(
                             track_id.internal.clone(),
@@ -198,16 +198,16 @@ impl actor::Actor for ParticipantActor {
                                 mid: None,
                             },
                         );
-                        let kind = if track.actor_id.kind.is_video() {
+                        let kind = if track.meta.kind.is_video() {
                             sfu::TrackKind::Video
                         } else {
                             sfu::TrackKind::Audio
                         };
 
                         self.pending_published_tracks.push(sfu::TrackInfo {
-                            track_id: track.actor_id.id.to_string(),
+                            track_id: track.meta.id.to_string(),
                             kind: kind as i32,
-                            participant_id: track.actor_id.id.origin_participant.to_string(),
+                            participant_id: track.meta.id.origin_participant.to_string(),
                         });
                     }
                 }
@@ -226,7 +226,7 @@ impl actor::Actor for ParticipantActor {
                         return;
                     };
 
-                    match track.track.actor_id.kind {
+                    match track.track.meta.kind {
                         MediaKind::Video => self.subscribed_video_tracks.remove(&mid),
                         MediaKind::Audio => self.subscribed_audio_tracks.remove(&mid),
                     };
@@ -289,7 +289,7 @@ impl ParticipantActor {
         while let (Some(sub), Some(available)) =
             (subscribed_tracks_iter.next(), available_tracks_iter.next())
         {
-            let meta = &available.1.track.actor_id;
+            let meta = &available.1.track.meta;
             sub.1.track_id.replace(meta.id.clone());
             available
                 .1

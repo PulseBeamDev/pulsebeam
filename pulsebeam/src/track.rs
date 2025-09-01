@@ -44,10 +44,10 @@ pub struct TrackActor {
 impl actor::Actor for TrackActor {
     type HighPriorityMsg = TrackControlMessage;
     type LowPriorityMsg = TrackDataMessage;
-    type ActorId = Arc<TrackMeta>;
+    type Meta = Arc<TrackMeta>;
     type ObservableState = ();
 
-    fn id(&self) -> Self::ActorId {
+    fn meta(&self) -> Self::Meta {
         self.meta.clone()
     }
 
@@ -62,7 +62,7 @@ impl actor::Actor for TrackActor {
             TrackControlMessage::Subscribe(participant) => {
                 tracing::info!(participant_id=?participant, "track subscribed");
                 self.subscribers
-                    .insert(participant.actor_id.clone(), participant);
+                    .insert(participant.meta.clone(), participant);
             }
             TrackControlMessage::Unsubscribe(participant_id) => {
                 // TODO: handle unsubscribe

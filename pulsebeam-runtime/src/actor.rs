@@ -9,7 +9,7 @@ use tracing::Instrument;
 
 use crate::mailbox;
 
-pub type JoinHandle<A: Actor> = Pin<Box<dyn Future<Output = (A::ActorId, ActorStatus)> + Send>>;
+pub type JoinHandle<A: Actor> = Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>;
 
 #[derive(Error, Debug)]
 pub enum ActorError {
@@ -66,14 +66,14 @@ pub trait Actor: Sized + Send + 'static {
     /// The type of low-priority messages this actor processes.
     type LowPriorityMsg: Debug + Send + 'static;
     /// The unique identifier for this actor.
-    type ActorId: Eq + Hash + Debug + Clone + Send;
+    type Meta: Eq + Hash + Debug + Clone + Send;
 
     /// ObservableState is a state snapshot of an actor. This is mainly used
     /// for testing.
     type ObservableState: std::fmt::Debug + Send + Sync + Clone;
 
-    /// Returns the actor's unique identifier.
-    fn id(&self) -> Self::ActorId;
+    /// Returns the actor's unique meta
+    fn meta(&self) -> Self::Meta;
 
     // Each actor implementor is responsible for defining what state is observable.
     fn get_observable_state(&self) -> Self::ObservableState;
@@ -192,7 +192,7 @@ pub struct ActorHandle<A: Actor> {
     sys_tx: mailbox::Sender<SystemMsg<A::ObservableState>>,
     hi_tx: mailbox::Sender<A::HighPriorityMsg>,
     lo_tx: mailbox::Sender<A::LowPriorityMsg>,
-    pub actor_id: A::ActorId,
+    pub meta: A::Meta,
 }
 
 impl<A: Actor> Clone for ActorHandle<A> {
@@ -201,14 +201,14 @@ impl<A: Actor> Clone for ActorHandle<A> {
             sys_tx: self.sys_tx.clone(),
             hi_tx: self.hi_tx.clone(),
             lo_tx: self.lo_tx.clone(),
-            actor_id: self.actor_id.clone(),
+            meta: self.meta.clone(),
         }
     }
 }
 
 impl<A: Actor> std::fmt::Debug for ActorHandle<A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.actor_id.fmt(f)
+        self.meta.fmt(f)
     }
 }
 
@@ -311,7 +311,7 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
         hi_tx,
         lo_tx,
         sys_tx,
-        actor_id: a.id(),
+        meta: a.meta(),
     };
 
     let ctx = ActorContext {
@@ -321,7 +321,7 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
         handle: handle.clone(),
     };
 
-    let actor_id1 = a.id();
+    let actor_id1 = a.meta();
     let actor_id2 = actor_id1.clone();
 
     let fut = async move {
@@ -341,10 +341,7 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
 
 pub fn spawn_default<A: Actor>(
     a: A,
-) -> (
-    ActorHandle<A>,
-    impl Future<Output = (A::ActorId, ActorStatus)>,
-) {
+) -> (ActorHandle<A>, impl Future<Output = (A::Meta, ActorStatus)>) {
     spawn(a, RunnerConfig::default())
 }
 

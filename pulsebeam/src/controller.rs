@@ -51,10 +51,10 @@ pub struct ControllerActor {
 impl actor::Actor for ControllerActor {
     type HighPriorityMsg = ControllerMessage;
     type LowPriorityMsg = ();
-    type ActorId = Arc<String>;
+    type Meta = Arc<String>;
     type ObservableState = ();
 
-    fn id(&self) -> Self::ActorId {
+    fn meta(&self) -> Self::Meta {
         self.id.clone()
     }
 

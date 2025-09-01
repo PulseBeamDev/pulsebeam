@@ -45,12 +45,12 @@ pub struct RoomState {
 }
 
 impl actor::Actor for RoomActor {
-    type ActorId = Arc<RoomId>;
+    type Meta = Arc<RoomId>;
     type HighPriorityMsg = RoomMessage;
     type LowPriorityMsg = ();
     type ObservableState = RoomState;
 
-    fn id(&self) -> Self::ActorId {
+    fn meta(&self) -> Self::Meta {
         self.room_id.clone()
     }
 
@@ -110,7 +110,7 @@ impl actor::Actor for RoomActor {
                 let track_id = track_meta.id.clone();
                 tracing::info!(
                     "{} published a track, added: {}",
-                    origin.handle.actor_id,
+                    origin.handle.meta,
                     track_id
                 );
 
@@ -200,7 +200,7 @@ impl RoomActor {
         let tracks: Vec<Arc<TrackId>> = participant
             .tracks
             .into_values()
-            .map(|t| t.actor_id.id.clone())
+            .map(|t| t.meta.id.clone())
             .collect();
         let tracks = Arc::new(tracks);
         for p in self.state.participants.values() {

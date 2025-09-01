@@ -20,10 +20,10 @@ pub struct SinkActor {
 impl actor::Actor for SinkActor {
     type LowPriorityMsg = SinkMessage;
     type HighPriorityMsg = ();
-    type ActorId = usize;
+    type Meta = usize;
     type ObservableState = ();
 
-    fn id(&self) -> Self::ActorId {
+    fn meta(&self) -> Self::Meta {
         0
     }
 
