@@ -198,6 +198,9 @@ impl RoomActor {
         let (track_handle, track_join) = actor::spawn(track_actor, actor::RunnerConfig::default());
         self.track_tasks.push(track_join);
         origin.tracks.insert(track_id.clone(), track_handle.clone());
+        self.state
+            .tracks
+            .insert(track_id.clone(), track_handle.clone());
 
         let mut new_tracks = HashMap::new();
         new_tracks.insert(track_id, track_handle.clone());
@@ -212,6 +215,14 @@ impl RoomActor {
         } else {
             return;
         };
+        if let Some(meta) = self
+            .state
+            .participants
+            .get_mut(&track_meta.id.origin_participant)
+        {
+            meta.tracks.remove(&track_meta.id);
+        }
+
         let mut removed_tracks = HashMap::new();
         removed_tracks.insert(track_meta.id.clone(), track_handle);
         let removed_tracks = Arc::new(removed_tracks);
