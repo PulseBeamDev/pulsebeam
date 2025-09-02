@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WHIP WebRTC Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        video {
+            width: 640px;
+            height: 480px;
+            background: black;
+        }
+        button {
+            margin: 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+        }
+        #status {
+            color: red;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>WHIP WebRTC Streaming</h1>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <button id="startButton" onclick="startStreaming()">Start Streaming</button>
+    <button id="stopButton" onclick="stopStreaming()" disabled>Stop Streaming</button>
+    <p id="status"></p>
+
+    <script>
+        let peerConnection = null;
+        let localStream = null;
+        const whipEndpoint = 'http://localhost:3000?room=test&participant=a'; // Replace with your WHIP server endpoint
+        const statusElement = document.getElementById('status');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+
+        async function startStreaming() {
+            try {
+                // Get user media (webcam)
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+
+                // Display local video
+                const localVideo = document.getElementById('localVideo');
+                localVideo.srcObject = localStream;
+
+                // Create WebRTC peer connection
+                peerConnection = new RTCPeerConnection();
+
+
+                peerConnection.addTransceiver(localStream.getVideoTracks()[0], { 'direction': 'sendonly' });
+                peerConnection.addTransceiver(localStream.getAudioTracks()[0], { 'direction': 'sendonly' });
+
+                // Create an SDP offer. This describes the media we want to receive.
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                // Now, we perform the HTTP POST request to the WHEP endpoint.
+                const response = await fetch(whipEndpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/sdp'
+                    },
+                    body: peerConnection.localDescription.sdp
+                });
+
+                if (!response.ok) {
+                    throw new Error(`WHEP request failed with status ${response.status}`);
+                }
+                
+                // The response from the WHEP endpoint is the SDP answer.
+                const answerSdp = await response.text();
+                
+                // Set the remote description with the answer from the server.
+                await peerConnection.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                console.log("Connection established successfully!");
+
+
+                statusElement.textContent = 'Streaming started!';
+                startButton.disabled = true;
+                stopButton.disabled = false;
+            } catch (error) { 
+                statusElement.textContent = `Error: ${error.message}`;
+            }
+        }
+
+        function stopStreaming() {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            document.getElementById('localVideo').srcObject = null;
+            statusElement.textContent = 'Streaming stopped.';
+            startButton.disabled = false;
+            stopButton.disabled = true;
+        }
+    </script>
+</body>
+</html>

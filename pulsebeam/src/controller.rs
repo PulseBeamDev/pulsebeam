@@ -96,11 +96,10 @@ impl ControllerActor {
         let mut rtc = Rtc::builder()
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            // Some WHIP client like OBS WHIP doesn't actively send a binding request,
-            // we need this to keep the timeout refreshed.
-            .set_ice_lite(false)
+            .set_ice_lite(true)
             .enable_vp9(false)
-            .enable_h264(false)
+            .enable_vp8(false)
+            .enable_h264(true)
             .build();
 
         for addr in self.local_addrs.iter() {

@@ -90,7 +90,6 @@ async fn spawn_participant(
     let mut headers = HeaderMap::new();
     headers.insert(LOCATION, location_url.parse().unwrap());
     let resp = (StatusCode::CREATED, headers, answer);
-    tracing::debug!("{resp:?}");
     Ok(resp)
 }
 
