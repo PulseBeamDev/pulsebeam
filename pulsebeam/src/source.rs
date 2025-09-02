@@ -58,11 +58,11 @@ impl actor::Actor for SourceActor {
     ) -> () {
         match msg {
             SourceControlMessage::AddParticipant(ufrag, participant) => {
-                tracing::trace!("added {ufrag} to connection map");
+                tracing::debug!("added {ufrag} to connection map");
                 self.conns.insert(ufrag, participant);
             }
             SourceControlMessage::RemoveParticipant(ufrag) => {
-                tracing::trace!("removed {ufrag} to connection map");
+                tracing::debug!("removed {ufrag} from connection map");
                 self.conns.remove(&ufrag);
                 if let Some(addrs) = self.reverse.remove(&ufrag) {
                     for addr in addrs.iter() {
@@ -91,13 +91,13 @@ impl SourceActor {
                     .push(source);
                 participant_handle.clone()
             } else {
-                tracing::trace!(
+                tracing::debug!(
                     "dropped a packet from {source} due to unregistered stun binding: {ufrag}"
                 );
                 return;
             }
         } else {
-            tracing::trace!(
+            tracing::debug!(
                 "dropped a packet from {source} due to unexpected message flow from an unknown source"
             );
             return;

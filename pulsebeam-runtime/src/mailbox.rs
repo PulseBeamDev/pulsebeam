@@ -73,7 +73,10 @@ impl<T> Sender<T> {
     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
         use mpsc::error::TrySendError as TokioTrySendError;
         self.sender.try_send(message).map_err(|e| match e {
-            TokioTrySendError::Full(m) => TrySendError::Full(m),
+            TokioTrySendError::Full(m) => {
+                tracing::debug!("try_send dropped a packet due to full queue");
+                TrySendError::Full(m)
+            }
             TokioTrySendError::Closed(m) => TrySendError::Closed(m),
         })
     }

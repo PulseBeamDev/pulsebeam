@@ -20,6 +20,7 @@ pub enum RoomMessage {
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
+    ufrag: String, // HACK:
 }
 
 /// Reponsibilities:
@@ -117,14 +118,15 @@ impl RoomActor {
         );
 
         // TODO: capacity
+        let participant_cfg = actor::RunnerConfig::default().with_lo(1024);
         let (participant_handle, participant_join) =
-            actor::spawn(participant_actor, actor::RunnerConfig::default());
+            actor::spawn(participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);
 
         self.system_ctx
             .source_handle
             .send_high(source::SourceControlMessage::AddParticipant(
-                ufrag,
+                ufrag.clone(),
                 participant_handle.clone(),
             ))
             .await
@@ -134,6 +136,7 @@ impl RoomActor {
             ParticipantMeta {
                 handle: participant_handle.clone(),
                 tracks: HashMap::new(),
+                ufrag,
             },
         );
 
@@ -155,6 +158,14 @@ impl RoomActor {
         for track_id in participant.tracks.keys() {
             self.state.tracks.remove(track_id);
         }
+
+        self.system_ctx
+            .source_handle
+            .send_high(source::SourceControlMessage::RemoveParticipant(
+                participant.ufrag,
+            ))
+            .await
+            .expect("TODO: handle error");
 
         // mark this tracks to be shared and immutable
         let tracks = Arc::new(participant.tracks);
@@ -184,7 +195,8 @@ impl RoomActor {
         );
 
         // TODO: update capacities
-        let (track_handle, track_join) = actor::spawn(track_actor, actor::RunnerConfig::default());
+        let (track_handle, track_join) =
+            actor::spawn(track_actor, actor::RunnerConfig::default().with_lo(1024));
         self.track_tasks.push(track_join);
         origin.tracks.insert(track_id.clone(), track_handle.clone());
         self.state
