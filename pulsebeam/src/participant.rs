@@ -211,6 +211,7 @@ impl actor::Actor for ParticipantActor {
                 }
             }
             ParticipantDataMessage::ForwardMedia(track, data) => {
+                tracing::debug!("received forwarded media: track -> participant, {track:?}");
                 self.handle_forward_media(track, data);
             }
 
@@ -260,11 +261,12 @@ impl ParticipantActor {
     async fn init_subscriptions(&mut self, ctx: &mut actor::ActorContext<Self>) {
         // auto subscribe
         let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
-        let mut available_tracks_iter = self.available_video_tracks.iter();
+        let mut available_tracks_iter = self.available_video_tracks.iter_mut();
 
         while let (Some(sub), Some(available)) =
             (subscribed_tracks_iter.next(), available_tracks_iter.next())
         {
+            available.1.mid.replace(*sub.0);
             let meta = &available.1.track.meta;
             sub.1.track_id.replace(meta.id.clone());
             available
@@ -385,17 +387,27 @@ impl ParticipantActor {
                 tracing::info!(track_id = ?track.meta.id, origin = ?track.meta.id.origin_participant, "subscribed track");
                 let track_id = track.meta.id.clone();
 
-                self.available_video_tracks.insert(
-                    track_id.internal.clone(),
-                    TrackOut {
-                        track: track.clone(),
-                        mid: None,
-                    },
-                );
-                let kind = if track.meta.kind.is_video() {
-                    sfu::TrackKind::Video
-                } else {
-                    sfu::TrackKind::Audio
+                let kind = match track.meta.kind {
+                    MediaKind::Video => {
+                        self.available_video_tracks.insert(
+                            track_id.internal.clone(),
+                            TrackOut {
+                                track: track.clone(),
+                                mid: None,
+                            },
+                        );
+                        sfu::TrackKind::Video
+                    }
+                    MediaKind::Audio => {
+                        self.available_audio_tracks.insert(
+                            track_id.internal.clone(),
+                            TrackOut {
+                                track: track.clone(),
+                                mid: None,
+                            },
+                        );
+                        sfu::TrackKind::Audio
+                    }
                 };
 
                 self.pending_published_tracks.push(sfu::TrackInfo {
@@ -461,6 +473,7 @@ impl ParticipantActor {
             }
             Event::MediaData(e) => {
                 if let Some(track) = self.published_video_tracks.get(&e.mid) {
+                    tracing::debug!("forwarded media: participant -> track, {track:?}");
                     let _ = track
                         .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
@@ -542,7 +555,7 @@ impl ParticipantActor {
                     ),
                 };
 
-                // self.reconfigure_downstreams().await;
+                self.init_subscriptions(ctx).await;
             }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
@@ -569,6 +582,7 @@ impl ParticipantActor {
             return;
         };
 
+        tracing::debug!("wrote to rtp");
         if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();

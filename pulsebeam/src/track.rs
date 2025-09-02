@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use str0m::media::MediaData;
+use str0m::media::{KeyframeRequestKind, MediaData};
 use tokio::time::Instant;
 
 use crate::{
@@ -63,6 +63,10 @@ impl actor::Actor for TrackActor {
                 tracing::info!(participant_id=?participant, "track subscribed");
                 self.subscribers
                     .insert(participant.meta.clone(), participant);
+                self.request_keyframe(message::KeyframeRequest {
+                    rid: None,
+                    kind: KeyframeRequestKind::Pli,
+                });
             }
             TrackControlMessage::Unsubscribe(participant_id) => {
                 // TODO: handle unsubscribe
@@ -78,6 +82,7 @@ impl actor::Actor for TrackActor {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
                 for sub in self.subscribers.values() {
+                    tracing::debug!("forwarded media: track -> participant");
                     let _ = sub.try_send_low(participant::ParticipantDataMessage::ForwardMedia(
                         self.meta.clone(),
                         data.clone(),
@@ -85,17 +90,7 @@ impl actor::Actor for TrackActor {
                 }
             }
             TrackDataMessage::KeyframeRequest(req) => {
-                let now = Instant::now();
-                let elapsed = now.duration_since(self.last_keyframe_request);
-                if elapsed >= KEYFRAME_REQUEST_THROTTLE {
-                    let _ = self.origin.try_send_low(
-                        participant::ParticipantDataMessage::KeyframeRequest(
-                            self.meta.id.clone(),
-                            req,
-                        ),
-                    );
-                    self.last_keyframe_request = now;
-                }
+                self.request_keyframe(req);
             }
         }
     }
@@ -109,6 +104,20 @@ impl TrackActor {
             subscribers: BTreeMap::new(),
             // allow keyframe request immediately
             last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
+        }
+    }
+
+    pub fn request_keyframe(&mut self, req: message::KeyframeRequest) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_keyframe_request);
+        if elapsed >= KEYFRAME_REQUEST_THROTTLE {
+            let _ = self
+                .origin
+                .try_send_low(participant::ParticipantDataMessage::KeyframeRequest(
+                    self.meta.id.clone(),
+                    req,
+                ));
+            self.last_keyframe_request = now;
         }
     }
 }

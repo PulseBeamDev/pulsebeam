@@ -42,8 +42,13 @@ async function startWHEP() {
   pc.addTransceiver("video", { direction: "recvonly" });
   pc.addTransceiver("audio", { direction: "recvonly" });
 
+  // Create a MediaStream for the remote tracks
+  const remoteStream = new MediaStream();
+  video.srcObject = remoteStream;
+
   pc.ontrack = (event) => {
-    video.srcObject = event.streams[0];
+    console.log("Got remote track:", event.track.kind);
+    remoteStream.addTrack(event.track);
   };
 
   await start(pc);
