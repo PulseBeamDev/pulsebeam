@@ -75,6 +75,9 @@ impl actor::Actor for SourceActor {
 }
 
 impl SourceActor {
+    // TODO: TCP candidate
+    // TODO: TLS candidate
+    // TODO: NAT rebinding
     pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
         let participant_handle = if let Some(participant_handle) = self.mapping.get(&source) {
             tracing::trace!("found connection from mapping: {source} -> {participant_handle:?}");
