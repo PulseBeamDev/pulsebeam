@@ -81,7 +81,7 @@ impl SourceActor {
             participant_handle.clone()
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
             if let Some(participant_handle) = self.conns.get(ufrag) {
-                tracing::trace!(
+                tracing::debug!(
                     "found connection from ufrag: {ufrag} -> {source} -> {participant_handle:?}"
                 );
                 self.mapping.insert(source, participant_handle.clone());
