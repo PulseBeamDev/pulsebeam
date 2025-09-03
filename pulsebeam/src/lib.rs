@@ -1,3 +1,4 @@
+pub mod audio_selector;
 pub mod controller;
 pub mod entity;
 pub mod ice;

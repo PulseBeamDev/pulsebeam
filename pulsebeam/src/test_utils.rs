@@ -2,11 +2,16 @@ use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use crate::{entity, system};
 use pulsebeam_runtime::net;
+use str0m::media::Mid;
 
-pub fn create_participant() -> (Arc<entity::ParticipantId>, Box<str0m::Rtc>) {
+pub fn create_participant_id() -> Arc<entity::ParticipantId> {
     let external = entity::ExternalParticipantId::new(entity::new_random_id("tp", 10)).unwrap();
     let participant_id = entity::ParticipantId::new(external);
-    let participant_id = Arc::new(participant_id);
+    Arc::new(participant_id)
+}
+
+pub fn create_participant() -> (Arc<entity::ParticipantId>, Box<str0m::Rtc>) {
+    let participant_id = create_participant_id();
     let rtc = str0m::Rtc::new();
 
     (participant_id, Box::new(rtc))
@@ -31,4 +36,9 @@ pub async fn create_system_ctx() -> system::SystemContext {
         .unwrap();
     let (system_ctx, _) = system::SystemContext::spawn(external_addr, socket);
     system_ctx
+}
+
+pub fn create_track_id() -> Arc<entity::TrackId> {
+    let participant_id = create_participant_id();
+    Arc::new(entity::TrackId::new(participant_id, Mid::new()))
 }
