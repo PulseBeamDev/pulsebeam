@@ -88,7 +88,6 @@ pub struct ParticipantActor {
     published_audio_tracks: HashMap<Mid, track::TrackHandle>,
     subscribed_video_tracks: HashMap<Mid, MidOutSlot>,
     subscribed_audio_tracks: HashMap<Mid, MidOutSlot>,
-    initialized: bool,
 
     // Global view of available tracks. This participant view is mirrored
     // 1:1 to the client. Thus, it's possible to be slightly different than the
@@ -242,7 +241,6 @@ impl ParticipantActor {
             participant_id,
             rtc,
 
-            initialized: false,
             published_video_tracks: HashMap::new(),
             published_audio_tracks: HashMap::new(),
             available_video_tracks: HashMap::new(),
@@ -258,8 +256,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn init_subscriptions(&mut self, ctx: &mut actor::ActorContext<Self>) {
-        // auto subscribe
+    async fn auto_subscribe(&mut self, ctx: &mut actor::ActorContext<Self>) {
         let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
         let mut available_tracks_iter = self.available_video_tracks.iter_mut();
 
@@ -276,13 +273,12 @@ impl ParticipantActor {
                 .await;
             tracing::info!("replaced track");
         }
-        self.initialized = true
     }
 
     async fn poll(&mut self, ctx: &mut actor::ActorContext<Self>) -> Option<Duration> {
         while self.rtc.is_alive() {
             if self.should_resync {
-                self.resync();
+                self.resync(ctx).await;
             }
 
             // Poll output until we get a timeout. The timeout means we
@@ -321,10 +317,11 @@ impl ParticipantActor {
         None
     }
 
-    fn resync(&mut self) {
+    async fn resync(&mut self, ctx: &mut actor::ActorContext<Self>) {
         // resync all pending states with client
         // TODO: check pending states and resync
 
+        self.auto_subscribe(ctx).await;
         self.should_resync = false;
     }
 
@@ -555,13 +552,14 @@ impl ParticipantActor {
                     ),
                 };
 
-                self.init_subscriptions(ctx).await;
+                self.auto_subscribe(ctx).await;
             }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
                 self.rtc.disconnect();
             }
         }
+        self.should_resync = true;
     }
 
     fn handle_forward_media(&mut self, track: Arc<TrackMeta>, data: Arc<MediaData>) {

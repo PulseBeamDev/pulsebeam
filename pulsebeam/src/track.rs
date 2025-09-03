@@ -8,7 +8,7 @@ use crate::{
     message::{self, TrackMeta},
     participant::{self, ParticipantHandle},
 };
-use pulsebeam_runtime::actor;
+use pulsebeam_runtime::{actor, mailbox};
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
@@ -69,7 +69,7 @@ impl actor::Actor for TrackActor {
                 });
             }
             TrackControlMessage::Unsubscribe(participant_id) => {
-                // TODO: handle unsubscribe
+                self.subscribers.remove(&participant_id);
             }
         }
     }
@@ -81,12 +81,23 @@ impl actor::Actor for TrackActor {
     ) -> () {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
-                for sub in self.subscribers.values() {
+                let mut to_remove = Vec::new();
+                for (participant_id, sub) in &self.subscribers {
                     tracing::debug!("forwarded media: track -> participant");
-                    let _ = sub.try_send_low(participant::ParticipantDataMessage::ForwardMedia(
+                    let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardMedia(
                         self.meta.clone(),
                         data.clone(),
                     ));
+
+                    // This gets triggered when a participant actor leaves
+                    if let Err(mailbox::TrySendError::Closed(_)) = res {
+                        // TODO: should this be a part of unsubscribe instead?
+                        to_remove.push(participant_id.clone());
+                    }
+                }
+
+                for key in to_remove {
+                    self.subscribers.remove(&key);
                 }
             }
             TrackDataMessage::KeyframeRequest(req) => {
