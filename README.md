@@ -71,7 +71,7 @@ git clone https://github.com/pulsebeamdev/pulsebeam.git
 cd pulsebeam
 
 # 2. Run the server
-cargo run
+cargo run --release
 ```
 
 Next, open `http://localhost:7880/demo` in two browser tabs to see the media relay in action.
