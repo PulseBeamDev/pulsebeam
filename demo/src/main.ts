@@ -1,81 +1,67 @@
-const mode = document.querySelector<HTMLInputElement>("input[name=mode]")!;
-const video = document.querySelector<HTMLVideoElement>("video")!;
-const trigger = document.querySelector<HTMLButtonElement>("#trigger")!;
-const form = document.querySelector<HTMLFormElement>("form")!;
-const endpoint = "http://localhost:3000?room=test&participant=lukas";
+const localVideo = document.getElementById("local") as HTMLVideoElement;
+const remoteVideo = document.getElementById("remote") as HTMLVideoElement;
+const form = document.getElementById("controls") as HTMLFormElement;
+const endpointInput = document.getElementById("endpoint") as HTMLInputElement;
+const toggleBtn = document.getElementById("toggle") as HTMLButtonElement;
+const statusEl = document.getElementById("status") as HTMLSpanElement;
 
-form.onsubmit = async (e) => {   
+let pc: RTCPeerConnection | null = null;
+let localStream: MediaStream | null = null;
+
+form.onsubmit = async (e) => {
   e.preventDefault();
-  const data = new FormData(form);
-  try {
-    if (data.get("mode") === "whip") {
-      await startWHIP();
-    } else {
-      await startWHEP();
-    }
-  } catch (e) {
-    console.error(e);
-    alert(`Error: ${e}`);
+  if (pc) {
+    stop();
+  } else {
+    const endpoint = endpointInput.value.trim();
+    if (!endpoint) return alert("Please enter a valid endpoint");
+    toggleBtn.textContent = "Stop";
+    await start(endpoint);
   }
-}
+};
 
-async function startWHIP() {
-  console.log("Starting WHIP...");
-  const pc = new RTCPeerConnection();
+async function start(endpoint: string) {
+  pc = new RTCPeerConnection();
+
+  // WHIP: send-only transceivers
   const videoTrans = pc.addTransceiver("video", { direction: "sendonly" });
   const audioTrans = pc.addTransceiver("audio", { direction: "sendonly" });
+  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  videoTrans.sender.replaceTrack(localStream.getVideoTracks()[0]);
+  audioTrans.sender.replaceTrack(localStream.getAudioTracks()[0]);
+  localVideo.srcObject = localStream;
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: true,
-    audio: true,
-  });
-  videoTrans.sender.replaceTrack(stream.getVideoTracks()[0]);
-  audioTrans.sender.replaceTrack(stream.getAudioTracks()[0]);
-  video.srcObject = stream;
-
-  await start(pc);
-}
-
-async function startWHEP() {
-  console.log("Starting WHEP...");
-  const pc = new RTCPeerConnection();
-
+  // WHEP: recv-only transceivers
   pc.addTransceiver("video", { direction: "recvonly" });
   pc.addTransceiver("audio", { direction: "recvonly" });
-
-  // Create a MediaStream for the remote tracks
   const remoteStream = new MediaStream();
-  video.srcObject = remoteStream;
+  remoteVideo.srcObject = remoteStream;
+  pc.ontrack = (e) => remoteStream.addTrack(e.track);
 
-  pc.ontrack = (event) => {
-    console.log("Got remote track:", event.track.kind);
-    remoteStream.addTrack(event.track);
-  };
-
-  await start(pc);
-}
-
-async function start(pc: RTCPeerConnection) {
   pc.onconnectionstatechange = () => {
-    console.log("Connection state:", pc.connectionState);
+    statusEl.textContent = pc?.connectionState ?? "Disconnected";
   };
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/sdp",
-    },
+    headers: { "Content-Type": "application/sdp" },
     body: offer.sdp,
   });
-
-  if (!response.ok) {
-    throw new Error(`WHEP request failed with status ${response.status}`);
-  }
-
+  if (!response.ok) throw new Error(`request failed: ${response.status}`);
   const answerSdp = await response.text();
-
   await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-  console.log("Connection established successfully!");
 }
+
+function stop() {
+  pc?.close();
+  localStream?.getTracks().forEach(track => track.stop());
+  localVideo.srcObject = null;
+  remoteVideo.srcObject = null;
+
+  pc = null;
+  localStream = null;
+  toggleBtn.textContent = "Start";
+  statusEl.textContent = pc?.connectionState ?? "Disconnected";
+}
+

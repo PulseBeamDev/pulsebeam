@@ -4,35 +4,36 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-
   <title>PulseBeam WHIP/WHEP</title>
   <link href="https://cdn.jsdelivr.net/npm/beercss@3.11.33/dist/cdn/beer.min.css" rel="stylesheet">
-  <script type="module" src="https://cdn.jsdelivr.net/npm/beercss@3.11.33/dist/cdn/beer.min.js"></script>
-  <script type="module"
-    src="https://cdn.jsdelivr.net/npm/material-dynamic-colors@1.1.2/dist/cdn/material-dynamic-colors.min.js"></script>
 </head>
 
 <body>
-  <div id="app">
-    <main class="responsive">
-      <h2>PulseBeam</h2>
-      <form class="field middle-align">
-        <nav>
-          <label class="radio">
-            <input type="radio" name="mode" value="whip" checked>
-            <span>WHIP</span>
-          </label>
-          <label class="radio">
-            <input type="radio" name="mode" value="whep">
-            <span>WHEP</span>
-          </label>
-        </nav>
+  <main class="responsive p-2">
+    <h2>PulseBeam</h2>
 
-        <button type="submit" id="trigger">Start Streaming</button>
-      </form>
-      <video width=1280 height=720 style="background-color: black" autoplay></video>
-    </main>
-  </div>
+    <form id="controls" class="field middle-align mb-2">
+      <input type="text" id="endpoint" placeholder="Enter WHIP/WHEP endpoint"
+        value="http://localhost:3000?room=test&participant=lukas" required />
+      <button type="submit" id="toggle" class="small-round">Start</button>
+    </form>
+
+    <button class="chip">
+      <i class="primary-text">fiber_manual_record</i>
+      <span id="status">Disconnected</span>
+    </button>
+
+    <div class="grid gap-2 responsive" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));">
+      <div class="card">
+        <h3>Local</h3>
+        <video id="local" autoplay muted style="width: 100%; height: auto; background:black;"></video>
+      </div>
+      <div class="card">
+        <h3>Remote</h3>
+        <video id="remote" autoplay style="width: 100%; height: auto; background:black;"></video>
+      </div>
+    </div>
+  </main>
 
   <script type="module" src="/src/main.ts"></script>
 </body>
