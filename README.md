@@ -5,129 +5,148 @@
 </p>
 
 <h1 align="center">PulseBeam</h1>
+
 <p align="center">
-  <strong>A lightweight, open-source SFU for real-time communication.</strong>
+  An open-source stack for real-time audio and video, with a focus on reliability and simplicity.
+</p>
+
+<p align="center">
+  <a href="https://github.com/pulsebeamdev/pulsebeam/issues">Report a Bug</a>
+  ·
+  <a href="https://github.com/pulsebeamdev/pulsebeam/issues">Request a Feature</a>
+  ·
+  <a href="https://discord.gg/Bhd3t9afuB">Join our Discord</a>
 </p>
 
 ---
 
-## Overview
+## What is PulseBeam?
 
-PulseBeam is a **lightweight, open-source SFU (Selective Forwarding Unit)** built in Rust. It helps you relay audio, video, and data between participants in real time—without the complexity of traditional solutions.  
+PulseBeam is an open-source media stack for building real-time applications. Our approach is guided by a focus on creating a robust, simple, and scalable foundation for developers.
 
-At its core, PulseBeam is **minimal and reliable**, designed to do one thing well: efficient media relay. Everything else lives outside the core, powered by **agents**—server-side clients that connect in real time to extend functionality.  
+At its heart is a minimal **Selective Forwarding Unit (SFU) written in Rust**. We've intentionally kept the core small, dedicated only to the essential task of routing real-time media. This design choice aims to create a stable and predictable system that is easy to reason about.
 
-Agents can do things like **record sessions, moderate content, run analytics, or even host AI models** that process streams in real time (transcription, translation, summarization, moderation, and more).  
+For all other features—like recording, analytics, or AI integrations—our design encourages building them as independent, server-side services that connect to the core, keeping the central media server stable and uncluttered.
 
-PulseBeam speaks **WHIP/WHEP by default**, so existing clients just work, and extensions let you go further when you need them.  
+### Our Design Philosophy
+
+*   **A Minimal Core:** We believe a small, stable core is the best foundation for a reliable system. It's easier to maintain, debug, and build upon.
+*   **Modular Features:** Our goal is to enable powerful functionality without creating a monolith. We favor a design where features are deployed as decoupled services.
+*   **Simple, HTTP-Based Signaling:** We use a simple, request/response signaling protocol that is a superset of WHIP/WHEP. This provides out-of-the-box compatibility while allowing for extensions to handle advanced use cases—all without requiring WebSockets for signaling.
+*   **Open and Transparent:** The project is open source, and building in Rust helps us create efficient and memory-safe code by design. We aim to be transparent in our work as we build the project with the community.
+
+---
+
+## A Simple Mental Model
+
+The architecture of PulseBeam is straightforward. The core SFU sits in the middle and relays media. On either side, different kinds of clients connect to it.
+
+```
++-----------------+      +--------------------+      +----------------------+
+|                 |      |                    |      |                      |
+| End-User Clients|      |                    |      | Server-Side Services |
+| (Browsers,      |<---->| PulseBeam Core SFU |<---->| (Recording,          |
+|  Mobile Apps,   |      |  (Media Relay)     |      |  AI, Analytics)      |
+|  Embedded)      |      |                    |      |                      |
++-----------------+      +--------------------+      +----------------------+
+```
+
+Conceptually, we find it helpful to think of every client that connects to the core as an **"agent"** with a specific job.
+
+From this perspective, a participant in a browser is simply an agent responsible for user interaction and media capture. A recording bot is an agent whose job is to persist media streams to disk.
+
+This mental model helps us keep the core SFU incredibly simple. The core doesn't need to know about different "types" of clients; it just routes media between connected agents. This is the key to the simplicity and robustness we're striving for.
 
 ---
 
 ## Quickstart
 
-Requirements: Rust and Cargo.
+You can get a PulseBeam server running locally in under a minute.
+
+**Requirements:** Rust and Cargo.
 
 ```bash
+# 1. Clone the repository
 git clone https://github.com/pulsebeamdev/pulsebeam.git
 cd pulsebeam
+
+# 2. Run the server
 cargo run
-````
+```
 
-Open `http://localhost:7880/demo` in two browser tabs to test a basic audio/video relay.
+Next, open `http://localhost:7880/demo` in two browser tabs to see the media relay in action.
 
-*(Early version—your feedback and contributions are welcome!)*
+*(This is an early version of PulseBeam. Your feedback and contributions are incredibly valuable as we work towards building a truly reliable platform.)*
 
 ---
 
-## High-Level Architecture
+## API & Usage
 
-PulseBeam follows a **minimal core + agents** model:
+PulseBeam's signaling is designed for both simplicity and flexibility. For basic media exchange, it's compatible with the WHIP/WHEP standard.
 
-```
- Participants <--> PulseBeam Core SFU <--> Agents
- (Browsers,           (Media relay)       (Recording, Moderation,
-  Mobile,                                  Analytics, AI, Integrations)
-  Embedded)                              
-```
+### Example: Connecting with WHIP/WHEP
 
-Agents are just **clients with special jobs**. They connect and communicate in real time, but instead of sending a webcam feed, they can capture streams, generate them, analyze them, or feed them into other systems.
-
----
-
-## Planned API
-
-PulseBeam works with WHIP/WHEP clients as-is, while supporting extensions for more advanced workflows. Cross-platform SDKs are planned for handling advanced features like dynamic stream prioritization, reconnection, etc.
-
-## Example: 1:1 Call with WHIP/WHEP
-
-With PulseBeam, you can set up a working 1:1 call in just a few lines of JavaScript:
+This example uses browser-native JavaScript—no proprietary SDKs are required for basic media publishing and viewing.
 
 ```javascript
 const pc = new RTCPeerConnection();
 
-// Local: send-only transceivers
+// Configure local media
 const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-pc.addTransceiver("video", { direction: "sendonly" })
-  .sender.replaceTrack(stream.getVideoTracks()[0]);
-pc.addTransceiver("audio", { direction: "sendonly" })
-  .sender.replaceTrack(stream.getAudioTracks()[0]);
-document.getElementById("local").srcObject = stream;
+pc.addTransceiver("video", { direction: "sendonly" }).sender.replaceTrack(stream.getVideoTracks()[0]);
+pc.addTransceiver("audio", { direction: "sendonly" }).sender.replaceTrack(stream.getAudioTracks()[0]);
 
-// Remote: recv-only transceivers
-pc.addTransceiver("video", { direction: "recvonly" });
-pc.addTransceiver("audio", { direction: "recvonly" });
-const remote = new MediaStream();
-pc.ontrack = e => remote.addTrack(e.track);
-document.getElementById("remote").srcObject = remote;
-
-// Negotiate with PulseBeam
+// Negotiate with the PulseBeam server
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
-const res = await fetch("http://localhost:7880?room=test&participant=alice", {
-  method: "POST", headers: { "Content-Type": "application/sdp" }, body: offer.sdp,
+
+const res = await fetch("http://localhost:3000?room=test&participant=alice", {
+  method: "POST",
+  headers: { "Content-Type": "application/sdp" },
+  body: offer.sdp,
 });
 await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 ```
 
-👉 See [demo](./demo) for a complete HTML + TypeScript demo with controls.
+This simple, HTTP-based interaction model is the foundation for how all clients, including server-side services, will communicate with the core.
+
+👉 For a complete implementation with UI controls, see the [demo](./demo) directory.
 
 ---
 
 ## Roadmap
 
-| Stage                      | Status & Focus                                                 |
-| -------------------------- | -------------------------------------------------------------- |
-| **Prototype**              | ✅ Minimal core relay running, demo available                   |
-| **Core Relay**             | 🚧 Improving stability & robustness                            |
-| **Agent Modules**          | Planned — recording, moderation, analytics, AI                 |
-| **SDKs & Integrations**    | Planned — JavaScript, embedded, and native SDKs                |
-| **Scaling & Optimization** | Planned — cascading SFUs, performance tuning, deployment tools |
+Our roadmap reflects our focus on building a stable foundation first.
+
+| Stage                      | Status & Focus                                                                                                              |
+| :------------------------- | :-------------------------------------------------------------------------------------------------------------------------- |
+| **Prototype**              | ✅ Minimal core SFU is functional with a working demo.                                                                      |
+| **Core Relay Stability**   | 🚧 **Current Focus:** Hardening the core SFU. Our main effort is on improving stability, connection recovery, and resilience.    |
+| **Signaling & Agent API**  | 📅 **Next:** Defining and documenting our full HTTP-based signaling API, ensuring it's robust for all types of clients.     |
+| **Essential Services & SDKs**| 📅 **Planned:** Releasing official server-side services (e.g., recording) and a lightweight JavaScript SDK.                 |
+| **Scaling & Deployment**   | 📅 **Future:** Developing guides and tools for multi-node deployments and high-availability configurations.                   |
 
 ---
 
 ## Contributing
 
-You can help shape PulseBeam in many ways:
+PulseBeam is a community-driven project, and we welcome contributions of all kinds.
 
-* Improve the Rust core
-* Prototype new agent modules
-* Build SDKs (JavaScript, embedded, native)
-* Write docs, tests, or tutorials
+*   **Improve the Rust core:** Help us enhance the robustness and reliability of the SFU.
+*   **Prototype new services:** Experiment with new server-side capabilities in a decoupled way.
+*   **Build SDKs:** Help create developer-friendly wrappers for web, mobile, or native platforms.
+*   **Write docs, tests, or tutorials:** Your help makes PulseBeam more accessible and dependable for everyone.
 
 ---
 
 ## Join the Community
 
-PulseBeam is for developers who want real-time communication that’s **lightweight, open, and extensible.**
+If our approach to building simpler, more robust real-time tools resonates with you, we'd love for you to get involved. By contributing, you can help shape a foundational piece of open infrastructure.
 
-By contributing early, you’re not just adding code—you’re shaping the foundation of a project that makes programmable video/audio simpler for everyone.
-
-✨ Try it, share feedback, or contribute. Every bit helps.
-
-💬 Join us on [Discord](https://discord.gg/Bhd3t9afuB) to connect with other developers and contributors.
+💬 **[Join us on Discord](https://discord.gg/Bhd3t9afuB)** to connect with the team and other developers.
 
 ---
 
 ## License
 
-PulseBeam server is open source under the GNU Affero General Public License Version 3 (AGPLv3).
+PulseBeam is open source, licensed under the **GNU Affero General Public License v3.0**.
