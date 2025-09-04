@@ -39,6 +39,7 @@ async function startWHIP() {
 async function startWHEP() {
   console.log("Starting WHEP...");
   const pc = new RTCPeerConnection();
+
   pc.addTransceiver("video", { direction: "recvonly" });
   pc.addTransceiver("audio", { direction: "recvonly" });
 
