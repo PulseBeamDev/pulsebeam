@@ -165,7 +165,15 @@ impl actor::Actor for ParticipantActor {
             }
             ParticipantControlMessage::TracksUnpublished(track_ids) => {
                 for track_id in track_ids.keys() {
-                    let Some(track) = self.available_video_tracks.remove(&track_id.internal) else {
+                    let track = if let Some(track) =
+                        self.available_video_tracks.remove(&track_id.internal)
+                    {
+                        track
+                    } else if let Some(track) =
+                        self.available_audio_tracks.remove(&track_id.internal)
+                    {
+                        track
+                    } else {
                         return;
                     };
 
@@ -174,8 +182,16 @@ impl actor::Actor for ParticipantActor {
                     };
 
                     match track.track.meta.kind {
-                        MediaKind::Video => self.subscribed_video_tracks.remove(&mid),
-                        MediaKind::Audio => self.subscribed_audio_tracks.remove(&mid),
+                        MediaKind::Video => {
+                            if let Some(slot) = self.subscribed_video_tracks.get_mut(&mid) {
+                                slot.track_id = None;
+                            }
+                        }
+                        MediaKind::Audio => {
+                            if let Some(slot) = self.subscribed_audio_tracks.get_mut(&mid) {
+                                slot.track_id = None;
+                            }
+                        }
                     };
 
                     self.pending_unpublished_tracks.push(track_id.to_string());
@@ -257,21 +273,29 @@ impl ParticipantActor {
     }
 
     async fn auto_subscribe(&mut self, ctx: &mut actor::ActorContext<Self>) {
-        let mut subscribed_tracks_iter = self.subscribed_video_tracks.iter_mut();
-        let mut available_tracks_iter = self.available_video_tracks.iter_mut();
+        let mut slot_iter = self.subscribed_video_tracks.iter_mut();
 
-        while let (Some(sub), Some(available)) =
-            (subscribed_tracks_iter.next(), available_tracks_iter.next())
-        {
-            available.1.mid.replace(*sub.0);
-            let meta = &available.1.track.meta;
-            sub.1.track_id.replace(meta.id.clone());
-            available
-                .1
-                .track
-                .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
-                .await;
-            tracing::info!("replaced track");
+        'outer: for (track_id, track) in self.available_video_tracks.iter_mut() {
+            if track.mid.is_some() {
+                continue;
+            }
+
+            loop {
+                let (slot_id, slot) = if let Some(slot) = slot_iter.next() {
+                    slot
+                } else {
+                    break 'outer;
+                };
+
+                track.mid.replace(*slot_id);
+                let meta = &track.track.meta;
+                slot.track_id.replace(meta.id.clone());
+                track
+                    .track
+                    .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
+                    .await;
+                tracing::info!("allocated slot: {track_id} -> {slot_id}");
+            }
         }
     }
 
@@ -508,6 +532,7 @@ impl ParticipantActor {
 
     async fn handle_new_media(&mut self, ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
         match media.direction {
+            // TODO: limit at most 1 video, 1 audio
             // client -> SFU
             Direction::RecvOnly => {
                 tracing::info!(?media, "handle_new_media from client");
@@ -551,8 +576,6 @@ impl ParticipantActor {
                         },
                     ),
                 };
-
-                self.auto_subscribe(ctx).await;
             }
             dir => {
                 tracing::warn!("{dir} transceiver is unsupported, shutdown misbehaving client");
