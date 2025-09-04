@@ -99,6 +99,8 @@ impl ControllerActor {
             .set_ice_lite(false)
             .enable_vp9(false)
             .enable_vp8(false)
+            // h264 as the lowest common denominator due to small clients like
+            // embedded devices, smartphones, OBS only supports H264
             .enable_h264(true)
             .build();
 
