@@ -3,6 +3,7 @@ pub mod controller;
 pub mod entity;
 pub mod ice;
 pub mod message;
+pub mod node;
 pub mod participant;
 pub mod proto;
 pub mod room;
