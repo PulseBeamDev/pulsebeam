@@ -15,6 +15,13 @@ panic = "unwind"
 debug = 1
 strip = "debuginfo"
 
+[profile.profiling]
+inherits = "release"
+debug = true # Full debug info for symbols and source lines
+strip = false # Retain symbols for profiling
+debug-assertions = false # Match release behavior
+panic = "abort" # make sure we don't include unwind in profile
+
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"]}

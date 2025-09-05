@@ -287,6 +287,10 @@ impl ParticipantActor {
                     break 'outer;
                 };
 
+                if slot.track_id.is_some() {
+                    continue;
+                }
+
                 track.mid.replace(*slot_id);
                 let meta = &track.track.meta;
                 slot.track_id.replace(meta.id.clone());
