@@ -381,6 +381,9 @@ macro_rules! actor_loop {
         loop {
             $($pre_select)*
 
+            // TODO: in a hot loop, this recv loop will incur a lot of synchronization cost.
+            // We should use try_recv as opposed to recv, aka trading off fairness with higher
+            // throughput
             tokio::select! {
                 biased;
                 res = $ctx.sys_rx.recv() => {

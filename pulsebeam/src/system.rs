@@ -21,7 +21,8 @@ impl SystemContext {
         // TODO: tune capacity
         let (source_handle, source_join) =
             actor::spawn(source_actor, actor::RunnerConfig::default());
-        let (sink_handle, sink_join) = actor::spawn(sink_actor, actor::RunnerConfig::default());
+        let (sink_handle, sink_join) =
+            actor::spawn(sink_actor, actor::RunnerConfig::default().with_lo(8192));
 
         let task = tokio::spawn(async {
             tokio::join!(source_join, sink_join);
