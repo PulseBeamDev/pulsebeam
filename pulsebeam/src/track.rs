@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use str0m::media::{KeyframeRequestKind, MediaData};
+use str0m::media::{KeyframeRequestKind, MediaData, Rid};
 use tokio::time::Instant;
 
 use crate::{
@@ -11,6 +11,10 @@ use crate::{
 use pulsebeam_runtime::{actor, mailbox};
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
+// Common simulcast RIDs (quarter, half, full)
+pub const RID_Q: Rid = Rid::from_array(*b"q\0\0\0\0\0\0\0");
+pub const RID_H: Rid = Rid::from_array(*b"h\0\0\0\0\0\0\0");
+pub const RID_F: Rid = Rid::from_array(*b"f\0\0\0\0\0\0\0");
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrackError {}
@@ -39,6 +43,8 @@ pub struct TrackActor {
     origin: ParticipantHandle,
     subscribers: BTreeMap<Arc<ParticipantId>, ParticipantHandle>,
     last_keyframe_request: Instant,
+
+    pinned_rid: Option<Rid>,
 }
 
 impl actor::Actor for TrackActor {
@@ -81,6 +87,11 @@ impl actor::Actor for TrackActor {
     ) -> () {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
+                // TODO: adjust streams based on subscribers
+                if data.rid != self.pinned_rid {
+                    return;
+                }
+
                 let mut to_remove = Vec::new();
                 for (participant_id, sub) in &self.subscribers {
                     tracing::debug!("forwarded media: track -> participant");
@@ -107,20 +118,38 @@ impl actor::Actor for TrackActor {
     }
 }
 
+pub fn pin_rid(simulcast_rids: &Option<Vec<Rid>>) -> Option<Rid> {
+    if let Some(rids) = simulcast_rids {
+        for rid in rids {
+            if rid.starts_with('f') {
+                return Some(*rid);
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+
 impl TrackActor {
     pub fn new(origin: ParticipantHandle, meta: Arc<TrackMeta>) -> Self {
+        let pinned_rid = pin_rid(&meta.simulcast_rids);
+        tracing::info!("selected: {pinned_rid:?}");
+
         Self {
             meta,
             origin,
             subscribers: BTreeMap::new(),
             // allow keyframe request immediately
             last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
+            pinned_rid,
         }
     }
 
-    pub fn request_keyframe(&mut self, req: message::KeyframeRequest) {
+    pub fn request_keyframe(&mut self, mut req: message::KeyframeRequest) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_keyframe_request);
+        req.rid = self.pinned_rid;
         if elapsed >= KEYFRAME_REQUEST_THROTTLE {
             let _ = self
                 .origin
