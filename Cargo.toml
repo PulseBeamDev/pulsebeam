@@ -34,7 +34,8 @@ rand = "0.9"
 [workspace]
 resolver = "2"
 members = [
-  "pulsebeam-runtime",
-  "pulsebeam-agent",
   "pulsebeam", 
+  "pulsebeam-agent",
+  "pulsebeam-runtime",
+  "pulsebeam-simulator",
 ]
