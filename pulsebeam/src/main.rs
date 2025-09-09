@@ -11,8 +11,10 @@ use systemstat::{Platform, System};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_target(true)
         .pretty()
         .init();
@@ -62,12 +64,17 @@ fn main() {
 }
 
 pub async fn run(cpu_rt: rt::Runtime) {
-    let external_addr: SocketAddr = format!("{}:3478", select_host_address()).parse().unwrap();
+    let external_ip = select_host_address();
+    let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
     let unified_socket = net::UnifiedSocket::bind(local_addr, net::Transport::Udp)
         .await
         .expect("bind to udp socket");
     let http_socket: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+    tracing::info!(
+        "✅ Signaling server listening. Clients should connect to http://{}:3000 or http://localhost:3000",
+        external_ip,
+    );
 
     node::run(cpu_rt, external_addr, unified_socket, http_socket)
         .await
