@@ -6,7 +6,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::net::{IpAddr, SocketAddr};
 
 use pulsebeam::node;
-use pulsebeam_runtime::net;
+use pulsebeam_runtime::{net, rt};
 use systemstat::{Platform, System};
 use tracing_subscriber::EnvFilter;
 
@@ -17,21 +17,51 @@ fn main() {
         .pretty()
         .init();
 
+    // Runtime priority strategy for SFU:
+    // - IO runtime stays at *default* system priority (normal).
+    //   We do NOT boost it above normal to avoid starving CPU workers.
+    // - CPU runtime threads are set to a slightly *lower* priority (e.g. 30–40 on
+    //   thread-priority’s crossplatform scale). This ensures:
+    //     * Signaling / HTTP / control I/O remains responsive under load.
+    //     * CPU-heavy media tasks still get full throughput when system is idle.
+    //     * No elevated privileges needed (unlike raising priority).
+    // In short: keep IO normal, lower CPU pool, let the OS scheduler do the rest.
+    //
+    // We intentionally avoid CPU core pinning here:
+    // - Pinning can reduce scheduler flexibility: if a pinned worker is overloaded
+    //   while another core is idle, throughput suffers.
+    // - In multi-tenant / VPS / VM / NUMA environments, pinning may backfire by
+    //   increasing memory latency or conflicting with the hypervisor.
+    // - Letting the OS scheduler float CPU worker threads generally gives better
+    //   balance and portability across environments.
+    // If ultra-low latency is required on bare metal, prefer isolating a core at
+    // the deployment level (e.g. taskset, cgroups) instead of hard pinning in code.
+
     // https://github.com/tokio-rs/tokio/discussions/6831
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let cpu_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .thread_name("cpu")
+        .on_thread_start(|| {
+            // lower priority for CPU works so IO gets higher priority
+            thread_priority::set_current_thread_priority(
+                thread_priority::ThreadPriority::Crossplatform(
+                    thread_priority::ThreadPriorityValue::try_from(40).unwrap(),
+                ),
+            )
+            .unwrap();
+        })
         .build()
         .unwrap();
-    let handle = rt.spawn(run());
-    rt.block_on(handle).unwrap();
-    // let rt = tokio::runtime::Builder::new_current_thread()
-    //     .enable_all()
-    //     .build()
-    //     .unwrap();
-    // rt.block_on(run());
+
+    let io_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .thread_name("io")
+        .build()
+        .unwrap();
+    io_rt.block_on(run(cpu_rt));
 }
 
-pub async fn run() {
+pub async fn run(cpu_rt: rt::Runtime) {
     let external_addr: SocketAddr = format!("{}:3478", select_host_address()).parse().unwrap();
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
     let unified_socket = net::UnifiedSocket::bind(local_addr, net::Transport::Udp)
@@ -39,8 +69,9 @@ pub async fn run() {
         .expect("bind to udp socket");
     let http_socket: SocketAddr = "0.0.0.0:3000".parse().unwrap();
 
-    let node = node::Node::new(external_addr, unified_socket, http_socket);
-    node.run().await;
+    node::run(cpu_rt, external_addr, unified_socket, http_socket)
+        .await
+        .unwrap();
 }
 
 pub fn select_host_address() -> IpAddr {

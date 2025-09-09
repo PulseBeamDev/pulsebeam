@@ -3,6 +3,8 @@ use std::time::Duration;
 pub use tokio::runtime::Handle;
 pub use tokio::task::JoinSet;
 
+pub type Runtime = tokio::runtime::Runtime;
+
 pub fn current() -> Handle {
     Handle::current()
 }
