@@ -24,9 +24,20 @@ async function start(endpoint: string) {
   pc = new RTCPeerConnection();
 
   // WHIP: send-only transceivers
-  const videoTrans = pc.addTransceiver("video", { direction: "sendonly" });
+  const videoTrans = pc.addTransceiver("video", { 
+    direction: "sendonly", 
+    // Define scalability layers (low, medium, high)
+    sendEncodings: [
+      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 },   // quarter res, ~150kbps
+      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 },   // half res, ~500kbps
+      { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_500_000 }, // full res, ~1.5Mbps
+    ]
+  });
   const audioTrans = pc.addTransceiver("audio", { direction: "sendonly" });
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  localStream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 1920, height: 1080, frameRate: 30 },
+    audio: true
+  });
   videoTrans.sender.replaceTrack(localStream.getVideoTracks()[0]);
   audioTrans.sender.replaceTrack(localStream.getAudioTracks()[0]);
   localVideo.srcObject = localStream;
