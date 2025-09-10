@@ -147,6 +147,27 @@ If our approach to building simpler, more robust real-time tools resonates with 
 
 ---
 
-## License
+## Licensing
 
-PulseBeam is open source, licensed under the **GNU Affero General Public License v3.0**.
+Pulsebeam applies different licenses to different parts of the project:
+
+- **Server components** are licensed under **AGPL-3.0**.  
+  This license ensures that the central technology remains open and that improvements made to the server are contributed back to the community.
+
+- **Client libraries and tooling** are licensed under **Apache-2.0**.  
+  This license provides a permissive and widely adopted framework that makes it straightforward to integrate Pulsebeam into applications and infrastructure.
+
+Each workspace member includes its own `LICENSE` file and declares its license in `Cargo.toml`.  
+Those files are the authoritative source for the license of each component.
+
+## Frequently Asked Questions
+
+Can I use the Pulsebeam SFU for an internal project at my company?
+
+> Yes, absolutely. The AGPL license does not restrict internal use.
+
+I have more questions or need a different license for the server core. Who should I contact?
+
+> We're happy to help. Please get in touch by emailing [lukas@pulsebeam.dev](mailto:lukas@pulsebeam.dev).
+
+This dual-license model is our way of creating a sustainable open-source project that is both protected from corporate exploitation and friendly to our developer community.
