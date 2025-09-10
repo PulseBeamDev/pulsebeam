@@ -1,6 +1,2 @@
 [workspace]
-# Disable publishing for all packages in the workspace by default.
 publish = false
-# Git tags and GitHub releases are still created by default.
-git_tag_enable = true
-git_release_enable = true
