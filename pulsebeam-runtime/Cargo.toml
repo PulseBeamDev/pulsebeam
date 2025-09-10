@@ -1,5 +1,6 @@
 [package]
 name = "pulsebeam-runtime"
+publish = false
 
 version.workspace = true
 edition.workspace = true
