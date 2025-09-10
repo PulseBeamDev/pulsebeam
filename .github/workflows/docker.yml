@@ -14,7 +14,6 @@ on:
 jobs:
   docker-build-and-publish:
     name: Build & Publish Docker image
-    needs: upload-assets
     runs-on: ubuntu-22.04
     if: github.repository_owner == 'PulseBeamDev'
     timeout-minutes: 30
