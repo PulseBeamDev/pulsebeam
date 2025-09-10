@@ -1787,6 +1787,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-cli"
+version = "0.1.0"
+
+[[package]]
 name = "pulsebeam-runtime"
 version = "0.1.0"
 dependencies = [

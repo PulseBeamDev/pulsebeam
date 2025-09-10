@@ -35,7 +35,8 @@ rand = "0.9"
 resolver = "2"
 members = [
   "pulsebeam", 
-  "pulsebeam-agent",
+  "pulsebeam-agent", 
+  "pulsebeam-cli",
   "pulsebeam-runtime",
   "pulsebeam-simulator",
 ]
