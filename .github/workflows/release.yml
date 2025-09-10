@@ -14,6 +14,7 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'PulseBeamDev' }}
     permissions:
       contents: write
       pull-requests: write
@@ -41,6 +42,7 @@ jobs:
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'PulseBeamDev' }}
     permissions:
       contents: write
     steps:
@@ -65,7 +67,7 @@ jobs:
   upload-binaries:
     name: Build and Upload Binaries
     needs: release-plz
-    if: needs.release-plz.outputs.releases_created == 'true'
+    if: needs.release-plz-release.outputs.releases_created == 'true'
     permissions:
       contents: write # Needed to upload release assets.
     runs-on: ${{ matrix.os }}
