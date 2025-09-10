@@ -1,16 +1,17 @@
+name: Docker
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+permissions:
+  contents: write
+  packages: write
+  id-token: write
 
-      - uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: pulsebeam
-          target: ${{ matrix.target }}
-          tar: all
-          zip: windows
-          token: ${{ secrets.GITHUB_TOKEN }}
+on:
+  push:
+    branches: [ "main" ]
+  release:
+    types: [published]
 
+jobs:
   docker-build-and-publish:
     name: Build & Publish Docker image
     needs: upload-assets
