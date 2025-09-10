@@ -87,7 +87,7 @@ impl actor::Actor for ControllerActor {
 impl ControllerActor {
     pub async fn allocate(
         &mut self,
-        ctx: &mut actor::ActorContext<Self>,
+        _ctx: &mut actor::ActorContext<Self>,
         room_id: RoomId,
         participant_id: ParticipantId,
         offer: String,

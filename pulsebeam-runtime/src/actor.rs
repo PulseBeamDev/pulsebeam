@@ -10,7 +10,27 @@ use tracing::Instrument;
 
 use crate::mailbox;
 
-pub type JoinHandle<A: Actor> = Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>;
+pub struct JoinHandle<A: Actor> {
+    inner: Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>,
+}
+
+impl<A: Actor> JoinHandle<A> {
+    pub fn new(future: Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>) -> Self {
+        Self { inner: future }
+    }
+}
+
+impl<A: Actor> Future for JoinHandle<A> {
+    type Output = (A::Meta, ActorStatus);
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Just delegate the poll to the inner future
+        self.inner.as_mut().poll(cx)
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ActorError {
@@ -316,7 +336,7 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
     })
     .boxed();
 
-    (handle, join)
+    (handle, JoinHandle::new(join))
 }
 
 pub fn spawn_default<A: Actor>(

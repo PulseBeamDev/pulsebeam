@@ -36,11 +36,11 @@ pub struct KeyframeRequest {
     pub kind: KeyframeRequestKind,
 }
 
-impl Into<KeyframeRequest> for str0m::media::KeyframeRequest {
-    fn into(self) -> KeyframeRequest {
-        KeyframeRequest {
-            rid: self.rid,
-            kind: self.kind,
+impl From<str0m::media::KeyframeRequest> for KeyframeRequest {
+    fn from(value: str0m::media::KeyframeRequest) -> Self {
+        Self {
+            rid: value.rid,
+            kind: value.kind,
         }
     }
 }

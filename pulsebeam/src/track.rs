@@ -4,7 +4,7 @@ use str0m::media::{KeyframeRequestKind, MediaData, Rid};
 use tokio::time::Instant;
 
 use crate::{
-    entity::{ParticipantId, TrackId},
+    entity::ParticipantId,
     message::{self, TrackMeta},
     participant::{self, ParticipantHandle},
 };

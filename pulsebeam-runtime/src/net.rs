@@ -2,20 +2,26 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use tokio::sync::mpsc;
-
 use tokio::net::UdpSocket;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
     Udp,
+
+    // ======================== TCP ========================
+    // TODO: Implement TCP Framing:
+    // * https://datatracker.ietf.org/doc/html/rfc6544
+    // * https://datatracker.ietf.org/doc/html/rfc4571
+    //
+    // Supported TCP mode:
+    // * Passive: Yes
+    // * Active: No
+    // * SO: No
     Tcp,
     Tls,
     SimUdp,
 }
 
-// ======================== UDP ========================
 #[derive(Clone)]
 pub struct UdpSocketImpl {
     socket: Arc<UdpSocket>,
@@ -41,7 +47,6 @@ impl UdpSocketImpl {
     }
 }
 
-// ======================== UDP ========================
 #[derive(Clone)]
 pub struct SimUdpSocketImpl {
     socket: Arc<turmoil::net::UdpSocket>,
@@ -67,70 +72,10 @@ impl SimUdpSocketImpl {
     }
 }
 
-// ======================== TCP ========================
-// TODO: Implement TCP Framing:
-// * https://datatracker.ietf.org/doc/html/rfc6544
-// * https://datatracker.ietf.org/doc/html/rfc4571
-//
-// Supported TCP mode:
-// * Passive: Yes
-// * Active: No
-// * SO: No
-#[derive(Clone)]
-pub struct TcpSocketImpl {}
-
-struct TcpConnection {
-    tx: mpsc::Sender<Bytes>,
-}
-
-impl TcpSocketImpl {
-    pub async fn new(local_addr: SocketAddr) -> io::Result<Self> {
-        todo!()
-    }
-
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        todo!()
-    }
-
-    pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        todo!()
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        todo!()
-    }
-}
-
-// ======================== TLS ========================
-#[derive(Clone)]
-pub struct TlsSocketImpl {}
-
-struct TlsConnection {}
-
-impl TlsSocketImpl {
-    pub async fn new(local_addr: SocketAddr) -> io::Result<Self> {
-        todo!()
-    }
-
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        todo!()
-    }
-
-    pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        todo!()
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        todo!()
-    }
-}
-
 // ======================== UnifiedSocket ========================
 #[derive(Clone)]
 pub enum UnifiedSocket {
     Udp(UdpSocketImpl),
-    Tcp(TcpSocketImpl),
-    Tls(TlsSocketImpl),
     SimUdp(SimUdpSocketImpl),
 }
 
@@ -138,17 +83,14 @@ impl UnifiedSocket {
     pub async fn bind(local_addr: SocketAddr, transport: Transport) -> io::Result<Self> {
         Ok(match transport {
             Transport::Udp => UnifiedSocket::Udp(UdpSocketImpl::new(local_addr).await?),
-            Transport::Tcp => UnifiedSocket::Tcp(TcpSocketImpl::new(local_addr).await?),
-            Transport::Tls => UnifiedSocket::Tls(TlsSocketImpl::new(local_addr).await?),
             Transport::SimUdp => UnifiedSocket::SimUdp(SimUdpSocketImpl::new(local_addr).await?),
+            Transport::Tcp | Transport::Tls => todo!(),
         })
     }
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         match self {
             UnifiedSocket::Udp(s) => s.recv_from(buf).await,
-            UnifiedSocket::Tcp(s) => s.recv_from(buf).await,
-            UnifiedSocket::Tls(s) => s.recv_from(buf).await,
             UnifiedSocket::SimUdp(s) => s.recv_from(buf).await,
         }
     }
@@ -156,8 +98,6 @@ impl UnifiedSocket {
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         match self {
             UnifiedSocket::Udp(s) => s.send_to(buf, addr).await,
-            UnifiedSocket::Tcp(s) => s.send_to(buf, addr).await,
-            UnifiedSocket::Tls(s) => s.send_to(buf, addr).await,
             UnifiedSocket::SimUdp(s) => s.send_to(buf, addr).await,
         }
     }
@@ -165,8 +105,6 @@ impl UnifiedSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             UnifiedSocket::Udp(s) => s.local_addr(),
-            UnifiedSocket::Tcp(s) => s.local_addr(),
-            UnifiedSocket::Tls(s) => s.local_addr(),
             UnifiedSocket::SimUdp(s) => s.local_addr(),
         }
     }

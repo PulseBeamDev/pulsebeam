@@ -6,7 +6,7 @@ use str0m::{
     Event, Input, Output, Rtc, RtcError,
     channel::{ChannelData, ChannelId},
     error::SdpError,
-    media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid, Simulcast},
+    media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid},
     net::{self, Transmit},
 };
 use tokio::time::Instant;
@@ -54,8 +54,6 @@ struct TrackOut {
 }
 
 struct MidOutSlot {
-    kind: MediaKind,
-    simulcast: Option<Simulcast>,
     track_id: Option<Arc<TrackId>>,
 }
 
@@ -153,8 +151,6 @@ impl actor::Actor for ParticipantActor {
         ctx: &mut actor::ActorContext<Self>,
         msg: Self::HighPriorityMsg,
     ) -> () {
-        use sfu::server_message::Payload;
-
         self.should_resync = true;
         match msg {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
@@ -197,7 +193,7 @@ impl actor::Actor for ParticipantActor {
                     self.pending_unpublished_tracks.push(track_id.to_string());
                 }
             }
-            ParticipantControlMessage::TrackPublishRejected(track_handle) => {
+            ParticipantControlMessage::TrackPublishRejected(_track_handle) => {
                 // TODO: notify rejection to client
             }
         }
@@ -294,6 +290,8 @@ impl ParticipantActor {
                 track.mid.replace(*slot_id);
                 let meta = &track.track.meta;
                 slot.track_id.replace(meta.id.clone());
+
+                // TODO: handle rejection
                 track
                     .track
                     .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
@@ -353,16 +351,16 @@ impl ParticipantActor {
         self.should_resync = false;
     }
 
-    fn send_server_event(&mut self, msg: sfu::server_message::Payload) {
-        // TODO: handle when data channel is closed
-
-        if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
-            let encoded = sfu::ServerMessage { payload: Some(msg) }.encode_to_vec();
-            if let Err(err) = ch.write(true, encoded.as_slice()) {
-                tracing::warn!("failed to send rpc via data channel: {err}");
-            }
-        }
-    }
+    // fn send_server_event(&mut self, msg: sfu::server_message::Payload) {
+    //     // TODO: handle when data channel is closed
+    //
+    //     if let Some(mut ch) = self.cid.and_then(|cid| self.rtc.channel(cid)) {
+    //         let encoded = sfu::ServerMessage { payload: Some(msg) }.encode_to_vec();
+    //         if let Err(err) = ch.write(true, encoded.as_slice()) {
+    //             tracing::warn!("failed to send rpc via data channel: {err}");
+    //         }
+    //     }
+    // }
 
     async fn handle_rpc(&mut self, data: ChannelData) -> Result<(), ParticipantError> {
         let msg = sfu::ClientMessage::decode(data.data.as_slice())
@@ -374,12 +372,12 @@ impl ParticipantActor {
 
         match payload {
             sfu::client_message::Payload::Subscribe(subscribe) => {
-                let mid = Mid::from(subscribe.mid.as_str());
+                let _mid = Mid::from(subscribe.mid.as_str());
 
                 // TODO: handle subscribe
             }
             sfu::client_message::Payload::Unsubscribe(unsubscribe) => {
-                let mid = Mid::from(unsubscribe.mid.as_str());
+                let _mid = Mid::from(unsubscribe.mid.as_str());
 
                 // TODO: handle unsubscribe
             }
@@ -442,14 +440,6 @@ impl ParticipantActor {
                 });
             }
         }
-    }
-
-    async fn handle_unsubscribe(&mut self, track_id: Arc<TrackId>) {
-        // TODO: handle unsubscribe
-        // let Some(track) = self.available_tracks.get(&track_id.internal) else {
-        //     return;
-        // };
-        // track.handle.subscribe(participant)
     }
 
     async fn handle_output_transmit(&mut self, t: Transmit) {
@@ -534,7 +524,7 @@ impl ParticipantActor {
             .try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
-    async fn handle_new_media(&mut self, ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
+    async fn handle_new_media(&mut self, _ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
         match media.direction {
             // TODO: limit at most 1 video, 1 audio
             // client -> SFU
@@ -561,24 +551,15 @@ impl ParticipantActor {
             }
             // SFU -> client
             Direction::SendOnly => {
+                // We map multiple simulcast layers to 1 slot. No need to track simulcast.
                 tracing::info!(?media, "handle_new_media from other participant");
                 match media.kind {
-                    MediaKind::Video => self.subscribed_video_tracks.insert(
-                        media.mid,
-                        MidOutSlot {
-                            kind: media.kind,
-                            simulcast: media.simulcast,
-                            track_id: None,
-                        },
-                    ),
-                    MediaKind::Audio => self.subscribed_audio_tracks.insert(
-                        media.mid,
-                        MidOutSlot {
-                            kind: media.kind,
-                            simulcast: media.simulcast,
-                            track_id: None,
-                        },
-                    ),
+                    MediaKind::Video => self
+                        .subscribed_video_tracks
+                        .insert(media.mid, MidOutSlot { track_id: None }),
+                    MediaKind::Audio => self
+                        .subscribed_audio_tracks
+                        .insert(media.mid, MidOutSlot { track_id: None }),
                 };
             }
             dir => {

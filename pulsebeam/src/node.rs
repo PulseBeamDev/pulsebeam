@@ -33,7 +33,7 @@ pub async fn run(
         );
         let (controller_handle, controller_join) =
             actor::spawn(controller_actor, actor::RunnerConfig::default());
-        controller_ready_tx.send(controller_handle);
+        controller_ready_tx.send(controller_handle).unwrap();
         controller_join.await;
     });
 

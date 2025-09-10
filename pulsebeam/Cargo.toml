@@ -20,29 +20,29 @@ str0m = { workspace = true }
 
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-config = { version = "0.15", features = ["toml"] }
-toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8.3", features = ["macros"] }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
 systemstat = "0.2.4"
 tower-http = { version = "0.6.2", features = ["cors"] }
 hex = "0.4.3"
-prost = "0.13.5"
+prost = "0.14.1"
 bs58 = "0.5.1"
 sha3 = "0.10.8"
 metrics = "0.24.2"
 mimalloc = "0.1.46"
 hyper = "1.6.0"
-turmoil = "0.6.6"
 pulsebeam-runtime = { version = "0.1.0", path = "../pulsebeam-runtime" }
 thread-priority = "3.0.0"
 
+[dev-dependencies]
+turmoil = "0.6.6"
+
 [build-dependencies]
-prost-build = "0.13.5"
+prost-build = "0.14.1"
 
 # [patch.crates-io]
 # str0m = { path = "../str0m" }
-[patch."https://github.com/algesten/str0m.git"]
-str0m = { path = "../../str0m" }
+# [patch."https://github.com/algesten/str0m.git"]
+# str0m = { path = "../../str0m" }
 
