@@ -18,8 +18,6 @@
   <a href="https://discord.gg/Bhd3t9afuB">Join our Discord</a>
 </p>
 
----
-
 ## What is PulseBeam?
 
 PulseBeam is an open-source media stack for building real-time applications. Our approach is guided by a focus on creating a robust, simple, and scalable foundation for developers.
@@ -34,8 +32,6 @@ For all other features—like recording, analytics, or AI integrations—our des
 *   **Modular Features:** Our goal is to enable powerful functionality without creating a monolith. We favor a design where features are deployed as decoupled services.
 *   **Simple, HTTP-Based Signaling:** We use a simple, request/response signaling protocol that is a superset of WHIP/WHEP. This provides out-of-the-box compatibility while allowing for extensions to handle advanced use cases—all without requiring WebSockets for signaling.
 *   **Open and Transparent:** The project is open source, and building in Rust helps us create efficient and memory-safe code by design. We aim to be transparent in our work as we build the project with the community.
-
----
 
 ## A Simple Mental Model
 
@@ -57,7 +53,6 @@ From this perspective, a participant in a browser is simply an agent responsible
 
 This mental model helps us keep the core SFU incredibly simple. The core doesn't need to know about different "types" of clients; it just routes media between connected agents. This is the key to the simplicity and robustness we're striving for.
 
----
 
 ## Quickstart
 
@@ -78,7 +73,6 @@ Next, open `http://localhost:7880/demo` in two browser tabs to see the media rel
 
 *(This is an early version of PulseBeam. Your feedback and contributions are incredibly valuable as we work towards building a truly reliable platform.)*
 
----
 
 ## API & Usage
 
@@ -112,8 +106,6 @@ This simple, HTTP-based interaction model is the foundation for how all clients,
 
 👉 For a complete implementation with UI controls, see the [demo](./demo) directory.
 
----
-
 ## Roadmap
 
 Our roadmap reflects our focus on building a stable foundation first.
@@ -126,7 +118,6 @@ Our roadmap reflects our focus on building a stable foundation first.
 | **Essential Services & SDKs**| 📅 **Planned:** Releasing official server-side services (e.g., recording) and a lightweight JavaScript SDK.                 |
 | **Scaling & Deployment**   | 📅 **Future:** Developing guides and tools for multi-node deployments and high-availability configurations.                   |
 
----
 
 ## Contributing
 
@@ -137,15 +128,12 @@ PulseBeam is a community-driven project, and we welcome contributions of all kin
 *   **Build SDKs:** Help create developer-friendly wrappers for web, mobile, or native platforms.
 *   **Write docs, tests, or tutorials:** Your help makes PulseBeam more accessible and dependable for everyone.
 
----
-
 ## Join the Community
 
 If our approach to building simpler, more robust real-time tools resonates with you, we'd love for you to get involved. By contributing, you can help shape a foundational piece of open infrastructure.
 
 💬 **[Join us on Discord](https://discord.gg/Bhd3t9afuB)** to connect with the team and other developers.
 
----
 
 ## Licensing
 
