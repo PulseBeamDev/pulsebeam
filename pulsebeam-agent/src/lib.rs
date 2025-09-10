@@ -1,3 +1,2 @@
-mod agent;
-
-pub use agent::{Agent, AgentConfig};
+pub mod agent;
+pub mod media;
