@@ -27,6 +27,8 @@ jobs:
       - name: Run release-plz
         id: release
         uses: release-plz/action@v0.5
+        with:
+          command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           # For publishing to crates.io, create a secret named CARGO_REGISTRY_TOKEN
