@@ -1,67 +1,8 @@
-name: CD
 
-permissions:
-  contents: write
-
-on:
-  release:
-    types: [published]
-
-env:
-  CARGO_INCREMENTAL: 0
-  CARGO_NET_GIT_FETCH_WITH_CLI: true
-  CARGO_NET_RETRY: 10
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  RUSTFLAGS: -D warnings
-  RUSTUP_MAX_RETRIES: 10
-
-defaults:
-  run:
-    shell: bash
-
-jobs:
-  upload-assets:
-    name: ${{ matrix.target }}
-    if: github.repository_owner == 'PulseBeamDev'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-22.04
-          - target: aarch64-apple-darwin
-            os: macos-13
-          - target: aarch64-pc-windows-msvc
-            os: windows-2022
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-22.04
-          - target: x86_64-apple-darwin
-            os: macos-13
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-          - target: x86_64-unknown-freebsd
-            os: ubuntu-22.04
-    timeout-minutes: 60
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: ${{ matrix.target }}
-        if: startsWith(matrix.os, 'ubuntu') && !contains(matrix.target, '-musl')
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
-        if: contains(matrix.target, '-musl')
-      - run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static" >> "${GITHUB_ENV}"
-        if: endsWith(matrix.target, 'windows-msvc')
+
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: pulsebeam
@@ -69,3 +10,44 @@ jobs:
           tar: all
           zip: windows
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-build-and-publish:
+    name: Build & Publish Docker image
+    needs: upload-assets
+    runs-on: ubuntu-22.04
+    if: github.repository_owner == 'PulseBeamDev'
+    timeout-minutes: 30
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/pulsebeam
+      IMAGE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            RUST_VERSION=stable
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
