@@ -121,7 +121,6 @@ struct Agent {
     config: AgentConfig,
     endpoint: String,
     event_tx: mpsc::Sender<AgentEvent>,
-    media_rx: mpsc::Receiver<MediaInput>,
     http_client: HttpClient,
     socket: Option<Arc<UdpSocket>>,
     remote_addr: Option<SocketAddr>,
@@ -131,7 +130,11 @@ struct Agent {
 }
 
 impl Agent {
-    async fn run(&mut self, mut cancel_rx: oneshot::Receiver<()>) -> Result<()> {
+    async fn run(
+        &mut self,
+        mut cancel_rx: oneshot::Receiver<()>,
+        mut media_rx: mpsc::Receiver<MediaInput>,
+    ) -> Result<()> {
         let mut next_timeout = Instant::now() + Duration::from_millis(100);
 
         info!("Starting WebRTC agent");
@@ -161,7 +164,7 @@ impl Agent {
                 }
 
                 // Handle incoming media to send
-                Some(media) = self.media_rx.recv() => {
+                Some(media) = media_rx.recv() => {
                     self.handle_media_input(media).await;
                 }
 
@@ -304,7 +307,12 @@ impl Agent {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
 
-            match writer.write(media.payload_type, wallclock, media.timestamp, media.data) {
+            match writer.write(
+                str0m::media::Pt::new_with_value(media.payload_type),
+                wallclock,
+                media.timestamp,
+                media.data,
+            ) {
                 Ok(_) => {
                     debug!("Media written to MID: {}", media.mid);
                 }
@@ -541,7 +549,6 @@ impl AgentHandle {
             config,
             endpoint,
             event_tx,
-            media_rx,
             http_client,
             socket: Some(socket),
             remote_addr: None,
@@ -552,7 +559,7 @@ impl AgentHandle {
 
         // Spawn agent task
         tokio::spawn(async move {
-            if let Err(e) = agent.run(cancel_rx).await {
+            if let Err(e) = agent.run(cancel_rx, media_rx).await {
                 error!("Agent error: {}", e);
             }
         });

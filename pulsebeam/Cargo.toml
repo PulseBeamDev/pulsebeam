@@ -16,13 +16,13 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+str0m = { workspace = true }
 
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.15", features = ["toml"] }
 toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-str0m = { git = "https://github.com/algesten/str0m.git", rev = "783b020ff7c859372884889e205c5c838792e97a" }
 axum = { version = "0.8.3", features = ["macros"] }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
 systemstat = "0.2.4"

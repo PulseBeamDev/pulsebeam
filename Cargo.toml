@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 futures = "0.3.31"
 rand = "0.9"
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "783b020ff7c859372884889e205c5c838792e97a" }
 
 [workspace]
 resolver = "2"

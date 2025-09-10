@@ -9,12 +9,13 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-str0m = "0.10"
-tokio = { version = "1", features = ["full"] }
+anyhow = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+str0m = { workspace = true }
+
 reqwest = { version = "0.12", features = ["json"] }
-anyhow = "1"
-log = "0.4"
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tracing.workspace = true
