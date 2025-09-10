@@ -1783,6 +1783,7 @@ dependencies = [
  "str0m 0.10.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.12",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

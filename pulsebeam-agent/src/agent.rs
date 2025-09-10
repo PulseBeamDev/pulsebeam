@@ -3,11 +3,14 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use str0m::{
-    Candidate, IceCandidate, Rtc, RtcError,
-    change::{SdpAnswer, SdpOffer},
+    Rtc,
+    change::SdpAnswer,
     media::{Direction, MediaKind, Mid},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Instant,
+};
 
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -34,15 +37,75 @@ pub struct Agent {
     rtc: Rtc,
     config: AgentConfig,
     endpoint: String,
-    cancel_tx: oneshot::Sender<()>,
     event_tx: mpsc::Sender<AgentEvent>,
-    event_rx: mpsc::Receiver<AgentEvent>,
-    rtp_tx: mpsc::Sender<(Mid, Vec<u8>)>,
     rtp_rx: mpsc::Receiver<(Mid, Vec<u8>)>,
     http_client: HttpClient,
 }
 
 impl Agent {
+    async fn run(&mut self, mut cancel_rx: oneshot::Receiver<()>) -> Result<()> {
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    break;
+                }
+                Ok(output) = self.rtc.poll_output() => {
+                    self.handle_output(output).await;
+                }
+                Some(rtp) = self.rtp_rx.recv() => {
+                    self.handle_rtp_rx(rtp).await;
+                }
+                else => break,
+            }
+        }
+
+        self.disconnect().await?;
+        self.event_tx.send(AgentEvent::Disconnected).await?;
+        Ok(())
+    }
+
+    async fn handle_output(&mut self, output: str0m::Output) -> Option<Instant> {
+        match output {
+            str0m::Output::Timeout(deadline) => return Ok(Some(deadline.into())),
+            str0m::Output::Transmit(data) => {}
+            str0m::Output::Event(event) => match event {
+                str0m::Event::MediaData(media) => {
+                    self.event_tx
+                        .send(AgentEvent::RtpReceived(media.mid, media.data))
+                        .await?;
+                }
+                str0m::Event::Connected => {
+                    self.event_tx.send(AgentEvent::Connected).await?;
+                }
+                _ => {}
+            },
+        }
+
+        None
+    }
+
+    async fn handle_rtp_rx(&mut self, rtp: (Mid, Vec<u8>)) {
+        if let Some(writer) = self.rtc.writer(rtp.0) {
+            writer.write(pt, wallclock, rtp_time, data)
+        }
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        self.http_client
+            .delete(&self.config.endpoint)
+            .send()
+            .await?;
+        Ok(())
+    }
+}
+
+pub struct AgentHandle {
+    cancel_tx: oneshot::Sender<()>,
+    event_rx: mpsc::Receiver<AgentEvent>,
+    rtp_tx: mpsc::Sender<(Mid, Vec<u8>)>,
+}
+
+impl AgentHandle {
     pub async fn connect(config: AgentConfig) -> Result<Self> {
         let mut rtc = Rtc::builder().enable_h264(true).build();
         let mut sdp = rtc.sdp_api();
@@ -65,7 +128,6 @@ impl Agent {
 
         // Perform WHIP/WHEP handshake
         let (offer, pending_offer) = sdp.apply().context("expect an offer")?;
-        let sdp_offer = SdpOffer::from_sdp_string(&offer.to_sdp_string())?;
 
         let resp = http_client
             .post(&config.endpoint)
@@ -83,74 +145,32 @@ impl Agent {
 
         let answer_str = resp.text().await?;
         let answer = SdpAnswer::from_sdp_string(&answer_str)?;
+        let sdp = rtc.sdp_api();
         sdp.accept_answer(pending_offer, answer);
 
         // Start session event loop
-        let session = Agent {
+        let mut agent = Agent {
             rtc,
             endpoint,
             config,
-            cancel_tx,
             event_tx,
-            event_rx,
-            rtp_tx,
             rtp_rx,
             http_client,
         };
 
-        tokio::spawn({
-            let mut session = session.clone();
-            async move {
-                session.run(cancel_rx).await.unwrap_or_else(|e| {
-                    log::error!("Session error: {}", e);
-                });
-            }
+        let agent_handle = Self {
+            cancel_tx,
+            event_rx,
+            rtp_tx,
+        };
+
+        tokio::spawn(async move {
+            agent.run(cancel_rx).await.unwrap_or_else(|e| {
+                tracing::error!("Session error: {}", e);
+            });
         });
 
-        Ok(session)
-    }
-
-    async fn run(&mut self, mut cancel_rx: oneshot::Receiver<()>) -> Result<()> {
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    self.disconnect().await?;
-                    self.event_tx.send(AgentEvent::Disconnected).await?;
-                    return Ok(());
-                }
-                event = self.rtc.poll_output() => {
-                    match event {
-                        Ok(str0m::Event::IceCandidate { candidate, .. }) => {
-                            self.handle_ice_candidate(candidate).await?;
-                        }
-                        Ok(str0m::Event::MediaData { mid, data, .. }) => {
-                            self.event_tx.send(AgentEvent::RtpReceived(mid, data)).await?;
-                        }
-                        Ok(str0m::Event::Connected) => {
-                            self.event_tx.send(AgentEvent::Connected).await?;
-                        }
-                        Ok(_) => {}
-                        Err(e) => return Err(anyhow!("RTC error: {}", e)),
-                    }
-                }
-                rtp = self.rtp_rx.recv() => {
-                    if let Some((mid, data)) = rtp {
-                        self.rtc.write_packet(mid, data)?;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn disconnect(&self) -> Result<()> {
-        self.http_client
-            .delete(&self.config.endpoint)
-            .send()
-            .await?;
-        Ok(())
+        Ok(agent_handle)
     }
 
     pub async fn send_rtp(&self, mid: Mid, rtp_packet: Vec<u8>) -> Result<()> {
