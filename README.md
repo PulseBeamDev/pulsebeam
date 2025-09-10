@@ -119,15 +119,6 @@ Our roadmap reflects our focus on building a stable foundation first.
 | **Scaling & Deployment**   | 📅 **Future:** Developing guides and tools for multi-node deployments and high-availability configurations.                   |
 
 
-## Contributing
-
-PulseBeam is a community-driven project, and we welcome contributions of all kinds.
-
-*   **Improve the Rust core:** Help us enhance the robustness and reliability of the SFU.
-*   **Prototype new services:** Experiment with new server-side capabilities in a decoupled way.
-*   **Build SDKs:** Help create developer-friendly wrappers for web, mobile, or native platforms.
-*   **Write docs, tests, or tutorials:** Your help makes PulseBeam more accessible and dependable for everyone.
-
 ## Join the Community
 
 If our approach to building simpler, more robust real-time tools resonates with you, we'd love for you to get involved. By contributing, you can help shape a foundational piece of open infrastructure.
