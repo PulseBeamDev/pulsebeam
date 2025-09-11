@@ -23,14 +23,14 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8.3", features = ["macros"] }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
-systemstat = "0.2.4"
-tower-http = { version = "0.6.2", features = ["cors"] }
+systemstat = "0.2.5"
+tower-http = { version = "0.6.6", features = ["cors"] }
 hex = "0.4.3"
 prost = "0.14.1"
 bs58 = "0.5.1"
 sha3 = "0.10.8"
 metrics = "0.24.2"
-mimalloc = "0.1.46"
+mimalloc = "0.1.48"
 hyper = "1.7.0"
 pulsebeam-runtime = { version = "^0.1.0", path = "../pulsebeam-runtime" }
 thread-priority = "3.0.0"

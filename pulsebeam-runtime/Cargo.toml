@@ -25,4 +25,4 @@ turmoil = "0.6.6"
 futures.workspace = true
 
 [dev-dependencies]
-rcgen = "0.14.3"
+rcgen = "0.14.4"
