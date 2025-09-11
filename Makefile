@@ -24,6 +24,12 @@ profile: $(BINARY)
 brew-deps:
 	brew install git-cliff axodotdev/tap/cargo-dist
 
+cargo-deps:
+	cargo install cargo-smart-release --features allow-emoji
+
+release:
+	cargo smart-release
+
 # Clean build artifacts and perf data
 .PHONY: clean
 clean:
