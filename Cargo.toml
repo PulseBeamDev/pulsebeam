@@ -22,6 +22,11 @@ strip = false # Retain symbols for profiling
 debug-assertions = false # Match release behavior
 panic = "abort" # make sure we don't include unwind in profile
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"]}
