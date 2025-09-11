@@ -104,7 +104,7 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 
 This simple, HTTP-based interaction model is the foundation for how all clients, including server-side services, will communicate with the core.
 
-👉 For a complete implementation with UI controls, see the [demo](./demo) directory.
+👉 For a complete implementation with UI controls, see the [demo](./demo) directory or [jsfiddle](https://jsfiddle.net/lherman/uc4r76e1/1/).
 
 ## Roadmap
 
