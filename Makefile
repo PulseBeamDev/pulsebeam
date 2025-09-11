@@ -21,6 +21,9 @@ build:
 profile: $(BINARY)
 	sudo $(PERF) record $(PERF_RECORD_FLAGS) -- $(BINARY)
 
+brew-deps:
+	brew install git-cliff axodotdev/tap/cargo-dist
+
 # Clean build artifacts and perf data
 .PHONY: clean
 clean:
