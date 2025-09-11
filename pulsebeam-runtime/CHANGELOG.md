@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## v0.1.0 (2025-09-11)
 
+<csr-id-f5b95d1f0192d19731a1ec8846ff70059f75682b/>
+
 ### Chore
 
  - <csr-id-f5b95d1f0192d19731a1ec8846ff70059f75682b/> release v0.1.0
@@ -33,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <csr-read-only-do-not-edit/>
 
- - 38 commits contributed to the release over the course of 14 calendar days.
+ - 39 commits contributed to the release over the course of 14 calendar days.
  - 5 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -44,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details><summary>view details</summary>
 
  * **Uncategorized**
+    - Release pulsebeam-runtime v0.1.0, pulsebeam v0.1.3 ([`9c73d5b`](https://github.com/PulseBeamDev/pulsebeam/commit/9c73d5bbe6b2a376895ad4f080ded4b1e822e163))
     - Merge pull request #1 from PulseBeamDev/release-plz-2025-09-10T17-40-26Z ([`896b23c`](https://github.com/PulseBeamDev/pulsebeam/commit/896b23c243113dd1a2a521dbc273597feb165a29))
     - Disable publish ([`2193397`](https://github.com/PulseBeamDev/pulsebeam/commit/2193397f2002bedcd7acd61eb46ce0755bf951ce))
     - Release v0.1.0 ([`f5b95d1`](https://github.com/PulseBeamDev/pulsebeam/commit/f5b95d1f0192d19731a1ec8846ff70059f75682b))

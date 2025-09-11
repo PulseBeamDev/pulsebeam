@@ -178,6 +178,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## v0.1.3 (2025-09-11)
 
+<csr-id-cf1e372142450caab8dadf09820bffac258b2ab4/>
+<csr-id-c8b148f561d4de1cd08250e699b4dc760da57397/>
+<csr-id-e59f8a72687c9f842ae777bbcaa0f1eedddffefe/>
+
 ### Chore
 
  - <csr-id-cf1e372142450caab8dadf09820bffac258b2ab4/> bump to 0.1.3
@@ -188,7 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <csr-read-only-do-not-edit/>
 
- - 6 commits contributed to the release.
+ - 7 commits contributed to the release.
  - 3 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -199,6 +203,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details><summary>view details</summary>
 
  * **Uncategorized**
+    - Release pulsebeam-runtime v0.1.0, pulsebeam v0.1.3 ([`9c73d5b`](https://github.com/PulseBeamDev/pulsebeam/commit/9c73d5bbe6b2a376895ad4f080ded4b1e822e163))
     - Merge pull request #8 from PulseBeamDev/dependabot/cargo/hyper-1.7.0 ([`4e87249`](https://github.com/PulseBeamDev/pulsebeam/commit/4e87249e0f0d6be08f390cdd2dfc126b21ac03bd))
     - Bump hyper from 1.6.0 to 1.7.0 ([`caf98fa`](https://github.com/PulseBeamDev/pulsebeam/commit/caf98fa9a6416bc8a1742bbaee0b2be9dfddc68c))
     - Bump to 0.1.3 ([`cf1e372`](https://github.com/PulseBeamDev/pulsebeam/commit/cf1e372142450caab8dadf09820bffac258b2ab4))
@@ -208,6 +213,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 </details>
 
 ## v0.1.2 (2025-09-10)
+
+<csr-id-f5b95d1f0192d19731a1ec8846ff70059f75682b/>
+<csr-id-addf3634bce5e3e048a42ccc2f2441f368862a47/>
 
 ### Chore
 
