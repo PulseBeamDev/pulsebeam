@@ -1,6 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{
+    future::Either,
+    stream::{FuturesUnordered, StreamExt},
+};
 use str0m::Rtc;
 
 use crate::{
@@ -9,6 +12,8 @@ use crate::{
     participant, source, system, track,
 };
 use pulsebeam_runtime::actor;
+
+const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum RoomMessage {
@@ -60,7 +65,15 @@ impl actor::Actor for RoomActor {
     }
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
+        pulsebeam_runtime::actor_loop!(self, ctx,
+            pre_select: {
+                let empty_room_timer =
+                    if self.state.participants.is_empty() {
+                        Either::Left(tokio::time::sleep(EMPTY_ROOM_TIMEOUT))
+                    } else {
+                        Either::Right(futures::future::pending::<()>())
+                    };
+            },
             select: {
                 Some((participant_id, _)) = self.participant_tasks.next() => {
                     self.handle_participant_left(participant_id).await;
@@ -68,6 +81,11 @@ impl actor::Actor for RoomActor {
 
                 Some((track_meta, _)) = self.track_tasks.next() => {
                     self.handle_track_unpublished(track_meta).await;
+                }
+
+                _ = empty_room_timer => {
+                    tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
+                    break;
                 }
             }
         );

@@ -368,7 +368,7 @@ async fn run<A: Actor>(mut a: A, mut ctx: ActorContext<A>) -> ActorStatus {
     };
 
     tracing::debug!("post_stop successful.");
-    tracing::info!(status = %status_after_run, "Actor fully shut down.");
+    tracing::info!(status = %status_after_run, "exited.");
 
     status_after_run
 }
