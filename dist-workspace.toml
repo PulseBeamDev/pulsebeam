@@ -10,11 +10,17 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
+
+[dist.github-custom-runners]
+global = "ubuntu-24.04"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-pc-windows-msvc = "ubuntu-24.04"
 
 # https://axodotdev.github.io/cargo-dist/book/reference/config.html?highlight=dependencies#dependencies
 [dist.dependencies.homebrew]
