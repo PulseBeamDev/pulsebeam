@@ -23,7 +23,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8.3", features = ["macros"] }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
-systemstat = "0.2.4"
+systemstat = "0.2.5"
 tower-http = { version = "0.6.2", features = ["cors"] }
 hex = "0.4.3"
 prost = "0.14.1"
