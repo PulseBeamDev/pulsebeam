@@ -3,11 +3,13 @@ name: Cargo Smart Release
 permissions:
   pull-requests: write
   contents: write
+  actions: write  # Needed for creating releases
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:  # Allows manual triggering
 
 jobs:
   smart-release-pr:
@@ -17,16 +19,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Full history for changelog generation
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-smart-release
         run: cargo install cargo-smart-release
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+      - name: Set up Git credentials (optional for private repos)
+        if: ${{ secrets.GIT_TOKEN != '' }}
+        run: |
+          git config --global credential.helper 'store --file=/tmp/git-credentials'
+          echo "https://:${{ secrets.GIT_TOKEN }}@github.com" > /tmp/git-credentials
       - name: Run cargo smart-release for PR
-        run: cargo smart-release --update-crates-index --no-publish --no-tag --no-push --execute  # Generates changes, but no tag/push yet
+        run: cargo smart-release --update-crates-index --no-publish --no-tag --no-push --execute --verbose
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore: prepare release"
           title: "Prepare next release"
           body: "Automated release preparation: version bumps and changelogs"
@@ -35,7 +46,8 @@ jobs:
   smart-release:
     name: Perform Release
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && contains(github.ref, 'main') && github.repository_owner == 'PulseBeamDev'  # Post-merge
+    needs: smart-release-pr
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'PulseBeamDev'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,15 +55,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-smart-release
         run: cargo install cargo-smart-release
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+      - name: Set up Git credentials (optional for private repos)
+        if: ${{ secrets.GIT_TOKEN != '' }}
+        run: |
+          git config --global credential.helper 'store --file=/tmp/git-credentials'
+          echo "https://:${{ secrets.GIT_TOKEN }}@github.com" > /tmp/git-credentials
       - name: Run cargo smart-release
-        run: cargo smart-release --update-crates-index --no-publish --execute  # Bumps, changelogs, tags, pushes
+        id: smart-release
+        run: |
+          cargo smart-release --update-crates-index --no-publish --execute --verbose
+          # Extract the latest tag for the release
+          echo "tag_name=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
       - name: Create GitHub Release
         uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}  # Use the tag from smart-release
-          release_name: Release ${{ github.ref }}
-          body_path: CHANGELOG.md  # Or path to generated changelog
+          tag_name: ${{ steps.smart-release.outputs.tag_name }}
+          release_name: Release ${{ steps.smart-release.outputs.tag_name }}
+          body_path: CHANGELOG.md  # Adjust if per-crate changelogs are used
           draft: false
           prerelease: false
