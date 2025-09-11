@@ -73,6 +73,6 @@ function stop() {
   pc = null;
   localStream = null;
   toggleBtn.textContent = "Start";
-  statusEl.textContent = pc?.connectionState ?? "Disconnected";
+  statusEl.textContent = "Disconnected";
 }
 
