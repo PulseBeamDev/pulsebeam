@@ -6,7 +6,7 @@ COPY . .
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release -p pulsebeam && \
-    ls /app/target && ls /app/target/release && mv /app/target/release/pulsebeam /app/pulsebeam-bin
+    mv /app/target/release/pulsebeam /app/pulsebeam-bin
 
 
 FROM docker.io/chainguard/static
