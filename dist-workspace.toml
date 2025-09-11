@@ -16,14 +16,13 @@ install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
 
-# CI setup to install dependencies (including protoc)
-[dist.ci.github]
-install = [
-    # Install protoc for Linux CI runners
-    "if [[ \"$RUNNER_OS\" == \"Linux\" ]]; then sudo apt-get update && sudo apt-get install -y protobuf-compiler; fi",
-    # Install protoc for macOS CI runners
-    "if [[ \"$RUNNER_OS\" == \"macOS\" ]]; then brew install protobuf; fi",
-    # Install protoc for Windows CI runners
-    "if [[ \"$RUNNER_OS\" == \"Windows\" ]]; then choco install protoc; fi"
-]
+# https://axodotdev.github.io/cargo-dist/book/reference/config.html?highlight=dependencies#dependencies
+[dist.dependencies.homebrew]
+protobuf = '*'
+
+[dist.dependencies.apt]
+protobuf-compiler = '*'
+
+[dist.dependencies.chocolatey]
+protoc = '*'
 
