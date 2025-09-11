@@ -1,0 +1,57 @@
+name: Cargo Smart Release
+
+permissions:
+  pull-requests: write
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  smart-release-pr:
+    name: Create Release PR
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'PulseBeamDev'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-smart-release
+        run: cargo install cargo-smart-release
+      - name: Run cargo smart-release for PR
+        run: cargo smart-release --update-crates-index --no-publish --no-tag --no-push --execute  # Generates changes, but no tag/push yet
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: prepare release"
+          title: "Prepare next release"
+          body: "Automated release preparation: version bumps and changelogs"
+          branch: release-prep
+
+  smart-release:
+    name: Perform Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && contains(github.ref, 'main') && github.repository_owner == 'PulseBeamDev'  # Post-merge
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-smart-release
+        run: cargo install cargo-smart-release
+      - name: Run cargo smart-release
+        run: cargo smart-release --update-crates-index --no-publish --execute  # Bumps, changelogs, tags, pushes
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}  # Use the tag from smart-release
+          release_name: Release ${{ github.ref }}
+          body_path: CHANGELOG.md  # Or path to generated changelog
+          draft: false
+          prerelease: false
