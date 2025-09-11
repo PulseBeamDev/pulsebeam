@@ -28,7 +28,7 @@ cargo-deps:
 	cargo install cargo-smart-release --features allow-emoji
 
 release:
-	cargo smart-release
+	cargo smart-release --execute
 
 # Clean build artifacts and perf data
 .PHONY: clean
