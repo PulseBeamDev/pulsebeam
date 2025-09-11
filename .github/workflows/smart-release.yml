@@ -32,7 +32,7 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           commit-message: "chore: prepare release"
           title: "Prepare next release"
           body: "Automated release preparation: version bumps and changelogs"
@@ -63,7 +63,7 @@ jobs:
       - name: Create GitHub Release
         uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         with:
           tag_name: ${{ steps.smart-release.outputs.tag_name }}
           release_name: Release ${{ steps.smart-release.outputs.tag_name }}
