@@ -334,27 +334,14 @@ impl<'a> UdpTransport<'a> {
 }
 
 /// UnifiedSocket enum for different transport types
-#[derive(Debug)]
-pub enum UnifiedSocket {
-    Udp(UdpTransport),
+pub enum UnifiedSocket<'a> {
+    Udp(UdpTransport<'a>),
 }
 
-impl UnifiedSocket {
-    pub async fn bind_udp(addr: SocketAddr) -> io::Result<Self> {
+impl<'a> UnifiedSocket<'a> {
+    pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         let transport = UdpTransport::bind(addr).await?;
         Ok(UnifiedSocket::Udp(transport))
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        match self {
-            UnifiedSocket::Udp(transport) => transport.local_addr(),
-        }
-    }
-
-    pub fn as_udp_mut(&mut self) -> Option<&mut UdpTransport> {
-        match self {
-            UnifiedSocket::Udp(transport) => Some(transport),
-        }
     }
 }
 
