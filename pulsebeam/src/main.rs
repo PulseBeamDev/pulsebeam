@@ -72,11 +72,11 @@ pub async fn run(cpu_rt: rt::Runtime) {
         .expect("bind to udp socket");
     let http_socket: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
-        "✅ Signaling server listening. Clients should connect to http://{}:3000 or http://localhost:3000",
+        "✅ Signaling server listening. Clients should connect to https://{}:3000 or https://localhost:3000",
         external_ip,
     );
 
-    node::run(cpu_rt, external_addr, unified_socket, http_socket)
+    node::run(cpu_rt, external_addr, unified_socket, http_socket, true)
         .await
         .unwrap();
 }
