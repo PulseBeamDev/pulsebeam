@@ -88,7 +88,7 @@ pub trait Actor: Sized + Send + 'static {
     /// The type of low-priority messages this actor processes.
     type LowPriorityMsg: Debug + Send + 'static;
     /// The unique identifier for this actor.
-    type Meta: Eq + Hash + Debug + Clone + Send;
+    type Meta: Eq + Hash + Display + Debug + Clone + Send;
 
     /// ObservableState is a state snapshot of an actor. This is mainly used
     /// for testing.
@@ -204,7 +204,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
 
 impl<A: Actor> std::fmt::Debug for ActorHandle<A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.meta.fmt(f)
+        std::fmt::Debug::fmt(&self.meta, f)
     }
 }
 
@@ -325,11 +325,9 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
     };
 
     let actor_id = a.meta().clone();
-    let join = tokio::spawn(run(a, ctx).instrument(tracing::span!(
-        tracing::Level::INFO,
-        "run",
-        ?actor_id
-    )))
+    let join = tokio::spawn(
+        run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
+    )
     .map(|res| match res {
         Ok(ret) => (actor_id, ret),
         Err(_) => (actor_id, ActorStatus::ShutDown),
@@ -368,7 +366,7 @@ async fn run<A: Actor>(mut a: A, mut ctx: ActorContext<A>) -> ActorStatus {
     };
 
     tracing::debug!("post_stop successful.");
-    tracing::info!(status = %status_after_run, "exited.");
+    tracing::info!(status = %status_after_run, "exited");
 
     status_after_run
 }

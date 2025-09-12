@@ -7,7 +7,7 @@ use crate::{
 use futures::stream::FuturesUnordered;
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::prelude::*;
-use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::SdpError};
+use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError};
 use tokio::sync::oneshot;
 
 #[derive(thiserror::Error, Debug)]
@@ -103,16 +103,30 @@ impl ControllerActor {
         offer: String,
     ) -> Result<String, ControllerError> {
         let offer = SdpOffer::from_sdp_string(&offer)?;
-        let mut rtc = Rtc::builder()
+        tracing::info!("{offer}");
+        let mut rtc_config = RtcConfig::new()
+            .clear_codecs()
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            .set_ice_lite(false)
-            .enable_vp9(false)
-            .enable_vp8(false)
-            // h264 as the lowest common denominator due to small clients like
-            // embedded devices, smartphones, OBS only supports H264
-            .enable_h264(true)
-            .build();
+            .set_ice_lite(false);
+        let codec_config = rtc_config.codec_config();
+        codec_config.enable_opus(true);
+        // h264 as the lowest common denominator due to small clients like
+        // embedded devices, smartphones, OBS only supports H264.
+        // Baseline profile to ensure compatibility with all platforms.
+        codec_config.add_h264(
+            108.into(),       // PT for video
+            Some(109.into()), // RTX PT
+            true,             // packetization-mode = 1
+            0x42e01f,         // Baseline 3.1
+        );
+        // codec_config.add_h264(
+        //     127.into(),       // PT for video
+        //     Some(121.into()), // RTX PT
+        //     true,             // packetization-mode = 1 (fragmented)
+        //     0x42001f,         // Constrained Baseline 3.1
+        // );
+        let mut rtc = rtc_config.build();
 
         for addr in self.local_addrs.iter() {
             // TODO: add tcp and ssltcp later
@@ -138,6 +152,7 @@ impl ControllerActor {
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
+        tracing::info!("{answer}");
         Ok(answer.to_sdp_string())
     }
 

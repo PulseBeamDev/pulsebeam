@@ -30,6 +30,12 @@ pub struct TrackMeta {
     pub simulcast_rids: Option<Vec<Rid>>,
 }
 
+impl std::fmt::Display for TrackMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.id, f)
+    }
+}
+
 #[derive(Debug)]
 pub struct KeyframeRequest {
     pub rid: Option<Rid>,
