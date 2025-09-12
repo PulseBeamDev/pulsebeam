@@ -193,7 +193,8 @@ impl AsRef<str> for ExternalRoomId {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
 pub struct ParticipantId {
     pub internal: EntityId,
 }
@@ -208,24 +209,6 @@ impl ParticipantId {
 impl Default for ParticipantId {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl hash::Hash for ParticipantId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.internal.hash(state);
-    }
-}
-
-impl PartialOrd for ParticipantId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ParticipantId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.internal.cmp(&other.internal)
     }
 }
 
@@ -248,14 +231,6 @@ impl TryFrom<String> for ParticipantId {
             .map_err(|_| IdValidationError::InvalidCharacters)?;
 
         Ok(ParticipantId { internal: value })
-    }
-}
-
-impl Eq for ParticipantId {}
-
-impl PartialEq for ParticipantId {
-    fn eq(&self, other: &Self) -> bool {
-        self.internal.eq(&other.internal)
     }
 }
 

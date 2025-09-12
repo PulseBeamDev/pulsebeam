@@ -19,6 +19,7 @@ const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum RoomMessage {
     PublishTrack(Arc<TrackMeta>),
     AddParticipant(Arc<ParticipantId>, Box<Rtc>),
+    RemoveParticipant(Arc<ParticipantId>),
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +103,12 @@ impl actor::Actor for RoomActor {
             RoomMessage::AddParticipant(participant_id, rtc) => {
                 self.handle_participant_joined(ctx, participant_id, rtc)
                     .await
+            }
+            RoomMessage::RemoveParticipant(participant_id) => {
+                if let Some(participant_handle) = self.state.participants.get(&participant_id) {
+                    // if it's closed, then the participant has exited
+                    let _ = participant_handle.handle.terminate().await;
+                }
             }
             RoomMessage::PublishTrack(track_meta) => {
                 self.handle_track_published(track_meta).await;

@@ -7,6 +7,7 @@ const statusEl = document.getElementById("status") as HTMLSpanElement;
 
 let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
+let sessionUrl: string | null = null;
 
 form.onsubmit = async (e) => {
   e.preventDefault();
@@ -47,7 +48,9 @@ async function start(endpoint: string) {
   pc.addTransceiver("audio", { direction: "recvonly" });
   const remoteStream = new MediaStream();
   remoteVideo.srcObject = remoteStream;
-  pc.ontrack = (e) => remoteStream.addTrack(e.track);
+  pc.ontrack = (e) => {
+    remoteStream.addTrack(e.track);
+  };
 
   pc.onconnectionstatechange = () => {
     statusEl.textContent = pc?.connectionState ?? "Disconnected";
@@ -61,10 +64,16 @@ async function start(endpoint: string) {
   });
   if (!response.ok) throw new Error(`request failed: ${response.status}`);
   const answerSdp = await response.text();
+  sessionUrl = response.headers.get("location");
   await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
 }
 
-function stop() {
+async function stop() {
+  if (sessionUrl) {
+    await fetch(sessionUrl, { method: "DELETE" });
+    sessionUrl = null;
+  }
+
   pc?.close();
   localStream?.getTracks().forEach(track => track.stop());
   localVideo.srcObject = null;

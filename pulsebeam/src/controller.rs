@@ -36,6 +36,7 @@ pub enum ControllerMessage {
         String,
         oneshot::Sender<Result<String, ControllerError>>,
     ),
+    RemoveParticipant(Arc<RoomId>, Arc<ParticipantId>),
 }
 
 pub struct ControllerActor {
@@ -79,6 +80,15 @@ impl actor::Actor for ControllerActor {
         match msg {
             ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
                 let _ = resp.send(self.allocate(ctx, room_id, participant_id, offer).await);
+            }
+
+            ControllerMessage::RemoveParticipant(room_id, participant_id) => {
+                if let Some(room_handle) = self.rooms.get(&room_id) {
+                    // if the room has exited, the participants have already cleaned up too.
+                    let _ = room_handle
+                        .send_high(room::RoomMessage::RemoveParticipant(participant_id))
+                        .await;
+                }
             }
         }
     }

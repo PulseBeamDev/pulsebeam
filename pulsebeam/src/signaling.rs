@@ -51,8 +51,6 @@ impl IntoResponse for SignalingError {
     }
 }
 
-/// Join a room / create participant
-/// POST /api/v1/rooms/{roomId}
 #[axum::debug_handler]
 async fn join_room(
     Path(room_id): Path<ExternalRoomId>,
@@ -78,23 +76,33 @@ async fn join_room(
         .await
         .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
+    // TODO: remove hardcoded URI
     let location_url = format!(
-        "/api/v1/rooms/{}/participants/{}",
-        &room_id, &participant_id
+        "http://localhost:3000/api/v1/rooms/{}/participants/{}",
+        &room_id.external, &participant_id
     );
     let mut response_headers = HeaderMap::new();
     response_headers.insert(LOCATION, location_url.parse().unwrap());
     Ok((StatusCode::CREATED, response_headers, answer_sdp))
 }
 
-/// Leave a room / delete participant
-/// DELETE /api/v1/rooms/{roomId}/participants/{participantId}
 #[axum::debug_handler]
 async fn leave_room(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
-    State(_controller): State<controller::ControllerHandle>,
+    State(con): State<controller::ControllerHandle>,
 ) -> Result<impl IntoResponse, SignalingError> {
-    // TODO: terminate participant session
+    let room_id = RoomId::new(room_id);
+    let room_id = Arc::new(room_id);
+    let participant_id = Arc::new(participant_id);
+
+    // If controller has exited, there's no dangling participants and rooms
+    let _ = con
+        .send_high(controller::ControllerMessage::RemoveParticipant(
+            room_id,
+            participant_id,
+        ))
+        .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

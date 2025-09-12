@@ -13,6 +13,7 @@ pub async fn run(
     // Configure CORS
     let cors = CorsLayer::very_permissive()
         .allow_origin(AllowOrigin::mirror_request())
+        .expose_headers([hyper::header::LOCATION])
         .max_age(Duration::from_secs(86400));
 
     // Spawn system and controller actors
