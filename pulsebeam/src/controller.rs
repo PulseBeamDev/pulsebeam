@@ -31,8 +31,8 @@ pub enum ControllerError {
 #[derive(Debug)]
 pub enum ControllerMessage {
     Allocate(
-        RoomId,
-        ParticipantId,
+        Arc<RoomId>,
+        Arc<ParticipantId>,
         String,
         oneshot::Sender<Result<String, ControllerError>>,
     ),
@@ -88,8 +88,8 @@ impl ControllerActor {
     pub async fn allocate(
         &mut self,
         _ctx: &mut actor::ActorContext<Self>,
-        room_id: RoomId,
-        participant_id: ParticipantId,
+        room_id: Arc<RoomId>,
+        participant_id: Arc<ParticipantId>,
         offer: String,
     ) -> Result<String, ControllerError> {
         let offer = SdpOffer::from_sdp_string(&offer)?;
@@ -115,7 +115,6 @@ impl ControllerActor {
             .accept_offer(offer)
             .map_err(ControllerError::OfferRejected)?;
 
-        let room_id = Arc::new(room_id);
         let room_handle = self.get_or_create_room(room_id);
 
         // TODO: probably retry? Or, let the client to retry instead?
@@ -123,7 +122,7 @@ impl ControllerActor {
         // But, a data race can still occur nonetheless
         room_handle
             .send_high(room::RoomMessage::AddParticipant(
-                Arc::new(participant_id),
+                participant_id,
                 Box::new(rtc),
             ))
             .await

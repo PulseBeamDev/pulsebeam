@@ -193,6 +193,7 @@ impl AsRef<str> for ExternalRoomId {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ParticipantId {
     pub internal: EntityId,
 }
@@ -201,6 +202,12 @@ impl ParticipantId {
     pub fn new() -> Self {
         let internal = new_entity_id(prefix::PARTICIPANT_ID);
         Self { internal }
+    }
+}
+
+impl Default for ParticipantId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -219,6 +226,28 @@ impl PartialOrd for ParticipantId {
 impl Ord for ParticipantId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.internal.cmp(&other.internal)
+    }
+}
+
+impl TryFrom<String> for ParticipantId {
+    type Error = IdValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        // Check prefix
+        let (prefix, encoded) = value
+            .split_once('_')
+            .ok_or(IdValidationError::InvalidCharacters)?;
+
+        if prefix != prefix::PARTICIPANT_ID {
+            return Err(IdValidationError::InvalidCharacters);
+        }
+
+        // Check if the encoded part is valid base58
+        bs58::decode(encoded)
+            .into_vec()
+            .map_err(|_| IdValidationError::InvalidCharacters)?;
+
+        Ok(ParticipantId { internal: value })
     }
 }
 

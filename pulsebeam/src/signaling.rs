@@ -1,16 +1,19 @@
-use crate::entity::{ParticipantId, RoomId};
-use crate::{controller, entity::ExternalRoomId};
+use std::sync::Arc;
+
+use crate::controller;
+use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
 use axum::{
     Router,
-    extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{delete, post},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{delete, get, post},
 };
-use axum_extra::{TypedHeader, headers::ContentType};
-use hyper::HeaderMap;
+use axum_extra::TypedHeader;
+use axum_extra::headers::ContentType;
 use hyper::header::LOCATION;
 
+/// Error type for signaling operations
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
     #[error("join failed: {0}")]
@@ -24,7 +27,7 @@ pub enum SignalingError {
 }
 
 impl IntoResponse for SignalingError {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> axum::response::Response {
         let status = match self {
             SignalingError::JoinError(controller::ControllerError::OfferInvalid(_)) => {
                 StatusCode::BAD_REQUEST
@@ -48,56 +51,67 @@ impl IntoResponse for SignalingError {
     }
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
-pub struct ParticipantInfo {
-    room: ExternalRoomId,
-}
-
+/// Join a room / create participant
+/// POST /api/v1/rooms/{roomId}
 #[axum::debug_handler]
-async fn spawn_participant(
-    Query(info): Query<ParticipantInfo>,
+async fn join_room(
+    Path(room_id): Path<ExternalRoomId>,
     State(con): State<controller::ControllerHandle>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<impl IntoResponse, SignalingError> {
-    // TODO: validate content_type = "application/sdp"
-
-    let room_id = RoomId::new(info.room);
+    let room_id = RoomId::new(room_id);
+    let room_id = Arc::new(room_id);
     let participant_id = ParticipantId::new();
-    tracing::info!("allocated {} to {}", participant_id, room_id);
+    let participant_id = Arc::new(participant_id);
 
-    // TODO: better unique ID to handle session.
-    let location_url = format!("/rooms/{}/participants/{}", &room_id, &participant_id,);
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     con.send_high(controller::ControllerMessage::Allocate(
-        room_id,
-        participant_id,
+        room_id.clone(),
+        participant_id.clone(),
         raw_offer,
         answer_tx,
     ))
     .await
     .map_err(|_| controller::ControllerError::ServiceUnavailable)?;
-    let answer = answer_rx
+    let answer_sdp = answer_rx
         .await
         .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(LOCATION, location_url.parse().unwrap());
-    let resp = (StatusCode::CREATED, headers, answer);
-    Ok(resp)
+    let location_url = format!(
+        "/api/v1/rooms/{}/participants/{}",
+        &room_id, &participant_id
+    );
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(LOCATION, location_url.parse().unwrap());
+    Ok((StatusCode::CREATED, response_headers, answer_sdp))
 }
 
+/// Leave a room / delete participant
+/// DELETE /api/v1/rooms/{roomId}/participants/{participantId}
 #[axum::debug_handler]
-async fn delete_participant(
-    State(_state): State<controller::ControllerHandle>,
+async fn leave_room(
+    Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    State(_controller): State<controller::ControllerHandle>,
 ) -> Result<impl IntoResponse, SignalingError> {
-    // TODO: delete participant from the room
-    Ok(StatusCode::OK)
+    // TODO: terminate participant session
+    Ok(StatusCode::NO_CONTENT)
 }
 
+/// Healthcheck endpoint for Kubernetes
+/// GET /healthz
+async fn healthcheck() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+/// Router setup
 pub fn router(controller: controller::ControllerHandle) -> Router {
     Router::new()
-        .route("/", post(spawn_participant))
-        .route("/", delete(delete_participant))
+        .route("/api/v1/rooms/{external_room_id}", post(join_room))
+        .route(
+            "/api/v1/rooms/{external_room_id}/participants/{participant_id}",
+            delete(leave_room),
+        )
+        .route("/healthz", get(healthcheck))
         .with_state(controller)
 }
