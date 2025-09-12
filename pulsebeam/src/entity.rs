@@ -194,23 +194,13 @@ impl AsRef<str> for ExternalRoomId {
 }
 
 pub struct ParticipantId {
-    pub external: ExternalParticipantId,
     pub internal: EntityId,
 }
 
 impl ParticipantId {
-    pub fn new(external: ExternalParticipantId) -> Self {
+    pub fn new() -> Self {
         let internal = new_entity_id(prefix::PARTICIPANT_ID);
-        Self { external, internal }
-    }
-}
-
-impl TryFrom<&str> for ParticipantId {
-    type Error = IdValidationError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let external = ExternalParticipantId::from_str(value)?;
-        Ok(Self::new(external))
+        Self { internal }
     }
 }
 
@@ -469,15 +459,10 @@ mod tests {
     #[test]
     fn test_participant_id_equality_and_hash() {
         let internal = "pa_xyz987".to_string();
-        let ext = ExternalParticipantId::new("external_pa".into()).unwrap();
         let id1 = ParticipantId {
-            external: ext.clone(),
             internal: internal.clone(),
         };
-        let id2 = ParticipantId {
-            external: ext,
-            internal,
-        };
+        let id2 = ParticipantId { internal };
 
         assert_eq!(id1, id2);
         use std::collections::hash_map::DefaultHasher;
@@ -486,13 +471,5 @@ mod tests {
         id1.hash(&mut h1);
         id2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
-    }
-
-    #[test]
-    fn test_participant_id_equality_multiple() {
-        let ext = ExternalParticipantId::new("external_pa".into()).unwrap();
-        let participant_id1 = ParticipantId::new(ext.clone());
-        let participant_id2 = ParticipantId::new(ext);
-        assert_ne!(participant_id1, participant_id2);
     }
 }

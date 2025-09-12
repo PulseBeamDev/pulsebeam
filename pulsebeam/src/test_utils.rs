@@ -5,8 +5,7 @@ use pulsebeam_runtime::net;
 use str0m::media::Mid;
 
 pub fn create_participant_id() -> Arc<entity::ParticipantId> {
-    let external = entity::ExternalParticipantId::new(entity::new_random_id("tp", 10)).unwrap();
-    let participant_id = entity::ParticipantId::new(external);
+    let participant_id = entity::ParticipantId::new();
     Arc::new(participant_id)
 }
 

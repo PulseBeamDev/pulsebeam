@@ -1,8 +1,5 @@
 use crate::entity::{ParticipantId, RoomId};
-use crate::{
-    controller,
-    entity::{ExternalParticipantId, ExternalRoomId},
-};
+use crate::{controller, entity::ExternalRoomId};
 use axum::{
     Router,
     extract::{Query, State},
@@ -54,7 +51,6 @@ impl IntoResponse for SignalingError {
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct ParticipantInfo {
     room: ExternalRoomId,
-    participant: ExternalParticipantId,
 }
 
 #[axum::debug_handler]
@@ -67,7 +63,7 @@ async fn spawn_participant(
     // TODO: validate content_type = "application/sdp"
 
     let room_id = RoomId::new(info.room);
-    let participant_id = ParticipantId::new(info.participant);
+    let participant_id = ParticipantId::new();
     tracing::info!("allocated {} to {}", participant_id, room_id);
 
     // TODO: better unique ID to handle session.
