@@ -1,12 +1,7 @@
-use std::{collections::HashMap, net::SocketAddr};
-
-use crate::{
-    ice,
-    message::{self, UDPPacket},
-    participant,
-};
-use bytes::Bytes;
+use crate::{ice, participant};
+use bytes::BytesMut;
 use pulsebeam_runtime::{actor, net};
+use std::{collections::HashMap, net::SocketAddr};
 
 #[derive(Debug)]
 pub enum GatewayControlMessage {
@@ -16,7 +11,7 @@ pub enum GatewayControlMessage {
 
 #[derive(Debug)]
 pub enum GatewayDataMessage {
-    Packet(message::EgressUDPPacket),
+    Packet(net::SendPacket),
 }
 
 pub struct GatewayActor {
@@ -25,6 +20,8 @@ pub struct GatewayActor {
     conns: HashMap<String, participant::ParticipantHandle>,
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
+    recv_batch: Vec<net::RecvPacket>, // Pre-allocated for receives
+    send_batch: Vec<net::SendPacket>, // Pre-allocated for sends
 }
 
 impl actor::Actor for GatewayActor {
@@ -40,18 +37,35 @@ impl actor::Actor for GatewayActor {
     fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        // let mut buf = BytesMut::with_capacity(128 * 1024);
-        let mut buf = vec![0; 2000];
+        const BATCH_SIZE: usize = 32; // Tune based on load (e.g., packet rate)
 
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
-        select: {
-            res = self.socket.recv_from(&mut buf) => {
-                match res {
-                    Ok((size, source)) => self.handle_packet(source, &buf[..size]),
+        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {
+            // Send any pending packets in send_batch
+            if !self.send_batch.is_empty() {
+                match self.socket.send_batch(&self.send_batch).await {
+                    Ok(sent) => {
+                        tracing::debug!("Sent {} packets in batch", sent);
+                        self.send_batch.clear(); // Clear after successful send
+                    }
                     Err(err) => {
-                        tracing::error!("udp socket is failing: {err}");
+                        tracing::warn!("Failed to send batch: {:?}", err);
+                        // Keep packets for retry in next iteration
+                    }
+                }
+            }
+        },
+        select: {
+            // Receive a batch of packets
+            res = self.socket.recv_batch(&mut self.recv_batch) => {
+                match res {
+                    Ok(num_received) if num_received > 0 => {
+                        self.handle_packet_batch(&self.recv_batch[..num_received]);
+                    }
+                    Ok(_) => {} // No packets received; continue
+                    Err(err) => {
+                        tracing::error!("UDP socket failed in recv_batch: {}", err);
                         break;
-                    },
+                    }
                 }
             }
         });
@@ -79,75 +93,98 @@ impl actor::Actor for GatewayActor {
                     }
                 }
             }
-        };
+        }
     }
 
     async fn on_low_priority(
         &mut self,
-        ctx: &mut actor::ActorContext<Self>,
+        _ctx: &mut actor::ActorContext<Self>,
         msg: Self::LowPriorityMsg,
     ) -> () {
         match msg {
             GatewayDataMessage::Packet(packet) => {
-                let res = self.socket.send_to(&packet.raw, packet.dst).await;
-                if let Err(err) = res {
-                    tracing::warn!("failed to send packet to {:?}: {:?}", packet.dst, err);
-                }
+                // Add to send_batch (zero-copy, reuse Bytes)
+                self.send_batch.push(packet);
             }
         }
     }
 }
 
 impl GatewayActor {
-    // TODO: TCP candidate
-    // TODO: TLS candidate
-    // TODO: NAT rebinding
-    pub fn handle_packet(&mut self, source: SocketAddr, packet: &[u8]) {
-        let participant_handle = if let Some(participant_handle) = self.mapping.get(&source) {
-            tracing::trace!("found connection from mapping: {source} -> {participant_handle:?}");
-            participant_handle.clone()
-        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(packet) {
-            if let Some(participant_handle) = self.conns.get(ufrag) {
-                tracing::debug!(
-                    "found connection from ufrag: {ufrag} -> {source} -> {participant_handle:?}"
-                );
-                self.mapping.insert(source, participant_handle.clone());
-                self.reverse
-                    .entry(ufrag.to_string())
-                    .or_default()
-                    .push(source);
-                participant_handle.clone()
-            } else {
-                tracing::debug!(
-                    "dropped a packet from {source} due to unregistered stun binding: {ufrag}"
-                );
-                return;
-            }
-        } else {
-            tracing::debug!(
-                "dropped a packet from {source} due to unexpected message flow from an unknown source"
-            );
-            return;
-        };
-
-        let _ = participant_handle.try_send_low(participant::ParticipantDataMessage::UdpPacket(
-            UDPPacket {
-                raw: Bytes::copy_from_slice(packet),
-                src: source,
-                dst: self.local_addr,
-            },
-        ));
-    }
-}
-
-impl GatewayActor {
     pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket<'static>) -> Self {
+        const BATCH_SIZE: usize = 32;
+        // Pre-allocate receive batch with MTU-sized buffers
+        let recv_batch = (0..BATCH_SIZE)
+            .map(|_| net::RecvPacket {
+                buf: BytesMut::with_capacity(1500), // MTU for RTP packets
+                len: 0,
+                src: "0.0.0.0:0".parse().unwrap(),
+            })
+            .collect();
+        // Pre-allocate send batch capacity
+        let send_batch = Vec::with_capacity(BATCH_SIZE);
+
         GatewayActor {
             local_addr,
             socket,
             conns: HashMap::new(),
             mapping: HashMap::new(),
             reverse: HashMap::new(),
+            recv_batch,
+            send_batch,
+        }
+    }
+
+    fn handle_packet_batch(&mut self, packets: &[net::RecvPacket]) {
+        for packet in packets {
+            let payload = &packet.buf[..packet.len];
+            let participant_handle = if let Some(participant_handle) = self.mapping.get(&packet.src)
+            {
+                tracing::trace!(
+                    "found connection from mapping: {} -> {:?}",
+                    packet.src,
+                    participant_handle
+                );
+                participant_handle.clone()
+            } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(payload) {
+                if let Some(participant_handle) = self.conns.get(ufrag) {
+                    tracing::debug!(
+                        "found connection from ufrag: {} -> {} -> {:?}",
+                        ufrag,
+                        packet.src,
+                        participant_handle
+                    );
+                    self.mapping.insert(packet.src, participant_handle.clone());
+                    self.reverse
+                        .entry(ufrag.to_string())
+                        .or_default()
+                        .push(packet.src);
+                    participant_handle.clone()
+                } else {
+                    tracing::debug!(
+                        "dropped a packet from {} due to unregistered stun binding: {}",
+                        packet.src,
+                        ufrag
+                    );
+                    continue;
+                }
+            } else {
+                tracing::debug!(
+                    "dropped a packet from {} due to unexpected message flow from an unknown source",
+                    packet.src
+                );
+                continue;
+            };
+
+            // Zero-copy: Create Bytes from received buffer
+            let _ = participant_handle.try_send_low(
+                participant::ParticipantDataMessage::UdpPacket(net::RecvPacket {
+                    buf: packet.buf.split_to(packet.len),
+                    len: packet.len,
+                    src: packet.src,
+                    dst: self.local_addr,
+                }),
+            );
         }
     }
 }

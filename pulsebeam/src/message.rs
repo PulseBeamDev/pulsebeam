@@ -10,19 +10,6 @@ pub use str0m::{Rtc, RtcError};
 
 use crate::entity::TrackId;
 
-#[derive(Debug)]
-pub struct UDPPacket {
-    pub raw: Bytes,
-    pub src: SocketAddr,
-    pub dst: SocketAddr,
-}
-
-#[derive(Debug)]
-pub struct EgressUDPPacket {
-    pub raw: Bytes,
-    pub dst: SocketAddr,
-}
-
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct TrackMeta {
     pub id: Arc<TrackId>,

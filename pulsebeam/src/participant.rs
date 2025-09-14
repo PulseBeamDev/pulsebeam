@@ -7,18 +7,18 @@ use str0m::{
     channel::{ChannelData, ChannelId},
     error::SdpError,
     media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid},
-    net::{self, Transmit},
+    net::Transmit,
 };
 use tokio::time::Instant;
 
 use crate::{
     entity::{EntityId, ParticipantId, TrackId},
     gateway,
-    message::{self, EgressUDPPacket, TrackMeta},
+    message::{self, TrackMeta},
     proto::{self, sfu},
     room, system, track,
 };
-use pulsebeam_runtime::actor;
+use pulsebeam_runtime::{actor, net};
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -44,7 +44,7 @@ pub enum ParticipantControlMessage {
 
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
-    UdpPacket(message::UDPPacket),
+    UdpPacket(net::RecvPacket),
     ForwardMedia(Arc<TrackMeta>, Arc<MediaData>),
     KeyframeRequest(Arc<TrackId>, message::KeyframeRequest),
 }
@@ -210,11 +210,11 @@ impl actor::Actor for ParticipantActor {
                 let now = Instant::now();
                 let res = self.rtc.handle_input(Input::Receive(
                     now.into_std(),
-                    net::Receive {
-                        proto: net::Protocol::Udp,
+                    str0m::net::Receive {
+                        proto: str0m::net::Protocol::Udp,
                         source: packet.src,
                         destination: packet.dst,
-                        contents: (&*packet.raw).try_into().unwrap(),
+                        contents: (&*packet.buf).try_into().unwrap(),
                     },
                 ));
 
@@ -448,8 +448,8 @@ impl ParticipantActor {
         let _ = self
             .system_ctx
             .gw_handle
-            .send_low(gateway::GatewayDataMessage::Packet(EgressUDPPacket {
-                raw: packet,
+            .send_low(gateway::GatewayDataMessage::Packet(net::SendPacket {
+                buf: packet,
                 dst: t.destination,
             }))
             .await;

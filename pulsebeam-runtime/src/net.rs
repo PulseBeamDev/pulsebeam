@@ -25,16 +25,19 @@ pub enum Transport {
 }
 
 /// A received packet (zero-copy buffer + source address).
+#[derive(Debug)]
 pub struct RecvPacket {
-    pub buf: BytesMut,    // pre-allocated buffer
-    pub len: usize,       // actual data length
-    pub addr: SocketAddr, // remote peer
+    pub buf: BytesMut,   // pre-allocated buffer
+    pub src: SocketAddr, // remote peer
+    pub dst: SocketAddr,
+    pub len: usize,
 }
 
 /// A packet to send.
+#[derive(Debug)]
 pub struct SendPacket {
-    pub buf: Bytes,       // zero-copy payload
-    pub addr: SocketAddr, // destination
+    pub buf: Bytes,      // zero-copy payload
+    pub dst: SocketAddr, // destination
 }
 
 /// tokio/mio doesn't support batching: https://github.com/tokio-rs/mio/issues/185
@@ -83,8 +86,9 @@ impl<'a> UdpTransport<'a> {
             // Use try_recv_from to non-blockingly receive (zero alloc)
             match self.sock.try_recv_from(&mut packets[count].buf) {
                 Ok((len, addr)) => {
+                    packets[count].src = addr;
+                    packets[count].dst = self.sock.local_addr()?;
                     packets[count].len = len;
-                    packets[count].addr = addr;
                     count += 1;
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -111,7 +115,7 @@ impl<'a> UdpTransport<'a> {
             // First, try to send non-blockingly
             match self
                 .sock
-                .try_send_to(&packets[count].buf, packets[count].addr)
+                .try_send_to(&packets[count].buf, packets[count].dst)
             {
                 Ok(_) => {
                     count += 1;
