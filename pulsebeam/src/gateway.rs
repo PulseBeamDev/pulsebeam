@@ -20,8 +20,6 @@ pub struct GatewayActor {
     conns: HashMap<String, participant::ParticipantHandle>,
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
-    recv_batch: Vec<net::RecvPacket>, // Pre-allocated for receives
-    send_batch: Vec<net::SendPacket>, // Pre-allocated for sends
 }
 
 impl actor::Actor for GatewayActor {
@@ -37,29 +35,26 @@ impl actor::Actor for GatewayActor {
     fn get_observable_state(&self) -> Self::ObservableState {}
 
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        const BATCH_SIZE: usize = 32; // Tune based on load (e.g., packet rate)
+        const BATCH_SIZE: usize = 32;
+        // Pre-allocate receive batch with MTU-sized buffers
+        let mut recv_batch: Vec<net::RecvPacket> = (0..BATCH_SIZE)
+            .map(|_| net::RecvPacket {
+                buf: BytesMut::with_capacity(1500),
+                len: 0,
+                src: "0.0.0.0:0".parse().unwrap(),
+                dst: "0.0.0.0:0".parse().unwrap(),
+            })
+            .collect();
+        // // Pre-allocate send batch capacity
+        // let send_batch: Vec<net::SendPacket> = Vec::with_capacity(BATCH_SIZE);
 
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {
-            // Send any pending packets in send_batch
-            if !self.send_batch.is_empty() {
-                match self.socket.send_batch(&self.send_batch).await {
-                    Ok(sent) => {
-                        tracing::debug!("Sent {} packets in batch", sent);
-                        self.send_batch.clear(); // Clear after successful send
-                    }
-                    Err(err) => {
-                        tracing::warn!("Failed to send batch: {:?}", err);
-                        // Keep packets for retry in next iteration
-                    }
-                }
-            }
-        },
+        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             // Receive a batch of packets
-            res = self.socket.recv_batch(&mut self.recv_batch) => {
+            res = self.socket.recv_batch(&mut recv_batch) => {
                 match res {
                     Ok(num_received) if num_received > 0 => {
-                        self.handle_packet_batch(&self.recv_batch[..num_received]);
+                        self.handle_packet_batch(&mut recv_batch[..num_received]);
                     }
                     Ok(_) => {} // No packets received; continue
                     Err(err) => {
@@ -102,9 +97,10 @@ impl actor::Actor for GatewayActor {
         msg: Self::LowPriorityMsg,
     ) -> () {
         match msg {
+            // TODO: each participant needs to own their pacers and bandwidth estimator.
+            // TODO: gateway needs to batch packets from multiple participants
             GatewayDataMessage::Packet(packet) => {
-                // Add to send_batch (zero-copy, reuse Bytes)
-                self.send_batch.push(packet);
+                let _ = self.socket.send_batch(&[packet]).await;
             }
         }
     }
@@ -112,30 +108,16 @@ impl actor::Actor for GatewayActor {
 
 impl GatewayActor {
     pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket<'static>) -> Self {
-        const BATCH_SIZE: usize = 32;
-        // Pre-allocate receive batch with MTU-sized buffers
-        let recv_batch = (0..BATCH_SIZE)
-            .map(|_| net::RecvPacket {
-                buf: BytesMut::with_capacity(1500), // MTU for RTP packets
-                len: 0,
-                src: "0.0.0.0:0".parse().unwrap(),
-            })
-            .collect();
-        // Pre-allocate send batch capacity
-        let send_batch = Vec::with_capacity(BATCH_SIZE);
-
         GatewayActor {
             local_addr,
             socket,
             conns: HashMap::new(),
             mapping: HashMap::new(),
             reverse: HashMap::new(),
-            recv_batch,
-            send_batch,
         }
     }
 
-    fn handle_packet_batch(&mut self, packets: &[net::RecvPacket]) {
+    fn handle_packet_batch(&mut self, packets: &mut [net::RecvPacket]) {
         for packet in packets {
             let payload = &packet.buf[..packet.len];
             let participant_handle = if let Some(participant_handle) = self.mapping.get(&packet.src)

@@ -68,8 +68,6 @@ impl<'a> UdpTransport<'a> {
 
         // TODO: set qos class?
 
-        sock.bind(&addr.into())?;
-
         let sock = tokio::net::UdpSocket::from_std(sock.into())?;
 
         Ok(UdpTransport {
