@@ -12,7 +12,10 @@ pub struct SystemContext {
 }
 
 impl SystemContext {
-    pub fn spawn(external_addr: SocketAddr, socket: net::UnifiedSocket) -> (Self, JoinHandle<()>) {
+    pub fn spawn(
+        external_addr: SocketAddr,
+        socket: net::UnifiedSocket<'static>,
+    ) -> (Self, JoinHandle<()>) {
         let rng = rand::Rng::from_os_rng();
         let gw_actor = gateway::GatewayActor::new(external_addr, socket);
 

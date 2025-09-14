@@ -141,7 +141,7 @@ impl GatewayActor {
 }
 
 impl GatewayActor {
-    pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket) -> Self {
+    pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket<'static>) -> Self {
         GatewayActor {
             local_addr,
             socket,

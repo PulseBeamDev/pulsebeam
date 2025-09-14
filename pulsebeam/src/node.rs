@@ -4,10 +4,10 @@ use pulsebeam_runtime::{actor, net, rt};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-pub async fn run<'a>(
+pub async fn run(
     cpu_rt: rt::Runtime,
     external_addr: SocketAddr,
-    unified_socket: net::UnifiedSocket<'a>,
+    unified_socket: net::UnifiedSocket<'static>,
     http_socket: SocketAddr,
     enable_tls: bool,
 ) -> anyhow::Result<()> {
