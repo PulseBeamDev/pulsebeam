@@ -13,9 +13,10 @@ use tokio::time::Instant;
 
 use crate::{
     entity::{EntityId, ParticipantId, TrackId},
+    gateway,
     message::{self, EgressUDPPacket, TrackMeta},
     proto::{self, sfu},
-    room, sink, system, track,
+    room, system, track,
 };
 use pulsebeam_runtime::actor;
 
@@ -446,8 +447,8 @@ impl ParticipantActor {
         let packet = Bytes::copy_from_slice(&t.contents);
         let _ = self
             .system_ctx
-            .sink_handle
-            .send_low(sink::SinkMessage::Packet(EgressUDPPacket {
+            .gw_handle
+            .send_low(gateway::GatewayDataMessage::Packet(EgressUDPPacket {
                 raw: packet,
                 dst: t.destination,
             }))

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::{sink, source};
+use crate::gateway;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
 use tokio::task::JoinHandle;
@@ -8,30 +8,20 @@ use tokio::task::JoinHandle;
 #[derive(Clone)]
 pub struct SystemContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-    pub source_handle: source::SourceHandle,
-    pub sink_handle: sink::SinkHandle,
+    pub gw_handle: gateway::GatewayHandle,
 }
 
 impl SystemContext {
     pub fn spawn(external_addr: SocketAddr, socket: net::UnifiedSocket) -> (Self, JoinHandle<()>) {
         let rng = rand::Rng::from_os_rng();
-        let source_actor = source::SourceActor::new(external_addr, socket.clone());
-        let sink_actor = sink::SinkActor::new(socket.clone());
+        let gw_actor = gateway::GatewayActor::new(external_addr, socket);
 
         // TODO: tune capacity
-        let (source_handle, source_join) =
-            actor::spawn(source_actor, actor::RunnerConfig::default());
-        let (sink_handle, sink_join) =
-            actor::spawn(sink_actor, actor::RunnerConfig::default().with_lo(8192));
-
+        let (gw_handle, gw_join) = actor::spawn(gw_actor, actor::RunnerConfig::default());
         let task = tokio::spawn(async {
-            tokio::join!(source_join, sink_join);
+            tokio::join!(gw_join);
         });
-        let ctx = SystemContext {
-            rng,
-            source_handle,
-            sink_handle,
-        };
+        let ctx = SystemContext { rng, gw_handle };
         (ctx, task)
     }
 }

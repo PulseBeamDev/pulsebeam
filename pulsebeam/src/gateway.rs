@@ -1,26 +1,35 @@
 use std::{collections::HashMap, net::SocketAddr};
 
-use crate::{ice, message::UDPPacket, participant};
+use crate::{
+    ice,
+    message::{self, UDPPacket},
+    participant,
+};
 use bytes::Bytes;
 use pulsebeam_runtime::{actor, net};
 
 #[derive(Debug)]
-pub enum SourceControlMessage {
+pub enum GatewayControlMessage {
     AddParticipant(String, participant::ParticipantHandle),
     RemoveParticipant(String),
 }
 
-pub struct SourceActor {
+#[derive(Debug)]
+pub enum GatewayDataMessage {
+    Packet(message::EgressUDPPacket),
+}
+
+pub struct GatewayActor {
     local_addr: SocketAddr,
-    socket: net::UnifiedSocket,
+    socket: net::UnifiedSocket<'static>,
     conns: HashMap<String, participant::ParticipantHandle>,
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
 }
 
-impl actor::Actor for SourceActor {
-    type HighPriorityMsg = SourceControlMessage;
-    type LowPriorityMsg = ();
+impl actor::Actor for GatewayActor {
+    type HighPriorityMsg = GatewayControlMessage;
+    type LowPriorityMsg = GatewayDataMessage;
     type Meta = usize;
     type ObservableState = ();
 
@@ -57,11 +66,11 @@ impl actor::Actor for SourceActor {
         msg: Self::HighPriorityMsg,
     ) -> () {
         match msg {
-            SourceControlMessage::AddParticipant(ufrag, participant) => {
+            GatewayControlMessage::AddParticipant(ufrag, participant) => {
                 tracing::debug!("added {ufrag} to connection map");
                 self.conns.insert(ufrag, participant);
             }
-            SourceControlMessage::RemoveParticipant(ufrag) => {
+            GatewayControlMessage::RemoveParticipant(ufrag) => {
                 tracing::debug!("removed {ufrag} from connection map");
                 self.conns.remove(&ufrag);
                 if let Some(addrs) = self.reverse.remove(&ufrag) {
@@ -72,9 +81,24 @@ impl actor::Actor for SourceActor {
             }
         };
     }
+
+    async fn on_low_priority(
+        &mut self,
+        ctx: &mut actor::ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) -> () {
+        match msg {
+            GatewayDataMessage::Packet(packet) => {
+                let res = self.socket.send_to(&packet.raw, packet.dst).await;
+                if let Err(err) = res {
+                    tracing::warn!("failed to send packet to {:?}: {:?}", packet.dst, err);
+                }
+            }
+        }
+    }
 }
 
-impl SourceActor {
+impl GatewayActor {
     // TODO: TCP candidate
     // TODO: TLS candidate
     // TODO: NAT rebinding
@@ -116,9 +140,9 @@ impl SourceActor {
     }
 }
 
-impl SourceActor {
+impl GatewayActor {
     pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket) -> Self {
-        SourceActor {
+        GatewayActor {
             local_addr,
             socket,
             conns: HashMap::new(),
@@ -128,4 +152,4 @@ impl SourceActor {
     }
 }
 
-pub type SourceHandle = actor::ActorHandle<SourceActor>;
+pub type GatewayHandle = actor::ActorHandle<GatewayActor>;

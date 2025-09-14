@@ -8,8 +8,9 @@ use str0m::Rtc;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
+    gateway,
     message::TrackMeta,
-    participant, source, system, track,
+    participant, system, track,
 };
 use pulsebeam_runtime::actor;
 
@@ -149,8 +150,8 @@ impl RoomActor {
         self.participant_tasks.push(participant_join);
 
         self.system_ctx
-            .source_handle
-            .send_high(source::SourceControlMessage::AddParticipant(
+            .gw_handle
+            .send_high(gateway::GatewayControlMessage::AddParticipant(
                 ufrag.clone(),
                 participant_handle.clone(),
             ))
@@ -185,8 +186,8 @@ impl RoomActor {
         }
 
         self.system_ctx
-            .source_handle
-            .send_high(source::SourceControlMessage::RemoveParticipant(
+            .gw_handle
+            .send_high(gateway::GatewayControlMessage::RemoveParticipant(
                 participant.ufrag,
             ))
             .await

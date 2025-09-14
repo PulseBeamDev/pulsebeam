@@ -4,10 +4,10 @@ use pulsebeam_runtime::{actor, net, rt};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-pub async fn run(
+pub async fn run<'a>(
     cpu_rt: rt::Runtime,
     external_addr: SocketAddr,
-    unified_socket: net::UnifiedSocket,
+    unified_socket: net::UnifiedSocket<'a>,
     http_socket: SocketAddr,
     enable_tls: bool,
 ) -> anyhow::Result<()> {
@@ -20,8 +20,7 @@ pub async fn run(
     // Spawn system and controller actors
     let mut join_set = FuturesUnordered::new();
 
-    let (system_ctx, system_join) =
-        system::SystemContext::spawn(external_addr, unified_socket.clone());
+    let (system_ctx, system_join) = system::SystemContext::spawn(external_addr, unified_socket);
     join_set.push(system_join.map(|_| ()).boxed());
 
     let (controller_ready_tx, controller_ready_rx) = tokio::sync::oneshot::channel();
