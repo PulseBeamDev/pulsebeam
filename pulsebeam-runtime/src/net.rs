@@ -39,6 +39,60 @@ pub struct SendPacket {
     pub dst: SocketAddr, // destination
 }
 
+/// UnifiedSocket enum for different transport types
+pub enum UnifiedSocket<'a> {
+    Udp(UdpTransport<'a>),
+}
+
+impl<'a> UnifiedSocket<'a> {
+    /// Binds a socket to the given address and transport type.
+    pub async fn bind(addr: SocketAddr, transport: Transport) -> io::Result<Self> {
+        let sock = match transport {
+            Transport::Udp => Self::Udp(UdpTransport::bind(addr)?),
+            _ => todo!(),
+        };
+        Ok(sock)
+    }
+
+    /// Waits until the socket is readable.
+    #[inline]
+    pub async fn readable(&self) -> io::Result<()> {
+        match self {
+            Self::Udp(inner) => inner.readable().await?,
+        }
+        Ok(())
+    }
+
+    /// Waits until the socket is writable.
+    #[inline]
+    pub async fn writable(&self) -> io::Result<()> {
+        match self {
+            Self::Udp(inner) => inner.writable().await?,
+        }
+        Ok(())
+    }
+
+    /// Receives a batch of packets into pre-allocated buffers.
+    /// Returns the number of packets received.
+    /// Stops on WouldBlock or fatal errors.
+    #[inline]
+    pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(inner) => inner.try_recv_batch(packets),
+        }
+    }
+
+    /// Sends a batch of packets.
+    /// Returns the number of packets sent.
+    /// Stops on WouldBlock or fatal errors; errors for individual packets are logged.
+    #[inline]
+    pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(inner) => inner.try_send_batch(packets),
+        }
+    }
+}
+
 /// tokio/mio doesn't support batching: https://github.com/tokio-rs/mio/issues/185
 /// TODO:
 /// * Evaluate quinn-udp
@@ -46,6 +100,7 @@ pub struct SendPacket {
 /// * Evaluate io-uring
 pub struct UdpTransport<'a> {
     sock: tokio::net::UdpSocket,
+    local_addr: SocketAddr,
 
     // Leaving a marker with lifetime here for future interactions with system
     // optimizations.
@@ -56,8 +111,11 @@ impl<'a> UdpTransport<'a> {
     pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let sock = std::net::UdpSocket::bind(addr)?;
-        let sock: socket2::Socket = sock.into();
+        let sock = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
         sock.set_nonblocking(true)?;
         sock.set_reuse_address(true)?;
         sock.set_reuse_port(true)?;
@@ -68,9 +126,11 @@ impl<'a> UdpTransport<'a> {
         // TODO: set qos class?
 
         let sock = tokio::net::UdpSocket::from_std(sock.into())?;
+        let local_addr = sock.local_addr()?;
 
         Ok(UdpTransport {
             sock,
+            local_addr,
             _marker: std::marker::PhantomData,
         })
     }
@@ -87,110 +147,34 @@ impl<'a> UdpTransport<'a> {
 
     pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
         let mut count = 0;
-        while count < packets.len() {
-            // Use try_recv_from to non-blockingly receive (zero alloc)
-            match self.sock.try_recv_from(&mut packets[count].buf) {
-                Ok((len, addr)) => {
-                    packets[count].src = addr;
-                    packets[count].dst = self.sock.local_addr()?;
-                    packets[count].len = len;
+        for packet in packets.iter_mut() {
+            match self.sock.try_recv_from(&mut packet.buf) {
+                Ok((len, src)) => {
+                    packet.src = src;
+                    // TODO: verify if this is a good value for dst here.
+                    packet.dst = self.local_addr;
+                    packet.len = len;
                     count += 1;
                 }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // No more data available right now; stop batch
-                    break;
-                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
         }
-
         Ok(count)
     }
 
     pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         let mut count = 0;
-        let mut last_error = None;
-
-        // Loop over the packets, attempting to send each one
-        while count < packets.len() {
-            // First, try to send non-blockingly
-            match self
-                .sock
-                .try_send_to(&packets[count].buf, packets[count].dst)
-            {
-                Ok(_) => {
-                    count += 1;
-                    last_error = None; // Reset error if successful
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // user has to wait until writable is true
-                    break;
-                }
+        for packet in packets.iter() {
+            match self.sock.try_send_to(&packet.buf, packet.dst) {
+                Ok(_) => count += 1,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    // Other error; store and continue to try next, but we'll return error if any
-                    last_error = Some(e);
-                    count += 1; // Skip this packet, consider "processed" but error will be returned
+                    tracing::warn!("Send packet to {} failed: {}", packet.dst, e); // Internal logging
+                    continue; // Skip and try next packet
                 }
             }
         }
-
-        if let Some(e) = last_error {
-            Err(e)
-        } else {
-            Ok(count)
-        }
-    }
-}
-
-/// UnifiedSocket enum for different transport types
-pub enum UnifiedSocket<'a> {
-    Udp(UdpTransport<'a>),
-}
-
-impl<'a> UnifiedSocket<'a> {
-    pub async fn bind(addr: SocketAddr, transport: Transport) -> io::Result<Self> {
-        let sock = match transport {
-            Transport::Udp => Self::Udp(UdpTransport::bind(addr)?),
-            _ => todo!(),
-        };
-        Ok(sock)
-    }
-
-    #[inline]
-    pub async fn readable(&self) -> io::Result<()> {
-        match self {
-            Self::Udp(inner) => inner.readable().await?,
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub async fn writable(&self) -> io::Result<()> {
-        match self {
-            Self::Udp(inner) => inner.writable().await?,
-        }
-        Ok(())
-    }
-
-    /// Receive a batch of packets (up to `packets.len()`).
-    /// Returns number of packets actually received.
-    /// Uses pre-allocated buffers in `packets`, awaits readability once, then drains available datagrams
-    /// with zero additional allocations.
-    #[inline]
-    pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(inner) => inner.try_recv_batch(packets),
-        }
-    }
-
-    /// Send a batch of packets.
-    /// Returns number of packets actually sent.
-    /// Uses provided buffers, awaits writability if needed, then sends as many as possible
-    /// with zero additional allocations.
-    #[inline]
-    pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(inner) => inner.try_send_batch(packets),
-        }
+        Ok(count)
     }
 }
