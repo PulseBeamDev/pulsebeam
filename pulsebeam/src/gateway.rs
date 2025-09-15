@@ -1,5 +1,4 @@
 use crate::{ice, participant};
-use bytes::BytesMut;
 use pulsebeam_runtime::{actor, net};
 use std::{collections::HashMap, io, net::SocketAddr};
 
@@ -15,7 +14,6 @@ pub enum GatewayDataMessage {
 }
 
 pub struct GatewayActor {
-    local_addr: SocketAddr,
     socket: net::UnifiedSocket<'static>,
     conns: HashMap<String, participant::ParticipantHandle>,
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
@@ -39,15 +37,16 @@ impl actor::Actor for GatewayActor {
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
-            Ok(_) = self.socket.readable() => {
-                if let Err(err) = self.read_socket() {
-                    tracing::error!("failed to read socket: {err}");
-                    break;
-                }
-            }
+            // biased toward writing to socket
             Ok(_) = self.socket.writable() => {
                 if let Err(err) = self.write_socket() {
                     tracing::error!("failed to write socket: {err}");
+                    break;
+                }
+            }
+            Ok(_) = self.socket.readable() => {
+                if let Err(err) = self.read_socket() {
+                    tracing::error!("failed to read socket: {err}");
                     break;
                 }
             }
@@ -95,22 +94,15 @@ impl actor::Actor for GatewayActor {
 }
 
 impl GatewayActor {
-    pub fn new(local_addr: SocketAddr, socket: net::UnifiedSocket<'static>) -> Self {
-        const BATCH_SIZE: usize = 32;
-        // Pre-allocate receive batch with MTU-sized buffers
-        let recv_batch = (0..BATCH_SIZE)
-            .map(|_| net::RecvPacket {
-                buf: BytesMut::with_capacity(1500),
-                len: 0,
-                src: "0.0.0.0:0".parse().unwrap(),
-                dst: "0.0.0.0:0".parse().unwrap(),
-            })
-            .collect();
-        // Pre-allocate send batch capacity
-        let send_batch: Vec<net::SendPacket> = Vec::with_capacity(BATCH_SIZE);
+    const BATCH_SIZE: usize = 64;
 
-        GatewayActor {
-            local_addr,
+    pub fn new(socket: net::UnifiedSocket<'static>) -> Self {
+        // Pre-allocate receive batch with MTU-sized buffers
+        let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
+        // Pre-allocate send batch capacity
+        let send_batch = Vec::with_capacity(Self::BATCH_SIZE);
+
+        Self {
             socket,
             conns: HashMap::new(),
             mapping: HashMap::new(),
@@ -121,10 +113,13 @@ impl GatewayActor {
     }
 
     fn read_socket(&mut self) -> io::Result<()> {
-        let num_received = self.socket.try_recv_batch(&mut self.recv_batch)?;
+        // the loop after reading should always clear the buffer
+        assert!(self.recv_batch.is_empty());
+        let batch_size = self.recv_batch.len();
+        self.socket
+            .try_recv_batch(&mut self.recv_batch, batch_size)?;
 
-        for packet in &mut self.recv_batch[..num_received] {
-            let payload = &packet.buf[..packet.len];
+        for packet in self.recv_batch.drain(..) {
             let participant_handle = if let Some(participant_handle) = self.mapping.get(&packet.src)
             {
                 tracing::trace!(
@@ -133,7 +128,7 @@ impl GatewayActor {
                     participant_handle
                 );
                 participant_handle.clone()
-            } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(payload) {
+            } else if let Some(ufrag) = ice::parse_stun_remote_ufrag(&packet.buf) {
                 if let Some(participant_handle) = self.conns.get(ufrag) {
                     tracing::debug!(
                         "found connection from ufrag: {} -> {} -> {:?}",
@@ -164,14 +159,8 @@ impl GatewayActor {
             };
 
             // Zero-copy: Create Bytes from received buffer
-            let _ = participant_handle.try_send_low(
-                participant::ParticipantDataMessage::UdpPacket(net::RecvPacket {
-                    buf: packet.buf.split_to(packet.len),
-                    len: packet.len,
-                    src: packet.src,
-                    dst: self.local_addr,
-                }),
-            );
+            let _ = participant_handle
+                .try_send_low(participant::ParticipantDataMessage::UdpPacket(packet));
         }
 
         Ok(())

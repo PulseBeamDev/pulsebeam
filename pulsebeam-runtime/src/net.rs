@@ -24,16 +24,15 @@ pub enum Transport {
 }
 
 /// A received packet (zero-copy buffer + source address).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RecvPacket {
-    pub buf: BytesMut,   // pre-allocated buffer
+    pub buf: Bytes,      // pre-allocated buffer
     pub src: SocketAddr, // remote peer
     pub dst: SocketAddr,
-    pub len: usize,
 }
 
 /// A packet to send.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SendPacket {
     pub buf: Bytes,      // zero-copy payload
     pub dst: SocketAddr, // destination
@@ -76,9 +75,13 @@ impl<'a> UnifiedSocket<'a> {
     /// Returns the number of packets received.
     /// Stops on WouldBlock or fatal errors.
     #[inline]
-    pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
+    pub fn try_recv_batch(
+        &mut self,
+        packets: &mut Vec<RecvPacket>,
+        batch_size: usize,
+    ) -> std::io::Result<usize> {
         match self {
-            Self::Udp(inner) => inner.try_recv_batch(packets),
+            Self::Udp(inner) => inner.try_recv_batch(packets, batch_size),
         }
     }
 
@@ -108,6 +111,7 @@ pub struct UdpTransport<'a> {
 }
 
 impl<'a> UdpTransport<'a> {
+    pub const MTU: usize = 1500;
     pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
@@ -135,34 +139,52 @@ impl<'a> UdpTransport<'a> {
         })
     }
 
+    #[inline]
     pub async fn readable(&self) -> io::Result<()> {
         self.sock.ready(tokio::io::Interest::READABLE).await?;
         Ok(())
     }
 
+    #[inline]
     pub async fn writable(&self) -> io::Result<()> {
         self.sock.ready(tokio::io::Interest::WRITABLE).await?;
         Ok(())
     }
 
-    pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
+    #[inline]
+    pub fn try_recv_batch(
+        &mut self,
+        packets: &mut Vec<RecvPacket>,
+        batch_size: usize,
+    ) -> std::io::Result<usize> {
         let mut count = 0;
-        for packet in packets.iter_mut() {
-            match self.sock.try_recv_from(&mut packet.buf) {
+
+        while count < batch_size {
+            // This is done for simplicity. In the future, we may want to evaluate
+            // contiguous memory for cache locality.
+            let mut buf = BytesMut::with_capacity(Self::MTU);
+            // Try to receive a packet
+            match self.sock.try_recv_buf_from(&mut buf) {
                 Ok((len, src)) => {
-                    packet.src = src;
-                    // TODO: verify if this is a good value for dst here.
-                    packet.dst = self.local_addr;
-                    packet.len = len;
+                    let packet_data = buf.split_to(len).freeze();
+                    packets.push(RecvPacket {
+                        buf: packet_data,
+                        src,
+                        dst: self.local_addr,
+                    });
                     count += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    tracing::warn!("Receive packet failed: {}", e);
+                    return Err(e);
+                }
             }
         }
         Ok(count)
     }
 
+    #[inline]
     pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         let mut count = 0;
         for packet in packets.iter() {

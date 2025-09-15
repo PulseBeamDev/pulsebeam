@@ -17,7 +17,7 @@ impl SystemContext {
         socket: net::UnifiedSocket<'static>,
     ) -> (Self, JoinHandle<()>) {
         let rng = rand::Rng::from_os_rng();
-        let gw_actor = gateway::GatewayActor::new(external_addr, socket);
+        let gw_actor = gateway::GatewayActor::new(socket);
 
         // TODO: tune capacity
         let (gw_handle, gw_join) = actor::spawn(gw_actor, actor::RunnerConfig::default());
