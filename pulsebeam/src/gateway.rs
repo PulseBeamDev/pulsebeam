@@ -39,7 +39,7 @@ impl actor::Actor for GatewayActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             // biased toward writing to socket
-            Ok(_) = self.socket.writable() => {
+            Ok(_) = self.socket.writable(), if !self.send_outgoing_batch.is_empty() || !self.send_incoming_batch.is_empty() => {
                 if let Err(err) = self.write_socket() {
                     tracing::error!("failed to write socket: {err}");
                     break;
@@ -53,7 +53,6 @@ impl actor::Actor for GatewayActor {
             }
         });
 
-        tracing::info!("ingress has exited");
         Ok(())
     }
 
@@ -88,6 +87,10 @@ impl actor::Actor for GatewayActor {
             // TODO: each participant needs to own their pacers and bandwidth estimator.
             // TODO: gateway needs to batch packets from multiple participants
             GatewayDataMessage::Packet(packet) => {
+                // If the outgoing buffer is empty, swap it with the incoming one.
+                if self.send_outgoing_batch.is_empty() {
+                    std::mem::swap(&mut self.send_incoming_batch, &mut self.send_outgoing_batch);
+                }
                 self.send_incoming_batch.push(packet);
             }
         }
@@ -117,10 +120,12 @@ impl GatewayActor {
     fn read_socket(&mut self) -> io::Result<()> {
         // the loop after reading should always clear the buffer
         assert!(self.recv_batch.is_empty());
-        let batch_size = self.recv_batch.len();
-        self.socket
+        let batch_size = self.recv_batch.capacity();
+        let count = self
+            .socket
             .try_recv_batch(&mut self.recv_batch, batch_size)?;
 
+        tracing::trace!("received {count} packets from socket");
         for packet in self.recv_batch.drain(..) {
             let participant_handle = if let Some(participant_handle) = self.mapping.get(&packet.src)
             {
@@ -145,7 +150,7 @@ impl GatewayActor {
                         .push(packet.src);
                     participant_handle.clone()
                 } else {
-                    tracing::debug!(
+                    tracing::trace!(
                         "dropped a packet from {} due to unregistered stun binding: {}",
                         packet.src,
                         ufrag
@@ -153,14 +158,13 @@ impl GatewayActor {
                     continue;
                 }
             } else {
-                tracing::debug!(
+                tracing::trace!(
                     "dropped a packet from {} due to unexpected message flow from an unknown source",
                     packet.src
                 );
                 continue;
             };
 
-            // Zero-copy: Create Bytes from received buffer
             let _ = participant_handle
                 .try_send_low(participant::ParticipantDataMessage::UdpPacket(packet));
         }
@@ -169,10 +173,6 @@ impl GatewayActor {
     }
 
     fn write_socket(&mut self) -> io::Result<()> {
-        // If the outgoing buffer is empty, swap it with the incoming one.
-        if self.send_outgoing_batch.is_empty() {
-            std::mem::swap(&mut self.send_incoming_batch, &mut self.send_outgoing_batch);
-        }
         let sent_count = self.socket.try_send_batch(&self.send_outgoing_batch)?;
         self.send_outgoing_batch.drain(..sent_count);
         Ok(())

@@ -35,12 +35,15 @@ pub async fn run(
         let (controller_handle, controller_join) =
             actor::spawn(controller_actor, actor::RunnerConfig::default());
         controller_ready_tx.send(controller_handle).unwrap();
+        tracing::debug!("controller is ready");
         controller_join.await;
     });
 
+    tracing::debug!("waiting on controller to be ready");
     let controller_handle = controller_ready_rx.await?;
     // Set up signaling router
     let router = signaling::router(controller_handle).layer(cors);
+    tracing::debug!("listening on {http_socket}");
 
     if enable_tls {
         // TODO: exclude from production build

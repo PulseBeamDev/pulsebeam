@@ -50,7 +50,14 @@ impl<'a> UnifiedSocket<'a> {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr)?),
             _ => todo!(),
         };
+        tracing::debug!("bound to {addr} ({transport:?})");
         Ok(sock)
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Udp(inner) => inner.local_addr(),
+        }
     }
 
     /// Waits until the socket is readable.
@@ -126,6 +133,7 @@ impl<'a> UdpTransport<'a> {
 
         sock.set_recv_buffer_size(Self::BUF_SIZE)?;
         sock.set_send_buffer_size(Self::BUF_SIZE)?;
+        sock.bind(&addr.into())?;
 
         // TODO: set qos class?
 
@@ -137,6 +145,10 @@ impl<'a> UdpTransport<'a> {
             local_addr,
             _marker: std::marker::PhantomData,
         })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     #[inline]
@@ -198,5 +210,34 @@ impl<'a> UdpTransport<'a> {
             }
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_loopback() {
+        let mut sock = UnifiedSocket::bind("0.0.0.0:3000".parse().unwrap(), Transport::Udp)
+            .await
+            .unwrap();
+
+        let payload = b"hello";
+        sock.writable().await.unwrap();
+        let packet = SendPacket {
+            buf: Bytes::from_static(payload),
+            dst: "127.0.0.1:3000".parse().unwrap(),
+        };
+        println!("send {packet:?}");
+        sock.try_send_batch(&[packet]).unwrap();
+
+        sock.readable().await.unwrap();
+        let mut buf = Vec::with_capacity(1);
+        let buf_cap = buf.capacity();
+        let count = sock.try_recv_batch(&mut buf, buf_cap).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(&buf[0].buf, payload.as_slice());
     }
 }
