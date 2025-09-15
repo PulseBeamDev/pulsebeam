@@ -19,7 +19,7 @@ const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum RoomMessage {
     PublishTrack(Arc<TrackMeta>),
-    AddParticipant(Arc<ParticipantId>, Box<Rtc>),
+    AddParticipant(Arc<ParticipantId>, Rtc),
     RemoveParticipant(Arc<ParticipantId>),
 }
 
@@ -133,7 +133,7 @@ impl RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<Self>,
         participant_id: Arc<ParticipantId>,
-        mut rtc: Box<str0m::Rtc>,
+        mut rtc: str0m::Rtc,
     ) {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let participant_actor = participant::ParticipantActor::new(

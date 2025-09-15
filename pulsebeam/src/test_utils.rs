@@ -9,11 +9,11 @@ pub fn create_participant_id() -> Arc<entity::ParticipantId> {
     Arc::new(participant_id)
 }
 
-pub fn create_participant() -> (Arc<entity::ParticipantId>, Box<str0m::Rtc>) {
+pub fn create_participant() -> (Arc<entity::ParticipantId>, str0m::Rtc) {
     let participant_id = create_participant_id();
     let rtc = str0m::Rtc::new();
 
-    (participant_id, Box::new(rtc))
+    (participant_id, rtc)
 }
 
 pub fn create_room(name: &str) -> Arc<entity::RoomId> {

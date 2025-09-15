@@ -76,7 +76,7 @@ pub struct ParticipantActor {
     room_handle: room::RoomHandle,
 
     // Engine
-    rtc: Box<str0m::Rtc>,
+    rtc: str0m::Rtc,
     cid: Option<ChannelId>,
 
     // Metadata
@@ -246,7 +246,7 @@ impl ParticipantActor {
         system_ctx: system::SystemContext,
         room_handle: room::RoomHandle,
         participant_id: Arc<ParticipantId>,
-        rtc: Box<Rtc>,
+        rtc: Rtc,
     ) -> Self {
         Self {
             system_ctx,

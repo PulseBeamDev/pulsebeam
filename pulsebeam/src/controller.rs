@@ -145,10 +145,7 @@ impl ControllerActor {
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .send_high(room::RoomMessage::AddParticipant(
-                participant_id,
-                Box::new(rtc),
-            ))
+            .send_high(room::RoomMessage::AddParticipant(participant_id, rtc))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
