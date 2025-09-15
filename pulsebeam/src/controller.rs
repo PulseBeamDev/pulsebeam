@@ -103,7 +103,7 @@ impl ControllerActor {
         offer: String,
     ) -> Result<String, ControllerError> {
         let offer = SdpOffer::from_sdp_string(&offer)?;
-        tracing::info!("{offer}");
+        tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
             // TODO: enable bwe
@@ -151,7 +151,7 @@ impl ControllerActor {
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
-        tracing::info!("{answer}");
+        tracing::debug!("{answer}");
         Ok(answer.to_sdp_string())
     }
 

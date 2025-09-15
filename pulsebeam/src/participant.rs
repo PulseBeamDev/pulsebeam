@@ -161,6 +161,7 @@ impl actor::Actor for ParticipantActor {
                 self.handle_published_tracks(ctx, tracks.as_ref());
             }
             ParticipantControlMessage::TracksUnpublished(track_ids) => {
+                tracing::info!("tracks unpublished: {track_ids:?}");
                 for track_id in track_ids.keys() {
                     let track = if let Some(track) =
                         self.available_video_tracks.remove(&track_id.internal)

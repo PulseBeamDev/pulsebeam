@@ -181,8 +181,13 @@ impl RoomActor {
             return;
         };
 
-        for track_id in participant.tracks.keys() {
+        // Explicitly terminate the tracks owned by the leaving participant.
+        // This prevents "zombie" track actors from causing race conditions if the participant rejoins quickly.
+        for (track_id, track_handle) in &participant.tracks {
+            // Remove the track from the central registry.
             self.state.tracks.remove(track_id);
+            // Terminate the track actor itself.
+            let _ = track_handle.terminate().await;
         }
 
         self.system_ctx
