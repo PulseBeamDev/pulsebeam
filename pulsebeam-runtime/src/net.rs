@@ -41,6 +41,7 @@ pub struct SendPacket {
 /// UnifiedSocket enum for different transport types
 pub enum UnifiedSocket<'a> {
     Udp(UdpTransport<'a>),
+    SimUdp(SimUdpTransport),
 }
 
 impl<'a> UnifiedSocket<'a> {
@@ -52,6 +53,7 @@ impl<'a> UnifiedSocket<'a> {
     ) -> io::Result<Self> {
         let sock = match transport {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
+            Transport::SimUdp => Self::SimUdp(SimUdpTransport::bind(addr, external_addr).await?),
             _ => todo!(),
         };
         tracing::debug!("bound to {addr} ({transport:?})");
@@ -61,6 +63,7 @@ impl<'a> UnifiedSocket<'a> {
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
+            Self::SimUdp(inner) => inner.local_addr(),
         }
     }
 
@@ -69,6 +72,7 @@ impl<'a> UnifiedSocket<'a> {
     pub async fn readable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.readable().await?,
+            Self::SimUdp(inner) => inner.readable().await?,
         }
         Ok(())
     }
@@ -78,6 +82,7 @@ impl<'a> UnifiedSocket<'a> {
     pub async fn writable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.writable().await?,
+            Self::SimUdp(inner) => inner.writable().await?,
         }
         Ok(())
     }
@@ -93,6 +98,7 @@ impl<'a> UnifiedSocket<'a> {
     ) -> std::io::Result<usize> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(packets, batch_size),
+            Self::SimUdp(inner) => inner.try_recv_batch(packets, batch_size),
         }
     }
 
@@ -103,6 +109,7 @@ impl<'a> UnifiedSocket<'a> {
     pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         match self {
             Self::Udp(inner) => inner.try_send_batch(packets),
+            Self::SimUdp(inner) => inner.try_send_batch(packets),
         }
     }
 }
@@ -210,6 +217,81 @@ impl<'a> UdpTransport<'a> {
                 Err(e) => {
                     tracing::warn!("Send packet to {} failed: {}", packet.dst, e); // Internal logging
                     continue; // Skip and try next packet
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
+pub struct SimUdpTransport {
+    sock: turmoil::net::UdpSocket,
+    local_addr: SocketAddr,
+}
+
+impl SimUdpTransport {
+    pub const MTU: usize = 1500;
+
+    pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
+        let sock = turmoil::net::UdpSocket::bind(addr).await?;
+        let local_addr = external_addr.unwrap_or(sock.local_addr()?);
+
+        Ok(SimUdpTransport { sock, local_addr })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    #[inline]
+    pub async fn readable(&self) -> io::Result<()> {
+        self.sock.readable().await
+    }
+
+    #[inline]
+    pub async fn writable(&self) -> io::Result<()> {
+        self.sock.writable().await
+    }
+
+    #[inline]
+    pub fn try_recv_batch(
+        &self,
+        packets: &mut Vec<RecvPacket>,
+        batch_size: usize,
+    ) -> std::io::Result<usize> {
+        let mut count = 0;
+        let mut buf = [0u8; Self::MTU];
+
+        while count < batch_size {
+            match self.sock.try_recv_from(&mut buf) {
+                Ok((len, src)) => {
+                    packets.push(RecvPacket {
+                        buf: Bytes::copy_from_slice(&buf[..len]),
+                        src,
+                        dst: self.local_addr,
+                    });
+                    count += 1;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    tracing::warn!("Receive packet failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    #[inline]
+    pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
+        let mut count = 0;
+        for packet in packets.iter() {
+            match self.sock.try_send_to(&packet.buf, packet.dst) {
+                Ok(_) => count += 1,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    tracing::warn!("Send packet to {} failed: {}", packet.dst, e);
+                    continue;
                 }
             }
         }
