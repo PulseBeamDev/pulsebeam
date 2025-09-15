@@ -173,7 +173,12 @@ impl GatewayActor {
     }
 
     fn write_socket(&mut self) -> io::Result<()> {
+        // If the outgoing buffer is empty, swap it with the incoming one.
+        if self.send_outgoing_batch.is_empty() {
+            std::mem::swap(&mut self.send_incoming_batch, &mut self.send_outgoing_batch);
+        }
         let sent_count = self.socket.try_send_batch(&self.send_outgoing_batch)?;
+        tracing::trace!("sent {sent_count} packets to socket");
         self.send_outgoing_batch.drain(..sent_count);
         Ok(())
     }
