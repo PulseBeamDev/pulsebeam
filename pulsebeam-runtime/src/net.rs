@@ -4,7 +4,6 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::Interest;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
@@ -76,9 +75,17 @@ impl<'a> UdpTransport<'a> {
         })
     }
 
-    pub async fn recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
-        self.sock.ready(Interest::READABLE).await?;
+    pub async fn readable(&self) -> io::Result<()> {
+        self.sock.ready(tokio::io::Interest::READABLE).await?;
+        Ok(())
+    }
 
+    pub async fn writable(&self) -> io::Result<()> {
+        self.sock.ready(tokio::io::Interest::WRITABLE).await?;
+        Ok(())
+    }
+
+    pub fn recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
         let mut count = 0;
         while count < packets.len() {
             // Use try_recv_from to non-blockingly receive (zero alloc)
@@ -100,11 +107,7 @@ impl<'a> UdpTransport<'a> {
         Ok(count)
     }
 
-    pub async fn send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
-        if packets.is_empty() {
-            return Ok(0);
-        }
-
+    pub fn send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         let mut count = 0;
         let mut last_error = None;
 
@@ -120,9 +123,8 @@ impl<'a> UdpTransport<'a> {
                     last_error = None; // Reset error if successful
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // Socket not writable; await writability
-                    self.sock.ready(Interest::WRITABLE).await?;
-                    // Continue trying (don't count as sent yet)
+                    // user has to wait until writable is true
+                    break;
                 }
                 Err(e) => {
                     // Other error; store and continue to try next, but we'll return error if any
@@ -154,14 +156,30 @@ impl<'a> UnifiedSocket<'a> {
         Ok(sock)
     }
 
+    #[inline]
+    pub async fn readable(&self) -> io::Result<()> {
+        match self {
+            Self::Udp(inner) => inner.readable().await?,
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub async fn writable(&self) -> io::Result<()> {
+        match self {
+            Self::Udp(inner) => inner.writable().await?,
+        }
+        Ok(())
+    }
+
     /// Receive a batch of packets (up to `packets.len()`).
     /// Returns number of packets actually received.
     /// Uses pre-allocated buffers in `packets`, awaits readability once, then drains available datagrams
     /// with zero additional allocations.
     #[inline]
-    pub async fn recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
+    pub fn recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
         match self {
-            Self::Udp(inner) => inner.recv_batch(packets).await,
+            Self::Udp(inner) => inner.recv_batch(packets),
         }
     }
 
@@ -170,9 +188,9 @@ impl<'a> UnifiedSocket<'a> {
     /// Uses provided buffers, awaits writability if needed, then sends as many as possible
     /// with zero additional allocations.
     #[inline]
-    pub async fn send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
+    pub fn send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         match self {
-            Self::Udp(inner) => inner.send_batch(packets).await,
+            Self::Udp(inner) => inner.send_batch(packets),
         }
     }
 }
