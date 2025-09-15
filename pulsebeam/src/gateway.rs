@@ -19,7 +19,8 @@ pub struct GatewayActor {
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
     recv_batch: Vec<net::RecvPacket>,
-    send_batch: Vec<net::SendPacket>,
+    send_incoming_batch: Vec<net::SendPacket>,
+    send_outgoing_batch: Vec<net::SendPacket>,
 }
 
 impl actor::Actor for GatewayActor {
@@ -87,7 +88,7 @@ impl actor::Actor for GatewayActor {
             // TODO: each participant needs to own their pacers and bandwidth estimator.
             // TODO: gateway needs to batch packets from multiple participants
             GatewayDataMessage::Packet(packet) => {
-                todo!("buffer packets to send_batch");
+                self.send_incoming_batch.push(packet);
             }
         }
     }
@@ -99,8 +100,8 @@ impl GatewayActor {
     pub fn new(socket: net::UnifiedSocket<'static>) -> Self {
         // Pre-allocate receive batch with MTU-sized buffers
         let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
-        // Pre-allocate send batch capacity
-        let send_batch = Vec::with_capacity(Self::BATCH_SIZE);
+        let send_incoming_batch = Vec::with_capacity(Self::BATCH_SIZE);
+        let send_outgoing_batch = Vec::with_capacity(Self::BATCH_SIZE);
 
         Self {
             socket,
@@ -108,7 +109,8 @@ impl GatewayActor {
             mapping: HashMap::new(),
             reverse: HashMap::new(),
             recv_batch,
-            send_batch,
+            send_incoming_batch,
+            send_outgoing_batch,
         }
     }
 
@@ -167,7 +169,12 @@ impl GatewayActor {
     }
 
     fn write_socket(&mut self) -> io::Result<()> {
-        self.socket.try_send_batch(&self.send_batch)?;
+        // If the outgoing buffer is empty, swap it with the incoming one.
+        if self.send_outgoing_batch.is_empty() {
+            std::mem::swap(&mut self.send_incoming_batch, &mut self.send_outgoing_batch);
+        }
+        let sent_count = self.socket.try_send_batch(&self.send_outgoing_batch)?;
+        self.send_outgoing_batch.drain(..sent_count);
         Ok(())
     }
 }
