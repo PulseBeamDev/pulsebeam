@@ -589,7 +589,7 @@ impl ParticipantActor {
             return;
         };
 
-        tracing::debug!("wrote to rtp");
+        tracing::trace!("wrote to rtp");
         if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();

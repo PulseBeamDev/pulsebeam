@@ -1,5 +1,6 @@
 const localVideo = document.getElementById("local") as HTMLVideoElement;
-const remoteVideo = document.getElementById("remote") as HTMLVideoElement;
+const remoteVideo = document.getElementById("remote-video") as HTMLVideoElement;
+const remoteAudio = document.getElementById("remote-audio") as HTMLAudioElement;
 const form = document.getElementById("controls") as HTMLFormElement;
 const endpointInput = document.getElementById("endpoint") as HTMLInputElement;
 const toggleBtn = document.getElementById("toggle") as HTMLButtonElement;
@@ -17,7 +18,11 @@ form.onsubmit = async (e) => {
     const endpoint = endpointInput.value.trim();
     if (!endpoint) return alert("Please enter a valid endpoint");
     toggleBtn.textContent = "Stop";
-    await start(endpoint);
+    try {
+      await start(endpoint);
+    } catch(e) {
+      stop();
+    }
   }
 };
 
@@ -46,10 +51,27 @@ async function start(endpoint: string) {
   // WHEP: recv-only transceivers
   pc.addTransceiver("video", { direction: "recvonly" });
   pc.addTransceiver("audio", { direction: "recvonly" });
-  const remoteStream = new MediaStream();
-  remoteVideo.srcObject = remoteStream;
+  const remoteVideoStream = new MediaStream();
+  const remoteAudioStream = new MediaStream();
+  remoteAudio.srcObject = remoteAudioStream;
   pc.ontrack = (e) => {
-    remoteStream.addTrack(e.track);
+    if (e.track.kind === "video") {
+      e.track.onended = () => {
+        console.log(`Remote track ended: ${e.track.kind}`);
+        remoteVideo.srcObject = null;
+      }
+      e.track.onmute = () => {
+        console.log(`Remote track muted: ${e.track.kind}`);
+        remoteVideo.srcObject = null;
+      }
+      e.track.onunmute = () => {
+        console.log(`Remote track unmuted: ${e.track.kind}`);
+        remoteVideo.srcObject = remoteVideoStream;
+      }
+      remoteVideoStream.addTrack(e.track);
+    } else if (e.track.kind === "audio") {
+      remoteAudioStream.addTrack(e.track);
+    }
   };
 
   pc.onconnectionstatechange = () => {
