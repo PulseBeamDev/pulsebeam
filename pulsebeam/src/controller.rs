@@ -106,6 +106,8 @@ impl ControllerActor {
         tracing::info!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
+            // TODO: enable bwe
+            // .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300))) // enable pacer
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
             .set_ice_lite(false);
