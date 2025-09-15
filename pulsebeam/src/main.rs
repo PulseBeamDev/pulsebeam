@@ -67,9 +67,10 @@ pub async fn run(cpu_rt: rt::Runtime) {
     let external_ip = select_host_address();
     let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
-    let unified_socket = net::UnifiedSocket::bind(local_addr, net::Transport::Udp)
-        .await
-        .expect("bind to udp socket");
+    let unified_socket =
+        net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
+            .await
+            .expect("bind to udp socket");
     let http_socket: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
         "✅ Signaling server listening. Clients should connect to https://{}:3000 or https://localhost:3000",

@@ -45,9 +45,13 @@ pub enum UnifiedSocket<'a> {
 
 impl<'a> UnifiedSocket<'a> {
     /// Binds a socket to the given address and transport type.
-    pub async fn bind(addr: SocketAddr, transport: Transport) -> io::Result<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        transport: Transport,
+        external_addr: Option<SocketAddr>,
+    ) -> io::Result<Self> {
         let sock = match transport {
-            Transport::Udp => Self::Udp(UdpTransport::bind(addr)?),
+            Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
             _ => todo!(),
         };
         tracing::debug!("bound to {addr} ({transport:?})");
@@ -121,7 +125,7 @@ impl<'a> UdpTransport<'a> {
     pub const MTU: usize = 1500;
     pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
-    pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+    pub fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
         let sock = socket2::Socket::new(
             socket2::Domain::for_address(addr),
             socket2::Type::DGRAM,
@@ -138,7 +142,7 @@ impl<'a> UdpTransport<'a> {
         // TODO: set qos class?
 
         let sock = tokio::net::UdpSocket::from_std(sock.into())?;
-        let local_addr = sock.local_addr()?;
+        let local_addr = external_addr.unwrap_or(sock.local_addr()?);
 
         Ok(UdpTransport {
             sock,
@@ -219,7 +223,7 @@ mod test {
 
     #[tokio::test]
     async fn test_loopback() {
-        let mut sock = UnifiedSocket::bind("0.0.0.0:3000".parse().unwrap(), Transport::Udp)
+        let mut sock = UnifiedSocket::bind("127.0.0.1:3000".parse().unwrap(), Transport::Udp, None)
             .await
             .unwrap();
 
@@ -227,9 +231,8 @@ mod test {
         sock.writable().await.unwrap();
         let packet = SendPacket {
             buf: Bytes::from_static(payload),
-            dst: "127.0.0.1:3000".parse().unwrap(),
+            dst: sock.local_addr(),
         };
-        println!("send {packet:?}");
         sock.try_send_batch(&[packet]).unwrap();
 
         sock.readable().await.unwrap();

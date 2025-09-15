@@ -30,9 +30,13 @@ pub fn create_sim<'a>() -> turmoil::Sim<'a> {
 
 pub async fn create_system_ctx() -> system::SystemContext {
     let external_addr = "192.168.1.1:3478".parse().unwrap();
-    let socket = net::UnifiedSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), net::Transport::SimUdp)
-        .await
-        .unwrap();
+    let socket = net::UnifiedSocket::bind(
+        (Ipv4Addr::LOCALHOST, 0).into(),
+        net::Transport::SimUdp,
+        Some(external_addr),
+    )
+    .await
+    .unwrap();
     let (system_ctx, _) = system::SystemContext::spawn(external_addr, socket);
     system_ctx
 }
