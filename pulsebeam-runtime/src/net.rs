@@ -85,7 +85,7 @@ impl<'a> UdpTransport<'a> {
         Ok(())
     }
 
-    pub fn recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
+    pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
         let mut count = 0;
         while count < packets.len() {
             // Use try_recv_from to non-blockingly receive (zero alloc)
@@ -107,7 +107,7 @@ impl<'a> UdpTransport<'a> {
         Ok(count)
     }
 
-    pub fn send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
+    pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         let mut count = 0;
         let mut last_error = None;
 
@@ -177,9 +177,9 @@ impl<'a> UnifiedSocket<'a> {
     /// Uses pre-allocated buffers in `packets`, awaits readability once, then drains available datagrams
     /// with zero additional allocations.
     #[inline]
-    pub fn recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
+    pub fn try_recv_batch(&self, packets: &mut [RecvPacket]) -> std::io::Result<usize> {
         match self {
-            Self::Udp(inner) => inner.recv_batch(packets),
+            Self::Udp(inner) => inner.try_recv_batch(packets),
         }
     }
 
@@ -188,9 +188,9 @@ impl<'a> UnifiedSocket<'a> {
     /// Uses provided buffers, awaits writability if needed, then sends as many as possible
     /// with zero additional allocations.
     #[inline]
-    pub fn send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
+    pub fn try_send_batch(&self, packets: &[SendPacket]) -> std::io::Result<usize> {
         match self {
-            Self::Udp(inner) => inner.send_batch(packets),
+            Self::Udp(inner) => inner.try_send_batch(packets),
         }
     }
 }
