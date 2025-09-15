@@ -77,7 +77,7 @@ pub async fn run(cpu_rt: rt::Runtime) {
         external_ip,
     );
 
-    node::run(cpu_rt, external_addr, unified_socket, http_socket, true)
+    node::run(cpu_rt, external_addr, unified_socket, http_socket, false)
         .await
         .unwrap();
 }

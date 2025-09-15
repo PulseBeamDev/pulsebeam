@@ -270,34 +270,32 @@ impl ParticipantActor {
     }
 
     async fn auto_subscribe(&mut self, ctx: &mut actor::ActorContext<Self>) {
-        let mut slot_iter = self.subscribed_video_tracks.iter_mut();
+        let mut available_tracks = self.available_video_tracks.iter_mut();
 
-        'outer: for (track_id, track) in self.available_video_tracks.iter_mut() {
-            if track.mid.is_some() {
+        for (slot_id, slot) in self.subscribed_video_tracks.iter_mut() {
+            if slot.track_id.is_some() {
                 continue;
             }
 
-            loop {
-                let (slot_id, slot) = if let Some(slot) = slot_iter.next() {
-                    slot
-                } else {
-                    break 'outer;
-                };
+            for (track_id, track) in &mut available_tracks {
+                if track.mid.is_some() {
+                    continue;
+                }
 
-                if slot.track_id.is_some() {
+                if track
+                    .track
+                    .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
+                    .await
+                    .is_err()
+                {
                     continue;
                 }
 
                 track.mid.replace(*slot_id);
                 let meta = &track.track.meta;
                 slot.track_id.replace(meta.id.clone());
-
-                // TODO: handle rejection
-                track
-                    .track
-                    .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
-                    .await;
                 tracing::info!("allocated slot: {track_id} -> {slot_id}");
+                break;
             }
         }
     }
@@ -589,7 +587,6 @@ impl ParticipantActor {
             return;
         };
 
-        tracing::trace!("wrote to rtp");
         if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();

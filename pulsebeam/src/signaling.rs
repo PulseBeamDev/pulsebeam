@@ -78,7 +78,7 @@ async fn join_room(
 
     // TODO: remove hardcoded URI
     let location_url = format!(
-        "https://localhost:3000/api/v1/rooms/{}/participants/{}",
+        "http://localhost:3000/api/v1/rooms/{}/participants/{}",
         &room_id.external, &participant_id
     );
     let mut response_headers = HeaderMap::new();
