@@ -12,11 +12,11 @@ all: build flamegraph
 # Build with profiling profile
 .PHONY: build
 build:
-	$(CARGO) build --profile profiling 
+	$(CARGO) build --profile profiling -p pulsebeam
 
 # Capture flamegraph
 .PHONY: flamegraph
-flamegraph: build
+flamegraph:
 	taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
 brew-deps:
