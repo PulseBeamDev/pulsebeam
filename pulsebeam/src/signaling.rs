@@ -54,7 +54,7 @@ impl IntoResponse for SignalingError {
 #[axum::debug_handler]
 async fn join_room(
     Path(room_id): Path<ExternalRoomId>,
-    State(con): State<controller::ControllerHandle>,
+    State(mut con): State<controller::ControllerHandle>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
 ) -> Result<impl IntoResponse, SignalingError> {
@@ -89,7 +89,7 @@ async fn join_room(
 #[axum::debug_handler]
 async fn leave_room(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
-    State(con): State<controller::ControllerHandle>,
+    State(mut con): State<controller::ControllerHandle>,
 ) -> Result<impl IntoResponse, SignalingError> {
     let room_id = RoomId::new(room_id);
     let room_id = Arc::new(room_id);

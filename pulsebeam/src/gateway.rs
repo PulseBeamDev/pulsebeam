@@ -127,7 +127,8 @@ impl GatewayActor {
 
         tracing::trace!("received {count} packets from socket");
         for packet in self.recv_batch.drain(..) {
-            let participant_handle = if let Some(participant_handle) = self.mapping.get(&packet.src)
+            let mut participant_handle = if let Some(participant_handle) =
+                self.mapping.get(&packet.src)
             {
                 tracing::trace!(
                     "found connection from mapping: {} -> {:?}",

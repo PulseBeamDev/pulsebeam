@@ -487,12 +487,12 @@ impl ParticipantActor {
                 }
             }
             Event::MediaData(e) => {
-                if let Some(track) = self.published_video_tracks.get(&e.mid) {
+                if let Some(track) = self.published_video_tracks.get_mut(&e.mid) {
                     tracing::debug!("forwarded media: participant -> track, {track:?}");
                     let _ = track
                         .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
-                } else if let Some(track) = self.published_audio_tracks.get(&e.mid) {
+                } else if let Some(track) = self.published_audio_tracks.get_mut(&e.mid) {
                     let _ = track
                         .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
@@ -515,7 +515,7 @@ impl ParticipantActor {
             return;
         };
 
-        let Some(track) = self.available_video_tracks.get(&track_id.internal) else {
+        let Some(track) = self.available_video_tracks.get_mut(&track_id.internal) else {
             return;
         };
 

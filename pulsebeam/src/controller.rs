@@ -83,7 +83,7 @@ impl actor::Actor for ControllerActor {
             }
 
             ControllerMessage::RemoveParticipant(room_id, participant_id) => {
-                if let Some(room_handle) = self.rooms.get(&room_id) {
+                if let Some(room_handle) = self.rooms.get_mut(&room_id) {
                     // if the room has exited, the participants have already cleaned up too.
                     let _ = room_handle
                         .send_high(room::RoomMessage::RemoveParticipant(participant_id))
@@ -141,7 +141,7 @@ impl ControllerActor {
             .accept_offer(offer)
             .map_err(ControllerError::OfferRejected)?;
 
-        let room_handle = self.get_or_create_room(room_id);
+        let mut room_handle = self.get_or_create_room(room_id);
 
         // TODO: probably retry? Or, let the client to retry instead?
         // Each room will always have a graceful timeout before closing.

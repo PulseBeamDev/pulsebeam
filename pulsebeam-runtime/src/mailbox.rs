@@ -1,21 +1,22 @@
+use futures::channel::mpsc;
+use futures::{SinkExt, StreamExt};
 use std::error::Error;
 use std::fmt;
-use tokio::sync::mpsc;
 
 /// An error returned when sending on a closed mailbox.
 ///
 /// This error is returned by the asynchronous `send` method. It contains
 /// the message that could not be sent.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SendError<T>(pub T);
+pub enum SendError {
+    Closed,
+}
 
-impl<T> fmt::Display for SendError<T> {
+impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "sending on a closed mailbox")
     }
 }
-
-impl<T: fmt::Debug> Error for SendError<T> {}
 
 /// An error returned from the `try_send` method on a `Sender`.
 #[derive(Debug, PartialEq, Eq)]
@@ -37,14 +38,6 @@ impl<T> fmt::Display for TrySendError<T> {
 
 impl<T: fmt::Debug> Error for TrySendError<T> {}
 
-// For convenience, we can convert a SendError into a TrySendError,
-// as a 'Closed' state is a subset of 'TrySend' failures.
-impl<T> From<SendError<T>> for TrySendError<T> {
-    fn from(err: SendError<T>) -> Self {
-        TrySendError::Closed(err.0)
-    }
-}
-
 /// A handle to send messages to an actor's mailbox.
 pub struct Sender<T> {
     sender: mpsc::Sender<T>,
@@ -62,22 +55,25 @@ impl<T> Sender<T> {
     /// Sends a message asynchronously, waiting if the mailbox is full.
     ///
     /// Returns a `SendError` only if the receiving actor has terminated.
-    pub async fn send(&self, message: T) -> Result<(), SendError<T>> {
-        self.sender.send(message).await.map_err(|e| SendError(e.0))
+    pub async fn send(&mut self, message: T) -> Result<(), SendError> {
+        self.sender
+            .send(message)
+            .await
+            .map_err(|_e| SendError::Closed)
     }
 
     /// Attempts to immediately send a message.
     ///
     /// Returns a `TrySendError` if the mailbox is full or if the
     /// receiving actor has terminated.
-    pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        use mpsc::error::TrySendError as TokioTrySendError;
-        self.sender.try_send(message).map_err(|e| match e {
-            TokioTrySendError::Full(m) => {
+    pub fn try_send(&mut self, message: T) -> Result<(), TrySendError<T>> {
+        self.sender.try_send(message).map_err(|e| {
+            if e.is_disconnected() {
+                TrySendError::Closed(e.into_inner())
+            } else {
                 tracing::info!("try_send dropped a packet due to full queue");
-                TrySendError::Full(m)
+                TrySendError::Full(e.into_inner())
             }
-            TokioTrySendError::Closed(m) => TrySendError::Closed(m),
         })
     }
 }
@@ -90,7 +86,7 @@ pub struct Receiver<T> {
 impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
-        self.receiver.recv().await
+        self.receiver.next().await
     }
 }
 
@@ -107,7 +103,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_and_recv_single_message() {
-        let (sender, mut mailbox) = mailbox::new(10);
+        let (mut sender, mut mailbox) = mailbox::new(10);
         let message = "hello".to_string();
 
         sender.send(message.clone()).await.unwrap();
@@ -118,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_none_when_all_senders_are_dropped() {
-        let (sender, mut mailbox) = mailbox::new::<i32>(10);
+        let (mut sender, mut mailbox) = mailbox::new::<i32>(10);
         sender.send(1).await.unwrap();
         sender.send(2).await.unwrap();
 
@@ -135,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_send_fails_when_receiver_is_dropped() {
-        let (sender, mailbox) = mailbox::new::<String>(10);
+        let (mut sender, mailbox) = mailbox::new::<String>(10);
 
         // Drop the mailbox immediately
         drop(mailbox);
@@ -144,8 +140,7 @@ mod tests {
         assert!(result.is_err());
 
         // Check that the error is our custom SendError and we can get the message back
-        if let Err(mailbox::SendError(msg)) = result {
-            assert_eq!(msg, "should fail");
+        if let Err(mailbox::SendError::Closed) = result {
         } else {
             panic!("Expected a SendError");
         }
@@ -153,7 +148,7 @@ mod tests {
 
     #[test]
     fn try_send_success_on_capacity() {
-        let (sender, _mailbox) = mailbox::new::<i32>(1);
+        let (mut sender, _mailbox) = mailbox::new::<i32>(1);
         let result = sender.try_send(123);
         assert!(result.is_ok());
     }
@@ -161,9 +156,10 @@ mod tests {
     #[test]
     fn try_send_fails_when_full() {
         // Create a mailbox with a buffer of 1
-        let (sender, _mailbox) = mailbox::new::<i32>(1);
+        let (mut sender, _mailbox) = mailbox::new::<i32>(1);
 
         // The first send succeeds and fills the buffer
+        sender.try_send(1).unwrap();
         sender.try_send(1).unwrap();
 
         // The second send should fail because the buffer is full
@@ -179,7 +175,7 @@ mod tests {
 
     #[test]
     fn try_send_fails_when_receiver_is_dropped() {
-        let (sender, mailbox) = mailbox::new::<i32>(1);
+        let (mut sender, mailbox) = mailbox::new::<i32>(1);
 
         // Drop the receiver
         drop(mailbox);
@@ -196,14 +192,14 @@ mod tests {
 
     #[tokio::test]
     async fn async_send_waits_when_full() {
-        let (sender, mut mailbox) = mailbox::new::<i32>(1);
+        let (mut sender, mut mailbox) = mailbox::new::<i32>(1);
 
         // Fill the buffer
         sender.send(1).await.unwrap();
 
         // This send should wait. We spawn it in a separate task.
         let send_task = tokio::spawn({
-            let sender = sender.clone();
+            let mut sender = sender.clone();
             async move {
                 sender.send(2).await.unwrap();
             }
@@ -227,8 +223,8 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_sender_works_and_channel_stays_open() {
-        let (sender1, mut mailbox) = mailbox::new::<i32>(10);
-        let sender2 = sender1.clone();
+        let (mut sender1, mut mailbox) = mailbox::new::<i32>(10);
+        let mut sender2 = sender1.clone();
 
         sender1.send(1).await.unwrap();
         sender2.send(2).await.unwrap();

@@ -19,10 +19,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+futures.workspace = true
 tokio-rustls = "0.26.2"
 rustls = "0.23.31"
 turmoil = "0.6.6"
-futures.workspace = true
 quinn-udp = "0.5.14"
 socket2 = "0.6.0"
 

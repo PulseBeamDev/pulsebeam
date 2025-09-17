@@ -93,7 +93,7 @@ impl actor::Actor for TrackActor {
                 }
 
                 let mut to_remove = Vec::new();
-                for (participant_id, sub) in &self.subscribers {
+                for (participant_id, sub) in self.subscribers.iter_mut() {
                     tracing::debug!("forwarded media: track -> participant");
                     let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardMedia(
                         self.meta.clone(),

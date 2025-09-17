@@ -214,9 +214,9 @@ impl<A: Actor> ActorHandle<A> {
     /// Returns an error if the actor's mailbox is closed.
     #[inline]
     pub async fn send_high(
-        &self,
+        &mut self,
         message: A::HighPriorityMsg,
-    ) -> Result<(), mailbox::SendError<A::HighPriorityMsg>> {
+    ) -> Result<(), mailbox::SendError> {
         self.hi_tx.send(message).await
     }
 
@@ -225,7 +225,7 @@ impl<A: Actor> ActorHandle<A> {
     /// Returns an error if the mailbox is full or closed.
     #[inline]
     pub fn try_send_high(
-        &self,
+        &mut self,
         message: A::HighPriorityMsg,
     ) -> Result<(), mailbox::TrySendError<A::HighPriorityMsg>> {
         self.hi_tx.try_send(message)
@@ -235,10 +235,7 @@ impl<A: Actor> ActorHandle<A> {
     ///
     /// Returns an error if the actor's mailbox is closed.
     #[inline]
-    pub async fn send_low(
-        &self,
-        message: A::LowPriorityMsg,
-    ) -> Result<(), mailbox::SendError<A::LowPriorityMsg>> {
+    pub async fn send_low(&mut self, message: A::LowPriorityMsg) -> Result<(), mailbox::SendError> {
         self.lo_tx.send(message).await
     }
 
@@ -247,13 +244,13 @@ impl<A: Actor> ActorHandle<A> {
     /// Returns an error if the mailbox is full or closed.
     #[inline]
     pub fn try_send_low(
-        &self,
+        &mut self,
         message: A::LowPriorityMsg,
     ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>> {
         self.lo_tx.try_send(message)
     }
 
-    pub async fn get_state(&self) -> Result<A::ObservableState, ActorError> {
+    pub async fn get_state(&mut self) -> Result<A::ObservableState, ActorError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let msg = SystemMsg::GetState(tx);
 
@@ -267,7 +264,7 @@ impl<A: Actor> ActorHandle<A> {
         rx.await.map_err(|_| ActorError::SystemError)
     }
 
-    pub async fn terminate(&self) -> Result<(), ActorError> {
+    pub async fn terminate(&mut self) -> Result<(), ActorError> {
         self.sys_tx
             .send(SystemMsg::Terminate)
             .await

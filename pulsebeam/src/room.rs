@@ -106,7 +106,7 @@ impl actor::Actor for RoomActor {
                     .await
             }
             RoomMessage::RemoveParticipant(participant_id) => {
-                if let Some(participant_handle) = self.state.participants.get(&participant_id) {
+                if let Some(participant_handle) = self.state.participants.get_mut(&participant_id) {
                     // if it's closed, then the participant has exited
                     let _ = participant_handle.handle.terminate().await;
                 }
@@ -145,7 +145,7 @@ impl RoomActor {
 
         // TODO: capacity
         let participant_cfg = actor::RunnerConfig::default().with_lo(1024);
-        let (participant_handle, participant_join) =
+        let (mut participant_handle, participant_join) =
             actor::spawn(participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);
 
@@ -177,13 +177,13 @@ impl RoomActor {
     }
 
     async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
-        let Some(participant) = self.state.participants.remove(&participant_id) else {
+        let Some(mut participant) = self.state.participants.remove(&participant_id) else {
             return;
         };
 
         // Explicitly terminate the tracks owned by the leaving participant.
         // This prevents "zombie" track actors from causing race conditions if the participant rejoins quickly.
-        for (track_id, track_handle) in &participant.tracks {
+        for (track_id, track_handle) in participant.tracks.iter_mut() {
             // Remove the track from the central registry.
             self.state.tracks.remove(track_id);
             // Terminate the track actor itself.
@@ -265,7 +265,7 @@ impl RoomActor {
     async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {
         // TODO: handle large scale room by batching with a fixed interval driven by the
         // room instead of reactive.
-        for participant in self.state.participants.values() {
+        for participant in self.state.participants.values_mut() {
             let _ = participant.handle.send_high(msg.clone()).await;
         }
     }
@@ -289,7 +289,7 @@ mod test {
 
         sim.client("test", async {
             let system_ctx = test_utils::create_system_ctx().await;
-            let (room_handle, _) =
+            let (mut room_handle, _) =
                 actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
             let (participant_id, participant_rtc) = test_utils::create_participant();
 
@@ -337,7 +337,7 @@ mod test {
         sim.client("test", async {
             // Setup: Create a room and add a participant with a track.
             let system_ctx = test_utils::create_system_ctx().await;
-            let (room_handle, _) =
+            let (mut room_handle, _) =
                 actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
             let (participant_id, participant_rtc) = test_utils::create_participant();
 
@@ -363,7 +363,7 @@ mod test {
 
             // Simulate participant leaving by dropping their actor.
             let state = room_handle.get_state().await.unwrap();
-            let participant_handle = state
+            let mut participant_handle = state
                 .participants
                 .get(&participant_id)
                 .unwrap()
@@ -393,7 +393,7 @@ mod test {
         sim.client("test", async {
             // Setup: Create a room without any participants.
             let system_ctx = test_utils::create_system_ctx().await;
-            let (room_handle, _) =
+            let (mut room_handle, _) =
                 actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
             let (participant_id, _) = test_utils::create_participant();
 
@@ -429,23 +429,23 @@ mod test {
         sim.client("test", async {
             // Setup: Create a room.
             let system_ctx = test_utils::create_system_ctx().await;
-            let (room_handle, _) =
+            let (mut room_handle, _) =
                 actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
 
             // Create multiple participants.
             let participants: Vec<_> = (0..3).map(|_| test_utils::create_participant()).collect();
 
             // Send AddParticipant messages concurrently.
-            let mut join_futures = FuturesUnordered::new();
             for (participant_id, participant_rtc) in participants {
-                join_futures.push(room_handle.send_high(RoomMessage::AddParticipant(
-                    participant_id.clone(),
-                    participant_rtc,
-                )));
+                room_handle
+                    .send_high(RoomMessage::AddParticipant(
+                        participant_id.clone(),
+                        participant_rtc,
+                    ))
+                    .await
+                    .unwrap();
             }
 
-            // Wait for all join messages to be processed.
-            while join_futures.next().await.is_some() {}
             rt::yield_now().await;
 
             // Verify: All participants should be added to the room state.
@@ -470,7 +470,7 @@ mod test {
         sim.client("test", async {
             // Setup: Create a room and add a participant.
             let system_ctx = test_utils::create_system_ctx().await;
-            let (room_handle, _) =
+            let (mut room_handle, _) =
                 actor::spawn_default(RoomActor::new(system_ctx, test_utils::create_room("roomA")));
             let (participant_id, participant_rtc) = test_utils::create_participant();
 
@@ -486,7 +486,7 @@ mod test {
 
             // Simulate a participant becoming unresponsive by terminating it.
             let state = room_handle.get_state().await.unwrap();
-            let participant_handle = state
+            let mut participant_handle = state
                 .participants
                 .get(&participant_id)
                 .unwrap()
