@@ -140,7 +140,6 @@ impl<'a> UdpTransport<'a> {
         )?;
         sock.set_nonblocking(true)?;
         sock.set_reuse_address(true)?;
-        sock.set_reuse_port(true)?;
 
         sock.set_recv_buffer_size(Self::BUF_SIZE)?;
         sock.set_send_buffer_size(Self::BUF_SIZE)?;
