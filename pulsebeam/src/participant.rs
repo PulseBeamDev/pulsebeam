@@ -224,19 +224,16 @@ impl actor::Actor for ParticipantActor {
                 }
             }
             ParticipantDataMessage::ForwardMedia(track, data) => {
-                tracing::debug!("received forwarded media: track -> participant, {track:?}");
+                tracing::trace!("received forwarded media: track -> participant, {track:?}");
                 self.handle_forward_media(track, data);
             }
 
             ParticipantDataMessage::KeyframeRequest(track_id, req) => {
-                let Some(mut writer) = self.rtc.writer(track_id.origin_mid) else {
-                    tracing::warn!(mid=?track_id.origin_mid, "mid is not found for regenerating a keyframe");
-                    return;
-                };
-
-                if let Err(err) = writer.request_keyframe(req.rid, req.kind) {
-                    tracing::warn!("failed to request a keyframe from the publisher: {err}");
-                }
+                self.request_keyframe(KeyframeRequest {
+                    mid: track_id.origin_mid,
+                    kind: req.kind,
+                    rid: req.rid,
+                });
             }
         }
     }
@@ -487,8 +484,16 @@ impl ParticipantActor {
                 }
             }
             Event::MediaData(e) => {
+                if e.contiguous {
+                    self.request_keyframe(KeyframeRequest {
+                        rid: e.rid,
+                        mid: e.mid,
+                        kind: str0m::media::KeyframeRequestKind::Fir,
+                    });
+                }
+
                 if let Some(track) = self.published_video_tracks.get_mut(&e.mid) {
-                    tracing::debug!("forwarded media: participant -> track, {track:?}");
+                    tracing::trace!("forwarded media: participant -> track, {track:?}");
                     let _ = track
                         .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(e)))
                         .await;
@@ -507,6 +512,7 @@ impl ParticipantActor {
     }
 
     fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
+        tracing::debug!("requested a keyframe: {req:?}");
         let Some(MidOutSlot {
             track_id: Some(track_id),
             ..
@@ -591,6 +597,17 @@ impl ParticipantActor {
         if let Err(err) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("failed to write media: {}", err);
             self.rtc.disconnect();
+        }
+    }
+
+    fn request_keyframe(&mut self, req: KeyframeRequest) {
+        let Some(mut writer) = self.rtc.writer(req.mid) else {
+            tracing::warn!(?req.mid, "mid is not found for regenerating a keyframe");
+            return;
+        };
+
+        if let Err(err) = writer.request_keyframe(req.rid, req.kind) {
+            tracing::warn!("failed to request a keyframe from the publisher: {err}");
         }
     }
 }
