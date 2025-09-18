@@ -51,12 +51,14 @@ pub struct RoomState {
     tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
 }
 
-impl actor::Actor for RoomActor {
+impl actor::MessageSet for RoomActor {
     type Meta = Arc<RoomId>;
     type HighPriorityMsg = RoomMessage;
     type LowPriorityMsg = ();
     type ObservableState = RoomState;
+}
 
+impl actor::Actor for RoomActor {
     fn meta(&self) -> Self::Meta {
         self.room_id.clone()
     }

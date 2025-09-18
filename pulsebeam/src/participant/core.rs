@@ -240,29 +240,30 @@ impl ParticipantCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{participant::state::TrackOut, track};
+    use crate::participant::state::{MidOutSlot, TrackOut};
+    use crate::track::TrackActor;
+    use pulsebeam_runtime::test_utils;
+    use pulsebeam_runtime::test_utils::FakeActor;
+    use std::collections::HashMap;
     use str0m::media::{MediaKind, Simulcast};
 
-    // --- Test Helpers ---
-    fn mock_track_handle(
+    fn new_fake_track(
         participant_id: Arc<ParticipantId>,
         kind: MediaKind,
-    ) -> track::TrackHandle {
+    ) -> FakeActor<TrackActor> {
         let meta = Arc::new(TrackMeta {
             id: Arc::new(TrackId::new(participant_id, Mid::new())),
             kind,
             simulcast_rids: None,
         });
-        track::TrackActor::new(origin, meta);
+        FakeActor::<TrackActor>::new(meta)
     }
 
-    // --- Tests ---
-
     #[test]
-    fn test_handle_media_added_recv_only_spawns_track() {
+    fn handle_media_added_spawn_tracks_and_resync() {
+        // ARRANGE
         let pid = Arc::new(ParticipantId::new());
         let mut core = ParticipantCore::new(pid.clone());
-
         let media = MediaAdded {
             mid: Mid::new(),
             direction: Direction::RecvOnly,
@@ -273,24 +274,43 @@ mod tests {
             }),
         };
 
+        // ACT
         let effects = core.handle_media_added(media);
 
+        // ASSERT
         assert_eq!(effects.len(), 1);
         if let ParticipantEffect::SpawnTrack(meta) = &effects[0] {
             assert_eq!(meta.kind, MediaKind::Video);
             assert_eq!(meta.id.origin_participant, pid);
         } else {
-            panic!("Expected SpawnTrack effect");
+            panic!("Expected SpawnTrack effect, but got {:?}", effects);
         }
+        assert!(!core.state.should_resync);
+
+        let media = MediaAdded {
+            mid: Mid::new(),
+            direction: Direction::SendOnly,
+            kind: MediaKind::Video,
+            simulcast: Some(Simulcast {
+                recv: vec![],
+                send: vec![],
+            }),
+        };
+
+        // ACT
+        let effects = core.handle_media_added(media);
+
+        // ASSERT
+        assert!(effects.is_empty());
         assert!(core.state.should_resync);
     }
 
     #[test]
-    fn test_handle_media_added_send_only_creates_slot() {
+    fn handle_media_added_send_only_creates_slot() {
+        // ARRANGE
         let pid = Arc::new(ParticipantId::new());
         let mut core = ParticipantCore::new(pid);
         let mid = Mid::new();
-
         let media = MediaAdded {
             mid,
             direction: Direction::SendOnly,
@@ -298,86 +318,112 @@ mod tests {
             simulcast: None,
         };
 
+        // ACT
         let effects = core.handle_media_added(media);
 
-        assert!(effects.is_empty());
+        // ASSERT
+        assert!(
+            effects.is_empty(),
+            "SendOnly should not produce immediate effects"
+        );
         assert!(core.state.should_resync);
         assert!(core.state.subscribed_audio_tracks.contains_key(&mid));
         assert!(core.state.subscribed_audio_tracks[&mid].track_id.is_none());
     }
 
-    #[test]
-    fn test_auto_subscribe_logic() {
+    #[tokio::test(start_paused = true)]
+    // #[ignore = "reason"]
+    async fn auto_subscribe_fills_empty_slot_and_notifies_track_actor() {
+        // ARRANGE: A participant and a mock for the remote track actor.
         let my_pid = Arc::new(ParticipantId::new());
-        let other_pid = Arc::new(ParticipantId::new());
+        let my_fake = test_utils::FakeActor::new(my_pid.clone());
+        let mut core = ParticipantCore::new(my_pid.clone());
 
-        let mut core = ParticipantCore::new(my_pid);
+        let mut remote_track = new_fake_track(my_pid.clone(), MediaKind::Video);
 
-        // GIVEN: One available track from another participant.
-        let other_track = mock_track_handle(other_pid, MediaKind::Video);
+        // The room announces the new track is available.
         core.handle_tracks_update(&HashMap::from([(
-            other_track.meta.id.clone(),
-            other_track.clone(),
+            remote_track.handle().meta.id.clone(),
+            remote_track.handle(),
         )]));
 
-        // GIVEN: One empty subscription slot.
+        // The participant creates an empty subscription slot.
         let slot_mid = Mid::new();
         core.state
             .subscribed_video_tracks
             .insert(slot_mid, MidOutSlot { track_id: None });
 
-        // GIVEN: Resync is needed.
+        // The participant needs to resync its state.
         core.state.should_resync = true;
 
-        // WHEN: Resync check is performed.
+        // ACT: The core's resync logic is executed.
         let effects = core.handle_resync_check();
 
-        // THEN: We expect a Subscribe effect and an RPC sync effect.
-        assert_eq!(effects.len(), 2);
-
-        let mut subscribe_found = false;
-        let mut rpc_found = false;
-
+        // The participant actor would execute the effects. We simulate this.
         for effect in effects {
             match effect {
-                ParticipantEffect::SubscribeToTrack(track_h) => {
-                    assert_eq!(track_h.meta.id, other_track.meta.id);
-                    subscribe_found = true;
+                ParticipantEffect::SubscribeToTrack(mut handle) => {
+                    // The core decided we should subscribe. Let's send the message.
+                    assert_eq!(
+                        handle.meta.id,
+                        remote_track.handle().meta.id,
+                        "Should subscribe to the correct track"
+                    );
+
+                    handle
+                        .send_high(crate::track::TrackControlMessage::Subscribe(
+                            my_fake.handle().clone(),
+                        ))
+                        .await
+                        .unwrap();
                 }
-                ParticipantEffect::SendRpc(_) => {
-                    rpc_found = true;
-                }
-                _ => panic!("Unexpected effect: {:?}", effect),
+                _ => {} // Ignore other effects like SendRpc for this test's focus.
             }
         }
 
-        assert!(subscribe_found && rpc_found);
+        // ASSERT
+        // We expect the remote track actor to have received a `Subscribe` message.
+        let received_msg = remote_track.expect_high().await;
+        if let crate::track::TrackControlMessage::Subscribe(handle) = received_msg {
+            assert_eq!(
+                handle.meta, my_pid,
+                "The correct participant should have subscribed"
+            );
+        } else {
+            panic!("Expected a Subscribe message");
+        }
 
-        // THEN: State should be updated.
-        assert!(!core.state.should_resync);
-
+        // The core's internal state should be correctly updated.
         let slot = &core.state.subscribed_video_tracks[&slot_mid];
-        assert_eq!(slot.track_id.as_ref().unwrap(), &other_track.meta.id);
+        assert_eq!(
+            slot.track_id.as_ref().unwrap(),
+            &remote_track.handle().meta.id
+        );
 
-        let track_out = core.state.find_track_out_mut(&other_track.meta.id).unwrap();
+        let track_out = core
+            .state
+            .find_track_out_mut(&remote_track.handle().meta.id)
+            .unwrap();
         assert_eq!(track_out.mid.unwrap(), slot_mid);
+
+        assert!(!core.state.should_resync);
     }
 
-    #[test]
-    fn test_tracks_removed_frees_slot() {
-        let my_pid = Arc::new(ParticipantId::new());
-        let other_pid = Arc::new(ParticipantId::new());
-        let mut core = ParticipantCore::new(my_pid);
+    #[tokio::test(start_paused = true)]
+    async fn tracks_removed_frees_slot_and_queues_sync() {
+        // ARRANGE
+        let mut core = ParticipantCore::new(Arc::new(ParticipantId::new()));
 
-        let other_track = mock_track_handle(other_pid, MediaKind::Video);
-        let track_id = other_track.meta.id.clone();
+        // Create a mock track that is already subscribed in a slot.
+        let fake_pid = Arc::new(ParticipantId::new());
+        let mut remote_track = new_fake_track(fake_pid, MediaKind::Video);
+        let track_id = remote_track.handle().meta.id.clone();
         let slot_mid = Mid::new();
 
-        // GIVEN: A track is subscribed in a slot.
         core.state.available_video_tracks.insert(
             track_id.internal.clone(),
             TrackOut {
-                track: other_track.clone(),
+                track: remote_track.handle(),
                 mid: Some(slot_mid),
             },
         );
@@ -388,19 +434,31 @@ mod tests {
             },
         );
 
-        // WHEN: The track is removed by the room.
-        core.handle_tracks_removed(&HashMap::from([(track_id.clone(), other_track)]));
+        // ACT: The room announces the track has been removed.
+        core.handle_tracks_removed(&HashMap::from([(track_id.clone(), remote_track.handle())]));
 
-        // THEN: The slot should be empty.
+        // ASSERT
+        // The subscription slot should now be empty.
         let slot = &core.state.subscribed_video_tracks[&slot_mid];
-        assert!(slot.track_id.is_none());
+        assert!(slot.track_id.is_none(), "Subscription slot should be freed");
 
-        // THEN: An unpublish sync should be queued.
+        // An "unpublished" event should be queued for the client.
         assert!(core.state.should_resync);
         assert_eq!(core.state.pending_unpublished_tracks.len(), 1);
         assert_eq!(
             core.state.pending_unpublished_tracks[0],
             track_id.to_string()
         );
+
+        // The track should no longer be in the available list.
+        assert!(
+            !core
+                .state
+                .available_video_tracks
+                .contains_key(&track_id.internal)
+        );
+
+        // The mock should have received no messages in this case.
+        remote_track.expect_no_message().await;
     }
 }

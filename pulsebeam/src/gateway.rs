@@ -23,12 +23,14 @@ pub struct GatewayActor {
     send_outgoing_batch: Vec<net::SendPacket>,
 }
 
-impl actor::Actor for GatewayActor {
+impl actor::MessageSet for GatewayActor {
     type HighPriorityMsg = GatewayControlMessage;
     type LowPriorityMsg = GatewayDataMessage;
     type Meta = usize;
     type ObservableState = ();
+}
 
+impl actor::Actor for GatewayActor {
     fn meta(&self) -> Self::Meta {
         0
     }

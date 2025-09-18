@@ -89,18 +89,19 @@ pub struct ActorContext<A: Actor> {
     pub handle: ActorHandle<A>,
 }
 
-pub trait Actor: Sized + Send + 'static {
+/// Defines the set of types associated with an actor's communication interface.
+pub trait MessageSet: Sized + Send + 'static {
     /// The type of high-priority messages this actor processes.
     type HighPriorityMsg: Debug + Send + 'static;
     /// The type of low-priority messages this actor processes.
     type LowPriorityMsg: Debug + Send + 'static;
     /// The unique identifier for this actor.
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
+    /// The observable state snapshot of an actor for testing and debugging.
+    type ObservableState: Debug + Send + Sync + Clone;
+}
 
-    /// ObservableState is a state snapshot of an actor. This is mainly used
-    /// for testing.
-    type ObservableState: std::fmt::Debug + Send + Sync + Clone;
-
+pub trait Actor: MessageSet + Sized + Send + 'static {
     /// Returns the actor's unique meta
     fn meta(&self) -> Self::Meta;
 
@@ -157,48 +158,15 @@ pub trait Actor: Sized + Send + 'static {
     }
 }
 
-// pub trait ActorFactory<A: Actor> {
-//     fn prepare(
-//         &self,
-//         actor: A,
-//         config: RunnerConfig,
-//     ) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>);
-// }
-//
-// impl<A, F> ActorFactory<A> for F
-// where
-//     A: Actor,
-//     F: Fn(A, RunnerConfig) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>),
-// {
-//     fn prepare(
-//         &self,
-//         actor: A,
-//         config: RunnerConfig,
-//     ) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>) {
-//         self(actor, config)
-//     }
-// }
-//
-// // Default implementation using LocalActorHandle::new
-// impl<A: Actor> ActorFactory<A> for () {
-//     fn prepare(
-//         &self,
-//         actor: A,
-//         config: RunnerConfig,
-//     ) -> (ActorHandle<A>, JoinHandle<(A::ActorId, ActorStatus)>) {
-//         spawn(actor, config)
-//     }
-// }
-
 /// A handle for sending high- and low-priority messages to an actor.
-pub struct ActorHandle<A: Actor> {
-    sys_tx: mailbox::Sender<SystemMsg<A::ObservableState>>,
-    hi_tx: mailbox::Sender<A::HighPriorityMsg>,
-    lo_tx: mailbox::Sender<A::LowPriorityMsg>,
-    pub meta: A::Meta,
+pub struct ActorHandle<M: MessageSet> {
+    pub sys_tx: mailbox::Sender<SystemMsg<M::ObservableState>>,
+    pub hi_tx: mailbox::Sender<M::HighPriorityMsg>,
+    pub lo_tx: mailbox::Sender<M::LowPriorityMsg>,
+    pub meta: M::Meta,
 }
 
-impl<A: Actor> Clone for ActorHandle<A> {
+impl<M: MessageSet> Clone for ActorHandle<M> {
     fn clone(&self) -> Self {
         Self {
             sys_tx: self.sys_tx.clone(),
@@ -467,12 +435,14 @@ mod tests {
         }
     }
 
-    impl Actor for FakeActor {
+    impl MessageSet for FakeActor {
         type HighPriorityMsg = i32;
         type LowPriorityMsg = i32;
         type Meta = String;
         type ObservableState = i32;
+    }
 
+    impl Actor for FakeActor {
         fn meta(&self) -> Self::Meta {
             self.meta.clone()
         }

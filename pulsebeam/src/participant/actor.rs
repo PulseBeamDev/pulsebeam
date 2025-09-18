@@ -228,12 +228,14 @@ impl ParticipantActor {
     }
 }
 
-impl actor::Actor for ParticipantActor {
+impl actor::MessageSet for ParticipantActor {
     type HighPriorityMsg = ParticipantControlMessage;
     type LowPriorityMsg = ParticipantDataMessage;
     type Meta = Arc<ParticipantId>;
     type ObservableState = ();
+}
 
+impl actor::Actor for ParticipantActor {
     fn meta(&self) -> Self::Meta {
         self.core.state.participant_id.clone()
     }

@@ -50,12 +50,14 @@ pub struct TrackActor {
     pinned_rid: Option<Rid>,
 }
 
-impl actor::Actor for TrackActor {
+impl actor::MessageSet for TrackActor {
     type HighPriorityMsg = TrackControlMessage;
     type LowPriorityMsg = TrackDataMessage;
     type Meta = Arc<TrackMeta>;
     type ObservableState = ();
+}
 
+impl actor::Actor for TrackActor {
     fn meta(&self) -> Self::Meta {
         self.meta.clone()
     }

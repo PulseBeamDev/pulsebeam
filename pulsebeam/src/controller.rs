@@ -49,12 +49,14 @@ pub struct ControllerActor {
     room_tasks: FuturesUnordered<actor::JoinHandle<room::RoomActor>>,
 }
 
-impl actor::Actor for ControllerActor {
+impl actor::MessageSet for ControllerActor {
     type HighPriorityMsg = ControllerMessage;
     type LowPriorityMsg = ();
     type Meta = Arc<String>;
     type ObservableState = ();
+}
 
+impl actor::Actor for ControllerActor {
     fn meta(&self) -> Self::Meta {
         self.id.clone()
     }
