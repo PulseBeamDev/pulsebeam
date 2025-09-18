@@ -37,7 +37,7 @@ pub async fn create_system_ctx() -> system::SystemContext {
     )
     .await
     .unwrap();
-    let (system_ctx, _) = system::SystemContext::spawn(external_addr, socket);
+    let (system_ctx, _) = system::SystemContext::spawn(socket);
     system_ctx
 }
 

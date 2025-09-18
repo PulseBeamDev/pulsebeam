@@ -8,7 +8,6 @@ use str0m::{
     net::Transmit,
 };
 
-use super::actor::ParticipantHandle;
 use super::state::{MidOutSlot, ParticipantState};
 use crate::{
     entity::{ParticipantId, TrackId},

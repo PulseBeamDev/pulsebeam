@@ -20,7 +20,7 @@ pub async fn run(
     // Spawn system and controller actors
     let mut join_set = FuturesUnordered::new();
 
-    let (system_ctx, system_join) = system::SystemContext::spawn(external_addr, unified_socket);
+    let (system_ctx, system_join) = system::SystemContext::spawn(unified_socket);
     join_set.push(system_join.map(|_| ()).boxed());
 
     let (controller_ready_tx, controller_ready_rx) = tokio::sync::oneshot::channel();

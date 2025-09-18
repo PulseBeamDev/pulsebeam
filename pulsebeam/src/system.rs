@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use crate::gateway;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
@@ -12,10 +10,7 @@ pub struct SystemContext {
 }
 
 impl SystemContext {
-    pub fn spawn(
-        external_addr: SocketAddr,
-        socket: net::UnifiedSocket<'static>,
-    ) -> (Self, JoinHandle<()>) {
+    pub fn spawn(socket: net::UnifiedSocket<'static>) -> (Self, JoinHandle<()>) {
         let rng = rand::Rng::from_os_rng();
         let gw_actor = gateway::GatewayActor::new(socket);
 
