@@ -7,7 +7,7 @@ Rust WebRTC SFU core. HTTP signaling (no WebSockets). Modular services.
 
 ---
 
-PulseBeam is a **real-time media stack** designed to be simple, reliable, and easy to extend.  
+PulseBeam is an opinionated **real-time media stack** designed to be simple, reliable, and easy to extend.  
 
 - **Rust SFU core** – fast, memory-safe, no garbage collector pauses.  
 - **HTTP signaling** – WHIP/WHEP-compatible, extended for multi-party and server-side use cases. No WebSockets required.  
