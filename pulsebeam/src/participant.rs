@@ -70,6 +70,8 @@ struct MidOutSlot {
 /// * Process Outbound Media from Track actor
 /// * Send Outbound Media to Egress
 /// * Route Subscriber RTCP Feedback to origin via Track actor
+/// * Estimate the connection available bandwidth
+/// * Decide the bandwidth slicing and share this to each track actor
 pub struct ParticipantActor {
     // Dependencies
     system_ctx: system::SystemContext,

@@ -38,6 +38,9 @@ pub enum TrackControlMessage {
 /// * Receive Packet Notifications
 /// * Filter & Forward Packet Notifications
 /// * Route Publisher-Bound RTCP: Receive RTCP feedback (PLI, FIR, etc.) from subscriber and forward it to the publisher
+/// * Estimate bandwidth per stream
+/// * Receive bandwidth budget per subscriber
+/// * Maintain bitrate to meet each subscriber's budget by switching layers and pacing
 pub struct TrackActor {
     meta: Arc<TrackMeta>,
     origin: ParticipantHandle,
