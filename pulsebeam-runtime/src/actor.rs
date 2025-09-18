@@ -288,7 +288,7 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             lo_cap: 1,
-            hi_cap: 1,
+            hi_cap: 128,
         }
     }
 }

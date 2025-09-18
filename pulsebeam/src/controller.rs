@@ -162,7 +162,8 @@ impl ControllerActor {
         } else {
             tracing::info!("create_room: {}", room_id);
             let room_actor = room::RoomActor::new(self.system_ctx.clone(), room_id.clone());
-            let (room_handle, room_join) = actor::spawn(room_actor, actor::RunnerConfig::default());
+            let (room_handle, room_join) =
+                actor::spawn(room_actor, actor::RunnerConfig::default().with_hi(1024));
             self.room_tasks.push(room_join);
 
             self.rooms.insert(room_id.clone(), room_handle.clone());
