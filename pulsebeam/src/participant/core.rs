@@ -25,7 +25,7 @@ pub enum ParticipantEffect {
     Transmit(Transmit),
     RequestKeyframeToClient(KeyframeRequest),
     RequestKeyframeToTrack(track::TrackHandle, message::KeyframeRequest),
-    SubscribeToTrack(track::TrackHandle, ParticipantHandle),
+    SubscribeToTrack(track::TrackHandle),
     SendRpc(Vec<u8>),
     SpawnTrack(Arc<TrackMeta>),
     Disconnect,
@@ -48,6 +48,11 @@ impl ParticipantCore {
     #[inline]
     pub fn get_published_track(&self, mid: Mid) -> Option<&track::TrackHandle> {
         self.state.get_published_track(mid)
+    }
+
+    #[inline]
+    pub fn get_published_track_mut(&mut self, mid: Mid) -> Option<&mut track::TrackHandle> {
+        self.state.get_published_track_mut(mid)
     }
 
     // --- Egress Path Helpers (for Actor) ---
@@ -171,10 +176,7 @@ impl ParticipantCore {
 
     // --- Periodic State Sync ---
 
-    pub fn handle_resync_check(
-        &mut self,
-        self_handle: &ParticipantHandle,
-    ) -> Vec<ParticipantEffect> {
+    pub fn handle_resync_check(&mut self) -> Vec<ParticipantEffect> {
         if !self.state.should_resync {
             return vec![];
         }
@@ -199,10 +201,7 @@ impl ParticipantCore {
 
                     tracing::info!(track_id=%track_out.track.meta.id, mid=?slot_mid, "Auto-subscribing");
 
-                    effects.push(ParticipantEffect::SubscribeToTrack(
-                        track_out.track.clone(),
-                        self_handle.clone(),
-                    ));
+                    effects.push(ParticipantEffect::SubscribeToTrack(track_out.track.clone()));
 
                     track_out.mid.replace(*slot_mid);
                     slot.track_id.replace(track_out.track.meta.id.clone());
@@ -243,34 +242,25 @@ mod tests {
     use super::*;
     use crate::{participant::state::TrackOut, track};
     use str0m::media::{MediaKind, Simulcast};
-    use tokio::sync::mpsc;
 
     // --- Test Helpers ---
-
-    fn mock_participant_handle(pid: Arc<ParticipantId>) -> ParticipantHandle {
-        let (tx, _rx) = mpsc::channel(1);
-        ParticipantHandle::new(pid, tx, tx)
-    }
-
     fn mock_track_handle(
         participant_id: Arc<ParticipantId>,
         kind: MediaKind,
     ) -> track::TrackHandle {
-        let (tx_high, _) = mpsc::channel::<track::TrackControlMessage>(1);
-        let (tx_low, _) = mpsc::channel(1);
         let meta = Arc::new(TrackMeta {
             id: Arc::new(TrackId::new(participant_id, Mid::new())),
             kind,
             simulcast_rids: None,
         });
-        track::TrackHandle::new(meta, tx_high, tx_low)
+        track::TrackActor::new(origin, meta);
     }
 
     // --- Tests ---
 
     #[test]
     fn test_handle_media_added_recv_only_spawns_track() {
-        let pid = Arc::new(ParticipantId::new_v4());
+        let pid = Arc::new(ParticipantId::new());
         let mut core = ParticipantCore::new(pid.clone());
 
         let media = MediaAdded {
@@ -297,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_handle_media_added_send_only_creates_slot() {
-        let pid = Arc::new(ParticipantId::new_v4());
+        let pid = Arc::new(ParticipantId::new());
         let mut core = ParticipantCore::new(pid);
         let mid = Mid::new();
 
@@ -318,9 +308,8 @@ mod tests {
 
     #[test]
     fn test_auto_subscribe_logic() {
-        let my_pid = Arc::new(ParticipantId::new_v4());
-        let other_pid = Arc::new(ParticipantId::new_v4());
-        let my_handle = mock_participant_handle(my_pid.clone());
+        let my_pid = Arc::new(ParticipantId::new());
+        let other_pid = Arc::new(ParticipantId::new());
 
         let mut core = ParticipantCore::new(my_pid);
 
@@ -341,7 +330,7 @@ mod tests {
         core.state.should_resync = true;
 
         // WHEN: Resync check is performed.
-        let effects = core.handle_resync_check(&my_handle);
+        let effects = core.handle_resync_check();
 
         // THEN: We expect a Subscribe effect and an RPC sync effect.
         assert_eq!(effects.len(), 2);
@@ -351,9 +340,8 @@ mod tests {
 
         for effect in effects {
             match effect {
-                ParticipantEffect::SubscribeToTrack(track_h, p_handle) => {
+                ParticipantEffect::SubscribeToTrack(track_h) => {
                     assert_eq!(track_h.meta.id, other_track.meta.id);
-                    assert_eq!(p_handle.meta(), my_handle.meta());
                     subscribe_found = true;
                 }
                 ParticipantEffect::SendRpc(_) => {
@@ -377,8 +365,8 @@ mod tests {
 
     #[test]
     fn test_tracks_removed_frees_slot() {
-        let my_pid = Arc::new(ParticipantId::new_v4());
-        let other_pid = Arc::new(ParticipantId::new_v4());
+        let my_pid = Arc::new(ParticipantId::new());
+        let other_pid = Arc::new(ParticipantId::new());
         let mut core = ParticipantCore::new(my_pid);
 
         let other_track = mock_track_handle(other_pid, MediaKind::Video);

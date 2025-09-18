@@ -5,7 +5,6 @@ use str0m::media::{MediaKind, Mid};
 
 use crate::{
     entity::{EntityId, ParticipantId, TrackId},
-    message::TrackMeta,
     proto::sfu as proto_sfu,
     track,
 };
@@ -147,6 +146,13 @@ impl ParticipantState {
         self.published_video_tracks
             .get(&mid)
             .or_else(|| self.published_audio_tracks.get(&mid))
+    }
+
+    #[inline]
+    pub fn get_published_track_mut(&mut self, mid: Mid) -> Option<&mut track::TrackHandle> {
+        self.published_video_tracks
+            .get_mut(&mid)
+            .or_else(|| self.published_audio_tracks.get_mut(&mid))
     }
 
     #[inline]
