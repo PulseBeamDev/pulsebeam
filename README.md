@@ -34,14 +34,11 @@ The easiest way to run PulseBeam is with Docker:
 docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.8
 ````
 
----
-
 Other ways to run:
 
 * **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases)
 * **Source:** `cargo run --release -p pulsebeam`
 
----
 
 ### Demo: Broadcast
 
