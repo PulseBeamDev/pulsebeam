@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use futures::{StreamExt, stream::FuturesUnordered};
 use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
@@ -89,6 +90,7 @@ pub struct ParticipantActor {
     published_audio_tracks: HashMap<Mid, track::TrackHandle>,
     subscribed_video_tracks: HashMap<Mid, MidOutSlot>,
     subscribed_audio_tracks: HashMap<Mid, MidOutSlot>,
+    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
 
     // Global view of available tracks. This participant view is mirrored
     // 1:1 to the client. Thus, it's possible to be slightly different than the
@@ -142,6 +144,9 @@ impl actor::Actor for ParticipantActor {
                 _ = tokio::time::sleep(delay) => {
                     // explicit empty, next loop polls again
                     // tracing::warn!("woke up from sleep: {}us", delay.as_micros());
+                }
+                Some((track_meta, _)) = self.track_tasks.next() => {
+                    self.handle_track_unpublished(track_meta);
                 }
             }
         );
@@ -260,6 +265,7 @@ impl ParticipantActor {
             available_audio_tracks: HashMap::new(),
             subscribed_video_tracks: HashMap::new(),
             subscribed_audio_tracks: HashMap::new(),
+            track_tasks: FuturesUnordered::new(),
             cid: None,
 
             pending_published_tracks: Vec::new(),
@@ -267,6 +273,13 @@ impl ParticipantActor {
             pending_switched_tracks: Vec::new(),
             should_resync: false,
         }
+    }
+
+    fn handle_track_unpublished(&mut self, track: Arc<TrackMeta>) {
+        match track.kind {
+            MediaKind::Video => self.published_video_tracks.remove(&track.id.origin_mid),
+            MediaKind::Audio => self.published_audio_tracks.remove(&track.id.origin_mid),
+        };
     }
 
     async fn auto_subscribe(&mut self, ctx: &mut actor::ActorContext<Self>) {
@@ -532,7 +545,7 @@ impl ParticipantActor {
             .try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
-    async fn handle_new_media(&mut self, _ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
+    async fn handle_new_media(&mut self, ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
         match media.direction {
             // TODO: limit at most 1 video, 1 audio
             // client -> SFU
@@ -541,16 +554,23 @@ impl ParticipantActor {
                 // TODO: handle back pressure by buffering temporarily
                 let track_id = TrackId::new(self.participant_id.clone(), media.mid);
                 let track_id = Arc::new(track_id);
-                let track = TrackMeta {
+                let track_meta = TrackMeta {
                     id: track_id.clone(),
                     kind: media.kind,
                     // TODO: double check the simulcast directions.
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 };
+                let track_meta = Arc::new(track_meta);
+
+                // TODO: update capacities
+                let track_actor = track::TrackActor::new(ctx.handle.clone(), track_meta.clone());
+                let (track_handle, track_join) =
+                    actor::spawn(track_actor, actor::RunnerConfig::default().with_lo(1024));
+                self.track_tasks.push(track_join);
 
                 if let Err(err) = self
                     .room_handle
-                    .send_high(room::RoomMessage::PublishTrack(Arc::new(track)))
+                    .send_high(room::RoomMessage::PublishTrack(track_handle))
                     .await
                 {
                     // this participant should get cleaned up by the supervisor
