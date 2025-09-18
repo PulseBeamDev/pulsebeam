@@ -12,11 +12,18 @@ use crate::mailbox;
 
 pub struct JoinHandle<A: Actor> {
     inner: Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>,
+    abort_handle: tokio::task::AbortHandle,
 }
 
 impl<A: Actor> JoinHandle<A> {
-    pub fn new(future: Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>) -> Self {
-        Self { inner: future }
+    pub fn abort(&self) {
+        self.abort_handle.abort();
+    }
+}
+
+impl<A: Actor> Drop for JoinHandle<A> {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -324,14 +331,22 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
     let actor_id = a.meta().clone();
     let join = tokio::spawn(
         run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
-    )
-    .map(|res| match res {
-        Ok(ret) => (actor_id, ret),
-        Err(_) => (actor_id, ActorStatus::ShutDown),
-    })
-    .boxed();
+    );
+    let abort_handle = join.abort_handle();
+    let join = join
+        .map(|res| match res {
+            Ok(ret) => (actor_id, ret),
+            Err(_) => (actor_id, ActorStatus::ShutDown),
+        })
+        .boxed();
 
-    (handle, JoinHandle::new(join))
+    (
+        handle,
+        JoinHandle {
+            inner: join,
+            abort_handle,
+        },
+    )
 }
 
 pub fn spawn_default<A: Actor>(
@@ -433,4 +448,59 @@ macro_rules! actor_loop {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, sleep};
+
+    struct FakeActor {
+        meta: String,
+    }
+
+    impl FakeActor {
+        fn new() -> Self {
+            FakeActor {
+                meta: "test_actor".to_string(),
+            }
+        }
+    }
+
+    impl Actor for FakeActor {
+        type HighPriorityMsg = i32;
+        type LowPriorityMsg = i32;
+        type Meta = String;
+        type ObservableState = i32;
+
+        fn meta(&self) -> Self::Meta {
+            self.meta.clone()
+        }
+
+        fn get_observable_state(&self) -> Self::ObservableState {
+            0
+        }
+
+        async fn run(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            actor_loop!(self, ctx, pre_select: {},
+            select: {
+                _ = sleep(Duration::from_secs(10)) => {},
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_join_handle_drop_aborts_actor() {
+        let actor = FakeActor::new();
+        let (mut handle, join_handle) = spawn(actor, RunnerConfig::default());
+
+        // Act: Drop the join handle
+        drop(join_handle);
+
+        // Assert: Actor should be shut down
+        sleep(Duration::from_millis(50)).await;
+        let result = handle.get_state().await;
+        assert!(result.is_err());
+    }
 }
