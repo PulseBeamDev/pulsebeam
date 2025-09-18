@@ -8,8 +8,9 @@ permissions:
 on:
   push:
     branches: [ "main" ]
-  release:
-    types: [published]
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   docker-build-and-publish:
