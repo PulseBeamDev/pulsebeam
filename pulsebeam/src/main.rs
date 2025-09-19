@@ -77,9 +77,15 @@ pub async fn run(cpu_rt: rt::Runtime) {
         external_ip,
     );
 
-    node::run(cpu_rt, external_addr, unified_socket, http_socket, false)
-        .await
-        .unwrap();
+    // Run the main logic and signal handler concurrently
+    tokio::select! {
+        Err(err) = node::run(cpu_rt, external_addr, unified_socket, http_socket, false) => {
+            tracing::warn!("node exited with an error: {err}");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received SIGINT, shutting down gracefully");
+        }
+    }
 }
 
 pub fn select_host_address() -> IpAddr {
