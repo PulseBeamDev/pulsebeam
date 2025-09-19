@@ -421,8 +421,10 @@ impl ParticipantActor {
         });
 
         let track_actor = track::TrackActor::new(ctx.handle.clone(), track_meta.clone());
-        let (track_handle, join_handle) =
-            actor::spawn(track_actor, actor::RunnerConfig::default().with_lo(1024));
+        let (track_handle, join_handle) = actor::spawn(
+            track_actor,
+            actor::RunnerConfig::default().with_lo(1024).with_hi(1024),
+        );
 
         self.track_tasks.push(join_handle);
 
