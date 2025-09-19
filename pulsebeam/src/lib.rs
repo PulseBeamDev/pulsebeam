@@ -1,3 +1,4 @@
+pub mod api;
 pub mod audio_selector;
 pub mod controller;
 pub mod entity;
@@ -8,7 +9,6 @@ pub mod node;
 pub mod participant;
 pub mod proto;
 pub mod room;
-pub mod signaling;
 pub mod system;
 pub mod track;
 

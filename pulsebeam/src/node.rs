@@ -1,4 +1,4 @@
-use crate::{controller, signaling, system};
+use crate::{api, controller, system};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::{actor, net, rt};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -42,7 +42,11 @@ pub async fn run(
     tracing::debug!("waiting on controller to be ready");
     let controller_handle = controller_ready_rx.await?;
     // Set up signaling router
-    let router = signaling::router(controller_handle).layer(cors);
+    let api_cfg = api::ApiConfig {
+        base_path: "/api/v1".to_string(),
+        default_host: http_socket.to_string(),
+    };
+    let router = api::router(controller_handle, api_cfg).layer(cors);
     tracing::debug!("listening on {http_socket}");
 
     if enable_tls {
