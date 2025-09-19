@@ -79,7 +79,7 @@ pub async fn run(cpu_rt: rt::Runtime) {
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(cpu_rt, external_addr, unified_socket, http_socket, false) => {
+        Err(err) = node::run(cpu_rt, external_addr, unified_socket, http_socket) => {
             tracing::warn!("node exited with an error: {err}");
         }
         _ = tokio::signal::ctrl_c() => {

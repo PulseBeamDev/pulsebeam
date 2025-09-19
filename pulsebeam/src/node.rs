@@ -8,8 +8,7 @@ pub async fn run(
     cpu_rt: rt::Runtime,
     external_addr: SocketAddr,
     unified_socket: net::UnifiedSocket<'static>,
-    http_socket: SocketAddr,
-    enable_tls: bool,
+    http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     // Configure CORS
     let cors = CorsLayer::very_permissive()
@@ -44,34 +43,16 @@ pub async fn run(
     // Set up signaling router
     let api_cfg = api::ApiConfig {
         base_path: "/api/v1".to_string(),
-        default_host: http_socket.to_string(),
+        default_host: http_addr.to_string(),
     };
     let router = api::router(controller_handle, api_cfg).layer(cors);
-    tracing::debug!("listening on {http_socket}");
+    tracing::debug!("listening on {http_addr}");
 
-    if enable_tls {
-        // TODO: exclude from production build
-        use axum_server::tls_rustls::RustlsConfig;
-        let cert = include_bytes!("cert.pem");
-        let key = include_bytes!("key.pem");
-        let config = RustlsConfig::from_pem(cert.to_vec(), key.to_vec()).await?;
-
-        let signaling = async move {
-            axum_server::bind_rustls(http_socket, config)
-                .serve(router.into_make_service())
-                .await
-                .unwrap();
-        };
-        join_set.push(tokio::spawn(signaling).map(|_| ()).boxed());
-    } else {
-        let signaling = async move {
-            axum_server::bind(http_socket)
-                .serve(router.into_make_service())
-                .await
-                .unwrap();
-        };
-        join_set.push(tokio::spawn(signaling).map(|_| ()).boxed());
-    }
+    let signaling = async move {
+        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+        axum::serve(listener, router).await.unwrap();
+    };
+    join_set.push(tokio::spawn(signaling).map(|_| ()).boxed());
 
     // Wait for all tasks to complete
     while join_set.next().await.is_some() {}
