@@ -24,11 +24,18 @@ aarch64-pc-windows-msvc = "ubuntu-24.04"
 
 # https://axodotdev.github.io/cargo-dist/book/reference/config.html?highlight=dependencies#dependencies
 [dist.dependencies.homebrew]
-protobuf = '*'
+clang = "*"
+pkg-config = "*"
+ffmpeg = "*"
+protobuf = "*"
 
 [dist.dependencies.apt]
-protobuf-compiler = '*'
+build-essential = "*"
+clang = "*"
+pkg-config = "*"
+ffmpeg-free = "*"
+protobuf-compiler = "*"
 
 [dist.dependencies.chocolatey]
-protoc = '*'
-
+ffmpeg = "*"
+protoc = "*"

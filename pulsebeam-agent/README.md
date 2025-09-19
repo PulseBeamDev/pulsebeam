@@ -1,17 +1,28 @@
 # `pulsebeam-agent`
 
-**STATUS: PLANNED - NOT YET IMPLEMENTED**
+**STATUS: IN_PROGRESS**
 
 This crate will be the canonical WebRTC peer implementation for the PulseBeam ecosystem.
 
 This is a library, not a binary. Its planned job is to handle the low-level complexities of a full WebRTC session, providing a clean, high-level API for an application to use. It will be the foundational client component for the entire PulseBeam stack.
+
+## System Dependencies
+
+This crate relies on ffmpeg to be available on the system. The final binary will be dynamically linked to ffmpeg.
+
+Fedora:
+
+```bash
+sudo dnf install ffmpeg-free-devel clang-devel
+```
+
 
 ## Planned Responsibilities
 
 -   **Signaling (WHIP/WHEP Superset):** It will manage the entire media session lifecycle using our HTTP-based protocol. Instead of a persistent WebSocket, it will use a series of HTTP requests (POST, PATCH, DELETE) to negotiate SDP offers/answers.
 -   **WebRTC Engine:** It will own and drive the `str0m::Rtc` state machine, handling all ICE, DTLS, and SRTP session logic.
 -   **Track Management:** It will provide a clean API for publishing local media tracks and subscribing to remote tracks.
--   **State Encapsulation:** It will be implemented as a `pulsebeam-runtime` actor, ensuring all state is managed safely within a dedicated async task.
+-   **Async Runtime Agnostic:** adapters will be provided as optional dependencies.
 
 ## Architectural Vision
 
