@@ -31,7 +31,7 @@ Clients (browsers, mobile, embedded, bots)
 The easiest way to run PulseBeam is with Docker:
 
 ```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.8
+docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.11
 ````
 
 Other ways to run:
