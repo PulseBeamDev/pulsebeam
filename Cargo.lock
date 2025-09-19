@@ -1509,6 +1509,7 @@ dependencies = [
  "thiserror 2.0.16",
  "thread-priority",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",

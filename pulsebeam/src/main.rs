@@ -1,4 +1,5 @@
 use mimalloc::MiMalloc;
+use tokio_util::sync::CancellationToken;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -55,15 +56,17 @@ fn main() {
         .build()
         .unwrap();
 
+    let shutdown = CancellationToken::new();
     let io_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .thread_name("io")
         .build()
         .unwrap();
-    io_rt.block_on(run(cpu_rt));
+    io_rt.block_on(run(shutdown.clone(), &cpu_rt));
+    shutdown.cancel();
 }
 
-pub async fn run(cpu_rt: rt::Runtime) {
+pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
     let external_ip = select_host_address();
     let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
@@ -73,17 +76,18 @@ pub async fn run(cpu_rt: rt::Runtime) {
             .expect("bind to udp socket");
     let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
-        "✅ Signaling server listening. Clients should connect to http://{}:3000 or http://localhost:3000",
+        "server listening at http://{}:3000 or http://localhost:3000",
         external_ip,
     );
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(cpu_rt, external_addr, unified_socket, http_addr) => {
-            tracing::warn!("node exited with an error: {err}");
+        Err(err) = node::run(shutdown.clone(), cpu_rt, external_addr, unified_socket, http_addr) => {
+            tracing::warn!("node exited with error: {err}");
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received SIGINT, shutting down gracefully");
+            tracing::info!("received SIGINT, shutting down gracefully...");
+                shutdown.cancel();
         }
     }
 }

@@ -33,6 +33,7 @@ mimalloc = { version = "0.1.48", features = ["v3"] }
 hyper = "1.7.0"
 pulsebeam-runtime = { version = "^0.1.0", path = "../pulsebeam-runtime" }
 thread-priority = "3.0.0"
+tokio-util = "0.7.16"
 
 [dev-dependencies]
 turmoil = "0.6.6"
