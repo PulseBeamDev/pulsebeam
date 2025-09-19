@@ -19,33 +19,14 @@ type HandlerFn<State, Msg> = Arc<dyn Fn(&mut State, Msg) + Send + Sync>;
 /// - Spawn the actor, send messages via the handle, and query observable state
 ///   to assert transitions, aligning with state-based testing principles from
 ///   "Software Engineering at Google" (focus on pre-state, action, post-state assertions).
-///
-/// Example:
-/// ```
-/// struct CounterState {
-///     count: i32,
-/// }
-///
-/// let test_actor = TestActor::new(
-///     "test_meta".to_string(),
-///     CounterState { count: 0 },
-///     Arc::new(|state: &mut CounterState, msg: i32| { state.count += msg; }),
-///     Arc::new(|state: &mut CounterState, msg: String| { /* ignore or handle */ }),
-/// );
-///
-/// let (handle, join) = spawn(test_actor, RunnerConfig::default());
-/// handle.send_high(5).await.unwrap();
-/// let new_state = handle.get_state().await.unwrap();
-/// assert_eq!(new_state.count, 5);
-/// ```
-pub struct TestActor<Meta, State, HighMsg, LowMsg> {
+pub struct FakeActor<Meta, State, HighMsg, LowMsg> {
     meta: Meta,
     state: State,
     on_high: HandlerFn<State, HighMsg>,
     on_low: HandlerFn<State, LowMsg>,
 }
 
-impl<Meta, State, HighMsg, LowMsg> TestActor<Meta, State, HighMsg, LowMsg>
+impl<Meta, State, HighMsg, LowMsg> FakeActor<Meta, State, HighMsg, LowMsg>
 where
     Meta: Eq + Hash + Display + Debug + Clone + Send + 'static,
     State: Debug + Send + Sync + Clone + 'static,
@@ -68,7 +49,7 @@ where
     }
 }
 
-impl<Meta, State, HighMsg, LowMsg> MessageSet for TestActor<Meta, State, HighMsg, LowMsg>
+impl<Meta, State, HighMsg, LowMsg> MessageSet for FakeActor<Meta, State, HighMsg, LowMsg>
 where
     Meta: Eq + Hash + Display + Debug + Clone + Send + 'static,
     State: Debug + Send + Clone + 'static,
@@ -81,7 +62,7 @@ where
     type ObservableState = State;
 }
 
-impl<Meta, State, HighMsg, LowMsg> Actor for TestActor<Meta, State, HighMsg, LowMsg>
+impl<Meta, State, HighMsg, LowMsg> Actor for FakeActor<Meta, State, HighMsg, LowMsg>
 where
     Meta: Eq + Hash + Display + Debug + Clone + Send + 'static,
     State: Debug + Send + Clone + 'static,
@@ -117,8 +98,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::rt;
+
     use super::*;
-    use tokio::time::{Duration, sleep};
 
     #[tokio::test(start_paused = true)]
     async fn test_join_handle_drop_aborts_actor() {
@@ -127,7 +109,7 @@ mod tests {
         type HighMsg = i32;
         type LowMsg = i32;
 
-        let actor = TestActor::new(
+        let actor = FakeActor::new(
             "test_actor".to_string(),
             0,                                                // initial state
             Arc::new(|_state: &mut State, _msg: HighMsg| {}), // no-op handler
@@ -140,32 +122,31 @@ mod tests {
         drop(join_handle);
 
         // Assert: Actor should be shut down
-        sleep(Duration::from_millis(50)).await;
+        rt::yield_now().await;
         let result = handle.get_state().await;
         assert!(result.is_err());
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_state_transition_on_message() {
-        type State = i32;
-        type HighMsg = i32;
-
-        let actor = TestActor::new(
+        let actor = FakeActor::new(
             "counter".to_string(),
             0,
-            Arc::new(|state: &mut State, msg: HighMsg| {
+            Arc::new(|state: &mut i32, msg: i32| {
                 *state += msg;
             }),
-            Arc::new(|_state: &mut State, _msg: ()| {}),
+            Arc::new(|_state: &mut i32, _msg: ()| {}),
         );
 
         let (mut handle, _join) = spawn(actor, RunnerConfig::default());
 
         handle.send_high(10).await.unwrap();
+        rt::yield_now().await;
         let state = handle.get_state().await.unwrap();
         assert_eq!(state, 10);
 
         handle.send_high(5).await.unwrap();
+        rt::yield_now().await;
         let state = handle.get_state().await.unwrap();
         assert_eq!(state, 15);
     }
