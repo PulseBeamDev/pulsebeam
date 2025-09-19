@@ -71,15 +71,15 @@ pub async fn run(cpu_rt: rt::Runtime) {
         net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
             .await
             .expect("bind to udp socket");
-    let http_socket: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+    let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
-        "✅ Signaling server listening. Clients should connect to https://{}:3000 or https://localhost:3000",
+        "✅ Signaling server listening. Clients should connect to http://{}:3000 or http://localhost:3000",
         external_ip,
     );
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(cpu_rt, external_addr, unified_socket, http_socket) => {
+        Err(err) = node::run(cpu_rt, external_addr, unified_socket, http_addr) => {
             tracing::warn!("node exited with an error: {err}");
         }
         _ = tokio::signal::ctrl_c() => {
