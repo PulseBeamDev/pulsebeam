@@ -1,138 +1,172 @@
-use crate::actor::{ActorHandle, MessageSet};
-use crate::mailbox;
-use std::fmt::Debug;
-use std::sync::{Arc, Mutex, MutexGuard};
+use crate::actor::*;
+use std::fmt::{Debug, Display};
+use std::hash::Hash;
+use std::sync::Arc;
 
-/// A handle to a spawned fake actor, used for state-based assertions in tests.
-/// This is the object your test will hold and interact with.
-pub struct FakeActor<S: 'static> {
-    state: Arc<Mutex<S>>,
-    // We hold the join handle to abort the internal task when the fake is dropped.
-    _task_join_handle: tokio::task::JoinHandle<()>,
+type HandlerFn<State, Msg> = Arc<dyn Fn(&mut State, Msg) + Send + Sync>;
+
+/// A generic test actor implementation for state-based testing.
+///
+/// This allows you to define a custom observable state type and provide closures
+/// that handle high-priority and low-priority messages by mutating the state.
+///
+/// The actor uses the default message loop, processing messages and updating state
+/// accordingly. System messages (like GetState and Terminate) are handled by default.
+///
+/// Usage in tests:
+/// - Define your State type (must implement Clone for observation).
+/// - Provide closures that mutate the state based on received messages.
+/// - Spawn the actor, send messages via the handle, and query observable state
+///   to assert transitions, aligning with state-based testing principles from
+///   "Software Engineering at Google" (focus on pre-state, action, post-state assertions).
+///
+/// Example:
+/// ```
+/// struct CounterState {
+///     count: i32,
+/// }
+///
+/// let test_actor = TestActor::new(
+///     "test_meta".to_string(),
+///     CounterState { count: 0 },
+///     Arc::new(|state: &mut CounterState, msg: i32| { state.count += msg; }),
+///     Arc::new(|state: &mut CounterState, msg: String| { /* ignore or handle */ }),
+/// );
+///
+/// let (handle, join) = spawn(test_actor, RunnerConfig::default());
+/// handle.send_high(5).await.unwrap();
+/// let new_state = handle.get_state().await.unwrap();
+/// assert_eq!(new_state.count, 5);
+/// ```
+pub struct TestActor<Meta, State, HighMsg, LowMsg> {
+    meta: Meta,
+    state: State,
+    on_high: HandlerFn<State, HighMsg>,
+    on_low: HandlerFn<State, LowMsg>,
 }
 
-impl<S: 'static> FakeActor<S> {
-    /// Provides locked, synchronous access to the fake's internal state for assertions.
-    ///
-    /// # Example
-    /// ```
-    /// let state = fake.state();
-    /// assert_eq!(state.subscribers.len(), 1);
-    /// ```
-    pub fn state(&self) -> MutexGuard<'_, S> {
-        self.state
-            .lock()
-            .expect("State mutex poisoned in test. This indicates a test logic error.")
-    }
-
-    /// A convenience method for asserting state in a more fluent way.
-    /// The test will panic if the closure's assertions fail.
-    ///
-    /// # Example
-    /// ```
-    /// fake.assert_state(|state| {
-    ///     assert_eq!(state.subscribers.len(), 1);
-    /// });
-    /// ```
-    #[track_caller]
-    pub fn assert_state<F>(&self, check: F)
-    where
-        F: FnOnce(&S),
-    {
-        check(&self.state());
-    }
-}
-
-/// A builder for creating `FakeActor` instances declaratively.
-/// This is the primary entry point for all tests.
-pub struct FakeActorBuilder<A: MessageSet, S> {
-    meta: A::Meta,
-    state: S,
-    on_high: Box<dyn FnMut(&mut S, A::HighPriorityMsg) + Send>,
-    on_low: Box<dyn FnMut(&mut S, A::LowPriorityMsg) + Send>,
-}
-
-impl<A: MessageSet, S> FakeActorBuilder<A, S>
+impl<Meta, State, HighMsg, LowMsg> TestActor<Meta, State, HighMsg, LowMsg>
 where
-    S: Default + Debug + Clone + Send + Sync + 'static,
-    A::HighPriorityMsg: Send + 'static,
-    A::LowPriorityMsg: Send + 'static,
+    Meta: Eq + Hash + Display + Debug + Clone + Send + 'static,
+    State: Debug + Send + Sync + Clone + 'static,
+    HighMsg: Debug + Send + 'static,
+    LowMsg: Debug + Send + 'static,
 {
-    /// Starts building a new `FakeActor`.
-    ///
-    /// It is generic over the REAL actor's `MessageSet` (`A`) and your
-    /// test-specific `State` (`S`).
-    pub fn new(meta: A::Meta) -> Self {
+    /// Creates a new TestActor with the given meta, initial state, and handler closures.
+    pub fn new(
+        meta: Meta,
+        initial_state: State,
+        on_high: HandlerFn<State, HighMsg>,
+        on_low: HandlerFn<State, LowMsg>,
+    ) -> Self {
         Self {
             meta,
-            state: Default::default(),
-            on_high: Box::new(|_, _| {}), // Default is to do nothing
-            on_low: Box::new(|_, _| {}),  // Default is to do nothing
+            state: initial_state,
+            on_high,
+            on_low,
         }
     }
+}
 
-    /// Defines the state transition logic for handling high-priority messages.
-    pub fn on_high<F>(mut self, f: F) -> Self
-    where
-        F: FnMut(&mut S, A::HighPriorityMsg) + Send + 'static,
-    {
-        self.on_high = Box::new(f);
-        self
+impl<Meta, State, HighMsg, LowMsg> MessageSet for TestActor<Meta, State, HighMsg, LowMsg>
+where
+    Meta: Eq + Hash + Display + Debug + Clone + Send + 'static,
+    State: Debug + Send + Clone + 'static,
+    HighMsg: Debug + Send + 'static,
+    LowMsg: Debug + Send + 'static,
+{
+    type HighPriorityMsg = HighMsg;
+    type LowPriorityMsg = LowMsg;
+    type Meta = Meta;
+    type ObservableState = State;
+}
+
+impl<Meta, State, HighMsg, LowMsg> Actor for TestActor<Meta, State, HighMsg, LowMsg>
+where
+    Meta: Eq + Hash + Display + Debug + Clone + Send + 'static,
+    State: Debug + Send + Clone + 'static,
+    HighMsg: Debug + Send + 'static,
+    LowMsg: Debug + Send + 'static,
+{
+    fn meta(&self) -> Self::Meta {
+        self.meta.clone()
     }
 
-    /// Defines the state transition logic for handling low-priority messages.
-    pub fn on_low<F>(mut self, f: F) -> Self
-    where
-        F: FnMut(&mut S, A::LowPriorityMsg) + Send + 'static,
-    {
-        self.on_low = Box::new(f);
-        self
+    fn get_observable_state(&self) -> Self::ObservableState {
+        self.state.clone()
     }
 
-    /// Consumes the builder, spawns the fake, and returns two things:
-    /// 1. A real `ActorHandle<A>` to inject into the system under test.
-    /// 2. A `FakeActor<S>` for your test to use for assertions.
-    pub fn build(self) -> (ActorHandle<A>, FakeActor<S>) {
-        let (lo_tx, mut lo_rx) = mailbox::new(128);
-        let (hi_tx, mut hi_rx) = mailbox::new(128);
-        let (sys_tx, _sys_rx) = mailbox::new(128);
+    fn on_high_priority(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        (self.on_high)(&mut self.state, msg);
+        async {}
+    }
 
-        // This is a REAL, correctly-typed handle.
-        let handle = ActorHandle {
-            hi_tx,
-            lo_tx,
-            sys_tx,
-            meta: self.meta,
-        };
+    fn on_low_priority(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        (self.on_low)(&mut self.state, msg);
+        async {}
+    }
+}
 
-        let state = Arc::new(Mutex::new(self.state));
-        let task_state = state.clone();
-        let mut on_high = self.on_high;
-        let mut on_low = self.on_low;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, sleep};
 
-        // Spawn a tiny, self-contained message processing loop.
-        let task_join_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(msg) = hi_rx.recv() => {
-                        on_high(&mut task_state.lock().unwrap(), msg);
-                    }
-                    Some(msg) = lo_rx.recv() => {
-                        on_low(&mut task_state.lock().unwrap(), msg);
-                    }
-                    else => {
-                        // All sender handles were dropped, so the task can exit.
-                        break;
-                    }
-                }
-            }
-        });
+    #[tokio::test(start_paused = true)]
+    async fn test_join_handle_drop_aborts_actor() {
+        // Define minimal types for this test (can be reused or customized).
+        type State = i32; // Same as old FakeActor
+        type HighMsg = i32;
+        type LowMsg = i32;
 
-        let fake_actor = FakeActor {
-            state,
-            _task_join_handle: task_join_handle,
-        };
+        let actor = TestActor::new(
+            "test_actor".to_string(),
+            0,                                                // initial state
+            Arc::new(|_state: &mut State, _msg: HighMsg| {}), // no-op handler
+            Arc::new(|_state: &mut State, _msg: LowMsg| {}),  // no-op handler
+        );
 
-        (handle, fake_actor)
+        let (mut handle, join_handle) = spawn(actor, RunnerConfig::default());
+
+        // Act: Drop the join handle
+        drop(join_handle);
+
+        // Assert: Actor should be shut down
+        sleep(Duration::from_millis(50)).await;
+        let result = handle.get_state().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_state_transition_on_message() {
+        type State = i32;
+        type HighMsg = i32;
+
+        let actor = TestActor::new(
+            "counter".to_string(),
+            0,
+            Arc::new(|state: &mut State, msg: HighMsg| {
+                *state += msg;
+            }),
+            Arc::new(|_state: &mut State, _msg: ()| {}),
+        );
+
+        let (mut handle, _join) = spawn(actor, RunnerConfig::default());
+
+        handle.send_high(10).await.unwrap();
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(state, 10);
+
+        handle.send_high(5).await.unwrap();
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(state, 15);
     }
 }

@@ -55,6 +55,12 @@ impl Ord for TrackScore {
     }
 }
 
+impl Default for AudioSelector {
+    fn default() -> Self {
+        Self::with_chromium_limit()
+    }
+}
+
 pub struct AudioSelector {
     n: usize, // Number of streams to select
     tracks: HashMap<Arc<TrackId>, TrackState>,
@@ -65,10 +71,14 @@ impl AudioSelector {
     /// Create a new AudioSelector with the specified number of streams (N)
     pub fn new(n: usize) -> Self {
         AudioSelector {
-            n: n.min(3), // Respect Chromium's limit of 3
+            n,
             tracks: HashMap::new(),
             top_n: BTreeSet::new(),
         }
+    }
+
+    pub fn with_chromium_limit() -> Self {
+        Self::new(3)
     }
 
     /// Add a new track to the selector

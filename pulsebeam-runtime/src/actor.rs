@@ -98,7 +98,7 @@ pub trait MessageSet: Sized + Send + 'static {
     /// The unique identifier for this actor.
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
     /// The observable state snapshot of an actor for testing and debugging.
-    type ObservableState: Debug + Send + Sync + Clone;
+    type ObservableState: Debug + Send + Clone;
 }
 
 pub trait Actor: MessageSet + Sized + Send + 'static {

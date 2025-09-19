@@ -168,30 +168,3 @@ impl TrackActor {
 }
 
 pub type TrackHandle = actor::ActorHandle<TrackActor>;
-
-#[cfg(test)]
-pub mod test {
-    use crate::entity::TrackId;
-
-    use super::*;
-    use pulsebeam_runtime::test_utils::FakeActorBuilder;
-    use str0m::media::{MediaKind, Mid};
-
-    #[derive(Debug, Clone, Default)]
-    pub struct FakeTrackState {
-        pub subscribers: Vec<Arc<ParticipantId>>,
-        pub keyframe_requests_received: u32,
-    }
-
-    pub fn new_fake_track(
-        participant_id: Arc<ParticipantId>,
-        kind: MediaKind,
-    ) -> FakeActorBuilder<TrackActor, FakeTrackState> {
-        let meta = Arc::new(TrackMeta {
-            id: Arc::new(TrackId::new(participant_id, Mid::new())),
-            kind,
-            simulcast_rids: None,
-        });
-        FakeActorBuilder::<TrackActor, FakeTrackState>::new(meta)
-    }
-}
