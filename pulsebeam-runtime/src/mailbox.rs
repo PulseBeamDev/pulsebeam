@@ -1,5 +1,3 @@
-use futures::channel::mpsc;
-use futures::{SinkExt, StreamExt};
 use std::error::Error;
 use std::fmt;
 
@@ -8,11 +6,9 @@ use std::fmt;
 /// This error is returned by the asynchronous `send` method. It contains
 /// the message that could not be sent.
 #[derive(Debug, PartialEq, Eq)]
-pub enum SendError {
-    Closed,
-}
+pub struct SendError<T>(pub T);
 
-impl fmt::Display for SendError {
+impl<T> fmt::Display for SendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "sending on a closed mailbox")
     }
@@ -40,7 +36,7 @@ impl<T: fmt::Debug> Error for TrySendError<T> {}
 
 /// A handle to send messages to an actor's mailbox.
 pub struct Sender<T> {
-    sender: mpsc::Sender<T>,
+    sender: flume::Sender<T>,
 }
 
 impl<T> Clone for Sender<T> {
@@ -55,11 +51,11 @@ impl<T> Sender<T> {
     /// Sends a message asynchronously, waiting if the mailbox is full.
     ///
     /// Returns a `SendError` only if the receiving actor has terminated.
-    pub async fn send(&mut self, message: T) -> Result<(), SendError> {
+    pub async fn send(&mut self, message: T) -> Result<(), SendError<T>> {
         self.sender
-            .send(message)
+            .send_async(message)
             .await
-            .map_err(|_e| SendError::Closed)
+            .map_err(|flume::SendError(e)| SendError(e))
     }
 
     /// Attempts to immediately send a message.
@@ -67,32 +63,28 @@ impl<T> Sender<T> {
     /// Returns a `TrySendError` if the mailbox is full or if the
     /// receiving actor has terminated.
     pub fn try_send(&mut self, message: T) -> Result<(), TrySendError<T>> {
-        self.sender.try_send(message).map_err(|e| {
-            if e.is_disconnected() {
-                TrySendError::Closed(e.into_inner())
-            } else {
-                tracing::info!("try_send dropped a packet due to full queue");
-                TrySendError::Full(e.into_inner())
-            }
+        self.sender.try_send(message).map_err(|e| match e {
+            flume::TrySendError::Full(e) => TrySendError::Full(e),
+            flume::TrySendError::Disconnected(e) => TrySendError::Closed(e),
         })
     }
 }
 
 /// An actor's mailbox for receiving messages.
 pub struct Receiver<T> {
-    receiver: mpsc::Receiver<T>,
+    receiver: flume::Receiver<T>,
 }
 
 impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
-        self.receiver.next().await
+        self.receiver.recv_async().await.ok()
     }
 }
 
 /// Creates a new mailbox and a corresponding sender handle.
 pub fn new<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
-    let (sender, receiver) = mpsc::channel(buffer);
+    let (sender, receiver) = flume::bounded(buffer);
     (Sender { sender }, Receiver { receiver })
 }
 
@@ -140,8 +132,7 @@ mod tests {
         assert!(result.is_err());
 
         // Check that the error is our custom SendError and we can get the message back
-        if let Err(mailbox::SendError::Closed) = result {
-        } else {
+        if result.is_ok() {
             panic!("Expected a SendError");
         }
     }

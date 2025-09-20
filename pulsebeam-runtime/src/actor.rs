@@ -191,7 +191,7 @@ impl<A: Actor> ActorHandle<A> {
     pub async fn send_high(
         &mut self,
         message: A::HighPriorityMsg,
-    ) -> Result<(), mailbox::SendError> {
+    ) -> Result<(), mailbox::SendError<A::HighPriorityMsg>> {
         self.hi_tx.send(message).await
     }
 
@@ -210,7 +210,10 @@ impl<A: Actor> ActorHandle<A> {
     ///
     /// Returns an error if the actor's mailbox is closed.
     #[inline]
-    pub async fn send_low(&mut self, message: A::LowPriorityMsg) -> Result<(), mailbox::SendError> {
+    pub async fn send_low(
+        &mut self,
+        message: A::LowPriorityMsg,
+    ) -> Result<(), mailbox::SendError<A::LowPriorityMsg>> {
         self.lo_tx.send(message).await
     }
 
