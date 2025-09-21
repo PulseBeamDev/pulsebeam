@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.89.0-alpine3.22 as builder
+FROM docker.io/library/rust:1.90.0-alpine3.22 as builder
 RUN apk add --no-cache musl-dev perl make protobuf-dev
 WORKDIR /app
 

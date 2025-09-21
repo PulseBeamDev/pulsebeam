@@ -1,7 +1,7 @@
 [toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
+channel = "1.90"
 profile = "minimal"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
 
 # https://internals.rust-lang.org/t/bundle-zig-cc-in-rustup-by-default/22096
 # In the future, Rust might just ship with zig by default!
