@@ -68,7 +68,7 @@ pub struct AudioAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
     top_n: BTreeSet<TrackScore>, // Use a BTreeSet to keep the top N tracks sorted
 
-    effects: Vec<effect::Effect>,
+    pub effects: Vec<effect::Effect>,
 }
 
 impl AudioAllocator {
@@ -105,7 +105,6 @@ impl AudioAllocator {
                 last_updated: now,
             },
         );
-        self.effects.push(effect::Effect::Subscribe(track_handle));
     }
 
     /// Remove a track

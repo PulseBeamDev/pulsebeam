@@ -1,15 +1,14 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
-use prost::{DecodeError, Message};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
-    channel::{ChannelData, ChannelId},
+    channel::ChannelId,
     error::SdpError,
     media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid},
     net::Transmit,
@@ -18,8 +17,8 @@ use tokio::time::Instant;
 
 use crate::{
     entity, gateway, message,
-    participant::{audio::AudioAllocator, video::VideoAllocator},
-    proto, room, system, track,
+    participant::{audio::AudioAllocator, core::ParticipantCore, effect, video::VideoAllocator},
+    room, system, track,
 };
 use pulsebeam_runtime::{actor, net};
 
@@ -31,8 +30,8 @@ pub enum ParticipantError {
     InvalidSdpFormat(#[from] SdpError),
     #[error("Offer rejected: {0}")]
     OfferRejected(#[from] RtcError),
-    #[error("Invalid RPC format: {0}")]
-    InvalidRpcFormat(#[from] DecodeError),
+    // #[error("Invalid RPC format: {0}")]
+    // InvalidRpcFormat(#[from] DecodeError),
 }
 
 #[derive(Debug, Clone)]
@@ -50,14 +49,11 @@ pub enum ParticipantDataMessage {
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
 
-#[derive(Clone)]
-struct TrackOut {
-    handle: track::TrackHandle,
-    mid: Option<Mid>,
-}
-
-struct MidSlot {
-    track_id: Option<Arc<entity::TrackId>>,
+pub struct ParticipantContext {
+    // Core dependencies
+    system_ctx: system::SystemContext,
+    room_handle: room::RoomHandle,
+    rtc: Rtc,
 }
 
 /// Manages WebRTC participant connections and media routing
@@ -69,39 +65,15 @@ struct MidSlot {
 /// - Audio filtering using AudioSelector (subscribes to all, forwards selectively)
 /// - Bandwidth control and congestion management
 pub struct ParticipantActor {
-    // Core dependencies
-    system_ctx: system::SystemContext,
-    room_handle: room::RoomHandle,
-    rtc: Rtc,
+    ctx: ParticipantContext,
 
     // Identity
     participant_id: Arc<entity::ParticipantId>,
     data_channel: Option<ChannelId>,
 
-    // Track management
-    published_tracks: PublishedTracks,
-    video_allocator: VideoAllocator,
-    audio_allocator: AudioAllocator,
+    core: ParticipantCore,
     track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
-}
-
-#[derive(Default)]
-struct PublishedTracks {
-    video: HashMap<Mid, track::TrackHandle>,
-    audio: HashMap<Mid, track::TrackHandle>,
-}
-
-#[derive(Default)]
-struct AvailableTracks {
-    video: HashMap<Arc<entity::EntityId>, TrackOut>,
-    // Audio tracks are always subscribed to, so we track them separately
-    audio: HashMap<Arc<entity::EntityId>, TrackOut>,
-}
-
-#[derive(Default)]
-struct SubscribedSlots {
-    video: HashMap<Mid, MidSlot>,
-    audio: HashMap<Mid, MidSlot>,
+    effects: VecDeque<effect::Effect>,
 }
 
 impl ParticipantActor {
@@ -111,15 +83,21 @@ impl ParticipantActor {
         participant_id: Arc<entity::ParticipantId>,
         rtc: Rtc,
     ) -> Self {
-        Self {
+        let ctx = ParticipantContext {
             system_ctx,
             room_handle,
-            participant_id,
             rtc,
+        };
+
+        let core = ParticipantCore::new();
+        let effects = VecDeque::with_capacity(16);
+
+        Self {
+            ctx,
+            core,
+            effects,
+            participant_id,
             data_channel: None,
-            published_tracks: PublishedTracks::default(),
-            video_allocator: VideoAllocator::default(),
-            audio_allocator: AudioAllocator::with_chromium_limit(),
             track_tasks: FuturesUnordered::new(),
         }
     }
@@ -155,12 +133,20 @@ impl ParticipantActor {
                 }
             }
         }
+
+        let effects: Vec<effect::Effect> = self
+            .state
+            .video_allocator
+            .effects
+            .drain(..)
+            .chain(self.state.audio_allocator.effects.drain(..))
+            .collect();
+
         None
     }
 
-    async fn resync_with_client(&mut self, ctx: &mut actor::ActorContext<Self>) {
-        // TODO: Send pending state changes to client via data channel
-        self.auto_subscribe_tracks(ctx).await;
+    async fn apply_effects(&mut self, effects: &[effect::Effect]) {
+        for e in &effects {}
     }
 
     fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {
@@ -179,9 +165,7 @@ impl ParticipantActor {
         tracks: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
     ) {
         for track_handle in tracks.values() {
-            let track_meta = &track_handle.meta;
-
-            if track_meta.id.origin_participant == self.participant_id {
+            if track_handle.meta.id.origin_participant == self.participant_id {
                 // Our own track - add to published
                 self.add_published_track(track_handle);
             } else {
@@ -204,78 +188,28 @@ impl ParticipantActor {
     }
 
     fn add_available_track(&mut self, track_handle: &track::TrackHandle) {
-        let track_meta = &track_handle.meta;
-        let track_out = TrackOut {
-            handle: track_handle.clone(),
-            mid: None,
-        };
-
-        let (tracks, kind) = match track_meta.kind {
-            MediaKind::Video => (
-                &mut self.available_tracks.video,
-                proto::sfu::TrackKind::Video,
-            ),
-            MediaKind::Audio => {
-                // Add to audio selector immediately for filtering
-                self.audio_selector.add_track(track_meta.id.clone());
-                (
-                    &mut self.available_tracks.audio,
-                    proto::sfu::TrackKind::Audio,
-                )
+        match track_handle.meta.kind {
+            MediaKind::Video => {
+                self.state
+                    .video_allocator
+                    .add_track(track_handle.clone(), &mut self.effects);
             }
-        };
-
-        tracks.insert(track_meta.id.internal.clone(), track_out);
-
-        // Queue for client notification
-        self.sync_state
-            .pending_published
-            .push(proto::sfu::TrackInfo {
-                track_id: track_meta.id.to_string(),
-                kind: kind as i32,
-                participant_id: track_meta.id.origin_participant.to_string(),
-            });
-
-        tracing::info!("Available track: {}", track_meta.id);
+            MediaKind::Audio => {
+                todo!();
+            }
+        }
     }
 
     fn remove_available_tracks(
         &mut self,
         track_ids: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
     ) {
-        for track_id in track_ids.keys() {
-            let track_out = self
-                .available_tracks
-                .video
-                .remove(&track_id.internal)
-                .or_else(|| self.available_tracks.audio.remove(&track_id.internal));
-
-            if let Some(track_out) = track_out {
-                // Remove from audio selector if it was an audio track
-                if track_out.handle.meta.kind == MediaKind::Audio {
-                    self.audio_selector.remove_track(track_id);
+        for (track_id, track_handle) in track_ids.into_iter() {
+            match track_handle.meta.kind {
+                MediaKind::Video => {
+                    self.video_allocator.remove_track(track_id);
                 }
-
-                if let Some(mid) = track_out.mid {
-                    // Clear the slot
-                    match track_out.handle.meta.kind {
-                        MediaKind::Video => {
-                            if let Some(slot) = self.subscribed_slots.video.get_mut(&mid) {
-                                slot.track_id = None;
-                            }
-                        }
-                        MediaKind::Audio => {
-                            if let Some(slot) = self.subscribed_slots.audio.get_mut(&mid) {
-                                slot.track_id = None;
-                            }
-                        }
-                    }
-                }
-
-                self.sync_state
-                    .pending_unpublished
-                    .push(track_id.to_string());
-                tracing::info!("Removed track: {}", track_id);
+                MediaKind::Audio => todo!(),
             }
         }
     }
@@ -320,9 +254,10 @@ impl ParticipantActor {
                     return;
                 }
 
-                if let Err(e) = self.handle_rpc(data).await {
-                    tracing::warn!("RPC error: {}", e);
-                }
+                // TODO: handle PulseBeam signaling
+                // if let Err(e) = self.handle_rpc(data).await {
+                //     tracing::warn!("RPC error: {}", e);
+                // }
             }
             Event::ChannelClose(id) => {
                 if Some(id) == self.data_channel {
@@ -357,7 +292,6 @@ impl ParticipantActor {
                 self.rtc.disconnect();
             }
         }
-        self.sync_state.needs_resync = true;
     }
 
     async fn handle_incoming_media(
@@ -391,13 +325,12 @@ impl ParticipantActor {
     }
 
     fn allocate_outgoing_slot(&mut self, media: MediaAdded) {
-        let slots = match media.kind {
-            MediaKind::Video => &mut self.subscribed_slots.video,
-            MediaKind::Audio => &mut self.subscribed_slots.audio,
-        };
-
-        slots.insert(media.mid, MidSlot { track_id: None });
-        tracing::info!("Allocated outgoing slot: {:?}", media.mid);
+        match media.kind {
+            MediaKind::Video => self.video_allocator.add_slot(media.mid),
+            MediaKind::Audio => {
+                todo!()
+            }
+        }
     }
 
     async fn handle_media_data(&mut self, data: MediaData) {
@@ -430,34 +363,18 @@ impl ParticipantActor {
     }
 
     fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
-        let slot = self.subscribed_slots.video.get(&req.mid);
-        let Some(MidSlot {
-            track_id: Some(track_id),
-            ..
-        }) = slot
-        else {
+        let Some(track_handle) = self.video_allocator.get_track_mut(&req.mid) else {
             return;
         };
-
-        let Some(track_out) = self.available_tracks.video.get_mut(&track_id.internal) else {
-            return;
-        };
-
-        let _ = track_out
-            .handle
-            .try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
+        let _ = track_handle.try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
     fn handle_forward_media(&mut self, track_meta: Arc<message::TrackMeta>, data: Arc<MediaData>) {
-        let Some(track_out) = self.available_tracks.video.get(&track_meta.id.internal) else {
+        let Some(mid) = self.video_allocator.get_slot(&track_meta.id) else {
             return;
         };
 
-        let Some(mid) = track_out.mid else {
-            return;
-        };
-
-        let Some(writer) = self.rtc.writer(mid) else {
+        let Some(writer) = self.rtc.writer(*mid) else {
             return;
         };
 
@@ -480,26 +397,6 @@ impl ParticipantActor {
         if let Err(e) = writer.request_keyframe(req.rid, req.kind) {
             tracing::warn!("Failed to request keyframe: {}", e);
         }
-    }
-
-    async fn handle_rpc(&mut self, data: ChannelData) -> Result<(), ParticipantError> {
-        let msg = proto::sfu::ClientMessage::decode(data.data.as_slice())?;
-        let Some(payload) = msg.payload else {
-            return Ok(());
-        };
-
-        match payload {
-            proto::sfu::client_message::Payload::Subscribe(req) => {
-                let _mid = Mid::from(req.mid.as_str());
-                // TODO: Implement subscription logic
-            }
-            proto::sfu::client_message::Payload::Unsubscribe(req) => {
-                let _mid = Mid::from(req.mid.as_str());
-                // TODO: Implement unsubscription logic
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -543,8 +440,6 @@ impl actor::Actor for ParticipantActor {
         ctx: &mut actor::ActorContext<Self>,
         msg: Self::HighPriorityMsg,
     ) {
-        self.sync_state.needs_resync = true;
-
         match msg {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
                 self.handle_published_tracks(ctx, &tracks);
