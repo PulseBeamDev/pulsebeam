@@ -1,5 +1,7 @@
-use crate::entity::TrackId;
-use crate::participant::effect;
+use str0m::media::Mid;
+
+use crate::entity::{self, TrackId};
+use crate::participant::effect::{self, Effect};
 use crate::track;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -21,6 +23,7 @@ pub struct AudioTrackData {
 struct TrackState {
     score: TrackScore,
     last_updated: Instant,
+    handle: track::TrackHandle,
 }
 
 /// Scoring struct for top N tracks
@@ -59,50 +62,34 @@ impl Ord for TrackScore {
 
 impl Default for AudioAllocator {
     fn default() -> Self {
-        Self::with_chromium_limit()
+        Self::new()
     }
 }
 
+struct Slot {
+    mid: Mid,
+    track_id: Option<Arc<entity::TrackId>>,
+    hit_count: u64,
+}
+
 pub struct AudioAllocator {
-    n: usize, // Number of streams to select
+    slots: Vec<Slot>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
     top_n: BTreeSet<TrackScore>, // Use a BTreeSet to keep the top N tracks sorted
-
-    pub effects: Vec<effect::Effect>,
 }
 
 impl AudioAllocator {
     /// Create a new AudioSelector with the specified number of streams (N)
-    pub fn new(n: usize) -> Self {
+    pub fn new() -> Self {
         AudioAllocator {
-            n,
+            slots: Vec::new(),
             tracks: HashMap::new(),
             top_n: BTreeSet::new(),
-            effects: Vec::with_capacity(16),
         }
     }
 
-    pub fn with_chromium_limit() -> Self {
-        Self::new(3)
-    }
-
-    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
-        let Some(slot) = self.slots.get(mid) else {
-            return None;
-        };
-        let Some(track_id) = &slot.track_id else {
-            return None;
-        };
-
-        let Some(track) = self.tracks.get_mut(track_id) else {
-            return None;
-        };
-
-        Some(&mut track.handle)
-    }
-
     /// Add a new track to the selector
-    pub fn add_track(&mut self, track_handle: Arc<track::TrackHandle>) {
+    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackHandle) {
         assert!(track_handle.meta.kind.is_audio());
 
         let track_id = track_handle.meta.id.clone();
@@ -118,8 +105,10 @@ impl AudioAllocator {
             TrackState {
                 score,
                 last_updated: now,
+                handle: track_handle.clone(),
             },
         );
+        effects.push_back(Effect::Subscribe(track_handle));
     }
 
     /// Remove a track
@@ -128,6 +117,15 @@ impl AudioAllocator {
             self.top_n.remove(&state.score);
             self.rebuild_top_n();
         }
+    }
+
+    pub fn add_slot(&mut self, mid: Mid) {
+        self.slots.push(Slot {
+            track_id: None,
+            mid,
+            hit_count: 0,
+        });
+        tracing::info!("added audio slot: {}", mid);
     }
 
     /// Check if an AudioTrackData packet should be forwarded
@@ -148,7 +146,7 @@ impl AudioAllocator {
             if self.top_n.contains(&old_score) {
                 self.top_n.remove(&old_score);
                 self.top_n.insert(new_score);
-            } else if self.top_n.len() < self.n {
+            } else if self.top_n.len() < self.slots.len() {
                 self.top_n.insert(new_score);
             } else if let Some(min_score) = self.top_n.iter().next()
                 && new_score > *min_score
@@ -174,7 +172,7 @@ impl AudioAllocator {
             .map(|state| state.score.clone())
             .collect();
         all_scores.sort_unstable();
-        for score in all_scores.into_iter().take(self.n) {
+        for score in all_scores.into_iter().take(self.slots.len()) {
             self.top_n.insert(score);
         }
     }

@@ -66,6 +66,11 @@ impl ParticipantContext {
         effects: &mut effect::Queue,
         self_handle: &ParticipantHandle,
     ) {
+        if effects.is_empty() {
+            return;
+        }
+
+        tracing::debug!("applying effects: {:?}", effects);
         for e in effects.drain(..) {
             match e {
                 Effect::Subscribe(mut track_handle) => {
@@ -91,6 +96,7 @@ impl ParticipantContext {
                     {
                         tracing::error!("Failed to publish track: {}", e);
                     }
+                    tracing::info!("published track: {}", track_meta.id);
                 }
                 Effect::Disconnect => {
                     self.rtc.disconnect();
@@ -135,10 +141,12 @@ impl actor::Actor for ParticipantActor {
     async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx,
             pre_select: {
-                let timeout = match self.poll(ctx).await {
+                let timeout = match self.poll().await {
                     Some(delay) => delay,
                     None => return Ok(()), // RTC disconnected
                 };
+
+                self.ctx.apply_effects(&mut self.effects, &ctx.handle).await;
             },
             select: {
                 _ = tokio::time::sleep(timeout) => {
@@ -238,7 +246,7 @@ impl ParticipantActor {
     }
 
     /// Main event loop with proper timeout handling
-    async fn poll(&mut self, ctx: &mut actor::ActorContext<Self>) -> Option<Duration> {
+    async fn poll(&mut self) -> Option<Duration> {
         while self.ctx.rtc.is_alive() {
             match self.ctx.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
@@ -268,8 +276,6 @@ impl ParticipantActor {
                 }
             }
         }
-
-        self.ctx.apply_effects(&mut self.effects, &ctx.handle).await;
 
         None
     }
@@ -348,7 +354,7 @@ impl ParticipantActor {
             });
         }
 
-        let Some(track) = self.core.get_track_mut(&data.mid) else {
+        let Some(track) = self.core.get_published_track_mut(&data.mid) else {
             return;
         };
 

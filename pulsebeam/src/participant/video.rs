@@ -18,8 +18,6 @@ struct Slot {
 pub struct VideoAllocator {
     tracks: HashMap<Arc<entity::TrackId>, TrackOut>,
     slots: HashMap<Mid, Slot>,
-
-    pub effects: Vec<effect::Effect>,
 }
 
 impl VideoAllocator {
@@ -43,14 +41,12 @@ impl VideoAllocator {
         effects: &mut effect::Queue,
         track_id: &entity::TrackId,
     ) -> Option<track::TrackHandle> {
-        let Some(mut track) = self.tracks.remove(track_id) else {
-            return None;
-        };
+        let mut track = self.tracks.remove(track_id)?;
 
-        if let Some(mid) = track.mid.take() {
-            if let Some(slot) = self.slots.get_mut(&mid) {
-                slot.track_id = None;
-            }
+        if let Some(mid) = track.mid.take()
+            && let Some(slot) = self.slots.get_mut(&mid)
+        {
+            slot.track_id = None;
         }
 
         tracing::info!("removed video track: {}", track.handle.meta.id);
@@ -64,36 +60,19 @@ impl VideoAllocator {
         self.auto_subscribe(effects);
     }
 
-    pub fn remove_slot(&mut self, effects: &mut effect::Queue, mid: &Mid) {
-        self.slots.remove(mid);
-        tracing::info!("removed video slot: {}", mid);
-        self.auto_subscribe(effects);
-    }
-
     pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
-        let Some(slot) = self.slots.get(mid) else {
-            return None;
-        };
-        let Some(track_id) = &slot.track_id else {
-            return None;
-        };
-
-        let Some(track) = self.tracks.get_mut(track_id) else {
-            return None;
-        };
+        let slot = self.slots.get(mid)?;
+        let track_id = slot.track_id.as_ref()?;
+        let track = self.tracks.get_mut(track_id)?;
 
         Some(&mut track.handle)
     }
 
     pub fn get_slot(&mut self, track_id: &Arc<entity::TrackId>) -> Option<&Mid> {
-        let Some(track) = self.tracks.get(track_id) else {
-            return None;
-        };
-        let Some(mid) = &track.mid else {
-            return None;
-        };
+        let track = self.tracks.get(track_id)?;
+        let mid = track.mid.as_ref()?;
 
-        Some(&mid)
+        Some(mid)
     }
 
     pub fn subscribe(&mut self, _track_id: &Arc<entity::TrackId>, _mid: &Mid) {

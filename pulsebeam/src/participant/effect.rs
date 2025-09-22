@@ -4,6 +4,7 @@ use crate::{message::TrackMeta, track};
 
 pub type Queue = VecDeque<Effect>;
 
+#[derive(Debug)]
 pub enum Effect {
     Subscribe(track::TrackHandle),
     SpawnTrack(Arc<TrackMeta>),

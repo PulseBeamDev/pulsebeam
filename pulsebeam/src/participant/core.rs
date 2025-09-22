@@ -22,12 +22,12 @@ impl ParticipantCore {
             participant_id,
             published_tracks: HashMap::new(),
             video_allocator: VideoAllocator::default(),
-            audio_allocator: AudioAllocator::with_chromium_limit(),
+            audio_allocator: AudioAllocator::default(),
         }
     }
 
-    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
-        self.video_allocator.get_track_mut(&mid).or_else(|| todo!())
+    pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
+        self.published_tracks.get_mut(mid)
     }
 
     pub fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {
@@ -59,7 +59,6 @@ impl ParticipantCore {
         let track_meta = &track_handle.meta;
         self.published_tracks
             .insert(track_meta.id.origin_mid, track_handle.clone());
-        tracing::info!("Published track: {}", track_meta.id);
     }
 
     fn add_available_track(
@@ -73,7 +72,8 @@ impl ParticipantCore {
                     .add_track(effects, track_handle.clone());
             }
             MediaKind::Audio => {
-                todo!();
+                self.audio_allocator
+                    .add_track(effects, track_handle.clone());
             }
         }
     }
@@ -83,12 +83,14 @@ impl ParticipantCore {
         effects: &mut effect::Queue,
         track_ids: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
     ) {
-        for (track_id, track_handle) in track_ids.into_iter() {
+        for (track_id, track_handle) in track_ids.iter() {
             match track_handle.meta.kind {
                 MediaKind::Video => {
                     self.video_allocator.remove_track(effects, track_id);
                 }
-                MediaKind::Audio => todo!(),
+                MediaKind::Audio => {
+                    self.audio_allocator.remove_track(track_id);
+                }
             }
         }
     }
@@ -118,16 +120,14 @@ impl ParticipantCore {
             simulcast_rids: media.simulcast.map(|s| s.recv),
         });
 
-        tracing::info!("Published new track: {:?}", track_meta);
+        tracing::info!("published new track: {:?}", track_meta);
         effects.push_back(Effect::SpawnTrack(track_meta));
     }
 
     fn allocate_outgoing_slot(&mut self, effects: &mut effect::Queue, media: MediaAdded) {
         match media.kind {
             MediaKind::Video => self.video_allocator.add_slot(effects, media.mid),
-            MediaKind::Audio => {
-                todo!()
-            }
+            MediaKind::Audio => self.audio_allocator.add_slot(media.mid),
         }
     }
 }
