@@ -17,7 +17,12 @@ use tokio::time::Instant;
 
 use crate::{
     entity, gateway, message,
-    participant::{audio::AudioAllocator, core::ParticipantCore, effect, video::VideoAllocator},
+    participant::{
+        audio::AudioAllocator,
+        core::ParticipantCore,
+        effect::{self, Effect},
+        video::VideoAllocator,
+    },
     room, system, track,
 };
 use pulsebeam_runtime::{actor, net};
@@ -54,6 +59,47 @@ pub struct ParticipantContext {
     system_ctx: system::SystemContext,
     room_handle: room::RoomHandle,
     rtc: Rtc,
+    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
+}
+
+impl ParticipantContext {
+    async fn apply_effects(
+        &mut self,
+        effects: &mut effect::Queue,
+        self_handle: &ParticipantHandle,
+    ) {
+        for e in effects.drain(..) {
+            match e {
+                Effect::Subscribe(mut track_handle) => {
+                    if let Err(err) = track_handle
+                        .send_high(track::TrackControlMessage::Subscribe(self_handle.clone()))
+                        .await
+                    {}
+                }
+                Effect::SpawnTrack(track_meta) => {
+                    let track_actor =
+                        track::TrackActor::new(self_handle.clone(), track_meta.clone());
+                    let (track_handle, join_handle) = actor::spawn(
+                        track_actor,
+                        actor::RunnerConfig::default().with_lo(1024).with_hi(1024),
+                    );
+
+                    self.track_tasks.push(join_handle);
+
+                    if let Err(e) = self
+                        .room_handle
+                        .send_high(room::RoomMessage::PublishTrack(track_handle))
+                        .await
+                    {
+                        tracing::error!("Failed to publish track: {}", e);
+                    }
+                }
+                Effect::Disconnect => {
+                    self.rtc.disconnect();
+                }
+            }
+        }
+    }
 }
 
 /// Manages WebRTC participant connections and media routing
@@ -68,12 +114,104 @@ pub struct ParticipantActor {
     ctx: ParticipantContext,
 
     // Identity
-    participant_id: Arc<entity::ParticipantId>,
     data_channel: Option<ChannelId>,
 
     core: ParticipantCore,
-    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
     effects: VecDeque<effect::Effect>,
+}
+
+impl actor::MessageSet for ParticipantActor {
+    type HighPriorityMsg = ParticipantControlMessage;
+    type LowPriorityMsg = ParticipantDataMessage;
+    type Meta = Arc<entity::ParticipantId>;
+    type ObservableState = ();
+}
+
+impl actor::Actor for ParticipantActor {
+    fn meta(&self) -> Self::Meta {
+        self.core.participant_id.clone()
+    }
+
+    fn get_observable_state(&self) -> Self::ObservableState {}
+
+    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+        pulsebeam_runtime::actor_loop!(self, ctx,
+            pre_select: {
+                let timeout = match self.poll(ctx).await {
+                    Some(delay) => delay,
+                    None => return Ok(()), // RTC disconnected
+                };
+            },
+            select: {
+                _ = tokio::time::sleep(timeout) => {
+                    // Timer expired, poll again
+                }
+                Some((track_meta, _)) = self.track_tasks.next() => {
+                    self.core.handle_track_finished(track_meta);
+                }
+            }
+        );
+
+        Ok(())
+    }
+
+    async fn on_high_priority(
+        &mut self,
+        _ctx: &mut actor::ActorContext<Self>,
+        msg: Self::HighPriorityMsg,
+    ) {
+        match msg {
+            ParticipantControlMessage::TracksSnapshot(tracks) => {
+                self.core
+                    .handle_published_tracks(&mut self.effects, &tracks);
+            }
+            ParticipantControlMessage::TracksPublished(tracks) => {
+                self.core
+                    .handle_published_tracks(&mut self.effects, &tracks);
+            }
+            ParticipantControlMessage::TracksUnpublished(tracks) => {
+                self.core
+                    .remove_available_tracks(&mut self.effects, &tracks);
+            }
+            ParticipantControlMessage::TrackPublishRejected(_) => {
+                // TODO: Notify client of rejection
+            }
+        }
+    }
+
+    async fn on_low_priority(
+        &mut self,
+        _ctx: &mut actor::ActorContext<Self>,
+        msg: Self::LowPriorityMsg,
+    ) {
+        match msg {
+            ParticipantDataMessage::UdpPacket(packet) => {
+                let input = Input::Receive(
+                    Instant::now().into_std(),
+                    str0m::net::Receive {
+                        proto: str0m::net::Protocol::Udp,
+                        source: packet.src,
+                        destination: packet.dst,
+                        contents: (&*packet.buf).try_into().unwrap(),
+                    },
+                );
+
+                if let Err(e) = self.ctx.rtc.handle_input(input) {
+                    tracing::warn!("Dropped UDP packet: {}", e);
+                }
+            }
+            ParticipantDataMessage::ForwardMedia(track_meta, data) => {
+                self.handle_forward_media(track_meta, data);
+            }
+            ParticipantDataMessage::KeyframeRequest(track_id, req) => {
+                self.request_keyframe_internal(KeyframeRequest {
+                    mid: track_id.origin_mid,
+                    kind: req.kind,
+                    rid: req.rid,
+                });
+            }
+        }
+    }
 }
 
 impl ParticipantActor {
@@ -89,14 +227,13 @@ impl ParticipantActor {
             rtc,
         };
 
-        let core = ParticipantCore::new();
+        let core = ParticipantCore::new(participant_id);
         let effects = VecDeque::with_capacity(16);
 
         Self {
             ctx,
             core,
             effects,
-            participant_id,
             data_channel: None,
             track_tasks: FuturesUnordered::new(),
         }
@@ -104,15 +241,15 @@ impl ParticipantActor {
 
     /// Main event loop with proper timeout handling
     async fn poll(&mut self, ctx: &mut actor::ActorContext<Self>) -> Option<Duration> {
-        while self.rtc.is_alive() {
-            match self.rtc.poll_output() {
+        while self.ctx.rtc.is_alive() {
+            match self.ctx.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
                     let now = Instant::now().into_std();
                     let duration = deadline.saturating_duration_since(now);
 
                     if duration.is_zero() {
                         // Handle timeout immediately
-                        if let Err(e) = self.rtc.handle_input(Input::Timeout(now)) {
+                        if let Err(e) = self.ctx.rtc.handle_input(Input::Timeout(now)) {
                             tracing::error!("Failed to handle timeout: {}", e);
                             break;
                         }
@@ -134,84 +271,9 @@ impl ParticipantActor {
             }
         }
 
-        let effects: Vec<effect::Effect> = self
-            .state
-            .video_allocator
-            .effects
-            .drain(..)
-            .chain(self.state.audio_allocator.effects.drain(..))
-            .collect();
+        self.ctx.apply_effects(&mut self.effects, ctx);
 
         None
-    }
-
-    async fn apply_effects(&mut self, effects: &[effect::Effect]) {
-        for e in &effects {}
-    }
-
-    fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {
-        let tracks = match track_meta.kind {
-            MediaKind::Video => &mut self.published_tracks.video,
-            MediaKind::Audio => &mut self.published_tracks.audio,
-        };
-
-        tracks.remove(&track_meta.id.origin_mid);
-        tracing::info!("Track finished: {}", track_meta.id);
-    }
-
-    fn handle_published_tracks(
-        &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        tracks: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
-    ) {
-        for track_handle in tracks.values() {
-            if track_handle.meta.id.origin_participant == self.participant_id {
-                // Our own track - add to published
-                self.add_published_track(track_handle);
-            } else {
-                // Track from another participant - add to available
-                self.add_available_track(track_handle);
-            }
-        }
-    }
-
-    fn add_published_track(&mut self, track_handle: &track::TrackHandle) {
-        let track_meta = &track_handle.meta;
-
-        let tracks = match track_meta.kind {
-            MediaKind::Video => &mut self.published_tracks.video,
-            MediaKind::Audio => &mut self.published_tracks.audio,
-        };
-
-        tracks.insert(track_meta.id.origin_mid, track_handle.clone());
-        tracing::info!("Published track: {}", track_meta.id);
-    }
-
-    fn add_available_track(&mut self, track_handle: &track::TrackHandle) {
-        match track_handle.meta.kind {
-            MediaKind::Video => {
-                self.state
-                    .video_allocator
-                    .add_track(track_handle.clone(), &mut self.effects);
-            }
-            MediaKind::Audio => {
-                todo!();
-            }
-        }
-    }
-
-    fn remove_available_tracks(
-        &mut self,
-        track_ids: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
-    ) {
-        for (track_id, track_handle) in track_ids.into_iter() {
-            match track_handle.meta.kind {
-                MediaKind::Video => {
-                    self.video_allocator.remove_track(track_id);
-                }
-                MediaKind::Audio => todo!(),
-            }
-        }
     }
 
     async fn handle_transmit(&mut self, transmit: Transmit) {
@@ -233,11 +295,11 @@ impl ParticipantActor {
     async fn handle_event(&mut self, ctx: &mut actor::ActorContext<Self>, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) => match state {
-                str0m::IceConnectionState::Disconnected => self.rtc.disconnect(),
+                str0m::IceConnectionState::Disconnected => self.ctx.rtc.disconnect(),
                 _ => tracing::trace!("ICE state: {:?}", state),
             },
             Event::MediaAdded(media) => {
-                self.handle_media_added(ctx, media).await;
+                self.core.handle_media_added(&mut self.effects, media);
             }
             Event::ChannelOpen(id, label) => {
                 if label == DATA_CHANNEL_LABEL {
@@ -261,7 +323,7 @@ impl ParticipantActor {
             }
             Event::ChannelClose(id) => {
                 if Some(id) == self.data_channel {
-                    self.rtc.disconnect();
+                    self.ctx.rtc.disconnect();
                 }
             }
             Event::MediaData(data) => {
@@ -271,65 +333,9 @@ impl ParticipantActor {
                 self.handle_keyframe_request(req);
             }
             Event::Connected => {
-                tracing::info!("Participant connected: {}", self.participant_id);
+                tracing::info!("connected");
             }
             _ => tracing::trace!("Unhandled event: {:?}", event),
-        }
-    }
-
-    async fn handle_media_added(&mut self, ctx: &mut actor::ActorContext<Self>, media: MediaAdded) {
-        match media.direction {
-            Direction::RecvOnly => {
-                // Client publishing to us
-                self.handle_incoming_media(ctx, media).await;
-            }
-            Direction::SendOnly => {
-                // We're sending to client
-                self.allocate_outgoing_slot(media);
-            }
-            dir => {
-                tracing::warn!("Unsupported direction {:?}, disconnecting", dir);
-                self.rtc.disconnect();
-            }
-        }
-    }
-
-    async fn handle_incoming_media(
-        &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-        media: MediaAdded,
-    ) {
-        let track_id = Arc::new(entity::TrackId::new(self.participant_id.clone(), media.mid));
-        let track_meta = Arc::new(message::TrackMeta {
-            id: track_id,
-            kind: media.kind,
-            simulcast_rids: media.simulcast.map(|s| s.recv),
-        });
-
-        let track_actor = track::TrackActor::new(ctx.handle.clone(), track_meta.clone());
-        let (track_handle, join_handle) = actor::spawn(
-            track_actor,
-            actor::RunnerConfig::default().with_lo(1024).with_hi(1024),
-        );
-
-        self.track_tasks.push(join_handle);
-
-        if let Err(e) = self
-            .room_handle
-            .send_high(room::RoomMessage::PublishTrack(track_handle))
-            .await
-        {
-            tracing::error!("Failed to publish track: {}", e);
-        }
-        tracing::info!("Published new track: {:?}", track_meta);
-    }
-
-    fn allocate_outgoing_slot(&mut self, media: MediaAdded) {
-        match media.kind {
-            MediaKind::Video => self.video_allocator.add_slot(media.mid),
-            MediaKind::Audio => {
-                todo!()
-            }
         }
     }
 
@@ -389,104 +395,13 @@ impl ParticipantActor {
     }
 
     fn request_keyframe_internal(&mut self, req: KeyframeRequest) {
-        let Some(mut writer) = self.rtc.writer(req.mid) else {
+        let Some(mut writer) = self.ctx.rtc.writer(req.mid) else {
             tracing::warn!("No writer for mid {:?}", req.mid);
             return;
         };
 
         if let Err(e) = writer.request_keyframe(req.rid, req.kind) {
             tracing::warn!("Failed to request keyframe: {}", e);
-        }
-    }
-}
-
-impl actor::MessageSet for ParticipantActor {
-    type HighPriorityMsg = ParticipantControlMessage;
-    type LowPriorityMsg = ParticipantDataMessage;
-    type Meta = Arc<entity::ParticipantId>;
-    type ObservableState = ();
-}
-
-impl actor::Actor for ParticipantActor {
-    fn meta(&self) -> Self::Meta {
-        self.participant_id.clone()
-    }
-
-    fn get_observable_state(&self) -> Self::ObservableState {}
-
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx,
-            pre_select: {
-                let timeout = match self.poll(ctx).await {
-                    Some(delay) => delay,
-                    None => return Ok(()), // RTC disconnected
-                };
-            },
-            select: {
-                _ = tokio::time::sleep(timeout) => {
-                    // Timer expired, poll again
-                }
-                Some((track_meta, _)) = self.track_tasks.next() => {
-                    self.handle_track_finished(track_meta);
-                }
-            }
-        );
-
-        Ok(())
-    }
-
-    async fn on_high_priority(
-        &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
-    ) {
-        match msg {
-            ParticipantControlMessage::TracksSnapshot(tracks) => {
-                self.handle_published_tracks(ctx, &tracks);
-            }
-            ParticipantControlMessage::TracksPublished(tracks) => {
-                self.handle_published_tracks(ctx, &tracks);
-            }
-            ParticipantControlMessage::TracksUnpublished(tracks) => {
-                self.remove_available_tracks(&tracks);
-            }
-            ParticipantControlMessage::TrackPublishRejected(_) => {
-                // TODO: Notify client of rejection
-            }
-        }
-    }
-
-    async fn on_low_priority(
-        &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::LowPriorityMsg,
-    ) {
-        match msg {
-            ParticipantDataMessage::UdpPacket(packet) => {
-                let input = Input::Receive(
-                    Instant::now().into_std(),
-                    str0m::net::Receive {
-                        proto: str0m::net::Protocol::Udp,
-                        source: packet.src,
-                        destination: packet.dst,
-                        contents: (&*packet.buf).try_into().unwrap(),
-                    },
-                );
-
-                if let Err(e) = self.rtc.handle_input(input) {
-                    tracing::warn!("Dropped UDP packet: {}", e);
-                }
-            }
-            ParticipantDataMessage::ForwardMedia(track_meta, data) => {
-                self.handle_forward_media(track_meta, data);
-            }
-            ParticipantDataMessage::KeyframeRequest(track_id, req) => {
-                self.request_keyframe_internal(KeyframeRequest {
-                    mid: track_id.origin_mid,
-                    kind: req.kind,
-                    rid: req.rid,
-                });
-            }
         }
     }
 }

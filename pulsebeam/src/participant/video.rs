@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use str0m::media::Mid;
 
@@ -26,11 +23,7 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
-    pub fn add_track(
-        &mut self,
-        track_handle: track::TrackHandle,
-        effects: &mut VecDeque<effect::Effect>,
-    ) {
+    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackHandle) {
         assert!(track_handle.meta.kind.is_video());
 
         tracing::info!("added video track: {}", track_handle.meta.id);
@@ -42,10 +35,14 @@ impl VideoAllocator {
             },
         );
 
-        self.auto_subscribe();
+        self.auto_subscribe(effects);
     }
 
-    pub fn remove_track(&mut self, track_id: &entity::TrackId) -> Option<track::TrackHandle> {
+    pub fn remove_track(
+        &mut self,
+        effects: &mut effect::Queue,
+        track_id: &entity::TrackId,
+    ) -> Option<track::TrackHandle> {
         let Some(mut track) = self.tracks.remove(track_id) else {
             return None;
         };
@@ -57,20 +54,20 @@ impl VideoAllocator {
         }
 
         tracing::info!("removed video track: {}", track.handle.meta.id);
-        self.auto_subscribe();
+        self.auto_subscribe(effects);
         Some(track.handle)
     }
 
-    pub fn add_slot(&mut self, mid: Mid) {
+    pub fn add_slot(&mut self, effects: &mut effect::Queue, mid: Mid) {
         self.slots.insert(mid, Slot { track_id: None });
         tracing::info!("added video slot: {}", mid);
-        self.auto_subscribe();
+        self.auto_subscribe(effects);
     }
 
-    pub fn remove_slot(&mut self, mid: &Mid) {
+    pub fn remove_slot(&mut self, effects: &mut effect::Queue, mid: &Mid) {
         self.slots.remove(mid);
         tracing::info!("removed video slot: {}", mid);
-        self.auto_subscribe();
+        self.auto_subscribe(effects);
     }
 
     pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
@@ -104,7 +101,7 @@ impl VideoAllocator {
     }
 
     /// Automatically subscribe available tracks to open slots
-    pub fn auto_subscribe(&mut self) {
+    pub fn auto_subscribe(&mut self, effects: &mut effect::Queue) {
         let mut available_tracks = self.tracks.iter_mut();
         for (slot_id, slot) in self.slots.iter_mut() {
             if slot.track_id.is_some() {
@@ -116,8 +113,7 @@ impl VideoAllocator {
                     continue;
                 }
 
-                self.effects
-                    .push(effect::Effect::Subscribe(track.handle.clone()));
+                effects.push_back(effect::Effect::Subscribe(track.handle.clone()));
                 track.mid.replace(*slot_id);
                 let meta = &track.handle.meta;
                 slot.track_id.replace(meta.id.clone());
