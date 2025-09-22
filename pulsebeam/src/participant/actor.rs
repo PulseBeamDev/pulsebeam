@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -12,7 +16,11 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::{audio_selector::AudioSelector, entity, gateway, message, proto, room, system, track};
+use crate::{
+    entity, gateway, message,
+    participant::{audio::AudioAllocator, video::VideoAllocator},
+    proto, room, system, track,
+};
 use pulsebeam_runtime::{actor, net};
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
@@ -72,15 +80,9 @@ pub struct ParticipantActor {
 
     // Track management
     published_tracks: PublishedTracks,
-    available_tracks: AvailableTracks,
-    subscribed_slots: SubscribedSlots,
+    video_allocator: VideoAllocator,
+    audio_allocator: AudioAllocator,
     track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
-
-    // Audio filtering - subscribes to all audio but filters forwarding
-    audio_selector: AudioSelector,
-
-    // Client sync state
-    sync_state: ClientSyncState,
 }
 
 #[derive(Default)]
@@ -102,14 +104,6 @@ struct SubscribedSlots {
     audio: HashMap<Mid, MidSlot>,
 }
 
-#[derive(Default)]
-struct ClientSyncState {
-    pending_published: Vec<proto::sfu::TrackInfo>,
-    pending_unpublished: Vec<entity::EntityId>,
-    pending_switched: Vec<proto::sfu::TrackSwitchInfo>,
-    needs_resync: bool,
-}
-
 impl ParticipantActor {
     pub fn new(
         system_ctx: system::SystemContext,
@@ -124,21 +118,15 @@ impl ParticipantActor {
             rtc,
             data_channel: None,
             published_tracks: PublishedTracks::default(),
-            available_tracks: AvailableTracks::default(),
-            subscribed_slots: SubscribedSlots::default(),
+            video_allocator: VideoAllocator::default(),
+            audio_allocator: AudioAllocator::with_chromium_limit(),
             track_tasks: FuturesUnordered::new(),
-            audio_selector: AudioSelector::with_chromium_limit(),
-            sync_state: ClientSyncState::default(),
         }
     }
 
     /// Main event loop with proper timeout handling
     async fn poll(&mut self, ctx: &mut actor::ActorContext<Self>) -> Option<Duration> {
         while self.rtc.is_alive() {
-            if self.sync_state.needs_resync {
-                self.resync_with_client(ctx).await;
-            }
-
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
                     let now = Instant::now().into_std();
@@ -173,42 +161,6 @@ impl ParticipantActor {
     async fn resync_with_client(&mut self, ctx: &mut actor::ActorContext<Self>) {
         // TODO: Send pending state changes to client via data channel
         self.auto_subscribe_tracks(ctx).await;
-        self.sync_state.needs_resync = false;
-    }
-
-    /// Automatically subscribe available tracks to open slots
-    /// Audio: Always subscribe to all audio tracks (filtering happens later)
-    /// Video: Subscribe based on available slots
-    async fn auto_subscribe_tracks(&mut self, ctx: &mut actor::ActorContext<Self>) {
-        // TODO: audio
-
-        let mut available_tracks = self.available_tracks.video.iter_mut();
-        for (slot_id, slot) in self.subscribed_slots.video.iter_mut() {
-            if slot.track_id.is_some() {
-                continue;
-            }
-
-            for (track_id, track) in &mut available_tracks {
-                if track.mid.is_some() {
-                    continue;
-                }
-
-                if track
-                    .handle
-                    .send_high(track::TrackControlMessage::Subscribe(ctx.handle.clone()))
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-
-                track.mid.replace(*slot_id);
-                let meta = &track.handle.meta;
-                slot.track_id.replace(meta.id.clone());
-                tracing::info!("allocated video slot: {track_id} -> {slot_id}");
-                break;
-            }
-        }
     }
 
     fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {

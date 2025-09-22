@@ -1,4 +1,6 @@
 use crate::entity::TrackId;
+use crate::participant::effect;
+use crate::track;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -55,25 +57,28 @@ impl Ord for TrackScore {
     }
 }
 
-impl Default for AudioSelector {
+impl Default for AudioAllocator {
     fn default() -> Self {
         Self::with_chromium_limit()
     }
 }
 
-pub struct AudioSelector {
+pub struct AudioAllocator {
     n: usize, // Number of streams to select
     tracks: HashMap<Arc<TrackId>, TrackState>,
     top_n: BTreeSet<TrackScore>, // Use a BTreeSet to keep the top N tracks sorted
+
+    effects: Vec<effect::Effect>,
 }
 
-impl AudioSelector {
+impl AudioAllocator {
     /// Create a new AudioSelector with the specified number of streams (N)
     pub fn new(n: usize) -> Self {
-        AudioSelector {
+        AudioAllocator {
             n,
             tracks: HashMap::new(),
             top_n: BTreeSet::new(),
+            effects: Vec::with_capacity(16),
         }
     }
 
@@ -82,7 +87,10 @@ impl AudioSelector {
     }
 
     /// Add a new track to the selector
-    pub fn add_track(&mut self, track_id: Arc<TrackId>) {
+    pub fn add_track(&mut self, track_handle: Arc<track::TrackHandle>) {
+        assert!(track_handle.meta.kind.is_audio());
+
+        let track_id = track_handle.meta.id.clone();
         let now = Instant::now();
         let score = TrackScore {
             track_id: track_id.clone(),
@@ -97,6 +105,7 @@ impl AudioSelector {
                 last_updated: now,
             },
         );
+        self.effects.push(effect::Effect::Subscribe(track_handle));
     }
 
     /// Remove a track
