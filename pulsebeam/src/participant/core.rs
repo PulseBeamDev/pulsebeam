@@ -11,9 +11,9 @@ use crate::{
 
 pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
-    published_tracks: HashMap<Mid, track::TrackHandle>,
-    video_allocator: VideoAllocator,
-    audio_allocator: AudioAllocator,
+    pub published_tracks: HashMap<Mid, track::TrackHandle>,
+    pub video_allocator: VideoAllocator,
+    pub audio_allocator: AudioAllocator,
 }
 
 impl ParticipantCore {
@@ -24,6 +24,10 @@ impl ParticipantCore {
             video_allocator: VideoAllocator::default(),
             audio_allocator: AudioAllocator::with_chromium_limit(),
         }
+    }
+
+    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
+        self.video_allocator.get_track_mut(&mid).or_else(|| todo!())
     }
 
     pub fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {

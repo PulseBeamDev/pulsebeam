@@ -86,6 +86,21 @@ impl AudioAllocator {
         Self::new(3)
     }
 
+    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
+        let Some(slot) = self.slots.get(mid) else {
+            return None;
+        };
+        let Some(track_id) = &slot.track_id else {
+            return None;
+        };
+
+        let Some(track) = self.tracks.get_mut(track_id) else {
+            return None;
+        };
+
+        Some(&mut track.handle)
+    }
+
     /// Add a new track to the selector
     pub fn add_track(&mut self, track_handle: Arc<track::TrackHandle>) {
         assert!(track_handle.meta.kind.is_audio());

@@ -10,7 +10,7 @@ use str0m::{
     Event, Input, Output, Rtc, RtcError,
     channel::ChannelId,
     error::SdpError,
-    media::{Direction, KeyframeRequest, MediaAdded, MediaData, MediaKind, Mid},
+    media::{KeyframeRequest, MediaData},
     net::Transmit,
 };
 use tokio::time::Instant;
@@ -18,10 +18,8 @@ use tokio::time::Instant;
 use crate::{
     entity, gateway, message,
     participant::{
-        audio::AudioAllocator,
         core::ParticipantCore,
         effect::{self, Effect},
-        video::VideoAllocator,
     },
     room, system, track,
 };
@@ -146,7 +144,7 @@ impl actor::Actor for ParticipantActor {
                 _ = tokio::time::sleep(timeout) => {
                     // Timer expired, poll again
                 }
-                Some((track_meta, _)) = self.track_tasks.next() => {
+                Some((track_meta, _)) = self.ctx.track_tasks.next() => {
                     self.core.handle_track_finished(track_meta);
                 }
             }
@@ -225,6 +223,7 @@ impl ParticipantActor {
             system_ctx,
             room_handle,
             rtc,
+            track_tasks: FuturesUnordered::new(),
         };
 
         let core = ParticipantCore::new(participant_id);
@@ -235,7 +234,6 @@ impl ParticipantActor {
             core,
             effects,
             data_channel: None,
-            track_tasks: FuturesUnordered::new(),
         }
     }
 
@@ -262,7 +260,7 @@ impl ParticipantActor {
                     self.handle_transmit(transmit).await;
                 }
                 Ok(Output::Event(event)) => {
-                    self.handle_event(ctx, event).await;
+                    self.handle_event(event).await;
                 }
                 Err(e) => {
                     tracing::error!("RTC poll error: {}", e);
@@ -271,7 +269,7 @@ impl ParticipantActor {
             }
         }
 
-        self.ctx.apply_effects(&mut self.effects, ctx);
+        self.ctx.apply_effects(&mut self.effects, &ctx.handle).await;
 
         None
     }
@@ -283,6 +281,7 @@ impl ParticipantActor {
         };
 
         if let Err(e) = self
+            .ctx
             .system_ctx
             .gw_handle
             .send_low(gateway::GatewayDataMessage::Packet(packet))
@@ -292,7 +291,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_event(&mut self, ctx: &mut actor::ActorContext<Self>, event: Event) {
+    async fn handle_event(&mut self, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) => match state {
                 str0m::IceConnectionState::Disconnected => self.ctx.rtc.disconnect(),
@@ -349,14 +348,7 @@ impl ParticipantActor {
             });
         }
 
-        // Forward to appropriate published track
-        let track_handle = self
-            .published_tracks
-            .video
-            .get_mut(&data.mid)
-            .or_else(|| self.published_tracks.audio.get_mut(&data.mid));
-
-        let Some(track) = track_handle else {
+        let Some(track) = self.core.get_track_mut(&data.mid) else {
             return;
         };
 
@@ -369,18 +361,18 @@ impl ParticipantActor {
     }
 
     fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
-        let Some(track_handle) = self.video_allocator.get_track_mut(&req.mid) else {
+        let Some(track_handle) = self.core.video_allocator.get_track_mut(&req.mid) else {
             return;
         };
         let _ = track_handle.try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
     fn handle_forward_media(&mut self, track_meta: Arc<message::TrackMeta>, data: Arc<MediaData>) {
-        let Some(mid) = self.video_allocator.get_slot(&track_meta.id) else {
+        let Some(mid) = self.core.video_allocator.get_slot(&track_meta.id) else {
             return;
         };
 
-        let Some(writer) = self.rtc.writer(*mid) else {
+        let Some(writer) = self.ctx.rtc.writer(*mid) else {
             return;
         };
 
@@ -390,7 +382,6 @@ impl ParticipantActor {
 
         if let Err(e) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("Failed to write media: {}", e);
-            self.rtc.disconnect();
         }
     }
 
