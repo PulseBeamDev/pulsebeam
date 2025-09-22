@@ -6,7 +6,6 @@ use crate::track;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
 
 #[derive(Clone)]
 pub struct AudioTrackData {
@@ -22,7 +21,7 @@ pub struct AudioTrackData {
 #[derive(Clone)]
 struct TrackState {
     score: TrackScore,
-    last_updated: Instant,
+    update_sequence: u64,
     handle: track::TrackHandle,
 }
 
@@ -31,8 +30,8 @@ struct TrackState {
 struct TrackScore {
     track_id: Arc<TrackId>,
     voice_activity: bool,
-    audio_level: i8, // Higher is louder (less negative)
-    last_updated: Instant,
+    audio_level: i8,      // Higher is louder (less negative)
+    update_sequence: u64, // Sequence number for ordering updates
 }
 
 impl PartialEq for TrackScore {
@@ -56,7 +55,7 @@ impl Ord for TrackScore {
             .cmp(&other.voice_activity)
             .reverse()
             .then_with(|| self.audio_level.cmp(&other.audio_level))
-            .then_with(|| self.last_updated.cmp(&other.last_updated).reverse())
+            .then_with(|| self.update_sequence.cmp(&other.update_sequence).reverse())
     }
 }
 
@@ -76,6 +75,7 @@ pub struct AudioAllocator {
     slots: Vec<Slot>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
     top_n: BTreeSet<TrackScore>, // Use a BTreeSet to keep the top N tracks sorted
+    sequence_counter: u64,       // Counter for update ordering
 }
 
 impl AudioAllocator {
@@ -85,6 +85,7 @@ impl AudioAllocator {
             slots: Vec::new(),
             tracks: HashMap::new(),
             top_n: BTreeSet::new(),
+            sequence_counter: 0,
         }
     }
 
@@ -93,18 +94,18 @@ impl AudioAllocator {
         assert!(track_handle.meta.kind.is_audio());
 
         let track_id = track_handle.meta.id.clone();
-        let now = Instant::now();
+        self.sequence_counter += 1;
         let score = TrackScore {
             track_id: track_id.clone(),
             voice_activity: false,
             audio_level: -127, // Start with the lowest possible audio level
-            last_updated: now,
+            update_sequence: self.sequence_counter,
         };
         self.tracks.insert(
             track_id,
             TrackState {
                 score,
-                last_updated: now,
+                update_sequence: self.sequence_counter,
                 handle: track_handle.clone(),
             },
         );
@@ -130,18 +131,18 @@ impl AudioAllocator {
 
     /// Check if an AudioTrackData packet should be forwarded
     pub fn should_forward(&mut self, track_data: &AudioTrackData) -> bool {
-        let now = Instant::now();
         if let Some(state) = self.tracks.get_mut(&track_data.track_id) {
             let old_score = state.score.clone();
+            self.sequence_counter += 1;
             let new_score = TrackScore {
                 track_id: track_data.track_id.clone(),
                 voice_activity: track_data.voice_activity.unwrap_or(false),
                 audio_level: track_data.audio_level.unwrap_or(-127),
-                last_updated: now,
+                update_sequence: self.sequence_counter,
             };
 
             state.score = new_score.clone();
-            state.last_updated = now;
+            state.update_sequence = self.sequence_counter;
 
             if self.top_n.contains(&old_score) {
                 self.top_n.remove(&old_score);
@@ -159,7 +160,7 @@ impl AudioAllocator {
             track_id: track_data.track_id.clone(),
             voice_activity: false, // These fields don't matter for contains check
             audio_level: 0,
-            last_updated: now,
+            update_sequence: 0,
         })
     }
 
