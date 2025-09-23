@@ -33,8 +33,12 @@ protobuf = "*"
 build-essential = "*"
 clang = "*"
 pkg-config = "*"
-ffmpeg-free = "*"
 protobuf-compiler = "*"
+
+# ffmpeg dependencies
+libavcodec-dev = "*" 
+libavformat-dev = "*"
+libavutil-dev = "*"
 
 [dist.dependencies.chocolatey]
 ffmpeg = "*"
