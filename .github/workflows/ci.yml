@@ -16,7 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v5
-    - run: sudo apt-get install -y protobuf-compiler clang libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libdevice-dev pkg-config
+    - run: sudo apt-get install -y protobuf-compiler clang libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev pkg-config
     - name: Build
       run: cargo build --verbose
     - name: Run tests
