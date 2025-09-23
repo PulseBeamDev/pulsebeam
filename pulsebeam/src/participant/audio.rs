@@ -221,4 +221,90 @@ impl AudioAllocator {
             self.active_ids.insert(s.track_id.clone());
         }
     }
+
+    #[cfg(test)]
+    fn get_selected_tracks(&self) -> Vec<Arc<TrackId>> {
+        self.top_n
+            .iter()
+            .rev()
+            .map(|s| s.track_id.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use str0m::media::MediaKind;
+
+    use super::*;
+
+    fn make_data(level: i8, vad: bool) -> AudioTrackData {
+        AudioTrackData {
+            audio_level: Some(level),
+            voice_activity: Some(vad),
+        }
+    }
+
+    #[tokio::test]
+    async fn louder_tracks_win() {
+        let mut alloc = AudioAllocator::new();
+        alloc.add_slot(Mid::new());
+        alloc.add_slot(Mid::new());
+
+        let mut effects = effect::Queue::default();
+
+        let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
+        let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
+        alloc.add_track(&mut effects, t1.clone());
+        alloc.add_track(&mut effects, t2.clone());
+
+        // t1 quiet, t2 loud
+        assert!(alloc.should_forward(&t1.meta.id, &make_data(-50, true)));
+        assert!(alloc.should_forward(&t2.meta.id, &make_data(-10, true)));
+
+        let selected = alloc.get_selected_tracks();
+        assert_eq!(selected, vec![t2.meta.id.clone(), t1.meta.id.clone()]);
+    }
+
+    #[tokio::test]
+    async fn vad_beats_non_vad() {
+        let mut alloc = AudioAllocator::new();
+        alloc.add_slot(Mid::new());
+
+        let mut effects = effect::Queue::default();
+
+        let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
+        let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
+
+        alloc.add_track(&mut effects, t1.clone());
+        alloc.add_track(&mut effects, t2.clone());
+
+        // t1 loud but no VAD, t2 quiet but VAD
+        assert!(alloc.should_forward(&t1.meta.id, &make_data(-5, false)));
+        assert!(alloc.should_forward(&t2.meta.id, &make_data(-30, true)));
+
+        let selected = alloc.get_selected_tracks();
+        assert_eq!(selected, vec![t2.meta.id.clone()]); // VAD wins
+    }
+
+    #[tokio::test]
+    async fn smoothing_reduces_flapping() {
+        let mut alloc = AudioAllocator::new();
+        alloc.add_slot(Mid::new());
+
+        let mut effects = effect::Queue::default();
+
+        let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
+        alloc.add_track(&mut effects, t1.clone());
+
+        // Start very quiet
+        assert!(!alloc.should_forward(&t1.meta.id, &make_data(-127, false)));
+
+        // Brief loud spike
+        assert!(alloc.should_forward(&t1.meta.id, &make_data(-5, true)));
+
+        // Immediately back to quiet
+        // Smoothed level should prevent immediate rejection
+        assert!(alloc.should_forward(&t1.meta.id, &make_data(-127, false)));
+    }
 }

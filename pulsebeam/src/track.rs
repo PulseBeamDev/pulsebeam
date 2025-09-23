@@ -173,10 +173,16 @@ pub type TrackHandle = actor::ActorHandle<TrackMessageSet>;
 
 #[cfg(test)]
 pub mod test {
-    use super::{TrackControlMessage, TrackDataMessage};
-    use crate::{message::TrackMeta, track::TrackMessageSet};
+    use super::*;
+    use crate::{
+        entity,
+        message::TrackMeta,
+        test_utils,
+        track::{self, TrackMessageSet},
+    };
     use pulsebeam_runtime::actor::{Actor, ActorContext};
     use std::sync::{Arc, Mutex};
+    use str0m::media::{MediaKind, Mid};
 
     /// A fake TrackActor implementation that records incoming state and messages.
     /// Useful for testing components that interact with tracks.
@@ -218,5 +224,23 @@ pub mod test {
                 received_low: Arc::new(Mutex::new(Vec::new())),
             }
         }
+    }
+
+    pub fn spawn_fake(
+        kind: MediaKind,
+    ) -> (
+        track::TrackHandle,
+        actor::JoinHandle<track::TrackMessageSet>,
+    ) {
+        let participant_id = test_utils::create_participant_id();
+        let mid = Mid::new();
+        let id = Arc::new(entity::TrackId::new(participant_id, mid));
+        let meta = Arc::new(TrackMeta {
+            id,
+            kind,
+            simulcast_rids: None,
+        });
+        let fake = track::test::FakeTrackActor::new(meta);
+        actor::spawn_default(fake)
     }
 }
