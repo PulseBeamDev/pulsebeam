@@ -1,11 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
-use str0m::media::{Direction, MediaAdded, MediaKind, Mid};
+use str0m::media::{Direction, MediaAdded, MediaData, MediaKind, Mid};
 
 use super::effect::Effect;
 use crate::{
-    entity, message,
-    participant::{audio::AudioAllocator, effect, video::VideoAllocator},
+    entity,
+    message::{self, TrackMeta},
+    participant::{
+        audio::{AudioAllocator, AudioTrackData},
+        effect,
+        video::VideoAllocator,
+    },
     track,
 };
 
@@ -28,6 +33,19 @@ impl ParticipantCore {
 
     pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
         self.published_tracks.get_mut(mid)
+    }
+
+    pub fn get_slot(&mut self, track_meta: &Arc<TrackMeta>, data: &Arc<MediaData>) -> Option<&Mid> {
+        match track_meta.kind {
+            MediaKind::Video => self.video_allocator.get_slot(&track_meta.id),
+            MediaKind::Audio => self.audio_allocator.get_slot(
+                &track_meta.id,
+                &AudioTrackData {
+                    audio_level: data.ext_vals.audio_level,
+                    voice_activity: data.ext_vals.voice_activity,
+                },
+            ),
+        }
     }
 
     pub fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {

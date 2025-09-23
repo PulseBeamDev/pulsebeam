@@ -374,7 +374,7 @@ impl ParticipantActor {
     }
 
     fn handle_forward_media(&mut self, track_meta: Arc<message::TrackMeta>, data: Arc<MediaData>) {
-        let Some(mid) = self.core.video_allocator.get_slot(&track_meta.id) else {
+        let Some(mid) = self.core.get_slot(&track_meta, &data) else {
             return;
         };
 

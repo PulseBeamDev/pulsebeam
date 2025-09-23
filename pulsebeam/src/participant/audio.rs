@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AudioTrackData {
-    /// Unique identifier for the track
-    pub track_id: Arc<TrackId>,
     /// Audio level in negative decibels (0 is max, -30 is typical)
     pub audio_level: Option<i8>,
     /// Indication of voice activity
@@ -129,13 +127,56 @@ impl AudioAllocator {
         tracing::info!("added audio slot: {}", mid);
     }
 
+    pub fn get_slot(
+        &mut self,
+        track_id: &Arc<entity::TrackId>,
+        data: &AudioTrackData,
+    ) -> Option<&Mid> {
+        if !self.should_forward(track_id, data) {
+            tracing::debug!("rejected {track_id} audio");
+            return None;
+        }
+
+        let mut lowest_hit: Option<&Mid> = None;
+        let mut lowest_hit_count = u64::MAX;
+        let mut matched_mid: Option<&Mid> = None;
+
+        for slot in self.slots.iter_mut() {
+            // 1. Matched track id
+            if let Some(slot_track_id) = &slot.track_id {
+                if slot_track_id == track_id {
+                    matched_mid = Some(&slot.mid);
+                    break; // Exit loop once we find a matching track ID
+                }
+            } else if matched_mid.is_none() {
+                // 2. Empty slot
+                matched_mid = Some(&slot.mid);
+            }
+
+            // 3. Track lowest hit count
+            if slot.hit_count < lowest_hit_count {
+                lowest_hit_count = slot.hit_count;
+                lowest_hit = Some(&slot.mid);
+            }
+        }
+
+        // Return the matched slot's Mid, or the lowest hit count Mid if no match
+        let res = matched_mid.or(lowest_hit);
+        tracing::debug!("forwarded audio from {} to {:?}", track_id, res);
+        res
+    }
+
     /// Check if an AudioTrackData packet should be forwarded
-    pub fn should_forward(&mut self, track_data: &AudioTrackData) -> bool {
-        if let Some(state) = self.tracks.get_mut(&track_data.track_id) {
+    pub fn should_forward(
+        &mut self,
+        track_id: &Arc<entity::TrackId>,
+        track_data: &AudioTrackData,
+    ) -> bool {
+        if let Some(state) = self.tracks.get_mut(track_id) {
             let old_score = state.score.clone();
             self.sequence_counter += 1;
             let new_score = TrackScore {
-                track_id: track_data.track_id.clone(),
+                track_id: track_id.clone(),
                 voice_activity: track_data.voice_activity.unwrap_or(false),
                 audio_level: track_data.audio_level.unwrap_or(-127),
                 update_sequence: self.sequence_counter,
@@ -157,7 +198,7 @@ impl AudioAllocator {
             }
         }
         self.top_n.contains(&TrackScore {
-            track_id: track_data.track_id.clone(),
+            track_id: track_id.clone(),
             voice_activity: false, // These fields don't matter for contains check
             audio_level: 0,
             update_sequence: 0,
