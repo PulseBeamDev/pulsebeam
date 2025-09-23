@@ -168,3 +168,62 @@ impl TrackActor {
 }
 
 pub type TrackHandle = actor::ActorHandle<TrackActor>;
+
+// #[cfg(test)]
+// pub mod test {
+//     use crate::entity;
+//
+//     use super::*;
+//     use pulsebeam_runtime::{actor::JoinHandle, test_utils::FakeActor};
+//     use str0m::media::Mid;
+//
+//     type HighPriorityMsg = TrackControlMessage;
+//     type LowPriorityMsg = TrackDataMessage;
+//     type Meta = Arc<TrackMeta>;
+//     type State = ();
+//     type Fake = FakeActor<Meta, State, HighPriorityMsg, LowPriorityMsg>;
+//
+//     pub struct FakeTrackActor {
+//         fake: FakeActor<Meta, State, HighPriorityMsg, LowPriorityMsg>,
+//     }
+//
+//     impl FakeTrackActor {
+//         pub fn new(track_meta: Arc<TrackMeta>) -> Self {
+//             let fake = pulsebeam_runtime::test_utils::FakeActor::new(
+//                 track_meta,
+//                 (),
+//                 Arc::new(|_state, _msg| {}),
+//                 Arc::new(|_state, _msg| {}),
+//             );
+//             Self { fake }
+//         }
+//     }
+//
+//     impl Default for FakeTrackActor {
+//         fn default() -> Self {
+//             Self::new(new_fake_meta())
+//         }
+//     }
+//
+//     pub fn spawn_default() -> (TrackHandle, JoinHandle<Fake>) {
+//         let fake: Fake = pulsebeam_runtime::test_utils::FakeActor::new(
+//             new_fake_meta(),
+//             (),
+//             Arc::new(|_state, _msg| {}),
+//             Arc::new(|_state, _msg| {}),
+//         );
+//         actor::spawn(fake, actor::RunnerConfig::default())
+//     }
+//
+//     pub fn new_fake_meta() -> Arc<TrackMeta> {
+//         let participant_id = Arc::new(entity::ParticipantId::new());
+//         let mid = Mid::new();
+//         let id = entity::TrackId::new(participant_id, mid);
+//         let meta = TrackMeta {
+//             id,
+//             kind: str0m::media::MediaKind::Video,
+//             simulcast_rids: None,
+//         };
+//         Arc::new(meta)
+//     }
+// }

@@ -135,9 +135,9 @@ Use browser-native APIs — no SDK lock-in:
 
 ## Roadmap
 
-* ✅ Prototype: working video-only Rust SFU + demo
+* ✅ Prototype: working basic audio/video Rust SFU + demo
 * 🚧 Core stability: simulation testing, end-to-end tests (current focus)
-* 📅 Bandwidth estimator, audio and data handling, video simulcast
+* 📅 Bandwidth estimator, data handling, video simulcast
 * 📅 First-party services (recording, etc.) + JS SDK
 * 📅 Built-in multi node or cascading SFU.
 

@@ -10,6 +10,10 @@ let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 let sessionUrl: string | null = null;
 
+window._injects = {
+  audio: true
+};
+
 form.onsubmit = async (e) => {
   e.preventDefault();
   if (pc) {
@@ -42,7 +46,7 @@ async function start(endpoint: string) {
   const audioTrans = pc.addTransceiver("audio", { direction: "sendonly" });
   localStream = await navigator.mediaDevices.getUserMedia({
     video: { width: 1920, height: 1080, frameRate: 30 },
-    audio: true
+    audio: window._injects.audio,
   });
   videoTrans.sender.replaceTrack(localStream.getVideoTracks()[0]);
   audioTrans.sender.replaceTrack(localStream.getAudioTracks()[0]);
@@ -50,7 +54,9 @@ async function start(endpoint: string) {
 
   // WHEP: recv-only transceivers
   pc.addTransceiver("video", { direction: "recvonly" });
-  pc.addTransceiver("audio", { direction: "recvonly" });
+  if (!window._injects.audio) {
+    pc.addTransceiver("audio", { direction: "recvonly" });
+  }
   const remoteVideoStream = new MediaStream();
   const remoteAudioStream = new MediaStream();
   remoteAudio.srcObject = remoteAudioStream;

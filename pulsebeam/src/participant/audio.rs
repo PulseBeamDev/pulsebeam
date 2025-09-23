@@ -3,8 +3,9 @@ use str0m::media::Mid;
 use crate::entity::{self, TrackId};
 use crate::participant::effect::{self, Effect};
 use crate::track;
+
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -19,8 +20,20 @@ pub struct AudioTrackData {
 #[derive(Clone)]
 struct TrackState {
     score: TrackScore,
-    update_sequence: u64,
-    handle: track::TrackHandle,
+    smoothed_level: i8,
+}
+
+impl TrackState {
+    fn update(&mut self, data: &AudioTrackData, insertion_order: u64) {
+        let level = data.audio_level.unwrap_or(-127);
+
+        // exponential moving average for smoothing
+        self.smoothed_level = ((self.smoothed_level as i16 * 3 + level as i16) / 4) as i8;
+
+        self.score.voice_activity = data.voice_activity.unwrap_or(false);
+        self.score.audio_level = self.smoothed_level;
+        self.score.insertion_order = insertion_order;
+    }
 }
 
 /// Scoring struct for top N tracks
@@ -29,7 +42,7 @@ struct TrackScore {
     track_id: Arc<TrackId>,
     voice_activity: bool,
     audio_level: i8,      // Higher is louder (less negative)
-    update_sequence: u64, // Sequence number for ordering updates
+    insertion_order: u64, // Deterministic tie-breaker
 }
 
 impl PartialEq for TrackScore {
@@ -37,7 +50,6 @@ impl PartialEq for TrackScore {
         self.track_id == other.track_id
     }
 }
-
 impl Eq for TrackScore {}
 
 impl PartialOrd for TrackScore {
@@ -45,15 +57,13 @@ impl PartialOrd for TrackScore {
         Some(self.cmp(other))
     }
 }
-
 impl Ord for TrackScore {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Prioritize voice_activity == true
         self.voice_activity
             .cmp(&other.voice_activity)
             .reverse()
             .then_with(|| self.audio_level.cmp(&other.audio_level))
-            .then_with(|| self.update_sequence.cmp(&other.update_sequence).reverse())
+            .then_with(|| self.insertion_order.cmp(&other.insertion_order))
     }
 }
 
@@ -72,45 +82,44 @@ struct Slot {
 pub struct AudioAllocator {
     slots: Vec<Slot>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
-    top_n: BTreeSet<TrackScore>, // Use a BTreeSet to keep the top N tracks sorted
-    sequence_counter: u64,       // Counter for update ordering
+    top_n: BTreeSet<TrackScore>,
+    active_ids: HashSet<Arc<TrackId>>,
+    insertion_counter: u64,
 }
 
 impl AudioAllocator {
-    /// Create a new AudioSelector with the specified number of streams (N)
     pub fn new() -> Self {
         AudioAllocator {
             slots: Vec::new(),
             tracks: HashMap::new(),
             top_n: BTreeSet::new(),
-            sequence_counter: 0,
+            active_ids: HashSet::new(),
+            insertion_counter: 0,
         }
     }
 
-    /// Add a new track to the selector
     pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackHandle) {
         assert!(track_handle.meta.kind.is_audio());
 
+        self.insertion_counter += 1;
+
         let track_id = track_handle.meta.id.clone();
-        self.sequence_counter += 1;
         let score = TrackScore {
             track_id: track_id.clone(),
             voice_activity: false,
-            audio_level: -127, // Start with the lowest possible audio level
-            update_sequence: self.sequence_counter,
+            audio_level: -127,
+            insertion_order: self.insertion_counter,
         };
-        self.tracks.insert(
-            track_id,
-            TrackState {
-                score,
-                update_sequence: self.sequence_counter,
-                handle: track_handle.clone(),
-            },
-        );
+
+        let state = TrackState {
+            score,
+            smoothed_level: -127,
+        };
+
+        self.tracks.insert(track_id, state);
         effects.push_back(Effect::Subscribe(track_handle));
     }
 
-    /// Remove a track
     pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
         if let Some(state) = self.tracks.remove(track_id) {
             self.top_n.remove(&state.score);
@@ -133,7 +142,6 @@ impl AudioAllocator {
         data: &AudioTrackData,
     ) -> Option<&Mid> {
         if !self.should_forward(track_id, data) {
-            tracing::debug!("rejected {track_id} audio");
             return None;
         }
 
@@ -166,46 +174,33 @@ impl AudioAllocator {
         res
     }
 
-    /// Check if an AudioTrackData packet should be forwarded
     pub fn should_forward(
         &mut self,
         track_id: &Arc<entity::TrackId>,
         track_data: &AudioTrackData,
     ) -> bool {
         if let Some(state) = self.tracks.get_mut(track_id) {
+            self.insertion_counter += 1;
             let old_score = state.score.clone();
-            self.sequence_counter += 1;
-            let new_score = TrackScore {
-                track_id: track_id.clone(),
-                voice_activity: track_data.voice_activity.unwrap_or(false),
-                audio_level: track_data.audio_level.unwrap_or(-127),
-                update_sequence: self.sequence_counter,
-            };
-
-            state.score = new_score.clone();
-            state.update_sequence = self.sequence_counter;
+            state.update(track_data, self.insertion_counter);
 
             if self.top_n.contains(&old_score) {
                 self.top_n.remove(&old_score);
-                self.top_n.insert(new_score);
+                self.top_n.insert(state.score.clone());
             } else if self.top_n.len() < self.slots.len() {
-                self.top_n.insert(new_score);
+                self.top_n.insert(state.score.clone());
             } else if let Some(min_score) = self.top_n.iter().next()
-                && new_score > *min_score
+                && state.score > *min_score
             {
                 self.top_n.pop_first();
-                self.top_n.insert(new_score);
+                self.top_n.insert(state.score.clone());
             }
+
+            self.refresh_active_ids();
         }
-        self.top_n.contains(&TrackScore {
-            track_id: track_id.clone(),
-            voice_activity: false, // These fields don't matter for contains check
-            audio_level: 0,
-            update_sequence: 0,
-        })
+        self.active_ids.contains(track_id)
     }
 
-    /// Rebuilds the top_n set from all tracked tracks.
     fn rebuild_top_n(&mut self) {
         self.top_n.clear();
         let mut all_scores: Vec<_> = self
@@ -217,13 +212,17 @@ impl AudioAllocator {
         for score in all_scores.into_iter().take(self.slots.len()) {
             self.top_n.insert(score);
         }
+        self.refresh_active_ids();
     }
 
-    /// Get the current top N track IDs
+    fn refresh_active_ids(&mut self) {
+        self.active_ids.clear();
+        for s in &self.top_n {
+            self.active_ids.insert(s.track_id.clone());
+        }
+    }
+
     pub fn get_selected_tracks(&self) -> Vec<Arc<TrackId>> {
-        self.top_n
-            .iter()
-            .map(|score| score.track_id.clone())
-            .collect()
+        self.top_n.iter().map(|s| s.track_id.clone()).collect()
     }
 }
