@@ -141,6 +141,8 @@ Use browser-native APIs — no SDK lock-in:
 * 📅 First-party services (recording, etc.) + JS SDK
 * 📅 Built-in multi node or cascading SFU.
 
+## Modules
+
 ---
 
 ## License
