@@ -74,10 +74,16 @@ impl ParticipantContext {
         for e in effects.drain(..) {
             match e {
                 Effect::Subscribe(mut track_handle) => {
-                    if let Err(err) = track_handle
+                    if track_handle
                         .send_high(track::TrackControlMessage::Subscribe(self_handle.clone()))
                         .await
-                    {}
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "failed to subscribe to {}. Will be cleaned up by room broadcast",
+                            track_handle.meta
+                        );
+                    }
                 }
                 Effect::SpawnTrack(track_meta) => {
                     let track_actor =
