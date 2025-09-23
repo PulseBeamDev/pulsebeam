@@ -151,7 +151,6 @@ mod tests {
 
         // The first send succeeds and fills the buffer
         sender.try_send(1).unwrap();
-        sender.try_send(1).unwrap();
 
         // The second send should fail because the buffer is full
         let result = sender.try_send(2);
