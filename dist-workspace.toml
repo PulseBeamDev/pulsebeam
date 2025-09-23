@@ -39,6 +39,7 @@ protobuf-compiler = "*"
 libavcodec-dev = "*" 
 libavformat-dev = "*"
 libavutil-dev = "*"
+libavfilter-dev = "*"
 
 [dist.dependencies.chocolatey]
 ffmpeg = "*"
