@@ -40,6 +40,7 @@ libavcodec-dev = "*"
 libavformat-dev = "*"
 libavutil-dev = "*"
 libavfilter-dev = "*"
+libdevice-dev = "*"
 
 [dist.dependencies.chocolatey]
 ffmpeg = "*"
