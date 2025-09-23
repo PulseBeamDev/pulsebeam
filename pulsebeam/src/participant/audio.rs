@@ -221,8 +221,4 @@ impl AudioAllocator {
             self.active_ids.insert(s.track_id.clone());
         }
     }
-
-    pub fn get_selected_tracks(&self) -> Vec<Arc<TrackId>> {
-        self.top_n.iter().map(|s| s.track_id.clone()).collect()
-    }
 }

@@ -144,7 +144,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         self.core.participant_id.clone()
     }
 
-    fn get_observable_state(&self) -> () {}
+    fn get_observable_state(&self) {}
 
     async fn run(
         &mut self,

@@ -37,11 +37,11 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         0
     }
 
-    fn get_observable_state(&self) -> () {}
+    fn get_observable_state(&self) {}
 
     async fn run(
         &mut self,
-        ctx: &mut actor::ActorContext<GatewayMessageSet>,
+        _ctx: &mut actor::ActorContext<GatewayMessageSet>,
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {

@@ -63,11 +63,11 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
         self.id.clone()
     }
 
-    fn get_observable_state(&self) -> () {}
+    fn get_observable_state(&self) {}
 
     async fn run(
         &mut self,
-        ctx: &mut actor::ActorContext<ControllerMessageSet>,
+        _ctx: &mut actor::ActorContext<ControllerMessageSet>,
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
             select: {

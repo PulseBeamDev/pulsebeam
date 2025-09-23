@@ -71,7 +71,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 
     async fn run(
         &mut self,
-        ctx: &mut actor::ActorContext<RoomMessageSet>,
+        _ctx: &mut actor::ActorContext<RoomMessageSet>,
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx,
             pre_select: {

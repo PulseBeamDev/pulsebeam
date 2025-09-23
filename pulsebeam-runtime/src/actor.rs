@@ -101,7 +101,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
 
     fn run(
         &mut self,
-        ctx: &mut ActorContext<M>,
+        _ctx: &mut ActorContext<M>,
     ) -> impl futures::Future<Output = Result<(), ActorError>> + Send {
         async {
             actor_loop!(self, ctx);

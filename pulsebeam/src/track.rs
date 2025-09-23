@@ -64,7 +64,7 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
         self.meta.clone()
     }
 
-    fn get_observable_state(&self) -> () {}
+    fn get_observable_state(&self) {}
 
     async fn on_high_priority(
         &mut self,
