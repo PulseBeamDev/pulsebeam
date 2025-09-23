@@ -143,6 +143,8 @@ Use browser-native APIs — no SDK lock-in:
 
 ## Modules
 
+* [pulsebeam](./pulsebeam): PulseBeam SFU
+
 ---
 
 ## License
