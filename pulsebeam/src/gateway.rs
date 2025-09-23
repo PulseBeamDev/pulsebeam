@@ -13,6 +13,15 @@ pub enum GatewayDataMessage {
     Packet(net::SendPacket),
 }
 
+pub struct GatewayMessageSet;
+
+impl actor::MessageSet for GatewayMessageSet {
+    type HighPriorityMsg = GatewayControlMessage;
+    type LowPriorityMsg = GatewayDataMessage;
+    type Meta = usize;
+    type ObservableState = ();
+}
+
 pub struct GatewayActor {
     socket: net::UnifiedSocket<'static>,
     conns: HashMap<String, participant::ParticipantHandle>,
@@ -23,21 +32,17 @@ pub struct GatewayActor {
     send_outgoing_batch: Vec<net::SendPacket>,
 }
 
-impl actor::MessageSet for GatewayActor {
-    type HighPriorityMsg = GatewayControlMessage;
-    type LowPriorityMsg = GatewayDataMessage;
-    type Meta = usize;
-    type ObservableState = ();
-}
-
-impl actor::Actor for GatewayActor {
-    fn meta(&self) -> Self::Meta {
+impl actor::Actor<GatewayMessageSet> for GatewayActor {
+    fn meta(&self) -> usize {
         0
     }
 
-    fn get_observable_state(&self) -> Self::ObservableState {}
+    fn get_observable_state(&self) -> () {}
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(
+        &mut self,
+        ctx: &mut actor::ActorContext<GatewayMessageSet>,
+    ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             // biased toward writing to socket
@@ -60,8 +65,8 @@ impl actor::Actor for GatewayActor {
 
     async fn on_high_priority(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
+        _ctx: &mut actor::ActorContext<GatewayMessageSet>,
+        msg: GatewayControlMessage,
     ) -> () {
         match msg {
             GatewayControlMessage::AddParticipant(ufrag, participant) => {
@@ -82,8 +87,8 @@ impl actor::Actor for GatewayActor {
 
     async fn on_low_priority(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::LowPriorityMsg,
+        _ctx: &mut actor::ActorContext<GatewayMessageSet>,
+        msg: GatewayDataMessage,
     ) -> () {
         match msg {
             // TODO: each participant needs to own their pacers and bandwidth estimator.
@@ -190,4 +195,4 @@ impl GatewayActor {
     }
 }
 
-pub type GatewayHandle = actor::ActorHandle<GatewayActor>;
+pub type GatewayHandle = actor::ActorHandle<GatewayMessageSet>;

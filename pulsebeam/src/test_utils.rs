@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
-use crate::{entity, system};
-use pulsebeam_runtime::net;
+use crate::{entity, message::TrackMeta, system, track};
+use pulsebeam_runtime::{actor, net};
 use str0m::media::Mid;
 
 pub fn create_participant_id() -> Arc<entity::ParticipantId> {
@@ -44,4 +44,20 @@ pub async fn create_system_ctx() -> system::SystemContext {
 pub fn create_track_id() -> Arc<entity::TrackId> {
     let participant_id = create_participant_id();
     Arc::new(entity::TrackId::new(participant_id, Mid::new()))
+}
+
+pub fn spawn_fake_track() -> (
+    track::TrackHandle,
+    actor::JoinHandle<track::TrackMessageSet>,
+) {
+    let participant_id = create_participant_id();
+    let mid = Mid::new();
+    let id = Arc::new(entity::TrackId::new(participant_id, mid));
+    let meta = Arc::new(TrackMeta {
+        id,
+        kind: str0m::media::MediaKind::Video,
+        simulcast_rids: None,
+    });
+    let fake = track::test::FakeTrackActor::new(meta);
+    actor::spawn_default(fake)
 }

@@ -57,7 +57,7 @@ pub struct ParticipantContext {
     system_ctx: system::SystemContext,
     room_handle: room::RoomHandle,
     rtc: Rtc,
-    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackActor>>,
+    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackMessageSet>>,
 }
 
 impl ParticipantContext {
@@ -112,6 +112,15 @@ impl ParticipantContext {
     }
 }
 
+pub struct ParticipantMessageSet;
+
+impl actor::MessageSet for ParticipantMessageSet {
+    type HighPriorityMsg = ParticipantControlMessage;
+    type LowPriorityMsg = ParticipantDataMessage;
+    type Meta = Arc<entity::ParticipantId>;
+    type ObservableState = ();
+}
+
 /// Manages WebRTC participant connections and media routing
 ///
 /// Core responsibilities:
@@ -130,21 +139,17 @@ pub struct ParticipantActor {
     effects: VecDeque<effect::Effect>,
 }
 
-impl actor::MessageSet for ParticipantActor {
-    type HighPriorityMsg = ParticipantControlMessage;
-    type LowPriorityMsg = ParticipantDataMessage;
-    type Meta = Arc<entity::ParticipantId>;
-    type ObservableState = ();
-}
-
-impl actor::Actor for ParticipantActor {
-    fn meta(&self) -> Self::Meta {
+impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
+    fn meta(&self) -> Arc<entity::ParticipantId> {
         self.core.participant_id.clone()
     }
 
-    fn get_observable_state(&self) -> Self::ObservableState {}
+    fn get_observable_state(&self) -> () {}
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(
+        &mut self,
+        ctx: &mut actor::ActorContext<ParticipantMessageSet>,
+    ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx,
             pre_select: {
                 let timeout = match self.poll().await {
@@ -169,8 +174,8 @@ impl actor::Actor for ParticipantActor {
 
     async fn on_high_priority(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
+        _ctx: &mut actor::ActorContext<ParticipantMessageSet>,
+        msg: ParticipantControlMessage,
     ) {
         match msg {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
@@ -193,8 +198,8 @@ impl actor::Actor for ParticipantActor {
 
     async fn on_low_priority(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::LowPriorityMsg,
+        _ctx: &mut actor::ActorContext<ParticipantMessageSet>,
+        msg: ParticipantDataMessage,
     ) {
         match msg {
             ParticipantDataMessage::UdpPacket(packet) => {
@@ -409,4 +414,4 @@ impl ParticipantActor {
     }
 }
 
-pub type ParticipantHandle = actor::ActorHandle<ParticipantActor>;
+pub type ParticipantHandle = actor::ActorHandle<ParticipantMessageSet>;

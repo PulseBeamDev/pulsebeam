@@ -31,6 +31,15 @@ pub enum TrackControlMessage {
     Unsubscribe(Arc<ParticipantId>),
 }
 
+pub struct TrackMessageSet;
+
+impl actor::MessageSet for TrackMessageSet {
+    type HighPriorityMsg = TrackControlMessage;
+    type LowPriorityMsg = TrackDataMessage;
+    type Meta = Arc<TrackMeta>;
+    type ObservableState = ();
+}
+
 /// Responsibilities:
 /// * Represent a Single Published Track
 /// * Manage Track Subscribers
@@ -50,24 +59,17 @@ pub struct TrackActor {
     pinned_rid: Option<Rid>,
 }
 
-impl actor::MessageSet for TrackActor {
-    type HighPriorityMsg = TrackControlMessage;
-    type LowPriorityMsg = TrackDataMessage;
-    type Meta = Arc<TrackMeta>;
-    type ObservableState = ();
-}
-
-impl actor::Actor for TrackActor {
-    fn meta(&self) -> Self::Meta {
+impl actor::Actor<TrackMessageSet> for TrackActor {
+    fn meta(&self) -> Arc<TrackMeta> {
         self.meta.clone()
     }
 
-    fn get_observable_state(&self) -> Self::ObservableState {}
+    fn get_observable_state(&self) -> () {}
 
     async fn on_high_priority(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
+        _ctx: &mut actor::ActorContext<TrackMessageSet>,
+        msg: TrackControlMessage,
     ) -> () {
         match msg {
             TrackControlMessage::Subscribe(participant) => {
@@ -87,8 +89,8 @@ impl actor::Actor for TrackActor {
 
     async fn on_low_priority(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
-        msg: Self::LowPriorityMsg,
+        _ctx: &mut actor::ActorContext<TrackMessageSet>,
+        msg: TrackDataMessage,
     ) -> () {
         match msg {
             TrackDataMessage::ForwardMedia(data) => {
@@ -167,63 +169,54 @@ impl TrackActor {
     }
 }
 
-pub type TrackHandle = actor::ActorHandle<TrackActor>;
+pub type TrackHandle = actor::ActorHandle<TrackMessageSet>;
 
-// #[cfg(test)]
-// pub mod test {
-//     use crate::entity;
-//
-//     use super::*;
-//     use pulsebeam_runtime::{actor::JoinHandle, test_utils::FakeActor};
-//     use str0m::media::Mid;
-//
-//     type HighPriorityMsg = TrackControlMessage;
-//     type LowPriorityMsg = TrackDataMessage;
-//     type Meta = Arc<TrackMeta>;
-//     type State = ();
-//     type Fake = FakeActor<Meta, State, HighPriorityMsg, LowPriorityMsg>;
-//
-//     pub struct FakeTrackActor {
-//         fake: FakeActor<Meta, State, HighPriorityMsg, LowPriorityMsg>,
-//     }
-//
-//     impl FakeTrackActor {
-//         pub fn new(track_meta: Arc<TrackMeta>) -> Self {
-//             let fake = pulsebeam_runtime::test_utils::FakeActor::new(
-//                 track_meta,
-//                 (),
-//                 Arc::new(|_state, _msg| {}),
-//                 Arc::new(|_state, _msg| {}),
-//             );
-//             Self { fake }
-//         }
-//     }
-//
-//     impl Default for FakeTrackActor {
-//         fn default() -> Self {
-//             Self::new(new_fake_meta())
-//         }
-//     }
-//
-//     pub fn spawn_default() -> (TrackHandle, JoinHandle<Fake>) {
-//         let fake: Fake = pulsebeam_runtime::test_utils::FakeActor::new(
-//             new_fake_meta(),
-//             (),
-//             Arc::new(|_state, _msg| {}),
-//             Arc::new(|_state, _msg| {}),
-//         );
-//         actor::spawn(fake, actor::RunnerConfig::default())
-//     }
-//
-//     pub fn new_fake_meta() -> Arc<TrackMeta> {
-//         let participant_id = Arc::new(entity::ParticipantId::new());
-//         let mid = Mid::new();
-//         let id = entity::TrackId::new(participant_id, mid);
-//         let meta = TrackMeta {
-//             id,
-//             kind: str0m::media::MediaKind::Video,
-//             simulcast_rids: None,
-//         };
-//         Arc::new(meta)
-//     }
-// }
+#[cfg(test)]
+pub mod test {
+    use super::{TrackControlMessage, TrackDataMessage};
+    use crate::{message::TrackMeta, track::TrackMessageSet};
+    use pulsebeam_runtime::actor::{Actor, ActorContext};
+    use std::sync::{Arc, Mutex};
+
+    /// A fake TrackActor implementation that records incoming state and messages.
+    /// Useful for testing components that interact with tracks.
+    pub struct FakeTrackActor {
+        pub meta: Arc<TrackMeta>,
+        pub received_high: Arc<Mutex<Vec<TrackControlMessage>>>,
+        pub received_low: Arc<Mutex<Vec<TrackDataMessage>>>,
+    }
+
+    impl Actor<TrackMessageSet> for FakeTrackActor {
+        fn meta(&self) -> Arc<TrackMeta> {
+            self.meta.clone()
+        }
+
+        fn get_observable_state(&self) {}
+
+        async fn on_high_priority(
+            &mut self,
+            _ctx: &mut ActorContext<TrackMessageSet>,
+            msg: TrackControlMessage,
+        ) {
+            self.received_high.lock().unwrap().push(msg);
+        }
+
+        async fn on_low_priority(
+            &mut self,
+            _ctx: &mut ActorContext<TrackMessageSet>,
+            msg: TrackDataMessage,
+        ) {
+            self.received_low.lock().unwrap().push(msg);
+        }
+    }
+
+    impl FakeTrackActor {
+        pub fn new(meta: Arc<TrackMeta>) -> Self {
+            Self {
+                meta,
+                received_high: Arc::new(Mutex::new(Vec::new())),
+                received_low: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+}

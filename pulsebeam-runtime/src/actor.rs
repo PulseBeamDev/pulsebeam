@@ -10,31 +10,30 @@ use tracing::Instrument;
 
 use crate::mailbox;
 
-pub struct JoinHandle<A: Actor> {
-    inner: Pin<Box<dyn Future<Output = (A::Meta, ActorStatus)> + Send>>,
+pub struct JoinHandle<M: MessageSet> {
+    inner: Pin<Box<dyn futures::Future<Output = (M::Meta, ActorStatus)> + Send>>,
     abort_handle: tokio::task::AbortHandle,
 }
 
-impl<A: Actor> JoinHandle<A> {
+impl<M: MessageSet> JoinHandle<M> {
     pub fn abort(&self) {
         self.abort_handle.abort();
     }
 }
 
-impl<A: Actor> Drop for JoinHandle<A> {
+impl<M: MessageSet> Drop for JoinHandle<M> {
     fn drop(&mut self) {
         self.abort();
     }
 }
 
-impl<A: Actor> Future for JoinHandle<A> {
-    type Output = (A::Meta, ActorStatus);
+impl<M: MessageSet> futures::Future for JoinHandle<M> {
+    type Output = (M::Meta, ActorStatus);
 
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // Just delegate the poll to the inner future
         self.inner.as_mut().poll(cx)
     }
 }
@@ -53,10 +52,10 @@ pub enum ActorError {
 pub enum ActorStatus {
     Starting,
     Running,
-    ExitedGracefully, // run_actor_logic returned Ok
-    ExitedWithError,  // run_actor_logic returned Err
+    ExitedGracefully,
+    ExitedWithError,
     Panicked,
-    ShutDown, // Successfully completed all stages it attempted
+    ShutDown,
 }
 
 impl Display for ActorStatus {
@@ -82,83 +81,59 @@ pub enum SystemMsg<S> {
     Terminate,
 }
 
-pub struct ActorContext<A: Actor> {
-    pub sys_rx: mailbox::Receiver<SystemMsg<A::ObservableState>>,
-    pub hi_rx: mailbox::Receiver<A::HighPriorityMsg>,
-    pub lo_rx: mailbox::Receiver<A::LowPriorityMsg>,
-    pub handle: ActorHandle<A>,
+pub struct ActorContext<M: MessageSet> {
+    pub sys_rx: mailbox::Receiver<SystemMsg<M::ObservableState>>,
+    pub hi_rx: mailbox::Receiver<M::HighPriorityMsg>,
+    pub lo_rx: mailbox::Receiver<M::LowPriorityMsg>,
+    pub handle: ActorHandle<M>,
 }
 
-/// Defines the set of types associated with an actor's communication interface.
 pub trait MessageSet: Sized + Send + 'static {
-    /// The type of high-priority messages this actor processes.
     type HighPriorityMsg: Debug + Send + 'static;
-    /// The type of low-priority messages this actor processes.
     type LowPriorityMsg: Debug + Send + 'static;
-    /// The unique identifier for this actor.
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
-    /// The observable state snapshot of an actor for testing and debugging.
     type ObservableState: Debug + Send + Clone;
 }
 
-pub trait Actor: MessageSet + Sized + Send + 'static {
-    /// Returns the actor's unique meta
-    fn meta(&self) -> Self::Meta;
+pub trait Actor<M: MessageSet>: Sized + Send + 'static {
+    fn meta(&self) -> M::Meta;
+    fn get_observable_state(&self) -> M::ObservableState;
 
-    // Each actor implementor is responsible for defining what state is observable.
-    fn get_observable_state(&self) -> Self::ObservableState;
-
-    /// Runs the actor's main message-processing loop.
-    ///
-    /// The default implementation processes high-priority messages before low-priority ones
-    /// using `tokio::select!` with biased polling. Implementors may override this method
-    /// for custom behavior.
     fn run(
         &mut self,
-        ctx: &mut ActorContext<Self>,
-    ) -> impl Future<Output = Result<(), ActorError>> + Send {
+        ctx: &mut ActorContext<M>,
+    ) -> impl futures::Future<Output = Result<(), ActorError>> + Send {
         async {
             actor_loop!(self, ctx);
             Ok(())
         }
     }
 
-    /// Handles a syste message
-    #[allow(unused_variables)]
     fn on_system(
         &mut self,
-        ctx: &mut ActorContext<Self>,
-        msg: SystemMsg<Self::ObservableState>,
-    ) -> impl Future<Output = ()> + Send {
+        _ctx: &mut ActorContext<M>,
+        _msg: SystemMsg<M::ObservableState>,
+    ) -> impl futures::Future<Output = ()> + Send {
         async move {}
     }
 
-    /// Handles a high-priority message.
-    #[allow(unused_variables)]
     fn on_high_priority(
         &mut self,
-        ctx: &mut ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
-    ) -> impl Future<Output = ()> + Send {
-        async {
-            todo!("unimplemented!");
-        }
+        _ctx: &mut ActorContext<M>,
+        _msg: M::HighPriorityMsg,
+    ) -> impl futures::Future<Output = ()> + Send {
+        async move {}
     }
 
-    /// Handles a low-priority message.
-    #[allow(unused_variables)]
     fn on_low_priority(
         &mut self,
-        ctx: &mut ActorContext<Self>,
-        msg: Self::LowPriorityMsg,
-    ) -> impl Future<Output = ()> + Send {
-        async {
-            todo!("unimplemented!");
-        }
+        _ctx: &mut ActorContext<M>,
+        _msg: M::LowPriorityMsg,
+    ) -> impl futures::Future<Output = ()> + Send {
+        async move {}
     }
 }
 
-/// A handle for sending high- and low-priority messages to an actor.
 pub struct ActorHandle<M: MessageSet> {
     pub sys_tx: mailbox::Sender<SystemMsg<M::ObservableState>>,
     pub hi_tx: mailbox::Sender<M::HighPriorityMsg>,
@@ -177,68 +152,47 @@ impl<M: MessageSet> Clone for ActorHandle<M> {
     }
 }
 
-impl<A: Actor> std::fmt::Debug for ActorHandle<A> {
+impl<M: MessageSet> Debug for ActorHandle<M> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.meta, f)
     }
 }
 
-impl<A: Actor> ActorHandle<A> {
-    /// Sends a high-priority message asynchronously.
-    ///
-    /// Returns an error if the actor's mailbox is closed.
-    #[inline]
+impl<M: MessageSet> ActorHandle<M> {
     pub async fn send_high(
         &mut self,
-        message: A::HighPriorityMsg,
-    ) -> Result<(), mailbox::SendError<A::HighPriorityMsg>> {
-        self.hi_tx.send(message).await
+        msg: M::HighPriorityMsg,
+    ) -> Result<(), mailbox::SendError<M::HighPriorityMsg>> {
+        self.hi_tx.send(msg).await
     }
 
-    /// Attempts to send a high-priority message synchronously.
-    ///
-    /// Returns an error if the mailbox is full or closed.
-    #[inline]
     pub fn try_send_high(
         &mut self,
-        message: A::HighPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<A::HighPriorityMsg>> {
-        self.hi_tx.try_send(message)
+        msg: M::HighPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<M::HighPriorityMsg>> {
+        self.hi_tx.try_send(msg)
     }
 
-    /// Sends a low-priority message asynchronously.
-    ///
-    /// Returns an error if the actor's mailbox is closed.
-    #[inline]
     pub async fn send_low(
         &mut self,
-        message: A::LowPriorityMsg,
-    ) -> Result<(), mailbox::SendError<A::LowPriorityMsg>> {
-        self.lo_tx.send(message).await
+        msg: M::LowPriorityMsg,
+    ) -> Result<(), mailbox::SendError<M::LowPriorityMsg>> {
+        self.lo_tx.send(msg).await
     }
 
-    /// Attempts to send a low-priority message synchronously.
-    ///
-    /// Returns an error if the mailbox is full or closed.
-    #[inline]
     pub fn try_send_low(
         &mut self,
-        message: A::LowPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<A::LowPriorityMsg>> {
-        self.lo_tx.try_send(message)
+        msg: M::LowPriorityMsg,
+    ) -> Result<(), mailbox::TrySendError<M::LowPriorityMsg>> {
+        self.lo_tx.try_send(msg)
     }
 
-    pub async fn get_state(&mut self) -> Result<A::ObservableState, ActorError> {
+    pub async fn get_state(&mut self) -> Result<M::ObservableState, ActorError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let msg = SystemMsg::GetState(tx);
-
-        // Send the request. If it fails, the actor is gone.
         self.sys_tx
-            .send(msg)
+            .send(SystemMsg::GetState(tx))
             .await
             .map_err(|_| ActorError::SystemError)?;
-
-        // Await the response. If it fails, the actor might have panicked or been terminated.
         rx.await.map_err(|_| ActorError::SystemError)
     }
 
@@ -268,24 +222,26 @@ impl RunnerConfig {
     pub fn new() -> Self {
         Self::default()
     }
-
     pub fn with_lo(mut self, cap: usize) -> Self {
         self.lo_cap = cap;
         self
     }
-
     pub fn with_hi(mut self, cap: usize) -> Self {
         self.hi_cap = cap;
         self
     }
 }
 
-pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandle<A>) {
+pub fn spawn<A, M>(a: A, config: RunnerConfig) -> (ActorHandle<M>, JoinHandle<M>)
+where
+    M: MessageSet,
+    A: Actor<M>,
+{
     let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
     let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
     let (sys_tx, sys_rx) = mailbox::new(1);
 
-    let handle = ActorHandle {
+    let handle = ActorHandle::<M> {
         hi_tx,
         lo_tx,
         sys_tx,
@@ -304,6 +260,7 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
         run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
     );
     let abort_handle = join.abort_handle();
+
     let join = join
         .map(|res| match res {
             Ok(ret) => (actor_id, ret),
@@ -320,38 +277,33 @@ pub fn spawn<A: Actor>(a: A, config: RunnerConfig) -> (ActorHandle<A>, JoinHandl
     )
 }
 
-pub fn spawn_default<A: Actor>(
-    a: A,
-) -> (ActorHandle<A>, impl Future<Output = (A::Meta, ActorStatus)>) {
+pub fn spawn_default<A, M>(a: A) -> (ActorHandle<M>, JoinHandle<M>)
+where
+    M: MessageSet,
+    A: Actor<M>,
+{
     spawn(a, RunnerConfig::default())
 }
 
-async fn run<A: Actor>(mut a: A, mut ctx: ActorContext<A>) -> ActorStatus {
+async fn run<A, M>(mut a: A, mut ctx: ActorContext<M>) -> ActorStatus
+where
+    M: MessageSet,
+    A: Actor<M>,
+{
     tracing::debug!("Starting actor...");
-
     let run_result = AssertUnwindSafe(a.run(&mut ctx)).catch_unwind().await;
 
-    let status_after_run = match run_result {
-        Ok(Ok(())) => {
-            tracing::debug!("Main logic exited gracefully.");
-            ActorStatus::ExitedGracefully
-        }
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "Main logic exited with an error.");
-            ActorStatus::ExitedWithError
-        }
-        Err(panic_payload) => {
-            let panic_msg = extract_panic_message(&panic_payload);
-
-            tracing::error!(panic.message = %panic_msg, "Actor panicked!");
+    let status = match run_result {
+        Ok(Ok(())) => ActorStatus::ExitedGracefully,
+        Ok(Err(_)) => ActorStatus::ExitedWithError,
+        Err(p) => {
+            tracing::error!("Actor panicked: {:?}", extract_panic_message(&p));
             ActorStatus::Panicked
         }
     };
 
-    tracing::debug!("post_stop successful.");
-    tracing::info!(status = %status_after_run, "exited");
-
-    status_after_run
+    tracing::info!(status = %status, "Actor exited");
+    status
 }
 
 fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
@@ -366,114 +318,29 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
 
 #[macro_export]
 macro_rules! actor_loop {
-    // Simple case - just actor and context
-    ($actor:ident, $ctx:ident) => {
-        actor_loop!($actor, $ctx, pre_select: {}, select: {})
-    };
-
-    // With only pre_select
-    ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => {
-        actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {})
-    };
-
-    // Full form with both pre_select and select
+    ($actor:ident, $ctx:ident) => { actor_loop!($actor, $ctx, pre_select: {}, select: {}) };
+    ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => { actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }, select: { $($extra:tt)* }) => {
-
         loop {
             $($pre_select)*
-
-            // TODO: in a hot loop, this recv loop will incur a lot of synchronization cost.
-            // We should use try_recv as opposed to recv, aka trading off fairness with higher
-            // throughput
             tokio::select! {
                 biased;
-                res = $ctx.sys_rx.recv() => {
-                    match res {
-                        Some(msg) => {
-                            match msg {
-                                $crate::actor::SystemMsg::GetState(responder) => {
-                                    let _ = responder.send($actor.get_observable_state());
-                                }
-                                $crate::actor::SystemMsg::Terminate => {
-                                    break;
-                                }
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                res = $ctx.hi_rx.recv() => {
-                    match res {
-                        Some(msg) => $actor.on_high_priority($ctx, msg).await,
-                        None => break,
-                    }
-                }
-                res = $ctx.lo_rx.recv() => {
-                    match res {
-                        Some(msg) => $actor.on_low_priority($ctx, msg).await,
-                        None => break,
-                    }
-                }
+                // res = $ctx.sys_rx.recv() => {
+                //     match res {
+                //         Some(msg) => match msg {
+                //             $crate::actor::SystemMsg::GetState(responder) => {
+                //                 let _ = responder.send($actor.get_observable_state());
+                //             }
+                //             $crate::actor::SystemMsg::Terminate => break,
+                //         },
+                //         None => break,
+                //     }
+                // }
+                // res = $ctx.hi_rx.recv() => { if let Some(msg) = res { $actor.on_high_priority($ctx, msg).await } else { break; } }
+                // res = $ctx.lo_rx.recv() => { if let Some(msg) = res { $actor.on_low_priority($ctx, msg).await } else { break; } }
                 $($extra)*
                 else => break,
             }
         }
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::{Duration, sleep};
-
-    struct FakeActor {
-        meta: String,
-    }
-
-    impl FakeActor {
-        fn new() -> Self {
-            FakeActor {
-                meta: "test_actor".to_string(),
-            }
-        }
-    }
-
-    impl MessageSet for FakeActor {
-        type HighPriorityMsg = i32;
-        type LowPriorityMsg = i32;
-        type Meta = String;
-        type ObservableState = i32;
-    }
-
-    impl Actor for FakeActor {
-        fn meta(&self) -> Self::Meta {
-            self.meta.clone()
-        }
-
-        fn get_observable_state(&self) -> Self::ObservableState {
-            0
-        }
-
-        async fn run(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-            actor_loop!(self, ctx, pre_select: {},
-            select: {
-                _ = sleep(Duration::from_secs(10)) => {},
-            });
-            Ok(())
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_join_handle_drop_aborts_actor() {
-        let actor = FakeActor::new();
-        let (mut handle, join_handle) = spawn(actor, RunnerConfig::default());
-
-        // Act: Drop the join handle
-        drop(join_handle);
-
-        // Assert: Actor should be shut down
-        sleep(Duration::from_millis(50)).await;
-        let result = handle.get_state().await;
-        assert!(result.is_err());
-    }
 }

@@ -30,6 +30,15 @@ pub struct ParticipantMeta {
     ufrag: String, // HACK:
 }
 
+pub struct RoomMessageSet;
+
+impl actor::MessageSet for RoomMessageSet {
+    type Meta = Arc<RoomId>;
+    type HighPriorityMsg = RoomMessage;
+    type LowPriorityMsg = ();
+    type ObservableState = RoomState;
+}
+
 /// Reponsibilities:
 /// * Manage Participant Lifecycle
 /// * Manage Track Lifecycle
@@ -41,7 +50,7 @@ pub struct RoomActor {
     system_ctx: system::SystemContext,
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
-    participant_tasks: FuturesUnordered<actor::JoinHandle<participant::ParticipantActor>>,
+    participant_tasks: FuturesUnordered<actor::JoinHandle<participant::ParticipantMessageSet>>,
     state: RoomState,
 }
 
@@ -51,23 +60,19 @@ pub struct RoomState {
     tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
 }
 
-impl actor::MessageSet for RoomActor {
-    type Meta = Arc<RoomId>;
-    type HighPriorityMsg = RoomMessage;
-    type LowPriorityMsg = ();
-    type ObservableState = RoomState;
-}
-
-impl actor::Actor for RoomActor {
-    fn meta(&self) -> Self::Meta {
+impl actor::Actor<RoomMessageSet> for RoomActor {
+    fn meta(&self) -> Arc<RoomId> {
         self.room_id.clone()
     }
 
-    fn get_observable_state(&self) -> Self::ObservableState {
+    fn get_observable_state(&self) -> RoomState {
         self.state.clone()
     }
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(
+        &mut self,
+        ctx: &mut actor::ActorContext<RoomMessageSet>,
+    ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx,
             pre_select: {
                 let empty_room_timer =
@@ -94,8 +99,8 @@ impl actor::Actor for RoomActor {
 
     async fn on_high_priority(
         &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
+        ctx: &mut actor::ActorContext<RoomMessageSet>,
+        msg: RoomMessage,
     ) -> () {
         match msg {
             RoomMessage::AddParticipant(participant_id, rtc) => {
@@ -127,7 +132,7 @@ impl RoomActor {
 
     async fn handle_participant_joined(
         &mut self,
-        ctx: &mut actor::ActorContext<Self>,
+        ctx: &mut actor::ActorContext<RoomMessageSet>,
         participant_id: Arc<ParticipantId>,
         mut rtc: str0m::Rtc,
     ) {
@@ -262,7 +267,7 @@ impl RoomActor {
     }
 }
 
-pub type RoomHandle = actor::ActorHandle<RoomActor>;
+pub type RoomHandle = actor::ActorHandle<RoomMessageSet>;
 
 // #[cfg(test)]
 // mod test {

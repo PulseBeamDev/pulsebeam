@@ -39,6 +39,15 @@ pub enum ControllerMessage {
     RemoveParticipant(Arc<RoomId>, Arc<ParticipantId>),
 }
 
+pub struct ControllerMessageSet;
+
+impl actor::MessageSet for ControllerMessageSet {
+    type HighPriorityMsg = ControllerMessage;
+    type LowPriorityMsg = ();
+    type Meta = Arc<String>;
+    type ObservableState = ();
+}
+
 pub struct ControllerActor {
     system_ctx: system::SystemContext,
 
@@ -46,24 +55,20 @@ pub struct ControllerActor {
     local_addrs: Vec<SocketAddr>,
 
     rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
-    room_tasks: FuturesUnordered<actor::JoinHandle<room::RoomActor>>,
+    room_tasks: FuturesUnordered<actor::JoinHandle<room::RoomMessageSet>>,
 }
 
-impl actor::MessageSet for ControllerActor {
-    type HighPriorityMsg = ControllerMessage;
-    type LowPriorityMsg = ();
-    type Meta = Arc<String>;
-    type ObservableState = ();
-}
-
-impl actor::Actor for ControllerActor {
-    fn meta(&self) -> Self::Meta {
+impl actor::Actor<ControllerMessageSet> for ControllerActor {
+    fn meta(&self) -> Arc<String> {
         self.id.clone()
     }
 
-    fn get_observable_state(&self) -> Self::ObservableState {}
+    fn get_observable_state(&self) -> () {}
 
-    async fn run(&mut self, ctx: &mut actor::ActorContext<Self>) -> Result<(), actor::ActorError> {
+    async fn run(
+        &mut self,
+        ctx: &mut actor::ActorContext<ControllerMessageSet>,
+    ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
             select: {
                 Some((room_id, _)) = self.room_tasks.next() => {
@@ -76,8 +81,8 @@ impl actor::Actor for ControllerActor {
 
     async fn on_high_priority(
         &mut self,
-        ctx: &mut actor::ActorContext<Self>,
-        msg: Self::HighPriorityMsg,
+        ctx: &mut actor::ActorContext<ControllerMessageSet>,
+        msg: ControllerMessage,
     ) -> () {
         match msg {
             ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
@@ -99,7 +104,7 @@ impl actor::Actor for ControllerActor {
 impl ControllerActor {
     pub async fn allocate(
         &mut self,
-        _ctx: &mut actor::ActorContext<Self>,
+        _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         room_id: Arc<RoomId>,
         participant_id: Arc<ParticipantId>,
         offer: String,
@@ -191,4 +196,4 @@ impl ControllerActor {
     }
 }
 
-pub type ControllerHandle = actor::ActorHandle<ControllerActor>;
+pub type ControllerHandle = actor::ActorHandle<ControllerMessageSet>;
