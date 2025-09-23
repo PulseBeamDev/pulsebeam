@@ -144,6 +144,7 @@ Use browser-native APIs — no SDK lock-in:
 ## Modules
 
 * [pulsebeam](./pulsebeam): PulseBeam SFU
+* [pulsebeam-runtime](./pulsebeam-runtime): PulseBeam SFU Runtime
 
 ---
 
