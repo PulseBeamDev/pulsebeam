@@ -41,7 +41,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
 
     async fn run(
         &mut self,
-        _ctx: &mut actor::ActorContext<GatewayMessageSet>,
+        ctx: &mut actor::ActorContext<GatewayMessageSet>,
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {

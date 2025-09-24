@@ -67,7 +67,7 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
 
     async fn run(
         &mut self,
-        _ctx: &mut actor::ActorContext<ControllerMessageSet>,
+        ctx: &mut actor::ActorContext<ControllerMessageSet>,
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
             select: {
@@ -124,17 +124,26 @@ impl ControllerActor {
         // embedded devices, smartphones, OBS only supports H264.
         // Baseline profile to ensure compatibility with all platforms.
         codec_config.add_h264(
-            108.into(),       // PT for video
-            Some(109.into()), // RTX PT
+            127.into(),       // PT for video
+            Some(121.into()), // RTX PT
             true,             // packetization-mode = 1
             0x42e01f,         // Baseline 3.1
         );
-        // codec_config.add_h264(
-        //     127.into(),       // PT for video
-        //     Some(121.into()), // RTX PT
-        //     true,             // packetization-mode = 1 (fragmented)
-        //     0x42001f,         // Constrained Baseline 3.1
-        // );
+        codec_config.add_h264(
+            108.into(),       // PT for video
+            Some(109.into()), // RTX PT
+            true,             // packetization-mode = 1
+            0x42001f,         // Constrained Baseline 3.1
+        );
+
+        // TODO: OBS only supports Baseline level 3.1
+        // // ESP32-P4 supports up to 1080p@30fps
+        // // https://components.espressif.com/components/espressif/esp_h264/versions/1.1.3/readme
+        // // Baseline Level 4.0, (pt=127, rtx=121)
+        // codec_config.add_h264(127.into(), Some(121.into()), true, 0x420028);
+        // // Constrained Baseline Level 4.0, (pt=108, rtx=109)
+        // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
+
         let mut rtc = rtc_config.build();
 
         for addr in self.local_addrs.iter() {

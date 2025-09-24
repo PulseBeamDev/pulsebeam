@@ -101,7 +101,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
 
     fn run(
         &mut self,
-        _ctx: &mut ActorContext<M>,
+        ctx: &mut ActorContext<M>,
     ) -> impl futures::Future<Output = Result<(), ActorError>> + Send {
         async {
             actor_loop!(self, ctx);
@@ -325,19 +325,19 @@ macro_rules! actor_loop {
             $($pre_select)*
             tokio::select! {
                 biased;
-                // res = $ctx.sys_rx.recv() => {
-                //     match res {
-                //         Some(msg) => match msg {
-                //             $crate::actor::SystemMsg::GetState(responder) => {
-                //                 let _ = responder.send($actor.get_observable_state());
-                //             }
-                //             $crate::actor::SystemMsg::Terminate => break,
-                //         },
-                //         None => break,
-                //     }
-                // }
-                // res = $ctx.hi_rx.recv() => { if let Some(msg) = res { $actor.on_high_priority($ctx, msg).await } else { break; } }
-                // res = $ctx.lo_rx.recv() => { if let Some(msg) = res { $actor.on_low_priority($ctx, msg).await } else { break; } }
+                res = $ctx.sys_rx.recv() => {
+                    match res {
+                        Some(msg) => match msg {
+                            $crate::actor::SystemMsg::GetState(responder) => {
+                                let _ = responder.send($actor.get_observable_state());
+                            }
+                            $crate::actor::SystemMsg::Terminate => break,
+                        },
+                        None => break,
+                    }
+                }
+                res = $ctx.hi_rx.recv() => { if let Some(msg) = res { $actor.on_high_priority($ctx, msg).await } else { break; } }
+                res = $ctx.lo_rx.recv() => { if let Some(msg) = res { $actor.on_low_priority($ctx, msg).await } else { break; } }
                 $($extra)*
                 else => break,
             }
