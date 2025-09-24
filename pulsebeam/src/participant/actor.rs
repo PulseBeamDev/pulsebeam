@@ -389,7 +389,7 @@ impl ParticipantActor {
             return;
         };
 
-        let Some(writer) = self.ctx.rtc.writer(*mid) else {
+        let Some(writer) = self.ctx.rtc.writer(mid) else {
             return;
         };
 

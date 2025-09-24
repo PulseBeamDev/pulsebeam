@@ -34,7 +34,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 futures = "0.3.31"
 rand = "0.9"
-str0m = { git = "https://github.com/algesten/str0m.git", rev = "783b020ff7c859372884889e205c5c838792e97a" }
+str0m = { git = "https://github.com/PulseBeamDev/str0m.git", rev = "b030ae90ab5b0174b58572eaee89fbc74089668c" }
 bytes = "1.10.1"
 
 [workspace]

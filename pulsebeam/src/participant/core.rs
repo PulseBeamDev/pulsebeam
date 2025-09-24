@@ -35,7 +35,7 @@ impl ParticipantCore {
         self.published_tracks.get_mut(mid)
     }
 
-    pub fn get_slot(&mut self, track_meta: &Arc<TrackMeta>, data: &Arc<MediaData>) -> Option<&Mid> {
+    pub fn get_slot(&mut self, track_meta: &Arc<TrackMeta>, data: &Arc<MediaData>) -> Option<Mid> {
         match track_meta.kind {
             MediaKind::Video => self.video_allocator.get_slot(&track_meta.id),
             MediaKind::Audio => self.audio_allocator.get_slot(

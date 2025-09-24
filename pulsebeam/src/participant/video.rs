@@ -68,11 +68,11 @@ impl VideoAllocator {
         Some(&mut track.handle)
     }
 
-    pub fn get_slot(&mut self, track_id: &Arc<entity::TrackId>) -> Option<&Mid> {
+    pub fn get_slot(&mut self, track_id: &Arc<entity::TrackId>) -> Option<Mid> {
         let track = self.tracks.get(track_id)?;
         let mid = track.mid.as_ref()?;
 
-        Some(mid)
+        Some(*mid)
     }
 
     pub fn subscribe(&mut self, _track_id: &Arc<entity::TrackId>, _mid: &Mid) {

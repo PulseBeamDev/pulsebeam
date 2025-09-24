@@ -299,6 +299,7 @@ impl AsRef<str> for ExternalParticipantId {
     }
 }
 
+#[derive(PartialOrd, Ord, Eq, PartialEq, Hash)]
 pub struct TrackId {
     pub internal: Arc<EntityId>,
     pub origin_participant: Arc<ParticipantId>,
@@ -313,20 +314,6 @@ impl TrackId {
             origin_participant: participant_id,
             origin_mid: mid,
         }
-    }
-}
-
-impl hash::Hash for TrackId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.internal.hash(state);
-    }
-}
-
-impl Eq for TrackId {}
-
-impl PartialEq for TrackId {
-    fn eq(&self, other: &Self) -> bool {
-        self.internal.eq(&other.internal)
     }
 }
 

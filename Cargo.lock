@@ -2172,7 +2172,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "str0m"
 version = "0.10.0"
-source = "git+https://github.com/algesten/str0m.git?rev=783b020ff7c859372884889e205c5c838792e97a#783b020ff7c859372884889e205c5c838792e97a"
+source = "git+https://github.com/PulseBeamDev/str0m.git?rev=b030ae90ab5b0174b58572eaee89fbc74089668c#b030ae90ab5b0174b58572eaee89fbc74089668c"
 dependencies = [
  "combine",
  "crc",
@@ -2185,7 +2185,6 @@ dependencies = [
  "sctp-proto",
  "serde",
  "sha1",
- "thiserror 1.0.69",
  "tracing",
 ]
 
