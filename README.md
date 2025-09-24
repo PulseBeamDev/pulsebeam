@@ -24,7 +24,13 @@ Clients (browsers, mobile, embedded, bots)
  External agents (recorders, transcoding, AI)
 ```
 
----
+## Compatibility
+
+To ensure wide hardware acceleration support, compatibility with embedded devices, and a minimal feature set, PulseBeam is opinionated about its media handling:
+
+* **Video**: H.264 Baseline Profile, Level 3.1 only.
+* **Audio**: Opus only.
+* **Data Channel**: Not yet supported.
 
 ## Quickstart
 
