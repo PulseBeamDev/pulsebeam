@@ -15,7 +15,7 @@ env:
   # The name of the Docker image to be built and pushed to GHCR
   # The image name is derived from the GitHub repository name and the GitHub Container Registry (GHCR) URL.
   # The image name will be in the format: ghcr.io/<owner>/<repo>
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/pulsebeam
+  GHCR_IMAGE: ghcr.io/pulsebeamdev/pulsebeam
 
 permissions:
   # Global permissions for the workflow, which can be overridden at the job level
