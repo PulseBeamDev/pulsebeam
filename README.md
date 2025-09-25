@@ -34,69 +34,115 @@ To ensure wide hardware acceleration support, compatibility with embedded device
 
 ## Quickstart
 
-The easiest way to run PulseBeam is with Docker:
+Getting started is a simple, step-by-step process. First, you'll run the server on your machine, and then you'll connect to it using the browser-based demos.
+
+### Step 1: Run the PulseBeam Server
+
+You must have the server running before the demo clients can connect. The easiest way to start it is with Docker.
+
+Open your terminal and run the following command:
 
 ```bash
 docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.12
-````
+```
 
-Other ways to run:
+This command starts the PulseBeam server, which is now listening for connections on your machine. Keep this terminal window running.
 
-* **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases)
-* **Source:** `cargo run --release -p pulsebeam`
+> **Other ways to run:**
+>
+> *   **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
+> *   **Source:** `cargo run --release -p pulsebeam`
 
+### Step 2: Run the Browser Demo
 
-### Demo: Broadcast
+With the server running, you can use the demo clients. The snippets below show the core JavaScript logic.
 
-The following snippets demonstrate how to use the browser-native WebRTC API to interact with PulseBeam. The HTML and UI code has been removed for clarity.
+**Note:** The linked JSFiddles are configured to connect to `http://localhost:3000` and are intended to be run on the **same machine** as the server. See the section below for instructions on testing with other devices.
 
-Full, runnable examples are available in the JSFiddle links.
+#### A. Start the Publisher
 
-#### Publisher (sends video)
+The publisher page accesses your webcam and sends the video stream to your local PulseBeam server.
 
-This snippet shows the core JavaScript logic for publishing a video stream.
+*   **[Open Publisher Demo in JSFiddle](https://jsfiddle.net/lherman/0bqe6xnv/)**
+
+Once the page loads, click **"Start Publishing"** to begin the stream.
 
 ```javascript
+// Core publisher logic
 const pc = new RTCPeerConnection();
 
+// 1. Get user's video and add it to the connection
 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-pc.addTransceiver("video", { direction: "sendonly" }).sender.replaceTrack(stream.getVideoTracks()[0]);
+const trans = pc.addTransceiver("video", { direction: "sendonly" });
+trans.sender.replaceTrack(stream.getVideoTracks()[0]);
 
+// 2. Create an SDP offer and send it to your local PulseBeam server
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
-
 const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
   method: "POST",
   headers: { "Content-Type": "application/sdp" },
   body: offer.sdp
 });
 
-await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+// 3. Set the remote description with PulseBeam's answer
+const answer = await res.text();
+await pc.setRemoteDescription({ type: "answer", sdp: answer });
 ```
 
-**See the full example:** [Open Publisher JSFiddle](https://jsfiddle.net/lherman/0bqe6xnv/) 
+---
 
-#### Viewer (receives video)
+#### B. Start the Viewer
+
+The viewer page subscribes to the video stream. Open the link in a **new browser tab on the same machine** to test.
+
+*   **[Open Viewer Demo in JSFiddle](https://jsfiddle.net/lherman/xotv9h6m)**
+
+Click **"Start Viewing,"** and you should see the video from the publisher tab.
 
 ```javascript
+// Core viewer logic
 const pc = new RTCPeerConnection();
 
+// 1. Set up the connection to receive video
 pc.addTransceiver("video", { direction: "recvonly" });
 pc.ontrack = e => remoteVideo.srcObject = e.streams[0]; // 'remoteVideo' is a <video> element
 
+// 2. Create an SDP offer to signal intent to receive
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
-
 const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
   method: "POST",
   headers: { "Content-Type": "application/sdp" },
   body: offer.sdp
 });
 
-await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+// 3. Set the remote description with PulseBeam's answer
+const answer = await res.text();
+await pc.setRemoteDescription({ type: "answer", sdp: answer });
 ```
 
-**See the full example:** [Open Viewer JSFiddle](https://jsfiddle.net/lherman/xotv9h6m) 
+### Optional: Testing From Another Device
+
+To run the viewer on a different device on your local network (like your phone), you must replace `localhost` with your computer's local network IP address.
+
+1.  **Find your computer's Local IP Address.** On the machine running the Docker container, open a terminal and run:
+    *   **macOS / Linux**: `ifconfig` or `ip a`
+    *   **Windows**: `ipconfig`
+    Look for an address like `192.168.1.123`.
+
+2.  **Modify the JSFiddle Code.** Open the [Viewer JSFiddle](https://jsfiddle.net/lherman/xotv9h6m) on your second device. In the JavaScript panel, find the `fetch` call and replace `localhost` with your computer's IP address:
+
+    ```javascript
+    // Change this line in the JSFiddle on your second device
+    const res = await fetch("http://YOUR_COMPUTER_IP_ADDRESS:3000/api/v1/rooms/demo", {
+        // ...
+    });
+    ```
+
+3.  **Run the demo.** Now, when you click "Start Viewing," it will connect to the server running on your other computer.
+
+> **Note:** This may require you to adjust your computer's firewall settings to allow incoming connections on port `3000`.
 
 ## Roadmap
 
