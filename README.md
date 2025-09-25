@@ -122,28 +122,6 @@ const answer = await res.text();
 await pc.setRemoteDescription({ type: "answer", sdp: answer });
 ```
 
-### Optional: Testing From Another Device
-
-To run the viewer on a different device on your local network (like your phone), you must replace `localhost` with your computer's local network IP address.
-
-1.  **Find your computer's Local IP Address.** On the machine running the Docker container, open a terminal and run:
-    *   **macOS / Linux**: `ifconfig` or `ip a`
-    *   **Windows**: `ipconfig`
-    Look for an address like `192.168.1.123`.
-
-2.  **Modify the JSFiddle Code.** Open the [Viewer JSFiddle](https://jsfiddle.net/lherman/xotv9h6m) on your second device. In the JavaScript panel, find the `fetch` call and replace `localhost` with your computer's IP address:
-
-    ```javascript
-    // Change this line in the JSFiddle on your second device
-    const res = await fetch("http://YOUR_COMPUTER_IP_ADDRESS:3000/api/v1/rooms/demo", {
-        // ...
-    });
-    ```
-
-3.  **Run the demo.** Now, when you click "Start Viewing," it will connect to the server running on your other computer.
-
-> **Note:** This may require you to adjust your computer's firewall settings to allow incoming connections on port `3000`.
-
 ## Roadmap
 
 * ✅ Prototype: working basic audio/video Rust SFU + demo
