@@ -1,5 +1,6 @@
 [workspace]
-members = ["cargo:."]
+# members = ["cargo:."]
+members = ["cargo:./pulsebeam"]
 
 # Config for 'dist'
 [dist]
