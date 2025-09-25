@@ -30,12 +30,14 @@ aarch64-apple-darwin = "macos-15"
 pkg-config = "*"
 ffmpeg = "*"
 protobuf = "*"
+nasm = "*"
 
 [dist.dependencies.apt]
 build-essential = "*"
 clang = "*"
 pkg-config = "*"
 protobuf-compiler = "*"
+nasm = "*"
 
 # ffmpeg dependencies
 libavcodec-dev = "*" 
@@ -48,3 +50,4 @@ libavdevice-dev = "*"
 msys2 = "*" # like build-essential on ubuntu
 ffmpeg = "*"
 protoc = "*"
+nasm = "*"
