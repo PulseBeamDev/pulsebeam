@@ -46,3 +46,6 @@ prost-build = "0.14.1"
 # [patch."https://github.com/algesten/str0m.git"]
 # str0m = { path = "../../str0m" }
 
+# Windows-specific str0m override
+[target.'cfg(windows)'.dependencies]
+str0m = { workspace = true, features = ["wincrypto"] }
