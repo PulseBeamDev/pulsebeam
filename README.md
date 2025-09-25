@@ -48,96 +48,55 @@ Other ways to run:
 
 ### Demo: Broadcast
 
-Use browser-native APIs — no SDK lock-in:
+The following snippets demonstrate how to use the browser-native WebRTC API to interact with PulseBeam. The HTML and UI code has been removed for clarity.
+
+Full, runnable examples are available in the JSFiddle links.
 
 #### Publisher (sends video)
 
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-</head>
-<body>
-  <h3>Publisher</h3>
-  <video id="localVideo" autoplay playsinline style="width:320px;height:240px;border:1px solid #ccc;"></video>
-  <button id="startBtn">Start Publishing</button>
-  <span id="status">Not connected</span>
+This snippet shows the core JavaScript logic for publishing a video stream.
 
-  <script type="module">
-    const status = document.getElementById("status");
-    const localVideo = document.getElementById("localVideo");
-    document.getElementById('startBtn').onclick = async () => {
-      const pc = new RTCPeerConnection();
+```javascript
+const pc = new RTCPeerConnection();
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      localVideo.srcObject = stream;
+const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+pc.addTransceiver("video", { direction: "sendonly" }).sender.replaceTrack(stream.getVideoTracks()[0]);
 
-      pc.addTransceiver("video", { direction: "sendonly" }).sender.replaceTrack(stream.getVideoTracks()[0]);
-      pc.onconnectionstatechange = () => status.textContent = pc.connectionState;
+const offer = await pc.createOffer();
+await pc.setLocalDescription(offer);
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
+  method: "POST",
+  headers: { "Content-Type": "application/sdp" },
+  body: offer.sdp
+});
 
-      const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
-        method: "POST",
-        headers: { "Content-Type": "application/sdp" },
-        body: offer.sdp
-      });
+await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+```
 
-      await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
-      console.log("Publishing started");
-    };
-  </script>
-</body>
-</html>
-````
-
-**Run it immediately:** [Open Publisher JSFiddle](https://jsfiddle.net/lherman/0bqe6xnv/)
-
----
+**See the full example:** [Open Publisher JSFiddle](https://jsfiddle.net/lherman/0bqe6xnv/) 
 
 #### Viewer (receives video)
 
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-</head>
-<body>
-  <h3>Viewer</h3>
-  <video id="remoteVideo" autoplay playsinline style="width:320px;height:240px;border:1px solid #ccc;"></video>
-  <button id="viewBtn">Start Viewing</button>
-  <span id="status">disconnected</span>
+```javascript
+const pc = new RTCPeerConnection();
 
-  <script type="module">
-    const status = document.getElementById("status");
-    const remoteVideo = document.getElementById("remoteVideo");
-    document.getElementById('viewBtn').onclick = async () => {
-      const pc = new RTCPeerConnection();
-      pc.addTransceiver("video", { direction: "recvonly" });
-      pc.ontrack = e => remoteVideo.srcObject = e.streams[0];
-      pc.onconnectionstatechange = () => status.textContent = pc.connectionState;
+pc.addTransceiver("video", { direction: "recvonly" });
+pc.ontrack = e => remoteVideo.srcObject = e.streams[0]; // 'remoteVideo' is a <video> element
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+const offer = await pc.createOffer();
+await pc.setLocalDescription(offer);
 
-      const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
-        method: "POST",
-        headers: { "Content-Type": "application/sdp" },
-        body: offer.sdp
-      });
+const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
+  method: "POST",
+  headers: { "Content-Type": "application/sdp" },
+  body: offer.sdp
+});
 
-      await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
-      console.log("Viewing started");
-    };
-  </script>
-</body>
-</html>
+await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 ```
 
-**Run it immediately:** [Open Viewer JSFiddle](https://jsfiddle.net/lherman/xotv9h6m)
+**See the full example:** [Open Viewer JSFiddle](https://jsfiddle.net/lherman/xotv9h6m) 
 
 ## Roadmap
 
