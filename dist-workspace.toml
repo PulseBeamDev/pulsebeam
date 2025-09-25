@@ -49,6 +49,7 @@ libavdevice-dev = "*"
 
 [dist.dependencies.chocolatey]
 msys2 = "*" # like build-essential on ubuntu
+llvm = "*"
 ffmpeg = "*"
 protoc = "*"
 nasm = "*"
