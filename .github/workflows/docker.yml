@@ -91,6 +91,9 @@ jobs:
         uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
           images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=ref,event=branch,pattern={{ github.ref_name }}    # for branch builds
+            type=ref,event=tag,pattern={{ github.ref_name }}       # for tag builds
 
       - name: Set up Docker Context for Buildx
         # This step sets up a Docker context for Buildx.
