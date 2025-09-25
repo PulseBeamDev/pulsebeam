@@ -9,6 +9,15 @@ documentation.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = ["ffmpeg-static"]
+
+# Force static linking (default)
+ffmpeg-static = ["ffmpeg-next/static"]
+
+# Use dynamic linking instead
+ffmpeg-dynamic = []
+
 [dependencies]
 futures = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +27,9 @@ bytes = { workspace = true }
 
 tokio = { workspace = true, optional = true }
 reqwest = { version = "0.12.23", optional = true }
-ffmpeg-next = "8.0.0"
 maybe-async = "0.2.10"
 http = "1.3.1"
+
+# FFmpeg integration
+ffmpeg-next = { version = "8.0.0", default-features = false, features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
+
