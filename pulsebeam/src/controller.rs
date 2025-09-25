@@ -123,18 +123,24 @@ impl ControllerActor {
         // h264 as the lowest common denominator due to small clients like
         // embedded devices, smartphones, OBS only supports H264.
         // Baseline profile to ensure compatibility with all platforms.
-        codec_config.add_h264(
-            127.into(),       // PT for video
-            Some(121.into()), // RTX PT
-            true,             // packetization-mode = 1
-            0x42e01f,         // Baseline 3.1
-        );
-        codec_config.add_h264(
-            108.into(),       // PT for video
-            Some(109.into()), // RTX PT
-            true,             // packetization-mode = 1
-            0x42001f,         // Constrained Baseline 3.1
-        );
+
+        // Level 3.1 to 4.1. This is mainly to support clients that don't handle
+        // level-asymmetry-allowed=true properly.
+        let baseline_levels = [0x1f, 0x20, 0x28, 0x29];
+        for level in &baseline_levels {
+            codec_config.add_h264(
+                127.into(),       // PT for video
+                Some(121.into()), // RTX PT
+                true,             // packetization-mode = 1
+                0x42e000 | level, // Baseline
+            );
+            codec_config.add_h264(
+                108.into(),       // PT for video
+                Some(109.into()), // RTX PT
+                true,             // packetization-mode = 1
+                0x420000 | level, // Constrained Baseline
+            );
+        }
 
         // TODO: OBS only supports Baseline level 3.1
         // // ESP32-P4 supports up to 1080p@30fps

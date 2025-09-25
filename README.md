@@ -28,8 +28,8 @@ Clients (browsers, mobile, embedded, bots)
 
 To ensure wide hardware acceleration support, compatibility with embedded devices, and a minimal feature set, PulseBeam is opinionated about its media handling:
 
-* **Video**: H.264 Baseline Profile, Level 3.1 only.
-* **Audio**: Opus only.
+* **Video**: H.264 Baseline profile up to Level 4.1.
+* **Audio**: Opus.
 * **Data Channel**: Not yet supported.
 
 ## Quickstart
