@@ -1,6 +1,5 @@
 [workspace]
-# members = ["cargo:."]
-members = ["cargo:./pulsebeam"]
+members = ["cargo:."]
 
 # Config for 'dist'
 [dist]
@@ -46,6 +45,6 @@ libavfilter-dev = "*"
 libavdevice-dev = "*"
 
 [dist.dependencies.chocolatey]
-pkg-config = "*"
+msys2 = "*" # like build-essential on ubuntu
 ffmpeg = "*"
 protoc = "*"
