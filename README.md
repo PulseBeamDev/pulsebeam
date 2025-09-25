@@ -37,7 +37,7 @@ To ensure wide hardware acceleration support, compatibility with embedded device
 The easiest way to run PulseBeam is with Docker:
 
 ```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.11
+docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.12
 ````
 
 Other ways to run:
