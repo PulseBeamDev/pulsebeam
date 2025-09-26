@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use pulsebeam::node;
 use pulsebeam_runtime::{net, rt};
-use systemstat::{Platform, System};
+use systemstat::{IpAddr as SysIpAddr, Platform, System};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -76,8 +76,9 @@ pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
             .expect("bind to udp socket");
     let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
-        "server listening at http://{}:3000 or http://localhost:3000",
+        "server listening at {}:3000 (signaling) and {}:3478 (webrtc)",
         external_ip,
+        external_ip
     );
 
     // Run the main logic and signal handler concurrently
@@ -94,19 +95,60 @@ pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
 
 pub fn select_host_address() -> IpAddr {
     let system = System::new();
-    let networks = system.networks().unwrap();
+    let networks = match system.networks() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("could not get network interfaces: {e}");
+            return IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        }
+    };
 
-    for net in networks.values() {
+    let mut external_candidates = vec![];
+    let mut lan_candidates = vec![];
+
+    for (name, net) in &networks {
+        // skip virtual / docker / bridge interfaces
+        if name.starts_with("docker")
+            || name.starts_with("veth")
+            || name.starts_with("br-")
+            || name.starts_with("virbr")
+        {
+            tracing::debug!("skipping virtual interface {}", name);
+            continue;
+        }
+
+        // optionally restrict to known LAN interface patterns
+        if !(name.starts_with("en") || name.starts_with("eth") || name.starts_with("wlp")) {
+            tracing::debug!("skipping non-lan interface {}", name);
+            continue;
+        }
+
         for n in &net.addrs {
-            tracing::debug!("found {:?}", n.addr);
-            if let systemstat::IpAddr::V4(v) = n.addr
-                && !v.is_loopback()
-                && !v.is_broadcast()
-            {
-                return IpAddr::V4(v);
+            if let SysIpAddr::V4(ipv4) = n.addr {
+                if ipv4.is_loopback() {
+                    tracing::debug!("skipping loopback {}: {}", name, ipv4);
+                    continue;
+                }
+
+                if !ipv4.is_private() {
+                    external_candidates.push(IpAddr::V4(ipv4));
+                    tracing::info!("found candidate external ip on {}: {}", name, ipv4);
+                } else {
+                    lan_candidates.push(IpAddr::V4(ipv4));
+                    tracing::info!("found candidate lan ip on {}: {}", name, ipv4);
+                }
             }
         }
     }
 
-    panic!("Found no usable network interface");
+    if let Some(ip) = external_candidates.first() {
+        tracing::info!("selecting external ip: {}", ip);
+        *ip
+    } else if let Some(ip) = lan_candidates.first() {
+        tracing::info!("selecting lan ip: {}", ip);
+        *ip
+    } else {
+        tracing::warn!("falling back to localhost");
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    }
 }
