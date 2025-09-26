@@ -87,7 +87,7 @@ pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received SIGINT, shutting down gracefully...");
-                shutdown.cancel();
+            shutdown.cancel();
         }
     }
 }

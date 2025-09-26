@@ -1,38 +1,49 @@
+# Directory and binary settings
 TARGET_DIR = target/profiling
 BINARY = $(TARGET_DIR)/pulsebeam
 
 # Rust settings
 CARGO = cargo
-RUSTFLAGS = -C force-frame-pointers=yes
+SCCACHE := $(shell which sccache)
+PROFILING_RUSTFLAGS = -C force-frame-pointers=yes
 
-# Default: Build and capture flamegraph
+# Development build and run
+.PHONY: dev
+dev:
+	$(CARGO) run -p pulsebeam
+
+# Default target: Build and capture flamegraph
 .PHONY: all
 all: build flamegraph
 
 # Build with profiling profile
 .PHONY: build
 build:
-	$(CARGO) build --profile profiling -p pulsebeam
+	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) $(CARGO) build --profile profiling -p pulsebeam
 
 # Capture flamegraph
 .PHONY: flamegraph
 flamegraph:
-	taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
+	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
+# Install Homebrew dependencies
+.PHONY: brew-deps
 brew-deps:
 	brew install git-cliff axodotdev/tap/cargo-dist
 
+# Install Cargo dependencies
+.PHONY: cargo-deps
 cargo-deps:
-	cargo install cargo-smart-release --features allow-emoji
-	cargo install flamegraph
+	RUSTC_WRAPPER=$(SCCACHE) $(CARGO) install cargo-smart-release --features allow-emoji
+	RUSTC_WRAPPER=$(SCCACHE) $(CARGO) install flamegraph
 
+# Release with smart-release
+.PHONY: release
 release:
-	cargo smart-release --execute
+	RUSTC_WRAPPER=$(SCCACHE) $(CARGO) build --release -p pulsebeam
 
 # Clean build artifacts and flamegraph data
 .PHONY: clean
 clean:
 	$(CARGO) clean
-	rm -f perf.data
-	rm -f flamegraph.svg
-
+	rm -f perf.data flamegraph.svg
