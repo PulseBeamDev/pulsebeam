@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  pulsebeam:
+    image: ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.12
+    restart: unless-stopped
+    network_mode: "host" # Linux only; uses real host IPs for WebRTC
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: "host" # shares host networking
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+configs:
+  caddyfile:
+    data: |
+      YOUR_DOMAIN_HERE {
+          reverse_proxy pulsebeam:3478
+
+          # rate limiting for HTTP requests (signaling)
+          @http_requests {
+              path /api/v1/*
+          }
+          rate_limit @http_requests {
+              window 1m
+              average 30
+              burst 50
+          }
+      }
