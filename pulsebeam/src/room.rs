@@ -151,7 +151,7 @@ impl RoomActor {
         self.participant_tasks.push(participant_join);
 
         self.node_ctx
-            .main_gateway
+            .gateway
             .send_high(gateway::GatewayControlMessage::AddParticipant(
                 ufrag.clone(),
                 participant_handle.clone(),
@@ -192,7 +192,7 @@ impl RoomActor {
         }
 
         self.node_ctx
-            .main_gateway
+            .gateway
             .send_high(gateway::GatewayControlMessage::RemoveParticipant(
                 participant.ufrag,
             ))

@@ -10,8 +10,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 #[derive(Clone)]
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-    pub main_gateway: gateway::GatewayHandle,
-    pub gateways: Vec<gateway::GatewayHandle>,
+    pub gateway: gateway::GatewayHandle,
     pub sockets: Vec<Arc<net::UnifiedSocket>>,
     egress_counter: Arc<AtomicUsize>,
 }
@@ -20,12 +19,11 @@ impl NodeContext {
     pub fn single(socket: net::UnifiedSocket) -> Self {
         let socket = Arc::new(socket);
 
-        let (gw, _) = actor::spawn_default(gateway::GatewayActor::new(socket.clone()));
+        let (gw, _) = actor::spawn_default(gateway::GatewayActor::new(vec![socket.clone()]));
 
         Self {
             rng: rand::Rng::from_os_rng(),
-            gateways: vec![gw.clone()],
-            main_gateway: gw,
+            gateway: gw,
             sockets: vec![socket.clone()],
             egress_counter: Arc::new(AtomicUsize::new(0)),
         }
@@ -46,9 +44,7 @@ pub async fn run(
     local_addr: SocketAddr,
     http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    let mut join_set = FuturesUnordered::new();
     let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
-    let mut gateways = Vec::new();
     for _ in 0..workers {
         let socket =
             match net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
@@ -65,21 +61,20 @@ pub async fn run(
             };
 
         let socket = Arc::new(socket);
-        let (gw, gw_join) = actor::spawn_default(gateway::GatewayActor::new(socket.clone()));
-        gateways.push(gw);
         sockets.push(socket);
-        join_set.push(gw_join.map(|_| ()).boxed());
     }
     let cors = CorsLayer::very_permissive()
         .allow_origin(AllowOrigin::mirror_request())
         .expose_headers([hyper::header::LOCATION])
         .max_age(Duration::from_secs(86400));
 
+    let mut join_set = FuturesUnordered::new();
+    let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
+    join_set.push(gateway_join.map(|_| ()).boxed());
     let rng = rand::Rng::from_os_rng();
     let node_ctx = NodeContext {
         rng,
-        main_gateway: gateways.first().expect("one gateway must exist").clone(),
-        gateways,
+        gateway,
         sockets,
         egress_counter: Arc::new(AtomicUsize::new(0)),
     };
