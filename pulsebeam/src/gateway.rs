@@ -8,16 +8,11 @@ pub enum GatewayControlMessage {
     RemoveParticipant(String),
 }
 
-#[derive(Debug)]
-pub enum GatewayDataMessage {
-    Packet(net::SendPacket),
-}
-
 pub struct GatewayMessageSet;
 
 impl actor::MessageSet for GatewayMessageSet {
     type HighPriorityMsg = GatewayControlMessage;
-    type LowPriorityMsg = GatewayDataMessage;
+    type LowPriorityMsg = ();
     type Meta = usize;
     type ObservableState = ();
 }
@@ -28,8 +23,6 @@ pub struct GatewayActor {
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
     recv_batch: Vec<net::RecvPacket>,
-    send_incoming_batch: Vec<net::SendPacket>,
-    send_outgoing_batch: Vec<net::SendPacket>,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayActor {
@@ -45,13 +38,6 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
-            // biased toward writing to socket
-            Ok(_) = self.socket.writable(), if !self.send_outgoing_batch.is_empty() || !self.send_incoming_batch.is_empty() => {
-                if let Err(err) = self.write_socket() {
-                    tracing::error!("failed to write socket: {err}");
-                    break;
-                }
-            }
             Ok(_) = self.socket.readable() => {
                 if let Err(err) = self.read_socket() {
                     tracing::error!("failed to read socket: {err}");
@@ -84,24 +70,6 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
             }
         }
     }
-
-    async fn on_low_priority(
-        &mut self,
-        _ctx: &mut actor::ActorContext<GatewayMessageSet>,
-        msg: GatewayDataMessage,
-    ) -> () {
-        match msg {
-            // TODO: each participant needs to own their pacers and bandwidth estimator.
-            // TODO: gateway needs to batch packets from multiple participants
-            GatewayDataMessage::Packet(packet) => {
-                // If the outgoing buffer is empty, swap it with the incoming one.
-                if self.send_outgoing_batch.is_empty() {
-                    std::mem::swap(&mut self.send_incoming_batch, &mut self.send_outgoing_batch);
-                }
-                self.send_incoming_batch.push(packet);
-            }
-        }
-    }
 }
 
 impl GatewayActor {
@@ -110,8 +78,6 @@ impl GatewayActor {
     pub fn new(socket: Arc<net::UnifiedSocket>) -> Self {
         // Pre-allocate receive batch with MTU-sized buffers
         let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
-        let send_incoming_batch = Vec::with_capacity(Self::BATCH_SIZE);
-        let send_outgoing_batch = Vec::with_capacity(Self::BATCH_SIZE);
 
         Self {
             socket,
@@ -119,8 +85,6 @@ impl GatewayActor {
             mapping: HashMap::new(),
             reverse: HashMap::new(),
             recv_batch,
-            send_incoming_batch,
-            send_outgoing_batch,
         }
     }
 
@@ -177,20 +141,6 @@ impl GatewayActor {
                 .try_send_low(participant::ParticipantDataMessage::UdpPacket(packet));
         }
 
-        Ok(())
-    }
-
-    fn write_socket(&mut self) -> io::Result<()> {
-        // If the outgoing buffer is empty, swap it with the incoming one.
-        if self.send_outgoing_batch.is_empty() {
-            std::mem::swap(&mut self.send_incoming_batch, &mut self.send_outgoing_batch);
-        }
-
-        // writable check MUST always make sure to only proceed with non-empty buffer.
-        assert!(!self.send_outgoing_batch.is_empty());
-        let sent_count = self.socket.try_send_batch(&self.send_outgoing_batch)?;
-        tracing::trace!("sent {sent_count} packets to socket");
-        self.send_outgoing_batch.drain(..sent_count);
         Ok(())
     }
 }

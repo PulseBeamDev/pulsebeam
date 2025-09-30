@@ -2,6 +2,7 @@ use crate::{api, controller, gateway};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
+use std::sync::atomic::AtomicUsize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -12,6 +13,30 @@ pub struct NodeContext {
     pub main_gateway: gateway::GatewayHandle,
     pub gateways: Vec<gateway::GatewayHandle>,
     pub sockets: Vec<Arc<net::UnifiedSocket>>,
+    egress_counter: Arc<AtomicUsize>,
+}
+
+impl NodeContext {
+    pub fn single(socket: net::UnifiedSocket) -> Self {
+        let socket = Arc::new(socket);
+
+        let (gw, _) = actor::spawn_default(gateway::GatewayActor::new(socket.clone()));
+
+        Self {
+            rng: rand::Rng::from_os_rng(),
+            gateways: vec![gw.clone()],
+            main_gateway: gw,
+            sockets: vec![socket.clone()],
+            egress_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn allocate_egress(&self) -> Arc<net::UnifiedSocket> {
+        let seq = self
+            .egress_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sockets.get(seq % self.sockets.len()).unwrap().clone()
+    }
 }
 
 pub async fn run(
@@ -56,6 +81,7 @@ pub async fn run(
         main_gateway: gateways.first().expect("one gateway must exist").clone(),
         gateways,
         sockets,
+        egress_counter: Arc::new(AtomicUsize::new(0)),
     };
 
     let controller_actor = controller::ControllerActor::new(
@@ -63,8 +89,7 @@ pub async fn run(
         vec![external_addr],
         Arc::new("root".to_string()),
     );
-    let (controller_handle, controller_join) =
-        actor::spawn(controller_actor, actor::RunnerConfig::default());
+    let (controller_handle, controller_join) = actor::spawn_default(controller_actor);
     join_set.push(controller_join.map(|_| ()).boxed());
 
     // HTTP API
