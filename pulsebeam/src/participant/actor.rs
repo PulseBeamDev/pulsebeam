@@ -54,7 +54,7 @@ pub enum ParticipantDataMessage {
 
 pub struct ParticipantContext {
     // Core dependencies
-    system_ctx: system::SystemContext,
+    system_ctx: system::NodeContext,
     room_handle: room::RoomHandle,
     rtc: Rtc,
     track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackMessageSet>>,
@@ -233,7 +233,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
 impl ParticipantActor {
     pub fn new(
-        system_ctx: system::SystemContext,
+        system_ctx: system::NodeContext,
         room_handle: room::RoomHandle,
         participant_id: Arc<entity::ParticipantId>,
         rtc: Rtc,

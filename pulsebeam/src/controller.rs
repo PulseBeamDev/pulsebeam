@@ -49,7 +49,7 @@ impl actor::MessageSet for ControllerMessageSet {
 }
 
 pub struct ControllerActor {
-    system_ctx: system::SystemContext,
+    system_ctx: system::NodeContext,
 
     id: Arc<String>,
     local_addrs: Vec<SocketAddr>,
@@ -197,7 +197,7 @@ impl ControllerActor {
 
 impl ControllerActor {
     pub fn new(
-        system_ctx: system::SystemContext,
+        system_ctx: node::NodeContext,
         local_addrs: Vec<SocketAddr>,
         id: Arc<String>,
     ) -> Self {

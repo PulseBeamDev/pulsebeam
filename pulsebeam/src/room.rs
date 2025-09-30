@@ -47,7 +47,7 @@ impl actor::MessageSet for RoomMessageSet {
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
-    system_ctx: system::SystemContext,
+    system_ctx: system::NodeContext,
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
     participant_tasks: FuturesUnordered<actor::JoinHandle<participant::ParticipantMessageSet>>,
@@ -121,7 +121,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 }
 
 impl RoomActor {
-    pub fn new(system_ctx: system::SystemContext, room_id: Arc<RoomId>) -> Self {
+    pub fn new(system_ctx: system::NodeContext, room_id: Arc<RoomId>) -> Self {
         Self {
             system_ctx,
             room_id,

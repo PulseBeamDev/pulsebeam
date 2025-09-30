@@ -28,7 +28,7 @@ pub fn create_sim<'a>() -> turmoil::Sim<'a> {
         .build()
 }
 
-pub async fn create_system_ctx() -> system::SystemContext {
+pub async fn create_system_ctx() -> system::NodeContext {
     let external_addr = "192.168.1.1:3478".parse().unwrap();
     let socket = net::UnifiedSocket::bind(
         (Ipv4Addr::LOCALHOST, 0).into(),
@@ -37,7 +37,7 @@ pub async fn create_system_ctx() -> system::SystemContext {
     )
     .await
     .unwrap();
-    let (system_ctx, _) = system::SystemContext::spawn(socket);
+    let (system_ctx, _) = system::NodeContext::spawn(socket);
     system_ctx
 }
 

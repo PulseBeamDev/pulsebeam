@@ -8,7 +8,6 @@ pub mod node;
 pub mod participant;
 pub mod proto;
 pub mod room;
-pub mod system;
 pub mod track;
 
 #[cfg(test)]

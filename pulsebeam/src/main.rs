@@ -7,7 +7,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::net::{IpAddr, SocketAddr};
 
 use pulsebeam::{gateway, node};
-use pulsebeam_runtime::{net, rt};
+use pulsebeam_runtime::{
+    actor::{self, RunnerConfig},
+    net, rt,
+};
 use systemstat::{IpAddr as SysIpAddr, Platform, System};
 use tracing_subscriber::EnvFilter;
 
@@ -31,32 +34,20 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(workers)
         .build()
         .unwrap();
 
-
     let shutdown = CancellationToken::new();
+    rt.block_on(run(shutdown, workers));
     shutdown.cancel();
 }
 
-pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
-    let mut socket_pool: Vec<Arc<net::UnifiedSocket>> = Vec::new();
+pub async fn run(shutdown: CancellationToken, workers: usize) {
     let external_ip = select_host_address();
     let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
 
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
-    let unified_socket =
-        net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
-            .await
-            .expect("bind to udp socket");
-
-                // TODO: when bind fails due to unavailable SO_REUSEPORT, we need to fallback
-                // either cloning existing socket using Arc clone or just spawn 1 gateway
-                let unified_socket =
-                    net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
-                        .await
-                        .expect("bind to udp socket");
-                gateway::GatewayActor::new(socket)
     let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
         "server listening at {}:3000 (signaling) and {}:3478 (webrtc)",
@@ -66,7 +57,7 @@ pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(shutdown.clone(), cpu_rt, external_addr, unified_socket, http_addr) => {
+        Err(err) = node::run(shutdown.clone(), workers, external_addr, local_addr, http_addr) => {
             tracing::warn!("node exited with error: {err}");
         }
         _ = wait_for_signal() => {
