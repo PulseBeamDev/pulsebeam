@@ -118,6 +118,7 @@ impl<'a> UnifiedSocket<'a> {
 /// TODO:
 /// * Evaluate quinn-udp
 /// * Evaluate XDP
+/// * Evaluate AF_XDP Socket (XSK)
 /// * Evaluate io-uring
 pub struct UdpTransport<'a> {
     sock: tokio::net::UdpSocket,
