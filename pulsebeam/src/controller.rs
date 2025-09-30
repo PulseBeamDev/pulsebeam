@@ -2,7 +2,7 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
     entity::{ParticipantId, RoomId},
-    room, system,
+    node, room,
 };
 use futures::stream::FuturesUnordered;
 use pulsebeam_runtime::actor;
@@ -49,7 +49,7 @@ impl actor::MessageSet for ControllerMessageSet {
 }
 
 pub struct ControllerActor {
-    system_ctx: system::NodeContext,
+    node_ctx: node::NodeContext,
 
     id: Arc<String>,
     local_addrs: Vec<SocketAddr>,
@@ -183,7 +183,7 @@ impl ControllerActor {
             handle.clone()
         } else {
             tracing::info!("create_room: {}", room_id);
-            let room_actor = room::RoomActor::new(self.system_ctx.clone(), room_id.clone());
+            let room_actor = room::RoomActor::new(self.node_ctx.clone(), room_id.clone());
             let (room_handle, room_join) =
                 actor::spawn(room_actor, actor::RunnerConfig::default().with_hi(1024));
             self.room_tasks.push(room_join);
@@ -203,7 +203,7 @@ impl ControllerActor {
     ) -> Self {
         Self {
             id,
-            system_ctx,
+            node_ctx: system_ctx,
             local_addrs,
             rooms: HashMap::new(),
             room_tasks: FuturesUnordered::new(),

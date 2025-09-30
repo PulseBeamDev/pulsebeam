@@ -9,6 +9,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 #[derive(Clone)]
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
+    pub main_gateway: gateway::GatewayHandle,
     pub gateways: Vec<gateway::GatewayHandle>,
     pub sockets: Vec<Arc<net::UnifiedSocket>>,
 }
@@ -20,6 +21,7 @@ pub async fn run(
     local_addr: SocketAddr,
     http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
+    let mut join_set = FuturesUnordered::new();
     let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
     let mut gateways = Vec::new();
     for _ in 0..workers {
@@ -41,29 +43,29 @@ pub async fn run(
         let (gw, gw_join) = actor::spawn_default(gateway::GatewayActor::new(socket.clone()));
         gateways.push(gw);
         sockets.push(socket);
+        join_set.push(gw_join.map(|_| ()).boxed());
     }
     let cors = CorsLayer::very_permissive()
         .allow_origin(AllowOrigin::mirror_request())
         .expose_headers([hyper::header::LOCATION])
         .max_age(Duration::from_secs(86400));
 
-    let mut join_set = FuturesUnordered::new();
     let rng = rand::Rng::from_os_rng();
-
     let node_ctx = NodeContext {
         rng,
+        main_gateway: gateways.first().expect("one gateway must exist").clone(),
         gateways,
         sockets,
     };
 
-    let shutdown_for_controller = shutdown.clone();
     let controller_actor = controller::ControllerActor::new(
-        system_ctx,
+        node_ctx,
         vec![external_addr],
         Arc::new("root".to_string()),
     );
     let (controller_handle, controller_join) =
         actor::spawn(controller_actor, actor::RunnerConfig::default());
+    join_set.push(controller_join.map(|_| ()).boxed());
 
     // HTTP API
     let api_cfg = api::ApiConfig {
