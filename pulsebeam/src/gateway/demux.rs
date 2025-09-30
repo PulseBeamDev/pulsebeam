@@ -1,4 +1,5 @@
 use crate::entity::ParticipantId;
+use crate::gateway::ice;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ enum PacketType {
     Stun,
     Rtp,
     Rtcp,
+    Dtls,
     Unknown,
 }
 
@@ -35,11 +37,14 @@ impl PacketType {
         if byte <= 0x01 {
             return PacketType::Stun;
         }
-        let version = byte >> 6;
-        if version != 2 {
-            return PacketType::Unknown;
+        if byte >= 20 && byte <= 64 {
+            return PacketType::Dtls; // handshake, alert, change_cipher_spec, app data
         }
-        PacketType::Rtp // cheap, RTCP handled by SSRC extractor
+        let version = byte >> 6;
+        if version == 2 {
+            return PacketType::Rtp; // SSRC distinguishes RTP vs RTCP
+        }
+        PacketType::Unknown
     }
 }
 
@@ -119,7 +124,7 @@ impl Demuxer {
 
         match PacketType::from_first_byte(data[0]) {
             PacketType::Stun => {
-                let ufrag = extract_stun_username(data)?;
+                let ufrag = ice::parse_stun_remote_ufrag_raw(data)?;
                 let expected = self.participant_ufrag.get(&participant_id)?;
                 if expected.as_ref() == ufrag {
                     Some(DemuxResult::Participant(participant_id))
@@ -136,6 +141,10 @@ impl Demuxer {
                     None
                 }
             }
+            PacketType::Dtls => {
+                // if it’s in the cache, we can accept it for this participant
+                Some(DemuxResult::Participant(participant_id))
+            }
             PacketType::Unknown => Some(DemuxResult::Rejected(RejectionReason::InvalidPacket)),
         }
     }
@@ -147,13 +156,20 @@ impl Demuxer {
         match PacketType::from_first_byte(data[0]) {
             PacketType::Stun => self.demux_stun(src, data),
             PacketType::Rtp | PacketType::Rtcp => self.demux_rtp(src, data),
+            PacketType::Dtls => {
+                if let Some(h) = self.addr_cache.get(&src) {
+                    DemuxResult::Participant(h.clone())
+                } else {
+                    DemuxResult::Rejected(RejectionReason::UnknownSource)
+                }
+            }
             PacketType::Unknown => DemuxResult::Rejected(RejectionReason::InvalidPacket),
         }
     }
 
     #[inline]
     fn demux_stun(&mut self, src: SocketAddr, data: &[u8]) -> DemuxResult {
-        if let Some(ufrag) = extract_stun_username(data) {
+        if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(data) {
             if let Some(h) = self.ice_ufrag_map.get(ufrag) {
                 self.addr_cache.insert(src, h.clone());
                 return DemuxResult::Participant(h.clone());
@@ -184,35 +200,6 @@ fn extract_ssrc(data: &[u8]) -> Option<u32> {
     } else {
         None
     }
-}
-
-/// Extract ICE ufrag from STUN (username attr 0x0006)
-#[inline]
-fn extract_stun_username(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < 20 {
-        return None;
-    }
-    if data[4..8] != [0x21, 0x12, 0xA4, 0x42] {
-        return None;
-    }
-    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-    let mut off = 20;
-    let end = 20 + msg_len.min(data.len() - 20);
-    while off + 4 <= end {
-        let attr_type = u16::from_be_bytes([data[off], data[off + 1]]);
-        let attr_len = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
-        if attr_type == 0x0006 {
-            let s = off + 4;
-            let e = s + attr_len;
-            if e <= data.len() {
-                let v = &data[s..e];
-                return v.split(|&b| b == b':').next();
-            }
-            return None;
-        }
-        off += 4 + ((attr_len + 3) & !3);
-    }
-    None
 }
 
 #[cfg(test)]
