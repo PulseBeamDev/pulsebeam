@@ -27,7 +27,6 @@ pub enum RoomMessage {
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
-    ufrag: String, // HACK:
 }
 
 pub struct RoomMessageSet;
@@ -163,7 +162,6 @@ impl RoomActor {
             ParticipantMeta {
                 handle: participant_handle.clone(),
                 tracks: HashMap::new(),
-                ufrag,
             },
         );
 
@@ -194,7 +192,7 @@ impl RoomActor {
         self.node_ctx
             .gateway
             .send_high(gateway::GatewayControlMessage::RemoveParticipant(
-                participant.ufrag,
+                participant_id,
             ))
             .await
             .expect("TODO: handle error");

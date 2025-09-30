@@ -1,15 +1,16 @@
 use crate::{
+    entity::ParticipantId,
     gateway::demux::{DemuxResult, Demuxer},
     participant,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::{actor, net};
-use std::{io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub enum GatewayControlMessage {
     AddParticipant(String, participant::ParticipantHandle),
-    RemoveParticipant(String),
+    RemoveParticipant(Arc<ParticipantId>),
 }
 
 pub struct GatewayMessageSet;
@@ -69,8 +70,6 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
 }
 
 impl GatewayActor {
-    const BATCH_SIZE: usize = 64;
-
     pub fn new(sockets: Vec<Arc<net::UnifiedSocket>>) -> Self {
         let workers = Vec::with_capacity(sockets.len());
         Self {
@@ -88,6 +87,8 @@ pub struct GatewayWorkerActor {
     socket: Arc<net::UnifiedSocket>,
     demuxer: Demuxer,
     recv_batch: Vec<net::RecvPacket>,
+
+    participants: HashMap<Arc<ParticipantId>, participant::ParticipantHandle>,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
@@ -104,7 +105,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             Ok(_) = self.socket.readable() => {
-                if let Err(err) = self.read_socket() {
+                if let Err(err) = self.read_socket().await {
                     tracing::error!("failed to read socket: {err}");
                     break;
                 }
@@ -112,6 +113,24 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         });
 
         Ok(())
+    }
+
+    async fn on_high_priority(
+        &mut self,
+        _ctx: &mut actor::ActorContext<GatewayMessageSet>,
+        msg: <GatewayMessageSet as actor::MessageSet>::HighPriorityMsg,
+    ) -> () {
+        match msg {
+            GatewayControlMessage::AddParticipant(ufrag, handle) => {
+                self.demuxer
+                    .register_ice_ufrag(ufrag.as_bytes(), handle.meta.clone());
+                self.participants.insert(handle.meta.clone(), handle);
+            }
+            GatewayControlMessage::RemoveParticipant(participant_id) => {
+                self.participants.remove(&participant_id);
+                self.demuxer.unregister(participant_id);
+            }
+        };
     }
 }
 
@@ -126,10 +145,11 @@ impl GatewayWorkerActor {
             socket,
             recv_batch,
             demuxer: Demuxer::new(),
+            participants: HashMap::with_capacity(1024),
         }
     }
 
-    fn read_socket(&mut self) -> io::Result<()> {
+    async fn read_socket(&mut self) -> io::Result<()> {
         // the loop after reading should always clear the buffer
         assert!(self.recv_batch.is_empty());
         let batch_size = self.recv_batch.capacity();
@@ -140,7 +160,16 @@ impl GatewayWorkerActor {
         tracing::trace!("received {count} packets from socket");
         for packet in self.recv_batch.iter() {
             match self.demuxer.demux(packet.src, &packet.buf) {
-                DemuxResult::Participant(handle) => todo!(),
+                DemuxResult::Participant(participant_id) => {
+                    if let Some(handle) = self.participants.get_mut(&participant_id) {
+                        handle
+                            .lo_tx
+                            .send(participant::ParticipantDataMessage::UdpPacket(
+                                packet.clone(),
+                            ))
+                            .await;
+                    }
+                }
                 DemuxResult::Rejected(reason) => tracing::debug!("rejected packet: {reason:?}"),
             }
         }
