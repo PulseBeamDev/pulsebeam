@@ -9,7 +9,7 @@ pub async fn run(
     shutdown: CancellationToken,
     cpu_rt: &rt::Runtime,
     external_addr: SocketAddr,
-    unified_socket: net::UnifiedSocket<'static>,
+    unified_socket: net::UnifiedSocket,
     http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::very_permissive()

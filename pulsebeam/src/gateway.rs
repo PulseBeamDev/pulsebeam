@@ -1,6 +1,6 @@
 use crate::{ice, participant};
 use pulsebeam_runtime::{actor, net};
-use std::{collections::HashMap, io, net::SocketAddr};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 #[derive(Debug)]
 pub enum GatewayControlMessage {
@@ -23,7 +23,7 @@ impl actor::MessageSet for GatewayMessageSet {
 }
 
 pub struct GatewayActor {
-    socket: net::UnifiedSocket<'static>,
+    socket: Arc<net::UnifiedSocket>,
     conns: HashMap<String, participant::ParticipantHandle>,
     mapping: HashMap<SocketAddr, participant::ParticipantHandle>,
     reverse: HashMap<String, Vec<SocketAddr>>,
@@ -107,7 +107,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
 impl GatewayActor {
     const BATCH_SIZE: usize = 64;
 
-    pub fn new(socket: net::UnifiedSocket<'static>) -> Self {
+    pub fn new(socket: Arc<net::UnifiedSocket>) -> Self {
         // Pre-allocate receive batch with MTU-sized buffers
         let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
         let send_incoming_batch = Vec::with_capacity(Self::BATCH_SIZE);
