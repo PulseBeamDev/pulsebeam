@@ -5,7 +5,10 @@ use tokio_util::sync::CancellationToken;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
+};
 
 use pulsebeam::node;
 use systemstat::{IpAddr as SysIpAddr, Platform, System};
@@ -20,13 +23,7 @@ fn main() {
         .pretty()
         .init();
 
-    let logical_cpus = num_cpus::get();
-    let physical_cpus = num_cpus::get_physical();
-    // Compute optimal worker threads for CPU-bound SFU tasks
-    let workers = logical_cpus.min(physical_cpus);
-
-    tracing::info!("detected logical CPUs: {}", logical_cpus);
-    tracing::info!("detected physical CPUs: {}", physical_cpus);
+    let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
