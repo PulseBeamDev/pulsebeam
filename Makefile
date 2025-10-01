@@ -26,6 +26,12 @@ build:
 flamegraph:
 	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
+.PHONY: perf
+perf:
+	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) cargo build --profile profiling -p pulsebeam --bin pulsebeam
+	taskset -c 2-5 perf record --call-graph dwarf ./target/profiling/pulsebeam
+	hotspot ./perf.data
+
 # Install Homebrew dependencies
 .PHONY: brew-deps
 brew-deps:
