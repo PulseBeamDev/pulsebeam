@@ -11,7 +11,7 @@ let localStream: MediaStream | null = null;
 let sessionUrl: string | null = null;
 
 window._injects = {
-  audio: true
+  audio: true,
 };
 
 form.onsubmit = async (e) => {
@@ -24,7 +24,7 @@ form.onsubmit = async (e) => {
     toggleBtn.textContent = "Stop";
     try {
       await start(endpoint);
-    } catch(e) {
+    } catch (e) {
       stop();
     }
   }
@@ -34,14 +34,14 @@ async function start(endpoint: string) {
   pc = new RTCPeerConnection();
 
   // WHIP: send-only transceivers
-  const videoTrans = pc.addTransceiver("video", { 
-    direction: "sendonly", 
+  const videoTrans = pc.addTransceiver("video", {
+    direction: "sendonly",
     // Define scalability layers (low, medium, high)
     sendEncodings: [
-      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 },   // quarter res, ~150kbps
-      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 },   // half res, ~500kbps
+      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 }, // quarter res, ~150kbps
+      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 }, // half res, ~500kbps
       { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_500_000 }, // full res, ~1.5Mbps
-    ]
+    ],
   });
   const audioTrans = pc.addTransceiver("audio", { direction: "sendonly" });
   localStream = await navigator.mediaDevices.getUserMedia({
@@ -65,15 +65,15 @@ async function start(endpoint: string) {
       e.track.onended = () => {
         console.log(`Remote track ended: ${e.track.kind}`);
         remoteVideo.srcObject = null;
-      }
+      };
       e.track.onmute = () => {
         console.log(`Remote track muted: ${e.track.kind}`);
         remoteVideo.srcObject = null;
-      }
+      };
       e.track.onunmute = () => {
         console.log(`Remote track unmuted: ${e.track.kind}`);
         remoteVideo.srcObject = remoteVideoStream;
-      }
+      };
       remoteVideoStream.addTrack(e.track);
     } else if (e.track.kind === "audio") {
       remoteAudioStream.addTrack(e.track);
@@ -103,7 +103,7 @@ async function stop() {
   }
 
   pc?.close();
-  localStream?.getTracks().forEach(track => track.stop());
+  localStream?.getTracks().forEach((track) => track.stop());
   localVideo.srcObject = null;
   remoteVideo.srcObject = null;
 
@@ -112,4 +112,3 @@ async function stop() {
   toggleBtn.textContent = "Start";
   statusEl.textContent = "Disconnected";
 }
-
