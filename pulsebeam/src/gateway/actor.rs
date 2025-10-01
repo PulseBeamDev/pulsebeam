@@ -1,8 +1,4 @@
-use crate::{
-    entity::ParticipantId,
-    gateway::demux::{DemuxResult, Demuxer},
-    participant,
-};
+use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::{actor, net};
 use std::{collections::HashMap, io, sync::Arc};
@@ -122,12 +118,9 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
     ) -> () {
         match msg {
             GatewayControlMessage::AddParticipant(ufrag, handle) => {
-                self.demuxer
-                    .register_ice_ufrag(ufrag.as_bytes(), handle.meta.clone());
-                self.participants.insert(handle.meta.clone(), handle);
+                self.demuxer.register_ice_ufrag(ufrag.as_bytes(), handle);
             }
             GatewayControlMessage::RemoveParticipant(participant_id) => {
-                self.participants.remove(&participant_id);
                 self.demuxer.unregister(&participant_id);
             }
         };
@@ -158,20 +151,8 @@ impl GatewayWorkerActor {
             .try_recv_batch(&mut self.recv_batch, batch_size)?;
 
         tracing::trace!("received {count} packets from socket");
-        for packet in self.recv_batch.iter() {
-            match self.demuxer.demux(packet.src, &packet.buf) {
-                DemuxResult::Participant(participant_id) => {
-                    if let Some(handle) = self.participants.get_mut(&participant_id) {
-                        handle
-                            .lo_tx
-                            .send(participant::ParticipantDataMessage::UdpPacket(
-                                packet.clone(),
-                            ))
-                            .await;
-                    }
-                }
-                DemuxResult::Rejected(reason) => tracing::debug!("rejected packet: {reason:?}"),
-            }
+        for packet in self.recv_batch.drain(..) {
+            self.demuxer.demux(packet).await;
         }
         self.recv_batch.clear();
 
