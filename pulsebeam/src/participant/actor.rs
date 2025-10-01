@@ -12,6 +12,7 @@ use str0m::{
     error::SdpError,
     media::{KeyframeRequest, MediaData},
     net::Transmit,
+    rtp::RtpPacket,
 };
 use tokio::time::Instant;
 
@@ -361,6 +362,7 @@ impl ParticipantActor {
             Event::MediaData(data) => {
                 self.handle_media_data(data).await;
             }
+            Event::RtpPacket(rtp) => {}
             Event::KeyframeRequest(req) => {
                 self.handle_keyframe_request(req);
             }
@@ -382,6 +384,19 @@ impl ParticipantActor {
         }
 
         let Some(track) = self.core.get_published_track_mut(&data.mid) else {
+            return;
+        };
+
+        if let Err(e) = track
+            .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(data)))
+            .await
+        {
+            tracing::error!("Failed to forward media: {}", e);
+        }
+    }
+
+    async fn handle_rtp_packet(&mut self, rtp: RtpPacket) {
+        let Some(track) = self.core.get_published_track_mut(&rtp.mid) else {
             return;
         };
 

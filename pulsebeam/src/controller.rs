@@ -113,6 +113,7 @@ impl ControllerActor {
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
+            .set_rtp_mode(true)
             // TODO: enable bwe
             // .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300))) // enable pacer
             // Uncomment this to see statistics
