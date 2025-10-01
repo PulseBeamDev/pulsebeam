@@ -10,7 +10,7 @@ use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     gateway,
     message::TrackMeta,
-    participant, system, track,
+    node, participant, track,
 };
 use pulsebeam_runtime::actor;
 
@@ -27,7 +27,6 @@ pub enum RoomMessage {
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
     tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
-    ufrag: String, // HACK:
 }
 
 pub struct RoomMessageSet;
@@ -47,7 +46,7 @@ impl actor::MessageSet for RoomMessageSet {
 /// * Mediate Subscriptions: Process subscription requests to tracks
 /// * Own & Supervise Track Actors
 pub struct RoomActor {
-    system_ctx: system::SystemContext,
+    node_ctx: node::NodeContext,
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
     participant_tasks: FuturesUnordered<actor::JoinHandle<participant::ParticipantMessageSet>>,
@@ -121,9 +120,9 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 }
 
 impl RoomActor {
-    pub fn new(system_ctx: system::SystemContext, room_id: Arc<RoomId>) -> Self {
+    pub fn new(node_ctx: node::NodeContext, room_id: Arc<RoomId>) -> Self {
         Self {
-            system_ctx,
+            node_ctx,
             room_id,
             state: RoomState::default(),
             participant_tasks: FuturesUnordered::new(),
@@ -138,7 +137,7 @@ impl RoomActor {
     ) {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let participant_actor = participant::ParticipantActor::new(
-            self.system_ctx.clone(),
+            self.node_ctx.clone(),
             ctx.handle.clone(),
             participant_id.clone(),
             rtc,
@@ -150,8 +149,8 @@ impl RoomActor {
             actor::spawn(participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);
 
-        self.system_ctx
-            .gw_handle
+        self.node_ctx
+            .gateway
             .send_high(gateway::GatewayControlMessage::AddParticipant(
                 ufrag.clone(),
                 participant_handle.clone(),
@@ -163,7 +162,6 @@ impl RoomActor {
             ParticipantMeta {
                 handle: participant_handle.clone(),
                 tracks: HashMap::new(),
-                ufrag,
             },
         );
 
@@ -191,10 +189,10 @@ impl RoomActor {
             let _ = track_handle.terminate().await;
         }
 
-        self.system_ctx
-            .gw_handle
+        self.node_ctx
+            .gateway
             .send_high(gateway::GatewayControlMessage::RemoveParticipant(
-                participant.ufrag,
+                participant_id,
             ))
             .await
             .expect("TODO: handle error");

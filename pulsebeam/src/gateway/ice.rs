@@ -173,6 +173,11 @@ pub fn parse_stun_remote_ufrag(data: &[u8]) -> Option<&str> {
 }
 
 #[inline]
+pub fn parse_stun_remote_ufrag_raw(data: &[u8]) -> Option<&[u8]> {
+    find_stun_username_slice(data).and_then(|slice| first_token(slice, b':'))
+}
+
+#[inline]
 fn first_token(input: &[u8], delimiter: u8) -> Option<&[u8]> {
     for (i, &b) in input.iter().enumerate() {
         if b == delimiter {

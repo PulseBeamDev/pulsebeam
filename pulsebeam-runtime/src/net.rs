@@ -39,12 +39,12 @@ pub struct SendPacket {
 }
 
 /// UnifiedSocket enum for different transport types
-pub enum UnifiedSocket<'a> {
-    Udp(UdpTransport<'a>),
+pub enum UnifiedSocket {
+    Udp(UdpTransport),
     SimUdp(SimUdpTransport),
 }
 
-impl<'a> UnifiedSocket<'a> {
+impl UnifiedSocket {
     /// Binds a socket to the given address and transport type.
     pub async fn bind(
         addr: SocketAddr,
@@ -92,7 +92,7 @@ impl<'a> UnifiedSocket<'a> {
     /// Stops on WouldBlock or fatal errors.
     #[inline]
     pub fn try_recv_batch(
-        &mut self,
+        &self,
         packets: &mut Vec<RecvPacket>,
         batch_size: usize,
     ) -> std::io::Result<usize> {
@@ -120,16 +120,12 @@ impl<'a> UnifiedSocket<'a> {
 /// * Evaluate XDP
 /// * Evaluate AF_XDP Socket (XSK)
 /// * Evaluate io-uring
-pub struct UdpTransport<'a> {
+pub struct UdpTransport {
     sock: tokio::net::UdpSocket,
     local_addr: SocketAddr,
-
-    // Leaving a marker with lifetime here for future interactions with system
-    // optimizations.
-    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> UdpTransport<'a> {
+impl UdpTransport {
     pub const MTU: usize = 1500;
     pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
@@ -142,6 +138,9 @@ impl<'a> UdpTransport<'a> {
         sock.set_nonblocking(true)?;
         sock.set_reuse_address(true)?;
 
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+
         sock.set_recv_buffer_size(Self::BUF_SIZE)?;
         sock.set_send_buffer_size(Self::BUF_SIZE)?;
         sock.bind(&addr.into())?;
@@ -151,11 +150,7 @@ impl<'a> UdpTransport<'a> {
         let sock = tokio::net::UdpSocket::from_std(sock.into())?;
         let local_addr = external_addr.unwrap_or(sock.local_addr()?);
 
-        Ok(UdpTransport {
-            sock,
-            local_addr,
-            _marker: std::marker::PhantomData,
-        })
+        Ok(UdpTransport { sock, local_addr })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -176,7 +171,7 @@ impl<'a> UdpTransport<'a> {
 
     #[inline]
     pub fn try_recv_batch(
-        &mut self,
+        &self,
         packets: &mut Vec<RecvPacket>,
         batch_size: usize,
     ) -> std::io::Result<usize> {

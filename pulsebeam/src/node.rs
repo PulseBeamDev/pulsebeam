@@ -1,52 +1,91 @@
-use crate::{api, controller, system};
+use crate::{api, controller, gateway};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::{actor, net, rt};
+use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::{actor, net, rand};
+use std::sync::atomic::AtomicUsize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+#[derive(Clone)]
+pub struct NodeContext {
+    pub rng: pulsebeam_runtime::rand::Rng,
+    pub gateway: gateway::GatewayHandle,
+    pub sockets: Vec<Arc<net::UnifiedSocket>>,
+    egress_counter: Arc<AtomicUsize>,
+}
+
+impl NodeContext {
+    pub fn single(socket: net::UnifiedSocket) -> Self {
+        let socket = Arc::new(socket);
+
+        let (gw, _) = actor::spawn_default(gateway::GatewayActor::new(vec![socket.clone()]));
+
+        Self {
+            rng: rand::Rng::from_os_rng(),
+            gateway: gw,
+            sockets: vec![socket.clone()],
+            egress_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn allocate_egress(&self) -> Arc<net::UnifiedSocket> {
+        let seq = self
+            .egress_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sockets.get(seq % self.sockets.len()).unwrap().clone()
+    }
+}
+
 pub async fn run(
     shutdown: CancellationToken,
-    cpu_rt: &rt::Runtime,
+    workers: usize,
     external_addr: SocketAddr,
-    unified_socket: net::UnifiedSocket<'static>,
+    local_addr: SocketAddr,
     http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
+    let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
+    for _ in 0..workers {
+        let socket =
+            match net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
+                .await
+            {
+                Ok(socket) => socket,
+                Err(err) if sockets.is_empty() => {
+                    return Err(anyhow::Error::new(err).context("failed to bind udp"));
+                }
+                Err(err) => {
+                    tracing::warn!("SO_REUSEPORT is not supported, fallback to 1 socket: {err}");
+                    break;
+                }
+            };
+
+        let socket = Arc::new(socket);
+        sockets.push(socket);
+    }
     let cors = CorsLayer::very_permissive()
         .allow_origin(AllowOrigin::mirror_request())
         .expose_headers([hyper::header::LOCATION])
         .max_age(Duration::from_secs(86400));
 
     let mut join_set = FuturesUnordered::new();
+    let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
+    join_set.push(gateway_join.map(|_| ()).boxed());
+    let rng = rand::Rng::from_os_rng();
+    let node_ctx = NodeContext {
+        rng,
+        gateway,
+        sockets,
+        egress_counter: Arc::new(AtomicUsize::new(0)),
+    };
 
-    let (system_ctx, system_join) = system::SystemContext::spawn(unified_socket);
-    join_set.push(system_join.map(|_| ()).boxed());
-
-    let (controller_ready_tx, controller_ready_rx) = tokio::sync::oneshot::channel();
-
-    // Spawn controller on CPU runtime
-    let shutdown_for_controller = shutdown.clone();
-    cpu_rt.spawn(async move {
-        let controller_actor = controller::ControllerActor::new(
-            system_ctx,
-            vec![external_addr],
-            Arc::new("root".to_string()),
-        );
-        let (controller_handle, controller_join) =
-            actor::spawn(controller_actor, actor::RunnerConfig::default());
-        let _ = controller_ready_tx.send(controller_handle);
-        tracing::debug!("controller is ready");
-
-        tokio::select! {
-            _ = controller_join => {}
-            _ = shutdown_for_controller.cancelled() => {
-                tracing::debug!("controller received shutdown");
-            }
-        }
-    });
-
-    tracing::debug!("waiting on controller to be ready");
-    let controller_handle = controller_ready_rx.await?;
+    let controller_actor = controller::ControllerActor::new(
+        node_ctx,
+        vec![external_addr],
+        Arc::new("root".to_string()),
+    );
+    let (controller_handle, controller_join) = actor::spawn_default(controller_actor);
+    join_set.push(controller_join.map(|_| ()).boxed());
 
     // HTTP API
     let api_cfg = api::ApiConfig {

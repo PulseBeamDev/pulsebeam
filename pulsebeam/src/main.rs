@@ -1,4 +1,5 @@
 use mimalloc::MiMalloc;
+use pulsebeam_runtime::system;
 use tokio_util::sync::CancellationToken;
 
 #[global_allocator]
@@ -7,7 +8,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::net::{IpAddr, SocketAddr};
 
 use pulsebeam::node;
-use pulsebeam_runtime::{net, rt};
 use systemstat::{IpAddr as SysIpAddr, Platform, System};
 use tracing_subscriber::EnvFilter;
 
@@ -20,60 +20,31 @@ fn main() {
         .pretty()
         .init();
 
-    // Runtime priority strategy for SFU:
-    // - IO runtime stays at *default* system priority (normal).
-    //   We do NOT boost it above normal to avoid starving CPU workers.
-    // - CPU runtime threads are set to a slightly *lower* priority (e.g. 30–40 on
-    //   thread-priority’s crossplatform scale). This ensures:
-    //     * Signaling / HTTP / control I/O remains responsive under load.
-    //     * CPU-heavy media tasks still get full throughput when system is idle.
-    //     * No elevated privileges needed (unlike raising priority).
-    // In short: keep IO normal, lower CPU pool, let the OS scheduler do the rest.
-    //
-    // We intentionally avoid CPU core pinning here:
-    // - Pinning can reduce scheduler flexibility: if a pinned worker is overloaded
-    //   while another core is idle, throughput suffers.
-    // - In multi-tenant / VPS / VM / NUMA environments, pinning may backfire by
-    //   increasing memory latency or conflicting with the hypervisor.
-    // - Letting the OS scheduler float CPU worker threads generally gives better
-    //   balance and portability across environments.
-    // If ultra-low latency is required on bare metal, prefer isolating a core at
-    // the deployment level (e.g. taskset, cgroups) instead of hard pinning in code.
+    let logical_cpus = num_cpus::get();
+    let physical_cpus = num_cpus::get_physical();
+    // Compute optimal worker threads for CPU-bound SFU tasks
+    let workers = logical_cpus.min(physical_cpus);
 
-    // https://github.com/tokio-rs/tokio/discussions/6831
-    let cpu_rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_time()
-        .thread_name("cpu")
-        .on_thread_start(|| {
-            // lower priority for CPU works so IO gets higher priority
-            thread_priority::set_current_thread_priority(
-                thread_priority::ThreadPriority::Crossplatform(
-                    thread_priority::ThreadPriorityValue::try_from(40).unwrap(),
-                ),
-            )
-            .unwrap();
-        })
+    tracing::info!("detected logical CPUs: {}", logical_cpus);
+    tracing::info!("detected physical CPUs: {}", physical_cpus);
+    tracing::info!("using {} worker threads", workers);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(workers)
         .build()
         .unwrap();
 
     let shutdown = CancellationToken::new();
-    let io_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .thread_name("io")
-        .build()
-        .unwrap();
-    io_rt.block_on(run(shutdown.clone(), &cpu_rt));
+    rt.block_on(run(shutdown.clone(), workers));
     shutdown.cancel();
 }
 
-pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
+pub async fn run(shutdown: CancellationToken, workers: usize) {
     let external_ip = select_host_address();
     let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
+
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
-    let unified_socket =
-        net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
-            .await
-            .expect("bind to udp socket");
     let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!(
         "server listening at {}:3000 (signaling) and {}:3478 (webrtc)",
@@ -83,10 +54,10 @@ pub async fn run(shutdown: CancellationToken, cpu_rt: &rt::Runtime) {
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(shutdown.clone(), cpu_rt, external_addr, unified_socket, http_addr) => {
+        Err(err) = node::run(shutdown.clone(), workers, external_addr, local_addr, http_addr) => {
             tracing::warn!("node exited with error: {err}");
         }
-        _ = wait_for_signal() => {
+        _ = system::wait_for_signal() => {
             tracing::info!("shutting down gracefully...");
             shutdown.cancel();
         }
@@ -151,47 +122,4 @@ pub fn select_host_address() -> IpAddr {
         tracing::warn!("falling back to localhost");
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     }
-}
-
-/// https://stackoverflow.com/questions/77585473/rust-tokio-how-to-handle-more-signals-than-just-sigint-i-e-sigquit
-/// Waits for a signal that requests a graceful shutdown, like SIGTERM or SIGINT.
-#[cfg(unix)]
-async fn wait_for_signal_impl() {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    // Infos here:
-    // https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
-    let mut signal_terminate = signal(SignalKind::terminate()).unwrap();
-    let mut signal_interrupt = signal(SignalKind::interrupt()).unwrap();
-
-    tokio::select! {
-        _ = signal_terminate.recv() => tracing::debug!("received SIGTERM."),
-        _ = signal_interrupt.recv() => tracing::debug!("received SIGINT."),
-    };
-}
-
-/// Waits for a signal that requests a graceful shutdown, Ctrl-C (SIGINT).
-#[cfg(windows)]
-async fn wait_for_signal_impl() {
-    use tokio::signal::windows;
-
-    // Infos here:
-    // https://learn.microsoft.com/en-us/windows/console/handlerroutine
-    let mut signal_c = windows::ctrl_c().unwrap();
-    let mut signal_break = windows::ctrl_break().unwrap();
-    let mut signal_close = windows::ctrl_close().unwrap();
-    let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
-
-    tokio::select! {
-        _ = signal_c.recv() => tracing::debug!("received CTRL_C."),
-        _ = signal_break.recv() => tracing::debug!("received CTRL_BREAK."),
-        _ = signal_close.recv() => tracing::debug!("received CTRL_CLOSE."),
-        _ = signal_shutdown.recv() => tracing::debug!("received CTRL_SHUTDOWN."),
-    };
-}
-
-/// Registers signal handlers and waits for a signal that
-/// indicates a shutdown request.
-async fn wait_for_signal() {
-    wait_for_signal_impl().await
 }
