@@ -1,10 +1,8 @@
 use crate::entity::ParticipantId;
 use crate::gateway::ice;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-
-const PROBE_THRESHOLD: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DemuxResult {
@@ -14,109 +12,105 @@ pub enum DemuxResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionReason {
+    /// Packet received from an unknown source address that was not a STUN binding request.
     UnknownSource,
+    /// Packet is not a valid STUN, DTLS, RTP, or RTCP packet.
     InvalidPacket,
+    /// STUN packet could not be parsed.
     MalformedStun,
+    /// STUN packet had a valid format but an unknown USERNAME attribute.
     UnauthorizedIceUfrag,
-    UnauthorizedSsrc,
+    /// Packet was too small to be processed.
     PacketTooSmall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketType {
     Stun,
-    Rtp,
-    Rtcp,
     Dtls,
+    RtpOrRtcp,
     Unknown,
 }
 
 impl PacketType {
+    /// Determines the packet type from the first byte of the packet.
     #[inline(always)]
     fn from_first_byte(byte: u8) -> Self {
         if byte <= 0x01 {
+            // STUN messages have 0b00 as the first two bits.
             return PacketType::Stun;
         }
         if byte >= 20 && byte <= 64 {
+            // DTLS messages occupy this range.
             return PacketType::Dtls;
         }
         let version = byte >> 6;
         if version == 2 {
-            return PacketType::Rtp;
+            // RTP/RTCP messages have 0b10 as the first two bits (version 2).
+            return PacketType::RtpOrRtcp;
         }
         PacketType::Unknown
     }
 }
 
+/// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
+///
+/// This implementation uses two primary mechanisms for routing incoming UDP packets:
+/// 1. A fast-path map from `SocketAddr` to `ParticipantId` (`addr_map`). This provides
+///    efficient routing for known addresses.
+/// 2. For packets from unknown addresses, it inspects STUN messages to learn the `ufrag`.
+///    The `ufrag` is used to identify the participant, and the source address is then
+///    added to the address map for future fast-path lookups.
+///
+/// Non-STUN packets from unknown addresses are rejected.
 pub struct Demuxer {
-    ice_ufrag_map: HashMap<Box<[u8]>, Arc<ParticipantId>>,
-    ssrc_map: HashMap<u32, Arc<ParticipantId>>,
-    addr_cache: HashMap<SocketAddr, Arc<ParticipantId>>,
+    /// Maps a remote ICE username fragment (ufrag) to a participant.
+    ufrag_map: HashMap<Box<[u8]>, Arc<ParticipantId>>,
+    /// A cache mapping a remote `SocketAddr` to a known participant. This is the fast path.
+    addr_map: HashMap<SocketAddr, Arc<ParticipantId>>,
+    /// A reverse map to efficiently clean up `ufrag_map` when a participant is unregistered.
     participant_ufrag: HashMap<Arc<ParticipantId>, Box<[u8]>>,
-    participant_ssrcs: HashMap<Arc<ParticipantId>, Vec<u32>>,
-    authenticated: HashSet<Arc<ParticipantId>>,
-    ssrc_probe: HashMap<(SocketAddr, u32), u8>,
-    ssrc_probe_owner: HashMap<u32, Arc<ParticipantId>>,
 }
 
 impl Demuxer {
     pub fn new() -> Self {
         Self {
-            ice_ufrag_map: HashMap::new(),
-            ssrc_map: HashMap::new(),
-            addr_cache: HashMap::new(),
+            ufrag_map: HashMap::new(),
+            addr_map: HashMap::new(),
             participant_ufrag: HashMap::new(),
-            participant_ssrcs: HashMap::new(),
-            authenticated: HashSet::new(),
-            ssrc_probe: HashMap::new(),
-            ssrc_probe_owner: HashMap::new(),
         }
     }
 
+    /// Registers a participant with their ICE username fragment.
     pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_id: Arc<ParticipantId>) {
-        let boxed = ufrag.to_vec().into_boxed_slice();
-        self.ice_ufrag_map
-            .insert(boxed.clone(), participant_id.clone());
-        self.participant_ufrag.insert(participant_id, boxed);
+        let boxed_ufrag = ufrag.to_vec().into_boxed_slice();
+        self.ufrag_map
+            .insert(boxed_ufrag.clone(), participant_id.clone());
+        self.participant_ufrag.insert(participant_id, boxed_ufrag);
     }
 
-    pub fn register_ssrc(&mut self, ssrc: u32, participant_id: Arc<ParticipantId>) {
-        self.ssrc_map.insert(ssrc, participant_id.clone());
-        self.participant_ssrcs
-            .entry(participant_id)
-            .or_default()
-            .push(ssrc);
-    }
-
-    pub fn unregister(&mut self, participant_id: Arc<ParticipantId>) {
-        if let Some(ufrag) = self.participant_ufrag.remove(&participant_id) {
-            self.ice_ufrag_map.remove(&ufrag);
+    /// Removes a participant and all associated state (ufrag and address mappings).
+    pub fn unregister(&mut self, participant_id: &Arc<ParticipantId>) {
+        if let Some(ufrag) = self.participant_ufrag.remove(participant_id) {
+            self.ufrag_map.remove(&ufrag);
         }
-        if let Some(ssrcs) = self.participant_ssrcs.remove(&participant_id) {
-            for s in ssrcs {
-                self.ssrc_map.remove(&s);
-                self.ssrc_probe_owner.remove(&s);
-            }
-        }
-        self.addr_cache.retain(|_, h| *h != participant_id);
-        self.authenticated.remove(&participant_id);
-        self.ssrc_probe.retain(|(_, _), _| true);
+        // Remove all address entries pointing to this participant.
+        self.addr_map.retain(|_, p| !Arc::ptr_eq(p, participant_id));
     }
 
-    pub fn mark_transport_authenticated(&mut self, participant: Arc<ParticipantId>) {
-        self.authenticated.insert(participant);
-    }
-
+    /// Determines the owner of an incoming UDP packet.
     pub fn demux(&mut self, src: SocketAddr, data: &[u8]) -> DemuxResult {
-        if data.len() < 12 {
+        if data.is_empty() {
             return DemuxResult::Rejected(RejectionReason::PacketTooSmall);
         }
 
+        // STUN packets must always be processed by the slow path to allow for address re-mapping.
+        // Other packet types can use the fast path if the address is already known.
         match PacketType::from_first_byte(data[0]) {
             PacketType::Stun => self.demux_stun(src, data),
-            PacketType::Rtp | PacketType::Rtcp => self.demux_rtp(src, data),
-            PacketType::Dtls => {
-                if let Some(participant) = self.addr_cache.get(&src) {
+            PacketType::Dtls | PacketType::RtpOrRtcp => {
+                // This is the fast path for non-STUN packets.
+                if let Some(participant) = self.addr_map.get(&src) {
                     DemuxResult::Participant(participant.clone())
                 } else {
                     DemuxResult::Rejected(RejectionReason::UnknownSource)
@@ -126,205 +120,200 @@ impl Demuxer {
         }
     }
 
+    /// Handles STUN packets to identify participants and learn their address.
     fn demux_stun(&mut self, src: SocketAddr, data: &[u8]) -> DemuxResult {
         if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(data) {
-            if let Some(participant) = self.ice_ufrag_map.get(ufrag) {
+            if let Some(participant) = self.ufrag_map.get(ufrag) {
                 let participant = participant.clone();
-                self.addr_cache.insert(src, participant.clone());
+                // Address learned or re-assigned, add it to the map for the fast path next time.
+                self.addr_map.insert(src, participant.clone());
                 return DemuxResult::Participant(participant);
             }
+            // Valid STUN but ufrag is not registered with us.
             return DemuxResult::Rejected(RejectionReason::UnauthorizedIceUfrag);
         }
+        // Not a valid STUN packet with a USERNAME attribute.
         DemuxResult::Rejected(RejectionReason::MalformedStun)
-    }
-
-    fn demux_rtp(&mut self, src: SocketAddr, data: &[u8]) -> DemuxResult {
-        let is_rtcp = data[1] >= 200 && data[1] <= 204;
-
-        let ssrc = match extract_ssrc_variant(data, is_rtcp) {
-            Some(s) => s,
-            None => return DemuxResult::Rejected(RejectionReason::InvalidPacket),
-        };
-
-        // Collision check with registered SSRCs
-        if let Some(owner) = self.ssrc_map.get(&ssrc) {
-            let participant = match self.addr_cache.get(&src) {
-                Some(p) => p.clone(),
-                None => return DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc),
-            };
-            if Arc::ptr_eq(owner, &participant) {
-                self.addr_cache.insert(src, participant.clone());
-                return DemuxResult::Participant(participant);
-            } else {
-                return DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc);
-            }
-        }
-
-        // Participant from address cache
-        let participant = match self.addr_cache.get(&src) {
-            Some(p) => p.clone(),
-            None => return DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc),
-        };
-
-        if !self.authenticated.contains(&participant) {
-            return DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc);
-        }
-
-        // Collision check with probe owner
-        if let Some(probe_owner) = self.ssrc_probe_owner.get(&ssrc) {
-            if !Arc::ptr_eq(probe_owner, &participant) {
-                return DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc);
-            }
-        }
-
-        // Immediate binding for RTCP Sender Report
-        if is_rtcp && data[1] == 200 {
-            self.register_ssrc(ssrc, participant.clone());
-            self.addr_cache.insert(src, participant.clone());
-            return DemuxResult::Participant(participant);
-        }
-
-        // Probe logic for RTP
-        let key = (src, ssrc);
-        let count = self.ssrc_probe.entry(key).or_insert(0);
-        *count = count.saturating_add(1);
-        self.ssrc_probe_owner
-            .entry(ssrc)
-            .or_insert_with(|| participant.clone());
-
-        if *count >= PROBE_THRESHOLD {
-            self.register_ssrc(ssrc, participant.clone());
-            self.ssrc_probe.remove(&(src, ssrc));
-            self.ssrc_probe_owner.remove(&ssrc);
-            self.addr_cache.insert(src, participant.clone());
-            return DemuxResult::Participant(participant);
-        }
-
-        DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc)
     }
 }
 
-/// Extract SSRC from RTP or RTCP
-fn extract_ssrc_variant(data: &[u8], is_rtcp: bool) -> Option<u32> {
-    if is_rtcp {
-        if data.len() >= 8 {
-            Some(u32::from_be_bytes([data[4], data[5], data[6], data[7]]))
-        } else {
-            None
-        }
-    } else if data.len() >= 12 {
-        Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
-    } else {
-        None
+impl Default for Demuxer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils;
+    use crate::test_utils; // Assuming a test utility for creating participant IDs.
     use std::net::{IpAddr, Ipv4Addr};
 
     fn make_addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    /// Manually constructs a STUN binding request packet with a USERNAME attribute.
+    /// This avoids the need for an external STUN crate in the tests.
+    fn make_stun_packet(ufrag: &str) -> Vec<u8> {
+        // The USERNAME attribute value, typically formatted as "remote_ufrag:local_ufrag".
+        // For testing, we only need the remote ufrag part that the demuxer expects.
+        let username_value = format!("{}:remote", ufrag);
+        let value_bytes = username_value.as_bytes();
+        let value_len = value_bytes.len();
+
+        // Attribute value must be padded to a multiple of 4 bytes.
+        let padded_value_len = (value_len + 3) & !3;
+        let padding_len = padded_value_len - value_len;
+
+        // Total attribute length (header + padded value).
+        let attr_total_len = 4 + padded_value_len;
+
+        // STUN Message Header (20 bytes).
+        let msg_type: u16 = 0x0001; // Binding Request
+        let msg_len: u16 = attr_total_len as u16; // Length of attributes section
+        let magic_cookie: u32 = 0x2112A442;
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+        // USERNAME Attribute (Type-Length-Value).
+        let attr_type: u16 = 0x0006; // USERNAME
+        let attr_value_len: u16 = value_len as u16;
+
+        // Assemble the packet.
+        let mut packet = Vec::with_capacity(20 + attr_total_len);
+        packet.extend_from_slice(&msg_type.to_be_bytes());
+        packet.extend_from_slice(&msg_len.to_be_bytes());
+        packet.extend_from_slice(&magic_cookie.to_be_bytes());
+        packet.extend_from_slice(&transaction_id);
+        packet.extend_from_slice(&attr_type.to_be_bytes());
+        packet.extend_from_slice(&attr_value_len.to_be_bytes());
+        packet.extend_from_slice(value_bytes);
+        packet.extend_from_slice(&vec![0; padding_len]);
+
+        packet
     }
 
     fn make_rtp_packet(ssrc: u32) -> Vec<u8> {
-        let mut pkt = vec![0x80, 0x00];
-        pkt.extend_from_slice(&[0, 0]);
-        pkt.extend_from_slice(&[0, 0, 0, 0]);
+        let mut pkt = vec![0x80, 0x00, 0, 0, 0, 0, 0, 0];
         pkt.extend_from_slice(&ssrc.to_be_bytes());
-        pkt.extend_from_slice(&[0; 12]);
-        pkt
-    }
-
-    fn make_rtcp_sr(ssrc: u32) -> Vec<u8> {
-        let mut pkt = vec![0x80, 200]; // version=2, PT=200 SR
-        pkt.extend_from_slice(&[0, 6]); // length field
-        pkt.extend_from_slice(&ssrc.to_be_bytes()); // SSRC
-        pkt.extend_from_slice(&[0; 24]);
+        pkt.extend_from_slice(&[0; 4]); // Payload
         pkt
     }
 
     #[test]
-    fn test_rtp_learning_with_auth() {
+    fn test_demux_by_stun_then_rtp() {
         let mut d = Demuxer::new();
-        let h = test_utils::create_participant_id();
-        let addr = make_addr(5000);
-        d.addr_cache.insert(addr, h.clone());
-        d.mark_transport_authenticated(h.clone());
+        let p1 = test_utils::create_participant_id();
+        let addr1 = make_addr(5000);
+        let ufrag1 = "ufrag-1";
 
-        let pkt = make_rtp_packet(1234);
+        d.register_ice_ufrag(ufrag1.as_bytes(), p1.clone());
 
-        // first packet rejected (probe)
+        // 1. Packet from unknown source, but it's STUN. Should be accepted and address learned.
+        let stun_pkt = make_stun_packet(ufrag1);
         assert_eq!(
-            d.demux(addr, &pkt),
-            DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc)
+            d.demux(addr1, &stun_pkt),
+            DemuxResult::Participant(p1.clone())
         );
 
-        // second packet accepted & bound
-        assert_eq!(d.demux(addr, &pkt), DemuxResult::Participant(h.clone()));
-
-        // third packet accepted immediately
-        assert_eq!(d.demux(addr, &pkt), DemuxResult::Participant(h));
-    }
-
-    #[test]
-    fn test_rtcp_sr_immediate_learning() {
-        let mut d = Demuxer::new();
-        let h = test_utils::create_participant_id();
-        let addr = make_addr(5001);
-        d.addr_cache.insert(addr, h.clone());
-        d.mark_transport_authenticated(h.clone());
-
-        let pkt = make_rtcp_sr(4242);
-
-        // should be accepted immediately
-        assert_eq!(d.demux(addr, &pkt), DemuxResult::Participant(h.clone()));
-        // subsequent RTP with same SSRC should also pass
-        let rtp = make_rtp_packet(4242);
-        assert_eq!(d.demux(addr, &rtp), DemuxResult::Participant(h));
-    }
-
-    #[test]
-    fn test_collision_rejected() {
-        let mut d = Demuxer::new();
-        let h1 = test_utils::create_participant_id();
-        let h2 = test_utils::create_participant_id();
-        let addr1 = make_addr(5002);
-        let addr2 = make_addr(5003);
-
-        d.addr_cache.insert(addr1, h1.clone());
-        d.addr_cache.insert(addr2, h2.clone());
-        d.mark_transport_authenticated(h1.clone());
-        d.mark_transport_authenticated(h2.clone());
-
-        let pkt1 = make_rtp_packet(5555);
-        let pkt2 = make_rtp_packet(5555);
-
-        // h1 learns SSRC first
-        d.demux(addr1, &pkt1);
-        d.demux(addr1, &pkt1); // bound now
-
-        // h2 tries to claim same SSRC
+        // 2. Now that the address is learned, a subsequent RTP packet should be accepted on the fast path.
+        let rtp_pkt = make_rtp_packet(12345);
         assert_eq!(
-            d.demux(addr2, &pkt2),
-            DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc)
+            d.demux(addr1, &rtp_pkt),
+            DemuxResult::Participant(p1.clone())
         );
     }
 
     #[test]
-    fn test_reject_without_auth() {
+    fn test_reject_rtp_from_unknown_source() {
         let mut d = Demuxer::new();
-        let h = test_utils::create_participant_id();
+        let p1 = test_utils::create_participant_id();
+        let addr1 = make_addr(5001);
+        let ufrag1 = "ufrag-2";
+
+        d.register_ice_ufrag(ufrag1.as_bytes(), p1.clone());
+
+        // An RTP packet arrives from an address we haven't learned via STUN yet.
+        // It should be rejected.
+        let rtp_pkt = make_rtp_packet(54321);
+        assert_eq!(
+            d.demux(addr1, &rtp_pkt),
+            DemuxResult::Rejected(RejectionReason::UnknownSource)
+        );
+    }
+
+    #[test]
+    fn test_reject_unauthorized_ufrag() {
+        let mut d = Demuxer::new();
+        let addr = make_addr(5002);
+        let stun_pkt = make_stun_packet("unregistered-ufrag");
+
+        assert_eq!(
+            d.demux(addr, &stun_pkt),
+            DemuxResult::Rejected(RejectionReason::UnauthorizedIceUfrag)
+        );
+    }
+
+    #[test]
+    fn test_unregister_participant() {
+        let mut d = Demuxer::new();
+        let p1 = test_utils::create_participant_id();
+        let addr1 = make_addr(5003);
+        let ufrag1 = "ufrag-3";
+
+        d.register_ice_ufrag(ufrag1.as_bytes(), p1.clone());
+
+        // Learn the address via STUN.
+        let stun_pkt = make_stun_packet(ufrag1);
+        assert_eq!(
+            d.demux(addr1, &stun_pkt),
+            DemuxResult::Participant(p1.clone())
+        );
+        assert_eq!(d.addr_map.len(), 1);
+        assert_eq!(d.ufrag_map.len(), 1);
+
+        // Unregister the participant.
+        d.unregister(&p1);
+
+        // Both the ufrag and the address mapping should be gone.
+        assert!(d.ufrag_map.is_empty());
+        assert!(d.addr_map.is_empty());
+        assert!(d.participant_ufrag.is_empty());
+
+        // A new packet from the same address should now be rejected.
+        assert_eq!(
+            d.demux(addr1, &stun_pkt),
+            DemuxResult::Rejected(RejectionReason::UnauthorizedIceUfrag)
+        );
+    }
+
+    #[test]
+    fn test_address_reassignment() {
+        let mut d = Demuxer::new();
+        let p1 = test_utils::create_participant_id();
+        let p2 = test_utils::create_participant_id();
         let addr = make_addr(5004);
-        d.addr_cache.insert(addr, h.clone());
+        let ufrag1 = "ufrag-p1";
+        let ufrag2 = "ufrag-p2";
 
-        let pkt = make_rtp_packet(9999);
+        d.register_ice_ufrag(ufrag1.as_bytes(), p1.clone());
+        d.register_ice_ufrag(ufrag2.as_bytes(), p2.clone());
 
-        assert_eq!(
-            d.demux(addr, &pkt),
-            DemuxResult::Rejected(RejectionReason::UnauthorizedSsrc)
-        );
+        // P1 sends a STUN packet, its address is mapped.
+        let stun1 = make_stun_packet(ufrag1);
+        assert_eq!(d.demux(addr, &stun1), DemuxResult::Participant(p1.clone()));
+        assert_eq!(d.addr_map.get(&addr).unwrap(), &p1);
+
+        // Now, P2 sends a STUN packet from the *same* address (e.g., behind the same NAT).
+        // The demuxer should re-map the address to P2.
+        let stun2 = make_stun_packet(ufrag2);
+        assert_eq!(d.demux(addr, &stun2), DemuxResult::Participant(p2.clone()));
+
+        // Verify that the map was updated.
+        assert_eq!(d.addr_map.get(&addr).unwrap(), &p2);
+
+        // An RTP packet should now be routed to P2.
+        let rtp = make_rtp_packet(999);
+        assert_eq!(d.demux(addr, &rtp), DemuxResult::Participant(p2));
     }
 }

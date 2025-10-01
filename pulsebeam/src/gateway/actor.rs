@@ -128,7 +128,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
             }
             GatewayControlMessage::RemoveParticipant(participant_id) => {
                 self.participants.remove(&participant_id);
-                self.demuxer.unregister(participant_id);
+                self.demuxer.unregister(&participant_id);
             }
         };
     }
