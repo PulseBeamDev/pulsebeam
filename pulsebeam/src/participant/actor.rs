@@ -337,23 +337,6 @@ impl ParticipantActor {
             },
             Event::MediaAdded(media) => {
                 tracing::debug!("media added: {media:?}");
-
-                // TODO: refactor to remove this duplicate with core
-
-                let mut api = self.ctx.rtc.direct_api();
-                match media.direction {
-                    Direction::RecvOnly => {
-                        // Client publishing to us
-                    }
-                    Direction::SendOnly => {
-                        // We're sending to client
-                        let main = api.new_ssrc();
-                        let rtx = api.new_ssrc();
-                        api.declare_stream_tx(main, Some(rtx), media.mid, None);
-                    }
-                    _ => {}
-                }
-
                 self.core.handle_media_added(&mut self.effects, media);
             }
             Event::ChannelOpen(id, label) => {
@@ -483,7 +466,7 @@ impl ParticipantActor {
 
         if let Err(err) = writer.write_rtp(
             rtp.header.payload_type,
-            (rtp.header.sequence_number as u64).into(),
+            rtp.seq_no,
             rtp.header.timestamp,
             rtp.timestamp,
             rtp.header.marker,
@@ -496,8 +479,8 @@ impl ParticipantActor {
     }
 
     fn request_keyframe_internal(&mut self, req: KeyframeRequest) {
-        tracing::trace!("request_keyframe_internal");
-        // self.request_keyframe_internal_rtp(req);
+        tracing::debug!("request_keyframe_internal");
+        self.request_keyframe_internal_rtp(req);
     }
 
     fn request_keyframe_internal_media(&mut self, req: KeyframeRequest) {
@@ -514,6 +497,7 @@ impl ParticipantActor {
     fn request_keyframe_internal_rtp(&mut self, req: KeyframeRequest) {
         let mut api = self.ctx.rtc.direct_api();
         let Some(stream) = api.stream_rx_by_mid(req.mid, req.rid) else {
+            tracing::warn!("stream_rx not found, keyframe request failed");
             return;
         };
 
