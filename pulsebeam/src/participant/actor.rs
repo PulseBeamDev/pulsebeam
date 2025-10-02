@@ -10,7 +10,7 @@ use str0m::{
     Event, Input, Output, Rtc, RtcError,
     channel::ChannelId,
     error::SdpError,
-    media::{KeyframeRequest, MediaData},
+    media::{KeyframeRequest, MediaData, Mid},
     net::Transmit,
     rtp::RtpPacket,
 };
@@ -50,6 +50,7 @@ pub enum ParticipantControlMessage {
 pub enum ParticipantDataMessage {
     UdpPacket(net::RecvPacket),
     ForwardMedia(Arc<message::TrackMeta>, Arc<MediaData>),
+    ForwardRtp(Arc<message::TrackMeta>, Arc<RtpPacket>),
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
 
@@ -232,6 +233,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ParticipantDataMessage::ForwardMedia(track_meta, data) => {
                 self.handle_forward_media(track_meta, data);
             }
+            ParticipantDataMessage::ForwardRtp(track_meta, rtp) => {
+                self.handle_forward_rtp(track_meta, rtp);
+            }
             ParticipantDataMessage::KeyframeRequest(track_id, req) => {
                 self.request_keyframe_internal(KeyframeRequest {
                     mid: track_id.origin_mid,
@@ -332,7 +336,13 @@ impl ParticipantActor {
                 _ => tracing::trace!("ICE state: {:?}", state),
             },
             Event::MediaAdded(media) => {
+                tracing::debug!("media added: {media:?}");
                 self.core.handle_media_added(&mut self.effects, media);
+                let mut api = self.ctx.rtc.direct_api();
+                let main = api.new_ssrc();
+                let rtx = api.new_ssrc();
+                let mid = Mid::new();
+                api.declare_stream_tx(main, Some(rtx), mid, None);
             }
             Event::ChannelOpen(id, label) => {
                 if label == DATA_CHANNEL_LABEL {
@@ -362,7 +372,9 @@ impl ParticipantActor {
             Event::MediaData(data) => {
                 self.handle_media_data(data).await;
             }
-            Event::RtpPacket(rtp) => {}
+            Event::RtpPacket(rtp) => {
+                self.handle_rtp_packet(rtp).await;
+            }
             Event::KeyframeRequest(req) => {
                 self.handle_keyframe_request(req);
             }
@@ -396,15 +408,20 @@ impl ParticipantActor {
     }
 
     async fn handle_rtp_packet(&mut self, rtp: RtpPacket) {
-        let Some(track) = self.core.get_published_track_mut(&rtp.mid) else {
+        let mut api = self.ctx.rtc.direct_api();
+        let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
+            return;
+        };
+
+        let Some(track) = self.core.get_published_track_mut(&stream.mid()) else {
             return;
         };
 
         if let Err(e) = track
-            .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(data)))
+            .send_low(track::TrackDataMessage::ForwardRtp(Arc::new(rtp)))
             .await
         {
-            tracing::error!("Failed to forward media: {}", e);
+            tracing::error!("Failed to forward rtp: {}", e);
         }
     }
 
@@ -431,6 +448,25 @@ impl ParticipantActor {
         if let Err(e) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
             tracing::error!("Failed to write media: {}", e);
         }
+    }
+
+    fn handle_forward_rtp(&mut self, track_meta: Arc<message::TrackMeta>, rtp: Arc<RtpPacket>) {
+        // TODO: handle forward rtp
+        // let Some(mid) = self.core.get_slot(&track_meta, &data) else {
+        //     return;
+        // };
+        //
+        // let Some(writer) = self.ctx.rtc.writer(mid) else {
+        //     return;
+        // };
+        //
+        // let Some(pt) = writer.match_params(rtp.params) else {
+        //     return;
+        // };
+        //
+        // if let Err(e) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
+        //     tracing::error!("Failed to write media: {}", e);
+        // }
     }
 
     fn request_keyframe_internal(&mut self, req: KeyframeRequest) {

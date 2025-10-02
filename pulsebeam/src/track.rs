@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use str0m::media::{KeyframeRequestKind, MediaData, Rid};
+use str0m::{
+    media::{KeyframeRequestKind, MediaData, Rid},
+    rtp::RtpPacket,
+};
 use tokio::time::Instant;
 
 use crate::{
@@ -22,6 +25,7 @@ pub enum TrackError {}
 #[derive(Debug)]
 pub enum TrackDataMessage {
     ForwardMedia(Arc<MediaData>),
+    ForwardRtp(Arc<RtpPacket>),
     KeyframeRequest(message::KeyframeRequest),
 }
 
@@ -105,6 +109,31 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                     let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardMedia(
                         self.meta.clone(),
                         data.clone(),
+                    ));
+
+                    // This gets triggered when a participant actor leaves
+                    if let Err(mailbox::TrySendError::Closed(_)) = res {
+                        // TODO: should this be a part of unsubscribe instead?
+                        to_remove.push(participant_id.clone());
+                    }
+                }
+
+                for key in to_remove {
+                    self.subscribers.remove(&key);
+                }
+            }
+            TrackDataMessage::ForwardRtp(rtp) => {
+                // TODO: adjust streams based on subscribers
+                if rtp.header.ext_vals.rid != self.pinned_rid {
+                    return;
+                }
+
+                let mut to_remove = Vec::new();
+                for (participant_id, sub) in self.subscribers.iter_mut() {
+                    tracing::trace!("forwarded media: track -> participant");
+                    let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardRtp(
+                        self.meta.clone(),
+                        rtp.clone(),
                     ));
 
                     // This gets triggered when a participant actor leaves
