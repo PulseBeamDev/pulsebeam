@@ -10,7 +10,7 @@ use str0m::{
     Event, Input, Output, Rtc, RtcError,
     channel::ChannelId,
     error::SdpError,
-    media::{Direction, KeyframeRequest, MediaData, Mid},
+    media::{Direction, KeyframeRequest, MediaData, Mid, Pt},
     net::Transmit,
     rtp::{RtpPacket, SeqNo},
 };
@@ -62,6 +62,15 @@ pub struct ParticipantContext {
     track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackMessageSet>>,
 
     egress: Arc<net::UnifiedSocket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InternalPt {
+    // --- Audio (0–63) ---
+    Opus = 1,
+
+    // --- Video (64–255) ---
+    H264 = 64,
 }
 
 impl ParticipantContext {
