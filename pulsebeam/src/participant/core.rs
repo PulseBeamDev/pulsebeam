@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use str0m::media::{Direction, MediaAdded, MediaData, MediaKind, Mid};
+use str0m::{
+    media::{Direction, MediaAdded, MediaData, MediaKind, Mid},
+    rtp::ExtensionValues,
+};
 
 use super::effect::Effect;
 use crate::{
@@ -35,14 +38,18 @@ impl ParticipantCore {
         self.published_tracks.get_mut(mid)
     }
 
-    pub fn get_slot(&mut self, track_meta: &Arc<TrackMeta>, data: &Arc<MediaData>) -> Option<Mid> {
+    pub fn get_slot(
+        &mut self,
+        track_meta: &Arc<TrackMeta>,
+        ext_vals: &ExtensionValues,
+    ) -> Option<Mid> {
         match track_meta.kind {
             MediaKind::Video => self.video_allocator.get_slot(&track_meta.id),
             MediaKind::Audio => self.audio_allocator.get_slot(
                 &track_meta.id,
                 &AudioTrackData {
-                    audio_level: data.ext_vals.audio_level,
-                    voice_activity: data.ext_vals.voice_activity,
+                    audio_level: ext_vals.audio_level,
+                    voice_activity: ext_vals.voice_activity,
                 },
             ),
         }
