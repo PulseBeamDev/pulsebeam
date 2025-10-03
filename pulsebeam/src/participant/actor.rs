@@ -7,11 +7,8 @@ use std::{
 use bytes::Bytes;
 use futures::{StreamExt, io, stream::FuturesUnordered};
 use str0m::{
-    Event, Input, Output, Rtc, RtcError,
-    channel::ChannelId,
-    error::SdpError,
-    media::{KeyframeRequest, MediaData},
-    net::Transmit,
+    Event, Input, Output, Rtc, RtcError, channel::ChannelId, error::SdpError,
+    media::KeyframeRequest, net::Transmit, rtp::RtpPacket,
 };
 use tokio::time::Instant;
 
@@ -48,7 +45,7 @@ pub enum ParticipantControlMessage {
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
     UdpPacket(net::RecvPacket),
-    ForwardMedia(Arc<message::TrackMeta>, Arc<MediaData>),
+    ForwardRtp(Arc<message::TrackMeta>, Arc<RtpPacket>),
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
 
@@ -141,6 +138,8 @@ pub struct ParticipantActor {
     effects: VecDeque<effect::Effect>,
 
     egress_buffer: double_buffer::DoubleBuffer<net::SendPacket>,
+    // mid -> internalPt
+    // internalPt -> mid
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -228,8 +227,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     tracing::warn!("Dropped UDP packet: {}", e);
                 }
             }
-            ParticipantDataMessage::ForwardMedia(track_meta, data) => {
-                self.handle_forward_media(track_meta, data);
+            ParticipantDataMessage::ForwardRtp(track_meta, rtp) => {
+                self.handle_forward_rtp(track_meta, rtp);
             }
             ParticipantDataMessage::KeyframeRequest(track_id, req) => {
                 self.request_keyframe_internal(KeyframeRequest {
@@ -331,6 +330,7 @@ impl ParticipantActor {
                 _ => tracing::trace!("ICE state: {:?}", state),
             },
             Event::MediaAdded(media) => {
+                tracing::debug!("media added: {media:?}");
                 self.core.handle_media_added(&mut self.effects, media);
             }
             Event::ChannelOpen(id, label) => {
@@ -358,8 +358,8 @@ impl ParticipantActor {
                     self.ctx.rtc.disconnect();
                 }
             }
-            Event::MediaData(data) => {
-                self.handle_media_data(data).await;
+            Event::RtpPacket(rtp) => {
+                self.handle_rtp_packet(rtp).await;
             }
             Event::KeyframeRequest(req) => {
                 self.handle_keyframe_request(req);
@@ -371,25 +371,26 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_media_data(&mut self, data: MediaData) {
-        // Handle contiguous flag for keyframe requests
-        if data.contiguous {
-            self.request_keyframe_internal(KeyframeRequest {
-                rid: data.rid,
-                mid: data.mid,
-                kind: str0m::media::KeyframeRequestKind::Fir,
-            });
-        }
-
-        let Some(track) = self.core.get_published_track_mut(&data.mid) else {
+    async fn handle_rtp_packet(&mut self, mut rtp: RtpPacket) {
+        tracing::trace!("handle_rtp_packet");
+        let mut api = self.ctx.rtc.direct_api();
+        let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
+            tracing::warn!("no stream_rx matched rtp ssrc, dropping.");
             return;
         };
 
+        let Some(track) = self.core.get_published_track_mut(&stream.mid()) else {
+            tracing::warn!("no published track matched mid, dropping.");
+            return;
+        };
+
+        // HACK: inject SDP rid to rtp.
+        rtp.header.ext_vals.rid = stream.rid();
         if let Err(e) = track
-            .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(data)))
+            .send_low(track::TrackDataMessage::ForwardRtp(Arc::new(rtp)))
             .await
         {
-            tracing::error!("Failed to forward media: {}", e);
+            tracing::error!("Failed to forward rtp: {}", e);
         }
     }
 
@@ -400,33 +401,69 @@ impl ParticipantActor {
         let _ = track_handle.try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
     }
 
-    fn handle_forward_media(&mut self, track_meta: Arc<message::TrackMeta>, data: Arc<MediaData>) {
-        let Some(mid) = self.core.get_slot(&track_meta, &data) else {
+    fn handle_forward_rtp(&mut self, track_meta: Arc<message::TrackMeta>, rtp: Arc<RtpPacket>) {
+        tracing::trace!("handle_forward_rtp");
+        let Some(mid) = self.core.get_slot(&track_meta, &rtp.header.ext_vals) else {
             return;
         };
 
-        let Some(writer) = self.ctx.rtc.writer(mid) else {
+        let pt = {
+            let Some(media) = self.ctx.rtc.media(mid) else {
+                tracing::warn!("no media found, dropping");
+                return;
+            };
+
+            let Some(pt) = media.remote_pts().first() else {
+                // TODO: better logic than matching first pt
+                tracing::warn!("no remote pt found, dropping");
+                return;
+            };
+            *pt
+        };
+
+        let mut api = self.ctx.rtc.direct_api();
+        let Some(writer) = api.stream_tx_by_mid(mid, None) else {
             return;
         };
 
-        let Some(pt) = writer.match_params(data.params) else {
-            return;
-        };
-
-        if let Err(e) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
-            tracing::error!("Failed to write media: {}", e);
+        if let Err(err) = writer.write_rtp(
+            pt,
+            rtp.seq_no,
+            rtp.header.timestamp,
+            rtp.timestamp,
+            rtp.header.marker,
+            rtp.header.ext_vals.clone(),
+            true,
+            rtp.payload.clone(),
+        ) {
+            tracing::warn!("failed to write rtp: {err}");
         }
     }
 
     fn request_keyframe_internal(&mut self, req: KeyframeRequest) {
+        tracing::debug!("request_keyframe_internal");
+        self.request_keyframe_internal_rtp(req);
+    }
+
+    fn request_keyframe_internal_media(&mut self, req: KeyframeRequest) {
         let Some(mut writer) = self.ctx.rtc.writer(req.mid) else {
-            tracing::warn!("No writer for mid {:?}", req.mid);
+            tracing::warn!("no writer for mid {:?}", req.mid);
             return;
         };
 
         if let Err(e) = writer.request_keyframe(req.rid, req.kind) {
-            tracing::warn!("Failed to request keyframe: {}", e);
+            tracing::warn!("failed to request keyframe: {}", e);
         }
+    }
+
+    fn request_keyframe_internal_rtp(&mut self, req: KeyframeRequest) {
+        let mut api = self.ctx.rtc.direct_api();
+        let Some(stream) = api.stream_rx_by_mid(req.mid, req.rid) else {
+            tracing::warn!("stream_rx not found, keyframe request failed");
+            return;
+        };
+
+        stream.request_keyframe(req.kind);
     }
 }
 
