@@ -7,12 +7,8 @@ use std::{
 use bytes::Bytes;
 use futures::{StreamExt, io, stream::FuturesUnordered};
 use str0m::{
-    Event, Input, Output, Rtc, RtcError,
-    channel::ChannelId,
-    error::SdpError,
-    media::{KeyframeRequest, MediaData},
-    net::Transmit,
-    rtp::RtpPacket,
+    Event, Input, Output, Rtc, RtcError, channel::ChannelId, error::SdpError,
+    media::KeyframeRequest, net::Transmit, rtp::RtpPacket,
 };
 use tokio::time::Instant;
 
@@ -49,7 +45,6 @@ pub enum ParticipantControlMessage {
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
     UdpPacket(net::RecvPacket),
-    ForwardMedia(Arc<message::TrackMeta>, Arc<MediaData>),
     ForwardRtp(Arc<message::TrackMeta>, Arc<RtpPacket>),
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
@@ -232,9 +227,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     tracing::warn!("Dropped UDP packet: {}", e);
                 }
             }
-            ParticipantDataMessage::ForwardMedia(track_meta, data) => {
-                self.handle_forward_media(track_meta, data);
-            }
             ParticipantDataMessage::ForwardRtp(track_meta, rtp) => {
                 self.handle_forward_rtp(track_meta, rtp);
             }
@@ -366,9 +358,6 @@ impl ParticipantActor {
                     self.ctx.rtc.disconnect();
                 }
             }
-            Event::MediaData(data) => {
-                self.handle_media_data(data).await;
-            }
             Event::RtpPacket(rtp) => {
                 self.handle_rtp_packet(rtp).await;
             }
@@ -379,28 +368,6 @@ impl ParticipantActor {
                 tracing::info!("connected");
             }
             _ => tracing::trace!("Unhandled event: {:?}", event),
-        }
-    }
-
-    async fn handle_media_data(&mut self, data: MediaData) {
-        // Handle contiguous flag for keyframe requests
-        if data.contiguous {
-            self.request_keyframe_internal(KeyframeRequest {
-                rid: data.rid,
-                mid: data.mid,
-                kind: str0m::media::KeyframeRequestKind::Fir,
-            });
-        }
-
-        let Some(track) = self.core.get_published_track_mut(&data.mid) else {
-            return;
-        };
-
-        if let Err(e) = track
-            .send_low(track::TrackDataMessage::ForwardMedia(Arc::new(data)))
-            .await
-        {
-            tracing::error!("Failed to forward media: {}", e);
         }
     }
 
@@ -432,24 +399,6 @@ impl ParticipantActor {
             return;
         };
         let _ = track_handle.try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
-    }
-
-    fn handle_forward_media(&mut self, track_meta: Arc<message::TrackMeta>, data: Arc<MediaData>) {
-        let Some(mid) = self.core.get_slot(&track_meta, &data.ext_vals) else {
-            return;
-        };
-
-        let Some(writer) = self.ctx.rtc.writer(mid) else {
-            return;
-        };
-
-        let Some(pt) = writer.match_params(data.params) else {
-            return;
-        };
-
-        if let Err(e) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
-            tracing::error!("Failed to write media: {}", e);
-        }
     }
 
     fn handle_forward_rtp(&mut self, track_meta: Arc<message::TrackMeta>, rtp: Arc<RtpPacket>) {

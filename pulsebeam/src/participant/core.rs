@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use str0m::{
-    media::{Direction, MediaAdded, MediaData, MediaKind, Mid},
+    media::{Direction, MediaAdded, MediaKind, Mid},
     rtp::ExtensionValues,
 };
 
