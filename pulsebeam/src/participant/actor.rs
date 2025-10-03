@@ -10,9 +10,9 @@ use str0m::{
     Event, Input, Output, Rtc, RtcError,
     channel::ChannelId,
     error::SdpError,
-    media::{Direction, KeyframeRequest, MediaData, Mid, Pt},
+    media::{KeyframeRequest, MediaData},
     net::Transmit,
-    rtp::{RtpPacket, SeqNo},
+    rtp::RtpPacket,
 };
 use tokio::time::Instant;
 
@@ -62,15 +62,6 @@ pub struct ParticipantContext {
     track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackMessageSet>>,
 
     egress: Arc<net::UnifiedSocket>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum InternalPt {
-    // --- Audio (0–63) ---
-    Opus = 1,
-
-    // --- Video (64–255) ---
-    H264 = 64,
 }
 
 impl ParticipantContext {
@@ -152,6 +143,8 @@ pub struct ParticipantActor {
     effects: VecDeque<effect::Effect>,
 
     egress_buffer: double_buffer::DoubleBuffer<net::SendPacket>,
+    // mid -> internalPt
+    // internalPt -> mid
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -463,18 +456,27 @@ impl ParticipantActor {
             return;
         };
 
+        let pt = {
+            let Some(media) = self.ctx.rtc.media(mid) else {
+                tracing::warn!("no media found, dropping");
+                return;
+            };
+
+            let Some(pt) = media.remote_pts().first() else {
+                // TODO: better logic than matching first pt
+                tracing::warn!("no remote pt found, dropping");
+                return;
+            };
+            *pt
+        };
+
         let mut api = self.ctx.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
             return;
         };
 
-        // TODO: adjust rtp headers
-        // let Some(pt) = writer.match_params(rtp.params) else {
-        //     return;
-        // };
-
         if let Err(err) = writer.write_rtp(
-            rtp.header.payload_type,
+            pt,
             rtp.seq_no,
             rtp.header.timestamp,
             rtp.timestamp,
