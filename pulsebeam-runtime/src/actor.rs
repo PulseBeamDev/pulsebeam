@@ -89,8 +89,8 @@ pub struct ActorContext<M: MessageSet> {
 }
 
 pub trait MessageSet: Sized + Send + 'static {
-    type HighPriorityMsg: Debug + Send + 'static;
-    type LowPriorityMsg: Debug + Send + 'static;
+    type HighPriorityMsg: Send + 'static;
+    type LowPriorityMsg: Send + 'static;
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
     type ObservableState: Debug + Send + Clone;
 }
