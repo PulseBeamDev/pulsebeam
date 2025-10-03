@@ -43,7 +43,7 @@ You must have the server running before the demo clients can connect. The easies
 Open your terminal and run the following command:
 
 ```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.13
+docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.2.2
 ```
 
 This command starts the PulseBeam server, which is now listening for connections on your machine. Keep this terminal window running.
