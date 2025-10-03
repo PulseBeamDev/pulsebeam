@@ -1,11 +1,13 @@
-use pulsebeam_runtime::net;
+use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;
 use crate::gateway::ice;
-use crate::participant::{self, ParticipantHandle};
+use crate::participant;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+pub type ParticipantHandle = mailbox::Sender<net::RecvPacket>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DemuxResult {
@@ -57,10 +59,15 @@ impl Demuxer {
     }
 
     /// Registers a participant with their ICE username fragment.
-    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_handle: ParticipantHandle) {
+    pub fn register_ice_ufrag(
+        &mut self,
+        participant_id: Arc<ParticipantId>,
+        ufrag: &[u8],
+        participant_handle: ParticipantHandle,
+    ) {
         let boxed_ufrag = ufrag.to_vec().into_boxed_slice();
         self.participant_ufrag
-            .insert(participant_handle.meta.clone(), boxed_ufrag.clone());
+            .insert(participant_id, boxed_ufrag.clone());
         self.ufrag_map.insert(boxed_ufrag, participant_handle);
     }
 
@@ -80,20 +87,10 @@ impl Demuxer {
     /// Determines the owner of an incoming UDP packet.
     pub async fn demux(&mut self, pkt: net::RecvPacket) {
         let participant_handle = if let Some(participant_handle) = self.addr_map.get_mut(&pkt.src) {
-            tracing::trace!(
-                "found connection from mapping: {} -> {:?}",
-                pkt.src,
-                participant_handle
-            );
             participant_handle
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&pkt.buf) {
             if let Some(participant_handle) = self.ufrag_map.get_mut(ufrag) {
-                tracing::debug!(
-                    "found connection from ufrag: {:?} -> {} -> {:?}",
-                    ufrag,
-                    pkt.src,
-                    participant_handle
-                );
+                tracing::debug!("found connection from ufrag: {:?} -> {}", ufrag, pkt.src,);
                 self.addr_map.insert(pkt.src, participant_handle.clone());
                 let key = ufrag.to_vec().into_boxed_slice();
                 self.ufrag_addrs.entry(key).or_default().push(pkt.src);
@@ -114,10 +111,7 @@ impl Demuxer {
             return;
         };
 
-        participant_handle
-            .lo_tx
-            .send(participant::ParticipantDataMessage::UdpPacket(pkt))
-            .await;
+        participant_handle.send(pkt).await;
     }
 }
 
