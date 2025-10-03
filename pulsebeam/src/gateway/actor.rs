@@ -1,11 +1,11 @@
-use crate::{entity::ParticipantId, gateway::demux::Demuxer, node::NodeContext, participant};
+use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
 use futures::{StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::{actor, net, rt};
+use pulsebeam_runtime::{actor, mailbox, net, rt};
 use std::{collections::HashMap, io, sync::Arc};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(String, participant::ParticipantHandle),
+    AddParticipant(Arc<ParticipantId>, String, mailbox::Sender<net::RecvPacket>),
     RemoveParticipant(Arc<ParticipantId>),
 }
 
@@ -119,8 +119,9 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         msg: <GatewayMessageSet as actor::MessageSet>::HighPriorityMsg,
     ) -> () {
         match msg {
-            GatewayControlMessage::AddParticipant(ufrag, handle) => {
-                self.demuxer.register_ice_ufrag(ufrag.as_bytes(), handle);
+            GatewayControlMessage::AddParticipant(participant_id, ufrag, handle) => {
+                self.demuxer
+                    .register_ice_ufrag(participant_id, ufrag.as_bytes(), handle);
             }
             GatewayControlMessage::RemoveParticipant(participant_id) => {
                 self.demuxer.unregister(&participant_id);

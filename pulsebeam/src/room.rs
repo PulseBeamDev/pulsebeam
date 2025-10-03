@@ -135,7 +135,6 @@ impl RoomActor {
         participant_id: Arc<ParticipantId>,
         mut rtc: str0m::Rtc,
     ) {
-        let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
         let participant_actor = participant::ParticipantActor::new(
             self.node_ctx.clone(),
             ctx.handle.clone(),
@@ -149,14 +148,6 @@ impl RoomActor {
             actor::spawn(&self.node_ctx.rt, participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);
 
-        self.node_ctx
-            .gateway
-            .send_high(gateway::GatewayControlMessage::AddParticipant(
-                ufrag.clone(),
-                participant_handle.clone(),
-            ))
-            .await
-            .expect("TODO: handle error");
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {
@@ -194,8 +185,7 @@ impl RoomActor {
             .send_high(gateway::GatewayControlMessage::RemoveParticipant(
                 participant_id,
             ))
-            .await
-            .expect("TODO: handle error");
+            .await;
 
         // mark this tracks to be shared and immutable
         let tracks = Arc::new(participant.tracks);

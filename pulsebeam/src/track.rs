@@ -105,16 +105,24 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                 let mut to_remove = Vec::new();
                 for (participant_id, sub) in self.subscribers.iter_mut() {
                     tracing::trace!("forwarded media: track -> participant");
-                    let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardRtp(
-                        self.meta.clone(),
-                        rtp.clone(),
-                    ));
+                    let res = sub
+                        .send_low(participant::ParticipantDataMessage::ForwardRtp(
+                            self.meta.clone(),
+                            rtp.clone(),
+                        ))
+                        .await;
 
-                    // This gets triggered when a participant actor leaves
-                    if let Err(mailbox::TrySendError::Closed(_)) = res {
+                    if let Err(mailbox::SendError(_)) = res {
                         // TODO: should this be a part of unsubscribe instead?
                         to_remove.push(participant_id.clone());
                     }
+                    // This gets triggered when a participant actor leaves
+                    // if let Err(mailbox::TrySendError::Closed(_)) = res {
+                    //     // TODO: should this be a part of unsubscribe instead?
+                    //     to_remove.push(participant_id.clone());
+                    // } else {
+                    //     tracing::warn!("participant queue is full, dropping");
+                    // }
                 }
 
                 for key in to_remove {

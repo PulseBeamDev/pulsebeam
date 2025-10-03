@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{StreamExt, io, stream::FuturesUnordered};
+use futures::{StreamExt, io, stream::FuturesUnordered, task::SpawnExt};
 use str0m::{
     Event, Input, Output, Rtc, RtcError, channel::ChannelId, error::SdpError,
     media::KeyframeRequest, net::Transmit, rtp::RtpPacket,
@@ -13,14 +13,14 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::{
-    entity, message, node,
+    entity, gateway, message, node,
     participant::{
         core::ParticipantCore,
         effect::{self, Effect},
     },
     room, track,
 };
-use pulsebeam_runtime::{actor, collections::double_buffer, net};
+use pulsebeam_runtime::{actor, collections::double_buffer, mailbox, net};
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -44,7 +44,6 @@ pub enum ParticipantControlMessage {
 
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
-    UdpPacket(net::RecvPacket),
     ForwardRtp(Arc<message::TrackMeta>, Arc<RtpPacket>),
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
@@ -139,8 +138,6 @@ pub struct ParticipantActor {
     effects: VecDeque<effect::Effect>,
 
     egress_buffer: double_buffer::DoubleBuffer<net::SendPacket>,
-    // mid -> internalPt
-    // internalPt -> mid
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -154,6 +151,18 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         &mut self,
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
+        let ufrag = self.ctx.rtc.direct_api().local_ice_credentials().ufrag;
+        let (gateway_tx, mut gateway_rx) = mailbox::new(8);
+        self.ctx
+            .node_ctx
+            .gateway
+            .send_high(gateway::GatewayControlMessage::AddParticipant(
+                self.meta(),
+                ufrag.clone(),
+                gateway_tx,
+            ))
+            .await;
+
         pulsebeam_runtime::actor_loop!(self, ctx,
             pre_select: {
                 let timeout = match self.poll().await {
@@ -170,6 +179,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         tracing::error!("failed to write socket: {err}");
                         break;
                     }
+                }
+                Some(pkt) = gateway_rx.recv() => {
+                    self.handle_udp_packet(pkt);
                 }
                 _ = tokio::time::sleep(timeout) => {
                     // Timer expired, poll again
@@ -213,21 +225,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         msg: ParticipantDataMessage,
     ) {
         match msg {
-            ParticipantDataMessage::UdpPacket(packet) => {
-                let input = Input::Receive(
-                    Instant::now().into_std(),
-                    str0m::net::Receive {
-                        proto: str0m::net::Protocol::Udp,
-                        source: packet.src,
-                        destination: packet.dst,
-                        contents: (&*packet.buf).try_into().unwrap(),
-                    },
-                );
-
-                if let Err(e) = self.ctx.rtc.handle_input(input) {
-                    tracing::warn!("Dropped UDP packet: {}", e);
-                }
-            }
             ParticipantDataMessage::ForwardRtp(track_meta, rtp) => {
                 self.handle_forward_rtp(track_meta, rtp);
             }
@@ -400,6 +397,22 @@ impl ParticipantActor {
             return;
         };
         let _ = track_handle.try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
+    }
+
+    fn handle_udp_packet(&mut self, pkt: net::RecvPacket) {
+        let input = Input::Receive(
+            Instant::now().into_std(),
+            str0m::net::Receive {
+                proto: str0m::net::Protocol::Udp,
+                source: pkt.src,
+                destination: pkt.dst,
+                contents: (&*pkt.buf).try_into().unwrap(),
+            },
+        );
+
+        if let Err(e) = self.ctx.rtc.handle_input(input) {
+            tracing::warn!("dropped UDP packet: {}", e);
+        }
     }
 
     fn handle_forward_rtp(&mut self, track_meta: Arc<message::TrackMeta>, rtp: Arc<RtpPacket>) {
