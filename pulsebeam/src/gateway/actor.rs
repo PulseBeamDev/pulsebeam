@@ -1,7 +1,7 @@
 use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::{actor, mailbox, net};
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, fmt, io, sync::Arc};
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
@@ -14,7 +14,7 @@ pub struct GatewayMessageSet;
 impl actor::MessageSet for GatewayMessageSet {
     type HighPriorityMsg = GatewayControlMessage;
     type LowPriorityMsg = ();
-    type Meta = usize;
+    type Meta = String;
     type ObservableState = ();
 }
 
@@ -26,8 +26,8 @@ pub struct GatewayActor {
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayActor {
-    fn meta(&self) -> usize {
-        0
+    fn meta(&self) -> String {
+        "gateway-main".to_string()
     }
 
     fn get_observable_state(&self) {}
@@ -88,8 +88,8 @@ pub struct GatewayWorkerActor {
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
-    fn meta(&self) -> usize {
-        self.id
+    fn meta(&self) -> String {
+        format!("gateway-{}", self.id)
     }
 
     fn get_observable_state(&self) {}

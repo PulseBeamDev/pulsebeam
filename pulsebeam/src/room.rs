@@ -133,7 +133,7 @@ impl RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
         participant_id: Arc<ParticipantId>,
-        mut rtc: str0m::Rtc,
+        rtc: str0m::Rtc,
     ) {
         let participant_actor = participant::ParticipantActor::new(
             self.node_ctx.clone(),
@@ -143,7 +143,7 @@ impl RoomActor {
         );
 
         // TODO: capacity
-        let participant_cfg = actor::RunnerConfig::default().with_lo(1024);
+        let participant_cfg = actor::RunnerConfig::default().with_lo(64);
         let (mut participant_handle, participant_join) =
             actor::spawn(participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);

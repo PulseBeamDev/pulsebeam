@@ -88,7 +88,7 @@ impl ParticipantContext {
                         track::TrackActor::new(self_handle.clone(), track_meta.clone());
                     let (track_handle, join_handle) = actor::spawn(
                         track_actor,
-                        actor::RunnerConfig::default().with_lo(1024).with_hi(1024),
+                        actor::RunnerConfig::default().with_lo(64).with_hi(1024),
                     );
 
                     self.track_tasks.push(join_handle);
@@ -151,7 +151,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.ctx.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(8);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(64);
         self.ctx
             .node_ctx
             .gateway

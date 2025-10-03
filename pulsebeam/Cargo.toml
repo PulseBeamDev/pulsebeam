@@ -34,6 +34,7 @@ hyper = "1.7.0"
 pulsebeam-runtime = { version = "^0.1.0", path = "../pulsebeam-runtime" }
 tokio-util = "0.7.16"
 num_cpus = "1.17.0"
+console-subscriber = "0.4.1"
 
 [dev-dependencies]
 turmoil = "0.6.6"

@@ -256,9 +256,14 @@ where
     };
 
     let actor_id = a.meta().clone();
-    let join = tokio::spawn(
-        run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
-    );
+    // let join = tokio::spawn(tokio::task::unconstrained(
+    //     run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
+    // ));
+
+    let join = tokio::task::Builder::new()
+        .name(&actor_id.clone().to_string())
+        .spawn(run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)))
+        .unwrap();
     let abort_handle = join.abort_handle();
 
     let join = join
