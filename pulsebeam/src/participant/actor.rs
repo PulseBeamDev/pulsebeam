@@ -404,7 +404,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_rtp_packet(&mut self, rtp: RtpPacket) {
+    async fn handle_rtp_packet(&mut self, mut rtp: RtpPacket) {
         tracing::trace!("handle_rtp_packet");
         let mut api = self.ctx.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
@@ -417,6 +417,8 @@ impl ParticipantActor {
             return;
         };
 
+        // HACK: inject SDP rid to rtp.
+        rtp.header.ext_vals.rid = stream.rid();
         if let Err(e) = track
             .send_low(track::TrackDataMessage::ForwardRtp(Arc::new(rtp)))
             .await

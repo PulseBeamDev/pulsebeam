@@ -125,11 +125,6 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
             TrackDataMessage::ForwardRtp(rtp) => {
                 // TODO: adjust streams based on subscribers
                 if rtp.header.ext_vals.rid != self.pinned_rid {
-                    tracing::warn!(
-                        "rtp rid doesn't match pinned_rid: {:?} != {:?}",
-                        rtp.header.ext_vals.rid,
-                        self.pinned_rid
-                    );
                     return;
                 }
 

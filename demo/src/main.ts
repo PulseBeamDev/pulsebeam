@@ -37,11 +37,11 @@ async function start(endpoint: string) {
   const videoTrans = pc.addTransceiver("video", {
     direction: "sendonly",
     // Define scalability layers (low, medium, high)
-    // sendEncodings: [
-    //   { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 }, // quarter res, ~150kbps
-    //   { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 }, // half res, ~500kbps
-    //   { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_500_000 }, // full res, ~1.5Mbps
-    // ],
+    sendEncodings: [
+      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 }, // quarter res, ~150kbps
+      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 }, // half res, ~500kbps
+      { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_500_000 }, // full res, ~1.5Mbps
+    ],
   });
   const audioTrans = pc.addTransceiver("audio", { direction: "sendonly" });
   localStream = await navigator.mediaDevices.getUserMedia({
