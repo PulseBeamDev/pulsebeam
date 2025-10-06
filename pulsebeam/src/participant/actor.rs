@@ -55,7 +55,7 @@ pub struct ParticipantContext {
     rtc: Rtc,
     track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackMessageSet>>,
 
-    egress: Arc<net::UnifiedSocket>,
+    egress: mailbox::Sender<net::SendPacket>,
 }
 
 impl ParticipantContext {
@@ -173,12 +173,12 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             },
             select: {
                 // biased toward writing to socket
-                Ok(_) = self.ctx.egress.writable(), if !self.egress_buffer.is_empty() => {
-                    if let Err(err) = self.flush_egress() {
-                        tracing::error!("failed to write socket: {err}");
-                        break;
-                    }
-                }
+                // Ok(_) = self.ctx.egress.writable(), if !self.egress_buffer.is_empty() => {
+                //     if let Err(err) = self.flush_egress() {
+                //         tracing::error!("failed to write socket: {err}");
+                //         break;
+                //     }
+                // }
                 Some(pkt) = gateway_rx.recv() => {
                     self.handle_udp_packet(pkt);
                 }
@@ -286,7 +286,7 @@ impl ParticipantActor {
                     return Some(duration);
                 }
                 Ok(Output::Transmit(transmit)) => {
-                    self.handle_transmit(transmit);
+                    self.handle_transmit(transmit).await;
                 }
                 Ok(Output::Event(event)) => {
                     self.handle_event(event).await;
@@ -301,30 +301,33 @@ impl ParticipantActor {
         None
     }
 
-    fn handle_transmit(&mut self, transmit: Transmit) {
+    async fn handle_transmit(&mut self, transmit: Transmit) {
         let packet = net::SendPacket {
             buf: Bytes::copy_from_slice(&transmit.contents),
             dst: transmit.destination,
         };
-        self.egress_buffer.push(packet);
+
+        tracing::trace!("transmit packet");
+        // self.egress_buffer.push(packet);
+        self.ctx.egress.send(packet).await;
     }
 
-    fn flush_egress(&mut self) -> io::Result<()> {
-        self.flush_egress_inner()?;
-        self.flush_egress_inner()?;
-        Ok(())
-    }
-
-    fn flush_egress_inner(&mut self) -> io::Result<()> {
-        let Some(buffer) = self.egress_buffer.prepare_send() else {
-            return Ok(());
-        };
-
-        let sent_count = self.ctx.egress.try_send_batch(buffer)?;
-        tracing::trace!("sent {sent_count} packets to socket");
-        self.egress_buffer.mark_sent(sent_count);
-        Ok(())
-    }
+    // fn flush_egress(&mut self) -> io::Result<()> {
+    //     self.flush_egress_inner()?;
+    //     self.flush_egress_inner()?;
+    //     Ok(())
+    // }
+    //
+    // fn flush_egress_inner(&mut self) -> io::Result<()> {
+    //     let Some(buffer) = self.egress_buffer.prepare_send() else {
+    //         return Ok(());
+    //     };
+    //
+    //     let sent_count = self.ctx.egress.try_send_batch(buffer)?;
+    //     tracing::trace!("sent {sent_count} packets to socket");
+    //     self.egress_buffer.mark_sent(sent_count);
+    //     Ok(())
+    // }
 
     async fn handle_event(&mut self, event: Event) {
         match event {

@@ -1,7 +1,8 @@
 use crate::{api, controller, gateway};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::collections::double_buffer;
 use pulsebeam_runtime::{actor, net, rand};
+use pulsebeam_runtime::{mailbox, prelude::*};
 use std::sync::atomic::AtomicUsize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -11,7 +12,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
     pub gateway: gateway::GatewayHandle,
-    pub sockets: Vec<Arc<net::UnifiedSocket>>,
+    pub sockets: Vec<mailbox::Sender<net::SendPacket>>,
     egress_counter: Arc<AtomicUsize>,
 }
 
@@ -24,12 +25,12 @@ impl NodeContext {
         Self {
             rng: rand::Rng::from_os_rng(),
             gateway: gw,
-            sockets: vec![socket.clone()],
+            sockets: vec![],
             egress_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub fn allocate_egress(&self) -> Arc<net::UnifiedSocket> {
+    pub fn allocate_egress(&self) -> mailbox::Sender<net::SendPacket> {
         let seq = self
             .egress_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -72,10 +73,39 @@ pub async fn run(
     let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
     join_set.push(gateway_join.map(|_| ()).boxed());
     let rng = rand::Rng::from_os_rng();
+
+    let mut egress = Vec::new();
+    for socket in &sockets {
+        let socket = socket.clone();
+        let (tx, mut rx) = mailbox::new(64);
+        tokio::task::spawn(async move {
+            let mut db = double_buffer::DoubleBuffer::new(64);
+            loop {
+                tokio::select! {
+                    Some(msg) = rx.recv() => {
+                tracing::trace!("received packet for egress");
+                        db.push(msg);
+                    }
+
+                    Ok(_) = socket.writable(), if !db.is_empty() => {
+                        let Some(buffer) = db.prepare_send() else {
+                            continue;
+                        };
+
+                        let sent_count = socket.try_send_batch(buffer).unwrap();
+                        tracing::trace!("sent {sent_count} packets to socket");
+                        db.mark_sent(sent_count);
+                    }
+                }
+            }
+        });
+
+        egress.push(tx);
+    }
     let node_ctx = NodeContext {
         rng,
         gateway,
-        sockets,
+        sockets: egress,
         egress_counter: Arc::new(AtomicUsize::new(0)),
     };
 
