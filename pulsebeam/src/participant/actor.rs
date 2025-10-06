@@ -310,6 +310,12 @@ impl ParticipantActor {
     }
 
     fn flush_egress(&mut self) -> io::Result<()> {
+        self.flush_egress_inner()?;
+        self.flush_egress_inner()?;
+        Ok(())
+    }
+
+    fn flush_egress_inner(&mut self) -> io::Result<()> {
         let Some(buffer) = self.egress_buffer.prepare_send() else {
             return Ok(());
         };

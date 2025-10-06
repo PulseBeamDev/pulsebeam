@@ -5,7 +5,6 @@ BINARY = $(TARGET_DIR)/pulsebeam
 # Rust settings
 CARGO = cargo
 SCCACHE := $(shell which sccache)
-PROFILING_RUSTFLAGS = -C force-frame-pointers=yes
 
 # Development build and run
 .PHONY: dev
@@ -19,16 +18,16 @@ all: build flamegraph
 # Build with profiling profile
 .PHONY: build
 build:
-	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) $(CARGO) build --profile profiling -p pulsebeam
+	RUSTC_WRAPPER=$(SCCACHE) $(CARGO) build --profile profiling -p pulsebeam
 
 # Capture flamegraph
 .PHONY: flamegraph
 flamegraph:
-	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
+	RUSTC_WRAPPER=$(SCCACHE) taskset -c 2-5 cargo flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
 .PHONY: perf
 perf:
-	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) cargo build --profile profiling -p pulsebeam --bin pulsebeam
+	RUSTC_WRAPPER=$(SCCACHE) cargo build --profile profiling -p pulsebeam --bin pulsebeam
 	taskset -c 2-5 perf record --call-graph dwarf ./target/profiling/pulsebeam
 	hotspot ./perf.data
 

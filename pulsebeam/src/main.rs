@@ -15,26 +15,31 @@ use systemstat::{IpAddr as SysIpAddr, Platform, System};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
-    // let env_filter =
-    //     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-    // tracing_subscriber::fmt()
-    //     .with_env_filter(env_filter)
-    //     .with_target(true)
-    //     .pretty()
-    //     .init();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .pretty()
+        .init();
 
-    console_subscriber::init();
+    // console_subscriber::init();
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(workers)
+        .event_interval(11)
+        // .disable_lifo_slot()
         .build()
         .unwrap();
 
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers));
+    rt.block_on(async {
+        let join = tokio::spawn(run(shutdown.clone(), workers));
+        join.await;
+    });
     shutdown.cancel();
 }
 

@@ -256,13 +256,12 @@ where
     };
 
     let actor_id = a.meta().clone();
-    // let join = tokio::spawn(tokio::task::unconstrained(
-    //     run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
-    // ));
 
+    let fut = run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id));
     let join = tokio::task::Builder::new()
         .name(&actor_id.clone().to_string())
-        .spawn(run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)))
+        // .spawn(tokio::task::unconstrained(fut))
+        .spawn(fut)
         .unwrap();
     let abort_handle = join.abort_handle();
 
@@ -326,7 +325,15 @@ macro_rules! actor_loop {
     ($actor:ident, $ctx:ident) => { actor_loop!($actor, $ctx, pre_select: {}, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => { actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }, select: { $($extra:tt)* }) => {
+        // const TIME_SLICE_US: u64 = 100; // 100μs time slice
+        // let mut last_yield = tokio::time::Instant::now();
         loop {
+            // // Force yield if time slice expired
+            // if last_yield.elapsed().as_micros() as u64 >= TIME_SLICE_US {
+            //     tokio::task::yield_now().await;
+            //     last_yield = tokio::time::Instant::now();
+            // }
+
             $($pre_select)*
             tokio::select! {
                 biased;

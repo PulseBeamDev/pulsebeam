@@ -98,7 +98,10 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         &mut self,
         ctx: &mut actor::ActorContext<GatewayMessageSet>,
     ) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
+        let worker_id = self.meta();
+        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {
+            tracing::debug!("{worker_id} -> {:?}", std::thread::current().id());
+        },
         select: {
             Ok(_) = self.socket.readable() => {
                 if let Err(err) = self.read_socket().await {

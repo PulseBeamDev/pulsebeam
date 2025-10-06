@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+pub use tokio::sync::mpsc::error::TryRecvError;
+
 /// An error returned when sending on a closed mailbox.
 ///
 /// This error is returned by the asynchronous `send` method. It contains
@@ -79,6 +81,10 @@ impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
         self.receiver.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.receiver.try_recv()
     }
 }
 
