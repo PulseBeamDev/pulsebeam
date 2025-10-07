@@ -1,6 +1,10 @@
 use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
-use futures::{StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::{actor, mailbox, net};
+use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
+use pulsebeam_runtime::{
+    actor,
+    mailbox::{self, TrySendError},
+    net,
+};
 use std::{collections::HashMap, fmt, io, sync::Arc};
 
 #[derive(Clone)]
@@ -85,6 +89,7 @@ pub struct GatewayWorkerActor {
     recv_batch: Vec<net::RecvPacket>,
 
     participants: HashMap<Arc<ParticipantId>, participant::ParticipantHandle>,
+    ticks: u16,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
@@ -143,6 +148,7 @@ impl GatewayWorkerActor {
             recv_batch,
             demuxer: Demuxer::new(),
             participants: HashMap::with_capacity(1024),
+            ticks: 0,
         }
     }
 
@@ -155,10 +161,24 @@ impl GatewayWorkerActor {
             .try_recv_batch(&mut self.recv_batch, batch_size)?;
 
         tracing::trace!("received {count} packets from socket");
+
         for packet in self.recv_batch.drain(..) {
-            self.demuxer.demux(packet).await;
+            let Some(handle) = self.demuxer.demux(&packet) else {
+                continue;
+            };
+
+            if let Err(TrySendError::Full(pkt)) = handle.try_send(packet) {
+                let _ = handle.send(pkt).await;
+                self.ticks = 0;
+            }
+
+            self.ticks += 1;
+            if self.ticks >= 32 {
+                // adjust for your throughput
+                tokio::task::yield_now().await;
+                self.ticks = 0; // reset tick here
+            }
         }
-        self.recv_batch.clear();
 
         Ok(())
     }

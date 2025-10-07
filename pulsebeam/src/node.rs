@@ -46,7 +46,7 @@ pub async fn run(
     http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
-    for _ in 0..workers {
+    for _ in 0..256 {
         let socket =
             match net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
                 .await
@@ -77,9 +77,9 @@ pub async fn run(
     let mut egress = Vec::new();
     for socket in &sockets {
         let socket = socket.clone();
-        let (tx, mut rx) = mailbox::new(64);
+        let (tx, mut rx) = mailbox::new(128);
         tokio::task::spawn(async move {
-            let mut db = double_buffer::DoubleBuffer::new(64);
+            let mut db = double_buffer::DoubleBuffer::new(1024);
             loop {
                 tokio::select! {
                     Some(msg) = rx.recv() => {
@@ -88,6 +88,14 @@ pub async fn run(
                     }
 
                     Ok(_) = socket.writable(), if !db.is_empty() => {
+                        let Some(buffer) = db.prepare_send() else {
+                            continue;
+                        };
+
+                        let sent_count = socket.try_send_batch(buffer).unwrap();
+                        tracing::trace!("sent {sent_count} packets to socket");
+                        db.mark_sent(sent_count);
+
                         let Some(buffer) = db.prepare_send() else {
                             continue;
                         };

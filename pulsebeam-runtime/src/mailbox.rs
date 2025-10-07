@@ -53,7 +53,7 @@ impl<T> Sender<T> {
     /// Sends a message asynchronously, waiting if the mailbox is full.
     ///
     /// Returns a `SendError` only if the receiving actor has terminated.
-    pub async fn send(&mut self, message: T) -> Result<(), SendError<T>> {
+    pub async fn send(&self, message: T) -> Result<(), SendError<T>> {
         self.sender
             .send(message)
             .await
@@ -64,7 +64,7 @@ impl<T> Sender<T> {
     ///
     /// Returns a `TrySendError` if the mailbox is full or if the
     /// receiving actor has terminated.
-    pub fn try_send(&mut self, message: T) -> Result<(), TrySendError<T>> {
+    pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
         self.sender.try_send(message).map_err(|e| match e {
             tokio::sync::mpsc::error::TrySendError::Full(e) => TrySendError::Full(e),
             tokio::sync::mpsc::error::TrySendError::Closed(e) => TrySendError::Closed(e),

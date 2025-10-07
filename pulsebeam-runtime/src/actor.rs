@@ -160,28 +160,28 @@ impl<M: MessageSet> Debug for ActorHandle<M> {
 
 impl<M: MessageSet> ActorHandle<M> {
     pub async fn send_high(
-        &mut self,
+        &self,
         msg: M::HighPriorityMsg,
     ) -> Result<(), mailbox::SendError<M::HighPriorityMsg>> {
         self.hi_tx.send(msg).await
     }
 
     pub fn try_send_high(
-        &mut self,
+        &self,
         msg: M::HighPriorityMsg,
     ) -> Result<(), mailbox::TrySendError<M::HighPriorityMsg>> {
         self.hi_tx.try_send(msg)
     }
 
     pub async fn send_low(
-        &mut self,
+        &self,
         msg: M::LowPriorityMsg,
     ) -> Result<(), mailbox::SendError<M::LowPriorityMsg>> {
         self.lo_tx.send(msg).await
     }
 
     pub fn try_send_low(
-        &mut self,
+        &self,
         msg: M::LowPriorityMsg,
     ) -> Result<(), mailbox::TrySendError<M::LowPriorityMsg>> {
         self.lo_tx.try_send(msg)
@@ -325,13 +325,13 @@ macro_rules! actor_loop {
     ($actor:ident, $ctx:ident) => { actor_loop!($actor, $ctx, pre_select: {}, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => { actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }, select: { $($extra:tt)* }) => {
-        // const TIME_SLICE_US: u64 = 100; // 100μs time slice
-        // let mut last_yield = tokio::time::Instant::now();
+        // const MAX_TICKS: u8 = 16; // 100μs time slice
+        // let mut tick_count = 0;
         loop {
             // // Force yield if time slice expired
-            // if last_yield.elapsed().as_micros() as u64 >= TIME_SLICE_US {
+            // if tick_count > MAX_TICKS {
             //     tokio::task::yield_now().await;
-            //     last_yield = tokio::time::Instant::now();
+            //     tick_count = 0;
             // }
 
             $($pre_select)*
@@ -353,6 +353,7 @@ macro_rules! actor_loop {
                 $($extra)*
                 else => break,
             }
+        // tick_count += 1;
         }
     };
 }

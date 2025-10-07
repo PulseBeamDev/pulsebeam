@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use futures::future::join_all;
 use str0m::{
     media::{KeyframeRequestKind, Rid},
     rtp::RtpPacket,
@@ -11,7 +12,10 @@ use crate::{
     message::{self, TrackMeta},
     participant::{self, ParticipantHandle},
 };
-use pulsebeam_runtime::{actor, mailbox};
+use pulsebeam_runtime::{
+    actor,
+    mailbox::{self, TrySendError},
+};
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 // Common simulcast RIDs (quarter, half, full)
@@ -60,6 +64,7 @@ pub struct TrackActor {
     last_keyframe_request: Instant,
 
     pinned_rid: Option<Rid>,
+    ticks: u16,
 }
 
 impl actor::Actor<TrackMessageSet> for TrackActor {
@@ -103,28 +108,33 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                 }
 
                 let mut to_remove = Vec::new();
-                for (participant_id, sub) in self.subscribers.iter_mut() {
-                    tracing::trace!("forwarded media: track -> participant");
-                    let res = sub
-                        .send_low(participant::ParticipantDataMessage::ForwardRtp(
-                            self.meta.clone(),
-                            rtp.clone(),
-                        ))
-                        .await;
 
-                    if let Err(mailbox::SendError(_)) = res {
-                        // TODO: should this be a part of unsubscribe instead?
-                        to_remove.push(participant_id.clone());
+                for (participant_id, sub) in self.subscribers.iter_mut() {
+                    let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardRtp(
+                        self.meta.clone(),
+                        rtp.clone(),
+                    ));
+
+                    match res {
+                        Err(TrySendError::Full(msg)) => {
+                            sub.send_low(msg).await;
+                            self.ticks = 0;
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            to_remove.push(participant_id.clone());
+                        }
+                        _ => {}
                     }
-                    // This gets triggered when a participant actor leaves
-                    // if let Err(mailbox::TrySendError::Closed(_)) = res {
-                    //     // TODO: should this be a part of unsubscribe instead?
-                    //     to_remove.push(participant_id.clone());
-                    // } else {
-                    //     tracing::warn!("participant queue is full, dropping");
-                    // }
+
+                    self.ticks += 1;
+                    if self.ticks >= 8 {
+                        // adjust batch size for throughput
+                        tokio::task::yield_now().await; // fairness
+                        self.ticks = 0;
+                    }
                 }
 
+                // Remove closed subscribers
                 for key in to_remove {
                     self.subscribers.remove(&key);
                 }
@@ -161,6 +171,7 @@ impl TrackActor {
             // allow keyframe request immediately
             last_keyframe_request: Instant::now() - KEYFRAME_REQUEST_THROTTLE,
             pinned_rid,
+            ticks: 0,
         }
     }
 

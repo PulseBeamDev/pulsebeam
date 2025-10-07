@@ -30,10 +30,13 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(workers)
-        .event_interval(11)
+        // .event_interval(11)
         // .disable_lifo_slot()
         .build()
         .unwrap();
+
+    // let rt = tokio::runtime::LocalRuntime::new().unwrap();
+    // let workers = 1;
 
     let shutdown = CancellationToken::new();
     rt.block_on(async {

@@ -85,33 +85,33 @@ impl Demuxer {
     }
 
     /// Determines the owner of an incoming UDP packet.
-    pub async fn demux(&mut self, pkt: net::RecvPacket) {
-        let participant_handle = if let Some(participant_handle) = self.addr_map.get_mut(&pkt.src) {
-            participant_handle
-        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&pkt.buf) {
-            if let Some(participant_handle) = self.ufrag_map.get_mut(ufrag) {
-                tracing::debug!("found connection from ufrag: {:?} -> {}", ufrag, pkt.src,);
-                self.addr_map.insert(pkt.src, participant_handle.clone());
-                let key = ufrag.to_vec().into_boxed_slice();
-                self.ufrag_addrs.entry(key).or_default().push(pkt.src);
-                participant_handle
-            } else {
-                tracing::trace!(
-                    "dropped a packet from {} due to unregistered stun binding: {:?}",
-                    pkt.src,
-                    ufrag
-                );
-                return;
-            }
-        } else {
+    pub fn demux(&mut self, pkt: &net::RecvPacket) -> Option<&ParticipantHandle> {
+        if self.addr_map.contains_key(&pkt.src) {
+            return self.addr_map.get(&pkt.src);
+        }
+
+        let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&pkt.buf) else {
             tracing::trace!(
                 "dropped a packet from {} due to unexpected message flow from an unknown source",
                 pkt.src
             );
-            return;
+            return None;
         };
 
-        participant_handle.send(pkt).await;
+        if let Some(participant_handle) = self.ufrag_map.get(ufrag) {
+            tracing::debug!("found connection from ufrag: {:?} -> {}", ufrag, pkt.src,);
+            self.addr_map.insert(pkt.src, participant_handle.clone());
+            let key = ufrag.to_vec().into_boxed_slice();
+            self.ufrag_addrs.entry(key).or_default().push(pkt.src);
+            Some(participant_handle)
+        } else {
+            tracing::trace!(
+                "dropped a packet from {} due to unregistered stun binding: {:?}",
+                pkt.src,
+                ufrag
+            );
+            None
+        }
     }
 }
 
