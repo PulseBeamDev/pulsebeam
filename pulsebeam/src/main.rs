@@ -1,5 +1,5 @@
 use mimalloc::MiMalloc;
-use pulsebeam_runtime::system;
+use pulsebeam_runtime::{rt, system};
 use tokio_util::sync::CancellationToken;
 
 #[global_allocator]
@@ -8,6 +8,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    sync::Arc,
 };
 
 use pulsebeam::node;
@@ -26,18 +27,13 @@ fn main() {
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(workers)
-        .build()
-        .unwrap();
-
+    let runtime = rt::PulsebeamRuntime::new(workers);
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers));
+    runtime.block_on(run(runtime.clone(), shutdown.clone(), workers));
     shutdown.cancel();
 }
 
-pub async fn run(shutdown: CancellationToken, workers: usize) {
+pub async fn run(rt: Arc<rt::PulsebeamRuntime>, shutdown: CancellationToken, workers: usize) {
     let external_ip = select_host_address();
     let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
 
@@ -51,7 +47,7 @@ pub async fn run(shutdown: CancellationToken, workers: usize) {
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(shutdown.clone(), workers, external_addr, local_addr, http_addr) => {
+        Err(err) = node::run(rt, shutdown.clone(), workers, external_addr, local_addr, http_addr) => {
             tracing::warn!("node exited with error: {err}");
         }
         _ = system::wait_for_signal() => {

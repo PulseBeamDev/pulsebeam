@@ -146,7 +146,7 @@ impl RoomActor {
         // TODO: capacity
         let participant_cfg = actor::RunnerConfig::default().with_lo(1024);
         let (mut participant_handle, participant_join) =
-            actor::spawn(participant_actor, participant_cfg);
+            actor::spawn(&self.node_ctx.rt, participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);
 
         self.node_ctx

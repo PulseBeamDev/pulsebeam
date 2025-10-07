@@ -1,7 +1,7 @@
 use crate::{api, controller, gateway};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
+use pulsebeam_runtime::{prelude::*, rt};
 use std::sync::atomic::AtomicUsize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -9,6 +9,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Clone)]
 pub struct NodeContext {
+    pub rt: Arc<rt::PulsebeamRuntime>,
     pub rng: pulsebeam_runtime::rand::Rng,
     pub gateway: gateway::GatewayHandle,
     pub sockets: Vec<Arc<net::UnifiedSocket>>,
@@ -19,9 +20,14 @@ impl NodeContext {
     pub fn single(socket: net::UnifiedSocket) -> Self {
         let socket = Arc::new(socket);
 
-        let (gw, _) = actor::spawn_default(gateway::GatewayActor::new(vec![socket.clone()]));
+        let rt = rt::PulsebeamRuntime::new(1);
+        let (gw, _) = actor::spawn_default(
+            &rt,
+            gateway::GatewayActor::new(rt.clone(), vec![socket.clone()]),
+        );
 
         Self {
+            rt,
             rng: rand::Rng::from_os_rng(),
             gateway: gw,
             sockets: vec![socket.clone()],
@@ -38,6 +44,7 @@ impl NodeContext {
 }
 
 pub async fn run(
+    rt: Arc<rt::PulsebeamRuntime>,
     shutdown: CancellationToken,
     workers: usize,
     external_addr: SocketAddr,
@@ -69,10 +76,12 @@ pub async fn run(
         .max_age(Duration::from_secs(86400));
 
     let mut join_set = FuturesUnordered::new();
-    let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
+    let (gateway, gateway_join) =
+        actor::spawn_default(&rt, gateway::GatewayActor::new(rt.clone(), sockets.clone()));
     join_set.push(gateway_join.map(|_| ()).boxed());
     let rng = rand::Rng::from_os_rng();
     let node_ctx = NodeContext {
+        rt: rt.clone(),
         rng,
         gateway,
         sockets,
@@ -84,7 +93,7 @@ pub async fn run(
         vec![external_addr],
         Arc::new("root".to_string()),
     );
-    let (controller_handle, controller_join) = actor::spawn_default(controller_actor);
+    let (controller_handle, controller_join) = actor::spawn_default(&rt, controller_actor);
     join_set.push(controller_join.map(|_| ()).boxed());
 
     // HTTP API
@@ -110,7 +119,7 @@ pub async fn run(
         }
     };
 
-    join_set.push(tokio::spawn(signaling).map(|_| ()).boxed());
+    join_set.push(rt.spawn(signaling).map(|_| ()).boxed());
 
     // Wait for all tasks to complete OR shutdown
     tokio::select! {

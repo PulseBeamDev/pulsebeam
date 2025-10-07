@@ -244,6 +244,7 @@ pub mod test {
             simulcast_rids: None,
         });
         let fake = track::test::FakeTrackActor::new(meta);
-        actor::spawn_default(fake)
+        todo!();
+        // actor::spawn_default(fake)
     }
 }

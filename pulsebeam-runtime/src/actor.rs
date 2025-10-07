@@ -1,42 +1,18 @@
 use crate::actor_loop;
+use crate::rt::PulsebeamRuntime;
 use futures::FutureExt;
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::Instrument;
 
 use crate::mailbox;
-
-pub struct JoinHandle<M: MessageSet> {
-    inner: Pin<Box<dyn futures::Future<Output = (M::Meta, ActorStatus)> + Send>>,
-    abort_handle: tokio::task::AbortHandle,
-}
-
-impl<M: MessageSet> JoinHandle<M> {
-    pub fn abort(&self) {
-        self.abort_handle.abort();
-    }
-}
-
-impl<M: MessageSet> Drop for JoinHandle<M> {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
-impl<M: MessageSet> futures::Future for JoinHandle<M> {
-    type Output = (M::Meta, ActorStatus);
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.inner.as_mut().poll(cx)
-    }
-}
+pub type JoinHandle<M: MessageSet> =
+    Pin<Box<dyn futures::Future<Output = (M::Meta, ActorStatus)> + Send>>;
 
 #[derive(Error, Debug)]
 pub enum ActorError {
@@ -232,7 +208,11 @@ impl RunnerConfig {
     }
 }
 
-pub fn spawn<A, M>(a: A, config: RunnerConfig) -> (ActorHandle<M>, JoinHandle<M>)
+pub fn spawn<A, M>(
+    rt: &PulsebeamRuntime,
+    a: A,
+    config: RunnerConfig,
+) -> (ActorHandle<M>, JoinHandle<M>)
 where
     M: MessageSet,
     A: Actor<M>,
@@ -256,10 +236,9 @@ where
     };
 
     let actor_id = a.meta().clone();
-    let join = tokio::spawn(
-        run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
-    );
-    let abort_handle = join.abort_handle();
+    // TODO: expose placement
+    let join =
+        rt.spawn(run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)));
 
     let join = join
         .map(|res| match res {
@@ -268,21 +247,15 @@ where
         })
         .boxed();
 
-    (
-        handle,
-        JoinHandle {
-            inner: join,
-            abort_handle,
-        },
-    )
+    (handle, join)
 }
 
-pub fn spawn_default<A, M>(a: A) -> (ActorHandle<M>, JoinHandle<M>)
+pub fn spawn_default<A, M>(rt: &PulsebeamRuntime, a: A) -> (ActorHandle<M>, JoinHandle<M>)
 where
     M: MessageSet,
     A: Actor<M>,
 {
-    spawn(a, RunnerConfig::default())
+    spawn(rt, a, RunnerConfig::default())
 }
 
 async fn run<A, M>(mut a: A, mut ctx: ActorContext<M>) -> ActorStatus

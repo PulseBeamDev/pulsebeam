@@ -88,6 +88,7 @@ impl ParticipantContext {
                     let track_actor =
                         track::TrackActor::new(self_handle.clone(), track_meta.clone());
                     let (track_handle, join_handle) = actor::spawn(
+                        &self.node_ctx.rt,
                         track_actor,
                         actor::RunnerConfig::default().with_lo(1024).with_hi(1024),
                     );

@@ -1,6 +1,6 @@
-use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
+use crate::{entity::ParticipantId, gateway::demux::Demuxer, node::NodeContext, participant};
 use futures::{StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::{actor, net};
+use pulsebeam_runtime::{actor, net, rt};
 use std::{collections::HashMap, io, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -19,6 +19,7 @@ impl actor::MessageSet for GatewayMessageSet {
 }
 
 pub struct GatewayActor {
+    rt: Arc<rt::PulsebeamRuntime>,
     sockets: Vec<Arc<net::UnifiedSocket>>,
     workers: Vec<GatewayWorkerHandle>,
 
@@ -38,7 +39,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
     ) -> Result<(), actor::ActorError> {
         for (id, socket) in self.sockets.iter().enumerate() {
             let (worker_handle, worker_join) =
-                actor::spawn_default(GatewayWorkerActor::new(id, socket.clone()));
+                actor::spawn_default(&self.rt, GatewayWorkerActor::new(id, socket.clone()));
             self.worker_tasks.push(worker_join);
             self.workers.push(worker_handle);
         }
@@ -66,9 +67,10 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
 }
 
 impl GatewayActor {
-    pub fn new(sockets: Vec<Arc<net::UnifiedSocket>>) -> Self {
+    pub fn new(rt: Arc<rt::PulsebeamRuntime>, sockets: Vec<Arc<net::UnifiedSocket>>) -> Self {
         let workers = Vec::with_capacity(sockets.len());
         Self {
+            rt,
             sockets,
             workers,
             worker_tasks: FuturesUnordered::new(),
