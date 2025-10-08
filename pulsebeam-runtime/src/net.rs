@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
 #[derive(Clone, Copy, Debug)]
@@ -30,6 +30,64 @@ pub struct RecvPacket {
     pub src: SocketAddr, // remote peer
     pub dst: SocketAddr,
     pub buf: Bytes, // pre-allocated buffer
+}
+
+pub struct RecvBatchStorage {
+    backend: Vec<u8>,
+    chunk_size: usize,
+}
+
+impl RecvBatchStorage {
+    const MAX_MTU: usize = 1500;
+
+    pub fn new(gro_segments: usize) -> Self {
+        let chunk_size = Self::MAX_MTU * gro_segments;
+        Self {
+            backend: vec![0; quinn_udp::BATCH_SIZE * chunk_size],
+            chunk_size,
+        }
+    }
+
+    pub fn as_io_slices(&mut self) -> Vec<IoSliceMut<'_>> {
+        self.backend
+            .chunks_mut(self.chunk_size)
+            .map(IoSliceMut::new)
+            .collect()
+    }
+}
+
+/// Holds IoSliceMut for recv operations and metadata.
+pub struct RecvPacketBatch<'a> {
+    slices: Vec<IoSliceMut<'a>>,
+    meta: Vec<RecvMeta>,
+}
+
+impl<'a> RecvPacketBatch<'a> {
+    pub fn new(storage: &'a mut RecvBatchStorage) -> Self {
+        let slices = storage.as_io_slices();
+        let meta = vec![RecvMeta::default(); quinn_udp::BATCH_SIZE];
+
+        Self { slices, meta }
+    }
+
+    /// Extract received packets into user-facing data
+    pub fn collect_packets(&self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacket>) {
+        // TODO: avoid reallocation here
+        // TODO: send as batch instead of individual packets
+        for (i, m) in self.meta.iter().take(count).enumerate() {
+            let buf = &self.slices[i];
+            let segments = m.len / m.stride;
+            for seg in 0..segments {
+                let start = seg * m.stride;
+                let end = start + m.stride;
+                out.push(RecvPacket {
+                    src: m.addr,
+                    dst: local_addr,
+                    buf: Bytes::copy_from_slice(&buf[start..end]),
+                });
+            }
+        }
+    }
 }
 
 /// A packet to send.
@@ -82,6 +140,13 @@ impl UnifiedSocket {
         }
     }
 
+    pub fn gro_segments(&self) -> usize {
+        match self {
+            Self::Udp(inner) => inner.gro_segments(),
+            Self::SimUdp(inner) => inner.gro_segments(),
+        }
+    }
+
     /// Waits until the socket is readable.
     #[inline]
     pub async fn readable(&self) -> io::Result<()> {
@@ -106,10 +171,14 @@ impl UnifiedSocket {
     /// Returns the number of packets received.
     /// Stops on WouldBlock or fatal errors.
     #[inline]
-    pub fn try_recv_batch(&self, packets: &mut Vec<RecvPacket>) -> std::io::Result<usize> {
+    pub fn try_recv_batch(
+        &self,
+        batch: &mut RecvPacketBatch,
+        packets: &mut Vec<RecvPacket>,
+    ) -> std::io::Result<()> {
         match self {
-            Self::Udp(inner) => inner.try_recv_batch(packets),
-            Self::SimUdp(inner) => inner.try_recv_batch(packets),
+            Self::Udp(inner) => inner.try_recv_batch(batch, packets),
+            Self::SimUdp(inner) => inner.try_recv_batch(batch, packets),
         }
     }
 
@@ -172,6 +241,10 @@ impl UdpTransport {
         self.state.max_gso_segments()
     }
 
+    pub fn gro_segments(&self) -> usize {
+        self.state.gro_segments()
+    }
+
     #[inline]
     pub async fn readable(&self) -> io::Result<()> {
         self.sock.ready(tokio::io::Interest::READABLE).await?;
@@ -185,44 +258,24 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub fn try_recv_batch(&self, packets: &mut Vec<RecvPacket>) -> std::io::Result<usize> {
-        // TODO: avoid reallocation here
-        // TODO: send as batch instead of individual packets
-        let mut receive_buffers =
-            vec![vec![0; Self::MAX_MTU * self.state.gro_segments()]; quinn_udp::BATCH_SIZE];
-        let mut receive_slices = receive_buffers
-            .iter_mut()
-            .map(|buf| IoSliceMut::new(buf))
-            .collect::<Vec<_>>();
-        let mut meta = vec![RecvMeta::default(); quinn_udp::BATCH_SIZE];
-
-        let count = 0;
+    pub fn try_recv_batch(
+        &self,
+        batch: &mut RecvPacketBatch,
+        out: &mut Vec<RecvPacket>,
+    ) -> std::io::Result<()> {
         let res = self.sock.try_io(tokio::io::Interest::READABLE, || {
             self.state
-                .recv((&self.sock).into(), &mut receive_slices, &mut meta)
+                .recv((&self.sock).into(), &mut batch.slices, &mut batch.meta)
         });
 
         match res {
-            Ok(n) => {
-                for (i, m) in meta.iter().take(n).enumerate() {
-                    let buffer = &receive_buffers[i];
-                    let segments = m.len / m.stride;
-                    for i in 0..segments {
-                        packets.push(RecvPacket {
-                            src: m.addr,
-                            dst: self.local_addr,
-                            buf: Bytes::copy_from_slice(
-                                &buffer[(i * m.stride)..((i + 1) * m.stride)],
-                            ),
-                        });
-                    }
-                }
+            Ok(count) => {
+                batch.collect_packets(self.local_addr, count, out);
+                Ok(())
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(0),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
         }
-
-        Ok(count)
     }
 
     #[inline]
@@ -268,6 +321,10 @@ impl SimUdpTransport {
         1
     }
 
+    pub fn gro_segments(&self) -> usize {
+        1
+    }
+
     #[inline]
     pub async fn readable(&self) -> io::Result<()> {
         self.sock.readable().await
@@ -279,8 +336,11 @@ impl SimUdpTransport {
     }
 
     #[inline]
-    pub fn try_recv_batch(&self, packets: &mut Vec<RecvPacket>) -> std::io::Result<usize> {
-        let mut count = 0;
+    pub fn try_recv_batch(
+        &self,
+        batch: &mut RecvPacketBatch,
+        packets: &mut Vec<RecvPacket>,
+    ) -> std::io::Result<()> {
         let mut buf = [0u8; Self::MTU];
 
         loop {
@@ -291,7 +351,6 @@ impl SimUdpTransport {
                         src,
                         dst: self.local_addr,
                     });
-                    count += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -300,7 +359,7 @@ impl SimUdpTransport {
                 }
             }
         }
-        Ok(count)
+        Ok(())
     }
 
     #[inline]

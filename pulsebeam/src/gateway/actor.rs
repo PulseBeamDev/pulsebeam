@@ -83,6 +83,7 @@ pub struct GatewayWorkerActor {
     socket: Arc<net::UnifiedSocket>,
     demuxer: Demuxer,
     recv_batch: Vec<net::RecvPacket>,
+    storage: net::RecvBatchStorage,
 
     participants: HashMap<Arc<ParticipantId>, participant::ParticipantHandle>,
 }
@@ -133,11 +134,13 @@ impl GatewayWorkerActor {
     pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
         // Pre-allocate receive batch with MTU-sized buffers
         let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
+        let storage = net::RecvBatchStorage::new(socket.gro_segments());
 
         Self {
             id,
             socket,
             recv_batch,
+            storage,
             demuxer: Demuxer::new(),
             participants: HashMap::with_capacity(1024),
         }
@@ -146,9 +149,11 @@ impl GatewayWorkerActor {
     async fn read_socket(&mut self) -> io::Result<()> {
         // the loop after reading should always clear the buffer
         assert!(self.recv_batch.is_empty());
-        let count = self.socket.try_recv_batch(&mut self.recv_batch)?;
 
-        tracing::trace!("received {count} packets from socket");
+        let mut batch = net::RecvPacketBatch::new(&mut self.storage);
+        self.socket
+            .try_recv_batch(&mut batch, &mut self.recv_batch)?;
+
         for packet in self.recv_batch.drain(..) {
             self.demuxer.demux(packet).await;
         }
