@@ -266,7 +266,7 @@ impl ParticipantActor {
             core,
             effects,
             data_channel: None,
-            batcher: Batcher::with_capacity(gso_segments),
+            batcher: Batcher::with_capacity(gso_segments * Self::MAX_MTU),
         }
     }
 
@@ -314,6 +314,7 @@ impl ParticipantActor {
                 segment_size: state.segment_size,
             });
 
+            tracing::trace!("flush egress: {ok}");
             if ok {
                 self.batcher.pop_front();
             }

@@ -230,12 +230,9 @@ impl UdpTransport {
             segment_size: Some(batch.segment_size),
             src_ip: None,
         };
+        tracing::trace!("try_send_batch: {}", transmit.contents.len());
         let _ = self.state.send((&self.sock).into(), &transmit);
-        if let Ok(_) = self.state.send((&self.sock).into(), &transmit) {
-            true
-        } else {
-            false
-        }
+        self.state.send((&self.sock).into(), &transmit).is_ok()
     }
 }
 

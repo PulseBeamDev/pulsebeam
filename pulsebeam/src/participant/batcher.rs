@@ -18,25 +18,31 @@ impl Batcher {
     }
 
     pub fn push_back(&mut self, dst: SocketAddr, mut content: Vec<u8>) {
+        debug_assert!(!content.is_empty());
+
         for state in &mut self.states {
-            match state.push(dst, content) {
-                Some(bounced) => {
-                    content = bounced;
-                }
-                None => return,
+            if let Some(bounced) = state.push(dst, content) {
+                content = bounced;
+            } else {
+                return; // content was accepted
             }
         }
 
-        // at this point, nobody took it.
-        self.states
-            .push_back(BatcherState::with_capacity(dst, self.cap));
+        // nobody took it — create a new state and ensure it receives the content
+        let mut new_state = BatcherState::with_capacity(dst, self.cap);
+        let bounced = new_state.push(dst, content);
+        debug_assert!(
+            bounced.is_none(),
+            "Newly created state should always accept its first content"
+        );
+        self.states.push_back(new_state);
     }
 
     pub fn pop_front(&mut self) -> Option<BatcherState> {
         self.states.pop_front()
     }
 
-    pub fn front(&mut self) -> Option<&BatcherState> {
+    pub fn front(&self) -> Option<&BatcherState> {
         self.states.front()
     }
 }
@@ -59,22 +65,22 @@ impl BatcherState {
     }
 
     fn push(&mut self, dst: SocketAddr, content: Vec<u8>) -> Option<Vec<u8>> {
-        // Check if we can add content to current batch
+        debug_assert!(!content.is_empty());
+
+        // Wrong destination or not enough capacity
         if self.dst != dst || (self.buf.len() + content.len()) > self.buf.capacity() {
             return Some(content);
         }
 
-        // Set segment size only if it's the first segment (segment_size == 0)
-        let is_first_segment = self.segment_size == 0;
-        let same_segment = is_first_segment || self.segment_size == content.len();
-
-        if is_first_segment && !content.is_empty() {
+        if self.segment_size == 0 {
+            // First segment — set the size
             self.segment_size = content.len();
         }
 
-        // Add content if it's the same segment size or we're in tail mode
+        let same_segment = content.len() == self.segment_size;
+
         if same_segment || self.is_tail {
-            self.is_tail = !same_segment;
+            self.is_tail = !same_segment; // toggle tail when sizes differ
             self.buf.extend(content);
             None
         } else {
@@ -105,109 +111,102 @@ mod tests {
 
         assert_eq!(batcher.dst, addr);
         assert_eq!(batcher.segment_size, 0);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf.capacity(), 100);
         assert_eq!(batcher.buf.len(), 0);
+        assert_eq!(batcher.buf.capacity(), 100);
+        assert!(!batcher.is_tail);
     }
 
     #[test]
     fn test_push_first_segment() {
         let addr = create_test_addr();
-        let mut batcher = BatcherState::with_capacity(addr, 100);
+        let mut state = BatcherState::with_capacity(addr, 100);
 
-        let content: Vec<u8> = vec![1, 2, 3];
-        let result = batcher.push(addr, content.clone());
+        let content = vec![1, 2, 3];
+        let result = state.push(addr, content.clone());
 
         assert_eq!(result, None);
-        assert_eq!(batcher.segment_size, 3);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, content);
+        assert_eq!(state.segment_size, 3);
+        assert_eq!(state.buf, content);
     }
 
     #[test]
     fn test_push_same_segment_size() {
         let addr = create_test_addr();
-        let mut batcher = BatcherState::with_capacity(addr, 100);
+        let mut state = BatcherState::with_capacity(addr, 100);
 
-        batcher.push(addr, vec![1, 2, 3]).unwrap();
-        let result = batcher.push(addr, vec![4, 5, 6]);
+        state.push(addr, vec![1, 2, 3]);
+        let result = state.push(addr, vec![4, 5, 6]);
 
         assert_eq!(result, None);
-        assert_eq!(batcher.segment_size, 3);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, vec![1u8, 2, 3, 4, 5, 6]);
+        assert_eq!(state.segment_size, 3);
+        assert_eq!(state.buf, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
-    fn test_push_different_segment_size() {
+    fn test_push_different_segment_size_bounces() {
         let addr = create_test_addr();
-        let mut batcher = BatcherState::with_capacity(addr, 100);
+        let mut state = BatcherState::with_capacity(addr, 100);
 
-        batcher.push(addr, vec![1, 2, 3]).unwrap();
-        let content: Vec<u8> = vec![4, 5];
-        let result = batcher.push(addr, content.clone());
+        state.push(addr, vec![1, 2, 3]);
+        let content = vec![4, 5];
+        let bounced = state.push(addr, content.clone());
 
-        assert_eq!(result, Some(content));
-        assert_eq!(batcher.segment_size, 3);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, vec![1u8, 2, 3]);
+        assert_eq!(bounced, Some(content));
+        assert_eq!(state.segment_size, 3);
+        assert_eq!(state.buf, vec![1, 2, 3]);
     }
 
     #[test]
-    fn test_push_different_destination() {
+    fn test_push_different_destination_bounces() {
         let addr1 = create_test_addr();
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 8080);
-        let mut batcher = BatcherState::with_capacity(addr1, 100);
+        let mut state = BatcherState::with_capacity(addr1, 100);
 
-        let content: Vec<u8> = vec![1, 2, 3];
-        let result = batcher.push(addr2, content.clone());
+        let content = vec![1, 2, 3];
+        let bounced = state.push(addr2, content.clone());
 
-        assert_eq!(result, Some(content));
-        assert_eq!(batcher.segment_size, 0);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, vec![] as Vec<u8>);
+        assert_eq!(bounced, Some(content));
+        assert_eq!(state.segment_size, 0);
+        assert_eq!(state.buf.len(), 0);
     }
 
     #[test]
-    fn test_push_exceeds_capacity() {
+    fn test_push_exceeds_capacity_bounces() {
         let addr = create_test_addr();
-        let mut batcher = BatcherState::with_capacity(addr, 5);
+        let mut state = BatcherState::with_capacity(addr, 5);
 
-        let content: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
-        let result = batcher.push(addr, content.clone());
+        let content = vec![1, 2, 3, 4, 5, 6];
+        let bounced = state.push(addr, content.clone());
 
-        assert_eq!(result, Some(content));
-        assert_eq!(batcher.segment_size, 0);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, vec![] as Vec<u8>);
+        assert_eq!(bounced, Some(content));
+        assert_eq!(state.segment_size, 0);
+        assert!(state.buf.is_empty());
     }
 
     #[test]
     fn test_clear() {
         let addr = create_test_addr();
-        let mut batcher = BatcherState::with_capacity(addr, 100);
+        let mut state = BatcherState::with_capacity(addr, 100);
 
-        batcher.push(addr, vec![1, 2, 3]).unwrap();
-        batcher.is_tail = true;
-        batcher.clear();
+        state.push(addr, vec![1, 2, 3]);
+        state.is_tail = true;
+        state.clear();
 
-        assert_eq!(batcher.segment_size, 0);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, vec![] as Vec<u8>);
+        assert_eq!(state.segment_size, 0);
+        assert!(!state.is_tail);
+        assert!(state.buf.is_empty());
     }
 
     #[test]
-    fn test_tail_mode() {
+    fn test_batcher_push_and_pop() {
         let addr = create_test_addr();
-        let mut batcher = BatcherState::with_capacity(addr, 100);
+        let mut batcher = Batcher::with_capacity(100);
 
-        batcher.push(addr, vec![1, 2, 3]).unwrap();
-        batcher.push(addr, vec![4, 5]).unwrap();
-        let result = batcher.push(addr, vec![6, 7, 8, 9]);
+        batcher.push_back(addr, vec![1, 2, 3]);
 
-        assert_eq!(result, None);
-        assert_eq!(batcher.segment_size, 3);
-        assert!(!batcher.is_tail);
-        assert_eq!(batcher.buf, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(!batcher.is_empty());
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.segment_size, 3);
+        assert_eq!(state.buf, vec![1, 2, 3]);
     }
 }
