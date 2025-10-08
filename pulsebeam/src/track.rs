@@ -103,6 +103,7 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                 }
 
                 let mut to_remove = Vec::new();
+                let mut detected_drop = false;
                 for (participant_id, sub) in self.subscribers.iter_mut() {
                     tracing::trace!("forwarded media: track -> participant");
 
@@ -126,9 +127,8 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                         Err(mailbox::TrySendError::Closed(_)) => {
                             to_remove.push(participant_id.clone());
                         }
-                        Err(mailbox::TrySendError::Full(msg)) => {
-                            rt::yield_now().await;
-                            sub.try_send_low(msg);
+                        Err(mailbox::TrySendError::Full(_)) => {
+                            detected_drop = true;
                             tracing::warn!("participant queue is full, dropping");
                         }
                         Ok(_) => {}
@@ -137,6 +137,10 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
 
                 for key in to_remove {
                     self.subscribers.remove(&key);
+                }
+
+                if detected_drop {
+                    rt::yield_now().await;
                 }
             }
             TrackDataMessage::KeyframeRequest(req) => {
