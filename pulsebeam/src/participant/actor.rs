@@ -317,6 +317,8 @@ impl ParticipantActor {
             tracing::trace!("flush egress: {ok}");
             if ok {
                 self.batcher.pop_front();
+            } else {
+                break;
             }
         }
 
