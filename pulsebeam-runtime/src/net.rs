@@ -153,7 +153,6 @@ impl UdpTransport {
 
         let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
         let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
-        let gro_segments = state.gro_segments();
 
         // TODO: set qos class?
         let local_addr = external_addr.unwrap_or(sock.local_addr()?);

@@ -152,7 +152,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.ctx.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(8);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(64);
         self.ctx
             .node_ctx
             .gateway

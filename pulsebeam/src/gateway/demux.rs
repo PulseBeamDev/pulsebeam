@@ -112,8 +112,10 @@ impl Demuxer {
             return;
         };
 
+        // participant_handle.send(pkt).await;
         if let Err(TrySendError::Full(pkt)) = participant_handle.try_send(pkt) {
-            participant_handle.send(pkt).await;
+            rt::yield_now().await;
+            participant_handle.try_send(pkt);
         }
     }
 }

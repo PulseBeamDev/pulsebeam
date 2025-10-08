@@ -11,7 +11,7 @@ use crate::{
     message::{self, TrackMeta},
     participant::{self, ParticipantHandle},
 };
-use pulsebeam_runtime::{actor, mailbox};
+use pulsebeam_runtime::{actor, mailbox, rt};
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 // Common simulcast RIDs (quarter, half, full)
@@ -105,22 +105,30 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                 let mut to_remove = Vec::new();
                 for (participant_id, sub) in self.subscribers.iter_mut() {
                     tracing::trace!("forwarded media: track -> participant");
-                    let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardRtp(
-                        self.meta.clone(),
-                        rtp.clone(),
-                    ));
 
+                    // let res = sub
+                    //     .send_low(participant::ParticipantDataMessage::ForwardRtp(
+                    //         self.meta.clone(),
+                    //         rtp.clone(),
+                    //     ))
+                    //     .await;
+                    //
                     // if let Err(mailbox::SendError(_)) = res {
                     //     // TODO: should this be a part of unsubscribe instead?
                     //     to_remove.push(participant_id.clone());
                     // }
+                    let res = sub.try_send_low(participant::ParticipantDataMessage::ForwardRtp(
+                        self.meta.clone(),
+                        rtp.clone(),
+                    ));
                     // This gets triggered when a participant actor leaves
                     match res {
                         Err(mailbox::TrySendError::Closed(_)) => {
                             to_remove.push(participant_id.clone());
                         }
                         Err(mailbox::TrySendError::Full(msg)) => {
-                            sub.send_low(msg).await;
+                            rt::yield_now().await;
+                            sub.try_send_low(msg);
                             tracing::warn!("participant queue is full, dropping");
                         }
                         Ok(_) => {}
