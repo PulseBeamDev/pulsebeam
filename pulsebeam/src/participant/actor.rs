@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use crate::{
     entity, gateway, message, node,
     participant::{
+        batcher::Batcher,
         core::ParticipantCore,
         effect::{self, Effect},
     },
@@ -136,7 +137,7 @@ pub struct ParticipantActor {
     core: ParticipantCore,
     effects: VecDeque<effect::Effect>,
 
-    egress_buffer: double_buffer::DoubleBuffer<net::SendPacket>,
+    batcher: Batcher,
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -173,7 +174,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             },
             select: {
                 // biased toward writing to socket
-                Ok(_) = self.ctx.egress.writable(), if !self.egress_buffer.is_empty() => {
+                Ok(_) = self.ctx.egress.writable(), if !self.batcher.is_empty() => {
                     if let Err(err) = self.flush_egress() {
                         tracing::error!("failed to write socket: {err}");
                         break;
@@ -239,6 +240,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 }
 
 impl ParticipantActor {
+    const MAX_MTU: usize = 1500;
+
     pub fn new(
         node_ctx: node::NodeContext,
         room_handle: room::RoomHandle,
@@ -246,6 +249,7 @@ impl ParticipantActor {
         rtc: Rtc,
     ) -> Self {
         let egress = node_ctx.allocate_egress();
+        let gso_segments = egress.max_gso_segments();
         let ctx = ParticipantContext {
             node_ctx,
             room_handle,
@@ -262,7 +266,7 @@ impl ParticipantActor {
             core,
             effects,
             data_channel: None,
-            egress_buffer: double_buffer::DoubleBuffer::new(16),
+            batcher: Batcher::with_capacity(gso_segments * Self::MAX_MTU),
         }
     }
 
@@ -286,7 +290,8 @@ impl ParticipantActor {
                     return Some(duration);
                 }
                 Ok(Output::Transmit(transmit)) => {
-                    self.handle_transmit(transmit);
+                    self.batcher
+                        .push_back(transmit.destination, transmit.contents.into());
                 }
                 Ok(Output::Event(event)) => {
                     self.handle_event(event).await;
@@ -301,22 +306,22 @@ impl ParticipantActor {
         None
     }
 
-    fn handle_transmit(&mut self, transmit: Transmit) {
-        let packet = net::SendPacket {
-            buf: Bytes::copy_from_slice(&transmit.contents),
-            dst: transmit.destination,
-        };
-        self.egress_buffer.push(packet);
-    }
-
     fn flush_egress(&mut self) -> io::Result<()> {
-        let Some(buffer) = self.egress_buffer.prepare_send() else {
-            return Ok(());
-        };
+        while let Some(state) = self.batcher.front() {
+            let ok = self.ctx.egress.try_send_batch(&net::SendPacketBatch {
+                dst: state.dst,
+                buf: &state.buf,
+                segment_size: state.segment_size,
+            });
 
-        let sent_count = self.ctx.egress.try_send_batch(buffer)?;
-        tracing::trace!("sent {sent_count} packets to socket");
-        self.egress_buffer.mark_sent(sent_count);
+            tracing::trace!("flush egress: {ok}");
+            if ok {
+                self.batcher.pop_front();
+            } else {
+                break;
+            }
+        }
+
         Ok(())
     }
 
