@@ -146,10 +146,7 @@ impl GatewayWorkerActor {
     async fn read_socket(&mut self) -> io::Result<()> {
         // the loop after reading should always clear the buffer
         assert!(self.recv_batch.is_empty());
-        let batch_size = self.recv_batch.capacity();
-        let count = self
-            .socket
-            .try_recv_batch(&mut self.recv_batch, batch_size)?;
+        let count = self.socket.try_recv_batch(&mut self.recv_batch)?;
 
         tracing::trace!("received {count} packets from socket");
         for packet in self.recv_batch.drain(..) {
