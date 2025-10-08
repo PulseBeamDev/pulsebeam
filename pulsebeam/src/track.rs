@@ -115,11 +115,15 @@ impl actor::Actor<TrackMessageSet> for TrackActor {
                     //     to_remove.push(participant_id.clone());
                     // }
                     // This gets triggered when a participant actor leaves
-                    if let Err(mailbox::TrySendError::Closed(_)) = res {
-                        // TODO: should this be a part of unsubscribe instead?
-                        to_remove.push(participant_id.clone());
-                    } else {
-                        tracing::warn!("participant queue is full, dropping");
+                    match res {
+                        Err(mailbox::TrySendError::Closed(_)) => {
+                            to_remove.push(participant_id.clone());
+                        }
+                        Err(mailbox::TrySendError::Full(msg)) => {
+                            sub.send_low(msg).await;
+                            tracing::warn!("participant queue is full, dropping");
+                        }
+                        Ok(_) => {}
                     }
                 }
 

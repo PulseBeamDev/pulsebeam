@@ -1,4 +1,5 @@
-use pulsebeam_runtime::{mailbox, net};
+use pulsebeam_runtime::mailbox::TrySendError;
+use pulsebeam_runtime::{mailbox, net, rt};
 
 use crate::entity::ParticipantId;
 use crate::gateway::ice;
@@ -111,7 +112,9 @@ impl Demuxer {
             return;
         };
 
-        participant_handle.send(pkt).await;
+        if let Err(TrySendError::Full(pkt)) = participant_handle.try_send(pkt) {
+            participant_handle.send(pkt).await;
+        }
     }
 }
 
