@@ -1559,6 +1559,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "bs58",
+ "bumpalo",
  "bytes",
  "futures",
  "hex",

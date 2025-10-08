@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use crate::{
     entity, gateway, message, node,
     participant::{
+        batcher::Batcher,
         core::ParticipantCore,
         effect::{self, Effect},
     },
@@ -136,8 +137,7 @@ pub struct ParticipantActor {
     core: ParticipantCore,
     effects: VecDeque<effect::Effect>,
 
-    egress_buffer: Vec<str0m::net::Transmit>,
-    batch_buffer: Vec<u8>,
+    batcher: Batcher,
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -174,7 +174,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             },
             select: {
                 // biased toward writing to socket
-                Ok(_) = self.ctx.egress.writable(), if !self.egress_buffer.is_empty() => {
+                Ok(_) = self.ctx.egress.writable(), if !self.batcher.is_empty() => {
                     if let Err(err) = self.flush_egress() {
                         tracing::error!("failed to write socket: {err}");
                         break;
@@ -266,8 +266,7 @@ impl ParticipantActor {
             core,
             effects,
             data_channel: None,
-            egress_buffer: Vec::with_capacity(64),
-            batch_buffer: Vec::with_capacity(Self::MAX_MTU * gso_segments),
+            batcher: Batcher::with_capacity(gso_segments),
         }
     }
 
@@ -291,7 +290,8 @@ impl ParticipantActor {
                     return Some(duration);
                 }
                 Ok(Output::Transmit(transmit)) => {
-                    self.egress_buffer.push(transmit);
+                    self.batcher
+                        .push_back(transmit.destination, transmit.contents.into());
                 }
                 Ok(Output::Event(event)) => {
                     self.handle_event(event).await;
@@ -307,6 +307,18 @@ impl ParticipantActor {
     }
 
     fn flush_egress(&mut self) -> io::Result<()> {
+        while let Some(state) = self.batcher.front() {
+            let ok = self.ctx.egress.try_send_batch(&net::SendPacketBatch {
+                dst: state.dst,
+                buf: &state.buf,
+                segment_size: state.segment_size,
+            });
+
+            if ok {
+                self.batcher.pop_front();
+            }
+        }
+
         Ok(())
     }
 
