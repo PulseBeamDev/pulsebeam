@@ -43,15 +43,16 @@ pub async fn run(shutdown: CancellationToken, workers: usize) {
 
     let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
     let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+    let internal_http_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
     tracing::info!(
-        "server listening at {}:3000 (signaling) and {}:3478 (webrtc)",
+        "server listening at {}:3000 (signaling), {}:3478 (webrtc), and 0.0.0.0:6060 (metrics/pprof)",
         external_ip,
         external_ip
     );
 
     // Run the main logic and signal handler concurrently
     tokio::select! {
-        Err(err) = node::run(shutdown.clone(), workers, external_addr, local_addr, http_addr) => {
+        Err(err) = node::run(shutdown.clone(), workers, external_addr, local_addr, http_addr, internal_http_addr) => {
             tracing::warn!("node exited with error: {err}");
         }
         _ = system::wait_for_signal() => {

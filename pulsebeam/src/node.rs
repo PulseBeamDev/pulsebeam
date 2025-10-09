@@ -43,6 +43,7 @@ pub async fn run(
     external_addr: SocketAddr,
     local_addr: SocketAddr,
     http_addr: SocketAddr,
+    internal_http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
     for _ in 0..workers {
@@ -111,6 +112,11 @@ pub async fn run(
     };
 
     join_set.push(tokio::spawn(signaling).map(|_| ()).boxed());
+    join_set.push(
+        internal::serve_internal_http(internal_http_addr, shutdown.child_token())
+            .map(|_| ())
+            .boxed(),
+    );
 
     // Wait for all tasks to complete OR shutdown
     tokio::select! {
@@ -121,4 +127,100 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+mod internal {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use axum::{Router, extract::Query, response::IntoResponse, routing::get};
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use pprof::{ProfilerGuard, protos::Message};
+    use serde::Deserialize;
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Deserialize)]
+    struct ProfileParams {
+        #[serde(default = "default_seconds")]
+        seconds: u64,
+        #[serde(default)]
+        flamegraph: bool,
+    }
+
+    fn default_seconds() -> u64 {
+        30
+    }
+
+    pub async fn serve_internal_http(addr: SocketAddr, shutdown: CancellationToken) -> Result<()> {
+        // Initialize Prometheus recorder
+        let builder = PrometheusBuilder::new();
+        let prometheus_handle = builder.install_recorder()?;
+
+        // Router
+        let router = Router::new()
+            .route(
+                "/metrics",
+                get({
+                    let handle = prometheus_handle.clone();
+                    move || async move { handle.render() }
+                }),
+            )
+            .route("/debug/pprof/profile", get(pprof_profile))
+            .with_state(());
+
+        // Run HTTP server
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        tokio::select! {
+            res = axum::serve(listener, router) => {
+                if let Err(e) = res {
+                    tracing::error!("internal http server error: {e}");
+                }
+            }
+            _ = shutdown.cancelled() => {
+                tracing::info!("internal http server shutting down");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handler: /debug/pprof/profile?seconds=30&flamegraph=true
+    async fn pprof_profile(Query(params): Query<ProfileParams>) -> impl IntoResponse {
+        // let guard = ProfilerGuard::new(100).unwrap(); // 100 Hz sampling
+        // tokio::time::sleep(Duration::from_secs(params.seconds)).await;
+        //
+        // match guard.report().build() {
+        //     Ok(report) => {
+        //         if params.flamegraph {
+        //             let mut body = Vec::new();
+        //             if let Err(e) = report.flamegraph(&mut body) {
+        //                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        //                     .into_response();
+        //             }
+        //             (
+        //                 axum::http::StatusCode::OK,
+        //                 [("Content-Type", "image/svg+xml")],
+        //                 body,
+        //             )
+        //                 .into_response()
+        //         } else {
+        //             let profile = report.pprof().unwrap();
+        //             let body = profile.encode_to_vec();
+        //             (
+        //                 axum::http::StatusCode::OK,
+        //                 [("Content-Type", "application/octet-stream")],
+        //                 body,
+        //             )
+        //                 .into_response()
+        //         }
+        //     }
+        //     Err(e) => (
+        //         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        //         format!("Failed to build pprof report: {e}"),
+        //     )
+        //         .into_response(),
+        // }
+    }
 }
