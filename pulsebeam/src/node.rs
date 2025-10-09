@@ -232,10 +232,10 @@ mod internal {
             ("track", track::TrackActor::monitor().intervals()),
         ];
 
-        let interval = Duration::from_secs(5);
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
 
         loop {
-            rt::sleep(interval).await;
+            interval.tick().await;
 
             for (actor_name, monitor) in &mut monitors {
                 let Some(snapshot) = monitor.next() else {
@@ -244,6 +244,7 @@ mod internal {
 
                 let labels = [("actor", *actor_name)];
 
+                // ---- Counters ----
                 metrics::counter!("actor_instrumented_count", &labels)
                     .absolute(snapshot.instrumented_count);
                 metrics::counter!("actor_dropped_count", &labels).absolute(snapshot.dropped_count);
@@ -264,6 +265,7 @@ mod internal {
                 metrics::counter!("actor_total_long_delay_count", &labels)
                     .absolute(snapshot.total_long_delay_count);
 
+                // ---- Histograms (durations in ms) ----
                 metrics::histogram!("actor_total_first_poll_delay_ms", &labels)
                     .record(snapshot.total_first_poll_delay.as_millis() as f64);
                 metrics::histogram!("actor_total_idle_duration_ms", &labels)
@@ -282,6 +284,95 @@ mod internal {
                     .record(snapshot.total_short_delay_duration.as_millis() as f64);
                 metrics::histogram!("actor_total_long_delay_duration_ms", &labels)
                     .record(snapshot.total_long_delay_duration.as_millis() as f64);
+
+                // ---- Derived metrics ----
+                let long_delay_ratio =
+                    if snapshot.total_short_delay_count + snapshot.total_long_delay_count > 0 {
+                        snapshot.total_long_delay_count as f64
+                            / (snapshot.total_short_delay_count + snapshot.total_long_delay_count)
+                                as f64
+                    } else {
+                        0.0
+                    };
+
+                let slow_poll_ratio = if snapshot.total_poll_count > 0 {
+                    snapshot.total_slow_poll_count as f64 / snapshot.total_poll_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_first_poll_delay = if snapshot.first_poll_count > 0 {
+                    snapshot.total_first_poll_delay.as_secs_f64() / snapshot.first_poll_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_idle_duration = if snapshot.total_idled_count > 0 {
+                    snapshot.total_idle_duration.as_secs_f64() / snapshot.total_idled_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_scheduled_duration = if snapshot.total_scheduled_count > 0 {
+                    snapshot.total_scheduled_duration.as_secs_f64()
+                        / snapshot.total_scheduled_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_poll_duration = if snapshot.total_poll_count > 0 {
+                    snapshot.total_poll_duration.as_secs_f64() / snapshot.total_poll_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_fast_poll_duration = if snapshot.total_fast_poll_count > 0 {
+                    snapshot.total_fast_poll_duration.as_secs_f64()
+                        / snapshot.total_fast_poll_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_slow_poll_duration = if snapshot.total_slow_poll_count > 0 {
+                    snapshot.total_slow_poll_duration.as_secs_f64()
+                        / snapshot.total_slow_poll_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_short_delay_duration = if snapshot.total_short_delay_count > 0 {
+                    snapshot.total_short_delay_duration.as_secs_f64()
+                        / snapshot.total_short_delay_count as f64
+                } else {
+                    0.0
+                };
+
+                let mean_long_delay_duration = if snapshot.total_long_delay_count > 0 {
+                    snapshot.total_long_delay_duration.as_secs_f64()
+                        / snapshot.total_long_delay_count as f64
+                } else {
+                    0.0
+                };
+
+                // Record derived metrics as gauges
+                metrics::gauge!("actor_long_delay_ratio", &labels).set(long_delay_ratio);
+                metrics::gauge!("actor_slow_poll_ratio", &labels).set(slow_poll_ratio);
+                metrics::gauge!("actor_mean_first_poll_delay_seconds", &labels)
+                    .set(mean_first_poll_delay);
+                metrics::gauge!("actor_mean_idle_duration_seconds", &labels)
+                    .set(mean_idle_duration);
+                metrics::gauge!("actor_mean_scheduled_duration_seconds", &labels)
+                    .set(mean_scheduled_duration);
+                metrics::gauge!("actor_mean_poll_duration_seconds", &labels)
+                    .set(mean_poll_duration);
+                metrics::gauge!("actor_mean_fast_poll_duration_seconds", &labels)
+                    .set(mean_fast_poll_duration);
+                metrics::gauge!("actor_mean_slow_poll_duration_seconds", &labels)
+                    .set(mean_slow_poll_duration);
+                metrics::gauge!("actor_mean_short_delay_duration_seconds", &labels)
+                    .set(mean_short_delay_duration);
+                metrics::gauge!("actor_mean_long_delay_duration_seconds", &labels)
+                    .set(mean_long_delay_duration);
             }
         }
     }
