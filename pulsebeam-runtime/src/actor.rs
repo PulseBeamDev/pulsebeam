@@ -1,12 +1,14 @@
 use crate::actor_loop;
 use futures::FutureExt;
+use once_cell::sync::Lazy;
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
-use tracing::Instrument;
+use tokio_metrics::TaskMonitor;
 
 use crate::mailbox;
 
@@ -98,6 +100,11 @@ pub trait MessageSet: Sized + Send + 'static {
 pub trait Actor<M: MessageSet>: Sized + Send + 'static {
     fn meta(&self) -> M::Meta;
     fn get_observable_state(&self) -> M::ObservableState;
+
+    fn monitor() -> Arc<TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
 
     fn run(
         &mut self,
@@ -255,10 +262,13 @@ where
         handle: handle.clone(),
     };
 
+    let monitor = A::monitor();
     let actor_id = a.meta().clone();
-    let join = tokio::spawn(
-        run(a, ctx).instrument(tracing::span!(tracing::Level::INFO, "run", %actor_id)),
+    let runnable = tracing::Instrument::instrument(
+        monitor.instrument(run(a, ctx)),
+        tracing::span!(tracing::Level::INFO, "run", %actor_id),
     );
+    let join = tokio::spawn(runnable);
     let abort_handle = join.abort_handle();
 
     let join = join

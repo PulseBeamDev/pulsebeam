@@ -27,6 +27,8 @@ quinn-udp = "0.5.14"
 socket2 = "0.6.0"
 no-panic = "0.1.35"
 bumpalo = { version = "3.19.0", features = ["collections"] }
+tokio-metrics = { version = "0.4.5", features = ["metrics-rs-integration"] }
+once_cell = "1.21.3"
 
 [dev-dependencies]
 rcgen = "0.14.4"

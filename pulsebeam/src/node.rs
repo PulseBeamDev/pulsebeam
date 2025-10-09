@@ -142,9 +142,12 @@ mod internal {
     };
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::{ProfilerGuard, protos::Message};
-    use pulsebeam_runtime::rt;
+    use pulsebeam_runtime::{actor::Actor, rt};
     use serde::Deserialize;
+    use tokio_metrics::TaskMonitor;
     use tokio_util::sync::CancellationToken;
+
+    use crate::{controller, gateway, participant, room, track};
 
     #[derive(Deserialize)]
     struct ProfileParams {
@@ -192,6 +195,7 @@ mod internal {
                 .with_interval(std::time::Duration::from_secs(5))
                 .describe_and_run(),
         );
+        let actor_monitor_join = tokio::spawn(monitor_actors());
 
         tokio::select! {
             res = axum::serve(listener, router) => {
@@ -199,14 +203,87 @@ mod internal {
                     tracing::error!("internal http server error: {e}");
                 }
             }
-            _ = runtime_metrics_join => {
-            }
+            _ = runtime_metrics_join => {}
+            _ = actor_monitor_join => {}
             _ = shutdown.cancelled() => {
                 tracing::info!("internal http server shutting down");
             }
         }
 
         Ok(())
+    }
+
+    async fn monitor_actors() {
+        let mut monitors = [
+            ("gateway", gateway::GatewayActor::monitor().intervals()),
+            (
+                "gateway_worker",
+                gateway::GatewayWorkerActor::monitor().intervals(),
+            ),
+            (
+                "controller",
+                controller::ControllerActor::monitor().intervals(),
+            ),
+            ("room", room::RoomActor::monitor().intervals()),
+            (
+                "participant",
+                participant::ParticipantActor::monitor().intervals(),
+            ),
+            ("track", track::TrackActor::monitor().intervals()),
+        ];
+
+        let interval = Duration::from_secs(5);
+
+        loop {
+            rt::sleep(interval).await;
+
+            for (actor_name, monitor) in &mut monitors {
+                let Some(snapshot) = monitor.next() else {
+                    continue;
+                };
+
+                let labels = [("actor", *actor_name)];
+
+                metrics::counter!("actor_instrumented_count", &labels)
+                    .absolute(snapshot.instrumented_count);
+                metrics::counter!("actor_dropped_count", &labels).absolute(snapshot.dropped_count);
+                metrics::counter!("actor_first_poll_count", &labels)
+                    .absolute(snapshot.first_poll_count);
+                metrics::counter!("actor_total_idled_count", &labels)
+                    .absolute(snapshot.total_idled_count);
+                metrics::counter!("actor_total_scheduled_count", &labels)
+                    .absolute(snapshot.total_scheduled_count);
+                metrics::counter!("actor_total_poll_count", &labels)
+                    .absolute(snapshot.total_poll_count);
+                metrics::counter!("actor_total_fast_poll_count", &labels)
+                    .absolute(snapshot.total_fast_poll_count);
+                metrics::counter!("actor_total_slow_poll_count", &labels)
+                    .absolute(snapshot.total_slow_poll_count);
+                metrics::counter!("actor_total_short_delay_count", &labels)
+                    .absolute(snapshot.total_short_delay_count);
+                metrics::counter!("actor_total_long_delay_count", &labels)
+                    .absolute(snapshot.total_long_delay_count);
+
+                metrics::histogram!("actor_total_first_poll_delay_ms", &labels)
+                    .record(snapshot.total_first_poll_delay.as_millis() as f64);
+                metrics::histogram!("actor_total_idle_duration_ms", &labels)
+                    .record(snapshot.total_idle_duration.as_millis() as f64);
+                metrics::histogram!("actor_max_idle_duration_ms", &labels)
+                    .record(snapshot.max_idle_duration.as_millis() as f64);
+                metrics::histogram!("actor_total_scheduled_duration_ms", &labels)
+                    .record(snapshot.total_scheduled_duration.as_millis() as f64);
+                metrics::histogram!("actor_total_poll_duration_ms", &labels)
+                    .record(snapshot.total_poll_duration.as_millis() as f64);
+                metrics::histogram!("actor_total_fast_poll_duration_ms", &labels)
+                    .record(snapshot.total_fast_poll_duration.as_millis() as f64);
+                metrics::histogram!("actor_total_slow_poll_duration_ms", &labels)
+                    .record(snapshot.total_slow_poll_duration.as_millis() as f64);
+                metrics::histogram!("actor_total_short_delay_duration_ms", &labels)
+                    .record(snapshot.total_short_delay_duration.as_millis() as f64);
+                metrics::histogram!("actor_total_long_delay_duration_ms", &labels)
+                    .record(snapshot.total_long_delay_duration.as_millis() as f64);
+            }
+        }
     }
 
     /// Handler: /debug/pprof/profile?seconds=30&flamegraph=true
