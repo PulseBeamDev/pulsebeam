@@ -142,6 +142,7 @@ mod internal {
     };
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::{ProfilerGuard, protos::Message};
+    use pulsebeam_runtime::rt;
     use serde::Deserialize;
     use tokio_util::sync::CancellationToken;
 
@@ -186,11 +187,19 @@ mod internal {
         // Run HTTP server
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
+        let runtime_metrics_join = tokio::spawn(
+            tokio_metrics::RuntimeMetricsReporterBuilder::default()
+                .with_interval(std::time::Duration::from_secs(5))
+                .describe_and_run(),
+        );
+
         tokio::select! {
             res = axum::serve(listener, router) => {
                 if let Err(e) = res {
                     tracing::error!("internal http server error: {e}");
                 }
+            }
+            _ = runtime_metrics_join => {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!("internal http server shutting down");
