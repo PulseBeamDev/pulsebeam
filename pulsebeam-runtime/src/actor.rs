@@ -101,10 +101,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
     fn meta(&self) -> M::Meta;
     fn get_observable_state(&self) -> M::ObservableState;
 
-    fn monitor() -> Arc<TaskMonitor> {
-        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
-        MONITOR.clone()
-    }
+    fn monitor() -> Arc<TaskMonitor>;
 
     fn run(
         &mut self,

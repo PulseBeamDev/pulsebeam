@@ -4,11 +4,11 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
-use futures::{StreamExt, io, stream::FuturesUnordered, task::SpawnExt};
+use futures::{StreamExt, io, stream::FuturesUnordered};
+use pulsebeam_runtime::prelude::*;
 use str0m::{
     Event, Input, Output, Rtc, RtcError, channel::ChannelId, error::SdpError,
-    media::KeyframeRequest, net::Transmit, rtp::RtpPacket,
+    media::KeyframeRequest, rtp::RtpPacket,
 };
 use tokio::time::Instant;
 
@@ -21,7 +21,7 @@ use crate::{
     },
     room, track,
 };
-use pulsebeam_runtime::{actor, collections::double_buffer, mailbox, net};
+use pulsebeam_runtime::{actor, mailbox, net};
 
 const DATA_CHANNEL_LABEL: &str = "pulsebeam::rpc";
 
@@ -141,6 +141,11 @@ pub struct ParticipantActor {
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
+    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
+
     fn meta(&self) -> Arc<entity::ParticipantId> {
         self.core.participant_id.clone()
     }

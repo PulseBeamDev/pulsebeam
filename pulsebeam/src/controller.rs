@@ -59,6 +59,11 @@ pub struct ControllerActor {
 }
 
 impl actor::Actor<ControllerMessageSet> for ControllerActor {
+    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
+
     fn meta(&self) -> Arc<String> {
         self.id.clone()
     }

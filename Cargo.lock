@@ -1893,6 +1893,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mimalloc",
  "num_cpus",
+ "once_cell",
  "pprof",
  "prost 0.14.1",
  "prost-build 0.14.1",

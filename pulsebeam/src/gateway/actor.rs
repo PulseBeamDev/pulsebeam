@@ -1,5 +1,6 @@
 use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
 use futures::{StreamExt, stream::FuturesUnordered};
+use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use std::{collections::HashMap, io, sync::Arc};
 
@@ -26,6 +27,11 @@ pub struct GatewayActor {
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayActor {
+    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
+
     fn meta(&self) -> usize {
         0
     }
@@ -89,6 +95,11 @@ pub struct GatewayWorkerActor {
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
+    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
+
     fn meta(&self) -> usize {
         self.id
     }

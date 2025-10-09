@@ -11,6 +11,7 @@ use crate::{
     message::{self, TrackMeta},
     participant::{self, ParticipantHandle},
 };
+use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, rt};
 
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
@@ -63,6 +64,11 @@ pub struct TrackActor {
 }
 
 impl actor::Actor<TrackMessageSet> for TrackActor {
+    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
+
     fn meta(&self) -> Arc<TrackMeta> {
         self.meta.clone()
     }
