@@ -36,7 +36,7 @@ tokio-util = "0.7.16"
 num_cpus = "1.17.0"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 metrics-exporter-prometheus = "0.17.2"
-pprof = { version = "0.15.0", features = ["prost-codec", "protobuf"] }
+pprof = { version = "0.15.0", features = ["flamegraph", "prost-codec", "protobuf"] }
 
 [dev-dependencies]
 turmoil = "0.6.6"

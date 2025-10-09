@@ -134,7 +134,12 @@ mod internal {
     use std::time::Duration;
 
     use anyhow::Result;
-    use axum::{Router, extract::Query, response::IntoResponse, routing::get};
+    use axum::{
+        Router,
+        extract::Query,
+        response::{Html, IntoResponse},
+        routing::get,
+    };
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::{ProfilerGuard, protos::Message};
     use serde::Deserialize;
@@ -157,6 +162,14 @@ mod internal {
         let builder = PrometheusBuilder::new();
         let prometheus_handle = builder.install_recorder()?;
 
+        const INDEX_HTML: &str = r#"
+<ul>
+  <li><a href="/metrics">Metrics</a></li>
+  <li><a href="/debug/pprof/profile?seconds=30">CPU Profile (pprof)</a></li>
+  <li><a href="/debug/pprof/profile?seconds=30&flamegraph=true">CPU Flamegraph</a></li>
+</ul>
+"#;
+
         // Router
         let router = Router::new()
             .route(
@@ -167,6 +180,7 @@ mod internal {
                 }),
             )
             .route("/debug/pprof/profile", get(pprof_profile))
+            .route("/", get(|| async { Html(INDEX_HTML) }))
             .with_state(());
 
         // Run HTTP server
@@ -188,39 +202,42 @@ mod internal {
 
     /// Handler: /debug/pprof/profile?seconds=30&flamegraph=true
     async fn pprof_profile(Query(params): Query<ProfileParams>) -> impl IntoResponse {
-        // let guard = ProfilerGuard::new(100).unwrap(); // 100 Hz sampling
-        // tokio::time::sleep(Duration::from_secs(params.seconds)).await;
-        //
-        // match guard.report().build() {
-        //     Ok(report) => {
-        //         if params.flamegraph {
-        //             let mut body = Vec::new();
-        //             if let Err(e) = report.flamegraph(&mut body) {
-        //                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        //                     .into_response();
-        //             }
-        //             (
-        //                 axum::http::StatusCode::OK,
-        //                 [("Content-Type", "image/svg+xml")],
-        //                 body,
-        //             )
-        //                 .into_response()
-        //         } else {
-        //             let profile = report.pprof().unwrap();
-        //             let body = profile.encode_to_vec();
-        //             (
-        //                 axum::http::StatusCode::OK,
-        //                 [("Content-Type", "application/octet-stream")],
-        //                 body,
-        //             )
-        //                 .into_response()
-        //         }
-        //     }
-        //     Err(e) => (
-        //         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        //         format!("Failed to build pprof report: {e}"),
-        //     )
-        //         .into_response(),
-        // }
+        let guard = ProfilerGuard::new(100).unwrap(); // 100 Hz sampling
+        tokio::time::sleep(Duration::from_secs(params.seconds)).await;
+
+        match guard.report().build() {
+            Ok(report) => {
+                if params.flamegraph {
+                    let mut body = Vec::new();
+                    if let Err(e) = report.flamegraph(&mut body) {
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            .into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [("Content-Type", "image/svg+xml")],
+                        body,
+                    )
+                        .into_response()
+                } else {
+                    let profile = report.pprof().unwrap();
+                    let body = profile.encode_to_vec();
+                    (
+                        axum::http::StatusCode::OK,
+                        [
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Disposition", "attachment; filename=cpu.pprof"),
+                        ],
+                        body,
+                    )
+                        .into_response()
+                }
+            }
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build pprof report: {e}"),
+            )
+                .into_response(),
+        }
     }
 }
