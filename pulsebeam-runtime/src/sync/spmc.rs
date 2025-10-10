@@ -37,74 +37,19 @@
 //! }
 //! ```
 
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    task::{Context, Poll, Waker},
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
-use parking_lot::{Mutex, RwLock};
-
-/// Per-ring coalesced notifier inspired by `tokio::sync::Notify`.
-#[derive(Debug)]
-struct CoalescedNotify {
-    has_waiters: AtomicU64,
-    waiters: Mutex<Vec<Waker>>,
-}
-
-impl CoalescedNotify {
-    fn new() -> Self {
-        Self {
-            has_waiters: AtomicU64::new(0),
-            waiters: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn register(&self, cx: &Context<'_>) {
-        let waker = cx.waker().clone();
-        let mut waiters = self.waiters.lock();
-
-        if let Some(existing) = waiters.iter_mut().find(|w| w.will_wake(&waker)) {
-            *existing = waker;
-            return;
-        }
-
-        waiters.push(waker);
-        self.has_waiters.store(1, Ordering::Release);
-    }
-
-    fn notify_all(&self) {
-        if self.has_waiters.load(Ordering::Acquire) == 0 {
-            return;
-        }
-
-        let waiters = {
-            let mut w = self.waiters.lock();
-            if w.is_empty() {
-                self.has_waiters.store(0, Ordering::Release);
-                return;
-            }
-            std::mem::take(&mut *w)
-        };
-
-        self.has_waiters.store(0, Ordering::Release);
-
-        for w in waiters {
-            w.wake();
-        }
-    }
-}
+use parking_lot::RwLock;
 
 /// A bounded, lock-free, drop-oldest ring buffer shared between sender and receivers.
 struct Ring<T> {
     capacity: usize,
     tail: AtomicU64,
     slots: Vec<RwLock<Option<Arc<T>>>>,
-    notify: CoalescedNotify,
+    notify: tokio::sync::Notify,
 }
 
 impl<T> Ring<T> {
@@ -117,7 +62,7 @@ impl<T> Ring<T> {
             capacity,
             tail: AtomicU64::new(0),
             slots,
-            notify: CoalescedNotify::new(),
+            notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -157,7 +102,7 @@ impl<T> Sender<T> {
 
     /// Explicitly wake all subscribers.
     pub fn notify_subscribers(&self) {
-        self.ring.notify.notify_all();
+        self.ring.notify.notify_waiters();
     }
 }
 
@@ -178,30 +123,13 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Receiver<T> {
     pub async fn recv(&mut self) -> Option<Arc<T>> {
-        RecvFuture { inner: self }.await
-    }
-}
-
-/// Internal future for receiver waiting.
-struct RecvFuture<'a, T> {
-    inner: &'a mut Receiver<T>,
-}
-
-impl<'a, T> Future for RecvFuture<'a, T> {
-    type Output = Option<Arc<T>>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let ring = &self.inner.ring;
-        let seq = self.inner.next_seq;
-
-        if let Some(val) = ring.get(seq) {
-            self.inner.next_seq = seq + 1;
-            return Poll::Ready(Some(val));
+        loop {
+            if let Some(val) = self.ring.get(self.next_seq) {
+                self.next_seq += 1;
+                return Some(val);
+            }
+            self.ring.notify.notified().await; // await publisher wake
         }
-
-        // No data yet, register and wait
-        ring.notify.register(cx);
-        Poll::Pending
     }
 }
 
