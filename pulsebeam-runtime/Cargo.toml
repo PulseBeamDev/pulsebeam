@@ -9,6 +9,10 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[[bench]]
+name = "sync"
+harness = false
+
 [lib]
 
 [dependencies]
@@ -33,3 +37,4 @@ parking_lot = "0.12.5"
 
 [dev-dependencies]
 rcgen = "0.14.4"
+criterion = { version = "0.7.0", features = ["async", "async_tokio"] }

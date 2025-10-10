@@ -1,6 +1,5 @@
 use crate::actor_loop;
 use futures::FutureExt;
-use once_cell::sync::Lazy;
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
