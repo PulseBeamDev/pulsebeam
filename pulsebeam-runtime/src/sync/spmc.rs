@@ -71,14 +71,27 @@ impl<T> Ring<T> {
         *self.slots[idx as usize].write() = Some(value);
     }
 
-    fn get(&self, seq: u64) -> Option<Arc<T>> {
+    /// Returns the next available packet for the subscriber.
+    /// Advances `seq` internally and handles slow consumer catch-up.
+    fn get_next(&self, seq: &mut u64) -> Option<Arc<T>> {
         let tail = self.tail.load(Ordering::Acquire);
-        if seq + (self.capacity as u64) < tail {
-            // Too far behind
-            return None;
+        let earliest_seq = tail.saturating_sub(self.capacity as u64);
+
+        // Catch up if subscriber is too far behind
+        if *seq < earliest_seq {
+            *seq = earliest_seq;
         }
-        let idx = seq % self.capacity as u64;
-        self.slots[idx as usize].read().clone()
+
+        if *seq >= tail {
+            return None; // no new packet yet
+        }
+
+        let idx = *seq % self.capacity as u64;
+        let packet = self.slots[idx as usize].write().clone();
+
+        // Only advance after reading
+        *seq += 1;
+        packet
     }
 }
 
@@ -124,8 +137,7 @@ impl<T> Clone for Receiver<T> {
 impl<T> Receiver<T> {
     pub async fn recv(&mut self) -> Option<Arc<T>> {
         loop {
-            if let Some(val) = self.ring.get(self.next_seq) {
-                self.next_seq += 1;
+            if let Some(val) = self.ring.get_next(&mut self.next_seq) {
                 return Some(val);
             }
             self.ring.notify.notified().await; // await publisher wake
