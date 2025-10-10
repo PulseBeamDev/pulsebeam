@@ -327,7 +327,7 @@ macro_rules! actor_loop {
     ($actor:ident, $ctx:ident) => { actor_loop!($actor, $ctx, pre_select: {}, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => { actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {}) };
     ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }, select: { $($extra:tt)* }) => {
-        let mut last_yield = tokio::time::Instant::now();
+        // let mut last_yield = tokio::time::Instant::now();
         loop {
             $($pre_select)*
             tokio::select! {
@@ -349,10 +349,10 @@ macro_rules! actor_loop {
                 else => break,
             }
 
-            if last_yield.elapsed() > std::time::Duration::from_micros(50) {
-                tokio::task::yield_now().await;
-                last_yield = tokio::time::Instant::now();
-            }
+            // if last_yield.elapsed() > std::time::Duration::from_micros(50) {
+            //     tokio::task::yield_now().await;
+            //     last_yield = tokio::time::Instant::now();
+            // }
         }
     };
 }

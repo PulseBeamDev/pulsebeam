@@ -19,7 +19,7 @@ pub struct TrackMeta {
 #[derive(Clone, Debug)]
 pub struct SimulcastReceiver {
     pub rid: Option<Rid>,
-    pub channel: spmc::Receiver<Arc<RtpPacket>>,
+    pub channel: spmc::Receiver<RtpPacket>,
 }
 
 impl SimulcastReceiver {
@@ -41,7 +41,7 @@ impl SimulcastReceiver {
 #[derive(Debug)]
 pub struct SimulcastSender {
     pub rid: Option<Rid>,
-    pub channel: spmc::Sender<Arc<RtpPacket>>,
+    pub channel: spmc::Sender<RtpPacket>,
 }
 
 /// Sender half of a track (typically owned by publisher/participant)
@@ -51,7 +51,7 @@ pub struct TrackSender {
 }
 
 impl TrackSender {
-    pub fn send(&self, rid: Option<&Rid>, pkt: Arc<RtpPacket>) {
+    pub fn send(&self, rid: Option<&Rid>, pkt: RtpPacket) {
         if let Some(sender) = self
             .simulcast
             .iter()

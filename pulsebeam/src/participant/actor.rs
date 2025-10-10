@@ -372,7 +372,7 @@ impl ParticipantActor {
         rtp.header.ext_vals.rid = stream.rid();
 
         // Forward into track’s broadcast channel
-        track.send(stream.rid().as_ref(), Arc::new(rtp));
+        track.send(stream.rid().as_ref(), rtp);
     }
 
     fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
