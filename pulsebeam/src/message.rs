@@ -8,13 +8,6 @@ pub use str0m::{Rtc, RtcError};
 
 use crate::entity::TrackId;
 
-#[derive(Debug, Eq, PartialEq, Hash)]
-pub struct TrackMeta {
-    pub id: Arc<TrackId>,
-    pub kind: MediaKind,
-    pub simulcast_rids: Option<Vec<Rid>>,
-}
-
 impl std::fmt::Display for TrackMeta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.id, f)

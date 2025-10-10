@@ -2185,12 +2185,14 @@ name = "pulsebeam"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "axum-extra",
  "bs58",
  "bumpalo",
  "bytes",
  "futures",
+ "futures-concurrency",
  "hex",
  "hyper",
  "metrics",

@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{StreamExt, io, stream::FuturesUnordered};
+use futures::io;
 use pulsebeam_runtime::prelude::*;
 use str0m::{
     Event, Input, Output, Rtc, RtcError, channel::ChannelId, error::SdpError,
@@ -31,8 +31,6 @@ pub enum ParticipantError {
     InvalidSdpFormat(#[from] SdpError),
     #[error("Offer rejected: {0}")]
     OfferRejected(#[from] RtcError),
-    // #[error("Invalid RPC format: {0}")]
-    // InvalidRpcFormat(#[from] DecodeError),
 }
 
 #[derive(Debug, Clone)]
@@ -45,41 +43,26 @@ pub enum ParticipantControlMessage {
 
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
-    ForwardRtp(Arc<message::TrackMeta>, Arc<RtpPacket>),
+    ForwardRtp(Arc<track::TrackMeta>, Arc<RtpPacket>),
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
 
 pub struct ParticipantContext {
-    // Core dependencies
     node_ctx: node::NodeContext,
     room_handle: room::RoomHandle,
     rtc: Rtc,
-
     egress: Arc<net::UnifiedSocket>,
 }
 
 impl ParticipantContext {
-    async fn apply_effects(
-        &mut self,
-        effects: &mut effect::Queue,
-        self_handle: &ParticipantHandle,
-    ) {
+    async fn apply_effects(&mut self, effects: &mut effect::Queue) {
         if effects.is_empty() {
             return;
         }
 
-        tracing::debug!("applying effects: {:?}", effects);
+        tracing::debug!("Applying effects: {:?}", effects);
         for e in effects.drain(..) {
             match e {
-                Effect::Subscribe(mut track) => {
-                    if let Some(simulcast) = track.by_rid(None) {
-                        simulcast.channel.recv();
-                        tracing::warn!(
-                            "failed to subscribe to {}. Will be cleaned up by room broadcast",
-                            track.meta
-                        );
-                    }
-                }
                 Effect::SpawnTrack(track_meta) => {
                     let (tx, rx) = track::new(track_meta, 64);
 
@@ -90,11 +73,11 @@ impl ParticipantContext {
                     {
                         tracing::error!("Failed to publish track: {}", e);
                     }
-                    tracing::info!("published track: {}", track_meta.id);
                 }
                 Effect::Disconnect => {
                     self.rtc.disconnect();
                 }
+                _ => {}
             }
         }
     }
@@ -109,23 +92,12 @@ impl actor::MessageSet for ParticipantMessageSet {
     type ObservableState = ();
 }
 
-/// Manages WebRTC participant connections and media routing
-///
-/// Core responsibilities:
-/// - WebRTC signaling and peer connection management
-/// - Media routing between client and room
-/// - Video subscription management and layer selection
-/// - Audio filtering using AudioSelector (subscribes to all, forwards selectively)
-/// - Bandwidth control and congestion management
+/// The SFU participant actor: manages WebRTC and media flow.
 pub struct ParticipantActor {
     ctx: ParticipantContext,
-
-    // Identity
     data_channel: Option<ChannelId>,
-
     core: ParticipantCore,
     effects: VecDeque<effect::Effect>,
-
     batcher: Batcher,
 }
 
@@ -161,24 +133,16 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             pre_select: {
                 let timeout = match self.poll().await {
                     Some(delay) => delay,
-                    None => return Ok(()), // RTC disconnected
+                    None => return Ok(()), // disconnected
                 };
-
-                self.ctx.apply_effects(&mut self.effects, &ctx.handle).await;
+                self.ctx.apply_effects(&mut self.effects).await;
             },
             select: {
-                // biased toward writing to socket
                 Ok(_) = self.ctx.egress.writable(), if !self.batcher.is_empty() => {
-                    if let Err(err) = self.flush_egress() {
-                        tracing::error!("failed to write socket: {err}");
-                        break;
-                    }
+                    let _ = self.flush_egress();
                 }
                 Some(pkt) = gateway_rx.recv() => {
                     self.handle_udp_packet(pkt);
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    // Timer expired, poll again
                 }
             }
         );
@@ -205,7 +169,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     .remove_available_tracks(&mut self.effects, &tracks);
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {
-                // TODO: Notify client of rejection
+                // could notify client
             }
         }
     }
@@ -220,7 +184,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 self.handle_forward_rtp(track_meta, rtp);
             }
             ParticipantDataMessage::KeyframeRequest(track_id, req) => {
-                self.request_keyframe_internal(KeyframeRequest {
+                self.request_keyframe(KeyframeRequest {
                     mid: track_id.origin_mid,
                     kind: req.kind,
                     rid: req.rid,
@@ -245,7 +209,6 @@ impl ParticipantActor {
             node_ctx,
             room_handle,
             rtc,
-            track_tasks: FuturesUnordered::new(),
             egress,
         };
 
@@ -261,7 +224,6 @@ impl ParticipantActor {
         }
     }
 
-    /// Main event loop with proper timeout handling
     async fn poll(&mut self) -> Option<Duration> {
         while self.ctx.rtc.is_alive() {
             match self.ctx.rtc.poll_output() {
@@ -270,19 +232,14 @@ impl ParticipantActor {
                     let duration = deadline.saturating_duration_since(now);
 
                     if duration.is_zero() {
-                        // Handle timeout immediately
-                        if let Err(e) = self.ctx.rtc.handle_input(Input::Timeout(now)) {
-                            tracing::error!("Failed to handle timeout: {}", e);
-                            break;
-                        }
+                        let _ = self.ctx.rtc.handle_input(Input::Timeout(now));
                         continue;
                     }
 
                     return Some(duration);
                 }
-                Ok(Output::Transmit(transmit)) => {
-                    self.batcher
-                        .push_back(transmit.destination, transmit.contents.into());
+                Ok(Output::Transmit(tx)) => {
+                    self.batcher.push_back(tx.destination, tx.contents.into());
                 }
                 Ok(Output::Event(event)) => {
                     self.handle_event(event).await;
@@ -299,57 +256,30 @@ impl ParticipantActor {
 
     fn flush_egress(&mut self) -> io::Result<()> {
         while let Some(state) = self.batcher.front() {
-            let ok = self.ctx.egress.try_send_batch(&net::SendPacketBatch {
+            if self.ctx.egress.try_send_batch(&net::SendPacketBatch {
                 dst: state.dst,
                 buf: &state.buf,
                 segment_size: state.segment_size,
-            });
-
-            tracing::trace!("flush egress: {ok}");
-            if ok {
+            }) {
                 self.batcher.pop_front();
             } else {
                 break;
             }
         }
-
         Ok(())
     }
 
     async fn handle_event(&mut self, event: Event) {
         match event {
-            Event::IceConnectionStateChange(state) => match state {
-                str0m::IceConnectionState::Disconnected => self.ctx.rtc.disconnect(),
-                _ => tracing::trace!("ICE state: {:?}", state),
-            },
-            Event::MediaAdded(media) => {
-                tracing::debug!("media added: {media:?}");
-                self.core.handle_media_added(&mut self.effects, media);
-            }
-            Event::ChannelOpen(id, label) => {
-                if label == DATA_CHANNEL_LABEL {
-                    self.data_channel = Some(id);
-                    tracing::info!("Data channel opened");
-                }
-            }
-            Event::ChannelData(data) => {
-                let Some(ch) = self.data_channel else {
-                    return;
-                };
-
-                if ch != data.id {
-                    return;
-                }
-
-                // TODO: handle PulseBeam signaling
-                // if let Err(e) = self.handle_rpc(data).await {
-                //     tracing::warn!("RPC error: {}", e);
-                // }
-            }
-            Event::ChannelClose(id) => {
-                if Some(id) == self.data_channel {
+            Event::IceConnectionStateChange(state) => {
+                tracing::trace!("ICE state: {:?}", state);
+                if state == str0m::IceConnectionState::Disconnected {
                     self.ctx.rtc.disconnect();
                 }
+            }
+            Event::MediaAdded(media) => {
+                tracing::debug!("Media added: {:?}", media);
+                self.core.handle_media_added(&mut self.effects, media);
             }
             Event::RtpPacket(rtp) => {
                 self.handle_rtp_packet(rtp).await;
@@ -358,59 +288,59 @@ impl ParticipantActor {
                 self.handle_keyframe_request(req);
             }
             Event::Connected => {
-                tracing::info!("connected");
+                tracing::info!("Connected");
             }
             _ => tracing::trace!("Unhandled event: {:?}", event),
         }
     }
 
     async fn handle_rtp_packet(&mut self, mut rtp: RtpPacket) {
-        tracing::trace!("handle_rtp_packet");
         let mut api = self.ctx.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
-            tracing::warn!("no stream_rx matched rtp ssrc, dropping.");
+            tracing::warn!("no stream_rx matched ssrc, dropping");
             return;
         };
 
         let Some(track) = self.core.get_published_track_mut(&stream.mid()) else {
-            tracing::warn!("no published track matched mid, dropping.");
+            tracing::warn!("no published track matched mid, dropping");
             return;
         };
 
-        // HACK: inject SDP rid to rtp.
         rtp.header.ext_vals.rid = stream.rid();
-        if let Err(e) = track
-            .send_low(track::TrackDataMessage::ForwardRtp(Arc::new(rtp)))
-            .await
-        {
-            tracing::error!("Failed to forward rtp: {}", e);
-        }
+
+        // Forward into track’s broadcast channel
+        track.send(stream.rid().as_ref(), Arc::new(rtp));
     }
 
     fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
         let Some(track_handle) = self.core.video_allocator.get_track_mut(&req.mid) else {
             return;
         };
-        let _ = track_handle.try_send_low(track::TrackDataMessage::KeyframeRequest(req.into()));
+        let _ = track_handle;
     }
 
-    fn handle_udp_packet(&mut self, pkt: net::RecvPacket) {
-        let input = Input::Receive(
-            Instant::now().into_std(),
-            str0m::net::Receive {
-                proto: str0m::net::Protocol::Udp,
-                source: pkt.src,
-                destination: pkt.dst,
-                contents: (&*pkt.buf).try_into().unwrap(),
-            },
-        );
+    fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
+        let contents = match (&*packet.buf).try_into() {
+            Ok(contents) => contents,
+            Err(err) => {
+                tracing::warn!("invalid packet, dropping: {err}");
+                return;
+            }
+        };
 
-        if let Err(e) = self.ctx.rtc.handle_input(input) {
-            tracing::warn!("dropped UDP packet: {}", e);
+        let recv = str0m::net::Receive {
+            proto: str0m::net::Protocol::Udp,
+            source: packet.src,
+            destination: packet.dst,
+            contents,
+        };
+        let ev = Input::Receive(Instant::now().into_std(), recv);
+        if let Err(e) = self.ctx.rtc.handle_input(ev) {
+            tracing::error!("Rtc receive error: {}", e);
         }
     }
 
-    fn handle_forward_rtp(&mut self, track_meta: Arc<message::TrackMeta>, rtp: Arc<RtpPacket>) {
+    fn handle_forward_rtp(&mut self, track_meta: Arc<track::TrackMeta>, rtp: Arc<RtpPacket>) {
         tracing::trace!("handle_forward_rtp");
         let Some(mid) = self.core.get_slot(&track_meta, &rtp.header.ext_vals) else {
             return;
@@ -449,23 +379,7 @@ impl ParticipantActor {
         }
     }
 
-    fn request_keyframe_internal(&mut self, req: KeyframeRequest) {
-        tracing::debug!("request_keyframe_internal");
-        self.request_keyframe_internal_rtp(req);
-    }
-
-    fn request_keyframe_internal_media(&mut self, req: KeyframeRequest) {
-        let Some(mut writer) = self.ctx.rtc.writer(req.mid) else {
-            tracing::warn!("no writer for mid {:?}", req.mid);
-            return;
-        };
-
-        if let Err(e) = writer.request_keyframe(req.rid, req.kind) {
-            tracing::warn!("failed to request keyframe: {}", e);
-        }
-    }
-
-    fn request_keyframe_internal_rtp(&mut self, req: KeyframeRequest) {
+    fn request_keyframe(&mut self, req: KeyframeRequest) {
         let mut api = self.ctx.rtc.direct_api();
         let Some(stream) = api.stream_rx_by_mid(req.mid, req.rid) else {
             tracing::warn!("stream_rx not found, keyframe request failed");
@@ -475,5 +389,3 @@ impl ParticipantActor {
         stream.request_keyframe(req.kind);
     }
 }
-
-pub type ParticipantHandle = actor::ActorHandle<ParticipantMessageSet>;

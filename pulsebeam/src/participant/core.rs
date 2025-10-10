@@ -5,21 +5,21 @@ use str0m::{
     rtp::ExtensionValues,
 };
 
-use super::effect::Effect;
 use crate::{
     entity,
-    message::{self, TrackMeta},
     participant::{
         audio::{AudioAllocator, AudioTrackData},
-        effect,
+        effect::{self, Effect},
         video::VideoAllocator,
     },
     track,
+    track::TrackMeta,
 };
 
+/// Core per-participant media management logic.
 pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
-    pub published_tracks: HashMap<Mid, track::TrackReceiver>,
+    pub published_tracks: HashMap<Mid, track::TrackSender>,
     pub video_allocator: VideoAllocator,
     pub audio_allocator: AudioAllocator,
 }
@@ -34,7 +34,7 @@ impl ParticipantCore {
         }
     }
 
-    pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackReceiver> {
+    pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackSender> {
         self.published_tracks.get_mut(mid)
     }
 
@@ -55,7 +55,7 @@ impl ParticipantCore {
         }
     }
 
-    pub fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {
+    pub fn handle_track_finished(&mut self, track_meta: Arc<track::TrackMeta>) {
         self.published_tracks.remove(&track_meta.id.origin_mid);
         tracing::info!("Track finished: {}", track_meta.id);
     }
@@ -67,20 +67,14 @@ impl ParticipantCore {
     ) {
         for track_handle in tracks.values() {
             if track_handle.meta.id.origin_participant == self.participant_id {
-                // Our own track - add to published
-                self.add_published_track(effects, track_handle);
+                self.add_published_track(track_handle);
             } else {
-                // Track from another participant - add to available
                 self.add_available_track(effects, track_handle);
             }
         }
     }
 
-    fn add_published_track(
-        &mut self,
-        _effects: &mut effect::Queue,
-        track_handle: &track::TrackReceiver,
-    ) {
+    fn add_published_track(&mut self, track_handle: &track::TrackReceiver) {
         let track_meta = &track_handle.meta;
         self.published_tracks
             .insert(track_meta.id.origin_mid, track_handle.clone());
@@ -122,14 +116,8 @@ impl ParticipantCore {
 
     pub fn handle_media_added(&mut self, effects: &mut effect::Queue, media: MediaAdded) {
         match media.direction {
-            Direction::RecvOnly => {
-                // Client publishing to us
-                self.handle_incoming_media(effects, media);
-            }
-            Direction::SendOnly => {
-                // We're sending to client
-                self.allocate_outgoing_slot(effects, media);
-            }
+            Direction::RecvOnly => self.handle_incoming_media(effects, media),
+            Direction::SendOnly => self.allocate_outgoing_slot(effects, media),
             dir => {
                 tracing::warn!("Unsupported direction {:?}, disconnecting", dir);
                 effects.push_back(Effect::Disconnect);
@@ -139,7 +127,7 @@ impl ParticipantCore {
 
     fn handle_incoming_media(&mut self, effects: &mut effect::Queue, media: MediaAdded) {
         let track_id = Arc::new(entity::TrackId::new(self.participant_id.clone(), media.mid));
-        let track_meta = Arc::new(message::TrackMeta {
+        let track_meta = Arc::new(track::TrackMeta {
             id: track_id,
             kind: media.kind,
             simulcast_rids: media.simulcast.map(|s| s.recv),
