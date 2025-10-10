@@ -84,6 +84,19 @@ impl TrackReceiver {
             .find(|s| s.rid.as_ref() == rid)
             .cloned()
     }
+
+    pub fn by_default(&self) -> Option<SimulcastReceiver> {
+        for simulcast in &*self.simulcast {
+            let Some(rid) = simulcast.rid else {
+                return Some(simulcast.clone());
+            };
+
+            if rid.starts_with('f') {
+                return Some(simulcast.clone());
+            }
+        }
+        None
+    }
 }
 
 /// Construct a new Track (returns sender + receiver).
@@ -99,7 +112,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
     for rid in simulcast_rids {
         let (tx, rx) = spmc::channel(capacity);
         senders.push(SimulcastSender {
-            rid: Some(rid.clone()),
+            rid: Some(rid),
             channel: tx,
         });
         receivers.push(SimulcastReceiver {

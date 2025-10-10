@@ -1,25 +1,32 @@
 use std::{
     collections::{HashMap, VecDeque},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
-use futures::io;
-use pulsebeam_runtime::prelude::*;
+use futures::{Stream, io};
+use futures_concurrency::stream::StreamGroup;
+use pulsebeam_runtime::{prelude::*, sync::spmc};
 use str0m::{
-    Event, Input, Output, Rtc, RtcError, channel::ChannelId, error::SdpError,
-    media::KeyframeRequest, rtp::RtpPacket,
+    Event, Input, Output, Rtc, RtcError,
+    channel::ChannelId,
+    error::SdpError,
+    media::{KeyframeRequest, MediaKind},
+    rtp::RtpPacket,
 };
 use tokio::time::Instant;
 
 use crate::{
-    entity, gateway, message, node,
+    entity::{self, TrackId},
+    gateway, message, node,
     participant::{
         batcher::Batcher,
         core::ParticipantCore,
         effect::{self, Effect},
     },
-    room, track,
+    room,
+    track::{self, TrackMeta},
 };
 use pulsebeam_runtime::{actor, mailbox, net};
 
@@ -100,6 +107,8 @@ pub struct ParticipantActor {
     core: ParticipantCore,
     effects: VecDeque<effect::Effect>,
     batcher: Batcher,
+    // TODO: This shouldn't return track meta..
+    stream_group: StreamGroup<Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<RtpPacket>)> + Send>>>,
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -142,6 +151,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Ok(_) = self.ctx.egress.writable(), if !self.batcher.is_empty() => {
                     let _ = self.flush_egress();
                 }
+                Some((meta, rtp)) = self.stream_group.next() => {
+                    self.handle_forward_rtp(meta, rtp);
+                }
                 Some(pkt) = gateway_rx.recv() => {
                     self.handle_udp_packet(pkt);
                 }
@@ -163,10 +175,51 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
                 self.core
                     .handle_published_tracks(&mut self.effects, &tracks);
+                for (_, track) in &tracks {
+                    if track.meta.kind == MediaKind::Video {
+                        let Some(mut simulcast) = track.by_default() else {
+                            continue;
+                        };
+
+                        let meta = track.meta.clone();
+                        let stream = async_stream::stream! {
+                            loop {
+                                match simulcast.channel.recv().await {
+                                    Ok(Some(pkt)) => {
+                                        yield (meta.clone(), pkt)
+                                    },
+                                    Ok(None) => break,                      // channel closed
+                                    Err(spmc::RecvError::Lagged(_)) => continue, // skip dropped frames
+                                }
+                            }
+                        };
+                        self.stream_group.insert(stream.boxed());
+                    }
+                }
             }
             ParticipantControlMessage::TracksPublished(tracks) => {
                 self.core
                     .handle_published_tracks(&mut self.effects, &tracks);
+
+                for (_, track) in tracks.as_ref() {
+                    if track.meta.kind == MediaKind::Video {
+                        let Some(mut simulcast) = track.by_default() else {
+                            continue;
+                        };
+
+                        let meta = track.meta.clone();
+                        let stream = async_stream::stream! {
+                            loop {
+                                match simulcast.channel.recv().await {
+                                    Ok(Some(pkt)) => yield (meta.clone(), pkt),
+                                    Ok(None) => break,                      // channel closed
+                                    Err(spmc::RecvError::Lagged(_)) => continue, // skip dropped frames
+                                }
+                            }
+                        };
+                        self.stream_group.insert(stream.boxed());
+                    }
+                }
             }
             ParticipantControlMessage::TracksUnpublished(tracks) => {
                 self.core
@@ -224,6 +277,7 @@ impl ParticipantActor {
             core,
             effects,
             data_channel: None,
+            stream_group: StreamGroup::new(),
             batcher: Batcher::with_capacity(gso_segments * Self::MAX_MTU),
         }
     }
@@ -366,6 +420,7 @@ impl ParticipantActor {
 
         let mut api = self.ctx.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
+            tracing::warn!("no mid found, dropping");
             return;
         };
 
