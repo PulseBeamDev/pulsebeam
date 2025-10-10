@@ -6,7 +6,7 @@ use crate::{entity, participant::effect, track};
 
 #[derive(Clone)]
 struct TrackOut {
-    handle: track::TrackHandle,
+    handle: track::TrackReceiver,
     mid: Option<Mid>,
 }
 
@@ -21,12 +21,12 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
-    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackHandle) {
-        assert!(track_handle.meta.kind.is_video());
+    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackReceiver) {
+        assert!(track_handle.kind.is_video());
 
-        tracing::info!("added video track: {}", track_handle.meta.id);
+        tracing::info!("added video track: {}", track_handle.id);
         self.tracks.insert(
-            track_handle.meta.id.clone(),
+            track_handle.id.clone(),
             TrackOut {
                 handle: track_handle,
                 mid: None,
@@ -40,7 +40,7 @@ impl VideoAllocator {
         &mut self,
         effects: &mut effect::Queue,
         track_id: &entity::TrackId,
-    ) -> Option<track::TrackHandle> {
+    ) -> Option<track::TrackReceiver> {
         let mut track = self.tracks.remove(track_id)?;
 
         if let Some(mid) = track.mid.take()
@@ -49,7 +49,7 @@ impl VideoAllocator {
             slot.track_id = None;
         }
 
-        tracing::info!("removed video track: {}", track.handle.meta.id);
+        tracing::info!("removed video track: {}", track.handle.id);
         self.auto_subscribe(effects);
         Some(track.handle)
     }
@@ -60,7 +60,7 @@ impl VideoAllocator {
         self.auto_subscribe(effects);
     }
 
-    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
+    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackReceiver> {
         let slot = self.slots.get(mid)?;
         let track_id = slot.track_id.as_ref()?;
         let track = self.tracks.get_mut(track_id)?;
@@ -94,7 +94,7 @@ impl VideoAllocator {
 
                 effects.push_back(effect::Effect::Subscribe(track.handle.clone()));
                 track.mid.replace(*slot_id);
-                let meta = &track.handle.meta;
+                let meta = &track.handle;
                 slot.track_id.replace(meta.id.clone());
                 tracing::info!("allocated video slot: {track_id} -> {slot_id}");
                 break;

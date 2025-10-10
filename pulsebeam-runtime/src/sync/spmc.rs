@@ -16,6 +16,7 @@ pub enum RecvError {
 }
 
 /// The shared ring buffer at the core of the channel.
+#[derive(Debug)]
 struct Ring<T: Clone> {
     capacity: usize,
     tail: AtomicU64,
@@ -92,7 +93,7 @@ impl<T: Clone + Send> Ring<T> {
 }
 
 /// The sending handle for the broadcast channel.
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct Sender<T: Clone + Send> {
     ring: Arc<Ring<T>>,
 }
@@ -117,6 +118,7 @@ impl<T: Clone + Send> Drop for Sender<T> {
 }
 
 /// The receiving handle for the broadcast channel.
+#[derive(Debug)]
 pub struct Receiver<T: Clone + Send> {
     ring: Arc<Ring<T>>,
     next_seq: u64,

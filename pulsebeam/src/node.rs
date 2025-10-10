@@ -229,7 +229,6 @@ mod internal {
                 "participant",
                 participant::ParticipantActor::monitor().intervals(),
             ),
-            ("track", track::TrackActor::monitor().intervals()),
         ];
 
         let mut interval = tokio::time::interval(Duration::from_secs(5));

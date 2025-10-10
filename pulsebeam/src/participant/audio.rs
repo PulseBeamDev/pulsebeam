@@ -95,7 +95,7 @@ impl AudioAllocator {
         }
     }
 
-    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackHandle) {
+    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackReceiver) {
         assert!(track_handle.meta.kind.is_audio());
         self.tracks
             .insert(track_handle.meta.id.clone(), Level(SILENCE_BASELINE));

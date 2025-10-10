@@ -19,7 +19,7 @@ use crate::{
 
 pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
-    pub published_tracks: HashMap<Mid, track::TrackHandle>,
+    pub published_tracks: HashMap<Mid, track::TrackReceiver>,
     pub video_allocator: VideoAllocator,
     pub audio_allocator: AudioAllocator,
 }
@@ -34,7 +34,7 @@ impl ParticipantCore {
         }
     }
 
-    pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
+    pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackReceiver> {
         self.published_tracks.get_mut(mid)
     }
 
@@ -63,7 +63,7 @@ impl ParticipantCore {
     pub fn handle_published_tracks(
         &mut self,
         effects: &mut effect::Queue,
-        tracks: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
+        tracks: &HashMap<Arc<entity::TrackId>, track::TrackReceiver>,
     ) {
         for track_handle in tracks.values() {
             if track_handle.meta.id.origin_participant == self.participant_id {
@@ -79,7 +79,7 @@ impl ParticipantCore {
     fn add_published_track(
         &mut self,
         _effects: &mut effect::Queue,
-        track_handle: &track::TrackHandle,
+        track_handle: &track::TrackReceiver,
     ) {
         let track_meta = &track_handle.meta;
         self.published_tracks
@@ -89,7 +89,7 @@ impl ParticipantCore {
     fn add_available_track(
         &mut self,
         effects: &mut effect::Queue,
-        track_handle: &track::TrackHandle,
+        track_handle: &track::TrackReceiver,
     ) {
         match track_handle.meta.kind {
             MediaKind::Video => {
@@ -106,7 +106,7 @@ impl ParticipantCore {
     pub fn remove_available_tracks(
         &mut self,
         effects: &mut effect::Queue,
-        track_ids: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
+        track_ids: &HashMap<Arc<entity::TrackId>, track::TrackReceiver>,
     ) {
         for (track_id, track_handle) in track_ids.iter() {
             match track_handle.meta.kind {

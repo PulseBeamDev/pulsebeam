@@ -37,10 +37,10 @@ pub enum ParticipantError {
 
 #[derive(Debug, Clone)]
 pub enum ParticipantControlMessage {
-    TracksSnapshot(HashMap<Arc<entity::TrackId>, track::TrackHandle>),
-    TracksPublished(Arc<HashMap<Arc<entity::TrackId>, track::TrackHandle>>),
-    TracksUnpublished(Arc<HashMap<Arc<entity::TrackId>, track::TrackHandle>>),
-    TrackPublishRejected(track::TrackHandle),
+    TracksSnapshot(HashMap<Arc<entity::TrackId>, track::TrackReceiver>),
+    TracksPublished(Arc<HashMap<Arc<entity::TrackId>, track::TrackReceiver>>),
+    TracksUnpublished(Arc<HashMap<Arc<entity::TrackId>, track::TrackReceiver>>),
+    TrackPublishRejected(track::TrackReceiver),
 }
 
 #[derive(Debug)]
@@ -54,7 +54,6 @@ pub struct ParticipantContext {
     node_ctx: node::NodeContext,
     room_handle: room::RoomHandle,
     rtc: Rtc,
-    track_tasks: FuturesUnordered<actor::JoinHandle<track::TrackMessageSet>>,
 
     egress: Arc<net::UnifiedSocket>,
 }
@@ -72,31 +71,21 @@ impl ParticipantContext {
         tracing::debug!("applying effects: {:?}", effects);
         for e in effects.drain(..) {
             match e {
-                Effect::Subscribe(mut track_handle) => {
-                    if track_handle
-                        .send_high(track::TrackControlMessage::Subscribe(self_handle.clone()))
-                        .await
-                        .is_err()
-                    {
+                Effect::Subscribe(mut track) => {
+                    if let Some(simulcast) = track.by_rid(None) {
+                        simulcast.channel.recv();
                         tracing::warn!(
                             "failed to subscribe to {}. Will be cleaned up by room broadcast",
-                            track_handle.meta
+                            track.meta
                         );
                     }
                 }
                 Effect::SpawnTrack(track_meta) => {
-                    let track_actor =
-                        track::TrackActor::new(self_handle.clone(), track_meta.clone());
-                    let (track_handle, join_handle) = actor::spawn(
-                        track_actor,
-                        actor::RunnerConfig::default().with_lo(1024).with_hi(1024),
-                    );
-
-                    self.track_tasks.push(join_handle);
+                    let (tx, rx) = track::new(track_meta, 64);
 
                     if let Err(e) = self
                         .room_handle
-                        .send_high(room::RoomMessage::PublishTrack(track_handle))
+                        .send_high(room::RoomMessage::PublishTrack(rx))
                         .await
                     {
                         tracing::error!("Failed to publish track: {}", e);
@@ -190,9 +179,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 _ = tokio::time::sleep(timeout) => {
                     // Timer expired, poll again
-                }
-                Some((track_meta, _)) = self.ctx.track_tasks.next() => {
-                    self.core.handle_track_finished(track_meta);
                 }
             }
         );
