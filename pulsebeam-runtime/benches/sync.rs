@@ -1,8 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::{
-    num::NonZeroUsize,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::task;
 
@@ -21,7 +18,7 @@ fn bench_broadcast_fanout(c: &mut Criterion) {
     group.sample_size(10);
 
     // --- Benchmark Definition ---
-    group.bench_function("6000_subs_2000_pkts", |b| {
+    group.bench_function("3000_subs_2000_pkts", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
             let mut total_duration = Duration::ZERO;
             for _ in 0..iters {
@@ -41,7 +38,7 @@ async fn run_broadcast_test() {
     // 1. --- Setup ---
     // The packet will now contain its sequence and the time it was sent.
     let channel_cap = 256;
-    let (tx, rx) = channel::<(usize, Instant)>(256);
+    let (tx, rx) = channel::<(usize, Instant)>(channel_cap);
     let num_subscribers = 3000;
     let num_packets_to_send = 2_000;
 
@@ -80,13 +77,15 @@ async fn run_broadcast_test() {
 
     // 3. --- Publisher sends packets ---
     let send_start = Instant::now();
-    let yield_interval =
-        channel_cap / std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    // let yield_interval =
+    //     channel_cap / std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     for i in 0..num_packets_to_send {
         tx.send((i, Instant::now()));
-        // A smaller delay to increase pressure.
-        if i % yield_interval == 0 {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // ~300pps with 30 fps
+        // Every other frame, we generate a keyframe that doubles the amount of packets in a burst.
+        if i % 10 == 0 && i % 20 != 0 {
+            tokio::time::sleep(Duration::from_millis(33)).await;
         }
     }
     let total_send_duration = send_start.elapsed();
