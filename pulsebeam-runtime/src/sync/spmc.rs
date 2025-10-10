@@ -87,7 +87,7 @@ impl<T> Ring<T> {
         }
 
         let idx = *seq % self.capacity as u64;
-        let packet = self.slots[idx as usize].write().clone();
+        let packet = self.slots[idx as usize].read().clone();
 
         // Only advance after reading
         *seq += 1;
