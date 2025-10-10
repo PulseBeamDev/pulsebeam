@@ -24,8 +24,8 @@ tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 futures.workspace = true
-tokio-rustls = "0.26.2"
-rustls = "0.23.31"
+tokio-rustls = "0.26.4"
+rustls = "0.23.32"
 turmoil = "0.6.6"
 quinn-udp = "0.5.14"
 socket2 = "0.6.0"
@@ -38,5 +38,5 @@ futures-concurrency = "7.6.3"
 async-stream = "0.3.6"
 
 [dev-dependencies]
-rcgen = "0.14.4"
+rcgen = "0.14.5"
 criterion = { version = "0.7.0", features = ["async", "async_tokio"] }
