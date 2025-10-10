@@ -402,9 +402,10 @@ mod test {
         assert!(sock.try_send_batch(&batch));
 
         sock.readable().await.unwrap();
+        let mut storage = RecvBatchStorage::new(1);
+        let mut batch = RecvPacketBatch::new(&mut storage);
         let mut buf = Vec::with_capacity(1);
-        let count = sock.try_recv_batch(&mut buf).unwrap();
-        assert_eq!(count, 1);
+        sock.try_recv_batch(&mut batch, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);
         assert_eq!(&buf[0].buf, payload.as_slice());
     }

@@ -48,6 +48,11 @@ cargo-deps:
 release:
 	RUSTC_WRAPPER=$(SCCACHE) $(CARGO) build --release -p pulsebeam
 
+
+.PHONY: profile
+profile:
+	RUSTFLAGS="$(PROFILING_RUSTFLAGS)" RUSTC_WRAPPER=$(SCCACHE) $(CARGO) build --profile profiling -p pulsebeam
+
 # Clean build artifacts and flamegraph data
 .PHONY: clean
 clean:
