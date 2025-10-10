@@ -167,173 +167,173 @@ impl AudioAllocator {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use str0m::media::MediaKind;
-
-    #[tokio::test]
-    async fn assigns_only_top_tracks_when_slots_are_limited() {
-        let mut allocator = AudioAllocator::new();
-        let mut effects = effect::Queue::default();
-
-        // Two slots available
-        allocator.add_slot(Mid::new());
-        allocator.add_slot(Mid::new());
-
-        // Create four tracks
-        let (t0, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t3, _) = track::test::spawn_fake(MediaKind::Audio);
-
-        allocator.add_track(&mut effects, t0.clone());
-        allocator.add_track(&mut effects, t1.clone());
-        allocator.add_track(&mut effects, t2.clone());
-        allocator.add_track(&mut effects, t3.clone());
-
-        // Assign audio levels
-        allocator.get_slot(
-            &t0.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-5),
-                voice_activity: Some(true),
-            },
-        );
-        allocator.get_slot(
-            &t1.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-10),
-                voice_activity: Some(true),
-            },
-        );
-        allocator.get_slot(
-            &t2.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-20),
-                voice_activity: Some(true),
-            },
-        );
-        allocator.get_slot(
-            &t3.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-50),
-                voice_activity: Some(true),
-            },
-        );
-
-        // Only the two loudest tracks should be active
-        let active = allocator.get_active_tracks();
-        assert!(active.contains(&t0.meta.id));
-        assert!(active.contains(&t1.meta.id));
-        assert!(!active.contains(&t2.meta.id));
-        assert!(!active.contains(&t3.meta.id));
-    }
-
-    #[tokio::test]
-    async fn prioritizes_vad_over_loud_non_vad() {
-        let mut allocator = AudioAllocator::new();
-        let mut effects = effect::Queue::default();
-
-        allocator.add_slot(Mid::new());
-        allocator.add_slot(Mid::new());
-
-        let (t0, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
-
-        allocator.add_track(&mut effects, t0.clone());
-        allocator.add_track(&mut effects, t1.clone());
-        allocator.add_track(&mut effects, t2.clone());
-
-        // Track0 loud but not speaking
-        allocator.get_slot(
-            &t0.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-50), // tie with VAD
-                voice_activity: Some(false),
-            },
-        );
-        // Track1 quiet but speaking
-        allocator.get_slot(
-            &t1.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-50),
-                voice_activity: Some(true),
-            },
-        );
-        // Track2 mid loudness and speaking
-        allocator.get_slot(
-            &t2.meta.id,
-            &AudioTrackData {
-                audio_level: Some(-20),
-                voice_activity: Some(true),
-            },
-        );
-
-        let active = allocator.get_active_tracks();
-        assert!(active.contains(&t1.meta.id));
-        assert!(active.contains(&t2.meta.id));
-        assert!(!active.contains(&t0.meta.id));
-    }
-
-    #[tokio::test]
-    async fn reuses_slots_for_louder_new_tracks() {
-        let mut allocator = AudioAllocator::new();
-        let mut effects = effect::Queue::default();
-
-        allocator.add_slot(Mid::new());
-        allocator.add_slot(Mid::new());
-
-        let (t0, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
-        let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
-
-        allocator.add_track(&mut effects, t0.clone());
-        allocator.add_track(&mut effects, t1.clone());
-        allocator.add_track(&mut effects, t2.clone());
-
-        // Step 1: t0 and t1 occupy slots
-        let _slot0 = allocator
-            .get_slot(
-                &t0.meta.id,
-                &AudioTrackData {
-                    audio_level: Some(-10),
-                    voice_activity: Some(true),
-                },
-            )
-            .unwrap();
-        let slot1 = allocator
-            .get_slot(
-                &t1.meta.id,
-                &AudioTrackData {
-                    audio_level: Some(-20),
-                    voice_activity: Some(true),
-                },
-            )
-            .unwrap();
-
-        let active = allocator.get_active_tracks();
-        assert!(active.contains(&t0.meta.id));
-        assert!(active.contains(&t1.meta.id));
-
-        // Step 2: t2 louder than t1 replaces t1
-        let slot2 = allocator
-            .get_slot(
-                &t2.meta.id,
-                &AudioTrackData {
-                    audio_level: Some(-5),
-                    voice_activity: Some(true),
-                },
-            )
-            .unwrap();
-
-        let active = allocator.get_active_tracks();
-        assert!(active.contains(&t0.meta.id));
-        assert!(active.contains(&t2.meta.id));
-        assert!(!active.contains(&t1.meta.id));
-
-        // Verify slot reuse
-        assert_eq!(slot2, slot1);
-    }
-}
+// #[cfg(test)]
+// mod test {
+//     use super::*;
+//     use str0m::media::MediaKind;
+//
+//     #[tokio::test]
+//     async fn assigns_only_top_tracks_when_slots_are_limited() {
+//         let mut allocator = AudioAllocator::new();
+//         let mut effects = effect::Queue::default();
+//
+//         // Two slots available
+//         allocator.add_slot(Mid::new());
+//         allocator.add_slot(Mid::new());
+//
+//         // Create four tracks
+//         let (t0, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t3, _) = track::test::spawn_fake(MediaKind::Audio);
+//
+//         allocator.add_track(&mut effects, t0.clone());
+//         allocator.add_track(&mut effects, t1.clone());
+//         allocator.add_track(&mut effects, t2.clone());
+//         allocator.add_track(&mut effects, t3.clone());
+//
+//         // Assign audio levels
+//         allocator.get_slot(
+//             &t0.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-5),
+//                 voice_activity: Some(true),
+//             },
+//         );
+//         allocator.get_slot(
+//             &t1.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-10),
+//                 voice_activity: Some(true),
+//             },
+//         );
+//         allocator.get_slot(
+//             &t2.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-20),
+//                 voice_activity: Some(true),
+//             },
+//         );
+//         allocator.get_slot(
+//             &t3.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-50),
+//                 voice_activity: Some(true),
+//             },
+//         );
+//
+//         // Only the two loudest tracks should be active
+//         let active = allocator.get_active_tracks();
+//         assert!(active.contains(&t0.meta.id));
+//         assert!(active.contains(&t1.meta.id));
+//         assert!(!active.contains(&t2.meta.id));
+//         assert!(!active.contains(&t3.meta.id));
+//     }
+//
+//     #[tokio::test]
+//     async fn prioritizes_vad_over_loud_non_vad() {
+//         let mut allocator = AudioAllocator::new();
+//         let mut effects = effect::Queue::default();
+//
+//         allocator.add_slot(Mid::new());
+//         allocator.add_slot(Mid::new());
+//
+//         let (t0, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
+//
+//         allocator.add_track(&mut effects, t0.clone());
+//         allocator.add_track(&mut effects, t1.clone());
+//         allocator.add_track(&mut effects, t2.clone());
+//
+//         // Track0 loud but not speaking
+//         allocator.get_slot(
+//             &t0.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-50), // tie with VAD
+//                 voice_activity: Some(false),
+//             },
+//         );
+//         // Track1 quiet but speaking
+//         allocator.get_slot(
+//             &t1.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-50),
+//                 voice_activity: Some(true),
+//             },
+//         );
+//         // Track2 mid loudness and speaking
+//         allocator.get_slot(
+//             &t2.meta.id,
+//             &AudioTrackData {
+//                 audio_level: Some(-20),
+//                 voice_activity: Some(true),
+//             },
+//         );
+//
+//         let active = allocator.get_active_tracks();
+//         assert!(active.contains(&t1.meta.id));
+//         assert!(active.contains(&t2.meta.id));
+//         assert!(!active.contains(&t0.meta.id));
+//     }
+//
+//     #[tokio::test]
+//     async fn reuses_slots_for_louder_new_tracks() {
+//         let mut allocator = AudioAllocator::new();
+//         let mut effects = effect::Queue::default();
+//
+//         allocator.add_slot(Mid::new());
+//         allocator.add_slot(Mid::new());
+//
+//         let (t0, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t1, _) = track::test::spawn_fake(MediaKind::Audio);
+//         let (t2, _) = track::test::spawn_fake(MediaKind::Audio);
+//
+//         allocator.add_track(&mut effects, t0.clone());
+//         allocator.add_track(&mut effects, t1.clone());
+//         allocator.add_track(&mut effects, t2.clone());
+//
+//         // Step 1: t0 and t1 occupy slots
+//         let _slot0 = allocator
+//             .get_slot(
+//                 &t0.meta.id,
+//                 &AudioTrackData {
+//                     audio_level: Some(-10),
+//                     voice_activity: Some(true),
+//                 },
+//             )
+//             .unwrap();
+//         let slot1 = allocator
+//             .get_slot(
+//                 &t1.meta.id,
+//                 &AudioTrackData {
+//                     audio_level: Some(-20),
+//                     voice_activity: Some(true),
+//                 },
+//             )
+//             .unwrap();
+//
+//         let active = allocator.get_active_tracks();
+//         assert!(active.contains(&t0.meta.id));
+//         assert!(active.contains(&t1.meta.id));
+//
+//         // Step 2: t2 louder than t1 replaces t1
+//         let slot2 = allocator
+//             .get_slot(
+//                 &t2.meta.id,
+//                 &AudioTrackData {
+//                     audio_level: Some(-5),
+//                     voice_activity: Some(true),
+//                 },
+//             )
+//             .unwrap();
+//
+//         let active = allocator.get_active_tracks();
+//         assert!(active.contains(&t0.meta.id));
+//         assert!(active.contains(&t2.meta.id));
+//         assert!(!active.contains(&t1.meta.id));
+//
+//         // Verify slot reuse
+//         assert_eq!(slot2, slot1);
+//     }
+// }

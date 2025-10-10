@@ -9,9 +9,8 @@ use str0m::Rtc;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
-    gateway,
-    message::TrackMeta,
-    node, participant, track,
+    gateway, node, participant, track,
+    track::TrackMeta,
 };
 use pulsebeam_runtime::actor;
 

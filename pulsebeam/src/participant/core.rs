@@ -67,17 +67,16 @@ impl ParticipantCore {
     ) {
         for track_handle in tracks.values() {
             if track_handle.meta.id.origin_participant == self.participant_id {
-                self.add_published_track(track_handle);
+                tracing::warn!("unexpected loopback");
             } else {
                 self.add_available_track(effects, track_handle);
             }
         }
     }
 
-    fn add_published_track(&mut self, track_handle: &track::TrackReceiver) {
-        let track_meta = &track_handle.meta;
+    pub fn add_published_track(&mut self, track: track::TrackSender) {
         self.published_tracks
-            .insert(track_meta.id.origin_mid, track_handle.clone());
+            .insert(track.meta.id.origin_mid, track);
     }
 
     fn add_available_track(

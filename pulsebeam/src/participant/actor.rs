@@ -55,7 +55,7 @@ pub struct ParticipantContext {
 }
 
 impl ParticipantContext {
-    async fn apply_effects(&mut self, effects: &mut effect::Queue) {
+    async fn apply_effects(&mut self, core: &mut ParticipantCore, effects: &mut effect::Queue) {
         if effects.is_empty() {
             return;
         }
@@ -65,6 +65,7 @@ impl ParticipantContext {
             match e {
                 Effect::SpawnTrack(track_meta) => {
                     let (tx, rx) = track::new(track_meta, 64);
+                    core.add_published_track(tx);
 
                     if let Err(e) = self
                         .room_handle
@@ -135,7 +136,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     Some(delay) => delay,
                     None => return Ok(()), // disconnected
                 };
-                self.ctx.apply_effects(&mut self.effects).await;
+                self.ctx.apply_effects(&mut self.core, &mut self.effects).await;
             },
             select: {
                 Ok(_) = self.ctx.egress.writable(), if !self.batcher.is_empty() => {
@@ -143,6 +144,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 Some(pkt) = gateway_rx.recv() => {
                     self.handle_udp_packet(pkt);
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    // Timer expired, poll again
                 }
             }
         );
@@ -389,3 +393,5 @@ impl ParticipantActor {
         stream.request_keyframe(req.kind);
     }
 }
+
+pub type ParticipantHandle = actor::ActorHandle<ParticipantMessageSet>;

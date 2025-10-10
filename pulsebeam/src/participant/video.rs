@@ -22,11 +22,11 @@ pub struct VideoAllocator {
 
 impl VideoAllocator {
     pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackReceiver) {
-        assert!(track_handle.kind.is_video());
+        assert!(track_handle.meta.kind.is_video());
 
-        tracing::info!("added video track: {}", track_handle.id);
+        tracing::info!("added video track: {}", track_handle.meta.id);
         self.tracks.insert(
-            track_handle.id.clone(),
+            track_handle.meta.id.clone(),
             TrackOut {
                 handle: track_handle,
                 mid: None,
@@ -49,7 +49,7 @@ impl VideoAllocator {
             slot.track_id = None;
         }
 
-        tracing::info!("removed video track: {}", track.handle.id);
+        tracing::info!("removed video track: {}", track.handle.meta.id);
         self.auto_subscribe(effects);
         Some(track.handle)
     }
@@ -94,8 +94,7 @@ impl VideoAllocator {
 
                 effects.push_back(effect::Effect::Subscribe(track.handle.clone()));
                 track.mid.replace(*slot_id);
-                let meta = &track.handle;
-                slot.track_id.replace(meta.id.clone());
+                slot.track_id.replace(track.handle.meta.id.clone());
                 tracing::info!("allocated video slot: {track_id} -> {slot_id}");
                 break;
             }
