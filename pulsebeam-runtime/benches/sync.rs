@@ -1,5 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
+use futures::{StreamExt, future::join_all};
+use futures_concurrency::stream::Merge;
 use rand::seq::index;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
@@ -222,18 +223,14 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
         }
 
         let handle = task::spawn(async move {
-            let (latency_tx, mut latency_rx) = mpsc::channel(256);
-            let mut futs = FuturesUnordered::new();
+            let mut futs = Vec::new();
 
             for mut receiver in subs_receivers {
-                let tx_clone = latency_tx.clone();
-                futs.push(async move {
+                futs.push(async_stream::stream! {
                     loop {
                         match receiver.recv().await {
                             Ok(Some((_, send_time))) => {
-                                if tx_clone.send(send_time.elapsed()).await.is_err() {
-                                    break;
-                                }
+                                yield send_time.elapsed();
                             }
                             Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
@@ -241,26 +238,8 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                     }
                 });
             }
-            drop(latency_tx);
-
-            let mut latencies = Vec::new();
-            let mut last_yield = tokio::time::Instant::now();
-
-            loop {
-                tokio::select! {
-                    _ = futs.next() => {}
-                    Some(latency) = latency_rx.recv() => {
-                        latencies.push(latency);
-                    }
-                    else => break,
-                }
-
-                if last_yield.elapsed() > Duration::from_micros(50) {
-                    tokio::task::yield_now().await;
-                    last_yield = tokio::time::Instant::now();
-                }
-            }
-            latencies
+            let latencies = futs.merge();
+            latencies.collect().await
         });
         subscriber_tasks.push(handle);
     }
