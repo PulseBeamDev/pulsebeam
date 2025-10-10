@@ -175,6 +175,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
                 self.core
                     .handle_published_tracks(&mut self.effects, &tracks);
+
                 for (_, track) in &tracks {
                     if track.meta.kind == MediaKind::Video {
                         let Some(mut simulcast) = track.by_default() else {
@@ -185,11 +186,12 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         let stream = async_stream::stream! {
                             loop {
                                 match simulcast.channel.recv().await {
-                                    Ok(Some(pkt)) => {
-                                        yield (meta.clone(), pkt)
-                                    },
+                                    Ok(Some(pkt)) => yield (meta.clone(), pkt),
                                     Ok(None) => break,                      // channel closed
-                                    Err(spmc::RecvError::Lagged(_)) => continue, // skip dropped frames
+                                    Err(spmc::RecvError::Lagged(n)) => {
+                                        tracing::warn!("lagged by {n}");
+                                        continue;
+                                    }, // skip dropped frames
                                 }
                             }
                         };
@@ -213,7 +215,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                                 match simulcast.channel.recv().await {
                                     Ok(Some(pkt)) => yield (meta.clone(), pkt),
                                     Ok(None) => break,                      // channel closed
-                                    Err(spmc::RecvError::Lagged(_)) => continue, // skip dropped frames
+                                    Err(spmc::RecvError::Lagged(n)) => {
+                                        tracing::warn!("lagged by {n}");
+                                        continue;
+                                    }, // skip dropped frames
                                 }
                             }
                         };

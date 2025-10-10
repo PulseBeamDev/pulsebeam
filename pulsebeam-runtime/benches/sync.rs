@@ -47,7 +47,7 @@ async fn run_single_fanout_test() {
             let mut latencies = Vec::with_capacity(num_packets_to_send);
             loop {
                 match r.recv().await {
-                    Ok(Some((_, send_time))) => latencies.push(send_time.elapsed()),
+                    Ok(Some(res)) => latencies.push(res.1.elapsed()),
                     Err(RecvError::Lagged(_)) => continue,
                     Ok(None) => break,
                 }
@@ -134,8 +134,8 @@ async fn run_interactive_room_mesh_spawn_test() {
                 task::spawn(async move {
                     loop {
                         match receiver.recv().await {
-                            Ok(Some((_, send_time))) => {
-                                if tx_clone.send(send_time.elapsed()).await.is_err() {
+                            Ok(Some(res)) => {
+                                if tx_clone.send(res.1.elapsed()).await.is_err() {
                                     break;
                                 }
                             }
@@ -229,8 +229,8 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                 futs.push(async_stream::stream! {
                     loop {
                         match receiver.recv().await {
-                            Ok(Some((_, send_time))) => {
-                                yield send_time.elapsed();
+                            Ok(Some(res)) => {
+                                yield res.1.elapsed();
                             }
                             Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
