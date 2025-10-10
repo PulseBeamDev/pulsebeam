@@ -1,25 +1,29 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 use tokio::runtime::Runtime;
 use tokio::task;
 
 // Make sure this path points to your updated spmc channel implementation.
 use pulsebeam_runtime::sync::spmc::{RecvError, channel};
 
-/// Measures broadcast throughput and average per-packet delivery latency for a large number of subscribers.
+/// Measures broadcast throughput, packet loss, and p99.9 latency under heavy fan-out.
 fn bench_broadcast_fanout(c: &mut Criterion) {
     // Set up a multi-threaded Tokio runtime for the benchmark.
     let rt = Runtime::new().unwrap();
 
-    let mut group = c.benchmark_group("spmc_broadcast");
-    // This increases the sample size for more stable results.
+    let mut group = c.benchmark_group("spmc_broadcast_high_fanout");
+    // Increase the measurement time for more stable results in a noisy environment.
+    group.measurement_time(Duration::from_secs(15));
+    // A smaller sample size is fine with a longer measurement time.
     group.sample_size(10);
 
     // --- Benchmark Definition ---
-    group.bench_function("6000_subscribers_1000_packets", |b| {
+    group.bench_function("6000_subs_2000_pkts", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
             let mut total_duration = Duration::ZERO;
-            // The custom loop allows us to measure total time accurately.
             for _ in 0..iters {
                 let start_time = Instant::now();
                 run_broadcast_test().await;
@@ -32,97 +36,100 @@ fn bench_broadcast_fanout(c: &mut Criterion) {
     group.finish();
 }
 
+/// A single run of the broadcast test scenario.
 async fn run_broadcast_test() {
     // 1. --- Setup ---
-    let capacity = 256;
-    let (tx, rx) = channel::<usize>(capacity);
-    let num_subscribers = 6000;
-    let num_packets_to_send = 1_000;
+    // The packet will now contain its sequence and the time it was sent.
+    let channel_cap = 256;
+    let (tx, rx) = channel::<(usize, Instant)>(256);
+    let num_subscribers = 3000;
+    let num_packets_to_send = 2_000;
 
     // 2. --- Spawn Subscribers ---
-    // Each subscriber task will return the number of packets it successfully
-    // received and the sum of the latencies for those packets.
+    // Each subscriber task will return a vector of all end-to-end latencies it measured.
     let mut subscribers = Vec::with_capacity(num_subscribers);
     for _ in 0..num_subscribers {
         let mut r = rx.clone();
         let handle = task::spawn(async move {
-            let mut packets_received = 0;
-            let mut total_latency = Duration::ZERO;
+            let mut latencies = Vec::with_capacity(num_packets_to_send);
 
             loop {
-                let recv_start_time = Instant::now();
                 match r.recv().await {
-                    // Successfully received a packet.
-                    Ok(Some(_packet)) => {
-                        total_latency += recv_start_time.elapsed();
-                        packets_received += 1;
+                    // Successfully received a packet with its send timestamp.
+                    Ok(Some((_packet_id, send_time))) => {
+                        // Calculate true end-to-end latency.
+                        latencies.push(send_time.elapsed());
                     }
-                    // The receiver lagged. This is expected under heavy load.
-                    // We simply continue the loop to try receiving again.
+                    // The receiver lagged. This is expected and is the primary source of packet loss.
                     Err(RecvError::Lagged(_)) => {
                         continue;
                     }
-                    // The sender was dropped, and the channel is empty.
-                    // This is our signal to terminate.
+                    // The sender was dropped, and the channel is empty. Terminate.
                     Ok(None) => {
                         break;
                     }
                 }
             }
-            (packets_received, total_latency)
+            latencies
         });
         subscribers.push(handle);
     }
 
-    // Give a brief moment for all subscribers to spawn and be ready to receive.
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Give a brief moment for all subscribers to spawn and be ready.
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
     // 3. --- Publisher sends packets ---
     let send_start = Instant::now();
+    let yield_interval =
+        channel_cap / std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     for i in 0..num_packets_to_send {
-        // Use the new, simplified `send` method.
-        tx.send(i);
-
-        // Introduce a small, artificial delay to simulate a real-world workload
-        // and prevent the publisher from overwhelming the receivers instantly.
-        if i % 32 == 0 {
-            tokio::time::sleep(Duration::from_micros(50)).await;
+        tx.send((i, Instant::now()));
+        // A smaller delay to increase pressure.
+        if i % yield_interval == 0 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
     let total_send_duration = send_start.elapsed();
 
     // 4. --- Signal Termination ---
-    // Drop the sender. This will cause all `recv()` calls to eventually
-    // return `Ok(None)`, reliably terminating the subscriber tasks.
+    // Dropping the sender is the reliable way to signal subscribers to finish.
     drop(tx);
 
     // 5. --- Collect and Aggregate Results ---
-    let mut total_packets_delivered = 0;
-    let mut total_latency_sum = Duration::ZERO;
-
+    let mut all_latencies = Vec::with_capacity(num_subscribers * num_packets_to_send);
     for sub_handle in subscribers {
-        // Await the result from each subscriber task.
-        let (packets_count, latency_sum) = sub_handle.await.unwrap();
-        total_packets_delivered += packets_count;
-        total_latency_sum += latency_sum;
+        let subscriber_latencies = sub_handle.await.unwrap();
+        all_latencies.extend(subscriber_latencies);
     }
 
     // 6. --- Compute and Print Metrics ---
-    // Throughput is the total number of packets successfully delivered to all
-    // subscribers, divided by the time it took the sender to send them all.
+    let total_packets_delivered = all_latencies.len();
+    let total_possible_deliveries = num_packets_to_send * num_subscribers;
+    let lost_packets = total_possible_deliveries - total_packets_delivered;
+    let loss_percentage = if total_possible_deliveries > 0 {
+        lost_packets as f64 * 100.0 / total_possible_deliveries as f64
+    } else {
+        0.0
+    };
+
     let throughput = total_packets_delivered as f64 / total_send_duration.as_secs_f64();
 
-    // Average latency is the total latency sum divided by the number of deliveries.
-    // Avoid division by zero if no packets were delivered.
-    let avg_latency = if total_packets_delivered > 0 {
-        total_latency_sum / total_packets_delivered as u32
+    // Calculate p99.9 latency
+    let p99_9_latency = if !all_latencies.is_empty() {
+        // Sort all collected latency values to find the percentile.
+        // Unstable sort is faster and sufficient here.
+        all_latencies.sort_unstable();
+        let p99_9_idx = (all_latencies.len() as f64 * 0.999).floor() as usize;
+        // Clamp the index to prevent out-of-bounds access.
+        let final_idx = p99_9_idx.min(all_latencies.len() - 1);
+        all_latencies[final_idx]
     } else {
         Duration::ZERO
     };
 
     println!(
-        "Delivered: {} packets, Total Send Time: {:.2?}, Throughput: {:.0} pkt/sec, Avg Delivery Latency: {:.2?}",
-        total_packets_delivered, total_send_duration, throughput, avg_latency
+        "Send Time: {:.2?}, Throughput: {:.0} pkt/sec, Packet Loss: {:.2}%, p99.9 Latency: {:.2?}",
+        total_send_duration, throughput, loss_percentage, p99_9_latency
     );
 }
 
