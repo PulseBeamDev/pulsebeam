@@ -1,12 +1,15 @@
 //! High-performance, Arc-aware, single-producer / multi-consumer broadcast channel.
 //!
-//! This implementation is optimized for the broadcast use case where a single
-//! piece of data needs to be shared with multiple consumers efficiently. It
-//! enforces a pattern where the channel manages the `Arc<T>` internally,
-//! ensuring that receivers always perform a cheap reference-count clone instead
-//! of a potentially expensive deep clone of `T`.
+//! The core design goal is to make `recv` a cheap, lock-free `Arc::clone`.
+//! It's a broadcast channel, so it's built for one writer and many readers.
+//!
+//! To eliminate false sharing under heavy cross-core contention, critical atomic
+//! fields and every single buffer slot are padded to cache-line boundaries.
+//! This increases the memory footprint of the ring buffer itself but is necessary
+//! to ensure maximum throughput when cache coherency is a limiting factor.
 
 use arc_swap::ArcSwapOption;
+use crossbeam_utils::CachePadded;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,99 +19,115 @@ use tokio::sync::Notify;
 /// Error returned when a `Receiver` has fallen behind the `Sender`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
-    /// The receiver lagged and was jumped forward to the given sequence number.
-    /// The receiver should call `recv` again to retrieve the message at this sequence.
+    /// The receiver was too slow and the ring buffer has lapped it.
+    /// The `u64` is the new sequence number the receiver must use to catch up.
     Lagged(u64),
 
+    /// The sender was dropped, closing the channel.
     Closed,
 }
 
-/// The shared ring buffer at the core of the channel.
+/// The core ring buffer data structure.
 #[derive(Debug)]
 struct Ring<T: Send + Sync> {
     capacity: usize,
-    tail: AtomicU64,
-    /// `ArcSwapOption<T>` is a specialized, highly optimized version of
-    /// `ArcSwap<Option<Arc<T>>>` from the `arc-swap` crate. It is perfect
-    /// for this use case, providing lock-free reads of an optional `Arc`.
-    slots: Vec<ArcSwapOption<T>>,
+
+    // The producer exclusively writes to `tail`. Padding prevents cache line
+    // invalidations for consumers reading other struct fields.
+    tail: CachePadded<AtomicU64>,
+
+    // Padding each slot is crucial. It prevents a write to slot[i] from
+    // invalidating the cache line for a consumer reading from adjacent slot[i-1].
+    // This is the main defense against inter-slot false sharing.
+    slots: Vec<CachePadded<ArcSwapOption<T>>>,
+
     notify: Notify,
-    closed: AtomicBool,
+
+    // Consumers read the `closed` flag. Padding isolates it from the
+    // producer's frequent writes to `tail`.
+    closed: CachePadded<AtomicBool>,
 }
 
 impl<T: Send + Sync> Ring<T> {
     fn new(capacity: usize) -> Arc<Self> {
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            // Initialize all slots as empty (`None`). This involves no allocation.
-            slots.push(ArcSwapOption::from(None));
+            // Each slot gets its own padded, cache-line-aligned allocation.
+            slots.push(CachePadded::new(ArcSwapOption::from(None)));
         }
 
         Arc::new(Self {
             capacity,
-            tail: AtomicU64::new(0),
+            tail: CachePadded::new(AtomicU64::new(0)),
             slots,
             notify: Notify::new(),
-            closed: AtomicBool::new(false),
+            closed: CachePadded::new(AtomicBool::new(false)),
         })
     }
 
-    /// The `send` logic takes ownership of `T` and wraps it in an `Arc`.
+    // `push` is only ever called by the single producer.
     fn push(&self, value: T) {
+        // `fetch_add` gives us the sequence number for the current slot before the increment.
         let seq = self.tail.fetch_add(1, Ordering::Release);
         let idx = (seq % self.capacity as u64) as usize;
 
-        // The single allocation for the broadcast happens here, wrapping the user's value.
+        // The only allocation for the broadcast happens here.
         let new_arc = Arc::new(value);
 
-        // Atomically store the `Some(Arc<T>)` into the slot.
+        // Atomically store the new `Arc` into the slot. `CachePadded` DRefs transparently.
+        // This `store` with `Release` ordering makes the new value visible to consumers.
         self.slots[idx].store(Some(new_arc));
 
+        // Wake up any sleeping receivers.
         self.notify.notify_waiters();
     }
 
-    /// `get_next` now returns an `Option<Arc<T>>`, which is a cheap clone.
-    fn get_next(&self, seq: &mut u64) -> Result<Option<Arc<T>>, RecvError> {
+    // `get_next` is called by consumers in their receive loop.
+    fn get_next(&self, seq: &mut u66) -> Result<Option<Arc<T>>, RecvError> {
+        // `Acquire` ordering ensures we see the latest writes from the producer's `push`.
         let tail = self.tail.load(Ordering::Acquire);
         let earliest = tail.saturating_sub(self.capacity as u64);
 
+        // If our sequence number is older than the oldest data in the ring,
+        // we've been lapped. The caller needs to jump forward to the new baseline.
         if *seq < earliest {
             *seq = earliest;
             return Err(RecvError::Lagged(earliest));
         }
 
+        // If our sequence number is current, there's no new data for us yet.
         if *seq >= tail {
             return Ok(None);
         }
 
         let idx = (*seq % self.capacity as u64) as usize;
-        // `load()` is a lock-free read that returns a smart pointer to the content.
         let slot_load = self.slots[idx].load();
 
         if let Some(packet_arc) = &*slot_load {
             *seq += 1;
-            // This is the key: we clone the Arc, which is just an atomic
-            // increment, NOT a deep clone of the data `T`.
+            // The whole point of the design: a cheap, atomic ref-count bump.
             Ok(Some(packet_arc.clone()))
         } else if self.closed.load(Ordering::Acquire) {
+            // The slot is empty, but the channel is also closed. This can happen
+            // if the last message was consumed right before the sender was dropped.
             Err(RecvError::Closed)
         } else {
-            // Race condition: tail is updated, but store is not yet visible.
-            // The `recv` loop will simply retry.
+            // The slot is empty. This indicates a race where `tail` has been
+            // incremented but the `store` to the slot isn't visible to this core yet.
+            // The `recv` loop will simply spin and try this function again.
             Ok(None)
         }
     }
 }
 
-/// The sending handle for the broadcast channel.
+// --- Public API ---
+
 #[derive(Debug)]
 pub struct Sender<T: Send + Sync> {
     ring: Arc<Ring<T>>,
 }
 
 impl<T: Send + Sync> Sender<T> {
-    /// Sends a value to all active `Receiver`s by taking ownership of it.
-    /// The value will be wrapped in an `Arc` internally to allow for efficient sharing.
     pub fn send(&self, value: T) {
         self.ring.push(value);
     }
@@ -121,7 +140,6 @@ impl<T: Send + Sync> Drop for Sender<T> {
     }
 }
 
-/// The receiving handle for the broadcast channel.
 #[derive(Debug)]
 pub struct Receiver<T: Send + Sync> {
     ring: Arc<Ring<T>>,
@@ -132,30 +150,31 @@ impl<T: Send + Sync> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Self {
             ring: Arc::clone(&self.ring),
+            // A new receiver starts reading from the current tip of the ring.
             next_seq: self.ring.tail.load(Ordering::Acquire),
         }
     }
 }
 
 impl<T: Send + Sync> Receiver<T> {
-    /// Asynchronously waits for the next message, returning a shared pointer (`Arc`).
-    ///
-    /// This method guarantees that receiving a message is a cheap operation, as it
-    /// only clones an `Arc`, regardless of the size of `T`.
     pub async fn recv(&mut self) -> Result<Option<Arc<T>>, RecvError> {
         loop {
             match self.ring.get_next(&mut self.next_seq) {
                 Ok(Some(pkt)) => return Ok(Some(pkt)),
                 Err(err) => return Err(err),
-                Ok(None) => { /* Continue to wait logic */ }
+                Ok(None) => { /* fall through to the wait logic */ }
             }
 
             if self.ring.closed.load(Ordering::Acquire) {
+                // Check for a value one last time in case a message and a close
+                // happened between our last check and now.
                 return self.ring.get_next(&mut self.next_seq);
             }
 
             let notified = self.ring.notify.notified();
 
+            // Double-check after subscribing to the notification. This handles the
+            // race where a message arrives after our first check but before we `await`.
             match self.ring.get_next(&mut self.next_seq) {
                 Ok(Some(pkt)) => return Ok(Some(pkt)),
                 Err(err) => return Err(err),
@@ -175,15 +194,8 @@ impl<T: Send + Sync> Receiver<T> {
     }
 }
 
-/// Creates a new single-producer, multi-consumer broadcast channel.
-///
-/// The transmitted type `T` only needs to be `Send + Sync`. The `Clone` trait
-/// is not required, as the channel handles sharing via `Arc<T>`.
-///
-/// # Panics
-/// Panics if `capacity` is 0.
 pub fn channel<T: Send + Sync>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    assert!(capacity > 0, "Capacity must be greater than 0");
+    assert!(capacity > 0, "Channel capacity must be non-zero");
     let ring = Ring::new(capacity);
     (
         Sender {
@@ -218,19 +230,16 @@ mod tests {
 
         assert_eq!(*val1_arc, "hello");
         assert_eq!(*val2_arc, "hello");
-        // Crucially, check they point to the same memory allocation.
+        // Ensure they point to the same memory allocation.
         assert!(Arc::ptr_eq(&val1_arc, &val2_arc));
     }
 
     #[tokio::test]
     async fn works_with_non_clone_types() {
-        // This struct does not implement Clone, which is now supported.
         #[derive(Debug, PartialEq, Eq)]
         struct NonCloneable(String);
 
         let (tx, mut rx) = channel::<NonCloneable>(4);
-
-        // This works because `send` takes ownership of the data.
         tx.send(NonCloneable("hello world".to_string()));
 
         let received_arc = rx.recv().await.unwrap().unwrap();
@@ -252,7 +261,7 @@ mod tests {
         assert_eq!(*rx1.recv().await.unwrap().unwrap(), 2);
         assert_eq!(*rx1.recv().await.unwrap().unwrap(), 3);
 
-        // The new receiver starts after the point of cloning and only sees new messages.
+        // The new receiver starts after the point of cloning, only seeing new messages.
         assert_eq!(*rx2.recv().await.unwrap().unwrap(), 3);
     }
 
@@ -280,7 +289,7 @@ mod tests {
 
         drop(tx);
 
-        // After the sender is dropped, recv returns None.
-        assert!(rx.recv().await.unwrap().is_none());
+        // After the sender is dropped, recv returns an error indicating closed.
+        assert!(matches!(rx.recv().await, Err(RecvError::Closed)));
     }
 }

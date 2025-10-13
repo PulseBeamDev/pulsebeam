@@ -37,6 +37,7 @@ parking_lot = "0.12.5"
 futures-concurrency = "7.6.3"
 async-stream = "0.3.6"
 arc-swap = "1.7.1"
+crossbeam-utils = "0.8.21"
 
 [dev-dependencies]
 rcgen = "0.14.4"
