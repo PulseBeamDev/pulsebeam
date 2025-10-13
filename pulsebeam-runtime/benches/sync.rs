@@ -13,6 +13,7 @@ use pulsebeam_runtime::sync::spmc::{RecvError, Sender, channel};
 // --- Benchmark Group Definition ---
 criterion_group!(
     benches,
+    bench_interactive_room_mesh_poll,
     bench_interactive_room_mesh_futures_unordered,
     bench_interactive_room_mesh_spawn,
     bench_single_fanout,
@@ -37,7 +38,7 @@ fn bench_single_fanout(c: &mut Criterion) {
 
 async fn run_single_fanout_test() {
     let (tx, rx) = channel::<(usize, Instant)>(256);
-    let num_subscribers = 3000;
+    let num_subscribers = 3_000;
     let num_packets_to_send = 2_000;
 
     let mut subscriber_tasks = Vec::with_capacity(num_subscribers);
@@ -49,6 +50,7 @@ async fn run_single_fanout_test() {
                 match r.recv().await {
                     Ok(Some(res)) => latencies.push(res.1.elapsed()),
                     Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
                     Ok(None) => break,
                 }
             }
@@ -141,6 +143,7 @@ async fn run_interactive_room_mesh_spawn_test() {
                             }
                             Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
                         }
                     }
                 });
@@ -234,12 +237,110 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                             }
                             Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
                         }
                     }
                 });
             }
             let latencies = futs.merge();
             latencies.collect().await
+        });
+        subscriber_tasks.push(handle);
+    }
+
+    let mut publisher_tasks = Vec::with_capacity(senders.len());
+    for tx in senders {
+        let handle = task::spawn(create_publisher_load(tx, num_packets_per_publisher));
+        publisher_tasks.push(handle);
+    }
+
+    let simulation_start = Instant::now();
+    join_all(publisher_tasks).await;
+    let total_send_duration = simulation_start.elapsed();
+
+    let all_latencies = aggregate_latencies(subscriber_tasks).await;
+    let total_possible_deliveries =
+        num_packets_per_publisher * subscriptions_per_subscriber * num_subscribers;
+    print_metrics(
+        "Interactive Room (Mesh-Spawn)",
+        total_send_duration,
+        all_latencies,
+        total_possible_deliveries,
+    );
+}
+
+fn bench_interactive_room_mesh_poll(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("spmc_interactive_room_mesh_poll");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
+    group.bench_function("150_pubs_150_subs_poll", |b| {
+        b.to_async(&rt).iter_custom(|iters| async move {
+            run_test_loop(iters, run_interactive_room_mesh_poll_test).await
+        });
+    });
+    group.finish();
+}
+
+async fn run_interactive_room_mesh_poll_test() {
+    let num_publishers = 150;
+    let num_subscribers = 150;
+    let num_packets_per_publisher = 1_000;
+    let subscriptions_per_subscriber = 15;
+
+    let mut senders = Vec::with_capacity(num_publishers);
+    let mut initial_receivers = Vec::with_capacity(num_publishers);
+    for _ in 0..num_publishers {
+        let (tx, rx) = channel::<(usize, Instant)>(256);
+        senders.push(tx);
+        initial_receivers.push(rx);
+    }
+
+    let mut rng = rand::rng();
+
+    let mut subscriber_tasks = Vec::with_capacity(num_subscribers);
+    for _ in 0..num_subscribers {
+        let random_indices = index::sample(&mut rng, num_publishers, subscriptions_per_subscriber);
+
+        let mut subs_receivers = Vec::with_capacity(subscriptions_per_subscriber);
+        for i in random_indices {
+            subs_receivers.push(initial_receivers[i].clone());
+        }
+
+        let handle = task::spawn(async move {
+            let mut latencies = Vec::new();
+            // Adaptive backoff / batching parameters
+            let mut idle_backoff = Duration::from_micros(10);
+            let max_backoff = Duration::from_micros(500);
+
+            loop {
+                if subs_receivers.is_empty() {
+                    break;
+                }
+
+                let mut work_done = false;
+
+                // Iterate through each receiver once per outer loop iteration.
+                for receiver in subs_receivers.iter_mut() {
+                    // Non-blocking drain of any messages currently in the queue
+                    while let Ok(Some(msg)) = receiver.try_recv() {
+                        latencies.push(msg.1.elapsed());
+                        work_done = true;
+                    }
+                }
+
+                // After checking all receivers, remove the ones that are closed.
+                subs_receivers.retain(|receiver| !receiver.is_closed());
+
+                if work_done {
+                    idle_backoff = Duration::from_micros(10); // reset
+                    tokio::task::yield_now().await; // cooperative yield
+                } else {
+                    tokio::time::sleep(idle_backoff).await;
+                    idle_backoff = (idle_backoff * 2).min(max_backoff);
+                }
+            }
+            latencies
         });
         subscriber_tasks.push(handle);
     }

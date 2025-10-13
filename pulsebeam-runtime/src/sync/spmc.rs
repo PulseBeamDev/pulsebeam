@@ -19,6 +19,8 @@ pub enum RecvError {
     /// The receiver lagged and was jumped forward to the given sequence number.
     /// The receiver should call `recv` again to retrieve the message at this sequence.
     Lagged(u64),
+
+    Closed,
 }
 
 /// The shared ring buffer at the core of the channel.
@@ -88,6 +90,8 @@ impl<T: Send + Sync> Ring<T> {
             // This is the key: we clone the Arc, which is just an atomic
             // increment, NOT a deep clone of the data `T`.
             Ok(Some(packet_arc.clone()))
+        } else if self.closed.load(Ordering::Acquire) {
+            Err(RecvError::Closed)
         } else {
             // Race condition: tail is updated, but store is not yet visible.
             // The `recv` loop will simply retry.
@@ -160,6 +164,14 @@ impl<T: Send + Sync> Receiver<T> {
                 }
             }
         }
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<Arc<T>>, RecvError> {
+        self.ring.get_next(&mut self.next_seq)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.ring.closed.load(Ordering::Acquire)
     }
 }
 
