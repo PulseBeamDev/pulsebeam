@@ -13,9 +13,12 @@
 
 use arc_swap::ArcSwapOption;
 use crossbeam_utils::CachePadded;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    fmt::{Debug, Pointer},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 use tokio::sync::Notify;
 
@@ -35,7 +38,6 @@ pub enum RecvError {
 /// - Hot write path (tail) is isolated on its own cache line
 /// - Read-mostly fields (capacity, slots) are grouped together
 /// - Notification fields are separate to avoid contention
-#[derive(Debug)]
 struct Ring<T: Send + Sync> {
     /// Write-hot field: isolated to prevent false sharing with readers
     tail: CachePadded<AtomicU64>,
@@ -139,9 +141,18 @@ impl<T: Send + Sync> Ring<T> {
 }
 
 /// The sending handle for the broadcast channel.
-#[derive(Debug)]
 pub struct Sender<T: Send + Sync> {
     ring: Arc<Ring<T>>,
+}
+
+impl<T: Send + Sync> Debug for Sender<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sender")
+            .field("capacity", &self.ring.capacity)
+            .field("tail", &self.ring.tail.load(Ordering::Relaxed))
+            .field("closed", &self.ring.closed.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: Send + Sync> Sender<T> {
@@ -167,11 +178,21 @@ impl<T: Send + Sync> Drop for Sender<T> {
 }
 
 /// The receiving handle for the broadcast channel.
-#[derive(Debug)]
 pub struct Receiver<T: Send + Sync> {
     ring: Arc<Ring<T>>,
     // Keep next_seq local to avoid cache line bouncing between receivers
     next_seq: u64,
+}
+
+impl<T: Send + Sync> Debug for Receiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver")
+            .field("capacity", &self.ring.capacity)
+            .field("next_seq", &self.next_seq)
+            .field("tail", &self.ring.tail.load(Ordering::Relaxed))
+            .field("closed", &self.ring.closed.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: Send + Sync> Clone for Receiver<T> {

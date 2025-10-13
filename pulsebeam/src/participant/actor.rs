@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use pulsebeam_runtime::prelude::*;
@@ -11,6 +11,7 @@ use str0m::{
     media::{KeyframeRequest, MediaKind},
     rtp::RtpPacket,
 };
+use tokio::time::Instant;
 
 use crate::{
     entity, gateway, message, node,
@@ -49,7 +50,6 @@ pub enum ParticipantControlMessage {
 
 #[derive(Debug)]
 pub enum ParticipantDataMessage {
-    ForwardRtp(Arc<track::TrackMeta>, Arc<RtpPacket>),
     KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
 }
 
@@ -151,7 +151,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             self.process_control_messages(ctx);
             self.process_media_ingress();
             self.process_network_input(&mut gateway_rx);
-            let rtc_deadline = self.poll_rtc_engine();
+            let Some(rtc_deadline) = self.poll_rtc_engine() else {
+                break;
+            };
 
             if !self.ctx.rtc.is_alive() {
                 tracing::info!(participant_id = %self.core.participant_id, "Participant disconnected, shutting down actor.");
@@ -165,57 +167,25 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 .await;
 
             // --- PHASE 3: Asynchronous Wait ---
-            // Implement a hybrid timer strategy: wait for the shorter of the RTC's
-            // required delay or our own low-latency pacing interval. This ensures
-            // we service long-term timers (e.g., STUN keepalives) correctly
-            // without sacrificing low-latency media forwarding.
-            let rtc_timeout = rtc_deadline.map_or(PACING_INTERVAL, |d| {
-                d.saturating_duration_since(Instant::now())
-            });
-            let sleep_duration = rtc_timeout.min(PACING_INTERVAL);
+            let sleep_duration = rtc_deadline.min(PACING_INTERVAL);
 
             tokio::select! {
                 biased;
 
+                // Wakes when the network socket is ready to accept more data. This is
+                // active whenever the batcher has items, as the head of the queue
+                // might be blocked.
+                Ok(_) = self.ctx.egress.writable(), if !self.batcher.is_empty() => {
+                    // No action needed here; the next loop iteration will call flush_egress().
+                }
+
                 Some(msg) = ctx.hi_rx.recv() => {
-                    self.on_high_priority(ctx, msg).await;
+                    self.on_high_priority_sync(ctx, msg);
                 }
-                _ = tokio::time::sleep(sleep_duration) => {
-                    // If the sleep was for the RTC's benefit, we must inform it.
-                    if rtc_timeout <= PACING_INTERVAL {
-                        if let Err(e) = self.ctx.rtc.handle_input(Input::Timeout(Instant::now())) {
-                            tracing::error!("RTC handle timeout error: {}", e);
-                        }
-                    }
-                }
+                _ = tokio::time::sleep(sleep_duration) => {}
             }
         }
         Ok(())
-    }
-
-    async fn on_high_priority(
-        &mut self,
-        _ctx: &mut actor::ActorContext<ParticipantMessageSet>,
-        msg: ParticipantControlMessage,
-    ) {
-        match msg {
-            ParticipantControlMessage::TracksSnapshot(tracks) => {
-                self.subscribe_to_tracks(tracks);
-            }
-            ParticipantControlMessage::TracksPublished(tracks) => {
-                self.subscribe_to_tracks((*tracks).clone());
-            }
-            ParticipantControlMessage::TracksUnpublished(tracks) => {
-                self.core
-                    .remove_available_tracks(&mut self.effects, tracks.as_ref());
-                for track_id in tracks.keys() {
-                    self.subscribed_tracks.remove(track_id);
-                }
-            }
-            ParticipantControlMessage::TrackPublishRejected(_) => {
-                // Application-specific logic could be added here (e.g., notify client).
-            }
-        }
     }
 }
 
@@ -247,10 +217,18 @@ impl ParticipantActor {
 
     /// Synchronously polls the `Rtc` engine, handling events and queueing
     /// outgoing packets in the batcher until it requests a timeout.
-    fn poll_rtc_engine(&mut self) -> Option<Instant> {
+    fn poll_rtc_engine(&mut self) -> Option<Duration> {
         while self.ctx.rtc.is_alive() {
             match self.ctx.rtc.poll_output() {
-                Ok(Output::Timeout(deadline)) => return Some(deadline),
+                Ok(Output::Timeout(deadline)) => {
+                    let now = tokio::time::Instant::now().into_std();
+                    let duration = deadline.saturating_duration_since(now);
+                    if duration.is_zero() {
+                        let _ = self.ctx.rtc.handle_input(Input::Timeout(now));
+                        continue;
+                    }
+                    return Some(duration);
+                }
                 Ok(Output::Transmit(tx)) => self.batcher.push_back(tx.destination, &tx.contents),
                 Ok(Output::Event(event)) => self.handle_event(event),
                 Err(e) => {
@@ -265,11 +243,10 @@ impl ParticipantActor {
     /// Greedily processes all pending high- and low-priority messages from the mailboxes.
     fn process_control_messages(&mut self, ctx: &mut actor::ActorContext<ParticipantMessageSet>) {
         while let Ok(msg) = ctx.hi_rx.try_recv() {
-            futures::executor::block_on(self.on_high_priority(ctx, msg));
+            self.on_high_priority_sync(ctx, msg);
         }
         while let Ok(msg) = ctx.lo_rx.try_recv() {
             match msg {
-                ParticipantDataMessage::ForwardRtp(meta, rtp) => self.handle_forward_rtp(meta, rtp),
                 ParticipantDataMessage::KeyframeRequest(id, req) => {
                     self.request_keyframe(KeyframeRequest {
                         mid: id.origin_mid,
@@ -277,6 +254,31 @@ impl ParticipantActor {
                         rid: req.rid,
                     });
                 }
+            }
+        }
+    }
+
+    fn on_high_priority_sync(
+        &mut self,
+        _ctx: &mut actor::ActorContext<ParticipantMessageSet>,
+        msg: ParticipantControlMessage,
+    ) {
+        match msg {
+            ParticipantControlMessage::TracksSnapshot(tracks) => {
+                self.subscribe_to_tracks(tracks);
+            }
+            ParticipantControlMessage::TracksPublished(tracks) => {
+                self.subscribe_to_tracks((*tracks).clone());
+            }
+            ParticipantControlMessage::TracksUnpublished(tracks) => {
+                self.core
+                    .remove_available_tracks(&mut self.effects, tracks.as_ref());
+                for track_id in tracks.keys() {
+                    self.subscribed_tracks.remove(track_id);
+                }
+            }
+            ParticipantControlMessage::TrackPublishRejected(_) => {
+                // Application-specific logic could be added here (e.g., notify client).
             }
         }
     }
@@ -342,7 +344,7 @@ impl ParticipantActor {
             destination: packet.dst,
             contents,
         };
-        let input = Input::Receive(Instant::now(), recv);
+        let input = Input::Receive(Instant::now().into_std(), recv);
         if let Err(e) = self.ctx.rtc.handle_input(input) {
             tracing::error!("Rtc::handle_input error: {}", e);
         }
@@ -400,21 +402,34 @@ impl ParticipantActor {
     /// Handles an RTP packet that has been forwarded from another participant's track.
     fn handle_forward_rtp(&mut self, track_meta: Arc<track::TrackMeta>, rtp: Arc<RtpPacket>) {
         let Some(mid) = self.core.get_slot(&track_meta, &rtp.header.ext_vals) else {
+            tracing::debug!(
+                track = ?track_meta,
+                "no slot found for track; dropping forwarded RTP"
+            );
             return;
         };
         let Some(media) = self.ctx.rtc.media(mid) else {
+            tracing::warn!(%mid, "no media found for mid; dropping forwarded RTP");
             return;
         };
         let Some(&pt) = media.remote_pts().first() else {
+            tracing::warn!(
+                %mid,
+                "no negotiated payload type for mid; dropping forwarded RTP"
+            );
             return;
         };
 
         let mut api = self.ctx.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
+            tracing::warn!(
+                %mid,
+                "no TxStream for mid; cannot forward RTP (maybe unnegotiated transceiver)"
+            );
             return;
         };
 
-        let _ = writer.write_rtp(
+        if let Err(err) = writer.write_rtp(
             pt,
             rtp.seq_no,
             rtp.header.timestamp,
@@ -423,7 +438,11 @@ impl ParticipantActor {
             rtp.header.ext_vals.clone(),
             true,
             rtp.payload.clone(),
-        );
+        ) {
+            tracing::error!(%mid, %err, "failed to forward RTP packet");
+        } else {
+            tracing::trace!(%mid, "write_rtp succeeded");
+        }
     }
 
     /// Sends a keyframe request to the remote peer for a specific media stream.
@@ -436,10 +455,14 @@ impl ParticipantActor {
 
     /// Helper to process a new set of tracks to subscribe to.
     fn subscribe_to_tracks(&mut self, tracks: HashMap<Arc<entity::TrackId>, track::TrackReceiver>) {
+        // TODO: refactor this to core
+        tracing::debug!(?tracks, "subscribe to tracks");
         self.core
             .handle_published_tracks(&mut self.effects, &tracks);
         for (track_id, track) in tracks {
-            if track.meta.kind == MediaKind::Video {
+            if track.meta.kind == MediaKind::Video
+                && track.meta.id.origin_participant != self.core.participant_id
+            {
                 self.subscribed_tracks.insert(track_id, track);
             }
         }
