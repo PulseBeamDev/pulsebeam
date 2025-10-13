@@ -28,9 +28,9 @@ impl SimulcastReceiver {
         stream! {
             loop {
                 match self.channel.recv().await {
-                    Ok(Some(pkt)) => yield pkt,
-                    Ok(None) => break,                      // channel closed
+                    Ok(pkt) => yield pkt,
                     Err(spmc::RecvError::Lagged(_)) => continue, // skip dropped frames
+                    Err(spmc::RecvError::Closed) => break,
                 }
             }
         }

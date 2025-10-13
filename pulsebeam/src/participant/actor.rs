@@ -186,8 +186,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         let stream = async_stream::stream! {
                             loop {
                                 match simulcast.channel.recv().await {
-                                    Ok(Some(pkt)) => yield (meta.clone(), pkt),
-                                    Ok(None) => break,                      // channel closed
+                                    Ok(pkt) => yield (meta.clone(), pkt),
+                                    Err(spmc::RecvError::Closed) => break,                      // channel closed
                                     Err(spmc::RecvError::Lagged(n)) => {
                                         tracing::warn!("lagged by {n}");
                                         continue;
@@ -213,8 +213,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         let stream = async_stream::stream! {
                             loop {
                                 match simulcast.channel.recv().await {
-                                    Ok(Some(pkt)) => yield (meta.clone(), pkt),
-                                    Ok(None) => break,                      // channel closed
+                                    Ok(pkt) => yield (meta.clone(), pkt),
+                                    Err(spmc::RecvError::Closed) => break,                      // channel closed
                                     Err(spmc::RecvError::Lagged(n)) => {
                                         tracing::warn!("lagged by {n}");
                                         continue;
