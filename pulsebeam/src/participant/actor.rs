@@ -141,7 +141,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
         pulsebeam_runtime::actor_loop!(self, ctx,
             pre_select: {
-                let timeout = match self.poll().await {
+                let timeout = match self.poll() {
                     Some(delay) => delay,
                     None => return Ok(()), // disconnected
                 };
@@ -287,7 +287,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn poll(&mut self) -> Option<Duration> {
+    fn poll(&mut self) -> Option<Duration> {
         while self.ctx.rtc.is_alive() {
             match self.ctx.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
@@ -302,10 +302,10 @@ impl ParticipantActor {
                     return Some(duration);
                 }
                 Ok(Output::Transmit(tx)) => {
-                    self.batcher.push_back(tx.destination, tx.contents.into());
+                    self.batcher.push_back(tx.destination, &tx.contents);
                 }
                 Ok(Output::Event(event)) => {
-                    self.handle_event(event).await;
+                    self.handle_event(event);
                 }
                 Err(e) => {
                     tracing::error!("RTC poll error: {}", e);
@@ -324,7 +324,8 @@ impl ParticipantActor {
                 buf: &state.buf,
                 segment_size: state.segment_size,
             }) {
-                self.batcher.pop_front();
+                let state = self.batcher.pop_front().unwrap();
+                self.batcher.reclaim(state);
             } else {
                 break;
             }
@@ -332,7 +333,7 @@ impl ParticipantActor {
         Ok(())
     }
 
-    async fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) => {
                 tracing::trace!("ICE state: {:?}", state);
@@ -345,7 +346,7 @@ impl ParticipantActor {
                 self.core.handle_media_added(&mut self.effects, media);
             }
             Event::RtpPacket(rtp) => {
-                self.handle_rtp_packet(rtp).await;
+                self.handle_rtp_packet(rtp);
             }
             Event::KeyframeRequest(req) => {
                 self.handle_keyframe_request(req);
@@ -357,7 +358,7 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_rtp_packet(&mut self, mut rtp: RtpPacket) {
+    fn handle_rtp_packet(&mut self, mut rtp: RtpPacket) {
         let mut api = self.ctx.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
             tracing::warn!("no stream_rx matched ssrc, dropping");
