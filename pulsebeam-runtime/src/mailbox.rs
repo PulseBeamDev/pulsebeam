@@ -34,6 +34,21 @@ impl<T> fmt::Display for TrySendError<T> {
 
 impl<T: fmt::Debug> Error for TrySendError<T> {}
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecvError {
+    Empty,
+    Disconnected,
+}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TryRecvError::Empty => write!(f, "receiving on an empty mailbox"),
+            TryRecvError::Disconnected => write!(f, "receiving on a disconnected mailbox"),
+        }
+    }
+}
+
 /// A handle to send messages to an actor's mailbox.
 pub struct Sender<T> {
     sender: tokio::sync::mpsc::Sender<T>,
@@ -79,6 +94,13 @@ impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
         self.receiver.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.receiver.try_recv().map_err(|e| match e {
+            tokio::sync::mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
+            tokio::sync::mpsc::error::TryRecvError::Disconnected => TryRecvError::Disconnected,
+        })
     }
 }
 

@@ -47,7 +47,7 @@ pub struct SimulcastSender {
 /// Sender half of a track (typically owned by publisher/participant)
 pub struct TrackSender {
     pub meta: Arc<TrackMeta>,
-    pub simulcast: Arc<Vec<SimulcastSender>>,
+    pub simulcast: Vec<SimulcastSender>,
 }
 
 impl TrackSender {
@@ -67,7 +67,7 @@ impl TrackSender {
 #[derive(Clone, Debug)]
 pub struct TrackReceiver {
     pub meta: Arc<TrackMeta>,
-    pub simulcast: Arc<Vec<SimulcastReceiver>>,
+    pub simulcast: Vec<SimulcastReceiver>,
 }
 
 impl TrackReceiver {
@@ -124,11 +124,11 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
     (
         TrackSender {
             meta: meta.clone(),
-            simulcast: Arc::new(senders),
+            simulcast: senders,
         },
         TrackReceiver {
             meta,
-            simulcast: Arc::new(receivers),
+            simulcast: receivers,
         },
     )
 }
