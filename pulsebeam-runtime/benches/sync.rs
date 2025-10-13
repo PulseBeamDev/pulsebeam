@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::{StreamExt, future::join_all};
 use futures_concurrency::stream::Merge;
-use rand::seq::index;
+use rand::{Rng, seq::index};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -309,9 +309,25 @@ async fn run_interactive_room_mesh_poll_test() {
 
         let handle = task::spawn(async move {
             let mut latencies = Vec::new();
-            // Adaptive backoff / batching parameters
-            let mut idle_backoff = Duration::from_micros(10);
-            let max_backoff = Duration::from_micros(500);
+
+            // --- TUNING PARAMETERS ---
+            // 1. Busy Budget: How many times to 'continue' draining before forced yield.
+            // Prevents starvation when under heavy load.
+            const BUSY_BUDGET_MAX: u32 = 16;
+
+            // 2. Idle Spins: How many times to 'yield_now' before resorting to sleep.
+            // Keeps latency low during short gaps between packets.
+            const IDLE_SPINS_MAX: u32 = 50;
+
+            // 3. Sleep Backoff: Only used during long silences (between frames).
+            // Kept very low to catch the start of the next frame quickly.
+            let min_sleep = Duration::from_micros(50);
+            let max_sleep = Duration::from_millis(1); // Max 1ms sleep
+
+            // --- STATE ---
+            let mut busy_budget = BUSY_BUDGET_MAX;
+            let mut idle_spins = 0;
+            let mut current_sleep = min_sleep;
 
             loop {
                 if subs_receivers.is_empty() {
@@ -320,28 +336,49 @@ async fn run_interactive_room_mesh_poll_test() {
 
                 let mut work_done = false;
 
-                // Iterate through each receiver once per outer loop iteration.
+                // Greedy non-blocking drain
                 for receiver in subs_receivers.iter_mut() {
-                    // Non-blocking drain of any messages currently in the queue
                     while let Ok(Some(msg)) = receiver.try_recv() {
                         latencies.push(msg.1.elapsed());
                         work_done = true;
                     }
                 }
-
-                // After checking all receivers, remove the ones that are closed.
                 subs_receivers.retain(|receiver| !receiver.is_closed());
 
                 if work_done {
-                    idle_backoff = Duration::from_micros(10); // reset
-                    tokio::task::yield_now().await; // cooperative yield
+                    // --- BUSY STATE ---
+                    // Reset idle counters because we found work.
+                    idle_spins = 0;
+                    current_sleep = min_sleep;
+
+                    busy_budget -= 1;
+                    if busy_budget == 0 {
+                        // Exhausted budget, yield to prevent starvation.
+                        busy_budget = BUSY_BUDGET_MAX;
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Stay hot, check again immediately.
+                        continue;
+                    }
                 } else {
-                    tokio::time::sleep(idle_backoff).await;
-                    idle_backoff = (idle_backoff * 2).min(max_backoff);
+                    // --- IDLE STATE ---
+                    // Reset busy budget.
+                    busy_budget = BUSY_BUDGET_MAX;
+
+                    if idle_spins < IDLE_SPINS_MAX {
+                        // Phase 1: Spin/Yield. High CPU, very low latency.
+                        idle_spins += 1;
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Phase 2: Sleep. Saves CPU during the ~30ms gap between frames.
+                        tokio::time::sleep(current_sleep).await;
+                        current_sleep = (current_sleep * 2).min(max_sleep);
+                    }
                 }
             }
             latencies
         });
+
         subscriber_tasks.push(handle);
     }
 
@@ -391,8 +428,14 @@ async fn create_publisher_load(tx: Sender<(usize, Instant)>, num_packets: usize)
     const FPS: f64 = 30.0;
     let frame_duration = Duration::from_secs_f64(1.0 / FPS); // Approx 33.3ms
 
-    // Give subscribers a moment to start listening.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // --- REALISTIC START TIME RANDOMIZATION ---
+    // In a real SFU, publishers don't all start sending at the exact same moment.
+    // We introduce a random "join" delay to stagger the start of the streams.
+    // This creates a more realistic, less perfectly synchronized initial load.
+    let random = rand::random_range(0..500);
+    // Each publisher will wait for a random duration between 0 and 500ms before starting.
+    let start_delay = Duration::from_millis(random);
+    tokio::time::sleep(start_delay).await;
 
     let mut packets_sent = 0;
     let mut frame_index = 0;
