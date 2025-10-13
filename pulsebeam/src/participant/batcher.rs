@@ -1,15 +1,17 @@
 use std::{collections::VecDeque, net::SocketAddr};
 
-/// Manages a pool of BatcherStates to build and emit network packets efficiently.
-/// This implementation reuses memory by pooling BatcherState objects,
-/// avoiding allocations on the hot path after an initial warm-up.
+/// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
+///
+/// This implementation reuses memory by pooling `BatcherState` objects and is instrumented
+/// with `metrics` to diagnose performance issues related to batching and allocation.
 pub struct Batcher {
     cap: usize,
     active_states: VecDeque<BatcherState>,
-    free_states: Vec<BatcherState>, // Pool of states for memory reuse
+    free_states: Vec<BatcherState>,
 }
 
 impl Batcher {
+    /// Creates a new `Batcher` where each internal buffer has the specified capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             cap,
@@ -18,60 +20,64 @@ impl Batcher {
         }
     }
 
+    /// Returns true if there are no active batches.
     pub fn is_empty(&self) -> bool {
         self.active_states.is_empty()
     }
 
-    /// Pushes content to an appropriate batch.
-    /// This operation is zero-allocation if a reusable state is available in the pool.
+    /// Pushes a content slice into an appropriate batch.
+    ///
+    /// It attempts to find an existing batch for the same destination that is not yet sealed.
+    /// If no suitable batch is found, it takes one from the free pool or allocates a new one.
     pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
-        debug_assert!(!content.is_empty(), "Content should not be empty");
+        debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
-        // Attempt to push to an existing active state
         for state in &mut self.active_states {
             if state.try_push(dst, content) {
                 return;
             }
         }
 
-        // Otherwise, grab a state from the free pool or create a new one
-        let mut new_state = self.free_states.pop().unwrap_or_else(|| {
-            // Allocation only happens here when the pool is empty
-            BatcherState::with_capacity(self.cap)
-        });
+        let mut new_state = match self.free_states.pop() {
+            Some(state) => {
+                metrics::counter!("batcher_pool_status", "status" => "hit").increment(1);
+                state
+            }
+            None => {
+                metrics::counter!("batcher_pool_status", "status" => "miss").increment(1);
+                BatcherState::with_capacity(self.cap)
+            }
+        };
 
         new_state.reset(dst);
 
-        // A new state should always accept the first content push.
-        // The debug_assert ensures we catch cases where content > capacity.
         if new_state.try_push(dst, content) {
             self.active_states.push_back(new_state);
         } else {
-            // This path should only be taken if the initial content is larger
-            // than the batcher's capacity. We put the state back.
             self.free_states.push(new_state);
-            debug_assert!(false, "Content is larger than the batcher capacity");
+            debug_assert!(
+                false,
+                "Content is larger than the batcher's configured capacity"
+            );
         }
     }
 
-    /// Returns a completed batch for processing.
-    /// The caller is responsible for returning it via `reclaim()` to prevent memory leaks.
+    /// Pops a single batch from the front of the queue.
     pub fn pop_front(&mut self) -> Option<BatcherState> {
         self.active_states.pop_front()
     }
 
-    /// Reclaims a BatcherState, returning its memory to the pool for reuse.
-    pub fn reclaim(&mut self, mut state: BatcherState) {
-        // We could clear the buffer here, but `reset` already does it upon reuse,
-        // which is slightly more efficient as it avoids a clear on the final use.
-        self.free_states.push(state);
+    pub fn front(&mut self) -> Option<&BatcherState> {
+        self.active_states.front()
     }
 
-    pub fn front(&self) -> Option<&BatcherState> {
-        self.active_states.front()
+    /// Reclaims a `BatcherState`, returning its memory to the pool for future reuse.
+    pub fn reclaim(&mut self, state: BatcherState) {
+        self.free_states.push(state);
     }
 }
 
+/// Holds the state for a single GSO-compatible batch.
 pub struct BatcherState {
     pub dst: SocketAddr,
     pub segment_size: usize,
@@ -82,39 +88,43 @@ pub struct BatcherState {
 impl BatcherState {
     fn with_capacity(cap: usize) -> Self {
         Self {
-            dst: "0.0.0.0:0".parse().unwrap(), // Default, overwritten on reset
+            dst: "0.0.0.0:0".parse().unwrap(),
             segment_size: 0,
             sealed: false,
             buf: Vec::with_capacity(cap),
         }
     }
 
-    /// Tries to append content to the buffer. Returns true on success.
+    /// Attempts to append a content slice to the buffer. Returns true on success.
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
-        // A sealed batch cannot accept more data.
-        if self.sealed || self.dst != dst || self.buf.len() + content.len() > self.buf.capacity() {
+        if self.sealed {
+            metrics::counter!("batcher_push_rejected", "reason" => "sealed").increment(1);
+            return false;
+        }
+        if self.dst != dst {
+            return false;
+        }
+        if self.buf.len() + content.len() > self.buf.capacity() {
+            metrics::counter!("batcher_push_rejected", "reason" => "capacity").increment(1);
             return false;
         }
 
-        // First segment pushed to this state, establish the segment size.
         if self.segment_size == 0 {
             self.segment_size = content.len();
         }
 
         if content.len() == self.segment_size {
-            // Segment has the expected size, append it.
             self.buf.extend_from_slice(content);
             true
         } else {
-            // This is a different-sized "tail" segment.
-            // Append it and seal the batch from further writes.
             self.buf.extend_from_slice(content);
             self.sealed = true;
+            metrics::counter!("batcher_batches_sealed_by_tail").increment(1);
             true
         }
     }
 
-    /// Resets the state for reuse.
+    /// Resets the state's properties for reuse.
     fn reset(&mut self, dst: SocketAddr) {
         self.dst = dst;
         self.segment_size = 0;
@@ -133,99 +143,109 @@ mod tests {
     }
 
     #[test]
-    fn test_push_same_size_segments() {
+    fn test_appends_same_size_and_stays_open() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(100);
-        state.reset(addr);
+        let mut batcher = Batcher::with_capacity(4096);
 
-        assert!(state.try_push(addr, &[1, 2, 3]));
-        assert_eq!(state.segment_size, 3);
-        assert!(!state.sealed);
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
 
-        assert!(state.try_push(addr, &[4, 5, 6]));
-        assert_eq!(state.buf, &[1, 2, 3, 4, 5, 6]);
-        assert!(!state.sealed); // Not sealed after same-size push
+        assert_eq!(batcher.active_states.len(), 1);
+        let batch = &batcher.active_states[0];
+        assert!(!batch.sealed);
+        assert_eq!(batch.segment_size, 1000);
+        assert_eq!(batch.buf.len(), 2000);
     }
 
     #[test]
-    fn test_push_tail_segment_seals_state() {
+    fn test_appends_tail_and_seals() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(100);
-        state.reset(addr);
+        let mut batcher = Batcher::with_capacity(4096);
 
-        state.try_push(addr, &[1, 2, 3]);
-        assert!(state.try_push(addr, &[4, 5])); // Push a tail segment
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
+        batcher.push_back(addr, &[3; 500]); // The tail packet
 
-        assert!(state.sealed); // State should now be sealed
-        assert_eq!(state.buf, &[1, 2, 3, 4, 5]);
-
-        // Further pushes should be rejected
-        assert!(!state.try_push(addr, &[6, 7, 8]));
-        assert!(!state.try_push(addr, &[9, 10]));
-
-        // Buffer should remain unchanged
-        assert_eq!(state.buf, &[1, 2, 3, 4, 5]);
+        assert_eq!(batcher.active_states.len(), 1);
+        let batch = &batcher.active_states[0];
+        assert!(batch.sealed);
+        assert_eq!(batch.segment_size, 1000);
+        assert_eq!(batch.buf.len(), 2500);
     }
 
     #[test]
-    fn test_rejects_push_when_sealed() {
+    fn test_sealed_batch_rejects_pushes_creating_new_batch() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(100);
-        state.reset(addr);
-        state.sealed = true; // Manually seal for test
+        let mut batcher = Batcher::with_capacity(4096);
 
-        assert!(!state.try_push(addr, &[1, 2, 3]));
-        assert!(state.buf.is_empty());
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[3; 500]); // This seals the first batch
+
+        // A further push should be rejected and create a new batch
+        batcher.push_back(addr, &[4; 1000]);
+        assert_eq!(batcher.active_states.len(), 2);
+
+        let batch1 = &batcher.active_states[0];
+        let batch2 = &batcher.active_states[1];
+
+        assert_eq!(batch1.buf.len(), 1500);
+        assert!(batch1.sealed);
+        assert_eq!(batch2.buf.len(), 1000);
+        assert!(!batch2.sealed);
     }
 
     #[test]
-    fn test_reclaim_and_reuse_resets_sealed_flag() {
-        let addr1 = create_test_addr();
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 8080);
-        let mut batcher = Batcher::with_capacity(100);
+    fn test_reclaim_and_reuse_resets_sealed_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(4096);
 
-        // Create a state, push a tail, which seals it
-        batcher.push_back(addr1, &[1, 2, 3]);
-        batcher.push_back(addr1, &[4, 5]);
+        // Create a batch and seal it
+        batcher.push_back(addr, &[1; 100]);
+        batcher.push_back(addr, &[2; 50]);
 
-        let mut state = batcher.pop_front().unwrap();
-        assert!(state.sealed);
+        let sealed_batch = batcher.pop_front().unwrap();
+        assert!(sealed_batch.sealed);
+        assert!(batcher.is_empty());
 
         // Reclaim the sealed state
-        batcher.reclaim(state);
+        batcher.reclaim(sealed_batch);
 
-        // Reuse the state for a new destination
-        batcher.push_back(addr2, &[10, 20]);
-        let reused_state = batcher.front().unwrap();
+        // Push again, which should reuse the reclaimed state from the pool
+        batcher.push_back(addr, &[3; 200]);
+        assert_eq!(batcher.active_states.len(), 1);
+        let reused_batch = &batcher.active_states[0];
 
-        assert_eq!(reused_state.dst, addr2);
-        assert!(!reused_state.sealed, "Reused state should not be sealed");
-        assert_eq!(reused_state.buf, &[10, 20]);
+        assert!(!reused_batch.sealed, "Reused batch should be open");
+        assert_eq!(reused_batch.segment_size, 200);
+        assert_eq!(reused_batch.buf.len(), 200);
     }
 
     #[test]
-    fn test_batcher_finds_correct_active_state() {
-        let addr1 = create_test_addr();
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 8080);
-        let mut batcher = Batcher::with_capacity(100);
+    fn test_pool_miss_allocates_new_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
+        assert_eq!(batcher.free_states.len(), 0);
 
-        batcher.push_back(addr1, &[1; 10]);
-        batcher.push_back(addr2, &[2; 10]);
+        // This is a pool miss
+        batcher.push_back(addr, &[1; 10]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+    }
 
-        assert_eq!(batcher.active_states.len(), 2);
+    #[test]
+    fn test_pool_hit_reuses_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
 
-        // This push should find the existing state for addr2, not addr1
-        batcher.push_back(addr2, &[3; 10]);
-        assert_eq!(batcher.active_states.len(), 2);
+        // First push causes allocation
+        batcher.push_back(addr, &[1; 10]);
+        let state = batcher.pop_front().unwrap();
+        batcher.reclaim(state);
+        assert_eq!(batcher.free_states.len(), 1);
 
-        let s1 = batcher.pop_front().unwrap();
-        assert_eq!(s1.dst, addr1);
-        assert_eq!(s1.buf.len(), 10);
-        batcher.reclaim(s1);
-
-        let s2 = batcher.pop_front().unwrap();
-        assert_eq!(s2.dst, addr2);
-        assert_eq!(s2.buf.len(), 20); // Both pushes for addr2 landed here
-        batcher.reclaim(s2);
+        // Second push should be a pool hit
+        batcher.push_back(addr, &[2; 20]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
     }
 }

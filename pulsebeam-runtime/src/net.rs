@@ -9,16 +9,6 @@ use quinn_udp::RecvMeta;
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
     Udp,
-
-    // ======================== TCP ========================
-    // TODO: Implement TCP Framing:
-    // * https://datatracker.ietf.org/doc/html/rfc6544
-    // * https://datatracker.ietf.org/doc/html/rfc4571
-    //
-    // Supported TCP mode:
-    // * Passive: Yes
-    // * Active: No
-    // * SO: No
     Tcp,
     Tls,
     SimUdp,
@@ -72,8 +62,13 @@ impl<'a> RecvPacketBatch<'a> {
 
     /// Extract received packets into user-facing data
     pub fn collect_packets(&self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacket>) {
-        // TODO: avoid reallocation here
-        // TODO: send as batch instead of individual packets
+        // Record the total size of the received batch as a metric.
+        let total_bytes: usize = self.meta.iter().take(count).map(|m| m.len).sum();
+        if total_bytes > 0 {
+            metrics::histogram!("network_recv_batch_bytes", "transport" => "udp")
+                .record(total_bytes as f64);
+        }
+
         for (i, m) in self.meta.iter().take(count).enumerate() {
             let buf = &self.slices[i];
             let segments = m.len / m.stride;
@@ -151,25 +146,21 @@ impl UnifiedSocket {
     #[inline]
     pub async fn readable(&self) -> io::Result<()> {
         match self {
-            Self::Udp(inner) => inner.readable().await?,
-            Self::SimUdp(inner) => inner.readable().await?,
+            Self::Udp(inner) => inner.readable().await,
+            Self::SimUdp(inner) => inner.readable().await,
         }
-        Ok(())
     }
 
     /// Waits until the socket is writable.
     #[inline]
     pub async fn writable(&self) -> io::Result<()> {
         match self {
-            Self::Udp(inner) => inner.writable().await?,
-            Self::SimUdp(inner) => inner.writable().await?,
+            Self::Udp(inner) => inner.writable().await,
+            Self::SimUdp(inner) => inner.writable().await,
         }
-        Ok(())
     }
 
     /// Receives a batch of packets into pre-allocated buffers.
-    /// Returns the number of packets received.
-    /// Stops on WouldBlock or fatal errors.
     #[inline]
     pub fn try_recv_batch(
         &self,
@@ -183,8 +174,6 @@ impl UnifiedSocket {
     }
 
     /// Sends a batch of packets.
-    /// Returns the number of packets sent.
-    /// Stops on WouldBlock or fatal errors; errors for individual packets are logged.
     #[inline]
     pub fn try_send_batch(&self, batch: &SendPacketBatch) -> bool {
         match self {
@@ -223,7 +212,6 @@ impl UdpTransport {
         let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
         let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
 
-        // TODO: set qos class?
         let local_addr = external_addr.unwrap_or(sock.local_addr()?);
 
         Ok(Self {
@@ -263,18 +251,16 @@ impl UdpTransport {
         batch: &mut RecvPacketBatch,
         out: &mut Vec<RecvPacket>,
     ) -> std::io::Result<()> {
-        let res = self.sock.try_io(tokio::io::Interest::READABLE, || {
+        match self.sock.try_io(tokio::io::Interest::READABLE, || {
             self.state
                 .recv((&self.sock).into(), &mut batch.slices, &mut batch.meta)
-        });
-
-        match res {
+        }) {
             Ok(count) => {
                 batch.collect_packets(self.local_addr, count, out);
                 Ok(())
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -290,11 +276,15 @@ impl UdpTransport {
         };
         tracing::trace!("try_send_batch: {}", transmit.contents.len());
 
-        self.sock
-            .try_io(tokio::io::Interest::WRITABLE, || {
-                self.state.send((&self.sock).into(), &transmit)
-            })
-            .is_ok()
+        let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
+            self.state.send((&self.sock).into(), &transmit)
+        });
+
+        if res.is_ok() {
+            metrics::histogram!("network_send_batch_bytes", "transport" => "udp")
+                .record(batch.buf.len() as f64);
+        }
+        res.is_ok()
     }
 }
 
@@ -338,14 +328,16 @@ impl SimUdpTransport {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        batch: &mut RecvPacketBatch,
+        _batch: &mut RecvPacketBatch,
         packets: &mut Vec<RecvPacket>,
     ) -> std::io::Result<()> {
         let mut buf = [0u8; Self::MTU];
+        let mut total_bytes = 0;
 
         loop {
             match self.sock.try_recv_from(&mut buf) {
                 Ok((len, src)) => {
+                    total_bytes += len;
                     packets.push(RecvPacket {
                         buf: Bytes::copy_from_slice(&buf[..len]),
                         src,
@@ -359,6 +351,12 @@ impl SimUdpTransport {
                 }
             }
         }
+
+        if total_bytes > 0 {
+            metrics::histogram!("network_recv_batch_bytes", "transport" => "sim_udp")
+                .record(total_bytes as f64);
+        }
+
         Ok(())
     }
 
@@ -368,7 +366,11 @@ impl SimUdpTransport {
         assert!(batch.buf.len() == batch.segment_size);
 
         match self.sock.try_send_to(batch.buf, batch.dst) {
-            Ok(_) => true,
+            Ok(_) => {
+                metrics::histogram!("network_send_batch_bytes", "transport" => "sim_udp")
+                    .record(batch.buf.len() as f64);
+                true
+            }
             Err(e) if e.kind() == ErrorKind::WouldBlock => false,
             Err(e) => {
                 tracing::warn!("Receive packet failed: {}", e);
@@ -384,6 +386,8 @@ mod test {
 
     #[tokio::test]
     async fn test_loopback() {
+        // NOTE: Metrics are not checked in this test, but their code paths are exercised.
+        // A proper test would involve setting up a metrics recorder.
         let sock = UnifiedSocket::bind("127.0.0.1:3000".parse().unwrap(), Transport::Udp, None)
             .await
             .unwrap();
