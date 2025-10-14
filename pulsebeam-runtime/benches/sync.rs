@@ -13,10 +13,10 @@ use pulsebeam_runtime::sync::spmc::{RecvError, Sender, channel};
 // --- Benchmark Group Definition ---
 criterion_group!(
     benches,
+    bench_single_fanout,
     bench_interactive_room_mesh_poll,
     bench_interactive_room_mesh_futures_unordered,
     bench_interactive_room_mesh_spawn,
-    bench_single_fanout,
 );
 criterion_main!(benches);
 
@@ -48,10 +48,9 @@ async fn run_single_fanout_test() {
             let mut latencies = Vec::with_capacity(num_packets_to_send);
             loop {
                 match r.recv().await {
-                    Ok(Some(res)) => latencies.push(res.1.elapsed()),
+                    Ok(res) => latencies.push(res.1.elapsed()),
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
-                    Ok(None) => break,
                 }
             }
             latencies
@@ -136,12 +135,11 @@ async fn run_interactive_room_mesh_spawn_test() {
                 task::spawn(async move {
                     loop {
                         match receiver.recv().await {
-                            Ok(Some(res)) => {
+                            Ok(res) => {
                                 if tx_clone.send(res.1.elapsed()).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
                             Err(RecvError::Closed) => break,
                         }
@@ -232,10 +230,9 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                 futs.push(async_stream::stream! {
                     loop {
                         match receiver.recv().await {
-                            Ok(Some(res)) => {
+                            Ok(res) => {
                                 yield res.1.elapsed();
                             }
-                            Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
                             Err(RecvError::Closed) => break,
                         }

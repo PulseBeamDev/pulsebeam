@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::{prelude::*, sync::spmc};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     error::SdpError,
@@ -292,15 +292,35 @@ impl ParticipantActor {
         // This requires `try_recv` on the spmc channel to take `&self`, not `&mut self`.
         // This is a necessary change in the spmc channel for this pattern to work.
         for track in self.subscribed_tracks.values_mut() {
-            for simulcast_receiver in track.simulcast.iter_mut() {
-                while let Ok(Some(pkt)) = simulcast_receiver.channel.try_recv() {
-                    packets_to_forward.push((track.meta.clone(), pkt));
+            let meta = track.meta.clone();
+            let Some(receiver) = track.by_default() else {
+                panic!("expect track to always have default receiver");
+            };
+
+            tracing::trace!(?meta, ?receiver, "polling track");
+            loop {
+                match receiver.channel.try_recv() {
+                    Ok(Some(pkt)) => {
+                        packets_to_forward.push((meta.clone(), pkt));
+                    }
+                    Ok(None) => {
+                        tracing::trace!("try again later");
+                        break;
+                    }
+                    Err(spmc::RecvError::Lagged(n)) => {
+                        tracing::warn!("lagged by {n}, will catch up");
+                    }
+                    Err(spmc::RecvError::Closed) => {
+                        tracing::warn!("publisher has exited");
+                        break;
+                    }
                 }
             }
         }
 
         // Now, process the collected batch of packets.
         for (meta, pkt) in packets_to_forward {
+            tracing::trace!(?meta, ?pkt, "forward rtp");
             self.handle_forward_rtp(meta, pkt);
         }
     }
@@ -372,9 +392,11 @@ impl ParticipantActor {
     fn handle_rtp_packet(&mut self, mut rtp: RtpPacket) {
         let mut api = self.ctx.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
+            tracing::warn!("no stream_rx matched rtp ssrc, dropping.");
             return;
         };
         let Some(track) = self.core.get_published_track_mut(&stream.mid()) else {
+            tracing::warn!("no published track matched mid, dropping.");
             return;
         };
 
@@ -462,6 +484,7 @@ impl ParticipantActor {
         for (track_id, track) in tracks {
             if track.meta.kind == MediaKind::Video
                 && track.meta.id.origin_participant != self.core.participant_id
+                && self.subscribed_tracks.len() == 0
             {
                 self.subscribed_tracks.insert(track_id, track);
             }

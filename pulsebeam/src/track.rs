@@ -58,7 +58,10 @@ impl TrackSender {
             .find(|s| s.rid.as_ref() == rid)
             .or_else(|| self.simulcast.first())
         {
+            tracing::trace!(?self.meta, ?pkt, ?rid, ?sender, "sent to track");
             sender.channel.send(pkt);
+        } else {
+            panic!("expected sender to always available");
         }
     }
 }
@@ -85,14 +88,14 @@ impl TrackReceiver {
             .cloned()
     }
 
-    pub fn by_default(&self) -> Option<SimulcastReceiver> {
-        for simulcast in &*self.simulcast {
+    pub fn by_default(&mut self) -> Option<&mut SimulcastReceiver> {
+        for simulcast in &mut self.simulcast {
             let Some(rid) = simulcast.rid else {
-                return Some(simulcast.clone());
+                return Some(simulcast);
             };
 
             if rid.starts_with('f') {
-                return Some(simulcast.clone());
+                return Some(simulcast);
             }
         }
         None
