@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pulsebeam_runtime::net;
 use pulsebeam_runtime::sync::spmc;
 use str0m::{
     Event, Input, Output, Rtc,
@@ -55,8 +56,26 @@ impl ParticipantCore {
 
     // --- INPUT HANDLERS (called by the async Actor) ---
 
-    pub fn handle_udp_packet(&mut self, now: Instant, packet: str0m::net::Receive) {
-        if let Err(e) = self.rtc.handle_input(Input::Receive(now, packet)) {
+    pub fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
+        let contents = match (&*packet.buf).try_into() {
+            Ok(contents) => contents,
+            Err(err) => {
+                tracing::warn!("invalid packet: {err}");
+                return;
+            }
+        };
+
+        tracing::trace!(?contents, "handle udp packet");
+        let recv = str0m::net::Receive {
+            proto: str0m::net::Protocol::Udp,
+            source: packet.src,
+            destination: packet.dst,
+            contents,
+        };
+        if let Err(e) = self
+            .rtc
+            .handle_input(Input::Receive(tokio::time::Instant::now().into_std(), recv))
+        {
             tracing::error!(participant_id = %self.participant_id, "Rtc::handle_input error: {}", e);
         }
     }
@@ -101,21 +120,44 @@ impl ParticipantCore {
     // --- SYNCHRONOUS WORK CYCLE ---
 
     /// The main synchronous work function. Drains media, handles timeouts, and polls the engine.
-    pub fn tick(&mut self, now: Instant) -> Option<Duration> {
+    pub fn tick(&mut self) -> Option<Duration> {
         self.process_media_ingress();
-        self.rtc.handle_input(Input::Timeout(now)).ok()?;
+        // self.rtc.handle_input(Input::Timeout(now)).ok()?;
 
-        let mut deadline = None;
+        // for _ in 0..RTC_POLL_BUDGET {
+        //     if !self.rtc.is_alive() {
+        //         self.effects.push_back(Effect::Disconnect);
+        //         return None;
+        //     }
+        //     match self.rtc.poll_output() {
+        //         Ok(Output::Timeout(t)) => {
+        //             deadline = Some(t.saturating_duration_since(now));
+        //             break;
+        //         }
+        //         Ok(Output::Transmit(tx)) => {
+        //             self.batcher.push_back(tx.destination, &tx.contents);
+        //         }
+        //         Ok(Output::Event(event)) => {
+        //             self.handle_event(event);
+        //         }
+        //         Err(_) => {
+        //             self.effects.push_back(Effect::Disconnect);
+        //             return None;
+        //         }
+        //     }
+        // }
+        // deadline
 
-        for _ in 0..RTC_POLL_BUDGET {
-            if !self.rtc.is_alive() {
-                self.effects.push_back(Effect::Disconnect);
-                return None;
-            }
+        while self.rtc.is_alive() {
             match self.rtc.poll_output() {
-                Ok(Output::Timeout(t)) => {
-                    deadline = Some(t.saturating_duration_since(now));
-                    break;
+                Ok(Output::Timeout(deadline)) => {
+                    let now = tokio::time::Instant::now().into_std();
+                    let duration = deadline.saturating_duration_since(now);
+                    if duration.is_zero() {
+                        let _ = self.rtc.handle_input(Input::Timeout(now));
+                        continue;
+                    }
+                    return Some(duration);
                 }
                 Ok(Output::Transmit(tx)) => {
                     self.batcher.push_back(tx.destination, &tx.contents);
@@ -124,12 +166,11 @@ impl ParticipantCore {
                     self.handle_event(event);
                 }
                 Err(_) => {
-                    self.effects.push_back(Effect::Disconnect);
-                    return None;
+                    self.rtc.disconnect();
                 }
             }
         }
-        deadline
+        None
     }
 
     // --- STATE MODIFICATION ---
@@ -212,15 +253,19 @@ impl ParticipantCore {
     fn handle_incoming_rtp(&mut self, mut rtp: RtpPacket) {
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
+            tracing::warn!(?rtp.header.ssrc, "no stream_rx found");
             return;
         };
         let mid = stream.mid();
         let rid = stream.rid();
 
-        if let Some(track) = self.published_tracks.get_mut(&mid) {
-            rtp.header.ext_vals.rid = rid;
-            track.send(rid.as_ref(), rtp);
-        }
+        let Some(track) = self.published_tracks.get_mut(&mid) else {
+            tracing::warn!(?rtp.header.ssrc, ?mid, "no published_tracks found");
+            return;
+        };
+
+        rtp.header.ext_vals.rid = rid;
+        track.send(rid.as_ref(), rtp);
     }
 
     fn handle_media_added(&mut self, media: MediaAdded) {

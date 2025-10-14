@@ -89,21 +89,21 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         loop {
             // --- DRAIN & PROCESS (Synchronous) ---
             self.drain_inputs(ctx, &mut gateway_rx);
-            let Some(delay) = self.core.tick(std::time::Instant::now()) else {
+            let Some(delay) = self.core.tick() else {
                 break; // Core requested shutdown.
             };
 
             // --- APPLY EFFECTS (Asynchronous) ---
             self.apply_core_effects().await;
 
-            // --- FLUSH NETWORK & AWAIT NEXT EVENT ---
-            self.core.batcher.flush(&self.egress);
-
             tokio::select! {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
                 Some(msg) = ctx.lo_rx.recv() => self.handle_data_message(msg),
-                Some(pkt) = gateway_rx.recv() => self.handle_udp_packet(pkt),
+                _ = self.egress.writable(), if !self.core.batcher.is_empty() => {
+                    self.core.batcher.flush(&self.egress);
+                }
+                Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
                 _ = rt::sleep(delay) => { /* Timeout expired. */ },
             }
         }
@@ -147,7 +147,7 @@ impl ParticipantActor {
             self.handle_data_message(msg);
         }
         while let Ok(pkt) = gateway_rx.try_recv() {
-            self.handle_udp_packet(pkt);
+            self.core.handle_udp_packet(pkt);
         }
     }
 
@@ -173,20 +173,6 @@ impl ParticipantActor {
                 }
             }
         }
-    }
-
-    fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
-        let contents = match (&*packet.buf).try_into() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let recv = str0m::net::Receive {
-            proto: str0m::net::Protocol::Udp,
-            source: packet.src,
-            destination: packet.dst,
-            contents,
-        };
-        self.core.handle_udp_packet(std::time::Instant::now(), recv);
     }
 
     fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
