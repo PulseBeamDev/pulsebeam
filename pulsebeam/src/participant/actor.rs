@@ -1,12 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use futures::pin_mut;
 use pulsebeam_runtime::{prelude::*, rt};
-use str0m::{
-    Rtc, RtcError,
-    error::SdpError,
-    media::{KeyframeRequest, MediaKind},
-};
-use tokio::time::Instant;
+use str0m::{Rtc, RtcError, error::SdpError, media::KeyframeRequest};
+use tokio::time::Instant as TokioInstant;
 
 use crate::{
     entity, gateway, message, node,
@@ -19,8 +16,6 @@ use crate::{
 };
 use pulsebeam_runtime::{actor, mailbox, net};
 
-// --- Tuning Constants ---
-const RTC_POLL_BUDGET: usize = 64;
 const MAX_MTU: usize = 1500;
 
 #[derive(thiserror::Error, Debug)]
@@ -54,17 +49,13 @@ impl actor::MessageSet for ParticipantMessageSet {
 }
 
 /// The async driver for a `ParticipantCore`.
-///
-/// This actor's responsibility is to bridge the async world (networking, channels)
-/// with the synchronous `ParticipantCore` state machine. It follows a strict
-/// "drain-process-apply-await" loop to ensure fairness and performance.
 pub struct ParticipantActor {
     core: ParticipantCore,
-    // Async-specific state and handles
+    effects_buffer: Vec<Effect>,
+    // Async-specific handles
     node_ctx: node::NodeContext,
     room_handle: room::RoomHandle,
     egress: Arc<net::UnifiedSocket>,
-    subscribed_tracks: HashMap<Arc<entity::TrackId>, track::TrackReceiver>,
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -98,8 +89,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         loop {
             // --- DRAIN & PROCESS (Synchronous) ---
             self.drain_inputs(ctx, &mut gateway_rx);
-            let Some(delay) = self.process_engine() else {
-                break;
+            let Some(delay) = self.core.tick(std::time::Instant::now()) else {
+                break; // Core requested shutdown.
             };
 
             // --- APPLY EFFECTS (Asynchronous) ---
@@ -113,9 +104,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
                 Some(msg) = ctx.lo_rx.recv() => self.handle_data_message(msg),
                 Some(pkt) = gateway_rx.recv() => self.handle_udp_packet(pkt),
-                _ = rt::sleep(delay) => {
-                    // Timeout expired. The next loop will handle it.
-                },
+                _ = rt::sleep(delay) => { /* Timeout expired. */ },
             }
         }
 
@@ -138,10 +127,10 @@ impl ParticipantActor {
 
         Self {
             core,
+            effects_buffer: Vec::with_capacity(32),
             node_ctx,
             room_handle,
             egress,
-            subscribed_tracks: HashMap::new(),
         }
     }
 
@@ -160,29 +149,13 @@ impl ParticipantActor {
         while let Ok(pkt) = gateway_rx.try_recv() {
             self.handle_udp_packet(pkt);
         }
-        self.process_media_ingress();
-    }
-
-    /// Drives the synchronous `ParticipantCore` engine with a budget.
-    fn process_engine(&mut self) -> Option<Duration> {
-        for _ in 0..RTC_POLL_BUDGET {
-            match self.core.poll_engine() {
-                Ok(Some(delay)) => {
-                    return Some(delay);
-                }
-                Ok(_) => continue, // Transmit and Event effects are queued in the core.
-                Err(_) => {
-                    self.core.rtc.disconnect();
-                    break;
-                }
-            }
-        }
-        None
     }
 
     /// Asynchronously executes all side effects produced by the core.
     async fn apply_core_effects(&mut self) {
-        for effect in self.core.effects.drain(..) {
+        self.effects_buffer.extend(self.core.effects.drain(..));
+
+        for effect in self.effects_buffer.drain(..) {
             match effect {
                 Effect::SpawnTrack(track_meta) => {
                     let (tx, rx) = track::new(track_meta, 64);
@@ -195,8 +168,9 @@ impl ParticipantActor {
                 Effect::Disconnect => {
                     self.core.rtc.disconnect();
                 }
-                // Other effects like requesting keyframes would be handled here.
-                _ => {}
+                Effect::Subscribe(track) => {
+                    self.core.subscribe_track(track);
+                }
             }
         }
     }
@@ -204,10 +178,7 @@ impl ParticipantActor {
     fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
         let contents = match (&*packet.buf).try_into() {
             Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Invalid UDP packet size, dropping: {}", e);
-                return;
-            }
+            Err(_) => return,
         };
         let recv = str0m::net::Receive {
             proto: str0m::net::Protocol::Udp,
@@ -215,63 +186,29 @@ impl ParticipantActor {
             destination: packet.dst,
             contents,
         };
-        self.core.handle_udp_packet(Instant::now(), recv);
+        self.core.handle_udp_packet(std::time::Instant::now(), recv);
     }
 
     fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
         match msg {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
                 self.core.handle_published_tracks(&tracks);
-                self.subscribe_to_tracks(tracks);
             }
             ParticipantControlMessage::TracksPublished(tracks) => {
-                let tracks = Arc::try_unwrap(tracks).unwrap_or_else(|arc| (*arc).clone());
                 self.core.handle_published_tracks(&tracks);
-                self.subscribe_to_tracks(tracks);
             }
             ParticipantControlMessage::TracksUnpublished(tracks) => {
                 self.core.remove_available_tracks(&tracks);
-                for track_id in tracks.keys() {
-                    self.subscribed_tracks.remove(track_id);
-                }
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {}
         }
     }
 
     fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
-        match msg {
-            ParticipantDataMessage::KeyframeRequest(track_id, req) => {
-                // In a future step, this could become an Effect produced by the core.
-                // For now, the actor can still manage this.
-                // let _ = self
-                //     .room_handle
-                //     .send_low(room::RoomMessage::KeyframeRequest { track_id, req });
-            }
-        }
-    }
-
-    fn subscribe_to_tracks(&mut self, tracks: HashMap<Arc<entity::TrackId>, track::TrackReceiver>) {
-        for (track_id, track) in tracks {
-            if track.meta.id.origin_participant != self.core.participant_id
-                && track.meta.kind == MediaKind::Video
-            {
-                if !self.subscribed_tracks.contains_key(&track_id) {
-                    tracing::info!(participant_id = %self.core.participant_id, track_id = %track_id, "Subscribing to new video track");
-                    self.subscribed_tracks.insert(track_id, track);
-                }
-            }
-        }
-    }
-
-    /// Drains media from subscribed tracks and forwards it into the core.
-    fn process_media_ingress(&mut self) {
-        for track in self.subscribed_tracks.values() {
-            for receiver in track.simulcast.iter_mut() {
-                while let Ok(Some(pkt)) = receiver.channel.try_recv() {
-                    self.core.handle_forward_rtp(track.meta.clone(), pkt);
-                }
-            }
+        if let ParticipantDataMessage::KeyframeRequest(track_id, req) = msg {
+            // let _ = self
+            //     .room_handle
+            //     .send_low(room::RoomMessage::KeyframeRequest { track_id, req });
         }
     }
 }
