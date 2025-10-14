@@ -1,9 +1,7 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
-use futures::pin_mut;
 use pulsebeam_runtime::{prelude::*, rt};
 use str0m::{Rtc, RtcError, error::SdpError, media::KeyframeRequest};
-use tokio::time::Instant as TokioInstant;
 
 use crate::{
     entity, gateway, message, node,
@@ -102,6 +100,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Some(msg) = ctx.lo_rx.recv() => self.handle_data_message(msg),
                 _ = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
+                }
+                Some((meta, rtp)) = self.core.downstream_manager.next() => {
+                    self.core.handle_forward_rtp(meta, rtp);
                 }
                 Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
                 _ = rt::sleep(delay) => { /* Timeout expired. */ },

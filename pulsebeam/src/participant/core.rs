@@ -1,15 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pulsebeam_runtime::net;
-use pulsebeam_runtime::sync::spmc;
 use str0m::{
     Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid},
     rtp::{ExtensionValues, RtpPacket},
 };
 
+use crate::participant::downstream::DownstreamManager;
 use crate::{
     entity,
     participant::{
@@ -34,9 +34,9 @@ pub struct ParticipantCore {
     pub batcher: Batcher,
     pub effects: effect::Queue,
     published_tracks: HashMap<Mid, TrackSender>,
-    subscribed_tracks: HashMap<Arc<entity::TrackId>, TrackReceiver>,
     video_allocator: VideoAllocator,
     audio_allocator: AudioAllocator,
+    pub downstream_manager: DownstreamManager,
 }
 
 impl ParticipantCore {
@@ -47,9 +47,9 @@ impl ParticipantCore {
             rtc,
             batcher,
             published_tracks: HashMap::new(),
-            subscribed_tracks: HashMap::new(),
             video_allocator: VideoAllocator::default(),
             audio_allocator: AudioAllocator::default(),
+            downstream_manager: DownstreamManager::new(),
             effects: VecDeque::with_capacity(64),
         }
     }
@@ -97,8 +97,7 @@ impl ParticipantCore {
     }
 
     pub fn subscribe_track(&mut self, track: TrackReceiver) {
-        tracing::debug!(?track, "subscribed to track");
-        self.subscribed_tracks.insert(track.meta.id.clone(), track);
+        self.downstream_manager.add_track(track);
     }
 
     pub fn remove_available_tracks(
@@ -110,11 +109,11 @@ impl ParticipantCore {
                 MediaKind::Video => {
                     self.video_allocator
                         .remove_track(&mut self.effects, track_id);
-                    self.subscribed_tracks.remove(track_id);
+                    self.downstream_manager.remove_track(track_id);
                 }
                 MediaKind::Audio => {
                     self.audio_allocator.remove_track(track_id);
-                    self.subscribed_tracks.remove(track_id);
+                    self.downstream_manager.remove_track(track_id);
                 }
             }
         }
@@ -124,7 +123,6 @@ impl ParticipantCore {
 
     /// The main synchronous work function. Drains media, handles timeouts, and polls the engine.
     pub fn tick(&mut self) -> Option<Duration> {
-        self.process_media_ingress();
         // self.rtc.handle_input(Input::Timeout(now)).ok()?;
 
         // for _ in 0..RTC_POLL_BUDGET {
@@ -189,32 +187,7 @@ impl ParticipantCore {
 
     // --- PRIVATE HELPERS ---
 
-    fn process_media_ingress(&mut self) {
-        let mut packets_to_forward = Vec::new();
-        for track in self.subscribed_tracks.values_mut() {
-            for receiver in &mut track.simulcast {
-                loop {
-                    match receiver.channel.try_recv() {
-                        Ok(Some(pkt)) => {
-                            tracing::trace!(?receiver, ?pkt, "forward packets");
-                            packets_to_forward.push((track.meta.clone(), pkt))
-                        }
-                        Ok(None) => break,
-                        Err(spmc::RecvError::Closed) => break,
-                        Err(spmc::RecvError::Lagged(n)) => {
-                            tracing::warn!(?receiver, "lagged by {n}")
-                        }
-                    }
-                }
-            }
-        }
-
-        for (meta, pkt) in packets_to_forward {
-            self.handle_forward_rtp(meta, pkt);
-        }
-    }
-
-    fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: Arc<RtpPacket>) {
+    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: Arc<RtpPacket>) {
         let Some(mid) = self.get_slot(&track_meta, &rtp.header.ext_vals) else {
             tracing::trace!(?track_meta, "no slot found");
             return;
