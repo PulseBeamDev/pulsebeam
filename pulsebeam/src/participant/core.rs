@@ -9,6 +9,7 @@ use str0m::{
     rtp::{ExtensionValues, RtpPacket},
 };
 
+use crate::entity::TrackId;
 use crate::participant::downstream::DownstreamManager;
 use crate::{
     entity,
@@ -96,8 +97,8 @@ impl ParticipantCore {
         }
     }
 
-    pub fn subscribe_track(&mut self, track: TrackReceiver) {
-        self.downstream_manager.add_track(track);
+    pub fn subscribe_track(&mut self, track_id: Arc<TrackId>) {
+        self.downstream_manager.resume_track(&track_id);
     }
 
     pub fn remove_available_tracks(
@@ -274,15 +275,16 @@ impl ParticipantCore {
     }
 
     /// Informs allocators about a new track. Returns `Some(TrackReceiver)` if a subscription is desired.
-    fn add_available_track(&mut self, track_handle: &TrackReceiver) {
-        match track_handle.meta.kind {
+    fn add_available_track(&mut self, track: &TrackReceiver) {
+        match track.meta.kind {
             MediaKind::Video => self
                 .video_allocator
-                .add_track(&mut self.effects, track_handle.clone()),
+                .add_track(&mut self.effects, track.meta.id.clone()),
             MediaKind::Audio => self
                 .audio_allocator
-                .add_track(&mut self.effects, track_handle.clone()),
+                .add_track(&mut self.effects, track.meta.id.clone()),
         }
+        self.downstream_manager.add_track(track.clone());
     }
 
     fn get_slot(&mut self, track_meta: &Arc<TrackMeta>, ext_vals: &ExtensionValues) -> Option<Mid> {

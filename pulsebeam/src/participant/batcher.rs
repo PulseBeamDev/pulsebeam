@@ -1,12 +1,8 @@
 use std::{collections::VecDeque, net::SocketAddr};
 
-use futures::io;
 use pulsebeam_runtime::net;
 
 /// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
-///
-/// This implementation reuses memory by pooling `BatcherState` objects and is instrumented
-/// with `metrics` to diagnose performance issues related to batching and allocation.
 pub struct Batcher {
     cap: usize,
     active_states: VecDeque<BatcherState>,
@@ -42,14 +38,8 @@ impl Batcher {
         }
 
         let mut new_state = match self.free_states.pop() {
-            Some(state) => {
-                metrics::counter!("batcher_pool_status", "status" => "hit").increment(1);
-                state
-            }
-            None => {
-                metrics::counter!("batcher_pool_status", "status" => "miss").increment(1);
-                BatcherState::with_capacity(self.cap)
-            }
+            Some(state) => state,
+            None => BatcherState::with_capacity(self.cap),
         };
 
         new_state.reset(dst);
@@ -116,14 +106,12 @@ impl BatcherState {
     /// Attempts to append a content slice to the buffer. Returns true on success.
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
         if self.sealed {
-            metrics::counter!("batcher_push_rejected", "reason" => "sealed").increment(1);
             return false;
         }
         if self.dst != dst {
             return false;
         }
         if self.buf.len() + content.len() > self.buf.capacity() {
-            metrics::counter!("batcher_push_rejected", "reason" => "capacity").increment(1);
             return false;
         }
 
@@ -137,7 +125,6 @@ impl BatcherState {
         } else {
             self.buf.extend_from_slice(content);
             self.sealed = true;
-            metrics::counter!("batcher_batches_sealed_by_tail").increment(1);
             true
         }
     }

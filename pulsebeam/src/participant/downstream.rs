@@ -16,9 +16,15 @@ type TrackDownstream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<RtpPacket>
 
 // The configuration for a single downstream track.
 // Clone is cheap as it only contains a boolean.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct DownstreamConfig {
     paused: bool,
+}
+
+impl Default for DownstreamConfig {
+    fn default() -> Self {
+        Self { paused: true }
+    }
 }
 
 /// Manages a dynamic number of downstream tracks, multiplexing them into a single stream.

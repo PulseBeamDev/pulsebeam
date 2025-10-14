@@ -95,11 +95,10 @@ impl AudioAllocator {
         }
     }
 
-    pub fn add_track(&mut self, effects: &mut effect::Queue, track_handle: track::TrackReceiver) {
-        assert!(track_handle.meta.kind.is_audio());
+    pub fn add_track(&mut self, effects: &mut effect::Queue, track_id: Arc<TrackId>) {
         self.tracks
-            .insert(track_handle.meta.id.clone(), Level(SILENCE_BASELINE));
-        effects.push_back(Effect::Subscribe(track_handle));
+            .insert(track_id.clone(), Level(SILENCE_BASELINE));
+        effects.push_back(Effect::Subscribe(track_id));
     }
 
     pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
