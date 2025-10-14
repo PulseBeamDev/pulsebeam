@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, task::Poll};
 
 use pulsebeam_runtime::{prelude::*, rt};
 use str0m::{Rtc, RtcError, error::SdpError, media::KeyframeRequest};
+use tokio_stream::StreamExt;
 
 use crate::{
     entity, gateway, message, node,
@@ -91,6 +92,14 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 break; // Core requested shutdown.
             };
 
+            // After all processing, check if we need to flush the batcher.
+            if !self.core.batcher.is_empty() {
+                // Flush all pending packets. This is the only place we should await egress I/O.
+                // If the network is congested, we will block here, but that's okay because
+                // we have already processed all other pending inputs for this tick.
+                self.core.batcher.flush(&self.egress);
+            }
+
             // --- APPLY EFFECTS (Asynchronous) ---
             self.apply_core_effects().await;
 
@@ -98,9 +107,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
                 Some(msg) = ctx.lo_rx.recv() => self.handle_data_message(msg),
-                _ = self.egress.writable(), if !self.core.batcher.is_empty() => {
-                    self.core.batcher.flush(&self.egress);
-                }
                 Some((meta, rtp)) = self.core.downstream_manager.next() => {
                     self.core.handle_forward_rtp(meta, rtp);
                 }
@@ -149,6 +155,9 @@ impl ParticipantActor {
         }
         while let Ok(pkt) = gateway_rx.try_recv() {
             self.core.handle_udp_packet(pkt);
+        }
+        while let Poll::Ready(Some((meta, rtp))) = self.core.downstream_manager.poll_next_packet() {
+            self.core.handle_forward_rtp(meta, rtp);
         }
     }
 

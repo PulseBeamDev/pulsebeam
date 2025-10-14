@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::stream::{SelectAll, Stream, StreamExt};
+use futures::task::noop_waker;
 use pulsebeam_runtime::sync::spmc;
 use str0m::rtp::RtpPacket;
 use tokio::sync::watch;
@@ -164,6 +165,16 @@ impl DownstreamManager {
         if self.tracks.remove(track_id).is_some() {
             tracing::debug!(?track_id, "Removed downstream track");
         }
+    }
+
+    /// Synchronously polls for the next available packet without waiting.
+    /// Returns Poll::Ready(Some(packet)) if a packet is immediately available.
+    /// Returns Poll::Ready(None) if the stream has ended.
+    /// Returns Poll::Pending if no packet is ready right now.
+    pub fn poll_next_packet(&mut self) -> Poll<Option<(Arc<TrackMeta>, Arc<RtpPacket>)>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        self.poll_next_unpin(&mut cx)
     }
 }
 
