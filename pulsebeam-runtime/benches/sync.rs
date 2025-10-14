@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::{StreamExt, future::join_all};
 use futures_concurrency::stream::Merge;
-use rand::seq::index;
+use rand::{Rng, seq::index};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -10,19 +10,122 @@ use tokio::task;
 // Use the specified import path for the SPMC channel implementation.
 use pulsebeam_runtime::sync::spmc::{RecvError, Sender, channel};
 
-const NUM_PUBLISHERS: usize = 150;
-const NUM_SUBSCRIBERS: usize = 150;
+const NUM_PUBLISHERS: usize = 1;
+const NUM_SUBSCRIBERS: usize = 3000;
 const NUM_PACKETS_PER_PUBLISHER: usize = 1_000;
-const SUBSCRIPTIONS_PER_SUBSCRIBER: usize = 15;
+const SUBSCRIPTIONS_PER_SUBSCRIBER: usize = 1;
 
 // --- Benchmark Group Definition ---
 criterion_group!(
     benches,
-    bench_interactive_room_mesh_poll,
+    bench_interactive_room_mesh_mpsc_fanout,
     bench_interactive_room_mesh_futures_unordered,
+    bench_interactive_room_mesh_poll,
     bench_interactive_room_mesh_spawn,
 );
 criterion_main!(benches);
+
+// =================================================================================
+// Benchmark 1: Mesh Room using "MPSC Fanout"
+// =================================================================================
+fn bench_interactive_room_mesh_mpsc_fanout(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("spmc_interactive_room_mesh_mpsc_fanout");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
+    group.bench_function(
+        format!(
+            "{NUM_PUBLISHERS}_pubs_{NUM_SUBSCRIBERS}_subs_{NUM_PACKETS_PER_PUBLISHER}_pkts_{SUBSCRIPTIONS_PER_SUBSCRIBER}_persub_mpsc_fanout"
+        ),
+        |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                run_test_loop(iters, run_interactive_room_mesh_mpsc_fanout_test).await
+            });
+        },
+    );
+    group.finish();
+}
+
+async fn run_interactive_room_mesh_mpsc_fanout_test() {
+    let mut rng = rand::rng();
+
+    // Create the communication channels between publishers, fanout tasks, and subscribers
+    let mut fanout_targets: Vec<Vec<mpsc::Sender<(usize, Instant)>>> = vec![vec![]; NUM_PUBLISHERS];
+
+    // CORRECTED INITIALIZATION: Build the Vec of Vecs without cloning.
+    let mut subscriber_receivers: Vec<Vec<mpsc::Receiver<(usize, Instant)>>> =
+        Vec::with_capacity(NUM_SUBSCRIBERS);
+    for _ in 0..NUM_SUBSCRIBERS {
+        subscriber_receivers.push(Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER));
+    }
+
+    for s_idx in 0..NUM_SUBSCRIBERS {
+        let publisher_indices =
+            index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+        for p_idx in publisher_indices.iter() {
+            let (tx, rx) = mpsc::channel(256);
+            fanout_targets[p_idx].push(tx);
+            subscriber_receivers[s_idx].push(rx);
+        }
+    }
+
+    // Spawn subscriber tasks
+    let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
+    for receivers in subscriber_receivers {
+        let handle = task::spawn(async move {
+            let mut streams = Vec::new();
+            for mut receiver in receivers {
+                streams.push(async_stream::stream! {
+                    while let Some(res) = receiver.recv().await {
+                        yield res.1.elapsed();
+                    }
+                });
+            }
+            let merged_stream = streams.merge();
+            merged_stream.collect::<Vec<Duration>>().await
+        });
+        subscriber_tasks.push(handle);
+    }
+
+    // Spawn publisher and fanout tasks
+    let mut publisher_tasks = Vec::with_capacity(NUM_PUBLISHERS);
+    for targets in fanout_targets {
+        let (pub_tx, mut fanout_rx) = mpsc::channel(256);
+
+        // Spawn the fanout task for this publisher
+        task::spawn(async move {
+            while let Some(msg) = fanout_rx.recv().await {
+                for target_tx in &targets {
+                    // If a subscriber is slow or gone, we don't want it to block the fanout task.
+                    // We use try_send and ignore the error if the channel is full or closed.
+                    let _ = target_tx.try_send(msg);
+                }
+            }
+        });
+
+        // Spawn the publisher task that sends to the fanout task
+        let handle = task::spawn(create_publisher_load_mpsc(
+            pub_tx,
+            NUM_PACKETS_PER_PUBLISHER,
+        ));
+        publisher_tasks.push(handle);
+    }
+
+    let simulation_start = Instant::now();
+    join_all(publisher_tasks).await;
+    let total_send_duration = simulation_start.elapsed();
+
+    let all_latencies = aggregate_latencies(subscriber_tasks).await;
+    let total_possible_deliveries =
+        NUM_PACKETS_PER_PUBLISHER * SUBSCRIPTIONS_PER_SUBSCRIBER * NUM_SUBSCRIBERS;
+
+    print_metrics(
+        "Interactive Room (MPSC Fanout)",
+        total_send_duration,
+        all_latencies,
+        total_possible_deliveries,
+    );
+}
 
 // =================================================================================
 // Benchmark 2: Mesh Room using "Spawn per Subscription"
@@ -66,7 +169,7 @@ async fn run_interactive_room_mesh_spawn_test() {
 
         // Then, create the list of receivers by cloning only the ones at the random indices.
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
-        for i in random_indices {
+        for i in random_indices.iter() {
             subs_receivers.push(initial_receivers[i].clone());
         }
 
@@ -163,7 +266,7 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
         let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
-        for i in random_indices {
+        for i in random_indices.iter() {
             subs_receivers.push(initial_receivers[i].clone());
         }
 
@@ -244,7 +347,7 @@ async fn run_interactive_room_mesh_poll_test() {
         let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
-        for i in random_indices {
+        for i in random_indices.iter() {
             subs_receivers.push(initial_receivers[i].clone());
         }
 
@@ -408,6 +511,41 @@ async fn create_publisher_load(tx: Sender<(usize, Instant)>, num_packets: usize)
         // If the burst took longer than the frame time (a system hiccup),
         // we just continue to the next frame immediately.
 
+        frame_index += 1;
+    }
+}
+
+/// A version of the publisher load generator that uses a tokio mpsc channel.
+async fn create_publisher_load_mpsc(tx: mpsc::Sender<(usize, Instant)>, num_packets: usize) {
+    const FPS: f64 = 30.0;
+    let frame_duration = Duration::from_secs_f64(1.0 / FPS);
+
+    let random = rand::random_range(0..500);
+    let start_delay = Duration::from_millis(random);
+    tokio::time::sleep(start_delay).await;
+
+    let mut packets_sent = 0;
+    let mut frame_index = 0;
+
+    while packets_sent < num_packets {
+        let frame_start_time = Instant::now();
+        let burst_size = if frame_index % 10 < 3 { 12 } else { 11 };
+
+        for _ in 0..burst_size {
+            if packets_sent >= num_packets {
+                break;
+            }
+            // Stop sending if the fanout task has shut down
+            if tx.send((packets_sent, Instant::now())).await.is_err() {
+                return;
+            }
+            packets_sent += 1;
+        }
+
+        let burst_duration = frame_start_time.elapsed();
+        if let Some(sleep_duration) = frame_duration.checked_sub(burst_duration) {
+            tokio::time::sleep(sleep_duration).await;
+        }
         frame_index += 1;
     }
 }
