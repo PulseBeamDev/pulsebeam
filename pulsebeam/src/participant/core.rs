@@ -78,6 +78,9 @@ impl ParticipantCore {
         {
             tracing::error!(participant_id = %self.participant_id, "Rtc::handle_input error: {}", e);
         }
+
+        // str0m only holds at most 1 rtp for receiving..
+        self.poll_rtc();
     }
 
     pub fn handle_published_tracks(
@@ -148,6 +151,10 @@ impl ParticipantCore {
         // }
         // deadline
 
+        self.poll_rtc()
+    }
+
+    fn poll_rtc(&mut self) -> Option<Duration> {
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
