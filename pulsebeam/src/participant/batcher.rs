@@ -1,5 +1,8 @@
 use std::{collections::VecDeque, net::SocketAddr};
 
+use futures::io;
+use pulsebeam_runtime::net;
+
 /// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
 ///
 /// This implementation reuses memory by pooling `BatcherState` objects and is instrumented
@@ -74,6 +77,21 @@ impl Batcher {
     /// Reclaims a `BatcherState`, returning its memory to the pool for future reuse.
     pub fn reclaim(&mut self, state: BatcherState) {
         self.free_states.push(state);
+    }
+
+    pub fn flush(&mut self, socket: &net::UnifiedSocket) {
+        while let Some(state) = self.front() {
+            if socket.try_send_batch(&net::SendPacketBatch {
+                dst: state.dst,
+                buf: &state.buf,
+                segment_size: state.segment_size,
+            }) {
+                let state = self.pop_front().unwrap();
+                self.reclaim(state);
+            } else {
+                break;
+            }
+        }
     }
 }
 
