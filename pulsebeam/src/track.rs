@@ -104,24 +104,19 @@ impl TrackReceiver {
 
 /// Construct a new Track (returns sender + receiver).
 pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
-    let simulcast_rids = meta
-        .simulcast_rids
-        .clone()
-        .unwrap_or_else(|| vec![Rid::from("f")]);
+    let simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
+        rids.iter().map(|rid| Some(*rid)).collect()
+    } else {
+        vec![None]
+    };
 
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
 
     for rid in simulcast_rids {
         let (tx, rx) = spmc::channel(capacity);
-        senders.push(SimulcastSender {
-            rid: Some(rid),
-            channel: tx,
-        });
-        receivers.push(SimulcastReceiver {
-            rid: Some(rid),
-            channel: rx,
-        });
+        senders.push(SimulcastSender { rid, channel: tx });
+        receivers.push(SimulcastReceiver { rid, channel: rx });
     }
 
     (

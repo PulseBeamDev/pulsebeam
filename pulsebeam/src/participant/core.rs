@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pulsebeam_runtime::sync::spmc;
 use str0m::{
     Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid},
@@ -74,6 +75,7 @@ impl ParticipantCore {
     }
 
     pub fn subscribe_track(&mut self, track: TrackReceiver) {
+        tracing::debug!(?track, "subscribed to track");
         self.subscribed_tracks.insert(track.meta.id.clone(), track);
     }
 
@@ -143,8 +145,18 @@ impl ParticipantCore {
         let mut packets_to_forward = Vec::new();
         for track in self.subscribed_tracks.values_mut() {
             for receiver in &mut track.simulcast {
-                while let Ok(Some(pkt)) = receiver.channel.try_recv() {
-                    packets_to_forward.push((track.meta.clone(), pkt));
+                loop {
+                    match receiver.channel.try_recv() {
+                        Ok(Some(pkt)) => {
+                            tracing::trace!(?receiver, ?pkt, "forward packets");
+                            packets_to_forward.push((track.meta.clone(), pkt))
+                        }
+                        Ok(None) => break,
+                        Err(spmc::RecvError::Closed) => break,
+                        Err(spmc::RecvError::Lagged(n)) => {
+                            tracing::warn!(?receiver, "lagged by {n}")
+                        }
+                    }
                 }
             }
         }
@@ -156,30 +168,34 @@ impl ParticipantCore {
 
     fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: Arc<RtpPacket>) {
         let Some(mid) = self.get_slot(&track_meta, &rtp.header.ext_vals) else {
+            tracing::trace!(?track_meta, "no slot found");
             return;
         };
-        let pt = match self
+        let Some(pt) = self
             .rtc
             .media(mid)
             .and_then(|m| m.remote_pts().first().copied())
-        {
-            Some(pt) => pt,
-            None => return,
+        else {
+            tracing::warn!(?track_meta, ?mid, "no matched pt");
+            return;
         };
 
         let mut api = self.rtc.direct_api();
-        if let Some(writer) = api.stream_tx_by_mid(mid, rtp.header.ext_vals.rid) {
-            let _ = writer.write_rtp(
-                pt,
-                rtp.seq_no,
-                rtp.header.timestamp,
-                rtp.timestamp,
-                rtp.header.marker,
-                rtp.header.ext_vals.clone(),
-                true,
-                rtp.payload.clone(),
-            );
-        }
+        let Some(writer) = api.stream_tx_by_mid(mid, None) else {
+            tracing::warn!(?track_meta, ?mid, "no stream_tx found");
+            return;
+        };
+
+        let _ = writer.write_rtp(
+            pt,
+            rtp.seq_no,
+            rtp.header.timestamp,
+            rtp.timestamp,
+            rtp.header.marker,
+            rtp.header.ext_vals.clone(),
+            true,
+            rtp.payload.clone(),
+        );
     }
 
     fn handle_event(&mut self, event: Event) {
