@@ -78,12 +78,13 @@ impl<T: Send + Sync> Ring<T> {
     fn push(&self, value: T) {
         // Relaxed ordering is sufficient because the `store` operation below
         // with `Release` ordering provides the necessary memory barrier.
-        let seq = self.tail.fetch_add(1, Ordering::Relaxed);
+        let seq = self.tail.load(Ordering::Relaxed);
         let idx = (seq % self.capacity as u64) as usize;
 
         let new_arc = Arc::new(value);
 
         self.slots[idx].store(Some(new_arc));
+        self.tail.store(seq + 1, Ordering::Release);
 
         self.notify.notify_waiters();
     }
