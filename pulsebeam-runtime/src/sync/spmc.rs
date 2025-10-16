@@ -1,4 +1,14 @@
-use parking_lot::RwLock;
+//! High-performance, race-free single-producer / multi-consumer broadcast channel.
+//!
+//! Design goals:
+//! - Single producer, multiple concurrent consumers
+//! - Atomic publication via `ArcSwapOption<Slot<T>>`
+//! - Lock-free, race-free
+//! - Lag detection and safe catching-up
+//! - Async wait via `tokio::Notify`
+
+use arc_swap::ArcSwapOption;
+use crossbeam_utils::CachePadded;
 use std::{
     fmt::Debug,
     sync::{
@@ -8,84 +18,78 @@ use std::{
 };
 use tokio::sync::Notify;
 
-/// Error type returned by a receiver.
+/// Errors returned by a receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
-    /// The receiver lagged behind the buffer capacity and was advanced forward.
+    /// Receiver lagged too far and was advanced to the tail.
     Lagged(u64),
-    /// The channel was closed — no more messages will arrive.
+    /// The channel is closed and no further messages will be sent.
     Closed,
 }
 
-/// A single slot in the ring buffer, protected by RwLock.
+/// A published message slot.
 #[derive(Debug)]
-struct Slot<T> {
-    seq: u64,
-    data: Option<Arc<T>>,
+pub struct Slot<T> {
+    pub seq: u64,
+    pub value: T,
 }
 
-impl<T> Slot<T> {
-    fn new() -> Self {
-        Self { seq: 0, data: None }
-    }
-}
-
-/// The shared ring buffer structure.
+/// The shared ring buffer.
 struct Ring<T: Send + Sync> {
-    tail: AtomicU64, // producer's tail sequence
+    tail: CachePadded<AtomicU64>, // producer’s sequence
     capacity: usize,
-    slots: Box<[RwLock<Slot<T>>]>,
-    notify: Notify,
-    closed: AtomicBool,
+    slots: Box<[ArcSwapOption<Slot<T>>]>,
+    notify: CachePadded<Notify>,
+    closed: CachePadded<AtomicBool>,
 }
 
 impl<T: Send + Sync> Ring<T> {
     fn new(capacity: usize) -> Arc<Self> {
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            slots.push(RwLock::new(Slot::new()));
+            slots.push(ArcSwapOption::from(None));
         }
 
         Arc::new(Self {
-            tail: AtomicU64::new(0),
+            tail: CachePadded::new(AtomicU64::new(0)),
             capacity,
             slots: slots.into_boxed_slice(),
-            notify: Notify::new(),
-            closed: AtomicBool::new(false),
+            notify: CachePadded::new(Notify::new()),
+            closed: CachePadded::new(AtomicBool::new(false)),
         })
     }
 
-    /// Push a message into the ring buffer.
+    /// Push a new message into the ring.
     fn push(&self, value: T) {
-        if self.is_closed() {
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
 
         let seq = self.tail.load(Ordering::Relaxed);
         let idx = (seq % self.capacity as u64) as usize;
 
-        {
-            let mut slot = self.slots[idx].write();
-            slot.seq = seq;
-            slot.data = Some(Arc::new(value));
-        }
+        // Atomically publish a new slot
+        self.slots[idx].store(Some(Arc::new(Slot { seq, value })));
 
+        // Advance tail
         self.tail.store(seq + 1, Ordering::Release);
+
+        // Notify all waiters
         self.notify.notify_waiters();
     }
 
-    /// Attempt to read the next message for a receiver.
-    fn get_next(&self, next_seq: &mut u64) -> Result<Option<Arc<T>>, RecvError> {
+    /// Attempt to fetch the next available message for a receiver.
+    fn get_next(&self, next_seq: &mut u64) -> Result<Option<Arc<Slot<T>>>, RecvError> {
         let tail = self.tail.load(Ordering::Acquire);
         let earliest = tail.saturating_sub(self.capacity as u64);
 
-        // Receiver lagged behind buffer capacity
+        // If the receiver is too far behind, jump ahead.
         if *next_seq < earliest {
             *next_seq = tail;
             return Err(RecvError::Lagged(tail));
         }
 
-        // No new messages
+        // Nothing new yet.
         if *next_seq >= tail {
             if self.closed.load(Ordering::Acquire) {
                 return Err(RecvError::Closed);
@@ -93,18 +97,20 @@ impl<T: Send + Sync> Ring<T> {
             return Ok(None);
         }
 
+        // Try reading the slot.
         let idx = (*next_seq % self.capacity as u64) as usize;
-        let slot = self.slots[idx].read();
-
-        if slot.seq != *next_seq {
-            // Not yet written
-            return Ok(None);
+        if let Some(slot) = self.slots[idx].load_full() {
+            if slot.seq == *next_seq {
+                *next_seq += 1;
+                return Ok(Some(slot));
+            } else {
+                // Overwritten before we could see it.
+                return Ok(None);
+            }
         }
 
-        if let Some(ref val) = slot.data {
-            *next_seq += 1;
-            Ok(Some(Arc::clone(val)))
-        } else if self.closed.load(Ordering::Acquire) {
+        // Slot not yet written.
+        if self.closed.load(Ordering::Acquire) {
             Err(RecvError::Closed)
         } else {
             Ok(None)
@@ -121,18 +127,16 @@ impl<T: Send + Sync> Ring<T> {
     }
 }
 
-/// Sender handle — single producer only.
+/// The sending handle — single producer.
 pub struct Sender<T: Send + Sync> {
     ring: Arc<Ring<T>>,
 }
 
 impl<T: Send + Sync> Sender<T> {
-    /// Send a message to all receivers.
     pub fn send(&self, value: T) {
         self.ring.push(value);
     }
 
-    /// Check if the channel has been closed.
     pub fn is_closed(&self) -> bool {
         self.ring.is_closed()
     }
@@ -154,38 +158,36 @@ impl<T: Send + Sync> Debug for Sender<T> {
     }
 }
 
-/// Receiver handle — safe for multiple consumers.
+/// The receiving handle — multi-consumer.
 pub struct Receiver<T: Send + Sync> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
 }
 
 impl<T: Send + Sync> Receiver<T> {
-    /// Receive the next message asynchronously.
-    pub async fn recv(&mut self) -> Result<Arc<T>, RecvError> {
+    pub async fn recv(&mut self) -> Result<Arc<Slot<T>>, RecvError> {
         loop {
             match self.ring.get_next(&mut self.next_seq) {
-                Ok(Some(val)) => return Ok(val),
+                Ok(Some(slot)) => return Ok(slot),
                 Err(e) => return Err(e),
                 Ok(None) => {}
             }
 
             let notified = self.ring.notify.notified();
 
+            // Double-check before awaiting.
             match self.ring.get_next(&mut self.next_seq) {
-                Ok(Some(val)) => return Ok(val),
+                Ok(Some(slot)) => return Ok(slot),
                 Err(e) => return Err(e),
                 Ok(None) => notified.await,
             }
         }
     }
 
-    /// Non-blocking attempt to receive a message.
-    pub fn try_recv(&mut self) -> Result<Option<Arc<T>>, RecvError> {
+    pub fn try_recv(&mut self) -> Result<Option<Arc<Slot<T>>>, RecvError> {
         self.ring.get_next(&mut self.next_seq)
     }
 
-    /// Check if the channel is closed.
     pub fn is_closed(&self) -> bool {
         self.ring.is_closed()
     }
@@ -195,7 +197,7 @@ impl<T: Send + Sync> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Self {
             ring: Arc::clone(&self.ring),
-            next_seq: self.ring.tail.load(Ordering::Acquire), // start live
+            next_seq: self.ring.tail.load(Ordering::Acquire),
         }
     }
 }
@@ -216,13 +218,14 @@ pub fn channel<T: Send + Sync>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "capacity must be > 0");
     let ring = Ring::new(capacity);
     let tail = ring.tail.load(Ordering::Relaxed);
+
     (
         Sender {
             ring: Arc::clone(&ring),
         },
         Receiver {
             ring,
-            next_seq: tail, // start live, not from 0
+            next_seq: tail,
         },
     )
 }
@@ -235,39 +238,40 @@ mod tests {
     async fn basic_send_recv() {
         let (tx, mut rx) = channel::<u64>(8);
         tx.send(42);
-        assert_eq!(*rx.recv().await.unwrap(), 42);
+        let slot = rx.recv().await.unwrap();
+        assert_eq!(slot.value, 42);
     }
 
     #[tokio::test]
-    async fn multiple_receivers_share_same_arc() {
+    async fn multi_subscribers_get_same_message() {
         let (tx, rx) = channel::<String>(4);
         let mut rx1 = rx.clone();
         let mut rx2 = rx.clone();
 
         tx.send("hello".to_string());
-        let a = rx1.recv().await.unwrap();
-        let b = rx2.recv().await.unwrap();
+        let s1 = rx1.recv().await.unwrap();
+        let s2 = rx2.recv().await.unwrap();
 
-        assert_eq!(*a, "hello");
-        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(s1.value, s2.value);
+        assert!(Arc::ptr_eq(&s1, &s2)); // both point to same slot Arc
     }
 
     #[tokio::test]
     async fn lagging_receiver_is_caught_up() {
         const CAP: usize = 4;
-        const MSGS: u64 = 20;
-
+        const N: u64 = 12;
         let (tx, mut rx) = channel::<u64>(CAP);
 
-        for i in 0..MSGS {
+        for i in 0..N {
             tx.send(i);
         }
-        drop(tx);
 
+        drop(tx);
         let mut received = 0;
+
         loop {
             match rx.recv().await {
-                Ok(_) => received += 1,
+                Ok(slot) => received += 1,
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             }

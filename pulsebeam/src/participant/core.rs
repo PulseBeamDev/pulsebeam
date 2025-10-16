@@ -188,7 +188,7 @@ impl ParticipantCore {
 
     // --- PRIVATE HELPERS ---
 
-    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: Arc<RtpPacket>) {
+    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
         let Some(mid) = self.get_slot(&track_meta, &rtp.header.ext_vals) else {
             tracing::trace!(?track_meta, "no slot found");
             return;

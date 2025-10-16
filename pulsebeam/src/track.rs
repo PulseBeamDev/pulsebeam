@@ -33,19 +33,6 @@ pub struct SimulcastReceiver {
 }
 
 impl SimulcastReceiver {
-    /// Returns an async stream of RTP packets for this RID.
-    pub fn stream(mut self) -> impl Stream<Item = Arc<RtpPacket>> + Send + 'static {
-        stream! {
-            loop {
-                match self.channel.recv().await {
-                    Ok(pkt) => yield pkt,
-                    Err(spmc::RecvError::Lagged(_)) => continue, // skip dropped frames
-                    Err(spmc::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-
     /// Request a keyframe on all simulcast layers.
     pub fn request_keyframe(&self) {
         let request = str0m::media::KeyframeRequest {
@@ -129,12 +116,6 @@ pub struct TrackReceiver {
 }
 
 impl TrackReceiver {
-    /// Merge all RID layers into a single unified stream.
-    pub fn merged_stream(&self) -> impl Stream<Item = Arc<RtpPacket>> + Send + 'static {
-        let streams: Vec<_> = self.simulcast.iter().cloned().map(|r| r.stream()).collect();
-        streams.merge()
-    }
-
     /// Convenience for accessing a specific RID
     pub fn by_rid(&self, rid: Option<&Rid>) -> Option<SimulcastReceiver> {
         self.simulcast

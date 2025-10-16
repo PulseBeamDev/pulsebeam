@@ -183,7 +183,7 @@ async fn run_interactive_room_mesh_spawn_test() {
                     loop {
                         match receiver.recv().await {
                             Ok(res) => {
-                                if tx_clone.send(res.1.elapsed()).await.is_err() {
+                                if tx_clone.send(res.value.1.elapsed()).await.is_err() {
                                     break;
                                 }
                             }
@@ -278,7 +278,7 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                     loop {
                         match receiver.recv().await {
                             Ok(res) => {
-                                yield res.1.elapsed();
+                                yield res.value.1.elapsed();
                             }
                             Err(RecvError::Lagged(_)) => continue,
                             Err(RecvError::Closed) => break,
@@ -383,7 +383,7 @@ async fn run_interactive_room_mesh_poll_test() {
                 // Greedy non-blocking drain
                 for receiver in subs_receivers.iter_mut() {
                     while let Ok(Some(msg)) = receiver.try_recv() {
-                        latencies.push(msg.1.elapsed());
+                        latencies.push(msg.value.1.elapsed());
                         work_done = true;
                     }
                 }

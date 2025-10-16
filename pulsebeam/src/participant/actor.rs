@@ -104,7 +104,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
                 Some(msg) = ctx.lo_rx.recv() => {},
                 Some((meta, rtp)) = self.core.downstream_manager.next() => {
-                    self.core.handle_forward_rtp(meta, rtp);
+                    self.core.handle_forward_rtp(meta, &rtp.value);
                 }
                 Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
                 _ = rt::sleep(delay) => { /* Timeout expired. */ },
@@ -125,7 +125,7 @@ impl ParticipantActor {
     ) -> Self {
         let egress = node_ctx.allocate_egress();
         let gso_segments = egress.max_gso_segments();
-        let batcher = Batcher::with_capacity(gso_segments * MAX_MTU);
+        let batcher = Batcher::with_capacity(3 * MAX_MTU);
         let core = ParticipantCore::new(participant_id, rtc, batcher);
 
         Self {
@@ -152,8 +152,9 @@ impl ParticipantActor {
         while let Ok(pkt) = gateway_rx.try_recv() {
             self.core.handle_udp_packet(pkt);
         }
-        while let Poll::Ready(Some((meta, rtp))) = self.core.downstream_manager.poll_next_packet() {
-            self.core.handle_forward_rtp(meta, rtp);
+        while let Poll::Ready(Some((meta, slot))) = self.core.downstream_manager.poll_next_packet()
+        {
+            self.core.handle_forward_rtp(meta, &slot.value);
         }
     }
 

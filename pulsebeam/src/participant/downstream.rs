@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use crate::entity::TrackId;
 use crate::track::{TrackMeta, TrackReceiver};
 
-type TrackDownstream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<RtpPacket>)> + Send>>;
+type TrackDownstream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)> + Send>>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct DownstreamConfig {
@@ -278,7 +278,7 @@ impl DownstreamManager {
         }
     }
 
-    pub fn poll_next_packet(&mut self) -> Poll<Option<(Arc<TrackMeta>, Arc<RtpPacket>)>> {
+    pub fn poll_next_packet(&mut self) -> Poll<Option<(Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)>> {
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
         self.poll_next_unpin(&mut cx)
@@ -286,7 +286,7 @@ impl DownstreamManager {
 }
 
 impl Stream for DownstreamManager {
-    type Item = (Arc<TrackMeta>, Arc<RtpPacket>);
+    type Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.streams.poll_next_unpin(cx)
