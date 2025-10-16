@@ -34,7 +34,7 @@ pub struct ParticipantCore {
     pub rtc: Rtc,
     pub batcher: Batcher,
     pub effects: effect::Queue,
-    published_tracks: HashMap<Mid, TrackSender>,
+    pub published_tracks: HashMap<Mid, TrackSender>,
     video_allocator: VideoAllocator,
     audio_allocator: AudioAllocator,
     pub downstream_manager: DownstreamManager,
@@ -227,6 +227,7 @@ impl ParticipantCore {
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
+            Event::KeyframeRequest(req) => {}
             _ => {}
         }
     }

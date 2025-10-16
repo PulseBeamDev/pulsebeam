@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_stream::stream;
 use futures::Stream;
@@ -8,7 +8,7 @@ use tokio::sync::watch;
 
 use pulsebeam_runtime::sync::spmc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KeyframeRequest {
     pub request: str0m::media::KeyframeRequest,
     pub requested_at: tokio::time::Instant,
@@ -53,6 +53,23 @@ pub struct SimulcastSender {
     pub channel: spmc::Sender<RtpPacket>,
     /// Used to receive keyframe requests from the receiver.
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
+
+    pub last_keyframe_requested_at: tokio::time::Instant,
+}
+
+impl SimulcastSender {
+    pub fn get_keyframe_request(&mut self) -> Option<KeyframeRequest> {
+        let Some(ref update) = *self.keyframe_requests.borrow_and_update() else {
+            return None;
+        };
+
+        // if self.last_keyframe_requested_at.elapsed() < Duration::from_secs(1) {
+        //     return None;
+        // }
+
+        self.last_keyframe_requested_at = tokio::time::Instant::now();
+        Some(update.clone())
+    }
 }
 
 /// Sender half of a track (typically owned by publisher/participant)
@@ -154,6 +171,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             rid,
             channel: tx,
             keyframe_requests: keyframe_rx,
+            last_keyframe_requested_at: tokio::time::Instant::now(),
         });
 
         receivers.push(SimulcastReceiver {

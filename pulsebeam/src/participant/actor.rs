@@ -34,9 +34,7 @@ pub enum ParticipantControlMessage {
 }
 
 #[derive(Debug)]
-pub enum ParticipantDataMessage {
-    KeyframeRequest(Arc<entity::TrackId>, message::KeyframeRequest),
-}
+pub enum ParticipantDataMessage {}
 
 pub struct ParticipantMessageSet;
 
@@ -88,6 +86,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         loop {
             // --- DRAIN & PROCESS (Synchronous) ---
             self.drain_inputs(ctx, &mut gateway_rx);
+            self.drain_keyframe_requests();
             let Some(delay) = self.core.tick() else {
                 break; // Core requested shutdown.
             };
@@ -106,7 +105,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             tokio::select! {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
-                Some(msg) = ctx.lo_rx.recv() => self.handle_data_message(msg),
+                Some(msg) = ctx.lo_rx.recv() => {},
                 Some((meta, rtp)) = self.core.downstream_manager.next() => {
                     self.core.handle_forward_rtp(meta, rtp);
                 }
@@ -150,14 +149,34 @@ impl ParticipantActor {
         while let Ok(msg) = ctx.hi_rx.try_recv() {
             self.handle_control_message(msg);
         }
-        while let Ok(msg) = ctx.lo_rx.try_recv() {
-            self.handle_data_message(msg);
-        }
+        // while let Ok(msg) = ctx.lo_rx.try_recv() {
+        //     self.handle_data_message(msg);
+        // }
         while let Ok(pkt) = gateway_rx.try_recv() {
             self.core.handle_udp_packet(pkt);
         }
         while let Poll::Ready(Some((meta, rtp))) = self.core.downstream_manager.poll_next_packet() {
             self.core.handle_forward_rtp(meta, rtp);
+        }
+    }
+
+    fn drain_keyframe_requests(&mut self) {
+        // TODO: make this reactive and encapsulate in core
+        for track in &mut self.core.published_tracks {
+            for sender in &mut track.1.simulcast {
+                let Some(key) = sender.get_keyframe_request() else {
+                    continue;
+                };
+
+                let mut api = self.core.rtc.direct_api();
+                let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) else {
+                    tracing::warn!("stream_rx not found, keyframe request failed");
+                    return;
+                };
+
+                stream.request_keyframe(key.request.kind);
+                tracing::debug!(?key, "requested keyframe");
+            }
         }
     }
 
@@ -197,14 +216,6 @@ impl ParticipantActor {
                 self.core.remove_available_tracks(&tracks);
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {}
-        }
-    }
-
-    fn handle_data_message(&mut self, msg: ParticipantDataMessage) {
-        if let ParticipantDataMessage::KeyframeRequest(track_id, req) = msg {
-            // let _ = self
-            //     .room_handle
-            //     .send_low(room::RoomMessage::KeyframeRequest { track_id, req });
         }
     }
 }
