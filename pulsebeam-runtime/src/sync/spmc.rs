@@ -102,8 +102,8 @@ impl<T: Send + Sync> Ring<T> {
         let earliest = tail.saturating_sub(self.capacity as u64);
 
         if *seq < earliest {
-            *seq = earliest;
-            return Err(RecvError::Lagged(earliest));
+            *seq = tail;
+            return Err(RecvError::Lagged(tail));
         }
 
         if *seq >= tail {
@@ -358,11 +358,10 @@ mod tests {
 
         // First recv should detect lag and return error
         let err = rx.recv().await.unwrap_err();
-        assert_eq!(err, RecvError::Lagged(2));
+        assert_eq!(err, RecvError::Lagged(4));
 
-        // After lag error, next recv should get message at sequence 2
-        assert_eq!(*rx.recv().await.unwrap(), 2);
-        assert_eq!(*rx.recv().await.unwrap(), 3);
+        // After lag error, next recv should go to tail
+        assert!(rx.try_recv().unwrap().is_none());
     }
 
     #[tokio::test]
