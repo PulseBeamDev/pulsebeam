@@ -362,6 +362,9 @@ mod tests {
 
         // After lag error, next recv should go to tail
         assert!(rx.try_recv().unwrap().is_none());
+        tx.send(4);
+        let num = rx.recv().await.unwrap();
+        assert_eq!(*num, 4);
     }
 
     #[tokio::test]

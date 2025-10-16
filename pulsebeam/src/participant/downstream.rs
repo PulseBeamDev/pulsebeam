@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::stream::{SelectAll, Stream, StreamExt};
-use futures::task::noop_waker;
+use futures::task::noop_waker_ref;
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::Rid;
 use str0m::rtp::RtpPacket;
@@ -279,8 +279,8 @@ impl DownstreamManager {
     }
 
     pub fn poll_next_packet(&mut self) -> Poll<Option<(Arc<TrackMeta>, Arc<RtpPacket>)>> {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
         self.poll_next_unpin(&mut cx)
     }
 }
