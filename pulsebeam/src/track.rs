@@ -4,8 +4,15 @@ use async_stream::stream;
 use futures::Stream;
 use futures_concurrency::stream::Merge;
 use str0m::{media::Rid, rtp::RtpPacket};
+use tokio::sync::watch;
 
 use pulsebeam_runtime::sync::spmc;
+
+#[derive(Debug)]
+pub struct KeyframeRequest {
+    pub request: str0m::media::KeyframeRequest,
+    pub requested_at: tokio::time::Instant,
+}
 
 /// Metadata for a track — wraps `TrackMeta` in the app layer.
 #[derive(Debug, Eq, PartialEq, Hash)]
@@ -20,6 +27,8 @@ pub struct TrackMeta {
 pub struct SimulcastReceiver {
     pub rid: Option<Rid>,
     pub channel: spmc::Receiver<RtpPacket>,
+    /// Used to request a keyframe from the sender.
+    pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
 }
 
 impl SimulcastReceiver {
@@ -42,6 +51,8 @@ impl SimulcastReceiver {
 pub struct SimulcastSender {
     pub rid: Option<Rid>,
     pub channel: spmc::Sender<RtpPacket>,
+    /// Used to receive keyframe requests from the receiver.
+    pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
 }
 
 /// Sender half of a track (typically owned by publisher/participant)
@@ -100,6 +111,28 @@ impl TrackReceiver {
         }
         None
     }
+
+    /// Request a keyframe on all simulcast layers.
+    pub fn request_keyframe(&self, rid: Option<&Rid>) {
+        let Some(receiver) = self.by_rid(rid) else {
+            tracing::warn!("no receiver found for a keyframe request");
+            return;
+        };
+
+        let request = str0m::media::KeyframeRequest {
+            mid: self.meta.id.origin_mid,
+            rid: receiver.rid,
+            kind: str0m::media::KeyframeRequestKind::Pli,
+        };
+        let wrapped = KeyframeRequest {
+            request,
+            requested_at: tokio::time::Instant::now(),
+        };
+        let Ok(_) = receiver.keyframe_requester.send(Some(wrapped)) else {
+            tracing::warn!(?request, "feedback channel is unavailable");
+            return;
+        };
+    }
 }
 
 /// Construct a new Track (returns sender + receiver).
@@ -115,8 +148,19 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
 
     for rid in simulcast_rids {
         let (tx, rx) = spmc::channel(capacity);
-        senders.push(SimulcastSender { rid, channel: tx });
-        receivers.push(SimulcastReceiver { rid, channel: rx });
+        let (keyframe_tx, keyframe_rx) = watch::channel(None);
+
+        senders.push(SimulcastSender {
+            rid,
+            channel: tx,
+            keyframe_requests: keyframe_rx,
+        });
+
+        receivers.push(SimulcastReceiver {
+            rid,
+            channel: rx,
+            keyframe_requester: keyframe_tx,
+        });
     }
 
     (
