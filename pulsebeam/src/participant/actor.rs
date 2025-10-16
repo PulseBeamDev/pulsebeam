@@ -1,11 +1,12 @@
-use std::{collections::HashMap, sync::Arc, task::Poll};
+use std::{collections::HashMap, pin::Pin, sync::Arc, task::Poll};
 
+use futures::stream::SelectAll;
 use pulsebeam_runtime::{prelude::*, rt};
 use str0m::{Rtc, RtcError, error::SdpError, media::KeyframeRequest};
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::{
-    entity, gateway, message, node,
+    entity, gateway, node,
     participant::{
         batcher::{Batcher, BatcherState},
         core::ParticipantCore,
@@ -16,6 +17,19 @@ use crate::{
 use pulsebeam_runtime::{actor, mailbox, net};
 
 const MAX_MTU: usize = 1500;
+
+// To make keyframe requests reactive, `ParticipantCore` must be updated.
+// It should contain a `SelectAll` stream to unify all keyframe request channels.
+//
+// pub struct ParticipantCore {
+//     ...
+//     pub keyframe_requests: SelectAll<KeyframeRequestStream>,
+//     ...
+// }
+//
+// The `add_published_track` method in `ParticipantCore` should be responsible
+// for creating a stream for the new track's keyframe requests and adding it to `self.keyframe_requests`.
+type KeyframeRequestStream = Pin<Box<dyn Stream<Item = (Arc<entity::TrackId>, usize)> + Send>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParticipantError {
@@ -45,11 +59,9 @@ impl actor::MessageSet for ParticipantMessageSet {
     type ObservableState = ();
 }
 
-/// The async driver for a `ParticipantCore`.
 pub struct ParticipantActor {
     core: ParticipantCore,
     effects_buffer: Vec<Effect>,
-    // Async-specific handles
     node_ctx: node::NodeContext,
     room_handle: room::RoomHandle,
     egress: Arc<net::UnifiedSocket>,
@@ -84,34 +96,33 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             .await;
 
         loop {
-            // --- DRAIN & PROCESS (Synchronous) ---
-            self.drain_inputs(ctx, &mut gateway_rx);
             self.drain_keyframe_requests();
+            // First, process any synchronous work and calculate the next tick timeout.
             let Some(delay) = self.core.tick() else {
                 break; // Core requested shutdown.
             };
 
-            // After all processing, check if we need to flush the batcher.
-            if !self.core.batcher.is_empty() {
-                // Flush all pending packets. This is the only place we should await egress I/O.
-                // If the network is congested, we will block here, but that's okay because
-                // we have already processed all other pending inputs for this tick.
-                self.core.batcher.flush(&self.egress);
-            }
-
-            // --- APPLY EFFECTS (Asynchronous) ---
-            self.apply_core_effects().await;
-
+            // This single select statement is the robust event loop.
+            // It efficiently waits for the next event to occur.
             tokio::select! {
                 biased;
-                Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
-                Some(msg) = ctx.lo_rx.recv() => {},
+
+                Some(msg) = ctx.hi_rx.recv() => {
+                    self.handle_control_message(msg);
+                }
+                Some(_msg) = ctx.lo_rx.recv() => {}
                 Some((meta, rtp)) = self.core.downstream_manager.next() => {
                     self.core.handle_forward_rtp(meta, rtp);
                 }
-                Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
-                _ = rt::sleep(delay) => { /* Timeout expired. */ },
+                Some(pkt) = gateway_rx.recv() => {
+                    self.core.handle_udp_packet(pkt);
+                }
+                _ = rt::sleep(delay) => { /* Timeout expired. The tick is handled above. */ },
             }
+
+            // After any event, flush pending network packets and apply side effects.
+            self.core.batcher.flush(&self.egress);
+            self.apply_core_effects().await;
         }
 
         tracing::info!(participant_id = %self.meta(), "Shutting down actor.");
@@ -140,26 +151,6 @@ impl ParticipantActor {
         }
     }
 
-    /// Greedily drains all input channels and forwards them to the synchronous core.
-    fn drain_inputs(
-        &mut self,
-        ctx: &mut actor::ActorContext<ParticipantMessageSet>,
-        gateway_rx: &mut mailbox::Receiver<net::RecvPacket>,
-    ) {
-        while let Ok(msg) = ctx.hi_rx.try_recv() {
-            self.handle_control_message(msg);
-        }
-        // while let Ok(msg) = ctx.lo_rx.try_recv() {
-        //     self.handle_data_message(msg);
-        // }
-        while let Ok(pkt) = gateway_rx.try_recv() {
-            self.core.handle_udp_packet(pkt);
-        }
-        while let Poll::Ready(Some((meta, rtp))) = self.core.downstream_manager.poll_next_packet() {
-            self.core.handle_forward_rtp(meta, rtp);
-        }
-    }
-
     fn drain_keyframe_requests(&mut self) {
         // TODO: make this reactive and encapsulate in core
         for track in &mut self.core.published_tracks {
@@ -180,7 +171,6 @@ impl ParticipantActor {
         }
     }
 
-    /// Asynchronously executes all side effects produced by the core.
     async fn apply_core_effects(&mut self) {
         self.effects_buffer.extend(self.core.effects.drain(..));
 
