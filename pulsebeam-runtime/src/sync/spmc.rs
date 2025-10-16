@@ -14,7 +14,7 @@
 use arc_swap::ArcSwapOption;
 use crossbeam_utils::CachePadded;
 use std::{
-    fmt::{Debug, Pointer},
+    fmt::Debug,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -25,8 +25,9 @@ use tokio::sync::Notify;
 /// Error returned when a `Receiver` operation fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
-    /// The receiver lagged and was jumped forward to the given sequence number.
-    /// The receiver should call `recv` again to retrieve the message at this sequence.
+    /// The receiver lagged too far behind and was jumped forward to the sender's
+    /// current tail to catch up. The enclosed value is the new sequence number.
+    /// The receiver should call `recv` again to get the next available message.
     Lagged(u64),
     /// The sender has been dropped and no more messages will be sent.
     Closed,
@@ -60,7 +61,6 @@ impl<T: Send + Sync> Ring<T> {
     fn new(capacity: usize) -> Arc<Self> {
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            // Initialize all slots as empty (`None`). This involves no allocation.
             slots.push(ArcSwapOption::from(None));
         }
 
@@ -76,60 +76,53 @@ impl<T: Send + Sync> Ring<T> {
     /// The `send` logic takes ownership of `T` and wraps it in an `Arc`.
     #[inline]
     fn push(&self, value: T) {
-        // Relaxed ordering for fetch_add is safe here because:
-        // - Each sender gets a unique sequence number
-        // - The Release store below provides synchronization
+        // Relaxed ordering is sufficient because the `store` operation below
+        // with `Release` ordering provides the necessary memory barrier.
         let seq = self.tail.fetch_add(1, Ordering::Relaxed);
-
         let idx = (seq % self.capacity as u64) as usize;
 
-        // The single allocation for the broadcast happens here, wrapping the user's value.
         let new_arc = Arc::new(value);
 
-        // Release ordering ensures the Arc is visible before readers see the updated tail
         self.slots[idx].store(Some(new_arc));
 
-        // Notify is relatively expensive, so it's good that it's on a separate cache line
         self.notify.notify_waiters();
     }
 
-    /// `get_next` now returns an `Option<Arc<T>>`, which is a cheap clone.
-    /// Returns Ok(pkt) with data, or Err to signal special conditions.
     #[inline]
     fn get_next(&self, seq: &mut u64) -> Result<Option<Arc<T>>, RecvError> {
-        // Acquire ordering to synchronize with the Release store in push()
+        // An `Acquire` load ensures we see the most up-to-date `tail`.
         let tail = self.tail.load(Ordering::Acquire);
         let earliest = tail.saturating_sub(self.capacity as u64);
 
         if *seq < earliest {
+            // JUMP TO TAIL: The receiver is lagging. To catch up, we discard
+            // all buffered messages and set the receiver's next expected sequence
+            // to the current tail.
             *seq = tail;
             return Err(RecvError::Lagged(tail));
         }
 
         if *seq >= tail {
-            // No message available - check if closed
             if self.closed.load(Ordering::Acquire) {
                 return Err(RecvError::Closed);
             }
-            // Not ready yet, but not an error condition
             return Ok(None);
         }
 
         let idx = (*seq % self.capacity as u64) as usize;
 
-        // `load()` is a lock-free read that returns a smart pointer to the content.
-        let slot_load = self.slots[idx].load();
+        let slot_load = self.slots[idx].load_full();
 
-        if let Some(packet_arc) = &*slot_load {
+        // `as_ref()` correctly handles the case where `load()` returns a non-null
+        // pointer to a `None` value.
+        if let Some(packet_arc) = slot_load.as_ref() {
             *seq += 1;
-            // This is the key: we clone the Arc, which is just an atomic
-            // increment, NOT a deep clone of the data `T`.
             Ok(Some(packet_arc.clone()))
         } else if self.closed.load(Ordering::Acquire) {
             Err(RecvError::Closed)
         } else {
-            // Race condition: tail is updated, but store is not yet visible.
-            // Just signal not ready.
+            // This case can happen if the `tail` is updated, but the `store`
+            // to the slot is not yet visible. The caller should retry.
             Ok(None)
         }
     }
@@ -156,14 +149,11 @@ impl<T: Send + Sync> Debug for Sender<T> {
 }
 
 impl<T: Send + Sync> Sender<T> {
-    /// Sends a value to all active `Receiver`s by taking ownership of it.
-    /// The value will be wrapped in an `Arc` internally to allow for efficient sharing.
     #[inline]
     pub fn send(&self, value: T) {
         self.ring.push(value);
     }
 
-    /// Returns `true` if the sender has been closed (dropped).
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.ring.is_closed()
@@ -172,6 +162,7 @@ impl<T: Send + Sync> Sender<T> {
 
 impl<T: Send + Sync> Drop for Sender<T> {
     fn drop(&mut self) {
+        // A `Release` store synchronizes with `Acquire` loads in `get_next`.
         self.ring.closed.store(true, Ordering::Release);
         self.ring.notify.notify_waiters();
     }
@@ -180,7 +171,6 @@ impl<T: Send + Sync> Drop for Sender<T> {
 /// The receiving handle for the broadcast channel.
 pub struct Receiver<T: Send + Sync> {
     ring: Arc<Ring<T>>,
-    // Keep next_seq local to avoid cache line bouncing between receivers
     next_seq: u64,
 }
 
@@ -199,68 +189,44 @@ impl<T: Send + Sync> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Self {
             ring: Arc::clone(&self.ring),
-            // Start at current tail to avoid reading stale data
+            // A new receiver should start at the current `tail`, so it only
+            // sees messages sent after it was cloned.
             next_seq: self.ring.tail.load(Ordering::Acquire),
         }
     }
 }
 
 impl<T: Send + Sync> Receiver<T> {
-    /// Asynchronously waits for the next message, returning a shared pointer (`Arc`).
-    ///
-    /// This method guarantees that receiving a message is a cheap operation, as it
-    /// only clones an `Arc`, regardless of the size of `T`.
-    ///
-    /// Returns:
-    /// - `Ok(Arc<T>)` when a message is successfully received
-    /// - `Err(RecvError::Lagged(seq))` when the receiver has fallen behind and should retry
-    /// - `Err(RecvError::Closed)` when the sender has been dropped and no more messages are available
     pub async fn recv(&mut self) -> Result<Arc<T>, RecvError> {
         loop {
+            // Attempt to receive a message without blocking first.
             match self.ring.get_next(&mut self.next_seq) {
                 Ok(Some(pkt)) => return Ok(pkt),
                 Err(err) => return Err(err),
                 Ok(None) => { /* Not ready, continue to wait */ }
             }
 
-            if self.ring.is_closed() {
-                // Final check after closed - see if there's a message we missed
-                return match self.ring.get_next(&mut self.next_seq) {
-                    Ok(Some(pkt)) => Ok(pkt),
-                    Ok(None) => Err(RecvError::Closed),
-                    Err(err) => Err(err),
-                };
-            }
-
             let notified = self.ring.notify.notified();
 
-            // Check again before awaiting to avoid missing notifications
+            // A crucial double-check after creating the notification future.
+            // This prevents a race where a message arrives and notifies
+            // *after* the first check but *before* we `.await`.
             match self.ring.get_next(&mut self.next_seq) {
                 Ok(Some(pkt)) => return Ok(pkt),
                 Err(err) => return Err(err),
                 Ok(None) => {
+                    // Finally, await the notification.
                     notified.await;
                 }
             }
         }
     }
 
-    /// Attempts to receive the next message without blocking.
-    ///
-    /// Returns:
-    /// - `Ok(Some(Arc<T>))` when a message is available
-    /// - `Ok(None)` when no message is currently available (but the sender is still alive)
-    /// - `Err(RecvError::Lagged(seq))` when the receiver has fallen behind
-    /// - `Err(RecvError::Closed)` when the sender has been dropped and no more messages are available
     #[inline]
     pub fn try_recv(&mut self) -> Result<Option<Arc<T>>, RecvError> {
         self.ring.get_next(&mut self.next_seq)
     }
 
-    /// Returns `true` if the sender has been dropped.
-    ///
-    /// Note: Even if this returns `true`, there may still be buffered messages
-    /// available to receive.
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.ring.is_closed()
@@ -277,17 +243,23 @@ impl<T: Send + Sync> Receiver<T> {
 pub fn channel<T: Send + Sync>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "Capacity must be greater than 0");
     let ring = Ring::new(capacity);
+    let initial_seq = ring.tail.load(Ordering::Relaxed);
     (
         Sender {
             ring: Arc::clone(&ring),
         },
-        Receiver { ring, next_seq: 0 },
+        Receiver {
+            ring,
+            next_seq: initial_seq,
+        },
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::time::{advance, timeout};
 
     #[tokio::test]
     async fn basic_send_recv() {
@@ -316,15 +288,10 @@ mod tests {
 
     #[tokio::test]
     async fn works_with_non_clone_types() {
-        // This struct does not implement Clone, which is now supported.
         #[derive(Debug, PartialEq, Eq)]
         struct NonCloneable(String);
-
         let (tx, mut rx) = channel::<NonCloneable>(4);
-
-        // This works because `send` takes ownership of the data.
         tx.send(NonCloneable("hello world".to_string()));
-
         let received_arc = rx.recv().await.unwrap();
         assert_eq!(*received_arc, NonCloneable("hello world".to_string()));
     }
@@ -334,90 +301,149 @@ mod tests {
         let (tx, mut rx1) = channel(4);
         tx.send(1);
         tx.send(2);
-
         assert_eq!(*rx1.recv().await.unwrap(), 1);
 
-        let mut rx2 = rx1.clone();
-
+        let mut rx2 = rx1.clone(); // Cloned when tail is 2
         tx.send(3);
 
         assert_eq!(*rx1.recv().await.unwrap(), 2);
         assert_eq!(*rx1.recv().await.unwrap(), 3);
 
-        // The new receiver starts after the point of cloning and only sees new messages.
+        // rx2 starts at tail=2, so its first message is 3.
         assert_eq!(*rx2.recv().await.unwrap(), 3);
     }
 
     #[tokio::test]
-    async fn drop_oldest_on_overflow() {
+    async fn overflow_jumps_to_tail_to_catch_up() {
         let (tx, mut rx) = channel::<u64>(2);
-        tx.send(0);
-        tx.send(1);
-        tx.send(2); // Overwrites 0
-        tx.send(3); // Overwrites 1
+        tx.send(0); // seq 0
+        tx.send(1); // seq 1
+        tx.send(2); // seq 2, overwrites 0
+        tx.send(3); // seq 3, overwrites 1
 
-        // First recv should detect lag and return error
+        // At this point, ring contains {2, 3}. tail=4, capacity=2.
+        // `rx` expects seq 0. `earliest` is 4-2=2. Since 0 < 2, it has lagged.
         let err = rx.recv().await.unwrap_err();
+
+        // The error indicates the new sequence number, which is the tail (4).
         assert_eq!(err, RecvError::Lagged(4));
 
-        // After lag error, next recv should go to tail
-        assert!(rx.try_recv().unwrap().is_none());
+        // The receiver is now caught up. There are no new messages yet.
+        assert_eq!(rx.try_recv().unwrap(), None);
+
+        // Send a new message.
         tx.send(4);
-        let num = rx.recv().await.unwrap();
-        assert_eq!(*num, 4);
+
+        // The receiver should now get the new message immediately.
+        assert_eq!(*rx.recv().await.unwrap(), 4);
     }
 
     #[tokio::test]
     async fn sender_drop_closes_channel() {
         let (tx, mut rx) = channel::<u64>(8);
         tx.send(1);
-
         assert_eq!(*rx.recv().await.unwrap(), 1);
-
         drop(tx);
-
-        // After the sender is dropped, recv returns Closed error.
         assert_eq!(rx.recv().await.unwrap_err(), RecvError::Closed);
     }
 
     #[tokio::test]
     async fn is_closed_on_both_sender_and_receiver() {
         let (tx, rx) = channel::<u64>(8);
-
         assert!(!tx.is_closed());
         assert!(!rx.is_closed());
-
         drop(tx);
-
         assert!(rx.is_closed());
     }
 
     #[tokio::test]
     async fn try_recv_returns_none_when_empty() {
         let (tx, mut rx) = channel::<u64>(8);
-
-        // Channel is empty
         assert_eq!(rx.try_recv().unwrap(), None);
-
         tx.send(42);
-
-        // Now message is available
         assert_eq!(*rx.try_recv().unwrap().unwrap(), 42);
-
-        // Empty again
         assert_eq!(rx.try_recv().unwrap(), None);
     }
 
     #[tokio::test]
     async fn try_recv_returns_closed_when_sender_dropped() {
         let (tx, mut rx) = channel::<u64>(8);
-
         tx.send(1);
         assert_eq!(*rx.try_recv().unwrap().unwrap(), 1);
+        drop(tx);
+        assert_eq!(rx.try_recv().unwrap_err(), RecvError::Closed);
+    }
 
+    /// This test deterministically verifies that a slow consumer correctly
+    /// detects a lag and that no message gaps are perceived between successful
+    /// reads, even after jumping to the tail.
+    #[tokio::test(start_paused = true)]
+    async fn lagging_consumer_is_handled_correctly() {
+        const MESSAGES: u64 = 1000;
+        const CAPACITY: usize = 64; // Small capacity to force lags
+
+        let (tx, rx) = channel::<u64>(CAPACITY);
+
+        let consumer_handle = tokio::spawn(async move {
+            let mut rx = rx;
+            let mut last_seen: u64 = 0;
+            let mut saw_first_message = false;
+            let mut lag_count = 0;
+
+            loop {
+                match rx.recv().await {
+                    Ok(val_arc) => {
+                        let val = *val_arc;
+                        if !saw_first_message {
+                            saw_first_message = true;
+                        } else {
+                            // The core assertion: we never see a gap between successful reads.
+                            assert_eq!(val, last_seen + 1, "Consumer detected a message gap!");
+                        }
+                        last_seen = val;
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        lag_count += 1;
+                        // After a lag, the next message can be anything.
+                        saw_first_message = false;
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            (lag_count, last_seen)
+        });
+
+        // Advance time slightly to ensure the consumer task runs and waits on the notify.
+        advance(Duration::from_micros(1)).await;
+
+        // Send a burst of messages larger than the capacity to guarantee a lag.
+        for i in 0..(CAPACITY as u64 * 2) {
+            tx.send(i);
+        }
+
+        // Advance time to let the consumer wake up, detect the lag, and process.
+        advance(Duration::from_micros(1)).await;
+
+        // Send the rest of the messages.
+        for i in (CAPACITY as u64 * 2)..MESSAGES {
+            tx.send(i);
+        }
+
+        // Drop the sender to close the channel and unblock the consumer's final recv.
         drop(tx);
 
-        // Should return Closed error
-        assert_eq!(rx.try_recv().unwrap_err(), RecvError::Closed);
+        let (lag_count, last_seen) = timeout(Duration::from_secs(1), consumer_handle)
+            .await
+            .expect("Test timed out")
+            .expect("Consumer task panicked");
+
+        // The test is designed to force at least one lag.
+        assert!(
+            lag_count > 0,
+            "A lag was not detected; test setup is flawed."
+        );
+        // We can't know the exact last message, but it must be valid.
+        // The successful completion of the task without panicking is the main success criteria.
+        assert!(last_seen < MESSAGES, "Consumer saw an invalid message.");
     }
 }
