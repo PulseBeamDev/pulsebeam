@@ -25,6 +25,7 @@ pub struct TrackMeta {
 /// Simulcast receiver for one RID.
 #[derive(Clone, Debug)]
 pub struct SimulcastReceiver {
+    pub meta: Arc<TrackMeta>,
     pub rid: Option<Rid>,
     pub channel: spmc::Receiver<RtpPacket>,
     /// Used to request a keyframe from the sender.
@@ -44,6 +45,23 @@ impl SimulcastReceiver {
             }
         }
     }
+
+    /// Request a keyframe on all simulcast layers.
+    pub fn request_keyframe(&self) {
+        let request = str0m::media::KeyframeRequest {
+            mid: self.meta.id.origin_mid,
+            rid: self.rid,
+            kind: str0m::media::KeyframeRequestKind::Pli,
+        };
+        let wrapped = KeyframeRequest {
+            request,
+            requested_at: tokio::time::Instant::now(),
+        };
+        let Ok(_) = self.keyframe_requester.send(Some(wrapped)) else {
+            tracing::warn!(?request, "feedback channel is unavailable");
+            return;
+        };
+    }
 }
 
 /// Simulcast sender for one RID.
@@ -59,13 +77,22 @@ pub struct SimulcastSender {
 
 impl SimulcastSender {
     pub fn get_keyframe_request(&mut self) -> Option<KeyframeRequest> {
+        let has_changed = self
+            .keyframe_requests
+            .has_changed()
+            .expect("keyframe request channel must be opened when publisher is alive.");
+
+        if !has_changed {
+            return None;
+        }
+
         let Some(ref update) = *self.keyframe_requests.borrow_and_update() else {
             return None;
         };
 
-        // if self.last_keyframe_requested_at.elapsed() < Duration::from_secs(1) {
-        //     return None;
-        // }
+        if self.last_keyframe_requested_at.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
 
         self.last_keyframe_requested_at = tokio::time::Instant::now();
         Some(update.clone())
@@ -128,28 +155,6 @@ impl TrackReceiver {
         }
         None
     }
-
-    /// Request a keyframe on all simulcast layers.
-    pub fn request_keyframe(&self, rid: Option<&Rid>) {
-        let Some(receiver) = self.by_rid(rid) else {
-            tracing::warn!("no receiver found for a keyframe request");
-            return;
-        };
-
-        let request = str0m::media::KeyframeRequest {
-            mid: self.meta.id.origin_mid,
-            rid: receiver.rid,
-            kind: str0m::media::KeyframeRequestKind::Pli,
-        };
-        let wrapped = KeyframeRequest {
-            request,
-            requested_at: tokio::time::Instant::now(),
-        };
-        let Ok(_) = receiver.keyframe_requester.send(Some(wrapped)) else {
-            tracing::warn!(?request, "feedback channel is unavailable");
-            return;
-        };
-    }
 }
 
 /// Construct a new Track (returns sender + receiver).
@@ -175,6 +180,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         });
 
         receivers.push(SimulcastReceiver {
+            meta: meta.clone(),
             rid,
             channel: rx,
             keyframe_requester: keyframe_tx,

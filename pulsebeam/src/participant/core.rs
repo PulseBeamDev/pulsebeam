@@ -227,7 +227,14 @@ impl ParticipantCore {
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
-            Event::KeyframeRequest(req) => {}
+            Event::KeyframeRequest(req) => {
+                let Some(track_id) = self.video_allocator.get_track(&req.mid) else {
+                    tracing::warn!(?req, "no track found from slots");
+                    return;
+                };
+
+                self.downstream_manager.request_keyframe(track_id);
+            }
             _ => {}
         }
     }

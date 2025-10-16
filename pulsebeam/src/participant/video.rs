@@ -46,6 +46,12 @@ impl VideoAllocator {
         self.auto_subscribe(effects);
     }
 
+    pub fn get_track(&self, mid: &Mid) -> Option<&Arc<entity::TrackId>> {
+        let slot = self.slots.get(mid)?;
+        let track_id = slot.track_id.as_ref()?;
+        Some(track_id)
+    }
+
     pub fn add_slot(&mut self, effects: &mut effect::Queue, mid: Mid) {
         self.slots.insert(mid, Slot { track_id: None });
         tracing::info!("added video slot: {}", mid);
