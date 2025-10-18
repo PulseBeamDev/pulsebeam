@@ -252,5 +252,20 @@ mod tests {
         batcher.push_back(addr, &[2; 20]);
         assert_eq!(batcher.active_states.len(), 1);
         assert_eq!(batcher.free_states.len(), 0);
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.buf, [2; 20]);
+        assert_eq!(state.segment_size, 20);
+        assert_eq!(state.dst, addr);
+        batcher.reclaim(state);
+
+        // Third shrinks the content
+        batcher.push_back(addr, &[3; 5]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.buf, [3; 5]);
+        assert_eq!(state.segment_size, 5);
+        assert_eq!(state.dst, addr);
+        batcher.reclaim(state);
     }
 }
