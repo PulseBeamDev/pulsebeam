@@ -47,19 +47,22 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
     for _ in 0..workers {
-        let socket =
-            match net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
-                .await
-            {
-                Ok(socket) => socket,
-                Err(err) if sockets.is_empty() => {
-                    return Err(anyhow::Error::new(err).context("failed to bind udp"));
-                }
-                Err(err) => {
-                    tracing::warn!("SO_REUSEPORT is not supported, fallback to 1 socket: {err}");
-                    break;
-                }
-            };
+        let socket = match net::UnifiedSocket::bind(
+            local_addr,
+            net::Transport::TokioUdp,
+            Some(external_addr),
+        )
+        .await
+        {
+            Ok(socket) => socket,
+            Err(err) if sockets.is_empty() => {
+                return Err(anyhow::Error::new(err).context("failed to bind udp"));
+            }
+            Err(err) => {
+                tracing::warn!("SO_REUSEPORT is not supported, fallback to 1 socket: {err}");
+                break;
+            }
+        };
 
         let socket = Arc::new(socket);
         sockets.push(socket);

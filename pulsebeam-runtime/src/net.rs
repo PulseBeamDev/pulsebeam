@@ -12,6 +12,7 @@ pub enum Transport {
     Tcp,
     Tls,
     SimUdp,
+    TokioUdp,
 }
 
 /// A received packet (zero-copy buffer + source address).
@@ -103,6 +104,7 @@ pub struct SendPacketBatch<'a> {
 pub enum UnifiedSocket {
     Udp(UdpTransport),
     SimUdp(SimUdpTransport),
+    TokioUdp(TokioUdpTransport),
 }
 
 impl UnifiedSocket {
@@ -115,6 +117,7 @@ impl UnifiedSocket {
         let sock = match transport {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
             Transport::SimUdp => Self::SimUdp(SimUdpTransport::bind(addr, external_addr).await?),
+            Transport::TokioUdp => Self::TokioUdp(TokioUdpTransport::bind(addr, external_addr)?),
             _ => todo!(),
         };
         tracing::debug!("bound to {addr} ({transport:?})");
@@ -125,6 +128,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::SimUdp(inner) => inner.local_addr(),
+            Self::TokioUdp(inner) => inner.local_addr(),
         }
     }
 
@@ -132,6 +136,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
             Self::SimUdp(inner) => inner.max_gso_segments(),
+            Self::TokioUdp(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -139,6 +144,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.gro_segments(),
             Self::SimUdp(inner) => inner.gro_segments(),
+            Self::TokioUdp(inner) => inner.gro_segments(),
         }
     }
 
@@ -148,6 +154,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.readable().await,
             Self::SimUdp(inner) => inner.readable().await,
+            Self::TokioUdp(inner) => inner.readable().await,
         }
     }
 
@@ -157,6 +164,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::SimUdp(inner) => inner.writable().await,
+            Self::TokioUdp(inner) => inner.writable().await,
         }
     }
 
@@ -170,6 +178,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(batch, packets),
             Self::SimUdp(inner) => inner.try_recv_batch(batch, packets),
+            Self::TokioUdp(inner) => inner.try_recv_batch(batch, packets),
         }
     }
 
@@ -179,6 +188,7 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::SimUdp(inner) => inner.try_send_batch(batch),
+            Self::TokioUdp(inner) => inner.try_send_batch(batch),
         }
     }
 }
@@ -291,6 +301,110 @@ impl UdpTransport {
                     tracing::warn!("try_send_batch failed with {err}");
                 }
                 false
+            }
+        }
+    }
+}
+
+pub struct TokioUdpTransport {
+    sock: tokio::net::UdpSocket,
+    local_addr: SocketAddr,
+}
+
+impl TokioUdpTransport {
+    pub const MAX_MTU: usize = 1500;
+    pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+    pub fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
+        let socket2_sock = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket2_sock.set_nonblocking(true)?;
+        socket2_sock.set_reuse_address(true)?;
+
+        #[cfg(unix)]
+        socket2_sock.set_reuse_port(true)?;
+
+        socket2_sock.set_recv_buffer_size(Self::BUF_SIZE)?;
+        socket2_sock.set_send_buffer_size(Self::BUF_SIZE)?;
+        socket2_sock.bind(&addr.into())?;
+
+        let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
+
+        let local_addr = external_addr.unwrap_or(sock.local_addr()?);
+
+        Ok(Self { sock, local_addr })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn max_gso_segments(&self) -> usize {
+        1
+    }
+
+    pub fn gro_segments(&self) -> usize {
+        1
+    }
+
+    #[inline]
+    pub async fn readable(&self) -> io::Result<()> {
+        self.sock.ready(tokio::io::Interest::READABLE).await?;
+        Ok(())
+    }
+
+    #[inline]
+    pub async fn writable(&self) -> io::Result<()> {
+        self.sock.ready(tokio::io::Interest::WRITABLE).await?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn try_recv_batch(
+        &self,
+        batch: &mut RecvPacketBatch,
+        out: &mut Vec<RecvPacket>,
+    ) -> std::io::Result<()> {
+        let mut buf = vec![0; 1500];
+        match self.sock.try_io(tokio::io::Interest::READABLE, || {
+            self.sock.try_recv_from(&mut buf)
+        }) {
+            Ok((n, src)) => {
+                out.push(RecvPacket {
+                    src,
+                    dst: self.local_addr,
+                    buf: Bytes::copy_from_slice(&buf[..n]),
+                });
+                Ok(())
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[inline]
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> bool {
+        debug_assert!(batch.segment_size != 0);
+        let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
+            self.sock.try_send_to(batch.buf, batch.dst)
+        });
+
+        match res {
+            Ok(_) => {
+                metrics::histogram!("network_send_batch_bytes", "transport" => "tokio_udp")
+                    .record(batch.buf.len() as f64);
+                true
+            }
+            Err(err) => {
+                if err.kind() != ErrorKind::WouldBlock {
+                    tracing::warn!("try_send_batch failed with {err}");
+                    false
+                } else {
+                    true
+                }
             }
         }
     }
