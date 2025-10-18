@@ -125,7 +125,7 @@ impl ParticipantActor {
     ) -> Self {
         let egress = node_ctx.allocate_egress();
         let gso_segments = egress.max_gso_segments();
-        let batcher = Batcher::with_capacity(3 * MAX_MTU);
+        let batcher = Batcher::with_capacity(gso_segments * MAX_MTU);
         let core = ParticipantCore::new(participant_id, rtc, batcher);
 
         Self {
