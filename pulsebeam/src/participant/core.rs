@@ -208,7 +208,7 @@ impl ParticipantCore {
             return;
         };
 
-        let _ = writer.write_rtp(
+        if let Err(err) = writer.write_rtp(
             pt,
             rtp.seq_no,
             rtp.header.timestamp,
@@ -217,7 +217,9 @@ impl ParticipantCore {
             rtp.header.ext_vals.clone(),
             true,
             rtp.payload.clone(),
-        );
+        ) {
+            tracing::warn!("write_rtp failed: {err}");
+        }
     }
 
     fn handle_event(&mut self, event: Event) {

@@ -105,7 +105,8 @@ impl<T: Send + Sync> Ring<T> {
                 return Ok(Some(slot));
             } else {
                 // Overwritten before we could see it.
-                return Ok(None);
+                *next_seq = tail;
+                return Err(RecvError::Lagged(tail));
             }
         }
 
@@ -278,5 +279,37 @@ mod tests {
         }
 
         assert!(received >= 0);
+    }
+
+    #[tokio::test]
+    async fn receiver_detects_immediate_overwrite() {
+        // Small capacity so we can easily force overwrites.
+        const CAP: usize = 2;
+        let (tx, mut rx) = channel::<u64>(CAP);
+
+        // Fill the ring several times over its capacity quickly.
+        for i in 0..CAP as u64 * 4 {
+            tx.send(i);
+        }
+
+        // The receiver has not consumed any yet, so it's definitely lagged.
+        match rx.try_recv() {
+            Err(RecvError::Lagged(seq)) => {
+                // It should jump directly to the tail.
+                let tail_now = seq;
+                let tail_expected = tx.ring.tail.load(std::sync::atomic::Ordering::Acquire);
+                assert_eq!(
+                    tail_now, tail_expected,
+                    "lagged seq should equal current tail"
+                );
+            }
+            other => panic!("expected immediate Lagged, got {:?}", other),
+        }
+
+        // After recovering, new sends should be received normally.
+        let next_val = 1234;
+        tx.send(next_val);
+        let slot = rx.recv().await.expect("should receive new message");
+        assert_eq!(slot.value, next_val);
     }
 }

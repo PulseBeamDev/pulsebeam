@@ -277,14 +277,22 @@ impl UdpTransport {
         tracing::trace!("try_send_batch: {}", transmit.contents.len());
 
         let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
-            self.state.send((&self.sock).into(), &transmit)
+            self.state.try_send((&self.sock).into(), &transmit)
         });
 
-        if res.is_ok() {
-            metrics::histogram!("network_send_batch_bytes", "transport" => "udp")
-                .record(batch.buf.len() as f64);
+        match res {
+            Ok(_) => {
+                metrics::histogram!("network_send_batch_bytes", "transport" => "udp")
+                    .record(batch.buf.len() as f64);
+                true
+            }
+            Err(err) => {
+                if err.kind() != ErrorKind::WouldBlock {
+                    tracing::warn!("try_send_batch failed with {err}");
+                }
+                false
+            }
         }
-        res.is_ok()
     }
 }
 
