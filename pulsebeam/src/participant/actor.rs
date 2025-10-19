@@ -143,6 +143,8 @@ impl ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
         gateway_rx: &mut mailbox::Receiver<net::RecvPacket>,
     ) {
+        let start = tokio::time::Instant::now();
+
         while let Ok(msg) = ctx.hi_rx.try_recv() {
             self.handle_control_message(msg);
         }
@@ -156,6 +158,10 @@ impl ParticipantActor {
         {
             self.core.handle_forward_rtp(meta, &slot.value);
         }
+
+        let elapsed = start.elapsed().as_micros();
+        let labels = [("type", "drain_inputs")];
+        metrics::histogram!("participant_poll_delay_us", &labels).record(elapsed as f64);
     }
 
     fn drain_keyframe_requests(&mut self) {
@@ -180,6 +186,7 @@ impl ParticipantActor {
 
     /// Asynchronously executes all side effects produced by the core.
     async fn apply_core_effects(&mut self) {
+        let start = tokio::time::Instant::now();
         self.effects_buffer.extend(self.core.effects.drain(..));
 
         for effect in self.effects_buffer.drain(..) {
@@ -200,6 +207,10 @@ impl ParticipantActor {
                 }
             }
         }
+
+        let elapsed = start.elapsed().as_micros();
+        let labels = [("type", "effects")];
+        metrics::histogram!("participant_poll_delay_us", &labels).record(elapsed as f64);
     }
 
     fn handle_control_message(&mut self, msg: ParticipantControlMessage) {

@@ -31,7 +31,10 @@ fn main() {
     //     .worker_threads(workers)
     //     .build()
     //     .unwrap();
-    let rt = tokio::runtime::LocalRuntime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let shutdown = CancellationToken::new();
     rt.block_on(run(shutdown.clone(), workers));

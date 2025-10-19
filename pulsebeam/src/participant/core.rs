@@ -150,7 +150,12 @@ impl ParticipantCore {
         // }
         // deadline
 
-        self.poll_rtc()
+        let start = tokio::time::Instant::now();
+        let res = self.poll_rtc();
+        let elapsed = start.elapsed().as_micros();
+        let labels = [("type", "tick")];
+        metrics::histogram!("participant_poll_delay_us", &labels).record(elapsed as f64);
+        res
     }
 
     fn poll_rtc(&mut self) -> Option<Duration> {
