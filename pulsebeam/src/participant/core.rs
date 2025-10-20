@@ -54,7 +54,6 @@ impl ParticipantCore {
     }
 
     pub fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
-        // [FIXED] Log if a UDP packet is malformed and dropped.
         if let Ok(contents) = (*packet.buf).try_into() {
             let recv = str0m::net::Receive {
                 proto: str0m::net::Protocol::Udp,
@@ -140,7 +139,6 @@ impl ParticipantCore {
                 );
             }
         } else {
-            // [FIXED] Log if a packet is dropped because its track is not active.
             tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP packet for inactive track");
         }
     }

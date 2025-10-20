@@ -261,12 +261,10 @@ impl DownstreamAllocator {
                         res = rx.changed() => if res.is_err() { break; },
                         res = receiver.channel.recv() => match res {
                             Ok(pkt) => yield (meta.clone(), pkt),
-                            // [FIXED] Log when packets are dropped due to lagging.
                             Err(spmc::RecvError::Lagged(count)) => {
                                 tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Dropping packets due to receiver lag");
                                 receiver.request_keyframe();
                             },
-                            // [FIXED] Log when the stream is terminated due to a closed channel.
                             Err(spmc::RecvError::Closed) => {
                                 tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, "Stopping stream; channel closed");
                                 break;

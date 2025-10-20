@@ -25,6 +25,9 @@ impl Batcher {
     }
 
     /// Pushes a content slice into an appropriate batch.
+    ///
+    /// It attempts to find an existing batch for the same destination that is not yet sealed.
+    /// If no suitable batch is found, it takes one from the free pool or allocates a new one.
     pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
         debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
@@ -34,18 +37,31 @@ impl Batcher {
             }
         }
 
-        let mut new_state = self
-            .free_states
-            .pop()
-            .unwrap_or_else(|| BatcherState::with_capacity(self.cap));
+        let mut new_state = match self.free_states.pop() {
+            Some(state) => state,
+            None => BatcherState::with_capacity(self.cap),
+        };
+
         new_state.reset(dst);
 
         if new_state.try_push(dst, content) {
             self.active_states.push_back(new_state);
         } else {
             self.free_states.push(new_state);
-            tracing::warn!("Content is larger than the batcher's configured capacity");
+            debug_assert!(
+                false,
+                "Content is larger than the batcher's configured capacity"
+            );
         }
+    }
+
+    /// Pops a single batch from the front of the queue.
+    pub fn pop_front(&mut self) -> Option<BatcherState> {
+        self.active_states.pop_front()
+    }
+
+    pub fn front(&mut self) -> Option<&BatcherState> {
+        self.active_states.front()
     }
 
     /// Reclaims a `BatcherState`, returning its memory to the pool for future reuse.
@@ -53,24 +69,23 @@ impl Batcher {
         self.free_states.push(state);
     }
 
-    /// Flushes all pending batches to the network socket.
     pub fn flush(&mut self, socket: &net::UnifiedSocket) {
-        while let Some(state) = self.active_states.front() {
-            let batch = net::SendPacketBatch {
+        let start = tokio::time::Instant::now();
+        while let Some(state) = self.front() {
+            if socket.try_send_batch(&net::SendPacketBatch {
                 dst: state.dst,
                 buf: &state.buf,
                 segment_size: state.segment_size,
-            };
-            if socket.try_send_batch(&batch) {
-                // The batch was sent, reclaim its state.
-                if let Some(sent_state) = self.active_states.pop_front() {
-                    self.reclaim(sent_state);
-                }
+            }) {
+                let state = self.pop_front().unwrap();
+                self.reclaim(state);
             } else {
-                // Socket is busy, stop trying to flush.
                 break;
             }
         }
+        let elapsed = start.elapsed().as_micros();
+        let labels = [("type", "flush")];
+        metrics::histogram!("participant_poll_delay_us", &labels).record(elapsed as f64);
     }
 }
 
@@ -92,8 +107,15 @@ impl BatcherState {
         }
     }
 
+    /// Attempts to append a content slice to the buffer. Returns true on success.
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
-        if self.sealed || self.dst != dst || self.buf.len() + content.len() > self.buf.capacity() {
+        if self.sealed {
+            return false;
+        }
+        if self.dst != dst {
+            return false;
+        }
+        if self.buf.len() + content.len() > self.buf.capacity() {
             return false;
         }
 
@@ -104,14 +126,16 @@ impl BatcherState {
         if content.len() == self.segment_size {
             self.buf.extend_from_slice(content);
             true
-        } else {
-            // This is a "tail" packet of a different size, which seals the batch.
+        } else if content.len() < self.segment_size {
             self.buf.extend_from_slice(content);
             self.sealed = true;
             true
+        } else {
+            false
         }
     }
 
+    /// Resets the state's properties for reuse.
     fn reset(&mut self, dst: SocketAddr) {
         self.dst = dst;
         self.segment_size = 0;
@@ -123,17 +147,19 @@ impl BatcherState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn create_addr() -> SocketAddr {
+    fn create_test_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
     }
 
     #[test]
-    fn appends_same_size_and_stays_open() {
+    fn test_appends_same_size_and_stays_open() {
+        let addr = create_test_addr();
         let mut batcher = Batcher::with_capacity(4096);
-        batcher.push_back(create_addr(), &[1; 1000]);
-        batcher.push_back(create_addr(), &[2; 1000]);
+
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
 
         assert_eq!(batcher.active_states.len(), 1);
         let batch = &batcher.active_states[0];
@@ -143,13 +169,139 @@ mod tests {
     }
 
     #[test]
-    fn appends_tail_and_seals() {
+    fn test_appends_tail_and_seals() {
+        let addr = create_test_addr();
         let mut batcher = Batcher::with_capacity(4096);
-        batcher.push_back(create_addr(), &[1; 1000]);
-        batcher.push_back(create_addr(), &[3; 500]);
+
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
+        batcher.push_back(addr, &[3; 500]); // The tail packet
 
         assert_eq!(batcher.active_states.len(), 1);
-        assert!(batcher.active_states[0].sealed);
-        assert_eq!(batcher.active_states[0].buf.len(), 1500);
+        let batch = &batcher.active_states[0];
+        assert!(batch.sealed);
+        assert_eq!(batch.segment_size, 1000);
+        assert_eq!(batch.buf.len(), 2500);
+    }
+
+    #[test]
+    fn test_sealed_batch_rejects_pushes_creating_new_batch() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(4096);
+
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[3; 500]); // This seals the first batch
+
+        // A further push should be rejected and create a new batch
+        batcher.push_back(addr, &[4; 1000]);
+        assert_eq!(batcher.active_states.len(), 2);
+
+        let batch1 = &batcher.active_states[0];
+        let batch2 = &batcher.active_states[1];
+
+        assert_eq!(batch1.buf.len(), 1500);
+        assert!(batch1.sealed);
+        assert_eq!(batch2.buf.len(), 1000);
+        assert!(!batch2.sealed);
+    }
+
+    #[test]
+    fn test_reclaim_and_reuse_resets_sealed_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(4096);
+
+        // Create a batch and seal it
+        batcher.push_back(addr, &[1; 100]);
+        batcher.push_back(addr, &[2; 50]);
+
+        let sealed_batch = batcher.pop_front().unwrap();
+        assert!(sealed_batch.sealed);
+        assert!(batcher.is_empty());
+
+        // Reclaim the sealed state
+        batcher.reclaim(sealed_batch);
+
+        // Push again, which should reuse the reclaimed state from the pool
+        batcher.push_back(addr, &[3; 200]);
+        assert_eq!(batcher.active_states.len(), 1);
+        let reused_batch = &batcher.active_states[0];
+
+        assert!(!reused_batch.sealed, "Reused batch should be open");
+        assert_eq!(reused_batch.segment_size, 200);
+        assert_eq!(reused_batch.buf.len(), 200);
+    }
+
+    #[test]
+    fn test_pool_miss_allocates_new_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
+        assert_eq!(batcher.free_states.len(), 0);
+
+        // This is a pool miss
+        batcher.push_back(addr, &[1; 10]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+    }
+
+    #[test]
+    fn test_pool_hit_reuses_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
+
+        // First push causes allocation
+        batcher.push_back(addr, &[1; 10]);
+        let state = batcher.pop_front().unwrap();
+        batcher.reclaim(state);
+        assert_eq!(batcher.free_states.len(), 1);
+
+        // Second push should be a pool hit
+        batcher.push_back(addr, &[2; 20]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.buf, [2; 20]);
+        assert_eq!(state.segment_size, 20);
+        assert_eq!(state.dst, addr);
+        batcher.reclaim(state);
+
+        // Third shrinks the content
+        batcher.push_back(addr, &[3; 5]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.buf, [3; 5]);
+        assert_eq!(state.segment_size, 5);
+        assert_eq!(state.dst, addr);
+        batcher.reclaim(state);
+    }
+
+    #[test]
+    fn test_seal_unequal_size() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
+
+        // First push causes allocation
+        batcher.push_back(addr, &[1; 10]);
+        batcher.push_back(addr, &[2; 10]);
+        // This is larger than last segment, it shouldn't be allowed
+        batcher.push_back(addr, &[3; 11]);
+        batcher.push_back(addr, &[4; 11]);
+        batcher.push_back(addr, &[5; 11]);
+        assert_eq!(batcher.active_states.len(), 2);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 20);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 33);
+
+        batcher.push_back(addr, &[1; 10]);
+        batcher.push_back(addr, &[2; 10]);
+        batcher.push_back(addr, &[3; 9]);
+        batcher.push_back(addr, &[4; 9]);
+        batcher.push_back(addr, &[5; 9]);
+        assert_eq!(batcher.active_states.len(), 2);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 29);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 18);
     }
 }

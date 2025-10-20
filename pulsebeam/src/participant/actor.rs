@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use once_cell::sync::Lazy;
 use pulsebeam_runtime::{actor, mailbox, net, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
-use tokio::task::spawn_blocking;
 use tokio_metrics::TaskMonitor;
 use tokio_stream::StreamExt;
 
