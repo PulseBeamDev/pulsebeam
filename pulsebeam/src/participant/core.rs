@@ -1,158 +1,193 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use pulsebeam_runtime::net;
+use str0m::media::Mid;
 use str0m::{
-    media::{Direction, MediaAdded, MediaKind, Mid},
-    rtp::ExtensionValues,
+    Event, Input, Output, Rtc,
+    media::{Direction, MediaAdded},
+    rtp::RtpPacket,
 };
 
-use super::effect::Effect;
-use crate::{
-    entity,
-    message::{self, TrackMeta},
-    participant::{
-        audio::{AudioAllocator, AudioTrackData},
-        effect,
-        video::VideoAllocator,
-    },
-    track,
-};
+use crate::entity;
+use crate::participant::{batcher::Batcher, downstream::DownstreamAllocator};
+use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
+
+/// Represents an asynchronous action the `ParticipantCore` requires the `ParticipantActor` to perform.
+#[derive(Debug)]
+pub enum CoreEvent {
+    /// A new track has been created locally and should be published to the room.
+    SpawnTrack(Arc<TrackMeta>),
+    /// The participant's connection has been terminated.
+    Disconnect,
+}
 
 pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
-    pub published_tracks: HashMap<Mid, track::TrackHandle>,
-    pub video_allocator: VideoAllocator,
-    pub audio_allocator: AudioAllocator,
+    pub rtc: Rtc,
+    pub batcher: Batcher,
+    pub published_tracks: HashMap<Mid, TrackSender>,
+    pub downstream_allocator: DownstreamAllocator,
+    events: Vec<CoreEvent>,
 }
 
 impl ParticipantCore {
-    pub fn new(participant_id: Arc<entity::ParticipantId>) -> Self {
+    pub fn new(
+        participant_id: Arc<entity::ParticipantId>,
+        rtc: Rtc,
+        batcher_capacity: usize,
+    ) -> Self {
         Self {
             participant_id,
+            rtc,
+            batcher: Batcher::with_capacity(batcher_capacity),
             published_tracks: HashMap::new(),
-            video_allocator: VideoAllocator::default(),
-            audio_allocator: AudioAllocator::default(),
+            downstream_allocator: DownstreamAllocator::new(),
+            events: Vec::with_capacity(32),
         }
     }
 
-    pub fn get_published_track_mut(&mut self, mid: &Mid) -> Option<&mut track::TrackHandle> {
-        self.published_tracks.get_mut(mid)
+    /// Drains all pending events for the actor to handle.
+    pub fn drain_events(&mut self) -> impl Iterator<Item = CoreEvent> + '_ {
+        self.events.drain(..)
     }
 
-    pub fn get_slot(
-        &mut self,
-        track_meta: &Arc<TrackMeta>,
-        ext_vals: &ExtensionValues,
-    ) -> Option<Mid> {
-        match track_meta.kind {
-            MediaKind::Video => self.video_allocator.get_slot(&track_meta.id),
-            MediaKind::Audio => self.audio_allocator.get_slot(
-                &track_meta.id,
-                &AudioTrackData {
-                    audio_level: ext_vals.audio_level,
-                    voice_activity: ext_vals.voice_activity,
-                },
-            ),
+    pub fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
+        if let Ok(contents) = (*packet.buf).try_into() {
+            let recv = str0m::net::Receive {
+                proto: str0m::net::Protocol::Udp,
+                source: packet.src,
+                destination: packet.dst,
+                contents,
+            };
+            let _ = self.rtc.handle_input(Input::Receive(Instant::now(), recv));
+        } else {
+            tracing::warn!(src = %packet.src, "Dropping malformed UDP packet");
         }
     }
 
-    pub fn handle_track_finished(&mut self, track_meta: Arc<message::TrackMeta>) {
-        self.published_tracks.remove(&track_meta.id.origin_mid);
-        tracing::info!("Track finished: {}", track_meta.id);
+    pub fn handle_timeout(&mut self) {
+        let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
     }
 
-    pub fn handle_published_tracks(
+    pub fn handle_available_tracks(
         &mut self,
-        effects: &mut effect::Queue,
-        tracks: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
+        tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
     ) {
         for track_handle in tracks.values() {
-            if track_handle.meta.id.origin_participant == self.participant_id {
-                // Our own track - add to published
-                self.add_published_track(effects, track_handle);
-            } else {
-                // Track from another participant - add to available
-                self.add_available_track(effects, track_handle);
-            }
-        }
-    }
-
-    fn add_published_track(
-        &mut self,
-        _effects: &mut effect::Queue,
-        track_handle: &track::TrackHandle,
-    ) {
-        let track_meta = &track_handle.meta;
-        self.published_tracks
-            .insert(track_meta.id.origin_mid, track_handle.clone());
-    }
-
-    fn add_available_track(
-        &mut self,
-        effects: &mut effect::Queue,
-        track_handle: &track::TrackHandle,
-    ) {
-        match track_handle.meta.kind {
-            MediaKind::Video => {
-                self.video_allocator
-                    .add_track(effects, track_handle.clone());
-            }
-            MediaKind::Audio => {
-                self.audio_allocator
-                    .add_track(effects, track_handle.clone());
+            if track_handle.meta.id.origin_participant != self.participant_id {
+                self.downstream_allocator.add_track(track_handle.clone());
             }
         }
     }
 
     pub fn remove_available_tracks(
         &mut self,
-        effects: &mut effect::Queue,
-        track_ids: &HashMap<Arc<entity::TrackId>, track::TrackHandle>,
+        tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
     ) {
-        for (track_id, track_handle) in track_ids.iter() {
-            match track_handle.meta.kind {
-                MediaKind::Video => {
-                    self.video_allocator.remove_track(effects, track_id);
-                }
-                MediaKind::Audio => {
-                    self.audio_allocator.remove_track(track_id);
-                }
-            }
+        for track_id in tracks.keys() {
+            self.downstream_allocator.remove_track(track_id);
         }
     }
 
-    pub fn handle_media_added(&mut self, effects: &mut effect::Queue, media: MediaAdded) {
+    /// Polls the inner RTC engine, handling all synchronous events and queueing async ones.
+    pub fn poll_rtc(&mut self) -> Option<Duration> {
+        while self.rtc.is_alive() {
+            match self.rtc.poll_output() {
+                Ok(Output::Timeout(deadline)) => {
+                    return Some(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(Output::Transmit(tx)) => {
+                    self.batcher.push_back(tx.destination, &tx.contents);
+                }
+                Ok(Output::Event(event)) => self.handle_event(event),
+                Err(_) => {
+                    self.events.push(CoreEvent::Disconnect);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    pub fn add_published_track(&mut self, track: TrackSender) {
+        self.published_tracks
+            .insert(track.meta.id.origin_mid, track);
+    }
+
+    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
+        if let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) {
+            let Some(pt) = self
+                .rtc
+                .media(mid)
+                .and_then(|m| m.remote_pts().first().copied())
+            else {
+                return;
+            };
+            let mut api = self.rtc.direct_api();
+            if let Some(writer) = api.stream_tx_by_mid(mid, None) {
+                let _ = writer.write_rtp(
+                    pt,
+                    rtp.seq_no,
+                    rtp.header.timestamp,
+                    rtp.timestamp,
+                    rtp.header.marker,
+                    rtp.header.ext_vals.clone(),
+                    true,
+                    rtp.payload.clone(),
+                );
+            }
+        } else {
+            tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP packet for inactive track");
+        }
+    }
+
+    /// Handles synchronous events from the RTC engine.
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::IceConnectionStateChange(state) if state.is_disconnected() => {
+                self.events.push(CoreEvent::Disconnect);
+            }
+            Event::MediaAdded(media) => self.handle_media_added(media),
+            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
+            Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
+
+            _ => {}
+        }
+    }
+
+    fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {
             Direction::RecvOnly => {
-                // Client publishing to us
-                self.handle_incoming_media(effects, media);
+                let track_id =
+                    Arc::new(entity::TrackId::new(self.participant_id.clone(), media.mid));
+                let track_meta = Arc::new(track::TrackMeta {
+                    id: track_id,
+                    kind: media.kind,
+                    simulcast_rids: media.simulcast.map(|s| s.recv),
+                });
+                self.events.push(CoreEvent::SpawnTrack(track_meta));
             }
             Direction::SendOnly => {
-                // We're sending to client
-                self.allocate_outgoing_slot(effects, media);
+                self.downstream_allocator.add_slot(media.mid, media.kind);
             }
-            dir => {
-                tracing::warn!("Unsupported direction {:?}, disconnecting", dir);
-                effects.push_back(Effect::Disconnect);
-            }
+            _ => self.events.push(CoreEvent::Disconnect),
         }
     }
 
-    fn handle_incoming_media(&mut self, effects: &mut effect::Queue, media: MediaAdded) {
-        let track_id = Arc::new(entity::TrackId::new(self.participant_id.clone(), media.mid));
-        let track_meta = Arc::new(message::TrackMeta {
-            id: track_id,
-            kind: media.kind,
-            simulcast_rids: media.simulcast.map(|s| s.recv),
-        });
+    fn handle_incoming_rtp(&mut self, mut rtp: RtpPacket) {
+        let mut api = self.rtc.direct_api();
+        let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
+            return;
+        };
+        let (mid, rid) = (stream.mid(), stream.rid());
 
-        tracing::info!("published new track: {:?}", track_meta);
-        effects.push_back(Effect::SpawnTrack(track_meta));
-    }
-
-    fn allocate_outgoing_slot(&mut self, effects: &mut effect::Queue, media: MediaAdded) {
-        match media.kind {
-            MediaKind::Video => self.video_allocator.add_slot(effects, media.mid),
-            MediaKind::Audio => self.audio_allocator.add_slot(media.mid),
+        if let Some(track) = self.published_tracks.get_mut(&mid) {
+            rtp.header.ext_vals.rid = rid;
+            track.send(rid.as_ref(), rtp);
+        } else {
+            tracing::warn!(ssrc = %rtp.header.ssrc, %mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }
     }
 }

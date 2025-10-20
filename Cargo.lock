@@ -67,6 +67,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 
 [[package]]
+name = "arc-swap"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2185,12 +2191,14 @@ name = "pulsebeam"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "axum-extra",
  "bs58",
  "bumpalo",
  "bytes",
  "futures",
+ "futures-concurrency",
  "hex",
  "hyper",
  "metrics",
@@ -2209,6 +2217,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tokio-metrics",
+ "tokio-stream",
  "tokio-util",
  "tower-http",
  "tracing",
@@ -2241,12 +2250,15 @@ name = "pulsebeam-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-stream",
  "bumpalo",
  "bytes",
  "criterion",
+ "crossbeam-utils",
  "futures",
  "futures-concurrency",
+ "metrics",
  "no-panic",
  "once_cell",
  "parking_lot",

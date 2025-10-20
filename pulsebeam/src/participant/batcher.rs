@@ -1,96 +1,145 @@
 use std::{collections::VecDeque, net::SocketAddr};
 
+use pulsebeam_runtime::net;
+
+/// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
 pub struct Batcher {
     cap: usize,
-    states: VecDeque<BatcherState>,
+    active_states: VecDeque<BatcherState>,
+    free_states: Vec<BatcherState>,
 }
 
 impl Batcher {
+    /// Creates a new `Batcher` where each internal buffer has the specified capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             cap,
-            states: VecDeque::with_capacity(3),
+            active_states: VecDeque::with_capacity(3),
+            free_states: Vec::with_capacity(3),
         }
     }
 
+    /// Returns true if there are no active batches.
     pub fn is_empty(&self) -> bool {
-        self.states.is_empty()
+        self.active_states.is_empty()
     }
 
-    pub fn push_back(&mut self, dst: SocketAddr, mut content: Vec<u8>) {
-        debug_assert!(!content.is_empty());
+    /// Pushes a content slice into an appropriate batch.
+    ///
+    /// It attempts to find an existing batch for the same destination that is not yet sealed.
+    /// If no suitable batch is found, it takes one from the free pool or allocates a new one.
+    pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
+        debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
-        for state in &mut self.states {
-            if let Some(bounced) = state.push(dst, content) {
-                content = bounced;
-            } else {
-                return; // content was accepted
+        for state in &mut self.active_states {
+            if state.try_push(dst, content) {
+                return;
             }
         }
 
-        // nobody took it — create a new state and ensure it receives the content
-        let mut new_state = BatcherState::with_capacity(dst, self.cap);
-        let bounced = new_state.push(dst, content);
-        debug_assert!(
-            bounced.is_none(),
-            "Newly created state should always accept its first content"
-        );
-        self.states.push_back(new_state);
+        let mut new_state = match self.free_states.pop() {
+            Some(state) => state,
+            None => BatcherState::with_capacity(self.cap),
+        };
+
+        new_state.reset(dst);
+
+        if new_state.try_push(dst, content) {
+            self.active_states.push_back(new_state);
+        } else {
+            self.free_states.push(new_state);
+            debug_assert!(
+                false,
+                "Content is larger than the batcher's configured capacity"
+            );
+        }
     }
 
+    /// Pops a single batch from the front of the queue.
     pub fn pop_front(&mut self) -> Option<BatcherState> {
-        self.states.pop_front()
+        self.active_states.pop_front()
     }
 
-    pub fn front(&self) -> Option<&BatcherState> {
-        self.states.front()
+    pub fn front(&mut self) -> Option<&BatcherState> {
+        self.active_states.front()
+    }
+
+    /// Reclaims a `BatcherState`, returning its memory to the pool for future reuse.
+    pub fn reclaim(&mut self, state: BatcherState) {
+        self.free_states.push(state);
+    }
+
+    pub fn flush(&mut self, socket: &net::UnifiedSocket) {
+        let start = tokio::time::Instant::now();
+        while let Some(state) = self.front() {
+            if socket.try_send_batch(&net::SendPacketBatch {
+                dst: state.dst,
+                buf: &state.buf,
+                segment_size: state.segment_size,
+            }) {
+                let state = self.pop_front().unwrap();
+                self.reclaim(state);
+            } else {
+                break;
+            }
+        }
+        let elapsed = start.elapsed().as_micros();
+        let labels = [("type", "flush")];
+        metrics::histogram!("participant_poll_delay_us", &labels).record(elapsed as f64);
     }
 }
 
+/// Holds the state for a single GSO-compatible batch.
 pub struct BatcherState {
     pub dst: SocketAddr,
     pub segment_size: usize,
-    is_tail: bool,
+    sealed: bool,
     pub buf: Vec<u8>,
 }
 
 impl BatcherState {
-    fn with_capacity(dst: SocketAddr, cap: usize) -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Self {
-            dst,
+            dst: "0.0.0.0:0".parse().unwrap(),
             segment_size: 0,
-            is_tail: false,
+            sealed: false,
             buf: Vec::with_capacity(cap),
         }
     }
 
-    fn push(&mut self, dst: SocketAddr, content: Vec<u8>) -> Option<Vec<u8>> {
-        debug_assert!(!content.is_empty());
-
-        // Wrong destination or not enough capacity
-        if self.dst != dst || (self.buf.len() + content.len()) > self.buf.capacity() {
-            return Some(content);
+    /// Attempts to append a content slice to the buffer. Returns true on success.
+    fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
+        if self.sealed {
+            return false;
+        }
+        if self.dst != dst {
+            return false;
+        }
+        if self.buf.len() + content.len() > self.buf.capacity() {
+            return false;
         }
 
         if self.segment_size == 0 {
-            // First segment — set the size
             self.segment_size = content.len();
         }
 
-        let same_segment = content.len() == self.segment_size;
-
-        if same_segment || self.is_tail {
-            self.is_tail = !same_segment; // toggle tail when sizes differ
-            self.buf.extend(content);
-            None
+        if content.len() == self.segment_size {
+            self.buf.extend_from_slice(content);
+            true
+        } else if content.len() < self.segment_size {
+            self.buf.extend_from_slice(content);
+            self.sealed = true;
+            true
         } else {
-            Some(content)
+            false
         }
     }
 
-    fn clear(&mut self) {
+    /// Resets the state's properties for reuse.
+    fn reset(&mut self, dst: SocketAddr) {
+        self.dst = dst;
         self.segment_size = 0;
-        self.is_tail = false;
+        self.sealed = false;
         self.buf.clear();
     }
 }
@@ -105,108 +154,154 @@ mod tests {
     }
 
     #[test]
-    fn test_new_batcher_state() {
+    fn test_appends_same_size_and_stays_open() {
         let addr = create_test_addr();
-        let batcher = BatcherState::with_capacity(addr, 100);
+        let mut batcher = Batcher::with_capacity(4096);
 
-        assert_eq!(batcher.dst, addr);
-        assert_eq!(batcher.segment_size, 0);
-        assert_eq!(batcher.buf.len(), 0);
-        assert_eq!(batcher.buf.capacity(), 100);
-        assert!(!batcher.is_tail);
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
+
+        assert_eq!(batcher.active_states.len(), 1);
+        let batch = &batcher.active_states[0];
+        assert!(!batch.sealed);
+        assert_eq!(batch.segment_size, 1000);
+        assert_eq!(batch.buf.len(), 2000);
     }
 
     #[test]
-    fn test_push_first_segment() {
+    fn test_appends_tail_and_seals() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(addr, 100);
+        let mut batcher = Batcher::with_capacity(4096);
 
-        let content = vec![1, 2, 3];
-        let result = state.push(addr, content.clone());
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
+        batcher.push_back(addr, &[3; 500]); // The tail packet
 
-        assert_eq!(result, None);
-        assert_eq!(state.segment_size, 3);
-        assert_eq!(state.buf, content);
+        assert_eq!(batcher.active_states.len(), 1);
+        let batch = &batcher.active_states[0];
+        assert!(batch.sealed);
+        assert_eq!(batch.segment_size, 1000);
+        assert_eq!(batch.buf.len(), 2500);
     }
 
     #[test]
-    fn test_push_same_segment_size() {
+    fn test_sealed_batch_rejects_pushes_creating_new_batch() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(addr, 100);
+        let mut batcher = Batcher::with_capacity(4096);
 
-        state.push(addr, vec![1, 2, 3]);
-        let result = state.push(addr, vec![4, 5, 6]);
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[3; 500]); // This seals the first batch
 
-        assert_eq!(result, None);
-        assert_eq!(state.segment_size, 3);
-        assert_eq!(state.buf, vec![1, 2, 3, 4, 5, 6]);
+        // A further push should be rejected and create a new batch
+        batcher.push_back(addr, &[4; 1000]);
+        assert_eq!(batcher.active_states.len(), 2);
+
+        let batch1 = &batcher.active_states[0];
+        let batch2 = &batcher.active_states[1];
+
+        assert_eq!(batch1.buf.len(), 1500);
+        assert!(batch1.sealed);
+        assert_eq!(batch2.buf.len(), 1000);
+        assert!(!batch2.sealed);
     }
 
     #[test]
-    fn test_push_different_segment_size_bounces() {
+    fn test_reclaim_and_reuse_resets_sealed_state() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(addr, 100);
+        let mut batcher = Batcher::with_capacity(4096);
 
-        state.push(addr, vec![1, 2, 3]);
-        let content = vec![4, 5];
-        let bounced = state.push(addr, content.clone());
+        // Create a batch and seal it
+        batcher.push_back(addr, &[1; 100]);
+        batcher.push_back(addr, &[2; 50]);
 
-        assert_eq!(bounced, Some(content));
-        assert_eq!(state.segment_size, 3);
-        assert_eq!(state.buf, vec![1, 2, 3]);
+        let sealed_batch = batcher.pop_front().unwrap();
+        assert!(sealed_batch.sealed);
+        assert!(batcher.is_empty());
+
+        // Reclaim the sealed state
+        batcher.reclaim(sealed_batch);
+
+        // Push again, which should reuse the reclaimed state from the pool
+        batcher.push_back(addr, &[3; 200]);
+        assert_eq!(batcher.active_states.len(), 1);
+        let reused_batch = &batcher.active_states[0];
+
+        assert!(!reused_batch.sealed, "Reused batch should be open");
+        assert_eq!(reused_batch.segment_size, 200);
+        assert_eq!(reused_batch.buf.len(), 200);
     }
 
     #[test]
-    fn test_push_different_destination_bounces() {
-        let addr1 = create_test_addr();
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 8080);
-        let mut state = BatcherState::with_capacity(addr1, 100);
+    fn test_pool_miss_allocates_new_state() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
+        assert_eq!(batcher.free_states.len(), 0);
 
-        let content = vec![1, 2, 3];
-        let bounced = state.push(addr2, content.clone());
-
-        assert_eq!(bounced, Some(content));
-        assert_eq!(state.segment_size, 0);
-        assert_eq!(state.buf.len(), 0);
+        // This is a pool miss
+        batcher.push_back(addr, &[1; 10]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
     }
 
     #[test]
-    fn test_push_exceeds_capacity_bounces() {
+    fn test_pool_hit_reuses_state() {
         let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(addr, 5);
+        let mut batcher = Batcher::with_capacity(1024);
 
-        let content = vec![1, 2, 3, 4, 5, 6];
-        let bounced = state.push(addr, content.clone());
-
-        assert_eq!(bounced, Some(content));
-        assert_eq!(state.segment_size, 0);
-        assert!(state.buf.is_empty());
-    }
-
-    #[test]
-    fn test_clear() {
-        let addr = create_test_addr();
-        let mut state = BatcherState::with_capacity(addr, 100);
-
-        state.push(addr, vec![1, 2, 3]);
-        state.is_tail = true;
-        state.clear();
-
-        assert_eq!(state.segment_size, 0);
-        assert!(!state.is_tail);
-        assert!(state.buf.is_empty());
-    }
-
-    #[test]
-    fn test_batcher_push_and_pop() {
-        let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(100);
-
-        batcher.push_back(addr, vec![1, 2, 3]);
-
-        assert!(!batcher.is_empty());
+        // First push causes allocation
+        batcher.push_back(addr, &[1; 10]);
         let state = batcher.pop_front().unwrap();
-        assert_eq!(state.segment_size, 3);
-        assert_eq!(state.buf, vec![1, 2, 3]);
+        batcher.reclaim(state);
+        assert_eq!(batcher.free_states.len(), 1);
+
+        // Second push should be a pool hit
+        batcher.push_back(addr, &[2; 20]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.buf, [2; 20]);
+        assert_eq!(state.segment_size, 20);
+        assert_eq!(state.dst, addr);
+        batcher.reclaim(state);
+
+        // Third shrinks the content
+        batcher.push_back(addr, &[3; 5]);
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.free_states.len(), 0);
+        let state = batcher.pop_front().unwrap();
+        assert_eq!(state.buf, [3; 5]);
+        assert_eq!(state.segment_size, 5);
+        assert_eq!(state.dst, addr);
+        batcher.reclaim(state);
+    }
+
+    #[test]
+    fn test_seal_unequal_size() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(1024);
+
+        // First push causes allocation
+        batcher.push_back(addr, &[1; 10]);
+        batcher.push_back(addr, &[2; 10]);
+        // This is larger than last segment, it shouldn't be allowed
+        batcher.push_back(addr, &[3; 11]);
+        batcher.push_back(addr, &[4; 11]);
+        batcher.push_back(addr, &[5; 11]);
+        assert_eq!(batcher.active_states.len(), 2);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 20);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 33);
+
+        batcher.push_back(addr, &[1; 10]);
+        batcher.push_back(addr, &[2; 10]);
+        batcher.push_back(addr, &[3; 9]);
+        batcher.push_back(addr, &[4; 9]);
+        batcher.push_back(addr, &[5; 9]);
+        assert_eq!(batcher.active_states.len(), 2);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 29);
+        let batch = batcher.pop_front().unwrap();
+        assert_eq!(batch.buf.len(), 18);
     }
 }

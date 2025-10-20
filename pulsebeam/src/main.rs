@@ -20,17 +20,19 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(true)
-        .pretty()
+        .with_ansi(false)
+        .compact()
         .init();
 
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(workers)
-        .build()
-        .unwrap();
+    // let rt = tokio::runtime::Builder::new_multi_thread()
+    //     .enable_all()
+    //     .worker_threads(workers)
+    //     .build()
+    //     .unwrap();
+    let rt = tokio::runtime::LocalRuntime::new().unwrap();
 
     let shutdown = CancellationToken::new();
     rt.block_on(run(shutdown.clone(), workers));

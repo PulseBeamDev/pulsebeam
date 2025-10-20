@@ -9,9 +9,8 @@ use str0m::Rtc;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
-    gateway,
-    message::TrackMeta,
-    node, participant, track,
+    gateway, node, participant, track,
+    track::TrackMeta,
 };
 use pulsebeam_runtime::actor;
 
@@ -19,7 +18,7 @@ const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum RoomMessage {
-    PublishTrack(track::TrackHandle),
+    PublishTrack(track::TrackReceiver),
     AddParticipant(Arc<ParticipantId>, Rtc),
     RemoveParticipant(Arc<ParticipantId>),
 }
@@ -27,7 +26,7 @@ pub enum RoomMessage {
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
-    tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
+    tracks: HashMap<Arc<TrackId>, track::TrackReceiver>,
 }
 
 pub struct RoomMessageSet;
@@ -57,7 +56,7 @@ pub struct RoomActor {
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
-    tracks: HashMap<Arc<TrackId>, track::TrackHandle>,
+    tracks: HashMap<Arc<TrackId>, track::TrackReceiver>,
 }
 
 impl actor::Actor<RoomMessageSet> for RoomActor {
@@ -177,13 +176,9 @@ impl RoomActor {
             return;
         };
 
-        // Explicitly terminate the tracks owned by the leaving participant.
-        // This prevents "zombie" track actors from causing race conditions if the participant rejoins quickly.
         for (track_id, track_handle) in participant.tracks.iter_mut() {
             // Remove the track from the central registry.
             self.state.tracks.remove(track_id);
-            // Terminate the track actor itself.
-            let _ = track_handle.terminate().await;
         }
 
         self.node_ctx
@@ -199,7 +194,7 @@ impl RoomActor {
         self.broadcast_message(msg).await;
     }
 
-    async fn handle_track_published(&mut self, track_handle: track::TrackHandle) {
+    async fn handle_track_published(&mut self, track_handle: track::TrackReceiver) {
         let Some(origin) = self
             .state
             .participants

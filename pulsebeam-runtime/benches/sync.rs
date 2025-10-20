@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::{StreamExt, future::join_all};
 use futures_concurrency::stream::Merge;
-use rand::seq::index;
+use rand::{Rng, seq::index};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -10,72 +10,120 @@ use tokio::task;
 // Use the specified import path for the SPMC channel implementation.
 use pulsebeam_runtime::sync::spmc::{RecvError, Sender, channel};
 
+const NUM_PUBLISHERS: usize = 1;
+const NUM_SUBSCRIBERS: usize = 3000;
+const NUM_PACKETS_PER_PUBLISHER: usize = 1_000;
+const SUBSCRIPTIONS_PER_SUBSCRIBER: usize = 1;
+
 // --- Benchmark Group Definition ---
 criterion_group!(
     benches,
+    bench_interactive_room_mesh_mpsc_fanout,
     bench_interactive_room_mesh_futures_unordered,
+    bench_interactive_room_mesh_poll,
     bench_interactive_room_mesh_spawn,
-    bench_single_fanout,
 );
 criterion_main!(benches);
 
 // =================================================================================
-// Benchmark 1: Single Publisher High Fan-Out (Baseline)
+// Benchmark 1: Mesh Room using "MPSC Fanout"
 // =================================================================================
-
-fn bench_single_fanout(c: &mut Criterion) {
+fn bench_interactive_room_mesh_mpsc_fanout(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("spmc_single_publisher_fanout");
-    group.measurement_time(Duration::from_secs(15));
+    let mut group = c.benchmark_group("spmc_interactive_room_mesh_mpsc_fanout");
+    group.measurement_time(Duration::from_secs(30));
     group.sample_size(10);
-    group.bench_function("3000_subs_2000_pkts", |b| {
-        b.to_async(&rt)
-            .iter_custom(|iters| async move { run_test_loop(iters, run_single_fanout_test).await });
-    });
+    group.bench_function(
+        format!(
+            "{NUM_PUBLISHERS}_pubs_{NUM_SUBSCRIBERS}_subs_{NUM_PACKETS_PER_PUBLISHER}_pkts_{SUBSCRIPTIONS_PER_SUBSCRIBER}_persub_mpsc_fanout"
+        ),
+        |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                run_test_loop(iters, run_interactive_room_mesh_mpsc_fanout_test).await
+            });
+        },
+    );
     group.finish();
 }
 
-async fn run_single_fanout_test() {
-    let (tx, rx) = channel::<(usize, Instant)>(256);
-    let num_subscribers = 3000;
-    let num_packets_to_send = 2_000;
+async fn run_interactive_room_mesh_mpsc_fanout_test() {
+    let mut rng = rand::rng();
 
-    let mut subscriber_tasks = Vec::with_capacity(num_subscribers);
-    for _ in 0..num_subscribers {
-        let mut r = rx.clone();
+    // Create the communication channels between publishers, fanout tasks, and subscribers
+    let mut fanout_targets: Vec<Vec<mpsc::Sender<(usize, Instant)>>> = vec![vec![]; NUM_PUBLISHERS];
+
+    // CORRECTED INITIALIZATION: Build the Vec of Vecs without cloning.
+    let mut subscriber_receivers: Vec<Vec<mpsc::Receiver<(usize, Instant)>>> =
+        Vec::with_capacity(NUM_SUBSCRIBERS);
+    for _ in 0..NUM_SUBSCRIBERS {
+        subscriber_receivers.push(Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER));
+    }
+
+    for s_idx in 0..NUM_SUBSCRIBERS {
+        let publisher_indices =
+            index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+        for p_idx in publisher_indices.iter() {
+            let (tx, rx) = mpsc::channel(256);
+            fanout_targets[p_idx].push(tx);
+            subscriber_receivers[s_idx].push(rx);
+        }
+    }
+
+    // Spawn subscriber tasks
+    let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
+    for receivers in subscriber_receivers {
         let handle = task::spawn(async move {
-            let mut latencies = Vec::with_capacity(num_packets_to_send);
-            loop {
-                match r.recv().await {
-                    Ok(Some((_, send_time))) => latencies.push(send_time.elapsed()),
-                    Err(RecvError::Lagged(_)) => continue,
-                    Ok(None) => break,
-                }
+            let mut streams = Vec::new();
+            for mut receiver in receivers {
+                streams.push(async_stream::stream! {
+                    while let Some(res) = receiver.recv().await {
+                        yield res.1.elapsed();
+                    }
+                });
             }
-            latencies
+            let merged_stream = streams.merge();
+            merged_stream.collect::<Vec<Duration>>().await
         });
         subscriber_tasks.push(handle);
     }
 
-    let publisher_task = task::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let send_start = Instant::now();
-        for i in 0..num_packets_to_send {
-            tx.send((i, Instant::now()));
-            if i % 10 == 0 && i % 20 != 0 {
-                tokio::time::sleep(Duration::from_millis(33)).await;
-            }
-        }
-        send_start.elapsed()
-    });
+    // Spawn publisher and fanout tasks
+    let mut publisher_tasks = Vec::with_capacity(NUM_PUBLISHERS);
+    for targets in fanout_targets {
+        let (pub_tx, mut fanout_rx) = mpsc::channel(256);
 
-    let send_duration = publisher_task.await.unwrap();
+        // Spawn the fanout task for this publisher
+        task::spawn(async move {
+            while let Some(msg) = fanout_rx.recv().await {
+                for target_tx in &targets {
+                    // If a subscriber is slow or gone, we don't want it to block the fanout task.
+                    // We use try_send and ignore the error if the channel is full or closed.
+                    let _ = target_tx.try_send(msg);
+                }
+            }
+        });
+
+        // Spawn the publisher task that sends to the fanout task
+        let handle = task::spawn(create_publisher_load_mpsc(
+            pub_tx,
+            NUM_PACKETS_PER_PUBLISHER,
+        ));
+        publisher_tasks.push(handle);
+    }
+
+    let simulation_start = Instant::now();
+    join_all(publisher_tasks).await;
+    let total_send_duration = simulation_start.elapsed();
+
     let all_latencies = aggregate_latencies(subscriber_tasks).await;
+    let total_possible_deliveries =
+        NUM_PACKETS_PER_PUBLISHER * SUBSCRIPTIONS_PER_SUBSCRIBER * NUM_SUBSCRIBERS;
+
     print_metrics(
-        "Single Fan-Out",
-        send_duration,
+        "Interactive Room (MPSC Fanout)",
+        total_send_duration,
         all_latencies,
-        num_packets_to_send * num_subscribers,
+        total_possible_deliveries,
     );
 }
 
@@ -88,40 +136,40 @@ fn bench_interactive_room_mesh_spawn(c: &mut Criterion) {
     let mut group = c.benchmark_group("spmc_interactive_room_mesh_spawn");
     group.measurement_time(Duration::from_secs(30));
     group.sample_size(10);
-    group.bench_function("150_pubs_150_subs_spawn_per_sub", |b| {
-        b.to_async(&rt).iter_custom(|iters| async move {
-            run_test_loop(iters, run_interactive_room_mesh_spawn_test).await
-        });
-    });
+    group.bench_function(
+        format!(
+            "{NUM_PUBLISHERS}_pubs_{NUM_SUBSCRIBERS}_subs_{NUM_PACKETS_PER_PUBLISHER}_pkts_{SUBSCRIPTIONS_PER_SUBSCRIBER}_persub_spawn_per_sub"
+        ),
+        |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                run_test_loop(iters, run_interactive_room_mesh_spawn_test).await
+            });
+        },
+    );
     group.finish();
 }
 
 async fn run_interactive_room_mesh_spawn_test() {
-    let num_publishers = 150;
-    let num_subscribers = 150;
-    let num_packets_per_publisher = 1_000;
-    let subscriptions_per_subscriber = 15;
-
-    let mut senders = Vec::with_capacity(num_publishers);
-    let mut initial_receivers = Vec::with_capacity(num_publishers);
-    for _ in 0..num_publishers {
+    let mut senders = Vec::with_capacity(NUM_PUBLISHERS);
+    let mut initial_receivers = Vec::with_capacity(NUM_PUBLISHERS);
+    for _ in 0..NUM_PUBLISHERS {
         let (tx, rx) = channel::<(usize, Instant)>(256);
         senders.push(tx);
         initial_receivers.push(rx);
     }
 
-    let mut subscriber_tasks = Vec::with_capacity(num_subscribers);
+    let mut subscriber_tasks = Vec::with_capacity(NUM_PUBLISHERS);
     // Create the random number generator once, outside the loop for efficiency.
     let mut rng = rand::rng();
 
-    for _ in 0..num_subscribers {
+    for _ in 0..NUM_SUBSCRIBERS {
         // --- CHANGE 2: Select 15 random receivers for this specific subscriber. ---
         // First, sample 15 unique random indices from the full range of publishers.
-        let random_indices = index::sample(&mut rng, num_publishers, subscriptions_per_subscriber);
+        let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         // Then, create the list of receivers by cloning only the ones at the random indices.
-        let mut subs_receivers = Vec::with_capacity(subscriptions_per_subscriber);
-        for i in random_indices {
+        let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
+        for i in random_indices.iter() {
             subs_receivers.push(initial_receivers[i].clone());
         }
 
@@ -134,13 +182,13 @@ async fn run_interactive_room_mesh_spawn_test() {
                 task::spawn(async move {
                     loop {
                         match receiver.recv().await {
-                            Ok(Some((_, send_time))) => {
-                                if tx_clone.send(send_time.elapsed()).await.is_err() {
+                            Ok(res) => {
+                                if tx_clone.send(res.value.1.elapsed()).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
                         }
                     }
                 });
@@ -158,7 +206,7 @@ async fn run_interactive_room_mesh_spawn_test() {
 
     let mut publisher_tasks = Vec::with_capacity(senders.len());
     for tx in senders {
-        let handle = task::spawn(create_publisher_load(tx, num_packets_per_publisher));
+        let handle = task::spawn(create_publisher_load(tx, NUM_PACKETS_PER_PUBLISHER));
         publisher_tasks.push(handle);
     }
 
@@ -169,7 +217,7 @@ async fn run_interactive_room_mesh_spawn_test() {
     let all_latencies = aggregate_latencies(subscriber_tasks).await;
 
     let total_possible_deliveries =
-        num_packets_per_publisher * subscriptions_per_subscriber * num_subscribers;
+        NUM_PACKETS_PER_PUBLISHER * SUBSCRIPTIONS_PER_SUBSCRIBER * NUM_SUBSCRIBERS;
 
     print_metrics(
         // Updated context name for clarity in the results.
@@ -189,23 +237,23 @@ fn bench_interactive_room_mesh_futures_unordered(c: &mut Criterion) {
     let mut group = c.benchmark_group("spmc_interactive_room_mesh_futures_unordered");
     group.measurement_time(Duration::from_secs(30));
     group.sample_size(10);
-    group.bench_function("150_pubs_150_subs_futures_unordered", |b| {
-        b.to_async(&rt).iter_custom(|iters| async move {
-            run_test_loop(iters, run_interactive_room_mesh_futures_unordered_test).await
-        });
-    });
+    group.bench_function(
+        format!(
+            "{NUM_PUBLISHERS}_pubs_{NUM_SUBSCRIBERS}_subs_{NUM_PACKETS_PER_PUBLISHER}_pkts_{SUBSCRIPTIONS_PER_SUBSCRIBER}_persub_futures_unordered"
+        ),
+        |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                run_test_loop(iters, run_interactive_room_mesh_futures_unordered_test).await
+            });
+        },
+    );
     group.finish();
 }
 
 async fn run_interactive_room_mesh_futures_unordered_test() {
-    let num_publishers = 150;
-    let num_subscribers = 150;
-    let num_packets_per_publisher = 1_000;
-    let subscriptions_per_subscriber = 15;
-
-    let mut senders = Vec::with_capacity(num_publishers);
-    let mut initial_receivers = Vec::with_capacity(num_publishers);
-    for _ in 0..num_publishers {
+    let mut senders = Vec::with_capacity(NUM_PUBLISHERS);
+    let mut initial_receivers = Vec::with_capacity(NUM_PUBLISHERS);
+    for _ in 0..NUM_PUBLISHERS {
         let (tx, rx) = channel::<(usize, Instant)>(256);
         senders.push(tx);
         initial_receivers.push(rx);
@@ -213,12 +261,12 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
 
     let mut rng = rand::rng();
 
-    let mut subscriber_tasks = Vec::with_capacity(num_subscribers);
-    for _ in 0..num_subscribers {
-        let random_indices = index::sample(&mut rng, num_publishers, subscriptions_per_subscriber);
+    let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
+    for _ in 0..NUM_SUBSCRIBERS {
+        let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
-        let mut subs_receivers = Vec::with_capacity(subscriptions_per_subscriber);
-        for i in random_indices {
+        let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
+        for i in random_indices.iter() {
             subs_receivers.push(initial_receivers[i].clone());
         }
 
@@ -229,11 +277,11 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                 futs.push(async_stream::stream! {
                     loop {
                         match receiver.recv().await {
-                            Ok(Some((_, send_time))) => {
-                                yield send_time.elapsed();
+                            Ok(res) => {
+                                yield res.value.1.elapsed();
                             }
-                            Ok(None) => break,
                             Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
                         }
                     }
                 });
@@ -246,7 +294,7 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
 
     let mut publisher_tasks = Vec::with_capacity(senders.len());
     for tx in senders {
-        let handle = task::spawn(create_publisher_load(tx, num_packets_per_publisher));
+        let handle = task::spawn(create_publisher_load(tx, NUM_PACKETS_PER_PUBLISHER));
         publisher_tasks.push(handle);
     }
 
@@ -256,7 +304,141 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
 
     let all_latencies = aggregate_latencies(subscriber_tasks).await;
     let total_possible_deliveries =
-        num_packets_per_publisher * subscriptions_per_subscriber * num_subscribers;
+        NUM_PACKETS_PER_PUBLISHER * SUBSCRIPTIONS_PER_SUBSCRIBER * NUM_SUBSCRIBERS;
+    print_metrics(
+        "Interactive Room (Mesh-Spawn)",
+        total_send_duration,
+        all_latencies,
+        total_possible_deliveries,
+    );
+}
+
+fn bench_interactive_room_mesh_poll(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("spmc_interactive_room_mesh_poll");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
+    group.bench_function(
+        format!(
+            "{NUM_PUBLISHERS}_pubs_{NUM_SUBSCRIBERS}_subs_{NUM_PACKETS_PER_PUBLISHER}_pkts_{SUBSCRIPTIONS_PER_SUBSCRIBER}_persub_poll"
+        ),
+        |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                run_test_loop(iters, run_interactive_room_mesh_poll_test).await
+            });
+        },
+    );
+    group.finish();
+}
+
+async fn run_interactive_room_mesh_poll_test() {
+    let mut senders = Vec::with_capacity(NUM_PUBLISHERS);
+    let mut initial_receivers = Vec::with_capacity(NUM_PUBLISHERS);
+    for _ in 0..NUM_PUBLISHERS {
+        let (tx, rx) = channel::<(usize, Instant)>(256);
+        senders.push(tx);
+        initial_receivers.push(rx);
+    }
+
+    let mut rng = rand::rng();
+
+    let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
+    for _ in 0..NUM_SUBSCRIBERS {
+        let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+
+        let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
+        for i in random_indices.iter() {
+            subs_receivers.push(initial_receivers[i].clone());
+        }
+
+        let handle = task::spawn(async move {
+            let mut latencies = Vec::new();
+
+            // --- TUNING PARAMETERS ---
+            // 1. Busy Budget: How many times to 'continue' draining before forced yield.
+            // Prevents starvation when under heavy load.
+            const BUSY_BUDGET_MAX: u32 = 16;
+
+            // 2. Idle Spins: How many times to 'yield_now' before resorting to sleep.
+            // Keeps latency low during short gaps between packets.
+            const IDLE_SPINS_MAX: u32 = 50;
+
+            // 3. Sleep Backoff: Only used during long silences (between frames).
+            // Kept very low to catch the start of the next frame quickly.
+            let min_sleep = Duration::from_micros(50);
+            let max_sleep = Duration::from_millis(1); // Max 1ms sleep
+
+            // --- STATE ---
+            let mut busy_budget = BUSY_BUDGET_MAX;
+            let mut idle_spins = 0;
+            let mut current_sleep = min_sleep;
+
+            loop {
+                if subs_receivers.is_empty() {
+                    break;
+                }
+
+                let mut work_done = false;
+
+                // Greedy non-blocking drain
+                for receiver in subs_receivers.iter_mut() {
+                    while let Ok(Some(msg)) = receiver.try_recv() {
+                        latencies.push(msg.value.1.elapsed());
+                        work_done = true;
+                    }
+                }
+                subs_receivers.retain(|receiver| !receiver.is_closed());
+
+                if work_done {
+                    // --- BUSY STATE ---
+                    // Reset idle counters because we found work.
+                    idle_spins = 0;
+                    current_sleep = min_sleep;
+
+                    busy_budget -= 1;
+                    if busy_budget == 0 {
+                        // Exhausted budget, yield to prevent starvation.
+                        busy_budget = BUSY_BUDGET_MAX;
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Stay hot, check again immediately.
+                        continue;
+                    }
+                } else {
+                    // --- IDLE STATE ---
+                    // Reset busy budget.
+                    busy_budget = BUSY_BUDGET_MAX;
+
+                    if idle_spins < IDLE_SPINS_MAX {
+                        // Phase 1: Spin/Yield. High CPU, very low latency.
+                        idle_spins += 1;
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Phase 2: Sleep. Saves CPU during the ~30ms gap between frames.
+                        tokio::time::sleep(current_sleep).await;
+                        current_sleep = (current_sleep * 2).min(max_sleep);
+                    }
+                }
+            }
+            latencies
+        });
+
+        subscriber_tasks.push(handle);
+    }
+
+    let mut publisher_tasks = Vec::with_capacity(senders.len());
+    for tx in senders {
+        let handle = task::spawn(create_publisher_load(tx, NUM_PACKETS_PER_PUBLISHER));
+        publisher_tasks.push(handle);
+    }
+
+    let simulation_start = Instant::now();
+    join_all(publisher_tasks).await;
+    let total_send_duration = simulation_start.elapsed();
+
+    let all_latencies = aggregate_latencies(subscriber_tasks).await;
+    let total_possible_deliveries =
+        NUM_PACKETS_PER_PUBLISHER * SUBSCRIPTIONS_PER_SUBSCRIBER * NUM_SUBSCRIBERS;
     print_metrics(
         "Interactive Room (Mesh-Spawn)",
         total_send_duration,
@@ -290,8 +472,14 @@ async fn create_publisher_load(tx: Sender<(usize, Instant)>, num_packets: usize)
     const FPS: f64 = 30.0;
     let frame_duration = Duration::from_secs_f64(1.0 / FPS); // Approx 33.3ms
 
-    // Give subscribers a moment to start listening.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // --- REALISTIC START TIME RANDOMIZATION ---
+    // In a real SFU, publishers don't all start sending at the exact same moment.
+    // We introduce a random "join" delay to stagger the start of the streams.
+    // This creates a more realistic, less perfectly synchronized initial load.
+    let random = rand::random_range(0..500);
+    // Each publisher will wait for a random duration between 0 and 500ms before starting.
+    let start_delay = Duration::from_millis(random);
+    tokio::time::sleep(start_delay).await;
 
     let mut packets_sent = 0;
     let mut frame_index = 0;
@@ -310,7 +498,8 @@ async fn create_publisher_load(tx: Sender<(usize, Instant)>, num_packets: usize)
             if packets_sent >= num_packets {
                 break;
             }
-            tx.send((packets_sent, Instant::now()));
+            // Error ignored intentionally, if receiver is gone, we just stop sending.
+            let _ = tx.send((packets_sent, Instant::now()));
             packets_sent += 1;
         }
 
@@ -326,12 +515,48 @@ async fn create_publisher_load(tx: Sender<(usize, Instant)>, num_packets: usize)
     }
 }
 
+/// A version of the publisher load generator that uses a tokio mpsc channel.
+async fn create_publisher_load_mpsc(tx: mpsc::Sender<(usize, Instant)>, num_packets: usize) {
+    const FPS: f64 = 30.0;
+    let frame_duration = Duration::from_secs_f64(1.0 / FPS);
+
+    let random = rand::random_range(0..500);
+    let start_delay = Duration::from_millis(random);
+    tokio::time::sleep(start_delay).await;
+
+    let mut packets_sent = 0;
+    let mut frame_index = 0;
+
+    while packets_sent < num_packets {
+        let frame_start_time = Instant::now();
+        let burst_size = if frame_index % 10 < 3 { 12 } else { 11 };
+
+        for _ in 0..burst_size {
+            if packets_sent >= num_packets {
+                break;
+            }
+            // Stop sending if the fanout task has shut down
+            if tx.send((packets_sent, Instant::now())).await.is_err() {
+                return;
+            }
+            packets_sent += 1;
+        }
+
+        let burst_duration = frame_start_time.elapsed();
+        if let Some(sleep_duration) = frame_duration.checked_sub(burst_duration) {
+            tokio::time::sleep(sleep_duration).await;
+        }
+        frame_index += 1;
+    }
+}
+
 async fn aggregate_latencies(handles: Vec<task::JoinHandle<Vec<Duration>>>) -> Vec<Duration> {
     let results = join_all(handles).await;
     let mut all_latencies = Vec::new();
     for result in results {
-        let subscriber_latencies = result.unwrap();
-        all_latencies.extend(subscriber_latencies);
+        if let Ok(subscriber_latencies) = result {
+            all_latencies.extend(subscriber_latencies);
+        }
     }
     all_latencies
 }
