@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use str0m::media::{MediaKind, Mid, Rid};
+use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
 use str0m::rtp::RtpPacket;
 use tokio::sync::watch;
 
@@ -13,7 +13,7 @@ use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
 type TrackStream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)> + Send>>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 struct StreamConfig {
     paused: bool,
     target_rid: Option<Rid>,
@@ -28,6 +28,32 @@ struct TrackState {
     control_tx: watch::Sender<StreamConfig>,
     audio_level: AudioLevel,
     assigned_mid: Option<Mid>,
+}
+
+impl TrackState {
+    fn update<F>(&self, update_fn: F)
+    where
+        F: FnOnce(&mut StreamConfig),
+    {
+        self.control_tx.send_if_modified(|config| {
+            let old = *config;
+            update_fn(config);
+
+            if old != *config {
+                config.generation = config.generation.wrapping_add(1);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn request_keyframe(&self) {
+        self.control_tx.send_if_modified(|config| {
+            config.generation = config.generation.wrapping_add(1);
+            true
+        });
+    }
 }
 
 struct MidSlot {
@@ -95,6 +121,25 @@ impl DownstreamAllocator {
             MediaKind::Video => self.video_slots.push(slot),
         }
         self.rebalance_allocations();
+    }
+
+    pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
+        let Some(slot) = self.video_slots.iter().find(|e| e.mid == req.mid) else {
+            tracing::warn!(?req, "no video slot found to handle keyframe request");
+            return;
+        };
+
+        let Some(track) = &slot.assigned_track else {
+            tracing::warn!(?req, "no assigned track, ignore keyframe request");
+            return;
+        };
+
+        let Some(state) = self.tracks.get(track) else {
+            tracing::warn!(?req, "no track state found, ignore keyframe request");
+            return;
+        };
+
+        state.request_keyframe();
     }
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
@@ -197,15 +242,7 @@ impl DownstreamAllocator {
         if let Some(state) = tracks.get_mut(track_id) {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
-            state.control_tx.send_if_modified(|config| {
-                if config.paused {
-                    config.paused = false;
-                    config.generation = config.generation.wrapping_add(1);
-                    true
-                } else {
-                    false
-                }
-            });
+            state.update(|c| c.paused = false);
             tracing::info!(%track_id, mid = %slot.mid, kind = ?state.meta.kind, "Assigned track to slot");
         }
     }
@@ -214,14 +251,7 @@ impl DownstreamAllocator {
         if let Some(track_id) = slot.assigned_track.take() {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
-                state.control_tx.send_if_modified(|config| {
-                    if !config.paused {
-                        config.paused = true;
-                        true
-                    } else {
-                        false
-                    }
-                });
+                state.update(|c| c.paused = true);
                 tracing::info!(%track_id, mid = %slot.mid, kind = ?state.meta.kind, "Unassigned track from slot");
             }
         }

@@ -151,6 +151,8 @@ impl ParticipantCore {
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
+            Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
+
             _ => {}
         }
     }
