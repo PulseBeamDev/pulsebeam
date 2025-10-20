@@ -1,6 +1,6 @@
 use crate::actor_loop;
 use futures::FutureExt;
-use std::any::Any;
+use std::any::{Any, type_name_of_val};
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
@@ -260,9 +260,10 @@ where
 
     let monitor = A::monitor();
     let actor_id = a.meta().clone();
+    let actor_type = type_name_of_val(&a);
     let runnable = tracing::Instrument::instrument(
         monitor.instrument(run(a, ctx)),
-        tracing::span!(tracing::Level::INFO, "run", %actor_id),
+        tracing::span!(tracing::Level::INFO, "run", %actor_id, %actor_type),
     );
     let join = tokio::spawn(runnable);
     let abort_handle = join.abort_handle();
