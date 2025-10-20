@@ -1,247 +1,205 @@
+use futures::stream::{SelectAll, Stream, StreamExt};
+use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-
-use futures::stream::{SelectAll, Stream, StreamExt};
-use futures::task::noop_waker_ref;
-use pulsebeam_runtime::sync::spmc;
-use str0m::media::Rid;
+use str0m::media::{MediaKind, Mid, Rid};
 use str0m::rtp::RtpPacket;
 use tokio::sync::watch;
 
 use crate::entity::TrackId;
-use crate::track::{TrackMeta, TrackReceiver};
+use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
-type TrackDownstream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)> + Send>>;
+type TrackStream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)> + Send>>;
 
 #[derive(Debug, Clone, PartialEq)]
-struct DownstreamConfig {
+struct StreamConfig {
     paused: bool,
     target_rid: Option<Rid>,
     generation: u64,
 }
 
-pub struct DownstreamManager {
-    streams: SelectAll<TrackDownstream>,
-    tracks: HashMap<Arc<TrackId>, watch::Sender<DownstreamConfig>>,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+struct AudioLevel(i32);
+
+struct TrackState {
+    meta: Arc<TrackMeta>,
+    control_tx: watch::Sender<StreamConfig>,
+    audio_level: AudioLevel,
+    assigned_mid: Option<Mid>,
 }
 
-impl DownstreamManager {
+struct MidSlot {
+    mid: Mid,
+    assigned_track: Option<Arc<TrackId>>,
+}
+
+pub struct DownstreamAllocator {
+    streams: SelectAll<TrackStream>,
+    tracks: HashMap<Arc<TrackId>, TrackState>,
+    audio_slots: Vec<MidSlot>,
+    video_slots: Vec<MidSlot>,
+}
+
+impl DownstreamAllocator {
     pub fn new() -> Self {
         Self {
             streams: SelectAll::new(),
             tracks: HashMap::new(),
+            audio_slots: Vec::new(),
+            video_slots: Vec::new(),
         }
     }
 
     pub fn add_track(&mut self, track: TrackReceiver) {
         if self.tracks.contains_key(&track.meta.id) {
-            tracing::warn!(?track.meta.id, "Attempted to add a track that already exists.");
             return;
         }
 
-        let find_default_index = |simulcast: &[crate::track::SimulcastReceiver]| -> Option<usize> {
-            simulcast
-                .iter()
-                .position(|s| s.rid.is_none() || s.rid.unwrap().starts_with('f'))
-        };
-
-        let initial_rid = find_default_index(&track.simulcast)
-            .and_then(|i| track.simulcast.get(i))
-            .and_then(|s| s.rid);
-
-        let initial_config = DownstreamConfig {
+        let initial_config = StreamConfig {
             paused: true,
-            target_rid: initial_rid,
+            target_rid: Self::find_default_rid(&track.simulcast),
             generation: 0,
         };
 
-        tracing::debug!(?track.meta.id, ?initial_config, "Adding downstream track");
-        let (tx, rx) = watch::channel(initial_config);
-        self.tracks.insert(track.meta.id.clone(), tx);
+        let (control_tx, control_rx) = watch::channel(initial_config);
+        self.streams
+            .push(Self::create_track_stream(track.clone(), control_rx));
 
-        let stream = Self::create_track_stream(track, rx, find_default_index);
-        self.streams.push(stream);
+        self.tracks.insert(
+            track.meta.id.clone(),
+            TrackState {
+                meta: track.meta,
+                control_tx,
+                audio_level: AudioLevel(-127),
+                assigned_mid: None,
+            },
+        );
+        self.rebalance_allocations();
     }
 
-    fn create_track_stream(
-        track: TrackReceiver,
-        mut rx: watch::Receiver<DownstreamConfig>,
-        find_default_index: fn(&[crate::track::SimulcastReceiver]) -> Option<usize>,
-    ) -> TrackDownstream {
-        async_stream::stream! {
-            let mut track = track;
-            let meta = track.meta.clone();
+    pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
+        if self.tracks.remove(track_id).is_some() {
+            self.rebalance_allocations();
+        }
+    }
 
-            let Some(mut active_index) = find_default_index(&track.simulcast) else {
-                tracing::error!(?meta.id, "Track has no default receiver. Terminating stream task.");
-                return;
-            };
+    pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
+        let slot = MidSlot {
+            mid,
+            assigned_track: None,
+        };
+        match kind {
+            MediaKind::Audio => self.audio_slots.push(slot),
+            MediaKind::Video => self.video_slots.push(slot),
+        }
+        self.rebalance_allocations();
+    }
 
-            let mut local_generation = 0;
-            let mut is_paused = true;
-
-            // Mark initial value as seen
-            rx.borrow_and_update();
-
-            loop {
-                // If paused, wait for unpause signal
-                if is_paused {
-                    tracing::trace!(?meta.id, "Track paused, waiting for resume");
-                    if rx.changed().await.is_err() {
-                        tracing::debug!(?meta.id, "Config channel closed while paused");
-                        break;
-                    }
-                    
-                    // Process config change after waking from pause
-                    let config = rx.borrow_and_update();
-                    
-                    if local_generation != config.generation {
-                        local_generation = config.generation;
-                        
-                        // Check if we need to switch quality
-                        let current_rid = track.simulcast[active_index].rid;
-                        if current_rid != config.target_rid {
-                            let new_index = match config.target_rid {
-                                Some(target_rid) => track.simulcast.iter().position(|s| s.rid == Some(target_rid)),
-                                None => find_default_index(&track.simulcast),
-                            };
-
-                            if let Some(new_index) = new_index {
-                                if active_index != new_index {
-                                    tracing::info!(
-                                        ?meta.id,
-                                        from = ?current_rid,
-                                        to = ?config.target_rid,
-                                        "Switching track quality"
-                                    );
-                                    active_index = new_index;
-                                }
-                            } else {
-                                tracing::warn!(
-                                    ?meta.id,
-                                    requested_rid = ?config.target_rid,
-                                    "Requested RID not found, keeping current quality"
-                                );
-                            }
-                        }
-
-                        // Flush and request keyframe if resuming or changing quality
-                        if !config.paused {
-                            let receiver = &mut track.simulcast[active_index];
-                            tracing::debug!(?meta.id, rid = ?receiver.rid, "Flushing channel and requesting keyframe due to state change.");
-                            receiver.request_keyframe();
-                        }
-                    }
-                    
-                    is_paused = config.paused;
-                    continue;
-                }
-
-                // HOT PATH: Active state - wait for either a packet or a config change
-                let receiver = &mut track.simulcast[active_index];
-                
-                tokio::select! {
-                    biased;
-                    
-                    // Check config changes first
-                    change_result = rx.changed() => {
-                        if change_result.is_err() {
-                            tracing::debug!(?meta.id, "Config channel closed");
-                            break;
-                        }
-                        
-                        // Process the config change
-                        let config = rx.borrow_and_update();
-                        
-                        if local_generation != config.generation {
-                            local_generation = config.generation;
-                            
-                            // Check if we need to switch quality
-                            let current_rid = track.simulcast[active_index].rid;
-                            if current_rid != config.target_rid {
-                                let new_index = match config.target_rid {
-                                    Some(target_rid) => track.simulcast.iter().position(|s| s.rid == Some(target_rid)),
-                                    None => find_default_index(&track.simulcast),
-                                };
-
-                                if let Some(new_index) = new_index {
-                                    if active_index != new_index {
-                                        tracing::info!(
-                                            ?meta.id,
-                                            from = ?current_rid,
-                                            to = ?config.target_rid,
-                                            "Switching track quality"
-                                        );
-                                        active_index = new_index;
-                                    }
-                                } else {
-                                    tracing::warn!(
-                                        ?meta.id,
-                                        requested_rid = ?config.target_rid,
-                                        "Requested RID not found, keeping current quality"
-                                    );
-                                }
-                            }
-
-                            // Flush and request keyframe if changing quality
-                            if !config.paused {
-                                let receiver = &mut track.simulcast[active_index];
-                                tracing::debug!(?meta.id, rid = ?receiver.rid, "Requesting keyframe due to config change.");
-                                receiver.request_keyframe();
-                            }
-                        }
-                        
-                        is_paused = config.paused;
-                    }
-                    
-                    // Then wait for packet
-                    result = receiver.channel.recv() => {
-                        match result {
-                            Ok(pkt) => {
-                                // Fast path: just yield the packet
-                                yield (meta.clone(), pkt);
-                            }
-                            Err(spmc::RecvError::Lagged(n)) => {
-                                tracing::warn!(
-                                    ?meta.id,
-                                    rid = ?receiver.rid,
-                                    lagged = n,
-                                    "Downstream track lagged, requesting keyframe"
-                                );
-                                receiver.request_keyframe();
-                            }
-                            Err(spmc::RecvError::Closed) => {
-                                tracing::info!(?meta.id, "Channel closed, terminating stream");
-                                break;
-                            }
-                        }
-                    }
+    pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
+        let mut needs_rebalance = false;
+        if let Some(track_state) = self.tracks.get_mut(&meta.id) {
+            if meta.kind == MediaKind::Audio {
+                let new_level = rtp.header.ext_vals.audio_level.unwrap_or(-127);
+                if track_state.audio_level.0 != new_level as i32 {
+                    track_state.audio_level = AudioLevel(new_level as i32);
+                    needs_rebalance = true;
                 }
             }
-            
-            tracing::debug!(?meta.id, "Downstream track stream ended");
         }
-        .boxed()
+
+        if needs_rebalance {
+            self.rebalance_allocations();
+        }
+
+        self.tracks.get(&meta.id).and_then(|s| s.assigned_mid)
     }
 
-    pub fn pause_track(&self, track_id: &Arc<TrackId>) {
-        if let Some(tx) = self.tracks.get(track_id) {
-            tx.send_if_modified(|config| {
-                if !config.paused {
-                    config.paused = true;
-                    true
-                } else {
-                    false
+    fn rebalance_allocations(&mut self) {
+        self.rebalance_audio();
+        self.rebalance_video();
+    }
+
+    fn rebalance_audio(&mut self) {
+        let mut audio_tracks: Vec<_> = self
+            .tracks
+            .iter()
+            .filter(|(_, state)| state.meta.kind == MediaKind::Audio)
+            .map(|(id, state)| (id.clone(), state.audio_level))
+            .collect();
+        audio_tracks.sort_unstable_by_key(|k| k.1);
+
+        let active_speakers: HashMap<_, _> = audio_tracks
+            .into_iter()
+            .take(self.audio_slots.len())
+            .map(|(id, _)| (id, ()))
+            .collect();
+
+        for slot in &mut self.audio_slots {
+            let mut needs_unassign = false;
+            if let Some(track_id) = slot.assigned_track.as_ref() {
+                if !active_speakers.contains_key(track_id) {
+                    needs_unassign = true;
                 }
-            });
+            }
+            if needs_unassign {
+                Self::perform_unassignment(&mut self.tracks, slot);
+            }
+        }
+
+        let mut speakers_to_assign: Vec<_> = active_speakers
+            .keys()
+            .filter(|id| {
+                self.tracks
+                    .get(*id)
+                    .map_or(false, |s| s.assigned_mid.is_none())
+            })
+            .cloned()
+            .collect();
+
+        for slot in &mut self.audio_slots {
+            if slot.assigned_track.is_none() {
+                if let Some(track_id) = speakers_to_assign.pop() {
+                    Self::perform_assignment(&mut self.tracks, slot, &track_id);
+                }
+            }
         }
     }
 
-    pub fn resume_track(&self, track_id: &Arc<TrackId>) {
-        if let Some(tx) = self.tracks.get(track_id) {
-            tx.send_if_modified(|config| {
+    fn rebalance_video(&mut self) {
+        let mut unassigned_tracks: Vec<_> = self
+            .tracks
+            .iter()
+            .filter(|(_, state)| {
+                state.meta.kind == MediaKind::Video && state.assigned_mid.is_none()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for slot in &mut self.video_slots {
+            if let Some(track_id) = &slot.assigned_track {
+                if !self.tracks.contains_key(track_id) {
+                    Self::perform_unassignment(&mut self.tracks, slot);
+                }
+            }
+            if slot.assigned_track.is_none() {
+                if let Some(track_id) = unassigned_tracks.pop() {
+                    Self::perform_assignment(&mut self.tracks, slot, &track_id);
+                }
+            }
+        }
+    }
+
+    fn perform_assignment(
+        tracks: &mut HashMap<Arc<TrackId>, TrackState>,
+        slot: &mut MidSlot,
+        track_id: &Arc<TrackId>,
+    ) {
+        if let Some(state) = tracks.get_mut(track_id) {
+            slot.assigned_track = Some(track_id.clone());
+            state.assigned_mid = Some(slot.mid);
+            state.control_tx.send_if_modified(|config| {
                 if config.paused {
                     config.paused = false;
                     config.generation = config.generation.wrapping_add(1);
@@ -250,42 +208,82 @@ impl DownstreamManager {
                     false
                 }
             });
+            tracing::info!(%track_id, mid = %slot.mid, kind = ?state.meta.kind, "Assigned track to slot");
         }
     }
 
-    pub fn request_keyframe(&self, track_id: &Arc<TrackId>) {
-        if let Some(tx) = self.tracks.get(track_id) {
-            tx.send_modify(|config| {
-                config.paused = false;
-                config.generation = config.generation.wrapping_add(1);
-            });
+    fn perform_unassignment(tracks: &mut HashMap<Arc<TrackId>, TrackState>, slot: &mut MidSlot) {
+        if let Some(track_id) = slot.assigned_track.take() {
+            if let Some(state) = tracks.get_mut(&track_id) {
+                state.assigned_mid = None;
+                state.control_tx.send_if_modified(|config| {
+                    if !config.paused {
+                        config.paused = true;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                tracing::info!(%track_id, mid = %slot.mid, kind = ?state.meta.kind, "Unassigned track from slot");
+            }
         }
     }
 
-    pub fn set_track_quality(&self, track_id: &Arc<TrackId>, rid: Option<Rid>) {
-        if let Some(tx) = self.tracks.get(track_id) {
-            tx.send_modify(|config| {
-                config.paused = false;
-                config.target_rid = rid;
-                config.generation = config.generation.wrapping_add(1);
-            });
-        }
+    fn find_default_rid(simulcast: &[SimulcastReceiver]) -> Option<Rid> {
+        simulcast
+            .iter()
+            .find(|s| s.rid.is_none() || s.rid.unwrap().starts_with('f'))
+            .and_then(|s| s.rid)
     }
 
-    pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
-        if self.tracks.remove(track_id).is_some() {
-            tracing::debug!(?track_id, "Removed downstream track");
-        }
-    }
+    fn create_track_stream(
+        mut track: TrackReceiver,
+        mut rx: watch::Receiver<StreamConfig>,
+    ) -> TrackStream {
+        async_stream::stream! {
+            let meta = track.meta.clone();
+            let find_index_for_rid = |rid: Option<Rid>, simulcast: &[SimulcastReceiver]| -> Option<usize> {
+                simulcast.iter().position(|s| s.rid == rid)
+            };
 
-    pub fn poll_next_packet(&mut self) -> Poll<Option<(Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)>> {
-        let waker = noop_waker_ref();
-        let mut cx = Context::from_waker(waker);
-        self.poll_next_unpin(&mut cx)
+            let Some(mut active_index) = find_index_for_rid(rx.borrow().target_rid, &track.simulcast) else {
+                return;
+            };
+
+            let mut local_generation = 0;
+            rx.borrow_and_update();
+
+            loop {
+                if rx.borrow().paused {
+                    if rx.changed().await.is_err() { break; }
+                } else {
+                    let receiver = &mut track.simulcast[active_index];
+                    tokio::select! {
+                        biased;
+                        res = rx.changed() => if res.is_err() { break; },
+                        res = receiver.channel.recv() => match res {
+                            Ok(pkt) => yield (meta.clone(), pkt),
+                            Err(spmc::RecvError::Lagged(_)) => receiver.request_keyframe(),
+                            Err(spmc::RecvError::Closed) => break,
+                        },
+                    }
+                }
+                let config = rx.borrow_and_update();
+                if local_generation != config.generation {
+                    local_generation = config.generation;
+                    if let Some(new_index) = find_index_for_rid(config.target_rid, &track.simulcast) {
+                        active_index = new_index;
+                    }
+                    if !config.paused {
+                        track.simulcast[active_index].request_keyframe();
+                    }
+                }
+            }
+        }.boxed()
     }
 }
 
-impl Stream for DownstreamManager {
+impl Stream for DownstreamAllocator {
     type Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
