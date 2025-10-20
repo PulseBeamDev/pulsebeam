@@ -54,6 +54,7 @@ impl ParticipantCore {
     }
 
     pub fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
+        // [FIXED] Log if a UDP packet is malformed and dropped.
         if let Ok(contents) = (*packet.buf).try_into() {
             let recv = str0m::net::Receive {
                 proto: str0m::net::Protocol::Udp,
@@ -62,6 +63,8 @@ impl ParticipantCore {
                 contents,
             };
             let _ = self.rtc.handle_input(Input::Receive(Instant::now(), recv));
+        } else {
+            tracing::warn!(src = %packet.src, "Dropping malformed UDP packet");
         }
     }
 
@@ -115,28 +118,30 @@ impl ParticipantCore {
     }
 
     pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
-        let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) else {
-            return;
-        };
-        let Some(pt) = self
-            .rtc
-            .media(mid)
-            .and_then(|m| m.remote_pts().first().copied())
-        else {
-            return;
-        };
-        let mut api = self.rtc.direct_api();
-        if let Some(writer) = api.stream_tx_by_mid(mid, None) {
-            let _ = writer.write_rtp(
-                pt,
-                rtp.seq_no,
-                rtp.header.timestamp,
-                rtp.timestamp,
-                rtp.header.marker,
-                rtp.header.ext_vals.clone(),
-                true,
-                rtp.payload.clone(),
-            );
+        if let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) {
+            let Some(pt) = self
+                .rtc
+                .media(mid)
+                .and_then(|m| m.remote_pts().first().copied())
+            else {
+                return;
+            };
+            let mut api = self.rtc.direct_api();
+            if let Some(writer) = api.stream_tx_by_mid(mid, None) {
+                let _ = writer.write_rtp(
+                    pt,
+                    rtp.seq_no,
+                    rtp.header.timestamp,
+                    rtp.timestamp,
+                    rtp.header.marker,
+                    rtp.header.ext_vals.clone(),
+                    true,
+                    rtp.payload.clone(),
+                );
+            }
+        } else {
+            // [FIXED] Log if a packet is dropped because its track is not active.
+            tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP packet for inactive track");
         }
     }
 
@@ -181,6 +186,9 @@ impl ParticipantCore {
         if let Some(track) = self.published_tracks.get_mut(&mid) {
             rtp.header.ext_vals.rid = rid;
             track.send(rid.as_ref(), rtp);
+        } else {
+            // [FIXED] Log if an incoming packet has no matching published track.
+            tracing::warn!(ssrc = %rtp.header.ssrc, %mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }
     }
 }
