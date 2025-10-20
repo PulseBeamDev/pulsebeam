@@ -85,24 +85,24 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
         loop {
             // --- DRAIN & PROCESS (Synchronous) ---
-            self.drain_inputs(ctx, &mut gateway_rx);
+            // self.drain_inputs(ctx, &mut gateway_rx);
             self.drain_keyframe_requests();
             let Some(delay) = self.core.tick() else {
                 break; // Core requested shutdown.
             };
 
-            // Flush all pending packets. This is the only place we should await egress I/O.
-            // If the network is congested, we will block here, but that's okay because
-            // we have already processed all other pending inputs for this tick.
-            self.core.batcher.flush(&self.egress);
-
             // --- APPLY EFFECTS (Asynchronous) ---
             self.apply_core_effects().await;
 
             tokio::select! {
-                biased;
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg),
                 Some(msg) = ctx.lo_rx.recv() => {},
+                Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
+                    // Flush all pending packets. This is the only place we should await egress I/O.
+                    // If the network is congested, we will block here, but that's okay because
+                    // we have already processed all other pending inputs for this tick.
+                    self.core.batcher.flush(&self.egress);
+                }
                 Some((meta, rtp)) = self.core.downstream_manager.next() => {
                     self.core.handle_forward_rtp(meta, &rtp.value);
                 }

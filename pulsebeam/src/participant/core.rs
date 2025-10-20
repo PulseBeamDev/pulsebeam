@@ -242,7 +242,9 @@ impl ParticipantCore {
 
                 self.downstream_manager.request_keyframe(track_id);
             }
-            _ => {}
+            e => {
+                tracing::warn!("unhandled event: {e:?}");
+            }
         }
     }
 

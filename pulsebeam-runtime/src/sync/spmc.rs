@@ -192,6 +192,10 @@ impl<T: Send + Sync> Receiver<T> {
     pub fn is_closed(&self) -> bool {
         self.ring.is_closed()
     }
+
+    pub fn reset(&mut self) {
+        self.next_seq = self.ring.tail.load(Ordering::Acquire);
+    }
 }
 
 impl<T: Send + Sync> Clone for Receiver<T> {
@@ -218,7 +222,7 @@ impl<T: Send + Sync> Debug for Receiver<T> {
 pub fn channel<T: Send + Sync>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "capacity must be > 0");
     let ring = Ring::new(capacity);
-    let tail = ring.tail.load(Ordering::Relaxed);
+    let tail = ring.tail.load(Ordering::Acquire);
 
     (
         Sender {
