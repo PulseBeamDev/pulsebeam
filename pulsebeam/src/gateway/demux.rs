@@ -115,8 +115,8 @@ impl Demuxer {
         // participant_handle.send(pkt).await;
         if let Err(TrySendError::Full(pkt)) = participant_handle.try_send(pkt) {
             tracing::warn!("gateway -> participant: full queue, dropping");
-            // rt::yield_now().await;
-            // participant_handle.try_send(pkt);
+            rt::yield_now().await;
+            participant_handle.try_send(pkt);
         }
     }
 }

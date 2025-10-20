@@ -59,7 +59,7 @@ pub struct SimulcastSender {
     /// Used to receive keyframe requests from the receiver.
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
 
-    pub last_keyframe_requested_at: tokio::time::Instant,
+    pub last_keyframe_requested_at: Option<tokio::time::Instant>,
 }
 
 impl SimulcastSender {
@@ -77,12 +77,17 @@ impl SimulcastSender {
             return None;
         };
 
-        if self.last_keyframe_requested_at.elapsed() < Duration::from_secs(1) {
-            return None;
-        }
-
-        self.last_keyframe_requested_at = tokio::time::Instant::now();
-        Some(update.clone())
+        let res = if let Some(last) = self.last_keyframe_requested_at {
+            if last.elapsed() < Duration::from_secs(1) {
+                Some(update.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.last_keyframe_requested_at = Some(tokio::time::Instant::now());
+        res
     }
 }
 
@@ -157,7 +162,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             rid,
             channel: tx,
             keyframe_requests: keyframe_rx,
-            last_keyframe_requested_at: tokio::time::Instant::now(),
+            last_keyframe_requested_at: None,
         });
 
         receivers.push(SimulcastReceiver {

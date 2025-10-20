@@ -201,7 +201,7 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub const MAX_MTU: usize = 1500;
-    pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
+    pub const BUF_SIZE: usize = 1024 * 1024 * 1024;
 
     pub fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
         let socket2_sock = socket2::Socket::new(

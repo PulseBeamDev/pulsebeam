@@ -279,7 +279,9 @@ impl DownstreamAllocator {
                         active_index = new_index;
                     }
                     if !config.paused {
-                        track.simulcast[active_index].request_keyframe();
+                        let receiver = &mut track.simulcast[active_index];
+                        receiver.channel.reset();
+                        receiver.request_keyframe();
                     }
                 }
             }

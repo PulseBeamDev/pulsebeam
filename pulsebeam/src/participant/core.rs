@@ -6,11 +6,11 @@ use pulsebeam_runtime::net;
 use str0m::media::Mid;
 use str0m::{
     Event, Input, Output, Rtc,
-    media::{Direction, MediaAdded, MediaKind},
+    media::{Direction, MediaAdded},
     rtp::RtpPacket,
 };
 
-use crate::entity::{self, TrackId};
+use crate::entity;
 use crate::participant::{batcher::Batcher, downstream::DownstreamAllocator};
 use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
 
@@ -185,7 +185,6 @@ impl ParticipantCore {
             rtp.header.ext_vals.rid = rid;
             track.send(rid.as_ref(), rtp);
         } else {
-            // [FIXED] Log if an incoming packet has no matching published track.
             tracing::warn!(ssrc = %rtp.header.ssrc, %mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }
     }

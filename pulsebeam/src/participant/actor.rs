@@ -63,7 +63,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(256);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(64);
 
         let _ = self
             .node_ctx
@@ -75,11 +75,13 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ))
             .await;
 
-        loop {
+        'outer: loop {
             // 1. Advance the core's synchronous state machine.
             let Some(delay) = self.core.poll_rtc() else {
-                break;
+                break 'outer;
             };
+
+            self.drain_keyframe_requests();
 
             // 2. Execute any asynchronous side effects requested by the core.
             let events: Vec<_> = self.core.drain_events().collect();
@@ -91,14 +93,16 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             tokio::select! {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg).await,
+                Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
+                    self.core.batcher.flush(&self.egress);
+                },
                 Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
                 Some((meta, rtp)) = self.core.downstream_allocator.next() => {
                     self.core.handle_forward_rtp(meta, &rtp.value);
                 },
-                Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
-                    self.core.batcher.flush(&self.egress);
+                _ = rt::sleep(delay) => {
+                    self.core.handle_timeout();
                 },
-                _ = rt::sleep(delay) => self.core.handle_timeout(),
             }
         }
 
@@ -155,6 +159,26 @@ impl ParticipantActor {
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {}
         };
+    }
+
+    fn drain_keyframe_requests(&mut self) {
+        // TODO: make this reactive and encapsulate in core
+        for track in &mut self.core.published_tracks {
+            for sender in &mut track.1.simulcast {
+                let Some(key) = sender.get_keyframe_request() else {
+                    continue;
+                };
+
+                let mut api = self.core.rtc.direct_api();
+                let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) else {
+                    tracing::warn!("stream_rx not found, keyframe request failed");
+                    return;
+                };
+
+                stream.request_keyframe(key.request.kind);
+                tracing::debug!(?key, "requested keyframe");
+            }
+        }
     }
 }
 
