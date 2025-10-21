@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -39,7 +39,7 @@ pub struct SimulcastReceiver {
     pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
 
     /// Receiver only reads. The publisher will estimate this.
-    pub bitrate: Arc<AtomicU32>,
+    pub bitrate: Arc<AtomicU64>,
 }
 
 impl SimulcastReceiver {
@@ -158,11 +158,14 @@ impl TrackReceiver {
 
 /// Construct a new Track (returns sender + receiver).
 pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
-    let simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
+    let mut simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
         rids.iter().map(|rid| Some(*rid)).collect()
     } else {
         vec![None]
     };
+
+    // "f" -> "h" -> "q"
+    simulcast_rids.sort_by_key(|rid| rid.unwrap_or_default().to_string());
 
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
@@ -182,7 +185,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
                 1_200_000
             }
         };
-        let bitrate = Arc::new(AtomicU32::new(bitrate));
+        let bitrate = Arc::new(AtomicU64::new(bitrate));
 
         let bwe = BandwidthEstimator::new(bitrate.clone());
         senders.push(SimulcastSender {
@@ -220,11 +223,11 @@ pub struct BandwidthEstimator {
     last_update: Instant,
     interval_bytes: usize,
     estimate: f64, // EWMA in bps
-    shared: Arc<AtomicU32>,
+    shared: Arc<AtomicU64>,
 }
 
 impl BandwidthEstimator {
-    pub fn new(shared: Arc<AtomicU32>) -> Self {
+    pub fn new(shared: Arc<AtomicU64>) -> Self {
         let initial_bps = shared.load(Ordering::Relaxed);
         Self {
             last_update: Instant::now(),
@@ -249,7 +252,7 @@ impl BandwidthEstimator {
             self.estimate = 0.90 * self.estimate + 0.10 * instant_bps;
 
             // add 15% headroom for bursts
-            let safe_bps = (self.estimate * 1.15) as u32;
+            let safe_bps = (self.estimate * 1.15) as u64;
             self.shared.store(safe_bps, Ordering::Relaxed);
 
             self.last_update = now;

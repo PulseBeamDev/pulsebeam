@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use str0m::bwe::BweKind;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
 use str0m::rtp::RtpPacket;
@@ -15,6 +16,8 @@ use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
 type TrackStream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)> + Send>>;
 
+/// Configuration that each downstream receiver listens to.
+/// Updated by the allocator to select which simulcast layer is active.
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct StreamConfig {
     paused: bool,
@@ -22,9 +25,11 @@ struct StreamConfig {
     generation: u64,
 }
 
+/// Used for comparing and sorting active speakers.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct AudioLevel(i32);
 
+/// Tracks the allocation and control state for one published track.
 struct TrackState {
     track: TrackReceiver,
     control_tx: watch::Sender<StreamConfig>,
@@ -62,16 +67,32 @@ impl TrackState {
     }
 }
 
+/// Represents an active media slot in an SDP session.
+/// Audio slots are simple; video slots have adaptive state.
 struct MidSlot {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
 }
 
+/// Per-subscriber video slot state.
+/// Keeps track of target quality, allocation history, and hysteresis timers.
+#[derive(Debug, Clone)]
+struct VideoSlotState {
+    mid: Mid,
+    assigned_track: Option<Arc<TrackId>>,
+    max_height: u32,
+    last_assigned_bitrate: Option<f64>,
+    last_rid_switch_at: Option<Instant>,
+}
+
+/// The main downstream allocator that manages multiple tracks and media slots.
+/// It consumes RTP packets from publishers and redistributes them to subscribers
+/// based on available bandwidth and per-subscriber constraints.
 pub struct DownstreamAllocator {
     streams: SelectAll<TrackStream>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<MidSlot>,
-    video_slots: Vec<MidSlot>,
+    video_slots: Vec<VideoSlotState>,
 }
 
 impl DownstreamAllocator {
@@ -118,15 +139,146 @@ impl DownstreamAllocator {
     }
 
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
-        let slot = MidSlot {
-            mid,
-            assigned_track: None,
-        };
         match kind {
-            MediaKind::Audio => self.audio_slots.push(slot),
-            MediaKind::Video => self.video_slots.push(slot),
+            MediaKind::Audio => {
+                self.audio_slots.push(MidSlot {
+                    mid,
+                    assigned_track: None,
+                });
+            }
+            MediaKind::Video => {
+                self.video_slots.push(VideoSlotState {
+                    mid,
+                    assigned_track: None,
+                    max_height: 720,
+                    last_assigned_bitrate: None,
+                    last_rid_switch_at: None,
+                });
+            }
         }
         self.rebalance_allocations();
+    }
+
+    /// Allows dynamic client-side adaptation (e.g. when resizing a video element).
+    pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
+        if let Some(slot) = self.video_slots.iter_mut().find(|s| s.mid == mid) {
+            slot.max_height = max_height;
+        }
+    }
+
+    pub fn desired_bitrate(&self) -> u64 {
+        let mut desired_bitrate = 0;
+        for slot in &self.video_slots {
+            let Some(track_id) = &slot.assigned_track else {
+                continue;
+            };
+            let Some(state) = self.tracks.get(track_id) else {
+                continue;
+            };
+
+            // simulcast is already sorted based on highest quality first
+            let Some(layer) = state.track.simulcast.first() else {
+                continue;
+            };
+
+            let bitrate = layer.bitrate.load(Ordering::Relaxed);
+            desired_bitrate = bitrate;
+        }
+
+        desired_bitrate
+    }
+
+    /// Applies TWCC feedback to perform bandwidth allocation across all active video slots.
+    /// This implements a greedy bin-packing strategy:
+    /// - Slots are sorted by priority (max_height)
+    /// - Each slot selects the highest simulcast layer that fits in the remaining bandwidth
+    /// - Hysteresis is used to avoid rapid switching
+    pub fn handle_bwe(&mut self, bwe: BweKind) -> Option<u64> {
+        let BweKind::Twcc(available_bandwidth) = bwe else {
+            return None; // only respond to TWCC-based feedback
+        };
+        let available_bandwidth = available_bandwidth.as_f64();
+
+        tracing::debug!("current downstream bitrate available: {available_bandwidth}");
+
+        // Sort slots by descending priority (higher max_height first)
+        self.video_slots
+            .sort_by(|a, b| b.max_height.cmp(&a.max_height));
+
+        let mut remaining_bw = available_bandwidth;
+        let now = Instant::now();
+
+        for slot in &mut self.video_slots {
+            let Some(track_id) = &slot.assigned_track else {
+                continue;
+            };
+            let Some(state) = self.tracks.get(track_id) else {
+                continue;
+            };
+
+            // Pick the highest bitrate layer that fits in the remaining bandwidth
+            let mut chosen = None;
+            // "f" -> "h" -> "q"
+            for layer in &state.track.simulcast {
+                let bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
+                if bitrate <= remaining_bw {
+                    chosen = Some((layer.rid, bitrate));
+                    break;
+                }
+            }
+
+            // If nothing fits, pause the track
+            let Some((target_rid, bitrate)) = chosen else {
+                state.update(|c| c.paused = true);
+                slot.last_assigned_bitrate = None;
+                continue;
+            };
+
+            // Apply amplitude + temporal hysteresis
+            let too_soon = slot
+                .last_rid_switch_at
+                .map(|t| now.duration_since(t) < Duration::from_secs(2))
+                .unwrap_or(false);
+
+            let big_jump = match slot.last_assigned_bitrate {
+                Some(prev) if bitrate > prev => bitrate > prev * 120.0 / 100.0, // increase >20%
+                Some(prev) if bitrate < prev => bitrate < prev * 80.0 / 100.0,  // decrease >20%
+                _ => true,
+            };
+
+            if !too_soon && big_jump {
+                state.update(|c| {
+                    c.paused = false;
+                    c.target_rid = target_rid;
+                });
+
+                slot.last_assigned_bitrate = Some(bitrate);
+                slot.last_rid_switch_at = Some(now);
+                remaining_bw -= bitrate;
+
+                tracing::info!(
+                    mid = %slot.mid,
+                    bitrate,
+                    rid = ?target_rid,
+                    remaining_bw,
+                    "updated video allocation"
+                );
+            } else {
+                // keep existing allocation under hysteresis window
+                if let Some(prev) = slot.last_assigned_bitrate {
+                    remaining_bw -= prev;
+                }
+                tracing::debug!(
+                    mid = %slot.mid,
+                    rid = ?state.current().target_rid,
+                    "kept current layer (hysteresis active)"
+                );
+            }
+        }
+
+        let total_bitrate = available_bandwidth - remaining_bw;
+        tracing::debug!("remaining bandwidth allocation: {remaining_bw}");
+        Some(total_bitrate as u64)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
@@ -146,36 +298,6 @@ impl DownstreamAllocator {
         };
 
         state.request_keyframe();
-    }
-
-    pub fn handle_bwe(&self, bwe: BweKind) {
-        let BweKind::Twcc(available_bandwidth) = bwe else {
-            // ignore remb, only use twcc feedback
-            return;
-        };
-
-        tracing::debug!("current downstream bitrate available: {available_bandwidth}");
-
-        for slot in &self.video_slots {
-            let Some(track_id) = slot.assigned_track.as_ref() else {
-                continue;
-            };
-
-            let Some(state) = self.tracks.get(track_id) else {
-                continue;
-            };
-
-            let cfg = state.current();
-
-            let Some(receiver) = state
-                .track
-                .simulcast
-                .iter()
-                .find(|s| s.rid == cfg.target_rid)
-            else {
-                continue;
-            };
-        }
     }
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
@@ -259,12 +381,22 @@ impl DownstreamAllocator {
         for slot in &mut self.video_slots {
             if let Some(track_id) = &slot.assigned_track {
                 if !self.tracks.contains_key(track_id) {
-                    Self::perform_unassignment(&mut self.tracks, slot);
+                    let mut tmp = MidSlot {
+                        mid: slot.mid,
+                        assigned_track: slot.assigned_track.clone(),
+                    };
+                    Self::perform_unassignment(&mut self.tracks, &mut tmp);
+                    slot.assigned_track = None;
                 }
             }
             if slot.assigned_track.is_none() {
                 if let Some(track_id) = unassigned_tracks.pop() {
-                    Self::perform_assignment(&mut self.tracks, slot, &track_id);
+                    let mut tmp = MidSlot {
+                        mid: slot.mid,
+                        assigned_track: None,
+                    };
+                    Self::perform_assignment(&mut self.tracks, &mut tmp, &track_id);
+                    slot.assigned_track = Some(track_id);
                 }
             }
         }
@@ -279,7 +411,12 @@ impl DownstreamAllocator {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
             state.update(|c| c.paused = false);
-            tracing::info!(%track_id, mid = %slot.mid, kind = ?state.track.meta.kind, "Assigned track to slot");
+            tracing::info!(
+                %track_id,
+                mid = %slot.mid,
+                kind = ?state.track.meta.kind,
+                "Assigned track to slot"
+            );
         }
     }
 
@@ -288,7 +425,12 @@ impl DownstreamAllocator {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
                 state.update(|c| c.paused = true);
-                tracing::info!(%track_id, mid = %slot.mid, kind = ?state.track.meta.kind, "Unassigned track from slot");
+                tracing::info!(
+                    %track_id,
+                    mid = %slot.mid,
+                    kind = ?state.track.meta.kind,
+                    "Unassigned track from slot"
+                );
             }
         }
     }
@@ -351,7 +493,8 @@ impl DownstreamAllocator {
                     }
                 }
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
 

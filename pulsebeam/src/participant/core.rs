@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pulsebeam_runtime::net;
+use str0m::bwe::Bitrate;
 use str0m::media::Mid;
 use str0m::{
     Event, Input, Output, Rtc,
@@ -152,7 +153,19 @@ impl ParticipantCore {
             Event::MediaAdded(media) => self.handle_media_added(media),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
             Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
-            Event::EgressBitrateEstimate(bwe) => self.downstream_allocator.handle_bwe(bwe),
+            Event::EgressBitrateEstimate(bwe) => {
+                let Some(current) = self.downstream_allocator.handle_bwe(bwe) else {
+                    return;
+                };
+
+                self.rtc.bwe().set_current_bitrate(Bitrate::bps(current));
+
+                // TODO: probably throttle this desired bitrate probe?
+                let desired_bitrate = self.downstream_allocator.desired_bitrate();
+                self.rtc
+                    .bwe()
+                    .set_desired_bitrate(Bitrate::bps(desired_bitrate));
+            }
             e => {
                 tracing::warn!("unhandled event: {e:?}");
             }
