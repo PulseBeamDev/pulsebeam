@@ -1,7 +1,6 @@
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -492,6 +491,7 @@ impl DownstreamAllocator {
 
             let mut local_generation = u64::MAX;
             let mut active_index: Option<usize> = None;
+            let mut waiting_keyframe = true;
 
             loop {
                 // Get the latest configuration.
@@ -511,6 +511,7 @@ impl DownstreamAllocator {
                         let receiver = &mut track.simulcast[new_index];
                         receiver.channel.reset();
                         receiver.request_keyframe();
+                        waiting_keyframe = true;
                     } else {
                         // The RID in the config is invalid, so we must pause until we get a valid one.
                         active_index = None;
@@ -544,7 +545,13 @@ impl DownstreamAllocator {
                     // Branch 2: A new RTP packet arrived on the active layer.
                     res = receiver.channel.recv() => {
                         match res {
-                            Ok(pkt) => yield (meta.clone(), pkt),
+                            Ok(pkt) => {
+                                if waiting_keyframe && !is_keyframe(&pkt.value) {
+                                    continue;
+                                }
+                                waiting_keyframe = false;
+                                yield (meta.clone(), pkt)
+                            },
                             Err(spmc::RecvError::Lagged(count)) => {
                                 tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe for recovery");
                                 receiver.request_keyframe();
@@ -562,70 +569,99 @@ impl DownstreamAllocator {
     }
 }
 
-fn is_keyframe(rtp: &RtpPacket) -> bool {
-    // A mapping of payload types to codecs would be ideal here,
-    // but for now we can inspect the payload directly. This is a common approach.
-
-    if rtp.payload.is_empty() {
-        return false;
-    }
-
-    // H.264 Keyframe Check
-    // https://datatracker.ietf.org/doc/html/rfc6184#section-5.2
-    // We look for NAL unit types that indicate an I-frame.
-    // Type 5 (IDR) is a guaranteed keyframe.
-    // Type 7 (SPS) and 8 (PPS) are parameter sets that precede keyframes.
-    let first_nal_byte = rtp.payload[0];
-    let nal_unit_type = first_nal_byte & 0x1F;
-    return nal_unit_type == 5 || nal_unit_type == 7;
-
-    // TODO: add VP8 and VP9 support
-    // Heuristics for common video codecs in WebRTC.
-    match *rtp.header.payload_type.deref() {
-        // VP8 Keyframe Check
-        // https://datatracker.ietf.org/doc/html/rfc6386#section-9.1
-        // The first byte of the payload describes the frame.
-        // A keyframe (I-frame) has the "frame type" bit (P) set to 0.
-        // Bit structure: | P | X | R | N | S | PartID... |
-        // So, we check if the first bit of the first byte is 0.
-        pt if (96..=102).contains(&pt) => {
-            // Typical dynamic PT range for VP8
-            let first_byte = rtp.payload[0];
-            let is_keyframe = (first_byte & 0b0000_0001) == 0;
-            return is_keyframe && rtp.header.marker; // For VP8, a keyframe can be fragmented.
-        }
-
-        // H.264 Keyframe Check
-        // https://datatracker.i-etf.org/doc/html/rfc6184#section-5.2
-        // We look for NAL unit types that indicate an I-frame.
-        // Type 5 (IDR) is a guaranteed keyframe.
-        // Type 7 (SPS) and 8 (PPS) are parameter sets that precede keyframes.
-        pt if (103..=110).contains(&pt) => {
-            // Typical dynamic PT range for H.264
-            let first_nal_byte = rtp.payload[0];
-            let nal_unit_type = first_nal_byte & 0x1F;
-            return nal_unit_type == 5 || nal_unit_type == 7;
-        }
-
-        // VP9 Keyframe Check
-        // https://www.w3.org/TR/webrtc-vp9/#rtp-payload-format
-        // Bit structure of first byte: | I | P | L | F | B | E | V | Z |
-        // The 'I' bit (most significant bit) is 1 for a keyframe.
-        pt if (111..=118).contains(&pt) => {
-            // Typical dynamic PT range for VP9
-            let first_byte = rtp.payload[0];
-            let is_keyframe = (first_byte & 0b1000_0000) != 0;
-            return is_keyframe;
-        }
-
-        _ => false,
-    }
-}
-
 impl Stream for DownstreamAllocator {
     type Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.streams.poll_next_unpin(cx)
     }
+}
+
+pub fn is_keyframe(rtp: &RtpPacket) -> bool {
+    let payload = &rtp.payload;
+    if payload.is_empty() {
+        return false;
+    }
+
+    let pt = rtp.header.payload_type;
+
+    // --- Try to infer codec based on dynamic PT ranges or payload patterns ---
+    if looks_like_h264(payload) {
+        return is_h264_keyframe(payload);
+    } else if looks_like_vp8(payload) {
+        return is_vp8_keyframe(payload);
+    } else if looks_like_vp9(payload) {
+        return is_vp9_keyframe(payload);
+    }
+
+    // Fallback by heuristic on PT ranges
+    match *pt {
+        96..=102 => is_vp8_keyframe(payload),
+        103..=110 => is_h264_keyframe(payload),
+        111..=118 => is_vp9_keyframe(payload),
+        _ => false,
+    }
+}
+
+fn looks_like_h264(payload: &[u8]) -> bool {
+    // Simple heuristic: NAL unit type 1–23 or FU-A (28)
+    let nal_type = payload[0] & 0x1F;
+    (1..=23).contains(&nal_type) || nal_type == 28
+}
+
+fn is_h264_keyframe(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+
+    let nal_type = payload[0] & 0x1F;
+
+    match nal_type {
+        5 | 7 | 8 => true, // IDR or SPS/PPS
+        28 => {
+            // FU-A fragmentation unit
+            if payload.len() < 2 {
+                return false;
+            }
+            let fu_header = payload[1];
+            let start_bit = fu_header & 0x80 != 0;
+            if start_bit {
+                let reconstructed_nal_type = fu_header & 0x1F;
+                return reconstructed_nal_type == 5; // IDR fragment
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn looks_like_vp8(payload: &[u8]) -> bool {
+    // VP8 has frame descriptor: X bit is bit 7, PartID in lower bits
+    // P bit is bit 0 (inverted meaning: 0 = keyframe)
+    payload.len() >= 1 && (payload[0] & 0xC0) == 0
+}
+
+fn is_vp8_keyframe(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    let first_byte = payload[0];
+    // P bit (bit 0): 0 = keyframe, 1 = interframe
+    (first_byte & 0x01) == 0
+}
+
+fn looks_like_vp9(payload: &[u8]) -> bool {
+    // VP9 payload descriptor starts with |I|P|L|F|B|E|V|Z|
+    // High bit (I) often set to 1
+    payload.len() >= 1 && (payload[0] & 0xE0) == 0x80
+}
+
+fn is_vp9_keyframe(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    let first_byte = payload[0];
+    // P bit (bit 6): 0 = keyframe, 1 = interframe
+    let p_bit = (first_byte >> 6) & 0x01;
+    p_bit == 0
 }
