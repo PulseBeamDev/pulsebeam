@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use str0m::bwe::BweKind;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
 use str0m::rtp::RtpPacket;
 use tokio::sync::watch;
@@ -141,6 +142,8 @@ impl DownstreamAllocator {
 
         state.request_keyframe();
     }
+
+    pub fn handle_bwe(&self, bwe: BweKind) {}
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
         let assigned_mid = self.tracks.get(&meta.id).and_then(|s| s.assigned_mid);
