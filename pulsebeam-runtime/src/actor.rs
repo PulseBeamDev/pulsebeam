@@ -260,10 +260,9 @@ where
 
     let monitor = A::monitor();
     let actor_id = a.meta().clone();
-    let actor_type = type_name_of_val(&a);
     let runnable = tracing::Instrument::instrument(
         monitor.instrument(run(a, ctx)),
-        tracing::span!(tracing::Level::INFO, "run", %actor_id, %actor_type),
+        tracing::span!(tracing::Level::INFO, "run", %actor_id),
     );
     let join = tokio::spawn(runnable);
     let abort_handle = join.abort_handle();
