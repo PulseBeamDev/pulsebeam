@@ -491,7 +491,7 @@ impl DownstreamAllocator {
 
             let mut local_generation = u64::MAX;
             let mut active_index: Option<usize> = None;
-            let mut waiting_keyframe = true;
+            // let mut waiting_keyframe = true;
 
             loop {
                 // Get the latest configuration.
@@ -511,7 +511,7 @@ impl DownstreamAllocator {
                         let receiver = &mut track.simulcast[new_index];
                         receiver.channel.reset();
                         receiver.request_keyframe();
-                        waiting_keyframe = true;
+                        // waiting_keyframe = true;
                     } else {
                         // The RID in the config is invalid, so we must pause until we get a valid one.
                         active_index = None;
@@ -546,10 +546,10 @@ impl DownstreamAllocator {
                     res = receiver.channel.recv() => {
                         match res {
                             Ok(pkt) => {
-                                if waiting_keyframe && !is_keyframe(&pkt.value) {
-                                    continue;
-                                }
-                                waiting_keyframe = false;
+                                // if waiting_keyframe && !is_keyframe(&pkt.value) {
+                                //     continue;
+                                // }
+                                // waiting_keyframe = false;
                                 yield (meta.clone(), pkt)
                             },
                             Err(spmc::RecvError::Lagged(count)) => {
