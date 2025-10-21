@@ -1,8 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use async_stream::stream;
-use futures::Stream;
-use futures_concurrency::stream::Merge;
 use str0m::{media::Rid, rtp::RtpPacket};
 use tokio::sync::watch;
 
@@ -73,9 +70,8 @@ impl SimulcastSender {
             return None;
         }
 
-        let Some(ref update) = *self.keyframe_requests.borrow_and_update() else {
-            return None;
-        };
+        let binding = self.keyframe_requests.borrow_and_update();
+        let update = binding.as_ref()?;
 
         let res = if let Some(last) = self.last_keyframe_requested_at {
             if last.elapsed() < Duration::from_secs(1) {
