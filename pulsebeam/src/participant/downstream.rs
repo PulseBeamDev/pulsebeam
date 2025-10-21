@@ -143,7 +143,14 @@ impl DownstreamAllocator {
         state.request_keyframe();
     }
 
-    pub fn handle_bwe(&self, bwe: BweKind) {}
+    pub fn handle_bwe(&self, bwe: BweKind) {
+        let BweKind::Twcc(bitrate) = bwe else {
+            // ignore remb, only use twcc feedback
+            return;
+        };
+
+        tracing::debug!("current downstream bitrate available: {bitrate}");
+    }
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
         let assigned_mid = self.tracks.get(&meta.id).and_then(|s| s.assigned_mid);
