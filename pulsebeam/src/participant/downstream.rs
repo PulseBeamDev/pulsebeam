@@ -3,6 +3,7 @@ use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use str0m::bwe::BweKind;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
@@ -25,7 +26,7 @@ struct StreamConfig {
 struct AudioLevel(i32);
 
 struct TrackState {
-    meta: Arc<TrackMeta>,
+    track: TrackReceiver,
     control_tx: watch::Sender<StreamConfig>,
     audio_level: AudioLevel,
     assigned_mid: Option<Mid>,
@@ -97,7 +98,7 @@ impl DownstreamAllocator {
         self.tracks.insert(
             track.meta.id.clone(),
             TrackState {
-                meta: track.meta,
+                track,
                 control_tx,
                 audio_level: AudioLevel(-127),
                 assigned_mid: None,
@@ -150,6 +151,12 @@ impl DownstreamAllocator {
         };
 
         tracing::debug!("current downstream bitrate available: {bitrate}");
+        for state in self.tracks.values() {
+            for simulcast in &state.track.simulcast {
+                let bitrate = simulcast.bitrate.load(Ordering::Relaxed);
+                tracing::debug!("estimated bitrate: {:?}={}", simulcast.rid, bitrate);
+            }
+        }
     }
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
@@ -182,7 +189,7 @@ impl DownstreamAllocator {
         let mut audio_tracks: Vec<_> = self
             .tracks
             .iter()
-            .filter(|(_, state)| state.meta.kind == MediaKind::Audio)
+            .filter(|(_, state)| state.track.meta.kind == MediaKind::Audio)
             .map(|(id, state)| (id.clone(), state.audio_level))
             .collect();
         audio_tracks.sort_unstable_by_key(|k| k.1);
@@ -225,7 +232,7 @@ impl DownstreamAllocator {
             .tracks
             .iter()
             .filter(|(_, state)| {
-                state.meta.kind == MediaKind::Video && state.assigned_mid.is_none()
+                state.track.meta.kind == MediaKind::Video && state.assigned_mid.is_none()
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -253,7 +260,7 @@ impl DownstreamAllocator {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
             state.update(|c| c.paused = false);
-            tracing::info!(%track_id, mid = %slot.mid, kind = ?state.meta.kind, "Assigned track to slot");
+            tracing::info!(%track_id, mid = %slot.mid, kind = ?state.track.meta.kind, "Assigned track to slot");
         }
     }
 
@@ -262,7 +269,7 @@ impl DownstreamAllocator {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
                 state.update(|c| c.paused = true);
-                tracing::info!(%track_id, mid = %slot.mid, kind = ?state.meta.kind, "Unassigned track from slot");
+                tracing::info!(%track_id, mid = %slot.mid, kind = ?state.track.meta.kind, "Unassigned track from slot");
             }
         }
     }

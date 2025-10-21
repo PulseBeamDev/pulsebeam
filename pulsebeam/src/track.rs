@@ -235,20 +235,21 @@ impl BandwidthEstimator {
     }
 
     pub fn update(&mut self, pkt_bytes: usize) {
-        self.interval_bytes += pkt_bytes + 40; // rough IPv6 header estimate
+        self.interval_bytes += pkt_bytes + 50; // rough IPv6 header estimate
 
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update);
         if elapsed >= Duration::from_millis(100) {
-            // instantaneous bps over interval
+            // instantaneous bps
             let instant_bps = (self.interval_bytes as f64 * 8.0) / elapsed.as_secs_f64();
             self.interval_bytes = 0;
 
-            // EWMA smoothing (long-term)
-            self.estimate = 0.97 * self.estimate + 0.03 * instant_bps;
+            // EWMA smoothing for long-term average
+            // alpha smaller => faster reaction to bursts
+            self.estimate = 0.90 * self.estimate + 0.10 * instant_bps;
 
-            // store conservative estimate in shared atomic
-            let safe_bps = (self.estimate * 0.85) as u32;
+            // add 15% headroom for bursts
+            let safe_bps = (self.estimate * 1.15) as u32;
             self.shared.store(safe_bps, Ordering::Relaxed);
 
             self.last_update = now;
