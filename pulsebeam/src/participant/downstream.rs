@@ -1,6 +1,7 @@
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,6 +31,7 @@ struct StreamConfig {
 struct AudioLevel(i32);
 
 /// Tracks the allocation and control state for one published track.
+#[derive(Debug)]
 struct TrackState {
     track: TrackReceiver,
     control_tx: watch::Sender<StreamConfig>,
@@ -40,14 +42,13 @@ struct TrackState {
 impl TrackState {
     fn update<F>(&self, update_fn: F)
     where
-        F: FnOnce(&mut StreamConfig),
+        F: FnOnce(&mut StreamConfig) -> bool,
     {
         self.control_tx.send_if_modified(|config| {
-            let old = *config;
-            update_fn(config);
-
-            if old != *config {
+            let changed = update_fn(config);
+            if changed {
                 config.generation = config.generation.wrapping_add(1);
+                tracing::debug!(?self.track.meta.id, "track state updated: {config:?}");
                 true
             } else {
                 false
@@ -60,10 +61,22 @@ impl TrackState {
     }
 
     fn request_keyframe(&self) {
-        self.control_tx.send_if_modified(|config| {
-            config.generation = config.generation.wrapping_add(1);
-            true
-        });
+        let config = self.current();
+        if config.paused {
+            return;
+        }
+
+        // Find the SimulcastReceiver for the currently active RID.
+        if let Some(receiver) = self
+            .track
+            .simulcast
+            .iter()
+            .find(|r| r.rid == config.target_rid)
+        {
+            // Call the keyframe request method on the receiver itself,
+            // which will signal the upstream track.
+            receiver.request_keyframe();
+        }
     }
 }
 
@@ -273,8 +286,10 @@ impl DownstreamAllocator {
 
             if new_paused != state.current().paused || new_rid != state.current().target_rid {
                 state.update(|c| {
+                    let changed = c.paused != new_paused || c.target_rid != new_rid;
                     c.paused = new_paused;
                     c.target_rid = new_rid;
+                    changed
                 });
                 slot.last_switch_at = Some(now);
             }
@@ -425,7 +440,11 @@ impl DownstreamAllocator {
         if let Some(state) = tracks.get_mut(track_id) {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
-            state.update(|c| c.paused = false);
+            state.update(|c| {
+                let changed = c.paused != false;
+                c.paused = false;
+                changed
+            });
             tracing::info!(
                 %track_id,
                 mid = %slot.mid,
@@ -439,7 +458,11 @@ impl DownstreamAllocator {
         if let Some(track_id) = slot.assigned_track.take() {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
-                state.update(|c| c.paused = true);
+                state.update(|c| {
+                    let changed = c.paused != true;
+                    c.paused = true;
+                    changed
+                });
                 tracing::info!(
                     %track_id,
                     mid = %slot.mid,
@@ -467,49 +490,135 @@ impl DownstreamAllocator {
                 simulcast.iter().position(|s| s.rid == rid)
             };
 
-            let Some(mut active_index) = find_index_for_rid(rx.borrow().target_rid, &track.simulcast) else {
-                return;
-            };
-
-            let mut local_generation = 0;
-            rx.borrow_and_update();
+            let mut local_generation = u64::MAX;
+            let mut active_index: Option<usize> = None;
 
             loop {
-                if rx.borrow().paused {
-                    if rx.changed().await.is_err() { break; }
-                } else {
-                    let receiver = &mut track.simulcast[active_index];
-                    tokio::select! {
-                        biased;
-                        res = rx.changed() => if res.is_err() { break; },
-                        res = receiver.channel.recv() => match res {
+                // Get the latest configuration.
+                let config = *rx.borrow();
+
+                // Check if the configuration has changed since the last time we checked.
+                if local_generation != config.generation {
+                    local_generation = config.generation;
+                    tracing::debug!(?track.meta.id, "Track state applied: {config:?}");
+
+                    if config.paused {
+                        active_index = None;
+                    } else if let Some(new_index) = find_index_for_rid(config.target_rid, &track.simulcast) {
+                        // The RID is valid, so we have a new active layer.
+                        active_index = Some(new_index);
+                        // A layer switch requires a new keyframe.
+                        let receiver = &mut track.simulcast[new_index];
+                        receiver.channel.reset();
+                        receiver.request_keyframe();
+                    } else {
+                        // The RID in the config is invalid, so we must pause until we get a valid one.
+                        active_index = None;
+                        tracing::warn!(?track.meta.id, ?config.target_rid, "Invalid target_rid, pausing stream");
+                    }
+                }
+                
+                // If we are paused or have an invalid RID, we have no active layer.
+                // In this state, our only job is to wait for the next configuration change.
+                if active_index.is_none() {
+                    if rx.changed().await.is_err() {
+                        break; // Channel closed, end the stream.
+                    }
+                    continue; // Loop again to process the new config.
+                }
+
+                // If we are here, we have an active layer to stream from.
+                let receiver = &mut track.simulcast[active_index.unwrap()];
+
+                // We must simultaneously listen for new packets and for the next config change.
+                tokio::select! {
+                    biased;
+
+                    // Branch 1: The configuration changed again.
+                    res = rx.changed() => {
+                        if res.is_err() { break; }
+                        // Do nothing here. The loop will restart and the logic at the top
+                        // will handle applying the new configuration.
+                    },
+
+                    // Branch 2: A new RTP packet arrived on the active layer.
+                    res = receiver.channel.recv() => {
+                        match res {
                             Ok(pkt) => yield (meta.clone(), pkt),
                             Err(spmc::RecvError::Lagged(count)) => {
-                                tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Dropping packets due to receiver lag");
+                                tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe for recovery");
                                 receiver.request_keyframe();
                             },
                             Err(spmc::RecvError::Closed) => {
                                 tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, "Stopping stream; channel closed");
                                 break;
                             },
-                        },
-                    }
-                }
-                let config = rx.borrow_and_update();
-                if local_generation != config.generation {
-                    local_generation = config.generation;
-                    if let Some(new_index) = find_index_for_rid(config.target_rid, &track.simulcast) {
-                        active_index = new_index;
-                    }
-                    if !config.paused {
-                        let receiver = &mut track.simulcast[active_index];
-                        receiver.channel.reset();
-                        receiver.request_keyframe();
+                        }
                     }
                 }
             }
         }
         .boxed()
+    }
+}
+
+fn is_keyframe(rtp: &RtpPacket) -> bool {
+    // A mapping of payload types to codecs would be ideal here,
+    // but for now we can inspect the payload directly. This is a common approach.
+
+    if rtp.payload.is_empty() {
+        return false;
+    }
+
+    // H.264 Keyframe Check
+    // https://datatracker.ietf.org/doc/html/rfc6184#section-5.2
+    // We look for NAL unit types that indicate an I-frame.
+    // Type 5 (IDR) is a guaranteed keyframe.
+    // Type 7 (SPS) and 8 (PPS) are parameter sets that precede keyframes.
+    let first_nal_byte = rtp.payload[0];
+    let nal_unit_type = first_nal_byte & 0x1F;
+    return nal_unit_type == 5 || nal_unit_type == 7;
+
+    // TODO: add VP8 and VP9 support
+    // Heuristics for common video codecs in WebRTC.
+    match *rtp.header.payload_type.deref() {
+        // VP8 Keyframe Check
+        // https://datatracker.ietf.org/doc/html/rfc6386#section-9.1
+        // The first byte of the payload describes the frame.
+        // A keyframe (I-frame) has the "frame type" bit (P) set to 0.
+        // Bit structure: | P | X | R | N | S | PartID... |
+        // So, we check if the first bit of the first byte is 0.
+        pt if (96..=102).contains(&pt) => {
+            // Typical dynamic PT range for VP8
+            let first_byte = rtp.payload[0];
+            let is_keyframe = (first_byte & 0b0000_0001) == 0;
+            return is_keyframe && rtp.header.marker; // For VP8, a keyframe can be fragmented.
+        }
+
+        // H.264 Keyframe Check
+        // https://datatracker.i-etf.org/doc/html/rfc6184#section-5.2
+        // We look for NAL unit types that indicate an I-frame.
+        // Type 5 (IDR) is a guaranteed keyframe.
+        // Type 7 (SPS) and 8 (PPS) are parameter sets that precede keyframes.
+        pt if (103..=110).contains(&pt) => {
+            // Typical dynamic PT range for H.264
+            let first_nal_byte = rtp.payload[0];
+            let nal_unit_type = first_nal_byte & 0x1F;
+            return nal_unit_type == 5 || nal_unit_type == 7;
+        }
+
+        // VP9 Keyframe Check
+        // https://www.w3.org/TR/webrtc-vp9/#rtp-payload-format
+        // Bit structure of first byte: | I | P | L | F | B | E | V | Z |
+        // The 'I' bit (most significant bit) is 1 for a keyframe.
+        pt if (111..=118).contains(&pt) => {
+            // Typical dynamic PT range for VP9
+            let first_byte = rtp.payload[0];
+            let is_keyframe = (first_byte & 0b1000_0000) != 0;
+            return is_keyframe;
+        }
+
+        _ => false,
     }
 }
 
