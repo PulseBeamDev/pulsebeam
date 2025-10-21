@@ -1,7 +1,17 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
-use str0m::{media::Rid, rtp::RtpPacket};
+use str0m::{
+    media::{MediaKind, Rid},
+    rtp::RtpPacket,
+};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use pulsebeam_runtime::sync::spmc;
 
@@ -27,6 +37,9 @@ pub struct SimulcastReceiver {
     pub channel: spmc::Receiver<RtpPacket>,
     /// Used to request a keyframe from the sender.
     pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
+
+    /// Receiver only reads. The publisher will estimate this.
+    pub bitrate: Arc<AtomicU32>,
 }
 
 impl SimulcastReceiver {
@@ -52,11 +65,13 @@ impl SimulcastReceiver {
 #[derive(Debug)]
 pub struct SimulcastSender {
     pub rid: Option<Rid>,
-    pub channel: spmc::Sender<RtpPacket>,
     /// Used to receive keyframe requests from the receiver.
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
 
     pub last_keyframe_requested_at: Option<tokio::time::Instant>,
+
+    channel: spmc::Sender<RtpPacket>,
+    bwe: BandwidthEstimator,
 }
 
 impl SimulcastSender {
@@ -85,6 +100,11 @@ impl SimulcastSender {
         self.last_keyframe_requested_at = Some(tokio::time::Instant::now());
         res
     }
+
+    pub fn send(&mut self, pkt: RtpPacket) {
+        self.bwe.update(pkt.payload.len() + pkt.header.header_len);
+        self.channel.send(pkt);
+    }
 }
 
 /// Sender half of a track (typically owned by publisher/participant)
@@ -94,18 +114,15 @@ pub struct TrackSender {
 }
 
 impl TrackSender {
-    pub fn send(&self, rid: Option<&Rid>, pkt: RtpPacket) {
-        if let Some(sender) = self
+    pub fn send(&mut self, rid: Option<&Rid>, pkt: RtpPacket) {
+        let sender = self
             .simulcast
-            .iter()
+            .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
-            .or_else(|| self.simulcast.first())
-        {
-            tracing::trace!(?self.meta, ?pkt, ?rid, ?sender, "sent to track");
-            sender.channel.send(pkt);
-        } else {
-            panic!("expected sender to always available");
-        }
+            .expect("expected sender to always available");
+
+        tracing::trace!(?self.meta, ?pkt, ?rid, ?sender, "sent to track");
+        sender.send(pkt);
     }
 }
 
@@ -154,11 +171,26 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         let (tx, rx) = spmc::channel(capacity);
         let (keyframe_tx, keyframe_rx) = watch::channel(None);
 
+        let bitrate = match (meta.kind, rid) {
+            (MediaKind::Audio, _) => 64_000,
+            (MediaKind::Video, None) => 1_200_000,
+            (MediaKind::Video, Some(rid)) if rid.starts_with("f") => 1_200_000,
+            (MediaKind::Video, Some(rid)) if rid.starts_with("h") => 500_000,
+            (MediaKind::Video, Some(rid)) if rid.starts_with("q") => 200_000,
+            (MediaKind::Video, Some(rid)) => {
+                tracing::warn!("use default bitrate due to unsupported rid: {rid}");
+                1_200_000
+            }
+        };
+        let bitrate = Arc::new(AtomicU32::new(bitrate));
+
+        let bwe = BandwidthEstimator::new(bitrate.clone());
         senders.push(SimulcastSender {
             rid,
             channel: tx,
             keyframe_requests: keyframe_rx,
             last_keyframe_requested_at: None,
+            bwe,
         });
 
         receivers.push(SimulcastReceiver {
@@ -166,6 +198,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             rid,
             channel: rx,
             keyframe_requester: keyframe_tx,
+            bitrate,
         });
     }
 
@@ -179,4 +212,46 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             simulcast: receivers,
         },
     )
+}
+
+/// Conservative long-term bandwidth estimator
+#[derive(Debug)]
+pub struct BandwidthEstimator {
+    last_update: Instant,
+    interval_bytes: usize,
+    estimate: f64, // EWMA in bps
+    shared: Arc<AtomicU32>,
+}
+
+impl BandwidthEstimator {
+    pub fn new(shared: Arc<AtomicU32>) -> Self {
+        let initial_bps = shared.load(Ordering::Relaxed);
+        Self {
+            last_update: Instant::now(),
+            interval_bytes: 0,
+            estimate: initial_bps as f64,
+            shared,
+        }
+    }
+
+    pub fn update(&mut self, pkt_bytes: usize) {
+        self.interval_bytes += pkt_bytes + 40; // rough IPv6 header estimate
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update);
+        if elapsed >= Duration::from_millis(100) {
+            // instantaneous bps over interval
+            let instant_bps = (self.interval_bytes as f64 * 8.0) / elapsed.as_secs_f64();
+            self.interval_bytes = 0;
+
+            // EWMA smoothing (long-term)
+            self.estimate = 0.97 * self.estimate + 0.03 * instant_bps;
+
+            // store conservative estimate in shared atomic
+            let safe_bps = (self.estimate * 0.85) as u32;
+            self.shared.store(safe_bps, Ordering::Relaxed);
+
+            self.last_update = now;
+        }
+    }
 }
