@@ -141,19 +141,6 @@ impl TrackReceiver {
             .find(|s| s.rid.as_ref() == rid)
             .cloned()
     }
-
-    pub fn by_default(&mut self) -> Option<&mut SimulcastReceiver> {
-        for simulcast in &mut self.simulcast {
-            let Some(rid) = simulcast.rid else {
-                return Some(simulcast);
-            };
-
-            if rid.starts_with('f') {
-                return Some(simulcast);
-            }
-        }
-        None
-    }
 }
 
 /// Construct a new Track (returns sender + receiver).
@@ -175,14 +162,14 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         let (keyframe_tx, keyframe_rx) = watch::channel(None);
 
         let bitrate = match (meta.kind, rid) {
-            (MediaKind::Audio, _) => 64_000,
-            (MediaKind::Video, None) => 1_200_000,
-            (MediaKind::Video, Some(rid)) if rid.starts_with("f") => 1_200_000,
-            (MediaKind::Video, Some(rid)) if rid.starts_with("h") => 500_000,
-            (MediaKind::Video, Some(rid)) if rid.starts_with("q") => 200_000,
+            (MediaKind::Audio, _) => 64_000, // Reasonable audio starting point
+            (MediaKind::Video, None) => 500_000, // Start with medium quality
+            (MediaKind::Video, Some(rid)) if rid.starts_with("f") => 800_000, // Start lower than max
+            (MediaKind::Video, Some(rid)) if rid.starts_with("h") => 300_000, // Start lower
+            (MediaKind::Video, Some(rid)) if rid.starts_with("q") => 150_000, // Start higher than min
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");
-                1_200_000
+                500_000
             }
         };
         let bitrate = Arc::new(AtomicU64::new(bitrate));
@@ -224,16 +211,20 @@ pub struct BandwidthEstimator {
     interval_bytes: usize,
     estimate: f64, // EWMA in bps
     shared: Arc<AtomicU64>,
+    /// Number of samples collected (for warm-up period)
+    sample_count: u32,
 }
 
 impl BandwidthEstimator {
     pub fn new(shared: Arc<AtomicU64>) -> Self {
+        // Start with the provided initial estimate
         let initial_bps = shared.load(Ordering::Relaxed);
         Self {
             last_update: Instant::now(),
             interval_bytes: 0,
             estimate: initial_bps as f64,
             shared,
+            sample_count: 0,
         }
     }
 
@@ -242,20 +233,43 @@ impl BandwidthEstimator {
 
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update);
+
+        // Update every 100ms for faster reaction
         if elapsed >= Duration::from_millis(100) {
-            // instantaneous bps
+            // Instantaneous bps
             let instant_bps = (self.interval_bytes as f64 * 8.0) / elapsed.as_secs_f64();
             self.interval_bytes = 0;
+            self.sample_count += 1;
 
-            // EWMA smoothing for long-term average
-            // alpha smaller => faster reaction to bursts
-            self.estimate = 0.90 * self.estimate + 0.10 * instant_bps;
+            // EWMA smoothing with faster reaction
+            // - During warm-up (first 5 samples): react very fast (alpha=0.5)
+            // - After warm-up: moderate smoothing (alpha=0.25)
+            let alpha = if self.sample_count < 5 {
+                0.50 // React fast during warm-up
+            } else {
+                0.25 // Moderate smoothing after warm-up
+            };
 
-            // add 15% headroom for bursts
-            let safe_bps = (self.estimate * 1.15) as u64;
-            self.shared.store(safe_bps, Ordering::Relaxed);
+            if self.estimate == 0.0 {
+                // First sample - initialize with current value
+                self.estimate = instant_bps;
+            } else {
+                // EWMA: new_estimate = (1-alpha) * old + alpha * new
+                self.estimate = (1.0 - alpha) * self.estimate + alpha * instant_bps;
+            }
+
+            // Store the estimate directly without additional dampening
+            self.shared.store(self.estimate as u64, Ordering::Relaxed);
 
             self.last_update = now;
         }
+    }
+
+    /// Reset the estimator (e.g., when layer switches)
+    pub fn reset(&mut self) {
+        self.interval_bytes = 0;
+        self.sample_count = 0;
+        self.last_update = Instant::now();
+        // Keep the current estimate as a baseline
     }
 }

@@ -20,7 +20,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(true)
-        .with_ansi(true)
+        .with_ansi(false)
         .pretty()
         .init();
 

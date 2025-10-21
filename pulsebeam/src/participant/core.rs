@@ -81,6 +81,7 @@ impl ParticipantCore {
                 self.downstream_allocator.add_track(track_handle.clone());
             }
         }
+        self.update_desired_bitrate();
     }
 
     pub fn remove_available_tracks(
@@ -90,6 +91,7 @@ impl ParticipantCore {
         for track_id in tracks.keys() {
             self.downstream_allocator.remove_track(track_id);
         }
+        self.update_desired_bitrate();
     }
 
     /// Polls the inner RTC engine, handling all synchronous events and queueing async ones.
@@ -159,17 +161,21 @@ impl ParticipantCore {
                 };
 
                 self.rtc.bwe().set_current_bitrate(Bitrate::bps(current));
-
-                // TODO: probably throttle this desired bitrate probe?
-                let desired_bitrate = self.downstream_allocator.desired_bitrate();
-                self.rtc
-                    .bwe()
-                    .set_desired_bitrate(Bitrate::bps(desired_bitrate));
+                self.update_desired_bitrate();
             }
             e => {
                 tracing::warn!("unhandled event: {e:?}");
             }
         }
+    }
+
+    fn update_desired_bitrate(&mut self) {
+        // TODO: probably throttle this desired bitrate probe?
+        let desired_bitrate = self.downstream_allocator.desired_bitrate();
+        // 1.25 * desired_bitrate to give headroom to increase qualities
+        let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 4);
+        self.rtc.bwe().set_desired_bitrate(desired_bitrate);
+        tracing::debug!("desired_bitrate={desired_bitrate}");
     }
 
     fn handle_media_added(&mut self, media: MediaAdded) {

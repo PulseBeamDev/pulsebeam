@@ -81,8 +81,8 @@ struct VideoSlotState {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
     max_height: u32,
+    last_switch_at: Option<Instant>,
     last_assigned_bitrate: Option<f64>,
-    last_rid_switch_at: Option<Instant>,
 }
 
 /// The main downstream allocator that manages multiple tracks and media slots.
@@ -93,6 +93,7 @@ pub struct DownstreamAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<MidSlot>,
     video_slots: Vec<VideoSlotState>,
+    smoothed_bwe_bps: Option<f64>,
 }
 
 impl DownstreamAllocator {
@@ -102,6 +103,7 @@ impl DownstreamAllocator {
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
+            smoothed_bwe_bps: None,
         }
     }
 
@@ -151,8 +153,8 @@ impl DownstreamAllocator {
                     mid,
                     assigned_track: None,
                     max_height: 720,
+                    last_switch_at: None,
                     last_assigned_bitrate: None,
-                    last_rid_switch_at: None,
                 });
             }
         }
@@ -182,31 +184,36 @@ impl DownstreamAllocator {
             };
 
             let bitrate = layer.bitrate.load(Ordering::Relaxed);
-            desired_bitrate = bitrate;
+            desired_bitrate += bitrate;
         }
 
         desired_bitrate
     }
 
-    /// Applies TWCC feedback to perform bandwidth allocation across all active video slots.
-    /// This implements a greedy bin-packing strategy:
-    /// - Slots are sorted by priority (max_height)
-    /// - Each slot selects the highest simulcast layer that fits in the remaining bandwidth
-    /// - Hysteresis is used to avoid rapid switching
     pub fn handle_bwe(&mut self, bwe: BweKind) -> Option<u64> {
         let BweKind::Twcc(available_bandwidth) = bwe else {
-            return None; // only respond to TWCC-based feedback
+            return None;
         };
-        let available_bandwidth = available_bandwidth.as_f64();
+        let new_bwe = available_bandwidth.as_f64();
 
-        tracing::debug!("current downstream bitrate available: {available_bandwidth}");
+        // 1. Smooth the bandwidth estimate to absorb temporary fluctuations.
+        // This makes the system resilient to both noisy estimates and periods with no feedback.
+        let smoothed_bwe = match self.smoothed_bwe_bps {
+            Some(prev) => prev * 0.85 + new_bwe * 0.15,
+            None => new_bwe,
+        };
+        self.smoothed_bwe_bps = Some(smoothed_bwe);
 
-        // Sort slots by descending priority (higher max_height first)
+        // 2. Allocate based on a conservative portion of the stable, smoothed estimate.
+        let budget = smoothed_bwe * 0.90;
+        let mut total_allocated_bitrate = 0.0;
+        let now = Instant::now();
+
+        const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(8);
+        const UPGRADE_HEADROOM: f64 = 1.25; // Require 25% headroom to upgrade.
+
         self.video_slots
             .sort_by(|a, b| b.max_height.cmp(&a.max_height));
-
-        let mut remaining_bw = available_bandwidth;
-        let now = Instant::now();
 
         for slot in &mut self.video_slots {
             let Some(track_id) = &slot.assigned_track else {
@@ -216,69 +223,76 @@ impl DownstreamAllocator {
                 continue;
             };
 
-            // Pick the highest bitrate layer that fits in the remaining bandwidth
-            let mut chosen = None;
-            // "f" -> "h" -> "q"
-            for layer in &state.track.simulcast {
-                let bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
-                if bitrate <= remaining_bw {
-                    chosen = Some((layer.rid, bitrate));
-                    break;
+            let remaining_budget = budget - total_allocated_bitrate;
+            let prev_bitrate = slot.last_assigned_bitrate.unwrap_or(0.0);
+            let can_switch = slot
+                .last_switch_at
+                .is_none_or(|t| now.duration_since(t) > MIN_SWITCH_INTERVAL);
+
+            let mut new_rid = state.current().target_rid;
+            let mut new_bitrate = prev_bitrate;
+            let mut new_paused = state.current().paused;
+
+            // Find the highest-quality layer that fits within the remaining budget.
+            let best_fitting_layer = state
+                .track
+                .simulcast
+                .iter()
+                .find(|l| (l.bitrate.load(Ordering::Relaxed) as f64) <= remaining_budget);
+
+            if state.current().paused {
+                // Try to resume if a suitable layer is found.
+                if let Some(layer) = best_fitting_layer {
+                    new_paused = false;
+                    new_rid = layer.rid;
+                    new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
                 }
-            }
-
-            // If nothing fits, pause the track
-            let Some((target_rid, bitrate)) = chosen else {
-                state.update(|c| c.paused = true);
-                slot.last_assigned_bitrate = None;
-                continue;
-            };
-
-            // Apply amplitude + temporal hysteresis
-            let too_soon = slot
-                .last_rid_switch_at
-                .map(|t| now.duration_since(t) < Duration::from_secs(2))
-                .unwrap_or(false);
-
-            let big_jump = match slot.last_assigned_bitrate {
-                Some(prev) if bitrate > prev => bitrate > prev * 120.0 / 100.0, // increase >20%
-                Some(prev) if bitrate < prev => bitrate < prev * 80.0 / 100.0,  // decrease >20%
-                _ => true,
-            };
-
-            if !too_soon && big_jump {
-                state.update(|c| {
-                    c.paused = false;
-                    c.target_rid = target_rid;
-                });
-
-                slot.last_assigned_bitrate = Some(bitrate);
-                slot.last_rid_switch_at = Some(now);
-                remaining_bw -= bitrate;
-
-                tracing::info!(
-                    mid = %slot.mid,
-                    bitrate,
-                    rid = ?target_rid,
-                    remaining_bw,
-                    "updated video allocation"
-                );
             } else {
-                // keep existing allocation under hysteresis window
-                if let Some(prev) = slot.last_assigned_bitrate {
-                    remaining_bw -= prev;
+                // Stream is active. Check if it's over budget.
+                if prev_bitrate > remaining_budget {
+                    // Must downgrade or pause to what fits.
+                    if let Some(layer) = best_fitting_layer {
+                        new_rid = layer.rid;
+                        new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
+                    } else {
+                        new_paused = true;
+                        new_bitrate = 0.0;
+                    }
+                } else if can_switch {
+                    // Consider an upgrade if there's enough headroom.
+                    let upgrade_budget = remaining_budget / UPGRADE_HEADROOM;
+                    if let Some(layer) = state.track.simulcast.iter().find(|l| {
+                        let bitrate = l.bitrate.load(Ordering::Relaxed) as f64;
+                        bitrate > prev_bitrate && bitrate <= upgrade_budget
+                    }) {
+                        new_rid = layer.rid;
+                        new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
+                    }
                 }
-                tracing::debug!(
-                    mid = %slot.mid,
-                    rid = ?state.current().target_rid,
-                    "kept current layer (hysteresis active)"
-                );
             }
+
+            if new_paused != state.current().paused || new_rid != state.current().target_rid {
+                state.update(|c| {
+                    c.paused = new_paused;
+                    c.target_rid = new_rid;
+                });
+                slot.last_switch_at = Some(now);
+            }
+
+            slot.last_assigned_bitrate = Some(new_bitrate);
+            total_allocated_bitrate += new_bitrate;
         }
 
-        let total_bitrate = available_bandwidth - remaining_bw;
-        tracing::debug!("remaining bandwidth allocation: {remaining_bw}");
-        Some(total_bitrate as u64)
+        let utilization = total_allocated_bitrate / smoothed_bwe;
+        tracing::debug!(
+            "BWE: utilization={:.2}%, available={:.0}, smoothed={:.0}, allocated={:.0}",
+            utilization * 100.0,
+            new_bwe,
+            smoothed_bwe,
+            total_allocated_bitrate,
+        );
+
+        Some(total_allocated_bitrate as u64)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
@@ -407,6 +421,7 @@ impl DownstreamAllocator {
         slot: &mut MidSlot,
         track_id: &Arc<TrackId>,
     ) {
+        // bwe handling will play the streams
         if let Some(state) = tracks.get_mut(track_id) {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
@@ -438,7 +453,7 @@ impl DownstreamAllocator {
     fn find_default_rid(simulcast: &[SimulcastReceiver]) -> Option<Rid> {
         simulcast
             .iter()
-            .find(|s| s.rid.is_none() || s.rid.unwrap().starts_with('f'))
+            .find(|s| s.rid.is_none() || s.rid.unwrap().starts_with('q'))
             .and_then(|s| s.rid)
     }
 
