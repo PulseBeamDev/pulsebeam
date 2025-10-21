@@ -50,6 +50,10 @@ impl TrackState {
         });
     }
 
+    fn current(&self) -> StreamConfig {
+        *self.control_tx.borrow()
+    }
+
     fn request_keyframe(&self) {
         self.control_tx.send_if_modified(|config| {
             config.generation = config.generation.wrapping_add(1);
@@ -145,17 +149,32 @@ impl DownstreamAllocator {
     }
 
     pub fn handle_bwe(&self, bwe: BweKind) {
-        let BweKind::Twcc(bitrate) = bwe else {
+        let BweKind::Twcc(available_bandwidth) = bwe else {
             // ignore remb, only use twcc feedback
             return;
         };
 
-        tracing::debug!("current downstream bitrate available: {bitrate}");
-        for state in self.tracks.values() {
-            for simulcast in &state.track.simulcast {
-                let bitrate = simulcast.bitrate.load(Ordering::Relaxed);
-                tracing::debug!("estimated bitrate: {:?}={}", simulcast.rid, bitrate);
-            }
+        tracing::debug!("current downstream bitrate available: {available_bandwidth}");
+
+        for slot in &self.video_slots {
+            let Some(track_id) = slot.assigned_track.as_ref() else {
+                continue;
+            };
+
+            let Some(state) = self.tracks.get(track_id) else {
+                continue;
+            };
+
+            let cfg = state.current();
+
+            let Some(receiver) = state
+                .track
+                .simulcast
+                .iter()
+                .find(|s| s.rid == cfg.target_rid)
+            else {
+                continue;
+            };
         }
     }
 
