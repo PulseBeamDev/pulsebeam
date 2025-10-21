@@ -58,6 +58,8 @@ impl SimulcastReceiver {
             tracing::warn!(?request, "feedback channel is unavailable");
             return;
         };
+
+        tracing::debug!(?request, "keyframe request is sent");
     }
 }
 
@@ -85,20 +87,29 @@ impl SimulcastSender {
             return None;
         }
 
+        // A new request has arrived. Check if we should process it.
         let binding = self.keyframe_requests.borrow_and_update();
-        let update = binding.as_ref()?;
-
-        let res = if let Some(last) = self.last_keyframe_requested_at {
-            if last.elapsed() < Duration::from_secs(1) {
-                Some(update.clone())
-            } else {
-                None
-            }
-        } else {
-            None
+        let Some(update) = binding.as_ref() else {
+            return None; // The update was to clear the request.
         };
-        self.last_keyframe_requested_at = Some(tokio::time::Instant::now());
-        res
+
+        // Check the throttle timer.
+        let now = tokio::time::Instant::now();
+        if let Some(last_request_time) = self.last_keyframe_requested_at
+            && now.duration_since(last_request_time) < Duration::from_secs(1)
+        {
+            // It's too soon. Ignore this request and DO NOT update the timer.
+            return None;
+        }
+
+        // If we reach here, it's either the first request ever, or the 1-second
+        // cooldown has passed. We can process it.
+
+        // Update the timer ONLY when we are actually processing a request.
+        self.last_keyframe_requested_at = Some(now);
+
+        // Return the keyframe request.
+        Some(update.clone())
     }
 
     pub fn send(&mut self, pkt: RtpPacket) {
