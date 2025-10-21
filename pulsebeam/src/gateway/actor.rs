@@ -1,8 +1,8 @@
-use crate::{entity::ParticipantId, gateway::demux::Demuxer, participant};
+use crate::{entity::ParticipantId, gateway::demux::Demuxer};
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
-use std::{collections::HashMap, io, sync::Arc};
+use std::{io, sync::Arc};
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
@@ -15,7 +15,7 @@ pub struct GatewayMessageSet;
 impl actor::MessageSet for GatewayMessageSet {
     type HighPriorityMsg = GatewayControlMessage;
     type LowPriorityMsg = ();
-    type Meta = usize;
+    type Meta = String;
     type ObservableState = ();
 }
 
@@ -32,8 +32,8 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         MONITOR.clone()
     }
 
-    fn meta(&self) -> usize {
-        0
+    fn meta(&self) -> String {
+        "gateway-controller".to_string()
     }
 
     fn get_observable_state(&self) {}
@@ -90,8 +90,6 @@ pub struct GatewayWorkerActor {
     demuxer: Demuxer,
     recv_batch: Vec<net::RecvPacket>,
     storage: net::RecvBatchStorage,
-
-    participants: HashMap<Arc<ParticipantId>, participant::ParticipantHandle>,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
@@ -100,8 +98,8 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         MONITOR.clone()
     }
 
-    fn meta(&self) -> usize {
-        self.id
+    fn meta(&self) -> String {
+        format!("gateway-{}", self.id)
     }
 
     fn get_observable_state(&self) {}
@@ -153,7 +151,6 @@ impl GatewayWorkerActor {
             recv_batch,
             storage,
             demuxer: Demuxer::new(),
-            participants: HashMap::with_capacity(1024),
         }
     }
 
