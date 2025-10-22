@@ -41,7 +41,7 @@ impl SimulcastReceiver {
         let request = str0m::media::KeyframeRequest {
             mid: self.meta.id.origin_mid,
             rid: self.rid,
-            kind: str0m::media::KeyframeRequestKind::Fir,
+            kind: str0m::media::KeyframeRequestKind::Pli,
         };
         let wrapped = KeyframeRequest {
             request,

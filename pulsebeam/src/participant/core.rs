@@ -15,7 +15,6 @@ use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
-use crate::rtp::rtp_rewriter::RtpRewriter;
 use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
 
 #[derive(thiserror::Error, Debug)]
@@ -39,7 +38,6 @@ pub struct ParticipantCore {
     pub batcher: Batcher,
     pub upstream_allocator: UpstreamAllocator,
     pub downstream_allocator: DownstreamAllocator,
-    rewriters: HashMap<Mid, RtpRewriter>,
     disconnect_reason: Option<DisconnectReason>,
     events: Vec<CoreEvent>,
 }
@@ -56,7 +54,6 @@ impl ParticipantCore {
             batcher: Batcher::with_capacity(batcher_capacity),
             upstream_allocator: UpstreamAllocator::new(),
             downstream_allocator: DownstreamAllocator::new(),
-            rewriters: HashMap::new(),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
         }
@@ -166,18 +163,13 @@ impl ParticipantCore {
             return;
         };
 
-        if is_switch_point {
-            tracing::info!(%mid, "Creating new RTP rewriter due to layer switch");
-            self.rewriters.insert(mid, RtpRewriter::new(rtp));
-        }
-
-        // TODO: handle seqno and timestamp rewrite
-        // let Some(rewriter) = self.rewriters.get_mut(&mid) else {
-        //     tracing::warn!(%mid, "No RTP rewriter for active track, dropping packet");
-        //     return;
-        // };
-
-        // let (new_seq, new_ts) = rewriter.rewrite(rtp);
+        let Some((new_seq, new_ts)) =
+            self.downstream_allocator
+                .rewrite_rtp(mid, rtp, is_switch_point)
+        else {
+            tracing::warn!(%mid, "No RTP rewriter for active track, dropping packet");
+            return;
+        };
 
         let pt = {
             let Some(media) = self.rtc.media(mid) else {
@@ -196,8 +188,8 @@ impl ParticipantCore {
 
         let _ = writer.write_rtp(
             pt,
-            rtp.seq_no,
-            rtp.header.timestamp,
+            new_seq,
+            new_ts,
             rtp.timestamp,
             rtp.header.marker,
             rtp.header.ext_vals.clone(),
@@ -248,7 +240,6 @@ impl ParticipantCore {
             }
             Direction::SendOnly => {
                 self.downstream_allocator.add_slot(media.mid, media.kind);
-                self.rewriters.remove(&media.mid);
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }

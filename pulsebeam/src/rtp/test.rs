@@ -23,3 +23,13 @@ impl PacketTiming for TestPacket {
         self.server_ts
     }
 }
+
+impl TestPacket {
+    pub fn new(seq_no: SeqNo, rtp_ts: MediaTime) -> Self {
+        Self {
+            seq_no,
+            rtp_ts,
+            server_ts: Instant::now(),
+        }
+    }
+}

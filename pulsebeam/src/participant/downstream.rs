@@ -1,4 +1,5 @@
-use crate::rtp::RtpPacket;
+use crate::rtp::rtp_rewriter::RtpRewriter;
+use crate::rtp::{self, RtpPacket};
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
@@ -9,6 +10,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use str0m::bwe::BweKind;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
+use str0m::rtp::SeqNo;
 use tokio::sync::watch;
 
 use crate::entity::TrackId;
@@ -82,9 +84,10 @@ impl TrackState {
 }
 
 /// Represents an active media slot in an SDP session.
-struct MidSlot {
+struct AudioSlotState {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
+    rewriter: rtp::rtp_rewriter::RtpRewriter,
 }
 
 /// Per-subscriber video slot state.
@@ -95,12 +98,13 @@ struct VideoSlotState {
     max_height: u32,
     last_switch_at: Option<Instant>,
     last_assigned_bitrate: Option<f64>,
+    rewriter: rtp::rtp_rewriter::RtpRewriter,
 }
 
 pub struct DownstreamAllocator {
     streams: SelectAll<TrackStream>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
-    audio_slots: Vec<MidSlot>,
+    audio_slots: Vec<AudioSlotState>,
     video_slots: Vec<VideoSlotState>,
     smoothed_bwe_bps: Option<f64>,
 }
@@ -152,9 +156,10 @@ impl DownstreamAllocator {
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
         match kind {
             MediaKind::Audio => {
-                self.audio_slots.push(MidSlot {
+                self.audio_slots.push(AudioSlotState {
                     mid,
                     assigned_track: None,
+                    rewriter: RtpRewriter::default(),
                 });
             }
             MediaKind::Video => {
@@ -164,6 +169,7 @@ impl DownstreamAllocator {
                     max_height: 720,
                     last_switch_at: None,
                     last_assigned_bitrate: None,
+                    rewriter: RtpRewriter::default(),
                 });
             }
         }
@@ -173,6 +179,31 @@ impl DownstreamAllocator {
     pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
         if let Some(slot) = self.video_slots.iter_mut().find(|s| s.mid == mid) {
             slot.max_height = max_height;
+        }
+    }
+
+    pub fn rewrite_rtp(
+        &mut self,
+        mid: Mid,
+        packet: &RtpPacket,
+        marker: bool,
+    ) -> Option<(SeqNo, u32)> {
+        if let Some(rewriter) = self
+            .video_slots
+            .iter_mut()
+            .find(|s| s.mid == mid)
+            .map(|s| &mut s.rewriter)
+        {
+            Some(rewriter.rewrite(packet, marker))
+        } else if let Some(rewriter) = self
+            .audio_slots
+            .iter_mut()
+            .find(|s| s.mid == mid)
+            .map(|s| &mut s.rewriter)
+        {
+            Some(rewriter.rewrite(packet, marker))
+        } else {
+            None
         }
     }
 
@@ -389,9 +420,10 @@ impl DownstreamAllocator {
         for slot in &mut self.video_slots {
             if let Some(track_id) = &slot.assigned_track {
                 if !self.tracks.contains_key(track_id) {
-                    let mut tmp = MidSlot {
+                    let mut tmp = AudioSlotState {
                         mid: slot.mid,
                         assigned_track: slot.assigned_track.clone(),
+                        rewriter: RtpRewriter::default(),
                     };
                     Self::perform_unassignment(&mut self.tracks, &mut tmp);
                     slot.assigned_track = None;
@@ -399,9 +431,10 @@ impl DownstreamAllocator {
             }
             if slot.assigned_track.is_none() {
                 if let Some(track_id) = unassigned_tracks.pop() {
-                    let mut tmp = MidSlot {
+                    let mut tmp = AudioSlotState {
                         mid: slot.mid,
                         assigned_track: None,
+                        rewriter: RtpRewriter::default(),
                     };
                     Self::perform_assignment(&mut self.tracks, &mut tmp, &track_id);
                     slot.assigned_track = Some(track_id);
@@ -412,7 +445,7 @@ impl DownstreamAllocator {
 
     fn perform_assignment(
         tracks: &mut HashMap<Arc<TrackId>, TrackState>,
-        slot: &mut MidSlot,
+        slot: &mut AudioSlotState,
         track_id: &Arc<TrackId>,
     ) {
         if let Some(state) = tracks.get_mut(track_id) {
@@ -432,7 +465,10 @@ impl DownstreamAllocator {
         }
     }
 
-    fn perform_unassignment(tracks: &mut HashMap<Arc<TrackId>, TrackState>, slot: &mut MidSlot) {
+    fn perform_unassignment(
+        tracks: &mut HashMap<Arc<TrackId>, TrackState>,
+        slot: &mut AudioSlotState,
+    ) {
         if let Some(track_id) = slot.assigned_track.take() {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
@@ -470,6 +506,7 @@ impl DownstreamAllocator {
 
             let mut local_generation = u64::MAX;
             let mut active_index: Option<usize> = None;
+            let mut waiting_keyframe = true;
 
             loop {
                 let config = *rx.borrow();
@@ -490,6 +527,7 @@ impl DownstreamAllocator {
                         let receiver = &mut track.simulcast[new_index];
                         receiver.channel.reset();
                         receiver.request_keyframe();
+                        waiting_keyframe = true;
                     }
                 }
 
@@ -499,7 +537,6 @@ impl DownstreamAllocator {
                 };
 
                 let receiver = &mut track.simulcast[current_index];
-                let mut is_first_packet_after_switch = true;
 
                 tokio::select! {
                     biased;
@@ -511,9 +548,17 @@ impl DownstreamAllocator {
                     res = receiver.channel.recv() => {
                         match res {
                             Ok(pkt) => {
-                                let is_switch_point = is_first_packet_after_switch;
-                                is_first_packet_after_switch = false;
-                                yield (meta.clone(), pkt, is_switch_point)
+                                let marker = if waiting_keyframe {
+                                    if pkt.value.is_keyframe() {
+                                        continue;
+                                    }
+                                    waiting_keyframe = false;
+                                    true
+                                } else {
+                                    false
+                                };
+
+                                yield (meta.clone(), pkt, marker)
                             },
                             Err(spmc::RecvError::Lagged(count)) => {
                                 tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe");
