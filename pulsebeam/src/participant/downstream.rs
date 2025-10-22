@@ -1,3 +1,4 @@
+use crate::rtp::RtpPacket;
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
@@ -8,13 +9,17 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use str0m::bwe::BweKind;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
-use str0m::rtp::RtpPacket;
 use tokio::sync::watch;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
-type TrackStream = Pin<Box<dyn Stream<Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>)> + Send>>;
+/// The event produced by the DownstreamAllocator stream.
+///
+/// It includes the packet and a boolean marker to indicate if this is the first
+/// packet after a simulcast layer switch.
+type TrackStreamItem = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>, bool);
+type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 
 /// Configuration that each downstream receiver listens to.
 /// Updated by the allocator to select which simulcast layer is active.
@@ -65,29 +70,24 @@ impl TrackState {
             return;
         }
 
-        // Find the SimulcastReceiver for the currently active RID.
         if let Some(receiver) = self
             .track
             .simulcast
             .iter()
             .find(|r| r.rid == config.target_rid)
         {
-            // Call the keyframe request method on the receiver itself,
-            // which will signal the upstream track.
             receiver.request_keyframe();
         }
     }
 }
 
 /// Represents an active media slot in an SDP session.
-/// Audio slots are simple; video slots have adaptive state.
 struct MidSlot {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
 }
 
 /// Per-subscriber video slot state.
-/// Keeps track of target quality, allocation history, and hysteresis timers.
 #[derive(Debug, Clone)]
 struct VideoSlotState {
     mid: Mid,
@@ -97,9 +97,6 @@ struct VideoSlotState {
     last_assigned_bitrate: Option<f64>,
 }
 
-/// The main downstream allocator that manages multiple tracks and media slots.
-/// It consumes RTP packets from publishers and redistributes them to subscribers
-/// based on available bandwidth and per-subscriber constraints.
 pub struct DownstreamAllocator {
     streams: SelectAll<TrackStream>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
@@ -173,7 +170,6 @@ impl DownstreamAllocator {
         self.rebalance_allocations();
     }
 
-    /// Allows dynamic client-side adaptation (e.g. when resizing a video element).
     pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
         if let Some(slot) = self.video_slots.iter_mut().find(|s| s.mid == mid) {
             slot.max_height = max_height;
@@ -190,15 +186,12 @@ impl DownstreamAllocator {
                 continue;
             };
 
-            // simulcast is already sorted based on highest quality first
             let Some(layer) = state.track.simulcast.first() else {
                 continue;
             };
 
-            let bitrate = layer.bitrate.load(Ordering::Relaxed);
-            desired_bitrate += bitrate;
+            desired_bitrate += layer.bitrate.load(Ordering::Relaxed);
         }
-
         desired_bitrate
     }
 
@@ -208,21 +201,18 @@ impl DownstreamAllocator {
         };
         let new_bwe = available_bandwidth.as_f64();
 
-        // 1. Smooth the bandwidth estimate to absorb temporary fluctuations.
-        // This makes the system resilient to both noisy estimates and periods with no feedback.
         let smoothed_bwe = match self.smoothed_bwe_bps {
             Some(prev) => prev * 0.85 + new_bwe * 0.15,
             None => new_bwe,
         };
         self.smoothed_bwe_bps = Some(smoothed_bwe);
 
-        // 2. Allocate based on a conservative portion of the stable, smoothed estimate.
         let budget = smoothed_bwe * 0.90;
         let mut total_allocated_bitrate = 0.0;
         let now = Instant::now();
 
         const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(8);
-        const UPGRADE_HEADROOM: f64 = 1.25; // Require 25% headroom to upgrade.
+        const UPGRADE_HEADROOM: f64 = 1.25;
 
         self.video_slots
             .sort_by(|a, b| b.max_height.cmp(&a.max_height));
@@ -245,7 +235,6 @@ impl DownstreamAllocator {
             let mut new_bitrate = prev_bitrate;
             let mut new_paused = state.current().paused;
 
-            // Find the highest-quality layer that fits within the remaining budget.
             let best_fitting_layer = state
                 .track
                 .simulcast
@@ -253,33 +242,27 @@ impl DownstreamAllocator {
                 .find(|l| (l.bitrate.load(Ordering::Relaxed) as f64) <= remaining_budget);
 
             if state.current().paused {
-                // Try to resume if a suitable layer is found.
                 if let Some(layer) = best_fitting_layer {
                     new_paused = false;
                     new_rid = layer.rid;
                     new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
                 }
-            } else {
-                // Stream is active. Check if it's over budget.
-                if prev_bitrate > remaining_budget {
-                    // Must downgrade or pause to what fits.
-                    if let Some(layer) = best_fitting_layer {
-                        new_rid = layer.rid;
-                        new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
-                    } else {
-                        new_paused = true;
-                        new_bitrate = 0.0;
-                    }
-                } else if can_switch {
-                    // Consider an upgrade if there's enough headroom.
-                    let upgrade_budget = remaining_budget / UPGRADE_HEADROOM;
-                    if let Some(layer) = state.track.simulcast.iter().find(|l| {
-                        let bitrate = l.bitrate.load(Ordering::Relaxed) as f64;
-                        bitrate > prev_bitrate && bitrate <= upgrade_budget
-                    }) {
-                        new_rid = layer.rid;
-                        new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
-                    }
+            } else if prev_bitrate > remaining_budget {
+                if let Some(layer) = best_fitting_layer {
+                    new_rid = layer.rid;
+                    new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
+                } else {
+                    new_paused = true;
+                    new_bitrate = 0.0;
+                }
+            } else if can_switch {
+                let upgrade_budget = remaining_budget / UPGRADE_HEADROOM;
+                if let Some(layer) = state.track.simulcast.iter().find(|l| {
+                    let bitrate = l.bitrate.load(Ordering::Relaxed) as f64;
+                    bitrate > prev_bitrate && bitrate <= upgrade_budget
+                }) {
+                    new_rid = layer.rid;
+                    new_bitrate = layer.bitrate.load(Ordering::Relaxed) as f64;
                 }
             }
 
@@ -311,20 +294,17 @@ impl DownstreamAllocator {
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
         let Some(slot) = self.video_slots.iter().find(|e| e.mid == req.mid) else {
-            tracing::warn!(?req, "no video slot found to handle keyframe request");
+            tracing::warn!(?req, "no video slot found for keyframe request");
             return;
         };
-
         let Some(track) = &slot.assigned_track else {
             tracing::warn!(?req, "no assigned track, ignore keyframe request");
             return;
         };
-
         let Some(state) = self.tracks.get(track) else {
             tracing::warn!(?req, "no track state found, ignore keyframe request");
             return;
         };
-
         state.request_keyframe();
     }
 
@@ -435,12 +415,11 @@ impl DownstreamAllocator {
         slot: &mut MidSlot,
         track_id: &Arc<TrackId>,
     ) {
-        // bwe handling will play the streams
         if let Some(state) = tracks.get_mut(track_id) {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
             state.update(|c| {
-                let changed = c.paused != false;
+                let changed = c.paused;
                 c.paused = false;
                 changed
             });
@@ -458,7 +437,7 @@ impl DownstreamAllocator {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
                 state.update(|c| {
-                    let changed = c.paused != true;
+                    let changed = !c.paused;
                     c.paused = true;
                     changed
                 });
@@ -491,69 +470,53 @@ impl DownstreamAllocator {
 
             let mut local_generation = u64::MAX;
             let mut active_index: Option<usize> = None;
-            // let mut waiting_keyframe = true;
 
             loop {
-                // Get the latest configuration.
                 let config = *rx.borrow();
 
-                // Check if the configuration has changed since the last time we checked.
                 if local_generation != config.generation {
                     local_generation = config.generation;
                     tracing::debug!(?track.meta.id, "Track state applied: {config:?}");
 
-                    if config.paused {
-                        active_index = None;
-                    } else if let Some(new_index) = find_index_for_rid(config.target_rid, &track.simulcast) {
-                        // The RID is valid, so we have a new active layer.
-                        active_index = Some(new_index);
-                        // A layer switch requires a new keyframe.
+                    let old_index = active_index;
+                    active_index = if config.paused {
+                        None
+                    } else {
+                        find_index_for_rid(config.target_rid, &track.simulcast)
+                    };
+
+                    if active_index != old_index && active_index.is_some() {
+                        let new_index = active_index.unwrap();
                         let receiver = &mut track.simulcast[new_index];
                         receiver.channel.reset();
                         receiver.request_keyframe();
-                        // waiting_keyframe = true;
-                    } else {
-                        // The RID in the config is invalid, so we must pause until we get a valid one.
-                        active_index = None;
-                        tracing::warn!(?track.meta.id, ?config.target_rid, "Invalid target_rid, pausing stream");
                     }
                 }
-                
-                // If we are paused or have an invalid RID, we have no active layer.
-                // In this state, our only job is to wait for the next configuration change.
-                if active_index.is_none() {
-                    if rx.changed().await.is_err() {
-                        break; // Channel closed, end the stream.
-                    }
-                    continue; // Loop again to process the new config.
-                }
 
-                // If we are here, we have an active layer to stream from.
-                let receiver = &mut track.simulcast[active_index.unwrap()];
+                let Some(current_index) = active_index else {
+                    if rx.changed().await.is_err() { break; }
+                    continue;
+                };
 
-                // We must simultaneously listen for new packets and for the next config change.
+                let receiver = &mut track.simulcast[current_index];
+                let mut is_first_packet_after_switch = true;
+
                 tokio::select! {
                     biased;
 
-                    // Branch 1: The configuration changed again.
                     res = rx.changed() => {
                         if res.is_err() { break; }
-                        // Do nothing here. The loop will restart and the logic at the top
-                        // will handle applying the new configuration.
                     },
 
-                    // Branch 2: A new RTP packet arrived on the active layer.
                     res = receiver.channel.recv() => {
                         match res {
                             Ok(pkt) => {
-                                // if waiting_keyframe && !is_keyframe(&pkt.value) {
-                                //     continue;
-                                // }
-                                // waiting_keyframe = false;
-                                yield (meta.clone(), pkt)
+                                let is_switch_point = is_first_packet_after_switch;
+                                is_first_packet_after_switch = false;
+                                yield (meta.clone(), pkt, is_switch_point)
                             },
                             Err(spmc::RecvError::Lagged(count)) => {
-                                tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe for recovery");
+                                tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe");
                                 receiver.request_keyframe();
                             },
                             Err(spmc::RecvError::Closed) => {
@@ -570,159 +533,9 @@ impl DownstreamAllocator {
 }
 
 impl Stream for DownstreamAllocator {
-    type Item = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>);
+    type Item = TrackStreamItem;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.streams.poll_next_unpin(cx)
     }
 }
-
-/// Heuristically detect whether this RTP packet appears to start a full intra (keyframe).
-/// 
-/// Notes:
-/// - Stateless: only inspects this RTP packet.
-/// - For H.264, detects IDR slices or the start fragment (FU-A with NAL type 5).
-/// - For VP8/VP9, checks the "keyframe" and "start of frame" bits.
-/// - Out-of-order packets are fine: detection is opportunistic, not sequential.
-/// 
-/// Reference specs:
-/// - H.264: RFC 6184 §5.2
-/// - VP8:  RFC 7741 §4.2
-/// - VP9:  W3C WebRTC VP9 RTP Payload Format
-pub fn is_keyframe(rtp: &RtpPacket) -> bool {
-    let payload = &rtp.payload;
-    if payload.is_empty() {
-        return false;
-    }
-
-    // You might have a payload type map if you know what codec is in use.
-    // But most WebRTC or RTP demuxers heuristically detect codec by payload content.
-    if looks_like_h264(payload) {
-        return is_h264_keyframe_start(payload);
-    }
-
-    if looks_like_vp8(payload) {
-        return is_vp8_keyframe_start(payload);
-    }
-
-    if looks_like_vp9(payload) {
-        return is_vp9_keyframe_start(payload);
-    }
-
-    false
-}
-
-/// Roughly guess H.264 by looking for NALU start patterns.
-fn looks_like_h264(payload: &[u8]) -> bool {
-    if payload.is_empty() {
-        return false;
-    }
-    let nal_type = payload[0] & 0x1F;
-    (1..=23).contains(&nal_type) || nal_type == 28
-}
-
-/// Detect if this H.264 RTP packet starts a keyframe (IDR).
-fn is_h264_keyframe_start(payload: &[u8]) -> bool {
-    if payload.is_empty() {
-        return false;
-    }
-
-    let nal_type = payload[0] & 0x1F;
-
-    match nal_type {
-        5 => true, // IDR slice (standalone)
-        28 => {
-            // Fragmentation Unit (FU-A)
-            if payload.len() < 2 {
-                return false;
-            }
-            let fu_header = payload[1];
-            let start_bit = fu_header & 0x80 != 0;
-            let frag_nal_type = fu_header & 0x1F;
-            start_bit && frag_nal_type == 5
-        }
-        _ => false,
-    }
-}
-
-/// Rough VP8 detection — first byte pattern with 0x10 (start of partition).
-fn looks_like_vp8(payload: &[u8]) -> bool {
-    let b0 = payload[0];
-    // For VP8, bits 0..2 are usually 0b000 or 0b001 for normal streams.
-    b0 & 0b1110_0000 == 0b0000_0000 || b0 & 0b1110_0000 == 0b0010_0000
-}
-
-/// Detect if this VP8 RTP packet appears to start a keyframe.
-///
-/// VP8 RTP Payload (RFC 7741):
-/// - Bit 0 (P): 0 = keyframe, 1 = interframe.
-/// - Bit 4..7 (PartID): 0 means start of a new frame.
-/// - Optional X field may follow.
-fn is_vp8_keyframe_start(payload: &[u8]) -> bool {
-    if payload.is_empty() {
-        return false;
-    }
-
-    let b0 = payload[0];
-    let x_bit = (b0 & 0x80) != 0;
-    let p_bit = (b0 & 0x01) != 0; // 0 = keyframe
-    let part_id = (b0 >> 4) & 0x0F;
-    let start_of_frame = part_id == 0;
-
-    if !start_of_frame || p_bit {
-        return false;
-    }
-
-    // Optionally skip extended control fields (rare but valid)
-    let mut idx = 1;
-    if x_bit && payload.len() > 1 {
-        let x_field = payload[idx];
-        idx += 1;
-        if x_field & 0x80 != 0 {
-            // PictureID
-            if idx >= payload.len() {
-                return false;
-            }
-            let picid = payload[idx];
-            idx += 1;
-            if picid & 0x80 != 0 {
-                idx += 1; // long PictureID
-            }
-        }
-        if x_field & 0x40 != 0 {
-            idx += 1; // TL0PICIDX
-        }
-        if x_field & 0x20 != 0 {
-            idx += 1; // TID/Y/KEYIDX
-        }
-    }
-
-    // If we reached here, it's the first packet of a keyframe
-    true
-}
-
-/// Rough VP9 detection — first byte often starts with I|P|L|F|B|E|V|Z bits.
-fn looks_like_vp9(payload: &[u8]) -> bool {
-    let b0 = payload[0];
-    // I bit is MSB; P bit next. B bit marks beginning of frame.
-    (b0 & 0xE0) == 0x80 || (b0 & 0xC0) == 0x00
-}
-
-/// Detect if this VP9 RTP packet appears to start a keyframe.
-///
-/// VP9 RTP Payload:
-/// - I bit (MSB): 1 if PictureID present
-/// - P bit: 0 = keyframe, 1 = interframe
-/// - B bit: 1 = beginning of frame
-fn is_vp9_keyframe_start(payload: &[u8]) -> bool {
-    if payload.is_empty() {
-        return false;
-    }
-
-    let b0 = payload[0];
-    let b_bit = (b0 & 0x08) != 0; // beginning of frame
-    let p_bit = (b0 & 0x40) != 0; // inter-frame indicator (1 = inter, 0 = keyframe)
-
-    b_bit && !p_bit
-}
-

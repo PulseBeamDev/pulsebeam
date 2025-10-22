@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use tokio::time::Instant;
 
+use crate::rtp::RtpPacket;
 use str0m::media::Mid;
-use str0m::rtp::RtpPacket;
 
-use crate::track::{ArrivedRtpPacket, KeyframeRequest, TrackSender};
+use crate::track::{KeyframeRequest, TrackSender};
 
 /// Manages all upstream tracks published by this participant.
 ///
@@ -41,17 +41,10 @@ impl UpstreamAllocator {
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
         mut rtp: RtpPacket,
-        arrival: Instant,
     ) {
         if let Some(track) = self.published_tracks.get_mut(&mid) {
             rtp.header.ext_vals.rid = rid.cloned();
-
-            let arrived_packet = ArrivedRtpPacket {
-                packet: rtp,
-                arrival,
-            };
-
-            track.push(rid, arrived_packet);
+            track.push(rid, rtp);
         } else {
             tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }

@@ -4,19 +4,20 @@ use std::time::{Duration, Instant};
 
 use pulsebeam_runtime::net;
 use str0m::bwe::Bitrate;
+use str0m::media::Mid;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
-    rtp::RtpPacket,
 };
 
 use crate::entity;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
+use crate::rtp::RtpPacket;
+use crate::rtp::rtp_rewriter::RtpRewriter;
 use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
 
-/// Represents the reason a participant's session was terminated.
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
     #[error("RTC engine error")]
@@ -27,10 +28,8 @@ pub enum DisconnectReason {
     InvalidMediaDirection,
 }
 
-/// Represents an asynchronous action the `ParticipantCore` requires the `ParticipantActor` to perform.
 #[derive(Debug)]
 pub enum CoreEvent {
-    /// A new track has been created locally and should be published to the room.
     SpawnTrack(Arc<TrackMeta>),
 }
 
@@ -40,6 +39,7 @@ pub struct ParticipantCore {
     pub batcher: Batcher,
     pub upstream_allocator: UpstreamAllocator,
     pub downstream_allocator: DownstreamAllocator,
+    rewriters: HashMap<Mid, RtpRewriter>,
     disconnect_reason: Option<DisconnectReason>,
     events: Vec<CoreEvent>,
 }
@@ -56,6 +56,7 @@ impl ParticipantCore {
             batcher: Batcher::with_capacity(batcher_capacity),
             upstream_allocator: UpstreamAllocator::new(),
             downstream_allocator: DownstreamAllocator::new(),
+            rewriters: HashMap::new(),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
         }
@@ -154,31 +155,55 @@ impl ParticipantCore {
         self.upstream_allocator.add_published_track(track);
     }
 
-    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
-        if let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) {
-            let Some(pt) = self
-                .rtc
-                .media(mid)
-                .and_then(|m| m.remote_pts().first().copied())
-            else {
+    pub fn handle_forward_rtp(
+        &mut self,
+        track_meta: Arc<TrackMeta>,
+        rtp: &RtpPacket,
+        is_switch_point: bool,
+    ) {
+        let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) else {
+            tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP for inactive track");
+            return;
+        };
+
+        if is_switch_point {
+            tracing::info!(%mid, "Creating new RTP rewriter due to layer switch");
+            self.rewriters.insert(mid, RtpRewriter::new(rtp));
+        }
+
+        // TODO: handle seqno and timestamp rewrite
+        // let Some(rewriter) = self.rewriters.get_mut(&mid) else {
+        //     tracing::warn!(%mid, "No RTP rewriter for active track, dropping packet");
+        //     return;
+        // };
+
+        // let (new_seq, new_ts) = rewriter.rewrite(rtp);
+
+        let pt = {
+            let Some(media) = self.rtc.media(mid) else {
                 return;
             };
-            let mut api = self.rtc.direct_api();
-            if let Some(writer) = api.stream_tx_by_mid(mid, None) {
-                let _ = writer.write_rtp(
-                    pt,
-                    rtp.seq_no,
-                    rtp.header.timestamp,
-                    rtp.timestamp,
-                    rtp.header.marker,
-                    rtp.header.ext_vals.clone(),
-                    true,
-                    rtp.payload.clone(),
-                );
-            }
-        } else {
-            tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP packet for inactive track");
-        }
+            let Some(pt) = media.remote_pts().first() else {
+                return;
+            };
+            *pt
+        };
+
+        let mut api = self.rtc.direct_api();
+        let Some(writer) = api.stream_tx_by_mid(mid, None) else {
+            return;
+        };
+
+        let _ = writer.write_rtp(
+            pt,
+            rtp.seq_no,
+            rtp.header.timestamp,
+            rtp.timestamp,
+            rtp.header.marker,
+            rtp.header.ext_vals.clone(),
+            true,
+            rtp.payload.clone(),
+        );
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -187,7 +212,7 @@ impl ParticipantCore {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
-            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
+            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp.into()),
             Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(bwe) => {
                 let Some(current) = self.downstream_allocator.handle_bwe(bwe) else {
@@ -223,20 +248,20 @@ impl ParticipantCore {
             }
             Direction::SendOnly => {
                 self.downstream_allocator.add_slot(media.mid, media.kind);
+                self.rewriters.remove(&media.mid);
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
     }
 
     fn handle_incoming_rtp(&mut self, rtp: RtpPacket) {
-        let now = tokio::time::Instant::now();
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
             return;
         };
         let (mid, rid) = (stream.mid(), stream.rid());
         self.upstream_allocator
-            .handle_incoming_rtp(mid, rid.as_ref(), rtp, now);
+            .handle_incoming_rtp(mid, rid.as_ref(), rtp);
     }
 
     fn disconnect(&mut self, reason: DisconnectReason) {

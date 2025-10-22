@@ -7,37 +7,17 @@ use std::{
 };
 
 use pulsebeam_runtime::sync::spmc;
-use str0m::{
-    media::{MediaKind, Rid},
-    rtp::RtpPacket,
-};
+use str0m::media::{MediaKind, Rid};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::participant::jitter_buffer::{self, JitterBuffer, MediaPacket, PollResult};
+use crate::rtp::RtpPacket;
+use crate::rtp::jitter_buffer::{self, JitterBuffer, PollResult};
 
 #[derive(Debug, Clone)]
 pub struct KeyframeRequest {
     pub request: str0m::media::KeyframeRequest,
     pub requested_at: Instant,
-}
-
-#[derive(Debug)]
-pub struct ArrivedRtpPacket {
-    pub packet: RtpPacket,
-    pub arrival: Instant,
-}
-
-impl MediaPacket for ArrivedRtpPacket {
-    fn sequence_number(&self) -> u64 {
-        *self.packet.seq_no
-    }
-    fn rtp_timestamp(&self) -> u32 {
-        self.packet.header.timestamp
-    }
-    fn arrival_timestamp(&self) -> Instant {
-        self.arrival
-    }
 }
 
 #[derive(Debug, Eq, PartialEq, Hash)]
@@ -78,7 +58,7 @@ pub struct SimulcastSender {
     pub rid: Option<Rid>,
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
     pub last_keyframe_requested_at: Option<Instant>,
-    jitter_buffer: JitterBuffer<ArrivedRtpPacket>,
+    jitter_buffer: JitterBuffer<RtpPacket>,
     channel: spmc::Sender<RtpPacket>,
     bwe: BandwidthEstimator,
 }
@@ -104,13 +84,13 @@ impl SimulcastSender {
         Some(update.clone())
     }
 
-    pub fn push(&mut self, pkt: ArrivedRtpPacket) {
-        self.jitter_buffer.push(pkt);
+    pub fn push(&mut self, packet: RtpPacket) {
+        self.jitter_buffer.push(packet);
     }
 
     pub fn poll(&mut self, now: Instant) {
-        while let PollResult::PacketReady(arrived) = self.jitter_buffer.poll(now) {
-            self.forward_packet(arrived.packet);
+        while let PollResult::PacketReady(packet) = self.jitter_buffer.poll(now) {
+            self.forward_packet(packet);
         }
     }
 
@@ -126,13 +106,13 @@ pub struct TrackSender {
 }
 
 impl TrackSender {
-    pub fn push(&mut self, rid: Option<&Rid>, pkt: ArrivedRtpPacket) {
+    pub fn push(&mut self, rid: Option<&Rid>, packet: RtpPacket) {
         let sender = self
             .simulcast
             .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available");
-        sender.push(pkt);
+        sender.push(packet);
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -164,15 +144,14 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         vec![None]
     };
 
-    // "f" -> "h" -> "q"
     simulcast_rids.sort_by_key(|rid| rid.unwrap_or_default().to_string());
 
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
 
     let jitter_config = match meta.kind {
-        MediaKind::Audio => jitter_buffer::JitterBufferConfig::audio(48000),
-        MediaKind::Video => jitter_buffer::JitterBufferConfig::video(90000),
+        MediaKind::Audio => jitter_buffer::JitterBufferConfig::audio_interactive(),
+        MediaKind::Video => jitter_buffer::JitterBufferConfig::video_interactive(),
     };
 
     for rid in simulcast_rids {
@@ -181,8 +160,14 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
 
         let bitrate = match (meta.kind, rid) {
             (MediaKind::Audio, _) => 64_000,
+            (MediaKind::Video, None) => 500_000,
             (MediaKind::Video, Some(r)) if r.starts_with('f') => 800_000,
-            _ => 300_000,
+            (MediaKind::Video, Some(r)) if r.starts_with('h') => 300_000,
+            (MediaKind::Video, Some(r)) if r.starts_with('q') => 150_000,
+            (MediaKind::Video, Some(rid)) => {
+                tracing::warn!("use default bitrate due to unsupported rid: {rid}");
+                500_000
+            }
         };
         let bitrate = Arc::new(AtomicU64::new(bitrate));
         let bwe = BandwidthEstimator::new(bitrate.clone());
