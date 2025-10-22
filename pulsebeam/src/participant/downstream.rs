@@ -194,14 +194,14 @@ impl DownstreamAllocator {
             .find(|s| s.mid == mid)
             .map(|s| &mut s.rewriter)
         {
-            Some(rewriter.rewrite(packet, marker))
+            Some(rewriter.rewrite(packet))
         } else if let Some(rewriter) = self
             .audio_slots
             .iter_mut()
             .find(|s| s.mid == mid)
             .map(|s| &mut s.rewriter)
         {
-            Some(rewriter.rewrite(packet, marker))
+            Some(rewriter.rewrite(packet))
         } else {
             None
         }
