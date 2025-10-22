@@ -243,6 +243,9 @@ impl<T: MediaPacket> JitterBuffer<T> {
                 self.advance_playout_time(packet.rtp_timestamp());
                 self.last_playout_seq = Some(seq_to_play);
                 self.last_playout_rtp_ts = Some(packet.rtp_timestamp());
+                // Record the intentional delay added by the buffer at the moment of playout.
+                metrics::histogram!("jitterbuffer_induced_latency_ms")
+                    .record(self.current_delay().as_millis() as f64);
                 return PollResult::PacketReady(packet);
             } else {
                 return PollResult::WaitUntil(self.playout_time);
