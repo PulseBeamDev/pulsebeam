@@ -110,14 +110,56 @@ pub struct JitterBufferConfig {
     pub silence_threshold: Duration,
 }
 
+impl JitterBufferConfig {
+    /// Creates a configuration tuned for interactive video.
+    ///
+    /// This preset prioritizes the lowest possible latency for natural conversation.
+    ///
+    /// ### Tuning rationale:
+    /// - **Low `loss_patience`:** Gives up on lost packets very quickly. This prefers a
+    ///   momentary visual glitch over a stream stall that increases latency for everyone.
+    /// - **Low `jitter_multiplier`:** The buffer is less conservative about adding delay,
+    ///   favoring responsiveness over riding out large jitter spikes.
+    pub fn video(clock_rate: u32) -> Self {
+        Self {
+            clock_rate,
+            jitter_multiplier: 3.0,
+            loss_patience: Duration::from_millis(30),
+            ..Self::default()
+        }
+    }
+
+    /// Creates a configuration tuned for interactive audio.
+    ///
+    /// This preset also prioritizes low latency, but is slightly more patient with packet
+    /// loss than the video profile.
+    ///
+    /// ### Tuning rationale:
+    /// - **Slightly higher `loss_patience`:** Audio dropouts are often more disruptive
+    ///   than a single skipped video frame. We wait a little longer for a lost audio packet
+    ///   in the hopes it arrives out-of-order, providing a more stable audio experience.
+    pub fn audio(clock_rate: u32) -> Self {
+        Self {
+            clock_rate,
+            jitter_multiplier: 3.0,
+            loss_patience: Duration::from_millis(50),
+            ..Self::default()
+        }
+    }
+}
+
+/// The default implementation provides a balanced, general-purpose starting point.
+///
+/// It's a safe baseline that is reasonably robust without adding excessive latency.
+/// Use the `video()` or `audio()` presets for more specific tuning.
 impl Default for JitterBufferConfig {
     fn default() -> Self {
         Self {
             clock_rate: 90000,
             max_capacity: 512,
             base_latency: Duration::from_millis(20),
-            jitter_multiplier: 4.0,
-            loss_patience: Duration::from_millis(40),
+            jitter_multiplier: 4.0, // A balanced, middle-ground value.
+            loss_patience: Duration::from_millis(40), // A balanced, middle-ground value.
             silence_threshold: Duration::from_secs(2),
         }
     }
