@@ -4,32 +4,43 @@ use std::time::{Duration, Instant};
 
 use pulsebeam_runtime::net;
 use str0m::bwe::Bitrate;
-use str0m::media::Mid;
 use str0m::{
-    Event, Input, Output, Rtc,
+    Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
     rtp::RtpPacket,
 };
 
 use crate::entity;
-use crate::participant::{batcher::Batcher, downstream::DownstreamAllocator};
+use crate::participant::{
+    batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
+};
 use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
+
+/// Represents the reason a participant's session was terminated.
+#[derive(thiserror::Error, Debug)]
+pub enum DisconnectReason {
+    #[error("RTC engine error")]
+    RtcError(#[from] RtcError),
+    #[error("ICE connection disconnected")]
+    IceDisconnected,
+    #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
+    InvalidMediaDirection,
+}
 
 /// Represents an asynchronous action the `ParticipantCore` requires the `ParticipantActor` to perform.
 #[derive(Debug)]
 pub enum CoreEvent {
     /// A new track has been created locally and should be published to the room.
     SpawnTrack(Arc<TrackMeta>),
-    /// The participant's connection has been terminated.
-    Disconnect,
 }
 
 pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
     pub rtc: Rtc,
     pub batcher: Batcher,
-    pub published_tracks: HashMap<Mid, TrackSender>,
+    pub upstream_allocator: UpstreamAllocator,
     pub downstream_allocator: DownstreamAllocator,
+    disconnect_reason: Option<DisconnectReason>,
     events: Vec<CoreEvent>,
 }
 
@@ -43,13 +54,17 @@ impl ParticipantCore {
             participant_id,
             rtc,
             batcher: Batcher::with_capacity(batcher_capacity),
-            published_tracks: HashMap::new(),
+            upstream_allocator: UpstreamAllocator::new(),
             downstream_allocator: DownstreamAllocator::new(),
+            disconnect_reason: None,
             events: Vec::with_capacity(32),
         }
     }
 
-    /// Drains all pending events for the actor to handle.
+    pub fn disconnect_reason(&self) -> Option<&DisconnectReason> {
+        self.disconnect_reason.as_ref()
+    }
+
     pub fn drain_events(&mut self) -> impl Iterator<Item = CoreEvent> + '_ {
         self.events.drain(..)
     }
@@ -69,6 +84,8 @@ impl ParticipantCore {
     }
 
     pub fn handle_timeout(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.upstream_allocator.poll(now);
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
     }
 
@@ -94,8 +111,26 @@ impl ParticipantCore {
         self.update_desired_bitrate();
     }
 
-    /// Polls the inner RTC engine, handling all synchronous events and queueing async ones.
     pub fn poll_rtc(&mut self) -> Option<Duration> {
+        if self.disconnect_reason.is_some() {
+            return None;
+        }
+
+        self.upstream_allocator.poll(tokio::time::Instant::now());
+
+        let key_requests = self.upstream_allocator.drain_keyframe_requests();
+        if !key_requests.is_empty() {
+            let mut api = self.rtc.direct_api();
+            for key in key_requests {
+                if let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) {
+                    stream.request_keyframe(key.request.kind);
+                    tracing::debug!(?key.request, "requested keyframe for upstream");
+                } else {
+                    tracing::warn!(?key.request, "stream not found for keyframe request");
+                }
+            }
+        }
+
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
@@ -105,18 +140,18 @@ impl ParticipantCore {
                     self.batcher.push_back(tx.destination, &tx.contents);
                 }
                 Ok(Output::Event(event)) => self.handle_event(event),
-                Err(_) => {
-                    self.events.push(CoreEvent::Disconnect);
+                Err(e) => {
+                    self.disconnect(e.into());
                     return None;
                 }
             }
         }
+
         None
     }
 
     pub fn add_published_track(&mut self, track: TrackSender) {
-        self.published_tracks
-            .insert(track.meta.id.origin_mid, track);
+        self.upstream_allocator.add_published_track(track);
     }
 
     pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
@@ -146,11 +181,10 @@ impl ParticipantCore {
         }
     }
 
-    /// Handles synchronous events from the RTC engine.
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
-                self.events.push(CoreEvent::Disconnect);
+                self.disconnect(DisconnectReason::IceDisconnected);
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
@@ -159,7 +193,6 @@ impl ParticipantCore {
                 let Some(current) = self.downstream_allocator.handle_bwe(bwe) else {
                     return;
                 };
-
                 self.rtc.bwe().set_current_bitrate(Bitrate::bps(current));
                 self.update_desired_bitrate();
             }
@@ -170,9 +203,7 @@ impl ParticipantCore {
     }
 
     fn update_desired_bitrate(&mut self) {
-        // TODO: probably throttle this desired bitrate probe?
         let desired_bitrate = self.downstream_allocator.desired_bitrate();
-        // 1.25 * desired_bitrate to give headroom to increase qualities
         let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 4);
         self.rtc.bwe().set_desired_bitrate(desired_bitrate);
         tracing::debug!("desired_bitrate={desired_bitrate}");
@@ -193,22 +224,27 @@ impl ParticipantCore {
             Direction::SendOnly => {
                 self.downstream_allocator.add_slot(media.mid, media.kind);
             }
-            _ => self.events.push(CoreEvent::Disconnect),
+            _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
     }
 
-    fn handle_incoming_rtp(&mut self, mut rtp: RtpPacket) {
+    fn handle_incoming_rtp(&mut self, rtp: RtpPacket) {
+        let now = tokio::time::Instant::now();
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
             return;
         };
         let (mid, rid) = (stream.mid(), stream.rid());
+        self.upstream_allocator
+            .handle_incoming_rtp(mid, rid.as_ref(), rtp, now);
+    }
 
-        if let Some(track) = self.published_tracks.get_mut(&mid) {
-            rtp.header.ext_vals.rid = rid;
-            track.send(rid.as_ref(), rtp);
-        } else {
-            tracing::warn!(ssrc = %rtp.header.ssrc, %mid, ?rid, "Dropping incoming RTP packet; no published track found");
+    fn disconnect(&mut self, reason: DisconnectReason) {
+        if self.disconnect_reason.is_some() {
+            return;
         }
+        tracing::info!(%reason, "Participant core disconnecting");
+        self.disconnect_reason = Some(reason);
+        self.rtc.disconnect();
     }
 }

@@ -76,20 +76,15 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             .await;
 
         'outer: loop {
-            // 1. Advance the core's synchronous state machine.
             let Some(delay) = self.core.poll_rtc() else {
                 break 'outer;
             };
 
-            self.drain_keyframe_requests();
-
-            // 2. Execute any asynchronous side effects requested by the core.
             let events: Vec<_> = self.core.drain_events().collect();
             for event in events {
                 self.handle_core_event(event).await;
             }
 
-            // 3. Wait for the next I/O event or timeout.
             tokio::select! {
                 biased;
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg).await,
@@ -106,7 +101,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             }
         }
 
-        tracing::info!(participant_id = %self.meta(), "Shutting down actor.");
+        if let Some(reason) = self.core.disconnect_reason() {
+            tracing::info!(participant_id = %self.meta(), %reason, "Shutting down actor due to disconnect.");
+        } else {
+            tracing::info!(participant_id = %self.meta(), "Shutting down actor.");
+        }
         Ok(())
     }
 }
@@ -129,7 +128,6 @@ impl ParticipantActor {
         }
     }
 
-    /// Executes asynchronous actions requested by the core.
     async fn handle_core_event(&mut self, event: CoreEvent) {
         match event {
             CoreEvent::SpawnTrack(track_meta) => {
@@ -139,9 +137,6 @@ impl ParticipantActor {
                     .room_handle
                     .send_high(room::RoomMessage::PublishTrack(rx))
                     .await;
-            }
-            CoreEvent::Disconnect => {
-                self.core.rtc.disconnect();
             }
         }
     }
@@ -159,26 +154,6 @@ impl ParticipantActor {
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {}
         };
-    }
-
-    fn drain_keyframe_requests(&mut self) {
-        // TODO: make this reactive and encapsulate in core
-        for track in &mut self.core.published_tracks {
-            for sender in &mut track.1.simulcast {
-                let Some(key) = sender.get_keyframe_request() else {
-                    continue;
-                };
-
-                let mut api = self.core.rtc.direct_api();
-                let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) else {
-                    tracing::warn!("stream_rx not found, keyframe request failed");
-                    return;
-                };
-
-                stream.request_keyframe(key.request.kind);
-                tracing::debug!(?key, "requested keyframe");
-            }
-        }
     }
 }
 
