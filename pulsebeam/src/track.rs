@@ -85,7 +85,8 @@ impl SimulcastSender {
     }
 
     pub fn push(&mut self, packet: RtpPacket) {
-        self.jitter_buffer.push(packet);
+        // self.jitter_buffer.push(packet);
+        self.forward_packet(packet);
     }
 
     pub fn poll(&mut self, now: Instant) {
