@@ -51,22 +51,29 @@ impl UpstreamAllocator {
     }
 
     /// Polls all jitter buffers for all tracks to release ready packets.
-    pub fn poll(&mut self, now: Instant) {
+    pub fn poll(&mut self, rtc: &mut str0m::Rtc, now: Instant) {
         for track in self.published_tracks.values_mut() {
             track.poll(now);
         }
+        self.drain_keyframe_requests(rtc);
     }
 
     /// Drains pending keyframe requests from all managed tracks.
-    pub fn drain_keyframe_requests(&mut self) -> Vec<KeyframeRequest> {
-        let mut requests = Vec::new();
+    fn drain_keyframe_requests(&mut self, rtc: &mut str0m::Rtc) {
         for track in self.published_tracks.values_mut() {
             for sender in &mut track.simulcast {
-                if let Some(req) = sender.get_keyframe_request() {
-                    requests.push(req);
+                let Some(key) = sender.get_keyframe_request() else {
+                    continue;
+                };
+
+                let mut api = rtc.direct_api();
+                if let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) {
+                    stream.request_keyframe(key.request.kind);
+                    tracing::debug!(?key.request, "requested keyframe for upstream");
+                } else {
+                    tracing::warn!(?key.request, "stream not found for keyframe request");
                 }
             }
         }
-        requests
     }
 }

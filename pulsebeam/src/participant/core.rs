@@ -82,8 +82,6 @@ impl ParticipantCore {
     }
 
     pub fn handle_timeout(&mut self) {
-        let now = tokio::time::Instant::now();
-        self.upstream_allocator.poll(now);
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
     }
 
@@ -114,20 +112,8 @@ impl ParticipantCore {
             return None;
         }
 
-        self.upstream_allocator.poll(tokio::time::Instant::now());
-
-        let key_requests = self.upstream_allocator.drain_keyframe_requests();
-        if !key_requests.is_empty() {
-            let mut api = self.rtc.direct_api();
-            for key in key_requests {
-                if let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) {
-                    stream.request_keyframe(key.request.kind);
-                    tracing::debug!(?key.request, "requested keyframe for upstream");
-                } else {
-                    tracing::warn!(?key.request, "stream not found for keyframe request");
-                }
-            }
-        }
+        self.upstream_allocator
+            .poll(&mut self.rtc, tokio::time::Instant::now());
 
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
