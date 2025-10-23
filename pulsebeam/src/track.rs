@@ -70,9 +70,7 @@ impl SimulcastSender {
         }
 
         let binding = self.keyframe_requests.borrow_and_update();
-        let Some(update) = binding.as_ref() else {
-            return None;
-        };
+        let update = binding.as_ref()?;
 
         let now = Instant::now();
         if let Some(last_request_time) = self.last_keyframe_requested_at {
@@ -85,8 +83,7 @@ impl SimulcastSender {
     }
 
     pub fn push(&mut self, packet: RtpPacket) {
-        // self.jitter_buffer.push(packet);
-        self.forward_packet(packet);
+        self.jitter_buffer.push(packet);
     }
 
     pub fn poll(&mut self, now: Instant) {
