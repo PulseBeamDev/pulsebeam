@@ -87,6 +87,17 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
             tokio::select! {
                 biased;
+                res = ctx.sys_rx.recv() => {
+                    match res {
+                        Some(msg) => match msg {
+                            actor::SystemMsg::GetState(responder) => {
+                                let _ = responder.send(self.get_observable_state());
+                            }
+                            actor::SystemMsg::Terminate => break,
+                        },
+                        None => break,
+                    }
+                }
                 Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg).await,
                 Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
