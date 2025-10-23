@@ -7,11 +7,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use str0m::bwe::BweKind;
+use std::time::Duration;
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
 use str0m::rtp::SeqNo;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
@@ -182,12 +183,7 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn rewrite_rtp(
-        &mut self,
-        mid: Mid,
-        packet: &RtpPacket,
-        marker: bool,
-    ) -> Option<(SeqNo, u32)> {
+    pub fn rewrite_rtp(&mut self, mid: Mid, packet: &RtpPacket) -> Option<(SeqNo, u32)> {
         if let Some(rewriter) = self
             .video_slots
             .iter_mut()
@@ -226,10 +222,11 @@ impl DownstreamAllocator {
         desired_bitrate
     }
 
-    pub fn handle_bwe(&mut self, bwe: BweKind) -> Option<u64> {
+    pub fn handle_bwe(&mut self, bwe: BweKind) -> Option<Bitrate> {
         let BweKind::Twcc(available_bandwidth) = bwe else {
             return None;
         };
+        let now = Instant::now();
         let new_bwe = available_bandwidth.as_f64();
 
         let smoothed_bwe = match self.smoothed_bwe_bps {
@@ -240,7 +237,6 @@ impl DownstreamAllocator {
 
         let budget = smoothed_bwe * 0.90;
         let mut total_allocated_bitrate = 0.0;
-        let now = Instant::now();
 
         const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(8);
         const UPGRADE_HEADROOM: f64 = 1.25;
@@ -312,15 +308,16 @@ impl DownstreamAllocator {
         }
 
         let utilization = total_allocated_bitrate / smoothed_bwe;
+        let total_allocated_bitrate = Bitrate::from(total_allocated_bitrate);
         tracing::debug!(
-            "BWE: utilization={:.2}%, available={:.0}, smoothed={:.0}, allocated={:.0}",
+            "BWE: utilization={:.2}%, available={}, smoothed={}, allocated={}",
             utilization * 100.0,
-            new_bwe,
-            smoothed_bwe,
+            Bitrate::from(new_bwe),
+            Bitrate::from(smoothed_bwe),
             total_allocated_bitrate,
         );
 
-        Some(total_allocated_bitrate as u64)
+        Some(total_allocated_bitrate)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {

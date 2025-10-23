@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
 use str0m::bwe::Bitrate;
-use str0m::media::Mid;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
@@ -75,14 +75,16 @@ impl ParticipantCore {
                 destination: packet.dst,
                 contents,
             };
-            let _ = self.rtc.handle_input(Input::Receive(Instant::now(), recv));
+            let _ = self
+                .rtc
+                .handle_input(Input::Receive(Instant::now().into(), recv));
         } else {
             tracing::warn!(src = %packet.src, "Dropping malformed UDP packet");
         }
     }
 
     pub fn handle_timeout(&mut self) {
-        let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
+        let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }
 
     pub fn handle_available_tracks(
@@ -112,13 +114,12 @@ impl ParticipantCore {
             return None;
         }
 
-        self.upstream_allocator
-            .poll(&mut self.rtc, tokio::time::Instant::now());
+        self.upstream_allocator.poll(&mut self.rtc);
 
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
-                    return Some(deadline.saturating_duration_since(Instant::now()));
+                    return Some(deadline.saturating_duration_since(Instant::now().into()));
                 }
                 Ok(Output::Transmit(tx)) => {
                     self.batcher.push_back(tx.destination, &tx.contents);
@@ -149,10 +150,7 @@ impl ParticipantCore {
             return;
         };
 
-        let Some((new_seq, new_ts)) =
-            self.downstream_allocator
-                .rewrite_rtp(mid, rtp, is_switch_point)
-        else {
+        let Some((new_seq, new_ts)) = self.downstream_allocator.rewrite_rtp(mid, rtp) else {
             tracing::warn!(%mid, "No RTP rewriter for active track, dropping packet");
             return;
         };
@@ -196,7 +194,7 @@ impl ParticipantCore {
                 let Some(current) = self.downstream_allocator.handle_bwe(bwe) else {
                     return;
                 };
-                self.rtc.bwe().set_current_bitrate(Bitrate::bps(current));
+                self.rtc.bwe().set_current_bitrate(current);
                 self.update_desired_bitrate();
             }
             e => {
@@ -207,7 +205,7 @@ impl ParticipantCore {
 
     fn update_desired_bitrate(&mut self) {
         let desired_bitrate = self.downstream_allocator.desired_bitrate();
-        let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 4);
+        let desired_bitrate = Bitrate::bps(desired_bitrate);
         self.rtc.bwe().set_desired_bitrate(desired_bitrate);
         tracing::debug!("desired_bitrate={desired_bitrate}");
     }

@@ -235,7 +235,8 @@ impl BandwidthEstimator {
             } else {
                 (1.0 - alpha) * self.estimate + alpha * instant_bps
             };
-            self.shared.store(self.estimate as u64, Ordering::Relaxed);
+            self.shared
+                .store((self.estimate * 1.25) as u64, Ordering::Relaxed);
             self.last_update = now;
         }
     }
