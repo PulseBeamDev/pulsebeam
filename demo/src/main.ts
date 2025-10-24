@@ -54,7 +54,7 @@ async function start(endpoint: string) {
 
   // WHEP: recv-only transceivers
   pc.addTransceiver("video", { direction: "recvonly" });
-  if (!window._injects.audio) {
+  if (window._injects.audio) {
     pc.addTransceiver("audio", { direction: "recvonly" });
   }
   const remoteVideoStream = new MediaStream();
