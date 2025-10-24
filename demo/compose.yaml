@@ -1,8 +1,7 @@
 version: "3.8"
-
 services:
   pulsebeam:
-    image: ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.2.5
+    image: ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.12
     restart: unless-stopped
     network_mode: "host" # Linux only; uses real host IPs for WebRTC
     healthcheck:
@@ -11,27 +10,19 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    logging:
 
   caddy:
     image: docker.io/library/caddy:2
     restart: unless-stopped
     network_mode: "host" # shares host networking
     volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:z # Mount the Caddyfile from the host
       - caddy_data:/data
       - caddy_config:/config
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     environment:
-      - CADDY_ADMIN=0.0.0.0:2019
-    configs:
-      - source: inline_caddyfile
-        target: /etc/caddy/Caddyfile
-
-configs:
-  inline_caddyfile:
-    content: |
-      demo.pulsebeam.dev {
-          reverse_proxy localhost:3000
-      }
+      - CADDY_ADMIN=0.0.0.0:2019 # Expose Caddy admin API for monitoring (optional)
 
 volumes:
   caddy_data:

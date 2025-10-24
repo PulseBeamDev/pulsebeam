@@ -1,0 +1,8 @@
+demo.pulsebeam.dev {
+    # Use Let's Encrypt for trusted certificates
+    # Uncomment and add your email for production
+    # tls your-email@example.com
+    
+    # Simple reverse proxy to your application
+    reverse_proxy localhost:3000
+}
