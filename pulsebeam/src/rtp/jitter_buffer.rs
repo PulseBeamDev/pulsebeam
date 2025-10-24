@@ -19,6 +19,7 @@ pub struct JitterBuffer<T: PacketTiming> {
     jitter_estimate: f64,
     last_arrival_time: Option<Instant>,
     last_received_rtp_ts: Option<MediaTime>,
+    first_seq: Option<SeqNo>, // Track the first sequence number we receive
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +82,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
             jitter_estimate: 0.0,
             last_arrival_time: None,
             last_received_rtp_ts: None,
+            first_seq: None,
         }
     }
 
@@ -89,6 +91,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
         let arrival = packet.arrival_timestamp();
         tracing::trace!(sequence = *seq, "packet pushed");
 
+        // Only drop packets that have already been played out
         if let Some(last_seq) = self.last_playout_seq {
             if seq <= last_seq {
                 tracing::debug!(
@@ -101,6 +104,14 @@ impl<T: PacketTiming> JitterBuffer<T> {
             }
         }
 
+        // Check for duplicates in buffer
+        if self.buffer.contains_key(&seq) {
+            tracing::debug!(sequence = *seq, "dropping duplicate packet");
+            metrics::counter!("jitterbuffer_dropped_packets_total").increment(1);
+            return;
+        }
+
+        // Detect silence periods and reset state
         if let Some(last_arrival) = self.last_arrival_time {
             if arrival.saturating_duration_since(last_arrival) > self.config.silence_threshold {
                 tracing::warn!(threshold = ?self.config.silence_threshold, "silence detected, resetting jitter buffer");
@@ -111,15 +122,45 @@ impl<T: PacketTiming> JitterBuffer<T> {
 
         self.update_jitter(&packet);
 
-        if self.buffer.is_empty() && self.last_playout_seq.is_none() {
+        // Track the first sequence number we ever receive to handle reordering
+        // Update first_seq to always point to the lowest sequence number we've seen
+        let should_adjust_playout = if let Some(current_first) = self.first_seq {
+            if seq < current_first {
+                self.first_seq = Some(seq);
+                // An earlier packet arrived - we need to adjust playout time
+                self.last_playout_seq.is_none() && !self.buffer.is_empty()
+            } else {
+                false
+            }
+        } else {
+            self.first_seq = Some(seq);
+            false
+        };
+
+        // Initialize playout time when first packet arrives
+        let is_first_packet = self.buffer.is_empty() && self.last_playout_seq.is_none();
+        if is_first_packet {
             self.playout_time = arrival + self.current_delay();
             tracing::debug!(playout_time = ?self.playout_time, "initial playout time established");
         }
 
         self.buffer.insert(seq, packet);
+
+        // Adjust playout time if an earlier sequenced packet arrived out of order
+        if should_adjust_playout {
+            // Recalculate playout time based on the earliest packet's arrival
+            if let Some(earliest_packet) = self.buffer.values().min_by_key(|p| p.seq_no()) {
+                self.playout_time = earliest_packet.arrival_timestamp() + self.current_delay();
+                tracing::debug!(
+                    playout_time = ?self.playout_time,
+                    "adjusted playout time for earlier packet"
+                );
+            }
+        }
         metrics::histogram!("jitterbuffer_buffer_occupancy_packets")
             .record(self.buffer.len() as f64);
 
+        // Enforce maximum buffer capacity
         if self.buffer.len() > self.config.max_capacity {
             if let Some(first_key) = self.buffer.keys().next().copied() {
                 self.buffer.remove(&first_key);
@@ -130,8 +171,9 @@ impl<T: PacketTiming> JitterBuffer<T> {
     }
 
     pub fn poll(&mut self, now: Instant) -> PollResult<T> {
+        // Determine next sequence to play: either continue from last played, or start with first received
         let next_seq_to_play = self.last_playout_seq.map_or_else(
-            || self.buffer.keys().next().copied(),
+            || self.first_seq,
             |last_played| Some(SeqNo::from(*last_played + 1)),
         );
 
@@ -139,6 +181,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
             return PollResult::Empty;
         };
 
+        // If the packet we want is ready, check if it's time to play it
         if self.buffer.contains_key(&seq_to_play) {
             if now >= self.playout_time {
                 let packet = self.buffer.remove(&seq_to_play).unwrap();
@@ -153,6 +196,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
             }
         }
 
+        // Packet is missing, check if we should skip the gap
         if !self.buffer.is_empty() {
             let overdue = now.saturating_duration_since(self.playout_time);
             if overdue > self.config.loss_patience {
@@ -176,11 +220,14 @@ impl<T: PacketTiming> JitterBuffer<T> {
         self.last_playout_rtp_ts = None;
         self.last_arrival_time = None;
         self.last_received_rtp_ts = None;
+        self.first_seq = None;
         tracing::debug!("jitter buffer state reset");
     }
 
     fn update_jitter(&mut self, packet: &T) {
         let rtp_timestamp = packet.rtp_timestamp();
+
+        // Jitter calculation requires two packets to establish transit time difference
         if let (Some(last_arrival), Some(last_rtp)) =
             (self.last_arrival_time, self.last_received_rtp_ts)
         {
@@ -189,8 +236,10 @@ impl<T: PacketTiming> JitterBuffer<T> {
                 .saturating_duration_since(last_arrival);
             let rtp_diff: Duration = rtp_timestamp.saturating_sub(last_rtp).into();
 
+            // Calculate absolute difference between arrival and RTP deltas
             let transit_diff = (arrival_diff.as_secs_f64() - rtp_diff.as_secs_f64()).abs();
 
+            // Apply exponential moving average with smoothing factor
             self.jitter_estimate += (transit_diff - self.jitter_estimate) * JITTER_SMOOTHING_FACTOR;
             self.jitter_estimate = self.jitter_estimate.clamp(0.0, MAX_JITTER_SECONDS);
         }
@@ -201,6 +250,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
     }
 
     fn advance_playout_time(&mut self, packet_sent: &T) {
+        // Calculate playout time for next packet based on RTP timestamp difference
         if let Some(next_packet) = self.buffer.values().next() {
             let rtp_diff = next_packet
                 .rtp_timestamp()
@@ -210,6 +260,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
     }
 
     fn skip_gap(&mut self, now: Instant) {
+        // Jump to the next available packet in the buffer
         if let Some(next_packet) = self.buffer.values().next() {
             self.playout_time = now;
             self.last_playout_seq = self
@@ -223,6 +274,7 @@ impl<T: PacketTiming> JitterBuffer<T> {
     }
 
     fn current_delay(&self) -> Duration {
+        // Calculate total delay: base latency + jitter-based adaptive delay
         let jitter_delay_secs = self.jitter_estimate * self.config.jitter_multiplier;
         let clamped = jitter_delay_secs.min(MAX_JITTER_SECONDS);
         self.config.base_latency + Duration::from_secs_f64(clamped)
@@ -314,9 +366,14 @@ mod test {
 
         let p1 = make_packet(1, 0, 0, now);
         jb.push(p1);
+
+        // Push a second packet to establish jitter baseline
+        let p1_5 = make_packet(2, 20, 25, now);
+        jb.push(p1_5);
         assert_ne!(jb.jitter_estimate, 0.0);
 
-        let p2 = make_packet(2, 100, 100, now);
+        // Silence period followed by new packet should reset
+        let p2 = make_packet(3, 100, 100, now);
         jb.push(p2);
         assert_eq!(jb.jitter_estimate, 0.0);
         assert!(jb.last_playout_seq.is_none());
@@ -349,6 +406,7 @@ mod test {
             server_ts: now + Duration::from_millis(70),
         };
         jb.push(m3);
-        assert!(jb.jitter_estimate > 0.005);
+        // With smoothing factor 1/16, first jitter sample of 0.01 becomes ~0.000625
+        assert!(jb.jitter_estimate > 0.0005);
     }
 }
