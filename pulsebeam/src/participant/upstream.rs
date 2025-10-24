@@ -52,10 +52,6 @@ impl UpstreamAllocator {
 
     /// Polls all jitter buffers for all tracks to release ready packets.
     pub fn poll(&mut self, rtc: &mut str0m::Rtc) {
-        let now = Instant::now();
-        for track in self.published_tracks.values_mut() {
-            track.poll(now);
-        }
         self.drain_keyframe_requests(rtc);
     }
 

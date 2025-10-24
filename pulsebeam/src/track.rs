@@ -12,7 +12,6 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
-use crate::rtp::jitter_buffer::{self, JitterBuffer, PollResult};
 
 #[derive(Debug, Clone)]
 pub struct KeyframeRequest {
@@ -58,7 +57,6 @@ pub struct SimulcastSender {
     pub rid: Option<Rid>,
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
     pub last_keyframe_requested_at: Option<Instant>,
-    jitter_buffer: JitterBuffer<RtpPacket>,
     channel: spmc::Sender<RtpPacket>,
     bwe: BandwidthEstimator,
 }
@@ -82,17 +80,7 @@ impl SimulcastSender {
         Some(update.clone())
     }
 
-    pub fn push(&mut self, packet: RtpPacket) {
-        self.jitter_buffer.push(packet);
-    }
-
-    pub fn poll(&mut self, now: Instant) {
-        while let PollResult::PacketReady(packet) = self.jitter_buffer.poll(now) {
-            self.forward_packet(packet);
-        }
-    }
-
-    fn forward_packet(&mut self, pkt: RtpPacket) {
+    pub fn push(&mut self, pkt: RtpPacket) {
         self.bwe.update(pkt.payload.len() + pkt.header.header_len);
         self.channel.send(pkt);
     }
@@ -111,12 +99,6 @@ impl TrackSender {
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available");
         sender.push(packet);
-    }
-
-    pub fn poll(&mut self, now: Instant) {
-        for sender in &mut self.simulcast {
-            sender.poll(now);
-        }
     }
 }
 
@@ -147,11 +129,6 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
 
-    let jitter_config = match meta.kind {
-        MediaKind::Audio => jitter_buffer::JitterBufferConfig::audio_interactive(),
-        MediaKind::Video => jitter_buffer::JitterBufferConfig::video_interactive(),
-    };
-
     for rid in simulcast_rids {
         let (tx, rx) = spmc::channel(capacity);
         let (keyframe_tx, keyframe_rx) = watch::channel(None);
@@ -175,7 +152,6 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             channel: tx,
             keyframe_requests: keyframe_rx,
             last_keyframe_requested_at: None,
-            jitter_buffer: JitterBuffer::new(jitter_config),
             bwe,
         });
         receivers.push(SimulcastReceiver {
