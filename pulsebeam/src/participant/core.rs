@@ -139,12 +139,7 @@ impl ParticipantCore {
         self.upstream_allocator.add_published_track(track);
     }
 
-    pub fn handle_forward_rtp(
-        &mut self,
-        track_meta: Arc<TrackMeta>,
-        rtp: &RtpPacket,
-        is_switch_point: bool,
-    ) {
+    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
         let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) else {
             tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP for inactive track");
             return;
@@ -205,7 +200,8 @@ impl ParticipantCore {
 
     fn update_desired_bitrate(&mut self) {
         let desired_bitrate = self.downstream_allocator.desired_bitrate();
-        let desired_bitrate = Bitrate::bps(desired_bitrate);
+        // TODO: improve desired_bitrate controller
+        let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 4);
         self.rtc.bwe().set_desired_bitrate(desired_bitrate);
         tracing::debug!("desired_bitrate={desired_bitrate}");
     }

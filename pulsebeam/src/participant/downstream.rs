@@ -226,6 +226,7 @@ impl DownstreamAllocator {
         let BweKind::Twcc(available_bandwidth) = bwe else {
             return None;
         };
+
         let now = Instant::now();
         let new_bwe = available_bandwidth.as_f64();
 
