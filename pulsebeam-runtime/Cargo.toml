@@ -24,11 +24,11 @@ tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 futures.workspace = true
-tokio-rustls = "0.26.2"
-rustls = "0.23.31"
+tokio-rustls = "0.26.4"
+rustls = "0.23.34"
 turmoil = "0.6.6"
 quinn-udp = "0.5.14"
-socket2 = "0.6.0"
+socket2 = "0.6.1"
 no-panic = "0.1.35"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 tokio-metrics = { version = "0.4.5", features = ["metrics-rs-integration"] }
@@ -41,5 +41,5 @@ crossbeam-utils = "0.8.21"
 metrics = "0.24.2"
 
 [dev-dependencies]
-rcgen = "0.14.4"
+rcgen = "0.14.5"
 criterion = { version = "0.7.0", features = ["async", "async_tokio"] }
