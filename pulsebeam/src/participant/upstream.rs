@@ -32,6 +32,10 @@ impl UpstreamAllocator {
             .insert(track.meta.id.origin_mid, track);
     }
 
+    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut TrackSender> {
+        self.published_tracks.get_mut(mid)
+    }
+
     /// Handles an incoming RTP packet from the RTC engine.
     ///
     /// This method finds the correct simulcast layer and pushes the packet

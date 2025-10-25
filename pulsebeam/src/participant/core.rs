@@ -198,6 +198,15 @@ impl ParticipantCore {
                 self.rtc.bwe().set_current_bitrate(current);
                 self.update_desired_bitrate();
             }
+            Event::StreamPaused(e) => {
+                let Some(track) = self.upstream_allocator.get_track_mut(&e.mid) else {
+                    return;
+                };
+                let Some(layer) = track.by_rid_mut(&e.rid) else {
+                    return;
+                };
+                layer.set_paused(e.paused);
+            }
             e => {
                 tracing::warn!("unhandled event: {e:?}");
             }

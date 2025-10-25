@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -32,7 +32,8 @@ pub struct SimulcastReceiver {
     pub rid: Option<Rid>,
     pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
-    pub bitrate: Arc<AtomicU64>,
+    bitrate: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
 }
 
 impl SimulcastReceiver {
@@ -50,6 +51,14 @@ impl SimulcastReceiver {
             tracing::warn!(?request, "feedback channel is unavailable");
         }
     }
+
+    pub fn estimated_bitrate(&self) -> u64 {
+        self.bitrate.load(Ordering::Relaxed)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug)]
@@ -59,6 +68,7 @@ pub struct SimulcastSender {
     pub last_keyframe_requested_at: Option<Instant>,
     channel: spmc::Sender<RtpPacket>,
     bwe: BandwidthEstimator,
+    paused: Arc<AtomicBool>,
 }
 
 impl SimulcastSender {
@@ -84,6 +94,10 @@ impl SimulcastSender {
         self.bwe.update(pkt.payload.len() + pkt.header.header_len);
         self.channel.send(pkt);
     }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
 }
 
 pub struct TrackSender {
@@ -100,6 +114,10 @@ impl TrackSender {
             .expect("expected sender to always be available");
         sender.push(packet);
     }
+
+    pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut SimulcastSender> {
+        self.simulcast.iter_mut().find(|s| s.rid == *rid)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -109,11 +127,8 @@ pub struct TrackReceiver {
 }
 
 impl TrackReceiver {
-    pub fn by_rid(&self, rid: Option<&Rid>) -> Option<SimulcastReceiver> {
-        self.simulcast
-            .iter()
-            .find(|s| s.rid.as_ref() == rid)
-            .cloned()
+    pub fn by_rid(&self, rid: Option<&Rid>) -> Option<&SimulcastReceiver> {
+        self.simulcast.iter().find(|s| s.rid.as_ref() == rid)
     }
 }
 
@@ -146,6 +161,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         };
         let bitrate = Arc::new(AtomicU64::new(bitrate));
         let bwe = BandwidthEstimator::new(bitrate.clone());
+        let paused = Arc::new(AtomicBool::new(true));
 
         senders.push(SimulcastSender {
             rid,
@@ -153,6 +169,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             keyframe_requests: keyframe_rx,
             last_keyframe_requested_at: None,
             bwe,
+            paused: paused.clone(),
         });
         receivers.push(SimulcastReceiver {
             meta: meta.clone(),
@@ -160,6 +177,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             channel: rx,
             keyframe_requester: keyframe_tx,
             bitrate,
+            paused,
         });
     }
 
