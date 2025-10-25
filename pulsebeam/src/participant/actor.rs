@@ -103,8 +103,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     self.core.batcher.flush(&self.egress);
                 },
                 Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
-                Some((meta, rtp, _)) = self.core.downstream_allocator.next() => {
-                    self.core.handle_forward_rtp(meta, &rtp.value);
+                Some((meta, rtp, is_switch)) = self.core.downstream_allocator.next() => {
+                    self.core.handle_forward_rtp(meta, &rtp.value, is_switch);
                 },
                 _ = rt::sleep(delay) => {
                     self.core.handle_timeout();

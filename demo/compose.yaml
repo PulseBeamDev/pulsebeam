@@ -1,7 +1,7 @@
 version: "3.8"
 services:
   pulsebeam:
-    image: ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.12
+    image: ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.2.5
     restart: unless-stopped
     network_mode: "host" # Linux only; uses real host IPs for WebRTC
     healthcheck:

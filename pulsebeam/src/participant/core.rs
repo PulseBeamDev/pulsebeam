@@ -139,13 +139,19 @@ impl ParticipantCore {
         self.upstream_allocator.add_published_track(track);
     }
 
-    pub fn handle_forward_rtp(&mut self, track_meta: Arc<TrackMeta>, rtp: &RtpPacket) {
+    pub fn handle_forward_rtp(
+        &mut self,
+        track_meta: Arc<TrackMeta>,
+        rtp: &RtpPacket,
+        is_switch: bool,
+    ) {
         let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) else {
             tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP for inactive track");
             return;
         };
 
-        let Some((new_seq, new_ts)) = self.downstream_allocator.rewrite_rtp(mid, rtp) else {
+        let Some((new_seq, new_ts)) = self.downstream_allocator.rewrite_rtp(mid, rtp, is_switch)
+        else {
             tracing::warn!(%mid, "No RTP rewriter for active track, dropping packet");
             return;
         };

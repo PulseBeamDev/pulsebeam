@@ -92,7 +92,7 @@ struct AudioSlotState {
 }
 
 /// Per-subscriber video slot state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct VideoSlotState {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
@@ -183,21 +183,26 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn rewrite_rtp(&mut self, mid: Mid, packet: &RtpPacket) -> Option<(SeqNo, u32)> {
+    pub fn rewrite_rtp(
+        &mut self,
+        mid: Mid,
+        packet: &RtpPacket,
+        is_switch: bool,
+    ) -> Option<(SeqNo, u32)> {
         if let Some(rewriter) = self
             .video_slots
             .iter_mut()
             .find(|s| s.mid == mid)
             .map(|s| &mut s.rewriter)
         {
-            Some(rewriter.rewrite(packet))
+            Some(rewriter.rewrite(packet, is_switch))
         } else if let Some(rewriter) = self
             .audio_slots
             .iter_mut()
             .find(|s| s.mid == mid)
             .map(|s| &mut s.rewriter)
         {
-            Some(rewriter.rewrite(packet))
+            Some(rewriter.rewrite(packet, is_switch))
         } else {
             None
         }

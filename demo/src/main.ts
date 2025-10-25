@@ -25,6 +25,7 @@ form.onsubmit = async (e) => {
     try {
       await start(endpoint);
     } catch (e) {
+      console.error(e);
       stop();
     }
   }
