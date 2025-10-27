@@ -1,5 +1,6 @@
 use crate::rtp::rtp_rewriter::RtpRewriter;
 use crate::rtp::{self, RtpPacket};
+use futures::FutureExt;
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
@@ -508,71 +509,141 @@ impl DownstreamAllocator {
             };
 
             let mut local_generation = u64::MAX;
+
+            // The stream we are actively trying to receive from.
             let mut active_index: Option<usize> = None;
-            let mut waiting_keyframe = true;
+            // The previous stream we are using as a fallback while waiting for a keyframe on the active one.
+            let mut fallback_index: Option<usize> = None;
 
             loop {
-                let config = *rx.borrow();
-
-                if local_generation != config.generation {
-                    local_generation = config.generation;
+                // Section 1: Check for configuration changes and update our state accordingly.
+                if local_generation != rx.borrow().generation {
+                    local_generation = rx.borrow().generation;
+                    let config = *rx.borrow();
                     tracing::debug!(?track.meta.id, "Track state applied: {config:?}");
 
-                    let old_index = active_index;
-                    active_index = if config.paused {
+                    let new_index = if config.paused {
                         None
                     } else {
                         find_index_for_rid(config.target_rid, &track.simulcast)
                     };
 
-                    if active_index != old_index && active_index.is_some() {
-                        let new_index = active_index.unwrap();
-                        let receiver = &mut track.simulcast[new_index];
-                        receiver.channel.reset();
-                        receiver.request_keyframe();
-                        waiting_keyframe = true;
+                    // Only react if the target index has actually changed.
+                    if active_index != new_index {
+                        if config.paused {
+                             // If pausing, immediately stop all streams.
+                            active_index = None;
+                            fallback_index = None;
+                        } else {
+                            // A switch is occurring. The old active stream becomes our fallback.
+                            fallback_index = active_index;
+                            active_index = new_index;
+
+                            // If we have a new stream to switch to, request a keyframe.
+                            if let Some(index) = active_index {
+                                let receiver = &mut track.simulcast[index];
+                                receiver.channel.reset(); // Clear any stale packets.
+                                receiver.request_keyframe();
+                                tracing::debug!(track_id = %meta.id, rid = ?receiver.rid, "Requesting keyframe for new stream");
+                            }
+                        }
                     }
                 }
 
-                let Some(current_index) = active_index else {
-                    if rx.changed().await.is_err() { break; }
-                    continue;
-                };
+                // Section 2: Wait for events based on the current state.
 
-                let receiver = &mut track.simulcast[current_index];
+                // State 1: We are in transition, consuming a fallback stream while waiting for a keyframe on the active one.
+                if let (Some(active_idx), Some(fallback_idx)) = (active_index, fallback_index) {
+                    let (active_receiver, fallback_receiver) = if fallback_idx < active_idx {
+                        let (left, right) = track.simulcast.split_at_mut(active_idx);
+                        (&mut right[0], &mut left[fallback_idx])
+                    } else {
+                        let (left, right) = track.simulcast.split_at_mut(fallback_idx);
+                        (&mut left[active_idx], &mut right[0])
+                    };
 
-                tokio::select! {
-                    biased;
+                    tokio::select! {
+                        biased;
 
-                    res = rx.changed() => {
-                        if res.is_err() { break; }
-                    },
+                        // Highest priority: a new config might change our plans again.
+                        res = rx.changed() => {
+                            if res.is_err() { break; }
+                            continue; // Restart loop to apply the new config.
+                        },
 
-                    res = receiver.channel.recv() => {
-                        match res {
-                            Ok(pkt) => {
-                                let marker = if waiting_keyframe {
+                        // Check for the keyframe on our new desired stream.
+                        res = active_receiver.channel.recv() => {
+                            match res {
+                                Ok(pkt) => {
+                                    // We only care about the keyframe to complete the switch.
                                     if pkt.value.is_keyframe() {
-                                        continue;
+                                        tracing::debug!(track_id = %meta.id, rid = ?active_receiver.rid, "Keyframe received, switch complete.");
+                                        // Keyframe received! The transition is over.
+                                        fallback_index = None;
+                                        // Yield this keyframe. The `true` marker signals a stream switch has occurred.
+                                        yield (meta.clone(), pkt, true);
                                     }
-                                    waiting_keyframe = false;
-                                    true
-                                } else {
-                                    false
-                                };
+                                    // Not a keyframe, so we drop it and continue waiting.
+                                },
+                                Err(spmc::RecvError::Lagged(count)) => {
+                                    tracing::warn!(track_id = %meta.id, rid = ?active_receiver.rid, count, "New stream lagged while waiting for keyframe, requesting again.");
+                                    active_receiver.request_keyframe();
+                                },
+                                Err(spmc::RecvError::Closed) => {
+                                    tracing::warn!(track_id = %meta.id, rid = ?active_receiver.rid, "New stream closed while waiting for keyframe. Aborting switch.");
+                                    // The new stream died. Abort the switch and revert to the fallback stream.
+                                    active_index = Some(fallback_idx);
+                                    fallback_index = None;
+                                },
+                            }
+                        },
 
-                                yield (meta.clone(), pkt, marker)
-                            },
-                            Err(spmc::RecvError::Lagged(count)) => {
-                                tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe");
-                                receiver.request_keyframe();
-                            },
-                            Err(spmc::RecvError::Closed) => {
-                                tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, "Stopping stream; channel closed");
-                                break;
-                            },
+                        // Meanwhile, continue consuming and yielding packets from the old (fallback) stream.
+                        res = fallback_receiver.channel.recv() => {
+                            match res {
+                                Ok(pkt) => {
+                                    // Yield packets from the old stream. No special marker.
+                                    yield (meta.clone(), pkt, false);
+                                },
+                                Err(_) => {
+                                    // The fallback stream died. We can stop listening to it.
+                                    fallback_index = None;
+                                }
+                            }
                         }
                     }
+                }
+                // State 2: Normal operation. We have one active stream and no fallback.
+                else if let Some(current_idx) = active_index {
+                    let receiver = &mut track.simulcast[current_idx];
+                    tokio::select! {
+                        biased;
+
+                        res = rx.changed() => {
+                            if res.is_err() { break; }
+                            continue;
+                        },
+
+                        res = receiver.channel.recv() => {
+                            match res {
+                                Ok(pkt) => {
+                                    yield (meta.clone(), pkt, false);
+                                },
+                                Err(spmc::RecvError::Lagged(count)) => {
+                                    tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe");
+                                    receiver.request_keyframe();
+                                },
+                                Err(spmc::RecvError::Closed) => {
+                                    tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, "Stopping stream; channel closed");
+                                    break;
+                                },
+                            }
+                        }
+                    }
+                }
+                // State 3: Paused. No active or fallback stream. Just wait for a config change.
+                else {
+                    if rx.changed().await.is_err() { break; }
                 }
             }
         }
