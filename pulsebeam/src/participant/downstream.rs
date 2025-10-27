@@ -1,17 +1,15 @@
 use crate::rtp::rtp_rewriter::RtpRewriter;
-use crate::rtp::{self, RtpPacket};
-use futures::FutureExt;
+use crate::rtp::{RtpPacket, TimingHeader};
 use futures::stream::{SelectAll, Stream, StreamExt};
-use pulsebeam_runtime::sync::spmc;
+use pulsebeam_runtime::sync::spmc::{self, Slot};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
-use str0m::rtp::SeqNo;
+use str0m::rtp::RtpHeader;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -22,7 +20,7 @@ use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 ///
 /// It includes the packet and a boolean marker to indicate if this is the first
 /// packet after a simulcast layer switch.
-type TrackStreamItem = (Arc<TrackMeta>, Arc<spmc::Slot<RtpPacket>>, bool);
+type TrackStreamItem = (Arc<TrackMeta>, TimingHeader, Arc<Slot<RtpPacket>>);
 type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 
 /// Configuration that each downstream receiver listens to.
@@ -89,7 +87,6 @@ impl TrackState {
 struct AudioSlotState {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
-    rewriter: rtp::rtp_rewriter::RtpRewriter,
 }
 
 /// Per-subscriber video slot state.
@@ -100,7 +97,6 @@ struct VideoSlotState {
     max_height: u32,
     last_switch_at: Option<Instant>,
     last_assigned_bitrate: Option<f64>,
-    rewriter: rtp::rtp_rewriter::RtpRewriter,
 }
 
 pub struct DownstreamAllocator {
@@ -161,7 +157,6 @@ impl DownstreamAllocator {
                 self.audio_slots.push(AudioSlotState {
                     mid,
                     assigned_track: None,
-                    rewriter: RtpRewriter::default(),
                 });
             }
             MediaKind::Video => {
@@ -171,7 +166,6 @@ impl DownstreamAllocator {
                     max_height: 720,
                     last_switch_at: None,
                     last_assigned_bitrate: None,
-                    rewriter: RtpRewriter::default(),
                 });
             }
         }
@@ -181,31 +175,6 @@ impl DownstreamAllocator {
     pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
         if let Some(slot) = self.video_slots.iter_mut().find(|s| s.mid == mid) {
             slot.max_height = max_height;
-        }
-    }
-
-    pub fn rewrite_rtp(
-        &mut self,
-        mid: Mid,
-        packet: &RtpPacket,
-        is_switch: bool,
-    ) -> Option<(SeqNo, u32)> {
-        if let Some(rewriter) = self
-            .video_slots
-            .iter_mut()
-            .find(|s| s.mid == mid)
-            .map(|s| &mut s.rewriter)
-        {
-            rewriter.rewrite(packet, is_switch)
-        } else if let Some(rewriter) = self
-            .audio_slots
-            .iter_mut()
-            .find(|s| s.mid == mid)
-            .map(|s| &mut s.rewriter)
-        {
-            rewriter.rewrite(packet, is_switch)
-        } else {
-            None
         }
     }
 
@@ -343,13 +312,13 @@ impl DownstreamAllocator {
         state.request_keyframe();
     }
 
-    pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, rtp: &RtpPacket) -> Option<Mid> {
+    pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, hdr: &RtpHeader) -> Option<Mid> {
         let assigned_mid = self.tracks.get(&meta.id).and_then(|s| s.assigned_mid);
 
         let mut needs_rebalance = false;
         if let Some(track_state) = self.tracks.get_mut(&meta.id) {
             if meta.kind == MediaKind::Audio {
-                let new_level = rtp.header.ext_vals.audio_level.unwrap_or(-127);
+                let new_level = hdr.ext_vals.audio_level.unwrap_or(-127);
                 if track_state.audio_level.0 != new_level as i32 {
                     track_state.audio_level = AudioLevel(new_level as i32);
                     needs_rebalance = true;
@@ -427,7 +396,6 @@ impl DownstreamAllocator {
                     let mut tmp = AudioSlotState {
                         mid: slot.mid,
                         assigned_track: slot.assigned_track.clone(),
-                        rewriter: RtpRewriter::default(),
                     };
                     Self::perform_unassignment(&mut self.tracks, &mut tmp);
                     slot.assigned_track = None;
@@ -438,7 +406,6 @@ impl DownstreamAllocator {
                     let mut tmp = AudioSlotState {
                         mid: slot.mid,
                         assigned_track: None,
-                        rewriter: RtpRewriter::default(),
                     };
                     Self::perform_assignment(&mut self.tracks, &mut tmp, &track_id);
                     slot.assigned_track = Some(track_id);
@@ -529,6 +496,7 @@ pub struct TrackReader {
     active_index: Option<usize>,
     fallback_index: Option<usize>,
     local_generation: u64,
+    rewriter: RtpRewriter,
 }
 
 impl TrackReader {
@@ -540,6 +508,7 @@ impl TrackReader {
             active_index: None,
             fallback_index: None,
             local_generation: u64::MAX,
+            rewriter: RtpRewriter::new(),
         }
     }
 
@@ -583,6 +552,19 @@ impl TrackReader {
         }
     }
 
+    pub fn rewrite(
+        &mut self,
+        pkt: Arc<Slot<RtpPacket>>,
+        is_switch: bool,
+    ) -> Option<TrackStreamItem> {
+        let meta = self.meta.clone();
+        let (seq_no, ts) = self.rewriter.rewrite(&pkt.value, is_switch)?;
+        let mut hdr: TimingHeader = (&pkt.value).into();
+        hdr.rtp_ts = ts;
+        hdr.seq_no = seq_no;
+        Some((meta, hdr, pkt))
+    }
+
     /// Poll for the next RTP packet, handling fallback and layer switching.
     pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
         loop {
@@ -607,7 +589,9 @@ impl TrackReader {
                             Ok(pkt) if pkt.value.is_keyframe() => {
                                 tracing::debug!(track_id = %self.meta.id, "Keyframe received, switching complete");
                                 self.fallback_index = None;
-                                return Some((self.meta.clone(), pkt, true));
+                                if let Some(pkt) = self.rewrite(pkt, true) {
+                                    return Some(pkt);
+                                }
                             }
                             Ok(_) => continue, // drop non-keyframe
                             Err(spmc::RecvError::Lagged(n)) => {
@@ -624,7 +608,11 @@ impl TrackReader {
 
                     res = fallback_receiver.channel.recv() => {
                         match res {
-                            Ok(pkt) => return Some((self.meta.clone(), pkt, false)),
+                            Ok(pkt) => {
+                                if let Some(pkt) = self.rewrite(pkt, false) {
+                                    return Some(pkt);
+                                }
+                            }
                             Err(_) => { self.fallback_index = None; }
                         }
                     }
@@ -643,7 +631,11 @@ impl TrackReader {
 
                     res = receiver.channel.recv() => {
                         match res {
-                            Ok(pkt) => return Some((self.meta.clone(), pkt, false)),
+                            Ok(pkt) => {
+                                if let Some(pkt) = self.rewrite(pkt, false) {
+                                    return Some(pkt);
+                                }
+                            },
                             Err(spmc::RecvError::Lagged(n)) => {
                                 tracing::warn!(%self.meta.id, "Receiver lagged {n}, re-requesting keyframe");
                                 receiver.request_keyframe();

@@ -1,7 +1,5 @@
 pub mod jitter_buffer;
 pub mod rtp_rewriter;
-#[cfg(test)]
-pub mod test;
 
 use std::ops::{Deref, DerefMut};
 
@@ -205,5 +203,46 @@ impl PacketTiming for RtpPacket {
     }
     fn arrival_timestamp(&self) -> Instant {
         self.inner.timestamp.into()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TimingHeader {
+    pub seq_no: SeqNo,
+    pub rtp_ts: MediaTime,
+    pub server_ts: Instant,
+}
+
+impl PacketTiming for TimingHeader {
+    fn seq_no(&self) -> SeqNo {
+        self.seq_no
+    }
+
+    fn rtp_timestamp(&self) -> MediaTime {
+        self.rtp_ts
+    }
+
+    fn arrival_timestamp(&self) -> Instant {
+        self.server_ts
+    }
+}
+
+impl<T: PacketTiming> From<&T> for TimingHeader {
+    fn from(value: &T) -> Self {
+        Self {
+            seq_no: value.seq_no(),
+            rtp_ts: value.rtp_timestamp(),
+            server_ts: value.arrival_timestamp(),
+        }
+    }
+}
+
+impl TimingHeader {
+    pub fn new(seq_no: SeqNo, rtp_ts: MediaTime) -> Self {
+        Self {
+            seq_no,
+            rtp_ts,
+            server_ts: Instant::now(),
+        }
     }
 }

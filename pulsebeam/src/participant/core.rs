@@ -1,6 +1,8 @@
+use pulsebeam_runtime::sync::spmc::Slot;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use str0m::rtp::RtpHeader;
 use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
@@ -14,7 +16,7 @@ use crate::entity;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
-use crate::rtp::RtpPacket;
+use crate::rtp::{RtpPacket, TimingHeader};
 use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
 
 #[derive(thiserror::Error, Debug)]
@@ -142,17 +144,14 @@ impl ParticipantCore {
     pub fn handle_forward_rtp(
         &mut self,
         track_meta: Arc<TrackMeta>,
-        rtp: &RtpPacket,
-        is_switch: bool,
+        hdr: TimingHeader,
+        pkt: &RtpPacket,
     ) {
-        let Some(mid) = self.downstream_allocator.handle_rtp(&track_meta, rtp) else {
-            tracing::warn!(track_id = %track_meta.id, ssrc = %rtp.header.ssrc, "Dropping RTP for inactive track");
-            return;
-        };
-
-        let Some((new_seq, new_ts)) = self.downstream_allocator.rewrite_rtp(mid, rtp, is_switch)
+        let Some(mid) = self
+            .downstream_allocator
+            .handle_rtp(&track_meta, &pkt.header)
         else {
-            tracing::warn!(%mid, "No RTP rewriter for active track, dropping packet");
+            tracing::warn!(track_id = %track_meta.id, ssrc = %pkt.header.ssrc, "Dropping RTP for inactive track");
             return;
         };
 
@@ -173,13 +172,13 @@ impl ParticipantCore {
 
         let _ = writer.write_rtp(
             pt,
-            new_seq,
-            new_ts,
-            rtp.timestamp,
-            rtp.header.marker,
-            rtp.header.ext_vals.clone(),
+            hdr.seq_no,
+            hdr.rtp_ts.numer() as u32,
+            hdr.server_ts.into(),
+            pkt.header.marker,
+            pkt.header.ext_vals.clone(),
             true,
-            rtp.payload.clone(),
+            pkt.payload.clone(),
         );
     }
 
