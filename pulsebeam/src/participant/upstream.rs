@@ -55,8 +55,12 @@ impl UpstreamAllocator {
     }
 
     /// Polls all jitter buffers for all tracks to release ready packets.
-    pub fn poll(&mut self, rtc: &mut str0m::Rtc) {
+    pub fn poll(&mut self, rtc: &mut str0m::Rtc, now: Instant) -> Option<Instant> {
         self.drain_keyframe_requests(rtc);
+        self.published_tracks
+            .values_mut()
+            .filter_map(|track| track.poll(now))
+            .min()
     }
 
     /// Drains pending keyframe requests from all managed tracks.

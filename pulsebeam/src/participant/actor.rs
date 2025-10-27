@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use once_cell::sync::Lazy;
 use pulsebeam_runtime::{actor, mailbox, net, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
+use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
 use tokio_stream::StreamExt;
 
@@ -76,9 +77,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             .await;
 
         'outer: loop {
-            let Some(delay) = self.core.poll_rtc() else {
+            let Some(deadline) = self.core.poll_rtc() else {
                 break 'outer;
             };
+            let delay = Instant::now().saturating_duration_since(deadline);
 
             let events: Vec<_> = self.core.drain_events().collect();
             for event in events {

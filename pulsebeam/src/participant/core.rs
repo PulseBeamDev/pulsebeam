@@ -109,17 +109,17 @@ impl ParticipantCore {
         self.update_desired_bitrate();
     }
 
-    pub fn poll_rtc(&mut self) -> Option<Duration> {
+    pub fn poll_rtc(&mut self) -> Option<Instant> {
         if self.disconnect_reason.is_some() {
             return None;
         }
 
-        self.upstream_allocator.poll(&mut self.rtc);
+        self.upstream_allocator.poll(&mut self.rtc, Instant::now());
 
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
-                    return Some(deadline.saturating_duration_since(Instant::now().into()));
+                    return Some(deadline.into());
                 }
                 Ok(Output::Transmit(tx)) => {
                     self.batcher.push_back(tx.destination, &tx.contents);
