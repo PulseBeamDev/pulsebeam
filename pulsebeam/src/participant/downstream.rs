@@ -499,152 +499,13 @@ impl DownstreamAllocator {
     }
 
     fn create_track_stream(
-        mut track: TrackReceiver,
-        mut rx: watch::Receiver<StreamConfig>,
+        track: TrackReceiver,
+        control_rx: watch::Receiver<StreamConfig>,
     ) -> TrackStream {
         async_stream::stream! {
-            let meta = track.meta.clone();
-            let find_index_for_rid = |rid: Option<Rid>, simulcast: &[SimulcastReceiver]| -> Option<usize> {
-                simulcast.iter().position(|s| s.rid == rid)
-            };
-
-            let mut local_generation = u64::MAX;
-
-            // The stream we are actively trying to receive from.
-            let mut active_index: Option<usize> = None;
-            // The previous stream we are using as a fallback while waiting for a keyframe on the active one.
-            let mut fallback_index: Option<usize> = None;
-
-            loop {
-                // Section 1: Check for configuration changes and update our state accordingly.
-                if local_generation != rx.borrow().generation {
-                    local_generation = rx.borrow().generation;
-                    let config = *rx.borrow();
-                    tracing::debug!(?track.meta.id, "Track state applied: {config:?}");
-
-                    let new_index = if config.paused {
-                        None
-                    } else {
-                        find_index_for_rid(config.target_rid, &track.simulcast)
-                    };
-
-                    // Only react if the target index has actually changed.
-                    if active_index != new_index {
-                        if config.paused {
-                             // If pausing, immediately stop all streams.
-                            active_index = None;
-                            fallback_index = None;
-                        } else {
-                            // A switch is occurring. The old active stream becomes our fallback.
-                            fallback_index = active_index;
-                            active_index = new_index;
-
-                            // If we have a new stream to switch to, request a keyframe.
-                            if let Some(index) = active_index {
-                                let receiver = &mut track.simulcast[index];
-                                receiver.channel.reset(); // Clear any stale packets.
-                                receiver.request_keyframe();
-                                tracing::debug!(track_id = %meta.id, rid = ?receiver.rid, "Requesting keyframe for new stream");
-                            }
-                        }
-                    }
-                }
-
-                // Section 2: Wait for events based on the current state.
-
-                // State 1: We are in transition, consuming a fallback stream while waiting for a keyframe on the active one.
-                if let (Some(active_idx), Some(fallback_idx)) = (active_index, fallback_index) {
-                    let (active_receiver, fallback_receiver) = if fallback_idx < active_idx {
-                        let (left, right) = track.simulcast.split_at_mut(active_idx);
-                        (&mut right[0], &mut left[fallback_idx])
-                    } else {
-                        let (left, right) = track.simulcast.split_at_mut(fallback_idx);
-                        (&mut left[active_idx], &mut right[0])
-                    };
-
-                    tokio::select! {
-                        biased;
-
-                        // Highest priority: a new config might change our plans again.
-                        res = rx.changed() => {
-                            if res.is_err() { break; }
-                            continue; // Restart loop to apply the new config.
-                        },
-
-                        // Check for the keyframe on our new desired stream.
-                        res = active_receiver.channel.recv() => {
-                            match res {
-                                Ok(pkt) => {
-                                    // We only care about the keyframe to complete the switch.
-                                    if pkt.value.is_keyframe() {
-                                        tracing::debug!(track_id = %meta.id, rid = ?active_receiver.rid, "Keyframe received, switch complete.");
-                                        // Keyframe received! The transition is over.
-                                        fallback_index = None;
-                                        // Yield this keyframe. The `true` marker signals a stream switch has occurred.
-                                        yield (meta.clone(), pkt, true);
-                                    }
-                                    // Not a keyframe, so we drop it and continue waiting.
-                                },
-                                Err(spmc::RecvError::Lagged(count)) => {
-                                    tracing::warn!(track_id = %meta.id, rid = ?active_receiver.rid, count, "New stream lagged while waiting for keyframe, requesting again.");
-                                    active_receiver.request_keyframe();
-                                },
-                                Err(spmc::RecvError::Closed) => {
-                                    tracing::warn!(track_id = %meta.id, rid = ?active_receiver.rid, "New stream closed while waiting for keyframe. Aborting switch.");
-                                    // The new stream died. Abort the switch and revert to the fallback stream.
-                                    active_index = Some(fallback_idx);
-                                    fallback_index = None;
-                                },
-                            }
-                        },
-
-                        // Meanwhile, continue consuming and yielding packets from the old (fallback) stream.
-                        res = fallback_receiver.channel.recv() => {
-                            match res {
-                                Ok(pkt) => {
-                                    // Yield packets from the old stream. No special marker.
-                                    yield (meta.clone(), pkt, false);
-                                },
-                                Err(_) => {
-                                    // The fallback stream died. We can stop listening to it.
-                                    fallback_index = None;
-                                }
-                            }
-                        }
-                    }
-                }
-                // State 2: Normal operation. We have one active stream and no fallback.
-                else if let Some(current_idx) = active_index {
-                    let receiver = &mut track.simulcast[current_idx];
-                    tokio::select! {
-                        biased;
-
-                        res = rx.changed() => {
-                            if res.is_err() { break; }
-                            continue;
-                        },
-
-                        res = receiver.channel.recv() => {
-                            match res {
-                                Ok(pkt) => {
-                                    yield (meta.clone(), pkt, false);
-                                },
-                                Err(spmc::RecvError::Lagged(count)) => {
-                                    tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, count, "Receiver lagged, requesting keyframe");
-                                    receiver.request_keyframe();
-                                },
-                                Err(spmc::RecvError::Closed) => {
-                                    tracing::warn!(track_id = %meta.id, rid = ?receiver.rid, "Stopping stream; channel closed");
-                                    break;
-                                },
-                            }
-                        }
-                    }
-                }
-                // State 3: Paused. No active or fallback stream. Just wait for a config change.
-                else {
-                    if rx.changed().await.is_err() { break; }
-                }
+            let mut reader = TrackReader::new(track, control_rx);
+            while let Some(item) = reader.next_packet().await {
+                yield item;
             }
         }
         .boxed()
@@ -656,5 +517,165 @@ impl Stream for DownstreamAllocator {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.streams.poll_next_unpin(cx)
+    }
+}
+
+/// Manages reading RTP packets from a TrackReceiver with dynamic layer switching.
+pub struct TrackReader {
+    meta: Arc<TrackMeta>,
+    track: TrackReceiver,
+    control_rx: watch::Receiver<StreamConfig>,
+
+    active_index: Option<usize>,
+    fallback_index: Option<usize>,
+    local_generation: u64,
+}
+
+impl TrackReader {
+    fn new(track: TrackReceiver, control_rx: watch::Receiver<StreamConfig>) -> Self {
+        Self {
+            meta: track.meta.clone(),
+            track,
+            control_rx,
+            active_index: None,
+            fallback_index: None,
+            local_generation: u64::MAX,
+        }
+    }
+
+    fn find_index_for_rid(rid: Option<Rid>, simulcast: &[SimulcastReceiver]) -> Option<usize> {
+        simulcast.iter().position(|s| s.rid == rid)
+    }
+
+    /// Apply new config if generation changed.
+    fn maybe_update_config(&mut self) {
+        let current_gen = self.control_rx.borrow().generation;
+        if self.local_generation == current_gen {
+            return;
+        }
+
+        self.local_generation = current_gen;
+        let config = *self.control_rx.borrow();
+        tracing::debug!(track_id = %self.meta.id, "Applying stream config: {config:?}");
+
+        let new_index = if config.paused {
+            None
+        } else {
+            Self::find_index_for_rid(config.target_rid, &self.track.simulcast)
+        };
+
+        // Only react if the target index changed
+        if self.active_index != new_index {
+            if config.paused {
+                self.active_index = None;
+                self.fallback_index = None;
+            } else {
+                self.fallback_index = self.active_index;
+                self.active_index = new_index;
+
+                if let Some(index) = self.active_index {
+                    let receiver = &mut self.track.simulcast[index];
+                    receiver.channel.reset();
+                    receiver.request_keyframe();
+                    tracing::debug!(track_id = %self.meta.id, rid = ?receiver.rid, "Requested keyframe for new active layer");
+                }
+            }
+        }
+    }
+
+    /// Poll for the next RTP packet, handling fallback and layer switching.
+    pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
+        loop {
+            self.maybe_update_config();
+
+            // STATE 1: Transition (active + fallback)
+            if let (Some(active_idx), Some(fallback_idx)) = (self.active_index, self.fallback_index)
+            {
+                let (active_receiver, fallback_receiver) =
+                    Self::split_receivers(&mut self.track.simulcast, active_idx, fallback_idx);
+
+                tokio::select! {
+                    biased;
+
+                    res = self.control_rx.changed() => {
+                        if res.is_err() { return None; }
+                        continue;
+                    },
+
+                    res = active_receiver.channel.recv() => {
+                        match res {
+                            Ok(pkt) if pkt.value.is_keyframe() => {
+                                tracing::debug!(track_id = %self.meta.id, "Keyframe received, switching complete");
+                                self.fallback_index = None;
+                                return Some((self.meta.clone(), pkt, true));
+                            }
+                            Ok(_) => continue, // drop non-keyframe
+                            Err(spmc::RecvError::Lagged(n)) => {
+                                tracing::warn!(%self.meta.id, "Active stream lagged {n}, re-requesting keyframe");
+                                active_receiver.request_keyframe();
+                            }
+                            Err(spmc::RecvError::Closed) => {
+                                tracing::warn!(%self.meta.id, "Active stream closed, reverting to fallback");
+                                self.active_index = Some(fallback_idx);
+                                self.fallback_index = None;
+                            }
+                        }
+                    },
+
+                    res = fallback_receiver.channel.recv() => {
+                        match res {
+                            Ok(pkt) => return Some((self.meta.clone(), pkt, false)),
+                            Err(_) => { self.fallback_index = None; }
+                        }
+                    }
+                }
+            }
+            // STATE 2: Normal operation
+            else if let Some(idx) = self.active_index {
+                let receiver = &mut self.track.simulcast[idx];
+                tokio::select! {
+                    biased;
+
+                    res = self.control_rx.changed() => {
+                        if res.is_err() { return None; }
+                        continue;
+                    },
+
+                    res = receiver.channel.recv() => {
+                        match res {
+                            Ok(pkt) => return Some((self.meta.clone(), pkt, false)),
+                            Err(spmc::RecvError::Lagged(n)) => {
+                                tracing::warn!(%self.meta.id, "Receiver lagged {n}, re-requesting keyframe");
+                                receiver.request_keyframe();
+                            }
+                            Err(spmc::RecvError::Closed) => {
+                                tracing::warn!(%self.meta.id, "Channel closed");
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            // STATE 3: Paused
+            else {
+                if self.control_rx.changed().await.is_err() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn split_receivers(
+        simulcast: &mut [SimulcastReceiver],
+        a: usize,
+        b: usize,
+    ) -> (&mut SimulcastReceiver, &mut SimulcastReceiver) {
+        if a < b {
+            let (left, right) = simulcast.split_at_mut(b);
+            (&mut left[a], &mut right[0])
+        } else {
+            let (left, right) = simulcast.split_at_mut(a);
+            (&mut right[0], &mut left[b])
+        }
     }
 }
