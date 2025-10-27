@@ -1,5 +1,4 @@
 use crate::rtp::PacketTiming;
-use std::collections::BTreeMap;
 use str0m::media::MediaTime;
 use str0m::rtp::SeqNo;
 
@@ -14,28 +13,14 @@ use str0m::rtp::SeqNo;
 #[derive(Debug)]
 pub struct RtpRewriter {
     /// The offset applied to incoming sequence numbers to maintain continuity.
-    seq_no_offset: i64,
+    seq_no_offset: u64,
     /// The offset applied to incoming timestamps to maintain correct timing.
-    timestamp_offset: i64,
+    timestamp_offset: u64,
 
     /// The highest sequence number that has been forwarded to the subscriber.
-    highest_forwarded_seq: Option<SeqNo>,
+    highest_forwarded_seq: SeqNo,
     /// The rewritten timestamp of the packet with `highest_forwarded_seq`.
-    highest_forwarded_ts: Option<MediaTime>,
-    /// The original timestamp of the last processed incoming packet. Used to
-    /// calculate timestamp progression across a layer switch.
-    last_incoming_ts: Option<MediaTime>,
-
-    /// After a switch, this stores the sequence number of the first packet from
-    /// the new stream. Any packet with an earlier sequence number is considered
-    /// part of the old stream and is dropped.
-    active_stream_start_seq: Option<SeqNo>,
-
-    /// A small cache to detect and ignore duplicate packets.
-    /// Maps incoming seq -> (rewritten seq, rewritten timestamp).
-    seen_packets: BTreeMap<u64, (SeqNo, MediaTime)>,
-    /// The maximum number of packets to retain in the cache.
-    max_cache_size: usize,
+    highest_forwarded_ts: MediaTime,
 }
 
 impl Default for RtpRewriter {
@@ -43,12 +28,8 @@ impl Default for RtpRewriter {
         Self {
             seq_no_offset: 0,
             timestamp_offset: 0,
-            highest_forwarded_seq: None,
-            highest_forwarded_ts: None,
-            last_incoming_ts: None,
-            active_stream_start_seq: None,
-            seen_packets: BTreeMap::new(),
-            max_cache_size: 100,
+            highest_forwarded_seq: SeqNo::new(),
+            highest_forwarded_ts: MediaTime::from_90khz(0),
         }
     }
 }
@@ -71,105 +52,80 @@ impl RtpRewriter {
     ) -> Option<(SeqNo, MediaTime)> {
         let incoming_seq = packet.seq_no();
 
-        // 1. Check for and return cached result for duplicate packets.
-        if let Some(&cached) = self.seen_packets.get(&*incoming_seq) {
-            tracing::trace!(
-                seq = *incoming_seq,
-                "Duplicate packet, returning cached rewrite"
-            );
-            return Some(cached);
-        }
-
-        // 2. A reset is needed for the very first packet or an explicit switch.
-        if self.highest_forwarded_seq.is_none() || is_switch {
+        if is_switch {
             self.reset(packet);
-        } else if let Some(start_seq) = self.active_stream_start_seq {
-            // 3. After a switch, drop any lingering packets from the old stream.
-            if is_seq_older(incoming_seq, start_seq) {
-                tracing::debug!(
-                    seq = *incoming_seq,
-                    start = *start_seq,
-                    "Dropping lingering packet from old stream"
-                );
-                return None;
-            }
         }
 
-        // 4. Calculate the new sequence number and timestamp using the offsets.
         let new_seq_val = (*incoming_seq as i64 + self.seq_no_offset) as u64;
         let new_seq = SeqNo::from(new_seq_val);
 
         let new_ts_numer = packet.rtp_timestamp().numer() as i64 + self.timestamp_offset;
         let new_ts = MediaTime::new(new_ts_numer as u64, packet.rtp_timestamp().frequency());
 
-        // 5. Update the state for the next packet.
-        self.highest_forwarded_seq = Some(new_seq);
-        self.highest_forwarded_ts = Some(new_ts);
-        self.last_incoming_ts = Some(packet.rtp_timestamp());
-
-        // 6. Cache the result for duplicate detection.
-        self.cache_packet(*incoming_seq, new_seq, new_ts);
+        // // 5. Update the state for the next packet.
+        // self.highest_forwarded_seq = Some(new_seq);
+        // self.highest_forwarded_ts = Some(new_ts);
+        // self.last_incoming_ts = Some(packet.rtp_timestamp());
+        //
+        // // 6. Cache the result for duplicate detection.
+        // self.cache_packet(*incoming_seq, new_seq, new_ts);
 
         Some((new_seq, new_ts))
     }
 
     /// Resets the rewriter's state to seamlessly transition to a new stream.
     fn reset(&mut self, packet: &impl PacketTiming) {
-        let target_seq = self
-            .highest_forwarded_seq
-            .map_or(*packet.seq_no(), |s| *s + 1);
-        self.seq_no_offset = (target_seq as i64) - (*packet.seq_no() as i64);
+        let target_seq_no = *self.highest_forwarded_seq + 1;
+        self.seq_no_offset = target_seq_no.wrapping_sub(*packet.seq_no());
 
-        let incoming_ts = packet.rtp_timestamp();
+        let rtp_timestamp = packet.rtp_timestamp();
+        let target_ts = self
+            .highest_forwarded_ts
+            .rebase(rtp_timestamp.frequency())
+            .numer();
+        let target_ts = MediaTime::new(target_ts, rtp_timestamp.frequency());
 
-        let target_ts = if let (Some(last_fwd_ts), Some(last_inc_ts)) =
-            (self.highest_forwarded_ts, self.last_incoming_ts)
-        {
-            let duration = incoming_ts.saturating_sub(last_inc_ts);
-            let last_fwd_ts_rebased = last_fwd_ts.rebase(duration.frequency());
-            last_fwd_ts_rebased + duration
-        } else {
-            incoming_ts
-        };
+        // TODO: determine sample duration with a better approach?
 
-        self.timestamp_offset = (target_ts.numer() as i64) - (incoming_ts.numer() as i64);
-
-        self.active_stream_start_seq = Some(packet.seq_no());
-
-        tracing::info!(
-            incoming_seq = *packet.seq_no(),
-            target_seq = target_seq,
-            seq_offset = self.seq_no_offset,
-            ts_offset = self.timestamp_offset,
-            "RTP rewriter reset for new stream"
-        );
+        // let incoming_ts = packet.rtp_timestamp();
+        //
+        // let target_ts = if let (Some(last_fwd_ts), Some(last_inc_ts)) =
+        //     (self.highest_forwarded_ts, self.last_incoming_ts)
+        // {
+        //     let duration = incoming_ts.saturating_sub(last_inc_ts);
+        //     let last_fwd_ts_rebased = last_fwd_ts.rebase(duration.frequency());
+        //     last_fwd_ts_rebased + duration
+        // } else {
+        //     incoming_ts
+        // };
+        //
+        // self.timestamp_offset = (target_ts.numer() as i64) - (incoming_ts.numer() as i64);
+        //
+        // self.active_stream_start_seq = Some(packet.seq_no());
+        //
+        // tracing::info!(
+        //     incoming_seq = *packet.seq_no(),
+        //     target_seq = target_seq,
+        //     seq_offset = self.seq_no_offset,
+        //     ts_offset = self.timestamp_offset,
+        //     "RTP rewriter reset for new stream"
+        // );
     }
-
-    /// Adds a packet's rewrite result to the cache and prunes old entries.
-    fn cache_packet(&mut self, incoming_seq: u64, rewritten_seq: SeqNo, rewritten_ts: MediaTime) {
-        self.seen_packets
-            .insert(incoming_seq, (rewritten_seq, rewritten_ts));
-
-        if self.seen_packets.len() > self.max_cache_size {
-            if let Some(&first_key) = self.seen_packets.keys().next() {
-                self.seen_packets.remove(&first_key);
-            }
-        }
-    }
-}
-
-/// Compares two sequence numbers, accounting for rollover, to see if `a` is older than `b`.
-fn is_seq_older(a: SeqNo, b: SeqNo) -> bool {
-    let a_u16 = *a as u16;
-    let b_u16 = *b as u16;
-    let diff = b_u16.wrapping_sub(a_u16);
-    diff != 0 && diff < 32768
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::rtp::TimingHeader;
+
+    #[test]
+    fn test_get_offset() {
+        let seq_nos = [(u64::MAX, 1), (1, u64::MAX), (5, 1), (1, 5), (1, 1)];
+        for (original, target) in seq_nos.iter().copied() {
+            let offset = target.wrapping_sub(original);
+            assert_eq!(original.wrapping_add(offset), target);
+        }
+    }
 
     #[test]
     fn handles_initial_packet() {
