@@ -609,6 +609,7 @@ impl TrackReader {
                     res = fallback_receiver.channel.recv() => {
                         match res {
                             Ok(pkt) => {
+                                tracing::debug!("fallback_receiver={:?}", fallback_receiver.rid);
                                 if let Some(pkt) = self.rewrite(pkt, false) {
                                     return Some(pkt);
                                 }
@@ -632,6 +633,7 @@ impl TrackReader {
                     res = receiver.channel.recv() => {
                         match res {
                             Ok(pkt) => {
+                                tracing::debug!("normal_receiver={:?}", receiver.rid);
                                 if let Some(pkt) = self.rewrite(pkt, false) {
                                     return Some(pkt);
                                 }
@@ -662,12 +664,13 @@ impl TrackReader {
         a: usize,
         b: usize,
     ) -> (&mut SimulcastReceiver, &mut SimulcastReceiver) {
+        assert!(a != b);
         if a < b {
             let (left, right) = simulcast.split_at_mut(b);
             (&mut left[a], &mut right[0])
         } else {
             let (left, right) = simulcast.split_at_mut(a);
-            (&mut right[0], &mut left[b])
+            (&mut left[b], &mut right[0])
         }
     }
 }
