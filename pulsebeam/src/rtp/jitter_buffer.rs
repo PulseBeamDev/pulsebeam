@@ -308,6 +308,8 @@ mod test {
             seq_no: seq_no.into(),
             rtp_ts: MediaTime::from_millis(rtp_ts_ms),
             server_ts: now + Duration::from_millis(arrival_offset_ms),
+            is_keyframe: false,
+            marker: false,
         }
     }
 
@@ -388,6 +390,8 @@ mod test {
             seq_no: 1.into(),
             rtp_ts: MediaTime::new(0, freq),
             server_ts: now,
+            is_keyframe: false,
+            marker: false,
         };
         jb.push(m1);
         assert_eq!(jb.jitter_estimate, 0.0);
@@ -396,6 +400,8 @@ mod test {
             seq_no: 2.into(),
             rtp_ts: MediaTime::new(30, freq),
             server_ts: now + Duration::from_millis(30),
+            is_keyframe: false,
+            marker: false,
         };
         jb.push(m2);
         assert!(jb.jitter_estimate < 1e-9);
@@ -404,6 +410,8 @@ mod test {
             seq_no: 3.into(),
             rtp_ts: MediaTime::new(60, freq),
             server_ts: now + Duration::from_millis(70),
+            is_keyframe: false,
+            marker: false,
         };
         jb.push(m3);
         // With smoothing factor 1/16, first jitter sample of 0.01 becomes ~0.000625

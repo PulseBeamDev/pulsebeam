@@ -126,6 +126,7 @@ impl ControllerActor {
             .set_ice_lite(false);
         let codec_config = rtc_config.codec_config();
         codec_config.enable_opus(true);
+        // codec_config.enable_vp8(true);
         // h264 as the lowest common denominator due to small clients like
         // embedded devices, smartphones, OBS only supports H264.
         // Baseline profile to ensure compatibility with all platforms.

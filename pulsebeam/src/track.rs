@@ -95,7 +95,8 @@ impl SimulcastSender {
     }
 
     pub fn push(&mut self, pkt: RtpPacket) {
-        self.jb.push(pkt)
+        // self.jb.push(pkt)
+        self.forward(pkt);
     }
 
     pub fn set_paused(&mut self, paused: bool) {
