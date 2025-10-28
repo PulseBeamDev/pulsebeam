@@ -215,7 +215,7 @@ impl ParticipantCore {
     fn update_desired_bitrate(&mut self) {
         let desired_bitrate = self.downstream_allocator.desired_bitrate();
         // TODO: improve desired_bitrate controller
-        let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 4);
+        let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 2);
         self.rtc.bwe().set_desired_bitrate(desired_bitrate);
         tracing::debug!("desired_bitrate={desired_bitrate}");
     }
