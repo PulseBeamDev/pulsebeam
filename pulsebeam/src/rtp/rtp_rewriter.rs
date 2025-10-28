@@ -84,7 +84,7 @@ impl RtpRewriter {
 
     /// Resets the rewriter's state to seamlessly transition to a new stream.
     fn reset(&mut self, packet: &impl PacketTiming) {
-        let target_seq = *self.highest_forwarded_seq + 1;
+        let target_seq = self.highest_forwarded_seq.wrapping_add(1);
         self.seq_no_offset = target_seq.wrapping_sub(*packet.seq_no());
 
         let rtp_timestamp = packet.rtp_timestamp();
@@ -128,6 +128,119 @@ mod test {
         assert_eq!(
             rewriter.rewrite(&p3, false).unwrap(),
             (SeqNo::from(302), MediaTime::from_90khz(6_000))
+        );
+    }
+
+    #[test]
+    fn test_sequence_continuity_across_layer_switch() {
+        let mut r = RtpRewriter::new();
+
+        // Layer A (base)
+        let p1 = TimingHeader::new(SeqNo::from(300), MediaTime::from_90khz(3_000));
+        let out1 = r.rewrite(&p1, false).unwrap();
+        assert_eq!(out1.0, SeqNo::from(300));
+
+        let p2 = TimingHeader::new(SeqNo::from(301), MediaTime::from_90khz(6_000));
+        let out2 = r.rewrite(&p2, false).unwrap();
+        assert_eq!(out2.0, SeqNo::from(301));
+        assert!(out2.0 > out1.0);
+
+        // Layer B (different encoder with far-apart seq range)
+        let p3 = TimingHeader::new(SeqNo::from(10_000), MediaTime::from_90khz(90_000));
+        let out3 = r.rewrite(&p3, true).unwrap();
+        assert_eq!(
+            out3.0,
+            SeqNo::from(302),
+            "First packet of new layer must continue from last + 1"
+        );
+        assert!(out3.0 > out2.0);
+
+        // More packets from new layer — should remain monotonic
+        let p4 = TimingHeader::new(SeqNo::from(10_001), MediaTime::from_90khz(93_000));
+        let out4 = r.rewrite(&p4, false).unwrap();
+        assert_eq!(out4.0, SeqNo::from(303));
+        assert!(out4.0 > out3.0);
+    }
+
+    #[test]
+    fn test_multiple_switches_stay_monotonic() {
+        let mut r = RtpRewriter::new();
+
+        let mut seq = 100;
+        let mut ts = 30_000;
+
+        // simulate rapid layer switches with large jumps
+        for i in 0..5 {
+            let p = TimingHeader::new(SeqNo::from(seq), MediaTime::from_90khz(ts));
+            let is_switch = i % 2 == 1; // every other packet triggers a "switch"
+            let out = r.rewrite(&p, is_switch).unwrap();
+
+            if i > 0 {
+                assert!(
+                    out.0 > SeqNo::from(100 + (i as u64 - 1)),
+                    "seq monotonic at iteration {i}"
+                );
+            }
+
+            seq += 10_000; // jump far ahead in incoming seq space
+            ts += 90_000;
+        }
+    }
+
+    #[test]
+    fn test_timestamp_continuity() {
+        let mut r = RtpRewriter::new();
+
+        let p1 = TimingHeader::new(SeqNo::from(500), MediaTime::from_90khz(0));
+        let out1 = r.rewrite(&p1, false).unwrap();
+
+        let p2 = TimingHeader::new(SeqNo::from(9_000), MediaTime::from_90khz(90_000));
+        let out2 = r.rewrite(&p2, true).unwrap();
+        assert!(out2.1 >= out1.1, "timestamp should not go backward");
+
+        let p3 = TimingHeader::new(SeqNo::from(9_001), MediaTime::from_90khz(93_000));
+        let out3 = r.rewrite(&p3, false).unwrap();
+        assert!(
+            out3.1 > out2.1,
+            "timestamp should move forward after switch"
+        );
+    }
+
+    #[test]
+    fn reproduce_backward_seq_after_switch() {
+        use super::*;
+        // ramp the outgoing stream to a high sequence number similar to the log
+        let mut r = RtpRewriter::new();
+
+        // forward many packets to advance highest_forwarded_seq
+        for i in 0..(20231u64 - 200u64) {
+            let seq = SeqNo::from(200 + i);
+            let ts = MediaTime::from_90khz(3_000 * (i + 1));
+            let p = TimingHeader::new(seq, ts);
+            let out = r.rewrite(&p, false).expect("should forward");
+            // sanity: outgoing should equal incoming at start
+            assert_eq!(out.0, seq);
+        }
+
+        // now highest_forwarded_seq should be 20230 (the last forwarded), next should be 20231
+        // send one more normal packet to be explicit
+        let last_in = TimingHeader::new(SeqNo::from(20230), MediaTime::from_90khz(756826681));
+        let out_last = r.rewrite(&last_in, false).unwrap();
+        assert_eq!(out_last.0, SeqNo::from(20230));
+
+        // Now simulate a switch: incoming new layer packet has seq 19322 (lower on-wire),
+        // like in your log. We expect the rewriter to produce next outgoing == last_out + 1 = 20231.
+        let switching_pkt =
+            TimingHeader::new(SeqNo::from(19322), MediaTime::from_90khz(1860279948));
+        let out_switch = r
+            .rewrite(&switching_pkt, true)
+            .expect("switch should produce a forwarded seq");
+
+        // If the rewriter is correct this must be last_out + 1 (20231). If it returns 19322, we reproduced the bug.
+        assert_eq!(
+            out_switch.0,
+            SeqNo::from(20231),
+            "after switch next outgoing seq must be last_out + 1 (no backward jump)"
         );
     }
 }
