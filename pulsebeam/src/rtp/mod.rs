@@ -83,27 +83,85 @@ fn looks_like_h264(payload: &[u8]) -> bool {
     (1..=23).contains(&nal_type) || nal_type == 28
 }
 
-/// Detect if this H.264 RTP packet starts a keyframe (IDR).
+/// Detects if an H264 payload is a keyframe.
+/// This code was taken from https://github.com/jech/galene/blob/codecs/rtpconn/rtpreader.go#L45
+/// All credits belong to Juliusz Chroboczek @jech and the awesome Galene SFU.
 fn is_h264_keyframe_start(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
     }
 
-    let nal_type = payload[0] & 0x1F;
+    let nalu = payload[0] & 0x1F;
 
-    match nal_type {
-        5 => true, // IDR slice (standalone)
-        28 => {
-            // Fragmentation Unit (FU-A)
+    match nalu {
+        0 => {
+            // reserved
+            false
+        }
+        1..=23 => {
+            // Simple NALU
+            // NALU type 7 is a Sequence Parameter Set (SPS), which indicates a keyframe.
+            nalu == 7
+        }
+        24..=27 => {
+            // STAP-A, STAP-B, MTAP16, or MTAP24
+            let mut i = 1;
+            if nalu >= 25 {
+                // Skip DON (Decoding Order Number)
+                i += 2;
+            }
+
+            while i < payload.len() {
+                if i + 2 > payload.len() {
+                    return false;
+                }
+                // Read the 16-bit length of the NAL unit
+                let length = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
+                i += 2;
+
+                if i + length > payload.len() {
+                    return false;
+                }
+
+                let mut offset = 0;
+                if nalu == 26 {
+                    // MTAP16
+                    offset = 3;
+                } else if nalu == 27 {
+                    // MTAP24
+                    offset = 4;
+                }
+
+                if offset >= length {
+                    return false;
+                }
+
+                let n = payload[i + offset] & 0x1F;
+                if n == 7 {
+                    return true;
+                }
+                // The original Go code has a debug log here for n >= 24.
+
+                i += length;
+            }
+
+            // If we've processed all aggregated NALUs and found no keyframe indicator
+            false
+        }
+        28 | 29 => {
+            // FU-A or FU-B
             if payload.len() < 2 {
                 return false;
             }
-            let fu_header = payload[1];
-            let start_bit = fu_header & 0x80 != 0;
-            let frag_nal_type = fu_header & 0x1F;
-            start_bit && frag_nal_type == 5
+            // Check for the start bit
+            if (payload[1] & 0x80) == 0 {
+                // Not a starting fragment
+                return false;
+            }
+            // Check if the fragmented NALU type is an SPS
+            (payload[1] & 0x1F) == 7
         }
-        _ => false,
+        _ => false, // 30, 31 are reserved or undefined
     }
 }
 
