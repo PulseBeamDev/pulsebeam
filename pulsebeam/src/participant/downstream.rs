@@ -514,7 +514,7 @@ pub struct TrackReader {
 }
 
 impl TrackReader {
-    pub fn new(track: TrackReceiver, control_rx: watch::Receiver<StreamConfig>) -> Self {
+    fn new(track: TrackReceiver, control_rx: watch::Receiver<StreamConfig>) -> Self {
         Self {
             meta: track.meta.clone(),
             track,

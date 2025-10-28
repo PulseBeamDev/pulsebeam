@@ -318,11 +318,11 @@ impl<T: Packet> From<&T> for TimingHeader {
 }
 
 impl TimingHeader {
-    pub fn new(seq_no: SeqNo, rtp_ts: MediaTime) -> Self {
+    pub fn new(seq_no: SeqNo, rtp_ts: MediaTime, arrival_ts: Instant) -> Self {
         Self {
             seq_no,
             rtp_ts,
-            server_ts: Instant::now(),
+            server_ts: arrival_ts,
             marker: false,
             is_keyframe: false,
         }
