@@ -50,66 +50,52 @@ impl RtpRewriter {
         packet: &impl PacketTiming,
         is_switch: bool,
     ) -> Option<(SeqNo, MediaTime)> {
-        let incoming_seq = packet.seq_no();
-
-        if is_switch {
+        let next_ts = if is_switch {
             self.reset(packet);
+            let ts = packet.rtp_timestamp();
+            MediaTime::new(
+                ts.numer()
+                    .wrapping_add(self.timestamp_offset)
+                    .wrapping_add(1),
+                ts.frequency(),
+            )
+        } else {
+            let ts = packet.rtp_timestamp();
+            let next_ts = MediaTime::new(
+                ts.numer().wrapping_add(self.timestamp_offset),
+                ts.frequency(),
+            );
+            self.highest_forwarded_ts = next_ts;
+            next_ts
+        };
+
+        if next_ts != self.highest_forwarded_ts {
+            tracing::debug!("next_ts={next_ts:?}");
         }
 
-        let new_seq_val = (*incoming_seq as i64 + self.seq_no_offset) as u64;
-        let new_seq = SeqNo::from(new_seq_val);
-
-        let new_ts_numer = packet.rtp_timestamp().numer() as i64 + self.timestamp_offset;
-        let new_ts = MediaTime::new(new_ts_numer as u64, packet.rtp_timestamp().frequency());
-
-        // // 5. Update the state for the next packet.
-        // self.highest_forwarded_seq = Some(new_seq);
-        // self.highest_forwarded_ts = Some(new_ts);
-        // self.last_incoming_ts = Some(packet.rtp_timestamp());
-        //
-        // // 6. Cache the result for duplicate detection.
-        // self.cache_packet(*incoming_seq, new_seq, new_ts);
-
-        Some((new_seq, new_ts))
+        let next_seq = SeqNo::from(packet.seq_no().wrapping_add(self.seq_no_offset));
+        self.highest_forwarded_seq = next_seq;
+        Some((next_seq, next_ts))
     }
 
     /// Resets the rewriter's state to seamlessly transition to a new stream.
     fn reset(&mut self, packet: &impl PacketTiming) {
-        let target_seq_no = *self.highest_forwarded_seq + 1;
-        self.seq_no_offset = target_seq_no.wrapping_sub(*packet.seq_no());
-
-        let rtp_timestamp = packet.rtp_timestamp();
-        let target_ts = self
-            .highest_forwarded_ts
-            .rebase(rtp_timestamp.frequency())
-            .numer();
-        let target_ts = MediaTime::new(target_ts, rtp_timestamp.frequency());
+        let target_seq = *self.highest_forwarded_seq + 1;
+        self.seq_no_offset = target_seq.wrapping_sub(*packet.seq_no());
 
         // TODO: determine sample duration with a better approach?
+        let rtp_timestamp = packet.rtp_timestamp();
+        self.highest_forwarded_ts = self.highest_forwarded_ts.rebase(rtp_timestamp.frequency());
+        let target_ts = self.highest_forwarded_ts.numer();
+        self.timestamp_offset = target_ts.wrapping_sub(rtp_timestamp.numer());
 
-        // let incoming_ts = packet.rtp_timestamp();
-        //
-        // let target_ts = if let (Some(last_fwd_ts), Some(last_inc_ts)) =
-        //     (self.highest_forwarded_ts, self.last_incoming_ts)
-        // {
-        //     let duration = incoming_ts.saturating_sub(last_inc_ts);
-        //     let last_fwd_ts_rebased = last_fwd_ts.rebase(duration.frequency());
-        //     last_fwd_ts_rebased + duration
-        // } else {
-        //     incoming_ts
-        // };
-        //
-        // self.timestamp_offset = (target_ts.numer() as i64) - (incoming_ts.numer() as i64);
-        //
-        // self.active_stream_start_seq = Some(packet.seq_no());
-        //
-        // tracing::info!(
-        //     incoming_seq = *packet.seq_no(),
-        //     target_seq = target_seq,
-        //     seq_offset = self.seq_no_offset,
-        //     ts_offset = self.timestamp_offset,
-        //     "RTP rewriter reset for new stream"
-        // );
+        tracing::info!(
+            incoming_seq = *packet.seq_no(),
+            target_seq = target_seq,
+            seq_offset = self.seq_no_offset,
+            ts_offset = self.timestamp_offset,
+            "RTP rewriter reset for new stream"
+        );
     }
 }
 
