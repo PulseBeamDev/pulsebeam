@@ -206,11 +206,31 @@ impl PacketTiming for RtpPacket {
     }
 }
 
+pub trait Packet: PacketTiming {
+    /// True if this is the last packet of a video frame.
+    fn marker(&self) -> bool;
+
+    /// Heuristically detect whether this RTP packet appears to start a keyframe.
+    fn is_keyframe(&self) -> bool;
+}
+
+impl Packet for RtpPacket {
+    fn marker(&self) -> bool {
+        self.inner.header.marker
+    }
+
+    fn is_keyframe(&self) -> bool {
+        self.is_keyframe()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct TimingHeader {
     pub seq_no: SeqNo,
     pub rtp_ts: MediaTime,
     pub server_ts: Instant,
+    pub marker: bool,
+    pub is_keyframe: bool,
 }
 
 impl PacketTiming for TimingHeader {
@@ -227,12 +247,14 @@ impl PacketTiming for TimingHeader {
     }
 }
 
-impl<T: PacketTiming> From<&T> for TimingHeader {
+impl<T: Packet> From<&T> for TimingHeader {
     fn from(value: &T) -> Self {
         Self {
             seq_no: value.seq_no(),
             rtp_ts: value.rtp_timestamp(),
             server_ts: value.arrival_timestamp(),
+            marker: value.marker(),
+            is_keyframe: value.is_keyframe(),
         }
     }
 }
@@ -243,6 +265,8 @@ impl TimingHeader {
             seq_no,
             rtp_ts,
             server_ts: Instant::now(),
+            marker: false,
+            is_keyframe: false,
         }
     }
 }

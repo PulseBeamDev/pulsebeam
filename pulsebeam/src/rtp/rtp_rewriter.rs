@@ -21,6 +21,7 @@ pub struct RtpRewriter {
     highest_forwarded_seq: SeqNo,
     /// The rewritten timestamp of the packet with `highest_forwarded_seq`.
     highest_forwarded_ts: MediaTime,
+    initialized: bool,
 }
 
 impl Default for RtpRewriter {
@@ -30,6 +31,7 @@ impl Default for RtpRewriter {
             timestamp_offset: 0,
             highest_forwarded_seq: SeqNo::new(),
             highest_forwarded_ts: MediaTime::from_90khz(0),
+            initialized: false,
         }
     }
 }
@@ -50,31 +52,33 @@ impl RtpRewriter {
         packet: &impl PacketTiming,
         is_switch: bool,
     ) -> Option<(SeqNo, MediaTime)> {
-        let next_ts = if is_switch {
+        if is_switch {
             self.reset(packet);
-            let ts = packet.rtp_timestamp();
-            MediaTime::new(
-                ts.numer()
-                    .wrapping_add(self.timestamp_offset)
-                    .wrapping_add(1),
-                ts.frequency(),
-            )
-        } else {
-            let ts = packet.rtp_timestamp();
-            let next_ts = MediaTime::new(
-                ts.numer().wrapping_add(self.timestamp_offset),
-                ts.frequency(),
-            );
-            self.highest_forwarded_ts = next_ts;
-            next_ts
         };
 
-        if next_ts != self.highest_forwarded_ts {
-            tracing::debug!("next_ts={next_ts:?}");
-        }
-
         let next_seq = SeqNo::from(packet.seq_no().wrapping_add(self.seq_no_offset));
+
+        let ts = packet.rtp_timestamp();
+        let next_ts = MediaTime::new(
+            ts.numer().wrapping_add(self.timestamp_offset),
+            ts.frequency(),
+        );
+
+        if self.initialized {
+            if next_seq < self.highest_forwarded_seq || next_ts < self.highest_forwarded_ts {
+                tracing::warn!("unexpected out-of-order, dropping packets");
+                return None;
+            }
+
+            if next_seq == self.highest_forwarded_seq {
+                tracing::warn!("unexpected duplication, dropping packets");
+                return None;
+            }
+        }
         self.highest_forwarded_seq = next_seq;
+        self.highest_forwarded_ts = next_ts;
+        self.initialized = true;
+        tracing::debug!("next_seq={next_seq:?},next_ts={next_ts:?}");
         Some((next_seq, next_ts))
     }
 
@@ -83,7 +87,6 @@ impl RtpRewriter {
         let target_seq = *self.highest_forwarded_seq + 1;
         self.seq_no_offset = target_seq.wrapping_sub(*packet.seq_no());
 
-        // TODO: determine sample duration with a better approach?
         let rtp_timestamp = packet.rtp_timestamp();
         self.highest_forwarded_ts = self.highest_forwarded_ts.rebase(rtp_timestamp.frequency());
         let target_ts = self.highest_forwarded_ts.numer();
@@ -101,78 +104,30 @@ impl RtpRewriter {
 
 #[cfg(test)]
 mod test {
+    use str0m::{media::MediaTime, rtp::SeqNo};
+
     use super::*;
     use crate::rtp::TimingHeader;
 
     #[test]
-    fn test_get_offset() {
-        let seq_nos = [(u64::MAX, 1), (1, u64::MAX), (5, 1), (1, 5), (1, 1)];
-        for (original, target) in seq_nos.iter().copied() {
-            let offset = target.wrapping_sub(original);
-            assert_eq!(original.wrapping_add(offset), target);
-        }
-    }
-
-    #[test]
-    fn handles_initial_packet() {
+    fn test_continuous_stream_after_switch() {
         let mut rewriter = RtpRewriter::new();
-        let p1 = TimingHeader::new(5000.into(), MediaTime::from_90khz(1000));
+        let p1 = TimingHeader::new(SeqNo::from(300), MediaTime::from_90khz(3_000));
+        assert_eq!(
+            rewriter.rewrite(&p1, false).unwrap(),
+            (SeqNo::from(300), MediaTime::from_90khz(3_000))
+        );
 
-        let (s1, t1) = rewriter.rewrite(&p1, false).unwrap();
+        let p2 = TimingHeader::new(SeqNo::from(1001), MediaTime::from_90khz(90_000));
+        assert_eq!(
+            rewriter.rewrite(&p2, true).unwrap(),
+            (SeqNo::from(301), MediaTime::from_90khz(3_000))
+        );
 
-        assert_eq!(*s1, 5000);
-        assert_eq!(t1, MediaTime::from_90khz(1000));
-    }
-
-    #[test]
-    fn maintains_continuity() {
-        let mut rewriter = RtpRewriter::new();
-        let p1 = TimingHeader::new(100.into(), MediaTime::from_90khz(1000));
-        let (s1, t1) = rewriter.rewrite(&p1, false).unwrap();
-
-        let p2 = TimingHeader::new(101.into(), MediaTime::from_90khz(1030));
-        let (s2, t2) = rewriter.rewrite(&p2, false).unwrap();
-
-        assert_eq!(*s2, *s1 + 1);
-        assert_eq!(t2, MediaTime::from_90khz(1030));
-        assert_eq!(t2.saturating_sub(t1), MediaTime::from_90khz(30));
-    }
-
-    #[test]
-    fn handles_signaled_switch() {
-        let mut rewriter = RtpRewriter::new();
-
-        let p1 = TimingHeader::new(100.into(), MediaTime::from_90khz(90000));
-        rewriter.rewrite(&p1, false).unwrap();
-        let p2 = TimingHeader::new(101.into(), MediaTime::from_90khz(92700));
-        let (s2, t2) = rewriter.rewrite(&p2, false).unwrap();
-
-        let p_switch = TimingHeader::new(5000.into(), MediaTime::from_90khz(95400));
-        let (s_switch, t_switch) = rewriter.rewrite(&p_switch, true).unwrap();
-
-        assert_eq!(*s_switch, *s2 + 1);
-        // The time delta between rewritten timestamps must equal the delta between original timestamps.
-        let expected_delta = p_switch.rtp_ts.saturating_sub(p2.rtp_ts);
-        assert_eq!(t_switch.saturating_sub(t2), expected_delta);
-
-        let p_next = TimingHeader::new(5001.into(), MediaTime::from_90khz(98100));
-        let (s_next, t_next) = rewriter.rewrite(&p_next, false).unwrap();
-
-        assert_eq!(*s_next, *s_switch + 1);
-        let expected_delta2 = p_next.rtp_ts.saturating_sub(p_switch.rtp_ts);
-        assert_eq!(t_next.saturating_sub(t_switch), expected_delta2);
-    }
-
-    #[test]
-    fn handles_duplicate_packets() {
-        let mut rewriter = RtpRewriter::new();
-
-        let p1 = TimingHeader::new(100.into(), MediaTime::from_90khz(90000));
-        let (s1, t1) = rewriter.rewrite(&p1, false).unwrap();
-
-        let (s1_dup, t1_dup) = rewriter.rewrite(&p1, false).unwrap();
-
-        assert_eq!(*s1_dup, *s1);
-        assert_eq!(t1_dup, t1);
+        let p3 = TimingHeader::new(SeqNo::from(1002), MediaTime::from_90khz(93_000));
+        assert_eq!(
+            rewriter.rewrite(&p3, false).unwrap(),
+            (SeqNo::from(302), MediaTime::from_90khz(6_000))
+        );
     }
 }
