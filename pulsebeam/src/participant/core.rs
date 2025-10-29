@@ -137,10 +137,6 @@ impl ParticipantCore {
         None
     }
 
-    pub fn add_published_track(&mut self, track: TrackSender) {
-        self.upstream_allocator.add_published_track(track);
-    }
-
     pub fn handle_forward_rtp(
         &mut self,
         track_meta: Arc<TrackMeta>,
@@ -231,7 +227,7 @@ impl ParticipantCore {
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 });
                 let (tx, rx) = track::new(track_meta, 64);
-                self.add_published_track(tx);
+                self.upstream_allocator.add_published_track(tx);
                 self.events.push(CoreEvent::SpawnTrack(rx));
             }
             Direction::SendOnly => {
