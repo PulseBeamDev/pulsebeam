@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
-use str0m::media::{MediaKind, Rid};
+use str0m::media::{KeyframeRequestKind, MediaKind, Rid};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -34,11 +34,11 @@ pub struct SimulcastReceiver {
 }
 
 impl SimulcastReceiver {
-    pub fn request_keyframe(&self) {
+    pub fn request_keyframe(&self, kind: KeyframeRequestKind) {
         let request = str0m::media::KeyframeRequest {
             mid: self.meta.id.origin_mid,
             rid: self.rid,
-            kind: str0m::media::KeyframeRequestKind::Fir,
+            kind,
         };
         let wrapped = KeyframeRequest {
             request,

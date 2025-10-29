@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::bwe::{Bitrate, BweKind};
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -67,7 +67,7 @@ impl TrackState {
         *self.control_tx.borrow()
     }
 
-    fn request_keyframe(&self) {
+    fn request_keyframe(&self, kind: KeyframeRequestKind) {
         let config = self.current();
         if config.paused {
             return;
@@ -79,7 +79,7 @@ impl TrackState {
             .iter()
             .find(|r| r.rid == config.target_rid)
         {
-            receiver.request_keyframe();
+            receiver.request_keyframe(kind);
         }
     }
 }
@@ -180,26 +180,8 @@ impl DownstreamAllocator {
     }
 
     pub fn desired_bitrate(&self) -> u64 {
-        // This function is critical for signaling our intent to the bandwidth estimator.
-        // It must be forward-looking (probing for more bandwidth) but also highly sensitive
-        // to network conditions to ensure stability.
-
-        // --- 1. First, assess the overall network health ---
-        // If any active stream is in a "Bad" state, we are experiencing congestion.
-        // In this state, our ONLY priority is to stabilize. We must NOT ask for more bandwidth.
-        let is_in_congestion_recovery = self.video_slots.iter().any(|slot| {
-            if let Some(track_id) = &slot.assigned_track {
-                if let Some(state) = self.tracks.get(track_id) {
-                    let cfg = state.current();
-                    if !cfg.paused {
-                        if let Some(layer) = state.track.by_rid(cfg.target_rid.as_ref()) {
-                            return layer.state.quality() == StreamQuality::Bad;
-                        }
-                    }
-                }
-            }
-            false
-        });
+        // This function signals our intent to the BWE. It must be forward-looking enough
+        // to allow the BWE to grow, but conservative enough to prevent instability.
 
         let mut desired_bitrate = 0;
         for slot in &self.video_slots {
@@ -211,51 +193,36 @@ impl DownstreamAllocator {
             };
 
             let cfg = state.current();
-            let stream_aspiration = if is_in_congestion_recovery {
-                // --- CONGESTION RECOVERY MODE ---
-                // Do not ask for more. Only report what we are currently using.
-                if !cfg.paused {
-                    state
-                        .track
-                        .by_rid(cfg.target_rid.as_ref())
-                        .map_or(0, |l| l.state.bitrate_bps())
+            let aspiration = if cfg.paused {
+                // Probe to unpause: Signal that we want enough for the lowest quality layer.
+                state
+                    .track
+                    .simulcast
+                    .iter()
+                    .min_by_key(|l| l.state.bitrate_bps())
+                    .map_or(0, |l| l.state.bitrate_bps())
+            } else {
+                // Stream is active. Decide our aspiration based on its current health.
+                if let Some(current_layer) = state.track.by_rid(cfg.target_rid.as_ref()) {
+                    let current_bps = current_layer.state.bitrate_bps();
+                    match current_layer.state.quality() {
+                        StreamQuality::Excellent | StreamQuality::Good => {
+                            // Quality is good. Signal that we are happy with the current bitrate,
+                            // but ask for a bit of headroom (25%) so the BWE can grow and we
+                            // have the option to upgrade later if conditions remain stable.
+                            (current_bps as f64 * 1.25) as u64
+                        }
+                        StreamQuality::Bad => {
+                            // Quality is bad. We are in recovery. Do not ask for more.
+                            // Report only what we are currently trying to use.
+                            current_bps
+                        }
+                    }
                 } else {
                     0
                 }
-            } else {
-                // --- STABLE / PROBING MODE ---
-                if cfg.paused {
-                    // Probe to unpause: Signal that we want enough for the lowest quality layer.
-                    state
-                        .track
-                        .simulcast
-                        .iter()
-                        .min_by_key(|l| l.state.bitrate_bps())
-                        .map_or(0, |l| l.state.bitrate_bps())
-                } else {
-                    // Stream is active. Decide whether to hold or probe for an upgrade.
-                    if let Some(current_layer) = state.track.by_rid(cfg.target_rid.as_ref()) {
-                        if current_layer.state.quality() == StreamQuality::Excellent {
-                            // Quality is great. Probe for the next higher layer.
-                            let current_bps = current_layer.state.bitrate_bps();
-                            let next_higher_layer = state
-                                .track
-                                .simulcast
-                                .iter()
-                                .filter(|l| l.state.bitrate_bps() > current_bps)
-                                .min_by_key(|l| l.state.bitrate_bps());
-
-                            next_higher_layer.map_or(current_bps, |l| l.state.bitrate_bps())
-                        } else {
-                            // Quality is just "Good". Hold steady. Don't ask for more yet.
-                            current_layer.state.bitrate_bps()
-                        }
-                    } else {
-                        0
-                    }
-                }
             };
-            desired_bitrate += stream_aspiration;
+            desired_bitrate += aspiration;
         }
 
         desired_bitrate
@@ -281,13 +248,9 @@ impl DownstreamAllocator {
         let mut total_allocated_bitrate = 0.0;
 
         // --- Constants defining the allocator's behavior ---
-        /// A stream must be stable for this duration before we consider upgrading it. Prevents churn.
         const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(15);
-        /// We require this much surplus bandwidth (e.g., 1.30 = 30% headroom) before upgrading.
         const UPGRADE_HEADROOM: f64 = 1.30;
 
-        // Sort slots by importance (largest resolution first). This ensures that if we run out
-        // of budget, we pause the least important streams first.
         self.video_slots
             .sort_by(|a, b| b.max_height.cmp(&a.max_height));
 
@@ -300,15 +263,19 @@ impl DownstreamAllocator {
             };
 
             let config = state.current();
-            let prev_bitrate = slot.last_assigned_bitrate.unwrap_or(0.0);
             let remaining_budget = budget - total_allocated_bitrate;
 
             let current_layer = state.track.by_rid(config.target_rid.as_ref());
             let current_quality = current_layer.map_or(StreamQuality::Good, |l| l.state.quality());
+            let current_bitrate = if !config.paused {
+                current_layer.map_or(0.0, |l| l.state.bitrate_bps() as f64)
+            } else {
+                0.0
+            };
 
             // --- Decision Making Logic ---
             let mut new_rid = config.target_rid;
-            let mut new_bitrate = prev_bitrate;
+            let mut new_bitrate = current_bitrate;
             let mut new_paused = config.paused;
 
             let lowest_layer = state
@@ -318,8 +285,6 @@ impl DownstreamAllocator {
                 .min_by_key(|l| l.state.bitrate_bps());
 
             if config.paused {
-                // --- 1. Cautious Unpause ---
-                // Try to unpause, but ONLY to the lowest quality layer to ensure stability.
                 if let Some(layer) = lowest_layer {
                     if (layer.state.bitrate_bps() as f64) <= remaining_budget {
                         new_paused = false;
@@ -332,13 +297,10 @@ impl DownstreamAllocator {
                     }
                 }
             } else {
-                // Stream is currently active, evaluate if a change is needed.
                 let can_switch = slot
                     .last_switch_at
                     .is_none_or(|t| now.duration_since(t) > MIN_SWITCH_INTERVAL);
 
-                // --- 2. Emergency Downgrade on Bad Quality (Highest Priority) ---
-                // If quality is bad, immediately drop to the lowest possible quality to stabilize.
                 if current_quality == StreamQuality::Bad && can_switch {
                     if let Some(layer) = lowest_layer {
                         if new_rid != layer.rid {
@@ -350,8 +312,7 @@ impl DownstreamAllocator {
                             new_bitrate = layer.state.bitrate_bps() as f64;
                         }
                     }
-                // --- 3. Forced Downgrade/Pause on Insufficient BWE ---
-                } else if prev_bitrate > remaining_budget {
+                } else if current_bitrate > remaining_budget {
                     let best_fit = state
                         .track
                         .simulcast
@@ -377,8 +338,6 @@ impl DownstreamAllocator {
                         new_paused = true;
                         new_bitrate = 0.0;
                     }
-                // --- 4. Very Conservative Upgrade ---
-                // Only upgrade if we've been stable for a while, quality is EXCELLENT, and we have plenty of headroom.
                 } else if can_switch && current_quality == StreamQuality::Excellent {
                     let upgrade_budget = remaining_budget / UPGRADE_HEADROOM;
                     let upgrade_candidate = state
@@ -388,7 +347,7 @@ impl DownstreamAllocator {
                         .filter(|l| {
                             let bitrate = l.state.bitrate_bps() as f64;
                             !l.state.is_inactive()
-                                && bitrate > prev_bitrate
+                                && bitrate > current_bitrate
                                 && bitrate <= upgrade_budget
                         })
                         .max_by_key(|l| l.state.bitrate_bps());
@@ -404,7 +363,6 @@ impl DownstreamAllocator {
                 }
             }
 
-            // --- Apply Decision ---
             if new_paused != config.paused || new_rid != config.target_rid {
                 state.update(|c| {
                     let changed = c.paused != new_paused || c.target_rid != new_rid;
@@ -449,7 +407,7 @@ impl DownstreamAllocator {
             tracing::warn!(?req, "no track state found, ignore keyframe request");
             return;
         };
-        state.request_keyframe();
+        state.request_keyframe(KeyframeRequestKind::Pli);
     }
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, hdr: &RtpHeader) -> Option<Mid> {
@@ -696,7 +654,7 @@ impl TrackReader {
                                 },
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.meta.id, "Receiver lagged {n}, requesting keyframe");
-                                    receiver.request_keyframe();
+                                    receiver.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
                                 }
                                 Err(spmc::RecvError::Closed) => {
                                     tracing::warn!(track_id = %self.meta.id, "Channel closed, ending stream");
@@ -736,7 +694,7 @@ impl TrackReader {
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.meta.id, "New active stream lagged {n}, completing switch anyway");
-                                    active_receiver.request_keyframe();
+                                    active_receiver.request_keyframe(KeyframeRequestKind::Pli);
                                     self.state = TrackReaderState::Streaming { active_index }; // Commit to the switch
                                 }
                                 Err(spmc::RecvError::Closed) => {
@@ -822,7 +780,7 @@ impl TrackReader {
             if let TrackReaderState::Transitioning { active_index, .. } = self.state {
                 let receiver = &mut self.track.simulcast[active_index];
                 receiver.channel.reset();
-                receiver.request_keyframe();
+                receiver.request_keyframe(KeyframeRequestKind::Fir);
                 tracing::debug!(track_id = %self.meta.id, rid = ?receiver.rid, "Requested keyframe for new active layer");
             }
         }

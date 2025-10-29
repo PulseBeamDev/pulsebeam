@@ -187,14 +187,23 @@ impl PacketLossWindow {
         self.initialized && self.packets_received >= self.window_size
     }
 
-    /// Resets the window with a new starting sequence number.
-    fn reset_with_seq(&mut self, seq_no: SeqNo) {
+    /// Resets the window to its initial state.
+    fn reset(&mut self) {
         for chunk in &mut self.bitmap {
             *chunk = 0;
         }
+        self.initialized = false;
+        self.packets_received = 0;
+        self.highest_seq = 0.into();
+    }
+
+    /// Resets the window with a new starting sequence number.
+    fn reset_with_seq(&mut self, seq_no: SeqNo) {
+        self.reset();
         self.highest_seq = seq_no;
         self.set_bit(seq_no, true);
         self.packets_received = 1;
+        self.initialized = true;
     }
 
     /// Gets the value of a bit in the bitmap for the given sequence number.
@@ -333,6 +342,26 @@ impl StreamMonitor {
     /// Periodically updates derived metrics and commits the final conclusion to the shared state.
     /// This should be called from a ticker or other periodic task.
     pub fn poll(&mut self, now: Instant) {
+        let was_inactive = self.shared_state.is_inactive();
+        let is_inactive = self.determine_inactive_state(now);
+
+        // This is the core of the fix. If we transition from an active state to an
+        // inactive one (due to packet timeout), we MUST reset all our metrics. This
+        // prevents us from holding onto a stale "Excellent" quality for a stream
+        // that has been throttled by the publisher and is no longer sending.
+        if is_inactive && !was_inactive {
+            self.reset();
+        }
+
+        self.shared_state
+            .inactive
+            .store(is_inactive, Ordering::Relaxed);
+
+        // Do not perform quality calculations for an inactive stream.
+        if is_inactive {
+            return;
+        }
+
         self.update_derived_metrics(now);
 
         // Update stream quality based on metrics
@@ -343,14 +372,24 @@ impl StreamMonitor {
                 .quality
                 .store(new_quality as u8, Ordering::Relaxed);
         }
+    }
 
-        // Update inactive state based on manual control or timeout
-        let new_inactive_state = self.determine_inactive_state(now);
-        if new_inactive_state != self.shared_state.is_inactive() {
-            self.shared_state
-                .inactive
-                .store(new_inactive_state, Ordering::Relaxed);
-        }
+    /// Resets the monitor to a clean state. Called when a stream becomes inactive.
+    fn reset(&mut self) {
+        // tracing::info!("Resetting stream monitor state due to inactivity");
+        self.loss_window.reset();
+        self.jitter_estimate = 0.0;
+        self.jitter_last_arrival = None;
+        self.jitter_last_rtp_time = None;
+        self.raw_loss_percent = 0.0;
+        self.raw_jitter_ms = 0;
+        self.bwe_interval_bytes = 0;
+
+        // Reset quality to a neutral default. It must prove itself again.
+        self.current_quality = StreamQuality::Good;
+        self.shared_state
+            .quality
+            .store(StreamQuality::Good as u8, Ordering::Relaxed);
     }
 
     pub fn set_manual_pause(&mut self, paused: bool) {
