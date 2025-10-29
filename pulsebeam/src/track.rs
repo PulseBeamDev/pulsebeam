@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{MediaKind, Rid};
@@ -209,47 +203,4 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             simulcast: receivers,
         },
     )
-}
-
-#[derive(Debug)]
-pub struct BandwidthEstimator {
-    last_update: Instant,
-    interval_bytes: usize,
-    estimate: f64,
-    shared: Arc<AtomicU64>,
-    sample_count: u32,
-}
-
-impl BandwidthEstimator {
-    pub fn new(shared: Arc<AtomicU64>) -> Self {
-        let initial_bps = shared.load(Ordering::Relaxed);
-        Self {
-            last_update: Instant::now(),
-            interval_bytes: 0,
-            estimate: initial_bps as f64,
-            shared,
-            sample_count: 0,
-        }
-    }
-
-    pub fn update(&mut self, pkt_bytes: usize) {
-        self.interval_bytes += pkt_bytes + 50;
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update);
-
-        if elapsed >= Duration::from_millis(100) {
-            let instant_bps = (self.interval_bytes as f64 * 8.0) / elapsed.as_secs_f64();
-            self.interval_bytes = 0;
-            self.sample_count += 1;
-            let alpha = if self.sample_count < 5 { 0.50 } else { 0.25 };
-            self.estimate = if self.estimate == 0.0 {
-                instant_bps
-            } else {
-                (1.0 - alpha) * self.estimate + alpha * instant_bps
-            };
-            self.shared
-                .store((self.estimate * 1.25) as u64, Ordering::Relaxed);
-            self.last_update = now;
-        }
-    }
 }
