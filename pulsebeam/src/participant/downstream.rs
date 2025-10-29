@@ -97,6 +97,9 @@ struct VideoSlotState {
     max_height: u32,
     last_switch_at: Option<Instant>,
     last_assigned_bitrate: Option<f64>,
+    last_observed_quality: Option<StreamQuality>,
+    quality_stable_count: usize,
+    last_upgrade_at: Option<tokio::time::Instant>,
 }
 
 pub struct DownstreamAllocator {
@@ -166,6 +169,9 @@ impl DownstreamAllocator {
                     max_height: 720,
                     last_switch_at: None,
                     last_assigned_bitrate: None,
+                    last_observed_quality: None,
+                    quality_stable_count: 0,
+                    last_upgrade_at: None,
                 });
             }
         }
@@ -190,16 +196,37 @@ impl DownstreamAllocator {
     }
 
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        const BUDGET_HEADROOM: f64 = 0.90;
-        const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-        const UPGRADE_HEADROOM: f64 = 1.30;
+        // === CONFIGURATION CONSTANTS ===
+
+        // Budget management
+        const BUDGET_HEADROOM: f64 = 0.85; // Conservative headroom for safety
+
+        // Timing constraints for stability
+        const MIN_DOWNGRADE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const MIN_UPGRADE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+        const UPGRADE_STABILIZATION_PERIOD: std::time::Duration =
+            std::time::Duration::from_secs(15);
+
+        // Quality thresholds
+        const UPGRADE_BUDGET_MARGIN: f64 = 1.40; // Need 40% extra budget to upgrade
+        const UPGRADE_MIN_BITRATE_GAIN: f64 = 1.25; // Must be 25% better to justify upgrade
+        const DOWNGRADE_URGENCY_THRESHOLD: f64 = 0.80; // Immediate downgrade if over 80% budget
+
+        // Desired bitrate calculation - simplified since StreamMonitor handles quality
+        const STABLE_PUBLISHER_HEADROOM: f64 = 1.35; // Normal headroom for stable streams
+        const EXCELLENT_QUALITY_HEADROOM: f64 = 1.50; // More aggressive for excellent quality
+
+        // Quality stability tracking
+        const BAD_QUALITY_THRESHOLD: usize = 3; // Consecutive bad quality samples before action
+        const EXCELLENT_QUALITY_THRESHOLD: usize = 10; // Consecutive excellent samples before upgrade
 
         let now = tokio::time::Instant::now();
-
         let budget = self.smoothed_bwe_bps * BUDGET_HEADROOM;
+
         let mut total_allocated = 0.0;
         let mut total_desired = 0.0;
 
+        // Sort by priority (highest resolution first)
         self.video_slots
             .sort_by(|a, b| b.max_height.cmp(&a.max_height));
 
@@ -222,8 +249,25 @@ impl DownstreamAllocator {
                 0.0
             };
 
-            // Compute desired bitrate (forward-looking)
+            // === QUALITY TRACKING FOR STABILITY ===
+
+            // Track consecutive quality samples
+            if let Some(last_quality) = slot.last_observed_quality {
+                if last_quality == current_quality {
+                    slot.quality_stable_count = slot.quality_stable_count.saturating_add(1);
+                } else {
+                    slot.quality_stable_count = 1;
+                }
+            } else {
+                slot.quality_stable_count = 1;
+            }
+            slot.last_observed_quality = Some(current_quality);
+
+            // === COMPUTE DESIRED BITRATE (STABLE, FORWARD-LOOKING) ===
+            // Note: StreamMonitor already factors in bitrate stability via quality assessment
+
             let desired_bitrate = if config.paused {
+                // When paused, desire the lowest layer to enable quick resume
                 state
                     .track
                     .simulcast
@@ -231,11 +275,23 @@ impl DownstreamAllocator {
                     .min_by_key(|l| l.state.bitrate_bps())
                     .map_or(0.0, |l| l.state.bitrate_bps() as f64)
             } else if let Some(layer) = current_layer {
-                match layer.state.quality() {
-                    StreamQuality::Excellent | StreamQuality::Good => {
-                        layer.state.bitrate_bps() as f64 * 1.25
+                match current_quality {
+                    StreamQuality::Excellent
+                        if slot.quality_stable_count >= EXCELLENT_QUALITY_THRESHOLD =>
+                    {
+                        // Excellent and stable - signal we want more
+                        // StreamMonitor has already verified bitrate stability
+                        layer.state.bitrate_bps() as f64 * EXCELLENT_QUALITY_HEADROOM
                     }
-                    StreamQuality::Bad => layer.state.bitrate_bps() as f64,
+                    StreamQuality::Good | StreamQuality::Excellent => {
+                        // Good quality (includes stable bitrate check from StreamMonitor)
+                        layer.state.bitrate_bps() as f64 * STABLE_PUBLISHER_HEADROOM
+                    }
+                    StreamQuality::Bad => {
+                        // Bad quality - stay at current, don't inflate desired
+                        // StreamMonitor considers bitrate instability as Bad quality
+                        layer.state.bitrate_bps() as f64
+                    }
                 }
             } else {
                 0.0
@@ -243,7 +299,8 @@ impl DownstreamAllocator {
 
             total_desired += desired_bitrate;
 
-            // --- Allocation decision ---
+            // === ALLOCATION DECISION (STABILITY-FOCUSED) ===
+
             let mut new_rid = config.target_rid;
             let mut new_bitrate = current_bitrate;
             let mut new_paused = config.paused;
@@ -255,68 +312,119 @@ impl DownstreamAllocator {
                 .min_by_key(|l| l.state.bitrate_bps());
 
             if config.paused {
+                // === UNPAUSE DECISION ===
+                // Only unpause if we have stable budget and lowest layer fits comfortably
                 if let Some(layer) = lowest_layer {
-                    if layer.state.bitrate_bps() as f64 <= remaining_budget {
+                    let layer_bitrate = layer.state.bitrate_bps() as f64;
+                    if layer_bitrate * 1.20 <= remaining_budget {
+                        // Need 20% margin
                         new_paused = false;
                         new_rid = layer.rid;
-                        new_bitrate = layer.state.bitrate_bps() as f64;
+                        new_bitrate = layer_bitrate;
                     }
                 }
             } else {
-                let can_switch = slot
-                    .last_switch_at
-                    .map_or(true, |t| now.duration_since(t) > MIN_SWITCH_INTERVAL);
+                // === ACTIVE STREAM DECISIONS ===
 
-                if current_quality == StreamQuality::Bad && can_switch {
-                    if let Some(layer) = lowest_layer {
-                        if new_rid != layer.rid {
-                            new_rid = layer.rid;
-                            new_bitrate = layer.state.bitrate_bps() as f64;
-                        }
-                    }
-                } else if current_bitrate > remaining_budget {
+                let time_since_last_switch = slot.last_switch_at.map(|t| now.duration_since(t));
+
+                // Check if we can downgrade (aggressive) or upgrade (conservative)
+                let can_downgrade =
+                    time_since_last_switch.map_or(true, |d| d > MIN_DOWNGRADE_INTERVAL);
+                let can_upgrade = time_since_last_switch.map_or(true, |d| d > MIN_UPGRADE_INTERVAL);
+
+                // === CRITICAL: DOWNGRADE LOGIC (AGGRESSIVE) ===
+
+                let is_over_budget = current_bitrate > remaining_budget;
+                let is_critically_over =
+                    current_bitrate > remaining_budget * DOWNGRADE_URGENCY_THRESHOLD;
+                let has_bad_quality = current_quality == StreamQuality::Bad
+                    && slot.quality_stable_count >= BAD_QUALITY_THRESHOLD;
+
+                if is_critically_over
+                    || (is_over_budget && can_downgrade)
+                    || (has_bad_quality && can_downgrade)
+                {
+                    // Find best layer that fits in budget
                     let best_fit = state
                         .track
                         .simulcast
                         .iter()
                         .filter(|l| {
                             !l.state.is_inactive()
-                                && l.state.bitrate_bps() as f64 <= remaining_budget
+                                && l.state.bitrate_bps() as f64 <= remaining_budget * 0.95 // 5% safety margin
                         })
                         .max_by_key(|l| l.state.bitrate_bps());
+
                     if let Some(layer) = best_fit {
                         new_rid = layer.rid;
                         new_bitrate = layer.state.bitrate_bps() as f64;
-                    } else {
+                    } else if is_critically_over {
+                        // No layer fits - must pause
                         new_paused = true;
                         new_bitrate = 0.0;
+                    } else if let Some(lowest) = lowest_layer {
+                        // Fall back to lowest layer
+                        new_rid = lowest.rid;
+                        new_bitrate = lowest.state.bitrate_bps() as f64;
                     }
-                } else if can_switch && current_quality == StreamQuality::Excellent {
-                    let upgrade_budget = remaining_budget / UPGRADE_HEADROOM;
-                    let upgrade_candidate = state
-                        .track
-                        .simulcast
-                        .iter()
-                        .filter(|l| {
-                            let b = l.state.bitrate_bps() as f64;
-                            !l.state.is_inactive() && b > current_bitrate && b <= upgrade_budget
-                        })
-                        .max_by_key(|l| l.state.bitrate_bps());
-                    if let Some(layer) = upgrade_candidate {
-                        new_rid = layer.rid;
-                        new_bitrate = layer.state.bitrate_bps() as f64;
+                }
+                // === UPGRADE LOGIC (CONSERVATIVE) ===
+                else if can_upgrade
+                    && current_quality == StreamQuality::Excellent
+                    && slot.quality_stable_count >= EXCELLENT_QUALITY_THRESHOLD
+                {
+                    // Check if enough time has passed since last upgrade for stabilization
+                    let is_stabilized = slot.last_upgrade_at.map_or(true, |t| {
+                        now.duration_since(t) > UPGRADE_STABILIZATION_PERIOD
+                    });
+
+                    if is_stabilized {
+                        // Conservative upgrade budget
+                        let upgrade_budget = remaining_budget / UPGRADE_BUDGET_MARGIN;
+
+                        let upgrade_candidate = state
+                            .track
+                            .simulcast
+                            .iter()
+                            .filter(|l| {
+                                let l_bitrate = l.state.bitrate_bps() as f64;
+                                !l.state.is_inactive()
+                                && l.state.quality() == StreamQuality::Excellent // Publisher must be excellent (includes stability)
+                                && l_bitrate > current_bitrate * UPGRADE_MIN_BITRATE_GAIN // Must be significant gain
+                                && l_bitrate <= upgrade_budget
+                            })
+                            .min_by_key(|l| l.state.bitrate_bps()); // Take smallest qualifying upgrade
+
+                        if let Some(layer) = upgrade_candidate {
+                            new_rid = layer.rid;
+                            new_bitrate = layer.state.bitrate_bps() as f64;
+                            slot.last_upgrade_at = Some(now); // Track upgrade time
+                        }
                     }
                 }
             }
 
+            // === APPLY CHANGES ===
+
             if new_paused != config.paused || new_rid != config.target_rid {
+                let is_upgrade = !new_paused && !config.paused && new_bitrate > current_bitrate;
+
                 state.update(|c| {
                     let changed = c.paused != new_paused || c.target_rid != new_rid;
                     c.paused = new_paused;
                     c.target_rid = new_rid;
                     changed
                 });
+
                 slot.last_switch_at = Some(now);
+
+                // Reset quality tracking on layer switch to rebuild confidence
+                slot.quality_stable_count = 0;
+
+                if is_upgrade {
+                    slot.last_upgrade_at = Some(now);
+                }
             }
 
             slot.last_assigned_bitrate = Some(new_bitrate);

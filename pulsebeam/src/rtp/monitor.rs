@@ -6,7 +6,8 @@
 //!
 //! 1.  `StreamMonitor`: A single-owner, stateful struct responsible for all calculations.
 //!     Its internal state is non-atomic for performance, as it is not intended to be shared.
-//!     It consumes packet metadata and synthesizes it into high-level metrics.
+//!     It consumes packet metadata and synthesizes it into high-level metrics including
+//!     bitrate stability.
 //!
 //! 2.  `StreamState`: A lightweight, thread-safe struct holding the final, shared conclusions
 //!     (e.g., quality and inactive status). It uses atomic types to allow for lock-free reads
@@ -26,18 +27,20 @@ use crate::rtp::PacketTiming;
 const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The size of the circular buffer used for the sliding window packet loss calculation.
 const LOSS_WINDOW_SIZE: usize = 256;
+/// Number of bitrate samples to track for stability measurement
+const BITRATE_HISTORY_SAMPLES: usize = 20;
 
 // --- Public-Facing Shared State ---
 
-/// Represents the measured quality of the stream.
+/// Represents the measured quality of the stream, including bitrate stability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StreamQuality {
-    /// The stream is experiencing significant packet loss or jitter.
+    /// The stream is experiencing significant packet loss, jitter, or bitrate instability.
     Bad = 0,
     /// The stream is performing adequately.
     Good = 1,
-    /// The stream has very low packet loss and jitter.
+    /// The stream has very low packet loss, jitter, and stable bitrate.
     Excellent = 2,
 }
 
@@ -50,7 +53,7 @@ pub struct StreamState {
     inactive: Arc<AtomicBool>,
     /// Estimated bitrate of the stream in bits per second.
     bitrate_bps: Arc<AtomicU64>,
-    /// The current assessed quality of the stream.
+    /// The current assessed quality of the stream (includes stability).
     quality: Arc<AtomicU8>,
 }
 
@@ -74,12 +77,84 @@ impl StreamState {
     }
 
     /// Returns the current quality of the stream.
+    /// Note: Quality assessment now includes bitrate stability as a factor.
     pub fn quality(&self) -> StreamQuality {
         match self.quality.load(Ordering::Relaxed) {
             0 => StreamQuality::Bad,
             2 => StreamQuality::Excellent,
             _ => StreamQuality::Good, // Default case
         }
+    }
+}
+
+// --- Bitrate History for Stability Tracking ---
+
+/// Circular buffer for tracking bitrate samples to measure stability
+#[derive(Debug)]
+struct BitrateHistory {
+    samples: Vec<f64>,
+    capacity: usize,
+    index: usize,
+    filled: bool,
+}
+
+impl BitrateHistory {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity),
+            capacity,
+            index: 0,
+            filled: false,
+        }
+    }
+
+    fn push(&mut self, value: f64) {
+        if self.samples.len() < self.capacity {
+            self.samples.push(value);
+            if self.samples.len() == self.capacity {
+                self.filled = true;
+            }
+        } else {
+            self.samples[self.index] = value;
+        }
+        self.index = (self.index + 1) % self.capacity;
+    }
+
+    /// Returns the coefficient of variation (CV) as a percentage.
+    /// CV = (standard_deviation / mean) * 100
+    /// This gives us a normalized stability metric independent of absolute bitrate.
+    fn coefficient_of_variation_percent(&self) -> f32 {
+        if self.samples.len() < 2 {
+            return 0.0;
+        }
+
+        let mean = self.samples.iter().sum::<f64>() / self.samples.len() as f64;
+        if mean < 1.0 {
+            return 0.0; // Avoid division by zero
+        }
+
+        let variance = self
+            .samples
+            .iter()
+            .map(|v| {
+                let diff = v - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / self.samples.len() as f64;
+
+        let std_dev = variance.sqrt();
+        ((std_dev / mean) * 100.0) as f32
+    }
+
+    fn is_ready(&self) -> bool {
+        self.filled
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.index = 0;
+        self.filled = false;
     }
 }
 
@@ -254,25 +329,39 @@ impl PacketLossWindow {
 // --- Health Thresholds ---
 
 /// Defines asymmetric thresholds to prevent state flapping.
+/// Now includes bitrate stability thresholds.
 #[derive(Debug, Clone, Copy)]
 pub struct HealthThresholds {
     pub become_bad_loss_percent: f32,
     pub become_bad_jitter_ms: u32,
+    pub become_bad_bitrate_cv_percent: f32,
+
     pub become_good_loss_percent: f32,
     pub become_good_jitter_ms: u32,
+    pub become_good_bitrate_cv_percent: f32,
+
     pub become_excellent_loss_percent: f32,
     pub become_excellent_jitter_ms: u32,
+    pub become_excellent_bitrate_cv_percent: f32,
 }
 
 impl Default for HealthThresholds {
     fn default() -> Self {
         Self {
+            // Bad thresholds (degradation)
             become_bad_loss_percent: 5.0,
             become_bad_jitter_ms: 30,
+            become_bad_bitrate_cv_percent: 30.0, // >30% CV = unstable
+
+            // Good thresholds (recovery)
             become_good_loss_percent: 2.0,
             become_good_jitter_ms: 20,
+            become_good_bitrate_cv_percent: 20.0, // <20% CV = stable enough
+
+            // Excellent thresholds (optimal)
             become_excellent_loss_percent: 1.0,
             become_excellent_jitter_ms: 15,
+            become_excellent_bitrate_cv_percent: 10.0, // <10% CV = very stable
         }
     }
 }
@@ -302,9 +391,13 @@ pub struct StreamMonitor {
     // Packet loss tracking
     loss_window: PacketLossWindow,
 
+    // Bitrate stability tracking
+    bitrate_history: BitrateHistory,
+
     // Derived metrics, calculated periodically in `poll`.
     raw_loss_percent: f32,
     raw_jitter_ms: u32,
+    raw_bitrate_cv_percent: f32,
     current_quality: StreamQuality,
 }
 
@@ -324,8 +417,10 @@ impl StreamMonitor {
             jitter_last_arrival: None,
             jitter_last_rtp_time: None,
             loss_window: PacketLossWindow::new(LOSS_WINDOW_SIZE),
+            bitrate_history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
             raw_loss_percent: 0.0,
             raw_jitter_ms: 0,
+            raw_bitrate_cv_percent: 0.0,
             current_quality: StreamQuality::Good,
         }
     }
@@ -347,10 +442,7 @@ impl StreamMonitor {
         let was_inactive = self.shared_state.is_inactive();
         let is_inactive = self.determine_inactive_state(now);
 
-        // This is the core of the fix. If we transition from an active state to an
-        // inactive one (due to packet timeout), we MUST reset all our metrics. This
-        // prevents us from holding onto a stale "Excellent" quality for a stream
-        // that has been throttled by the publisher and is no longer sending.
+        // If we transition from active to inactive, reset all metrics
         if is_inactive && !was_inactive {
             self.reset();
         }
@@ -366,7 +458,7 @@ impl StreamMonitor {
 
         self.update_derived_metrics(now);
 
-        // Update stream quality based on metrics
+        // Update stream quality based on metrics (now includes bitrate stability)
         let new_quality = self.determine_stream_quality();
         if new_quality != self.current_quality {
             self.current_quality = new_quality;
@@ -378,13 +470,14 @@ impl StreamMonitor {
 
     /// Resets the monitor to a clean state. Called when a stream becomes inactive.
     fn reset(&mut self) {
-        // tracing::info!("Resetting stream monitor state due to inactivity");
         self.loss_window.reset();
         self.jitter_estimate = 0.0;
         self.jitter_last_arrival = None;
         self.jitter_last_rtp_time = None;
+        self.bitrate_history.reset();
         self.raw_loss_percent = 0.0;
         self.raw_jitter_ms = 0;
+        self.raw_bitrate_cv_percent = 0.0;
         self.bwe_interval_bytes = 0;
 
         // Reset quality to a neutral default. It must prove itself again.
@@ -406,6 +499,10 @@ impl StreamMonitor {
         self.raw_jitter_ms
     }
 
+    pub fn get_bitrate_cv_percent(&self) -> f32 {
+        self.raw_bitrate_cv_percent
+    }
+
     /// Determines the inactive state based on manual override or packet timeout.
     fn determine_inactive_state(&self, now: Instant) -> bool {
         if self.manual_pause {
@@ -417,33 +514,55 @@ impl StreamMonitor {
         false
     }
 
-    /// Assesses stream quality based on current loss and jitter metrics.
+    /// Assesses stream quality based on loss, jitter, AND bitrate stability.
     fn determine_stream_quality(&self) -> StreamQuality {
         if !self.loss_window.is_ready() {
             return StreamQuality::Good; // Not enough data, assume Good.
         }
 
+        // For bitrate stability, only enforce if we have enough history
+        let check_bitrate_stability = self.bitrate_history.is_ready();
+
         match self.current_quality {
             StreamQuality::Excellent | StreamQuality::Good => {
-                if self.raw_loss_percent > self.thresholds.become_bad_loss_percent
-                    || self.raw_jitter_ms > self.thresholds.become_bad_jitter_ms
-                {
-                    StreamQuality::Bad
-                } else if self.raw_loss_percent < self.thresholds.become_excellent_loss_percent
-                    && self.raw_jitter_ms < self.thresholds.become_excellent_jitter_ms
-                {
-                    StreamQuality::Excellent
-                } else {
-                    self.current_quality // Remain in current state
+                // Check if ANY metric is bad
+                let has_bad_loss = self.raw_loss_percent > self.thresholds.become_bad_loss_percent;
+                let has_bad_jitter = self.raw_jitter_ms > self.thresholds.become_bad_jitter_ms;
+                let has_bad_bitrate = check_bitrate_stability
+                    && self.raw_bitrate_cv_percent > self.thresholds.become_bad_bitrate_cv_percent;
+
+                if has_bad_loss || has_bad_jitter || has_bad_bitrate {
+                    return StreamQuality::Bad;
                 }
+
+                // Check if ALL metrics are excellent
+                let has_excellent_loss =
+                    self.raw_loss_percent < self.thresholds.become_excellent_loss_percent;
+                let has_excellent_jitter =
+                    self.raw_jitter_ms < self.thresholds.become_excellent_jitter_ms;
+                let has_excellent_bitrate = !check_bitrate_stability
+                    || self.raw_bitrate_cv_percent
+                        < self.thresholds.become_excellent_bitrate_cv_percent;
+
+                if has_excellent_loss && has_excellent_jitter && has_excellent_bitrate {
+                    return StreamQuality::Excellent;
+                }
+
+                // Otherwise maintain current state
+                self.current_quality
             }
             StreamQuality::Bad => {
-                if self.raw_loss_percent < self.thresholds.become_good_loss_percent
-                    && self.raw_jitter_ms < self.thresholds.become_good_jitter_ms
-                {
+                // To recover to Good, ALL metrics must be good
+                let has_good_loss =
+                    self.raw_loss_percent < self.thresholds.become_good_loss_percent;
+                let has_good_jitter = self.raw_jitter_ms < self.thresholds.become_good_jitter_ms;
+                let has_good_bitrate = !check_bitrate_stability
+                    || self.raw_bitrate_cv_percent < self.thresholds.become_good_bitrate_cv_percent;
+
+                if has_good_loss && has_good_jitter && has_good_bitrate {
                     StreamQuality::Good
                 } else {
-                    StreamQuality::Bad // Remain Bad
+                    StreamQuality::Bad
                 }
             }
         }
@@ -451,10 +570,11 @@ impl StreamMonitor {
 
     // --- Internal Calculation Methods ---
 
-    /// Updates derived metrics like bitrate and packet loss based on accumulated data.
+    /// Updates derived metrics like bitrate, packet loss, and bitrate stability.
     fn update_derived_metrics(&mut self, now: Instant) {
         const ALPHA_UP: f64 = 0.5;
         const ALPHA_DOWN: f64 = 0.1;
+
         // Update bitrate
         let elapsed = now.saturating_duration_since(self.bwe_last_update);
         if elapsed >= Duration::from_millis(500) {
@@ -471,6 +591,11 @@ impl StreamMonitor {
                 self.shared_state
                     .bitrate_bps
                     .store(self.bwe_ewma as u64, Ordering::Relaxed);
+
+                // Track bitrate for stability calculation
+                if self.bwe_ewma > 0.0 {
+                    self.bitrate_history.push(self.bwe_ewma);
+                }
             }
             self.bwe_interval_bytes = 0;
             self.bwe_last_update = now;
@@ -478,6 +603,9 @@ impl StreamMonitor {
 
         // Update packet loss percentage
         self.raw_loss_percent = self.loss_window.calculate_loss_percent();
+
+        // Update bitrate coefficient of variation
+        self.raw_bitrate_cv_percent = self.bitrate_history.coefficient_of_variation_percent();
     }
 
     fn discover_clock_rate(&mut self, packet: &impl PacketTiming) {
@@ -542,8 +670,10 @@ mod test {
         let thresholds = HealthThresholds {
             become_bad_loss_percent: 7.0,
             become_bad_jitter_ms: 30,
+            become_bad_bitrate_cv_percent: 30.0,
             become_good_loss_percent: 4.0,
             become_good_jitter_ms: 20,
+            become_good_bitrate_cv_percent: 20.0,
             ..Default::default()
         };
         let state = StreamState::new(true, 0);
@@ -614,6 +744,43 @@ mod test {
             StreamQuality::Bad,
             "Quality should be Bad due to high packet loss ({}%)",
             monitor.get_loss_percent()
+        );
+    }
+
+    #[test]
+    fn quality_becomes_bad_due_to_unstable_bitrate() {
+        let (mut monitor, state) = setup();
+        let start = Instant::now();
+        monitor.set_manual_pause(false);
+        monitor.poll(start);
+
+        // Simulate highly fluctuating bitrate
+        let bitrates = vec![1000000, 500000, 1200000, 400000, 1100000, 300000];
+        for (i, &target_bps) in bitrates
+            .iter()
+            .cycle()
+            .take(BITRATE_HISTORY_SAMPLES + 5)
+            .enumerate()
+        {
+            let bytes_needed = (target_bps / 8) / 2; // Per 500ms
+            for j in 0..10 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: ((i * 10 + j) as u64).into(),
+                        at: start + Duration::from_millis(i as u64 * 500),
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    bytes_needed / 10,
+                );
+            }
+            monitor.poll(start + Duration::from_millis(i as u64 * 500 + 501));
+        }
+
+        assert_eq!(
+            state.quality(),
+            StreamQuality::Bad,
+            "Quality should be Bad due to unstable bitrate (CV: {}%)",
+            monitor.get_bitrate_cv_percent()
         );
     }
 
@@ -749,6 +916,39 @@ mod test {
             monitor.get_loss_percent() < 1.0,
             "Should handle reordered packets without detecting false losses (loss: {}%)",
             monitor.get_loss_percent()
+        );
+    }
+
+    #[test]
+    fn excellent_quality_requires_stable_bitrate() {
+        let (mut monitor, state) = setup();
+        let start = Instant::now();
+        monitor.set_manual_pause(false);
+        monitor.poll(start);
+
+        // Send stable bitrate with low loss and jitter
+        for i in 0..(BITRATE_HISTORY_SAMPLES + 10) {
+            // Send consistent packets for stable bitrate (1 Mbps)
+            for j in 0..25 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: ((i * 25 + j) as u64).into(),
+                        at: start + Duration::from_millis(i as u64 * 500 + j as u64 * 20),
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    5000, // 5KB every 20ms = ~2 Mbps
+                );
+            }
+            monitor.poll(start + Duration::from_millis(i as u64 * 500 + 501));
+        }
+
+        assert_eq!(
+            state.quality(),
+            StreamQuality::Excellent,
+            "Quality should be Excellent with stable bitrate (CV: {}%, loss: {}%, jitter: {}ms)",
+            monitor.get_bitrate_cv_percent(),
+            monitor.get_loss_percent(),
+            monitor.get_jitter_ms()
         );
     }
 }
