@@ -292,6 +292,7 @@ pub struct StreamMonitor {
 
     bwe_last_update: Instant,
     bwe_interval_bytes: usize,
+    bwe_ewma: f64,
 
     // Jitter calculation
     jitter_estimate: f64,
@@ -318,6 +319,7 @@ impl StreamMonitor {
             clock_rate: 0,
             bwe_last_update: now,
             bwe_interval_bytes: 0,
+            bwe_ewma: 0.0,
             jitter_estimate: 0.0,
             jitter_last_arrival: None,
             jitter_last_rtp_time: None,
@@ -451,15 +453,24 @@ impl StreamMonitor {
 
     /// Updates derived metrics like bitrate and packet loss based on accumulated data.
     fn update_derived_metrics(&mut self, now: Instant) {
+        const ALPHA_UP: f64 = 0.5;
+        const ALPHA_DOWN: f64 = 0.1;
         // Update bitrate
         let elapsed = now.saturating_duration_since(self.bwe_last_update);
         if elapsed >= Duration::from_millis(500) {
             let elapsed_secs = elapsed.as_secs_f64();
             if elapsed_secs > 0.0 {
                 let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
+                let alpha = if bps > self.bwe_ewma {
+                    ALPHA_UP
+                } else {
+                    ALPHA_DOWN
+                };
+
+                self.bwe_ewma = (1.0 - alpha) * self.bwe_ewma + alpha * bps;
                 self.shared_state
                     .bitrate_bps
-                    .store(bps as u64, Ordering::Relaxed);
+                    .store(self.bwe_ewma as u64, Ordering::Relaxed);
             }
             self.bwe_interval_bytes = 0;
             self.bwe_last_update = now;
