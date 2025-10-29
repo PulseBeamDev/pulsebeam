@@ -31,7 +31,7 @@ pub enum DisconnectReason {
 
 #[derive(Debug)]
 pub enum CoreEvent {
-    SpawnTrack(Arc<TrackMeta>),
+    SpawnTrack(TrackReceiver),
 }
 
 pub struct ParticipantCore {
@@ -230,7 +230,9 @@ impl ParticipantCore {
                     kind: media.kind,
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 });
-                self.events.push(CoreEvent::SpawnTrack(track_meta));
+                let (tx, rx) = track::new(track_meta, 64);
+                self.add_published_track(tx);
+                self.events.push(CoreEvent::SpawnTrack(rx));
             }
             Direction::SendOnly => {
                 self.downstream_allocator.add_slot(media.mid, media.kind);

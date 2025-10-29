@@ -143,9 +143,7 @@ impl ParticipantActor {
 
     async fn handle_core_event(&mut self, event: CoreEvent) {
         match event {
-            CoreEvent::SpawnTrack(track_meta) => {
-                let (tx, rx) = track::new(track_meta, 64);
-                self.core.add_published_track(tx);
+            CoreEvent::SpawnTrack(rx) => {
                 let _ = self
                     .room_handle
                     .send_high(room::RoomMessage::PublishTrack(rx))
