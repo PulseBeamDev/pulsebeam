@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
-use str0m::bwe::{Bitrate, BweKind};
+use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
 use tokio::sync::watch;
@@ -105,7 +104,7 @@ pub struct DownstreamAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<AudioSlotState>,
     video_slots: Vec<VideoSlotState>,
-    smoothed_bwe_bps: Option<f64>,
+    smoothed_bwe_bps: f64,
 }
 
 impl DownstreamAllocator {
@@ -115,7 +114,7 @@ impl DownstreamAllocator {
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
-            smoothed_bwe_bps: None,
+            smoothed_bwe_bps: 0.0,
         }
     }
 
@@ -179,77 +178,27 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn desired_bitrate(&self) -> u64 {
-        // This function signals our intent to the BWE. It must be forward-looking enough
-        // to allow the BWE to grow, but conservative enough to prevent instability.
-
-        let mut desired_bitrate = 0;
-        for slot in &self.video_slots {
-            let Some(track_id) = &slot.assigned_track else {
-                continue;
-            };
-            let Some(state) = self.tracks.get(track_id) else {
-                continue;
-            };
-
-            let cfg = state.current();
-            let aspiration = if cfg.paused {
-                // Probe to unpause: Signal that we want enough for the lowest quality layer.
-                state
-                    .track
-                    .simulcast
-                    .iter()
-                    .min_by_key(|l| l.state.bitrate_bps())
-                    .map_or(0, |l| l.state.bitrate_bps())
-            } else {
-                // Stream is active. Decide our aspiration based on its current health.
-                if let Some(current_layer) = state.track.by_rid(cfg.target_rid.as_ref()) {
-                    let current_bps = current_layer.state.bitrate_bps();
-                    match current_layer.state.quality() {
-                        StreamQuality::Excellent | StreamQuality::Good => {
-                            // Quality is good. Signal that we are happy with the current bitrate,
-                            // but ask for a bit of headroom (25%) so the BWE can grow and we
-                            // have the option to upgrade later if conditions remain stable.
-                            (current_bps as f64 * 1.25) as u64
-                        }
-                        StreamQuality::Bad => {
-                            // Quality is bad. We are in recovery. Do not ask for more.
-                            // Report only what we are currently trying to use.
-                            current_bps
-                        }
-                    }
-                } else {
-                    0
-                }
-            };
-            desired_bitrate += aspiration;
-        }
-
-        desired_bitrate
-    }
-
-    pub fn handle_bwe(&mut self, bwe: BweKind) -> Option<Bitrate> {
-        let BweKind::Twcc(available_bandwidth) = bwe else {
-            return None;
-        };
-
-        let now = Instant::now();
+    /// Handle BWE and compute both current and desired bitrate in one pass.
+    pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
+        const SMOOTHING_ALPHA: f64 = 0.15;
         let new_bwe = available_bandwidth.as_f64();
 
-        // Use exponential smoothing to avoid reacting to sudden, temporary BWE spikes/dips.
-        let smoothed_bwe = match self.smoothed_bwe_bps {
-            Some(prev) => prev * 0.85 + new_bwe * 0.15,
-            None => new_bwe,
-        };
-        self.smoothed_bwe_bps = Some(smoothed_bwe);
+        // Exponential smoothing
+        self.smoothed_bwe_bps =
+            (1.0 - SMOOTHING_ALPHA) * self.smoothed_bwe_bps + new_bwe * SMOOTHING_ALPHA;
+        self.update_allocations()
+    }
 
-        // Operate on a conservative budget, slightly less than the smoothed estimate.
-        let budget = smoothed_bwe * 0.90;
-        let mut total_allocated_bitrate = 0.0;
-
-        // --- Constants defining the allocator's behavior ---
-        const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(15);
+    pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
+        const BUDGET_HEADROOM: f64 = 0.90;
+        const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
         const UPGRADE_HEADROOM: f64 = 1.30;
+
+        let now = tokio::time::Instant::now();
+
+        let budget = self.smoothed_bwe_bps * BUDGET_HEADROOM;
+        let mut total_allocated = 0.0;
+        let mut total_desired = 0.0;
 
         self.video_slots
             .sort_by(|a, b| b.max_height.cmp(&a.max_height));
@@ -263,7 +212,7 @@ impl DownstreamAllocator {
             };
 
             let config = state.current();
-            let remaining_budget = budget - total_allocated_bitrate;
+            let remaining_budget = budget - total_allocated;
 
             let current_layer = state.track.by_rid(config.target_rid.as_ref());
             let current_quality = current_layer.map_or(StreamQuality::Good, |l| l.state.quality());
@@ -273,7 +222,28 @@ impl DownstreamAllocator {
                 0.0
             };
 
-            // --- Decision Making Logic ---
+            // Compute desired bitrate (forward-looking)
+            let desired_bitrate = if config.paused {
+                state
+                    .track
+                    .simulcast
+                    .iter()
+                    .min_by_key(|l| l.state.bitrate_bps())
+                    .map_or(0.0, |l| l.state.bitrate_bps() as f64)
+            } else if let Some(layer) = current_layer {
+                match layer.state.quality() {
+                    StreamQuality::Excellent | StreamQuality::Good => {
+                        layer.state.bitrate_bps() as f64 * 1.25
+                    }
+                    StreamQuality::Bad => layer.state.bitrate_bps() as f64,
+                }
+            } else {
+                0.0
+            };
+
+            total_desired += desired_bitrate;
+
+            // --- Allocation decision ---
             let mut new_rid = config.target_rid;
             let mut new_bitrate = current_bitrate;
             let mut new_paused = config.paused;
@@ -286,28 +256,20 @@ impl DownstreamAllocator {
 
             if config.paused {
                 if let Some(layer) = lowest_layer {
-                    if (layer.state.bitrate_bps() as f64) <= remaining_budget {
+                    if layer.state.bitrate_bps() as f64 <= remaining_budget {
                         new_paused = false;
                         new_rid = layer.rid;
                         new_bitrate = layer.state.bitrate_bps() as f64;
-                        tracing::info!(
-                            track_id = %state.track.meta.id, mid = %slot.mid, to_rid = ?new_rid,
-                            "Unpausing stream to lowest quality layer."
-                        );
                     }
                 }
             } else {
                 let can_switch = slot
                     .last_switch_at
-                    .is_none_or(|t| now.duration_since(t) > MIN_SWITCH_INTERVAL);
+                    .map_or(true, |t| now.duration_since(t) > MIN_SWITCH_INTERVAL);
 
                 if current_quality == StreamQuality::Bad && can_switch {
                     if let Some(layer) = lowest_layer {
                         if new_rid != layer.rid {
-                            tracing::warn!(
-                                track_id = %state.track.meta.id, mid = %slot.mid, from_rid = ?config.target_rid, to_rid = ?layer.rid,
-                                "Emergency downgrade to lowest quality layer due to Bad stream quality."
-                            );
                             new_rid = layer.rid;
                             new_bitrate = layer.state.bitrate_bps() as f64;
                         }
@@ -319,22 +281,13 @@ impl DownstreamAllocator {
                         .iter()
                         .filter(|l| {
                             !l.state.is_inactive()
-                                && (l.state.bitrate_bps() as f64) <= remaining_budget
+                                && l.state.bitrate_bps() as f64 <= remaining_budget
                         })
                         .max_by_key(|l| l.state.bitrate_bps());
-
                     if let Some(layer) = best_fit {
-                        tracing::warn!(
-                            track_id = %state.track.meta.id, mid = %slot.mid, from_rid = ?config.target_rid, to_rid = ?layer.rid,
-                            "Downgrading layer due to insufficient bandwidth."
-                        );
                         new_rid = layer.rid;
                         new_bitrate = layer.state.bitrate_bps() as f64;
                     } else {
-                        tracing::warn!(
-                            track_id = %state.track.meta.id, mid = %slot.mid, from_rid = ?config.target_rid,
-                            "Pausing stream due to insufficient bandwidth."
-                        );
                         new_paused = true;
                         new_bitrate = 0.0;
                     }
@@ -345,18 +298,11 @@ impl DownstreamAllocator {
                         .simulcast
                         .iter()
                         .filter(|l| {
-                            let bitrate = l.state.bitrate_bps() as f64;
-                            !l.state.is_inactive()
-                                && bitrate > current_bitrate
-                                && bitrate <= upgrade_budget
+                            let b = l.state.bitrate_bps() as f64;
+                            !l.state.is_inactive() && b > current_bitrate && b <= upgrade_budget
                         })
                         .max_by_key(|l| l.state.bitrate_bps());
-
                     if let Some(layer) = upgrade_candidate {
-                        tracing::info!(
-                            track_id = %state.track.meta.id, mid = %slot.mid, from_rid = ?config.target_rid, to_rid = ?layer.rid,
-                            "Upgrading layer after stable period with excellent quality."
-                        );
                         new_rid = layer.rid;
                         new_bitrate = layer.state.bitrate_bps() as f64;
                     }
@@ -374,24 +320,13 @@ impl DownstreamAllocator {
             }
 
             slot.last_assigned_bitrate = Some(new_bitrate);
-            total_allocated_bitrate += new_bitrate;
+            total_allocated += new_bitrate;
         }
 
-        let utilization = if smoothed_bwe > 0.0 {
-            total_allocated_bitrate / smoothed_bwe
-        } else {
-            0.0
-        };
-        let total_allocated_bitrate = Bitrate::from(total_allocated_bitrate);
-        tracing::debug!(
-            "BWE: utilization={:.2}%, available={}, smoothed={}, allocated={}",
-            utilization * 100.0,
-            Bitrate::from(new_bwe),
-            Bitrate::from(smoothed_bwe),
-            total_allocated_bitrate,
-        );
+        let current_total = Bitrate::from(total_allocated);
+        let desired_total = Bitrate::from(total_desired);
 
-        Some(total_allocated_bitrate)
+        (current_total, desired_total)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {

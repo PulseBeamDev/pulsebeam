@@ -6,7 +6,7 @@ use str0m::rtp::RtpHeader;
 use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
-use str0m::bwe::Bitrate;
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
@@ -186,12 +186,10 @@ impl ParticipantCore {
             Event::MediaAdded(media) => self.handle_media_added(media),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp.into()),
             Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
-            Event::EgressBitrateEstimate(bwe) => {
-                let Some(current) = self.downstream_allocator.handle_bwe(bwe) else {
-                    return;
-                };
+            Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
+                let (current, desired) = self.downstream_allocator.update_bitrate(available);
                 self.rtc.bwe().set_current_bitrate(current);
-                self.update_desired_bitrate();
+                self.rtc.bwe().set_desired_bitrate(desired);
             }
             Event::StreamPaused(e) => {
                 let Some(track) = self.upstream_allocator.get_track_mut(&e.mid) else {
@@ -209,9 +207,7 @@ impl ParticipantCore {
     }
 
     fn update_desired_bitrate(&mut self) {
-        let desired_bitrate = self.downstream_allocator.desired_bitrate();
-        // TODO: improve desired_bitrate controller
-        let desired_bitrate = Bitrate::bps(desired_bitrate + desired_bitrate / 2);
+        let (_, desired_bitrate) = self.downstream_allocator.update_allocations();
         self.rtc.bwe().set_desired_bitrate(desired_bitrate);
         tracing::debug!("desired_bitrate={desired_bitrate}");
     }
