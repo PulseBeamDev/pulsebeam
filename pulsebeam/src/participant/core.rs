@@ -200,7 +200,7 @@ impl ParticipantCore {
                 let Some(layer) = track.by_rid_mut(&e.rid) else {
                     return;
                 };
-                layer.set_paused(e.paused);
+                layer.monitor.set_manual_pause(e.paused);
             }
             e => {
                 tracing::warn!("unhandled event: {e:?}");

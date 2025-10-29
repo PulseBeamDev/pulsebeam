@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use crate::rtp::{
     RtpPacket,
     jitter_buffer::{self, PollResult},
+    monitor::{HealthThresholds, StreamMonitor, StreamState},
 };
 
 #[derive(Debug, Clone)]
@@ -35,8 +36,7 @@ pub struct SimulcastReceiver {
     pub rid: Option<Rid>,
     pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
-    bitrate: Arc<AtomicU64>,
-    paused: Arc<AtomicBool>,
+    pub state: StreamState,
 }
 
 impl SimulcastReceiver {
@@ -54,14 +54,6 @@ impl SimulcastReceiver {
             tracing::warn!(?request, "feedback channel is unavailable");
         }
     }
-
-    pub fn estimated_bitrate(&self) -> u64 {
-        self.bitrate.load(Ordering::Relaxed)
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
-    }
 }
 
 #[derive(Debug)]
@@ -69,10 +61,9 @@ pub struct SimulcastSender {
     pub rid: Option<Rid>,
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
     pub last_keyframe_requested_at: Option<Instant>,
+    pub monitor: StreamMonitor,
     channel: spmc::Sender<RtpPacket>,
     jb: jitter_buffer::JitterBuffer<RtpPacket>,
-    bwe: BandwidthEstimator,
-    paused: Arc<AtomicBool>,
 }
 
 impl SimulcastSender {
@@ -99,11 +90,8 @@ impl SimulcastSender {
         self.forward(pkt);
     }
 
-    pub fn set_paused(&mut self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
-    }
-
     pub fn poll(&mut self, now: Instant) -> Option<Instant> {
+        self.monitor.poll(now);
         loop {
             match self.jb.poll(now) {
                 PollResult::PacketReady(pkt) => self.forward(pkt),
@@ -114,7 +102,8 @@ impl SimulcastSender {
     }
 
     fn forward(&mut self, pkt: RtpPacket) {
-        self.bwe.update(pkt.payload.len() + pkt.header.header_len);
+        self.monitor
+            .process_packet(&pkt, pkt.payload.len() + pkt.header.header_len);
         self.channel.send(pkt);
     }
 }
@@ -185,9 +174,8 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
                 500_000
             }
         };
-        let bitrate = Arc::new(AtomicU64::new(bitrate));
-        let bwe = BandwidthEstimator::new(bitrate.clone());
-        let paused = Arc::new(AtomicBool::new(true));
+        let stream_state = StreamState::new(true, bitrate);
+        let monitor = StreamMonitor::new(stream_state.clone(), HealthThresholds::default());
         let jbc = if meta.kind == MediaKind::Video {
             jitter_buffer::JitterBufferConfig::video_interactive()
         } else {
@@ -199,17 +187,15 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             channel: tx,
             keyframe_requests: keyframe_rx,
             last_keyframe_requested_at: None,
-            bwe,
+            monitor,
             jb: jitter_buffer::JitterBuffer::new(jbc),
-            paused: paused.clone(),
         });
         receivers.push(SimulcastReceiver {
             meta: meta.clone(),
             rid,
             channel: rx,
             keyframe_requester: keyframe_tx,
-            bitrate,
-            paused,
+            state: stream_state,
         });
     }
 

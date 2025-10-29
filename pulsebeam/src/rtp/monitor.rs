@@ -40,10 +40,10 @@ pub struct StreamState {
 }
 
 impl StreamState {
-    pub fn new(paused: Arc<AtomicBool>, bitrate_bps: Arc<AtomicU64>) -> Self {
+    pub fn new(paused: bool, bitrate_bps: u64) -> Self {
         Self {
-            paused,
-            bitrate_bps,
+            paused: Arc::new(AtomicBool::new(paused)),
+            bitrate_bps: Arc::new(AtomicU64::new(bitrate_bps)),
         }
     }
 
@@ -441,9 +441,7 @@ mod test {
     }
 
     fn setup() -> (StreamMonitor, StreamState) {
-        let paused = Arc::new(AtomicBool::new(true));
-        let bitrate = Arc::new(AtomicU64::new(0));
-        let state = StreamState::new(paused, bitrate);
+        let state = StreamState::new(true, 0);
         let monitor = StreamMonitor::new(state.clone(), HealthThresholds::default());
         (monitor, state)
     }

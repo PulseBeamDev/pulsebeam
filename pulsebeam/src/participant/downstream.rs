@@ -192,7 +192,7 @@ impl DownstreamAllocator {
                 continue;
             };
 
-            desired_bitrate += layer.estimated_bitrate();
+            desired_bitrate += layer.state.bitrate_bps();
         }
         desired_bitrate
     }
@@ -238,22 +238,20 @@ impl DownstreamAllocator {
             let mut new_bitrate = prev_bitrate;
             let mut new_paused = state.current().paused;
 
-            let best_fitting_layer = state
-                .track
-                .simulcast
-                .iter()
-                .find(|l| !l.is_paused() && (l.estimated_bitrate() as f64) <= remaining_budget);
+            let best_fitting_layer = state.track.simulcast.iter().find(|l| {
+                !l.state.is_paused() && (l.state.bitrate_bps() as f64) <= remaining_budget
+            });
 
             if state.current().paused {
                 if let Some(layer) = best_fitting_layer {
                     new_paused = false;
                     new_rid = layer.rid;
-                    new_bitrate = layer.estimated_bitrate() as f64;
+                    new_bitrate = layer.state.bitrate_bps() as f64;
                 }
             } else if prev_bitrate > remaining_budget {
                 if let Some(layer) = best_fitting_layer {
                     new_rid = layer.rid;
-                    new_bitrate = layer.estimated_bitrate() as f64;
+                    new_bitrate = layer.state.bitrate_bps() as f64;
                 } else {
                     new_paused = true;
                     new_bitrate = 0.0;
@@ -261,11 +259,11 @@ impl DownstreamAllocator {
             } else if can_switch {
                 let upgrade_budget = remaining_budget / UPGRADE_HEADROOM;
                 if let Some(layer) = state.track.simulcast.iter().find(|l| {
-                    let bitrate = l.estimated_bitrate() as f64;
-                    !l.is_paused() && bitrate > prev_bitrate && bitrate <= upgrade_budget
+                    let bitrate = l.state.bitrate_bps() as f64;
+                    !l.state.is_paused() && bitrate > prev_bitrate && bitrate <= upgrade_budget
                 }) {
                     new_rid = layer.rid;
-                    new_bitrate = layer.estimated_bitrate() as f64;
+                    new_bitrate = layer.state.bitrate_bps() as f64;
                 }
             }
 
