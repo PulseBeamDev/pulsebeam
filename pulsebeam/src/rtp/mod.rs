@@ -1,4 +1,5 @@
 pub mod jitter_buffer;
+pub mod monitor;
 pub mod rtp_rewriter;
 
 use std::ops::{Deref, DerefMut};
@@ -253,12 +254,17 @@ pub trait PacketTiming {
 }
 
 impl PacketTiming for RtpPacket {
+    #[inline]
     fn seq_no(&self) -> SeqNo {
         self.inner.seq_no
     }
+
+    #[inline]
     fn rtp_timestamp(&self) -> MediaTime {
         self.inner.time
     }
+
+    #[inline]
     fn arrival_timestamp(&self) -> Instant {
         self.inner.timestamp.into()
     }
@@ -273,10 +279,12 @@ pub trait Packet: PacketTiming {
 }
 
 impl Packet for RtpPacket {
+    #[inline]
     fn marker(&self) -> bool {
         self.inner.header.marker
     }
 
+    #[inline]
     fn is_keyframe(&self) -> bool {
         self.is_keyframe()
     }
