@@ -1,12 +1,9 @@
-use pulsebeam_runtime::sync::spmc::Slot;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use str0m::rtp::RtpHeader;
 use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
-use str0m::bwe::{Bitrate, BweKind};
+use str0m::bwe::BweKind;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
@@ -17,7 +14,7 @@ use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::{RtpPacket, TimingHeader};
-use crate::track::{self, TrackMeta, TrackReceiver, TrackSender};
+use crate::track::{self, TrackMeta, TrackReceiver};
 
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
@@ -109,6 +106,11 @@ impl ParticipantCore {
             self.downstream_allocator.remove_track(track_id);
         }
         self.update_desired_bitrate();
+    }
+
+    pub fn poll_stats(&mut self, now: Instant) {
+        self.update_desired_bitrate();
+        self.upstream_allocator.poll_stats(now);
     }
 
     pub fn poll_rtc(&mut self) -> Option<Instant> {
@@ -209,7 +211,6 @@ impl ParticipantCore {
     fn update_desired_bitrate(&mut self) {
         let (_, desired_bitrate) = self.downstream_allocator.update_allocations();
         self.rtc.bwe().set_desired_bitrate(desired_bitrate);
-        tracing::debug!("desired_bitrate={desired_bitrate}");
     }
 
     fn handle_media_added(&mut self, media: MediaAdded) {

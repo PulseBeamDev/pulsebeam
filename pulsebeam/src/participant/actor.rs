@@ -1,9 +1,10 @@
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use once_cell::sync::Lazy;
 use pulsebeam_runtime::{actor, mailbox, net, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
-use tokio::time::Instant;
+use tokio::time::{Instant, Interval};
 use tokio_metrics::TaskMonitor;
 use tokio_stream::StreamExt;
 
@@ -75,10 +76,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 gateway_tx,
             ))
             .await;
+        let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
 
-        'outer: loop {
+        loop {
             let Some(deadline) = self.core.poll_rtc() else {
-                break 'outer;
+                break;
             };
             let delay = Instant::now().saturating_duration_since(deadline);
 
@@ -108,6 +110,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Some((meta, hdr, pkt)) = self.core.downstream_allocator.next() => {
                     self.core.handle_forward_rtp(meta, hdr, &pkt.value);
                 },
+                now = stats_interval.tick() => {
+                    self.core.poll_stats(now);
+                }
                 _ = rt::sleep(delay) => {
                     self.core.handle_timeout();
                 },

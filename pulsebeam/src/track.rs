@@ -84,8 +84,11 @@ impl SimulcastSender {
         self.forward(pkt);
     }
 
-    pub fn poll(&mut self, now: Instant) -> Option<Instant> {
+    pub fn poll_stats(&mut self, now: Instant) {
         self.monitor.poll(now);
+    }
+
+    pub fn poll(&mut self, now: Instant) -> Option<Instant> {
         loop {
             match self.jb.poll(now) {
                 PollResult::PacketReady(pkt) => self.forward(pkt),
@@ -126,6 +129,12 @@ impl TrackSender {
             .iter_mut()
             .filter_map(|layer| layer.poll(now))
             .min()
+    }
+
+    pub fn poll_stats(&mut self, now: Instant) {
+        self.simulcast
+            .iter_mut()
+            .for_each(|layer| layer.poll_stats(now));
     }
 }
 

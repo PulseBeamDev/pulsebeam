@@ -63,6 +63,12 @@ impl UpstreamAllocator {
             .min()
     }
 
+    pub fn poll_stats(&mut self, now: Instant) {
+        self.published_tracks
+            .values_mut()
+            .for_each(|track| track.poll_stats(now));
+    }
+
     /// Drains pending keyframe requests from all managed tracks.
     fn drain_keyframe_requests(&mut self, rtc: &mut str0m::Rtc) {
         for track in self.published_tracks.values_mut() {

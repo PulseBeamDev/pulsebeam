@@ -54,12 +54,7 @@ impl TrackState {
             let old = *config;
             update_fn(config);
 
-            if old != *config {
-                tracing::debug!(?self.track.meta.id, "track state updated: {config:?}");
-                true
-            } else {
-                false
-            }
+            old != *config
         });
     }
 
@@ -205,11 +200,13 @@ impl DownstreamAllocator {
             state.update(|c| *c = config);
         }
 
-        loop {
-            let mut upgraded = false;
-
-            let mut total_allocated: u64 = 0;
-            let mut total_desired: u64 = 0;
+        let mut total_allocated: u64 = 0;
+        let mut total_desired: u64 = 0;
+        let mut upgraded = true;
+        while upgraded {
+            upgraded = false;
+            total_allocated = 0;
+            total_desired = 0;
 
             for slot in &self.video_slots {
                 let Some(track_id) = &slot.assigned_track else {
@@ -232,16 +229,20 @@ impl DownstreamAllocator {
                 }
 
                 // Calculate desired quality for total_desired tracking
-                let desired = match current_receiver.state.quality() {
-                    StreamQuality::Bad => track.lowest_quality(),
-                    StreamQuality::Good => current_receiver,
-                    StreamQuality::Excellent => track
-                        .higher_quality(&config.target_rid)
-                        .filter(|next| {
-                            next.state.quality() == StreamQuality::Excellent
-                                && !next.state.is_inactive()
-                        })
-                        .unwrap_or(current_receiver),
+                let desired = if config.paused {
+                    current_receiver
+                } else {
+                    match current_receiver.state.quality() {
+                        StreamQuality::Bad => track.lowest_quality(),
+                        StreamQuality::Good => current_receiver,
+                        StreamQuality::Excellent => track
+                            .higher_quality(&config.target_rid)
+                            .filter(|next| {
+                                next.state.quality() == StreamQuality::Excellent
+                                    && !next.state.is_inactive()
+                            })
+                            .unwrap_or(current_receiver),
+                    }
                 };
 
                 let desired_bitrate = desired.state.bitrate_bps();
@@ -252,30 +253,23 @@ impl DownstreamAllocator {
                     total_allocated += desired_bitrate;
                     config.target_rid = desired.rid;
                     config.paused = false;
-
-                    tracing::info!(
-                        "upgrade simulcast layer: {:?} -> {:?}",
-                        current_receiver.rid,
-                        desired.rid,
-                    );
                     state.update(|c| *c = config);
                 } else {
                     total_allocated += current_receiver.state.bitrate_bps();
                 }
             }
-
-            if !upgraded {
-                tracing::debug!(
-                    bwe = %Bitrate::from(self.smoothed_bwe),
-                    budget = %Bitrate::from(budget),
-                    allocated = %Bitrate::from(total_allocated),
-                    desired = %Bitrate::from(total_desired),
-                    "allocation summary"
-                );
-
-                return (Bitrate::from(total_allocated), Bitrate::from(total_desired));
-            }
         }
+
+        let total_desired = total_desired.max(300_000);
+        tracing::trace!(
+            bwe = %Bitrate::from(self.smoothed_bwe),
+            budget = %Bitrate::from(budget),
+            allocated = %Bitrate::from(total_allocated),
+            desired = %Bitrate::from(total_desired),
+            "allocation summary"
+        );
+
+        (Bitrate::from(total_allocated), Bitrate::from(total_desired))
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
@@ -655,11 +649,19 @@ impl TrackReader {
             self.state = next_state;
 
             // If we are starting a transition, request a keyframe on the new target layer.
-            if let TrackReaderState::Transitioning { active_index, .. } = self.state {
-                let receiver = &mut self.track.simulcast[active_index];
-                receiver.channel.reset();
-                receiver.request_keyframe(KeyframeRequestKind::Fir);
-                tracing::debug!(track_id = %self.meta.id, rid = ?receiver.rid, "Requested keyframe for new active layer");
+            if let TrackReaderState::Transitioning {
+                active_index,
+                fallback_index,
+            } = self.state
+            {
+                let fallback_receiver_rid = { self.track.simulcast[fallback_index].rid };
+                let active_receiver = &mut self.track.simulcast[active_index];
+                active_receiver.channel.reset();
+                active_receiver.request_keyframe(KeyframeRequestKind::Fir);
+                tracing::info!(track_id = %self.meta.id,
+                    "switch simulcast layer: {:?} -> {:?}",
+                    fallback_receiver_rid, active_receiver.rid
+                );
             }
         }
     }
