@@ -336,7 +336,7 @@ impl DownstreamAllocator {
             tracing::warn!(?req, "no track state found, ignore keyframe request");
             return;
         };
-        state.request_keyframe(KeyframeRequestKind::Pli);
+        state.request_keyframe(req.kind);
     }
 
     pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, hdr: &RtpHeader) -> Option<Mid> {
