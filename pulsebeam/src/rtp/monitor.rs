@@ -13,11 +13,14 @@
 //!     (e.g., quality and inactive status). It uses atomic types to allow for lock-free reads
 //!     from multiple downstream consumers, providing a simple and performant API for decision-making.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-};
 use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
+};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
@@ -28,7 +31,7 @@ const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The size of the circular buffer used for the sliding window packet loss calculation.
 const LOSS_WINDOW_SIZE: usize = 256;
 /// Number of bitrate samples to track for stability measurement
-const BITRATE_HISTORY_SAMPLES: usize = 20;
+const BITRATE_HISTORY_SAMPLES: usize = 600; // ~3-5 seconds of data
 
 // --- Public-Facing Shared State ---
 
@@ -89,72 +92,179 @@ impl StreamState {
 
 // --- Bitrate History for Stability Tracking ---
 
-/// Circular buffer for tracking bitrate samples to measure stability
+/// A data structure for tracking a history of bitrate samples over a sliding window.
+///
+/// It is highly optimized for calculating statistics like percentiles and the
+/// coefficient of variation without expensive operations like cloning or sorting
+/// on each call. It uses a combination of a circular buffer (for storing raw values
+/// in insertion order) and a sorted frequency map (`BTreeMap`) for efficient statistical queries.
 #[derive(Debug)]
-struct BitrateHistory {
-    samples: Vec<f64>,
+pub struct BitrateHistory {
+    /// A circular buffer holding the raw sample values in insertion order.
+    /// Pre-allocated to the capacity to avoid reallocations on push.
+    samples: Vec<u64>,
+
+    /// A sorted frequency map of the values currently in the sliding window.
+    /// The key is the bitrate value (as bps), and the value is its frequency (count).
+    /// This allows for O(log K) updates and fast percentile calculations, where K
+    /// is the number of unique values in the window.
+    value_counts: BTreeMap<u64, usize>,
+
+    /// The maximum number of samples to store.
     capacity: usize,
+
+    /// The current position in the circular buffer.
     index: usize,
+
+    /// Becomes true once the buffer has been completely filled at least once.
     filled: bool,
+
+    /// The current number of valid samples in the history (<= capacity).
+    total_samples: usize,
 }
 
 impl BitrateHistory {
-    fn new(capacity: usize) -> Self {
+    /// Creates a new `BitrateHistory` with a specified capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - The number of samples to keep in the sliding window.
+    pub fn new(capacity: usize) -> Self {
         Self {
-            samples: Vec::with_capacity(capacity),
+            samples: vec![0; capacity], // Pre-allocate to prevent reallocations.
+            value_counts: BTreeMap::new(),
             capacity,
             index: 0,
             filled: false,
+            total_samples: 0,
         }
     }
 
-    fn push(&mut self, value: f64) {
-        if self.samples.len() < self.capacity {
-            self.samples.push(value);
-            if self.samples.len() == self.capacity {
-                self.filled = true;
+    /// Adds a new bitrate sample to the history.
+    ///
+    /// This is an O(log K) operation, where K is the number of unique bitrate
+    /// values currently in the window.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new bitrate sample (in bits per second).
+    pub fn push(&mut self, value: f64) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let new_val = value as u64;
+
+        // If the buffer is full, an old value is being replaced.
+        // We must remove the old value from our frequency map first.
+        if self.filled {
+            let old_val = self.samples[self.index];
+            if let Some(count) = self.value_counts.get_mut(&old_val) {
+                *count -= 1;
+                if *count == 0 {
+                    self.value_counts.remove(&old_val);
+                }
             }
         } else {
-            self.samples[self.index] = value;
+            // The buffer is not yet full, so we are just adding a new sample.
+            self.total_samples += 1;
+            if self.total_samples == self.capacity {
+                self.filled = true;
+            }
         }
+
+        // Update the circular buffer with the new value.
+        self.samples[self.index] = new_val;
+
+        // Add the new value to our frequency map.
+        *self.value_counts.entry(new_val).or_insert(0) += 1;
+
+        // Advance the circular buffer index.
         self.index = (self.index + 1) % self.capacity;
+    }
+
+    /// Calculates the value at a given percentile from the samples in the window.
+    ///
+    /// This operation is efficient and does not require sorting the entire sample set.
+    /// Its complexity is O(K), where K is the number of unique values.
+    ///
+    /// # Arguments
+    ///
+    /// * `p` - The desired percentile, expressed as a float between 0.0 (P0) and 1.0 (P100).
+    ///
+    /// # Returns
+    ///
+    /// An `Option<f64>` containing the bitrate value at the specified percentile,
+    /// or `None` if there are not enough samples to compute it.
+    pub fn percentile(&self, p: f64) -> Option<f64> {
+        // Ensure there's enough data and the percentile is valid.
+        if self.total_samples < 2 || !(0.0..=1.0).contains(&p) {
+            return None;
+        }
+
+        // Determine the target rank (0-indexed) using the nearest-rank method.
+        let target_rank = ((self.total_samples as f64 - 1.0) * p).round() as usize;
+
+        let mut current_rank = 0;
+        // The BTreeMap iterates through key-value pairs in sorted key order.
+        for (&value, &count) in &self.value_counts {
+            // If the target rank falls within the group of this value, we've found our percentile.
+            if current_rank + count > target_rank {
+                return Some(value as f64);
+            }
+            current_rank += count;
+        }
+
+        // Fallback to the last element if rank calculation points to the very end.
+        // This can happen with p=1.0 due to floating point inaccuracies.
+        self.value_counts.last_key_value().map(|(&v, _)| v as f64)
     }
 
     /// Returns the coefficient of variation (CV) as a percentage.
     /// CV = (standard_deviation / mean) * 100
-    /// This gives us a normalized stability metric independent of absolute bitrate.
-    fn coefficient_of_variation_percent(&self) -> f32 {
-        if self.samples.len() < 2 {
+    /// This gives a normalized stability metric independent of absolute bitrate.
+    pub fn coefficient_of_variation_percent(&self) -> f32 {
+        if self.total_samples < 2 {
             return 0.0;
         }
 
-        let mean = self.samples.iter().sum::<f64>() / self.samples.len() as f64;
+        let samples_slice = if self.filled {
+            &self.samples[..]
+        } else {
+            &self.samples[..self.total_samples]
+        };
+
+        let mean = samples_slice.iter().sum::<u64>() as f64 / self.total_samples as f64;
         if mean < 1.0 {
-            return 0.0; // Avoid division by zero
+            return 0.0; // Avoid division by zero or meaningless CV for near-zero bitrates.
         }
 
-        let variance = self
-            .samples
+        let variance = samples_slice
             .iter()
-            .map(|v| {
-                let diff = v - mean;
+            .map(|&v| {
+                let diff = v as f64 - mean;
                 diff * diff
             })
             .sum::<f64>()
-            / self.samples.len() as f64;
+            / self.total_samples as f64;
 
         let std_dev = variance.sqrt();
         ((std_dev / mean) * 100.0) as f32
     }
 
-    fn is_ready(&self) -> bool {
+    /// Returns true if the history buffer has been completely filled.
+    pub fn is_ready(&self) -> bool {
         self.filled
     }
 
-    fn reset(&mut self) {
-        self.samples.clear();
+    /// Resets the history, clearing all samples and state.
+    pub fn reset(&mut self) {
+        // No need to reallocate, just clear the existing structures.
+        self.samples.fill(0);
+        self.value_counts.clear();
         self.index = 0;
         self.filled = false;
+        self.total_samples = 0;
     }
 }
 
@@ -381,7 +491,6 @@ pub struct StreamMonitor {
 
     bwe_last_update: Instant,
     bwe_interval_bytes: usize,
-    bwe_ewma: f64,
 
     // Jitter calculation
     jitter_estimate: f64,
@@ -412,7 +521,6 @@ impl StreamMonitor {
             clock_rate: 0,
             bwe_last_update: now,
             bwe_interval_bytes: 0,
-            bwe_ewma: 0.0,
             jitter_estimate: 0.0,
             jitter_last_arrival: None,
             jitter_last_rtp_time: None,
@@ -572,29 +680,19 @@ impl StreamMonitor {
 
     /// Updates derived metrics like bitrate, packet loss, and bitrate stability.
     fn update_derived_metrics(&mut self, now: Instant) {
-        const ALPHA_UP: f64 = 0.5;
-        const ALPHA_DOWN: f64 = 0.1;
-
         // Update bitrate
         let elapsed = now.saturating_duration_since(self.bwe_last_update);
         if elapsed >= Duration::from_millis(500) {
             let elapsed_secs = elapsed.as_secs_f64();
-            if elapsed_secs > 0.0 {
+            if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
                 let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
-                let alpha = if bps > self.bwe_ewma {
-                    ALPHA_UP
-                } else {
-                    ALPHA_DOWN
-                };
-
-                self.bwe_ewma = (1.0 - alpha) * self.bwe_ewma + alpha * bps;
-                self.shared_state
-                    .bitrate_bps
-                    .store(self.bwe_ewma as u64, Ordering::Relaxed);
-
                 // Track bitrate for stability calculation
-                if self.bwe_ewma > 0.0 {
-                    self.bitrate_history.push(self.bwe_ewma);
+                self.bitrate_history.push(bps);
+
+                if let Some(p99) = self.bitrate_history.percentile(0.99) {
+                    self.shared_state
+                        .bitrate_bps
+                        .store(p99 as u64, Ordering::Relaxed);
                 }
             }
             self.bwe_interval_bytes = 0;

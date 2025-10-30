@@ -30,7 +30,6 @@ type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 struct StreamConfig {
     paused: bool,
     target_rid: Option<Rid>,
-    generation: u64,
 }
 
 /// Used for comparing and sorting active speakers.
@@ -55,8 +54,7 @@ impl TrackState {
             let old = *config;
             update_fn(config);
 
-            if old.paused != config.paused || old.target_rid != config.target_rid {
-                config.generation = config.generation.wrapping_add(1);
+            if old != *config {
                 tracing::debug!(?self.track.meta.id, "track state updated: {config:?}");
                 true
             } else {
@@ -100,7 +98,7 @@ pub struct DownstreamAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<SlotState>,
     video_slots: Vec<SlotState>,
-    available_bandwidth: f64,
+    smoothed_bwe: f64,
 }
 
 impl DownstreamAllocator {
@@ -110,7 +108,7 @@ impl DownstreamAllocator {
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
-            available_bandwidth: 300_000.0,
+            smoothed_bwe: 300_000.0,
         }
     }
 
@@ -122,7 +120,6 @@ impl DownstreamAllocator {
         let initial_config = StreamConfig {
             paused: true,
             target_rid: Self::find_default_rid(&track.simulcast),
-            generation: 0,
         };
 
         let (control_tx, control_rx) = watch::channel(initial_config);
@@ -175,8 +172,9 @@ impl DownstreamAllocator {
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
+        const ALPHA: f64 = 0.25;
         let new_bwe = available_bandwidth.as_f64();
-        self.available_bandwidth = new_bwe;
+        self.smoothed_bwe = (1.0 - ALPHA) * self.smoothed_bwe + ALPHA * new_bwe;
         self.update_allocations()
     }
 
@@ -184,18 +182,17 @@ impl DownstreamAllocator {
     //  1. Available bandwidth
     //  2. Video slots
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        // pretend that we always have at least 300Kbps bandwidth so allocator
-        // should always have enough bandwidth for 1 slot to start probing the network.
-        let mut budget = self.available_bandwidth.max(300_000.0);
+        let mut budget = self.smoothed_bwe;
 
-        let mut allocated: u64 = 0;
-        let mut desired: u64 = 0;
+        let mut total_allocated: u64 = 0;
+        let mut total_desired: u64 = 0;
+        let mut highest_priority_idx: Option<usize> = None;
 
         // Prioritize high-resolution slots first
         self.video_slots
             .sort_by_key(|s| std::cmp::Reverse(s.priority));
 
-        for slot in &mut self.video_slots {
+        for (idx, slot) in &mut self.video_slots.iter().enumerate() {
             let Some(track_id) = &slot.assigned_track else {
                 tracing::trace!(slot_height = slot.priority, "no track assigned");
                 continue;
@@ -240,6 +237,10 @@ impl DownstreamAllocator {
                 }
             };
 
+            if highest_priority_idx.is_none() {
+                highest_priority_idx.replace(idx);
+            }
+
             // Step 2: apply the plan according to available bandwidth
 
             // adjust target_receiver to fit into available bandwidth
@@ -254,8 +255,9 @@ impl DownstreamAllocator {
 
             let (target_rid, paused) = match adjusted_target_receiver {
                 Some(adjusted_target) => {
-                    desired += target_receiver.state.bitrate_bps();
-                    allocated += adjusted_target.state.bitrate_bps();
+                    total_desired += target_receiver.state.bitrate_bps();
+                    let allocated = adjusted_target.state.bitrate_bps();
+                    total_allocated += allocated;
                     budget -= allocated as f64;
 
                     if adjusted_target.rid != current_receiver.rid {
@@ -270,7 +272,7 @@ impl DownstreamAllocator {
                 }
                 None => {
                     tracing::info!(
-                        "paused track due to insufficient available bandwidth: {}",
+                        "paused track due to insufficient bandwidth: {}",
                         track.meta.id
                     );
                     (current_receiver.rid, true)
@@ -283,15 +285,42 @@ impl DownstreamAllocator {
             });
         }
 
+        // If all slots have been paused due to insufficient bandwidth,
+        // find the highest priority slot and force it to be unpaused at the lowest quality.
+        if total_allocated == 0
+            && let Some(highest_priority_idx) = highest_priority_idx
+        {
+            let track_id = self.video_slots[highest_priority_idx]
+                .assigned_track
+                .as_ref()
+                .unwrap();
+            let state = self.tracks.get_mut(track_id).unwrap();
+            let receiver = state.track.lowest_quality();
+
+            tracing::info!(
+                "no allocations due to insufficient bandwidth, keeping highest priority track to keep probing: {}",
+                track_id
+            );
+
+            let allocated = receiver.state.bitrate_bps();
+            total_desired += allocated;
+            total_allocated += allocated;
+            budget = 0.0;
+            state.update(|c| {
+                c.paused = false;
+                c.target_rid = receiver.rid;
+            });
+        }
+
         tracing::debug!(
-            bwe = %Bitrate::from(self.available_bandwidth),
+            bwe = %Bitrate::from(self.smoothed_bwe),
             budget = %Bitrate::from(budget),
-            allocated = %Bitrate::from(allocated),
-            desired = %Bitrate::from(desired),
+            allocated = %Bitrate::from(total_allocated),
+            desired = %Bitrate::from(total_desired),
             "allocation summary"
         );
 
-        (Bitrate::from(allocated), Bitrate::from(desired))
+        (Bitrate::from(total_allocated), Bitrate::from(total_desired))
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
@@ -491,20 +520,24 @@ pub struct TrackReader {
     control_rx: watch::Receiver<StreamConfig>,
 
     state: TrackReaderState,
-    local_generation: u64,
+    config: StreamConfig,
     rewriter: RtpRewriter,
 }
 
 impl TrackReader {
-    fn new(track: TrackReceiver, control_rx: watch::Receiver<StreamConfig>) -> Self {
-        Self {
+    fn new(track: TrackReceiver, mut control_rx: watch::Receiver<StreamConfig>) -> Self {
+        let config = *control_rx.borrow_and_update();
+        let mut this = Self {
             meta: track.meta.clone(),
             track,
             control_rx,
             state: TrackReaderState::Paused,
-            local_generation: u64::MAX,
+            config,
             rewriter: RtpRewriter::new(),
-        }
+        };
+        // seed initial state
+        this.update_state(config);
+        this
     }
 
     /// Poll for the next RTP packet, handling fallback and layer switching.
@@ -611,21 +644,25 @@ impl TrackReader {
 
     /// Checks for a new stream configuration and updates the state machine accordingly.
     fn maybe_update_state(&mut self) {
-        if self.control_rx.borrow().generation == self.local_generation {
+        let current = *self.control_rx.borrow_and_update();
+        if current == self.config {
             return;
         }
 
-        let config = *self.control_rx.borrow();
-        self.local_generation = config.generation;
-        tracing::debug!(track_id = %self.meta.id, "Applying new stream config: {config:?}");
+        self.update_state(current);
+    }
 
-        let new_active_index = if config.paused {
+    fn update_state(&mut self, current: StreamConfig) {
+        self.config = current;
+        tracing::debug!(track_id = %self.meta.id, "Applying new stream config: {current:?}");
+
+        let new_active_index = if current.paused {
             None
         } else {
             self.track
                 .simulcast
                 .iter()
-                .position(|s| s.rid == config.target_rid)
+                .position(|s| s.rid == current.target_rid)
         };
 
         // Determine the next state based on the current state and the new config.
