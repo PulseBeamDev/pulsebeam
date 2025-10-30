@@ -1,3 +1,4 @@
+use crate::participant::bitrate::BitrateController;
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::rtp_rewriter::RtpRewriter;
 use crate::rtp::{RtpPacket, TimingHeader};
@@ -7,7 +8,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
@@ -93,7 +93,8 @@ pub struct DownstreamAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<SlotState>,
     video_slots: Vec<SlotState>,
-    smoothed_bwe: f64,
+    available_bandwidth: f64,
+    desired_bandwidth: BitrateController,
 }
 
 impl DownstreamAllocator {
@@ -103,7 +104,8 @@ impl DownstreamAllocator {
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
-            smoothed_bwe: 300_000.0,
+            available_bandwidth: 300_000.0,
+            desired_bandwidth: BitrateController::default(),
         }
     }
 
@@ -169,16 +171,17 @@ impl DownstreamAllocator {
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
         const ALPHA: f64 = 0.25;
         let new_bwe = available_bandwidth.as_f64();
-        self.smoothed_bwe = (1.0 - ALPHA) * self.smoothed_bwe + ALPHA * new_bwe;
+        self.available_bandwidth = (1.0 - ALPHA) * self.available_bandwidth + ALPHA * new_bwe;
         self.update_allocations()
     }
 
     // Update allocations based on the following events:
     //  1. Available bandwidth
     //  2. Video slots
+    //  3. update_allocations get polled every 500ms
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
         // Pretend that we have some bandwidth so we can keep probing.
-        let budget = self.smoothed_bwe.max(300_000.0) as u64;
+        let budget = self.available_bandwidth.max(300_000.0) as u64;
 
         // Prioritize filling more slots first
         self.video_slots.sort_by_key(|s| s.priority);
@@ -260,16 +263,19 @@ impl DownstreamAllocator {
             }
         }
 
-        let total_desired = total_desired.max(300_000);
-        tracing::trace!(
-            bwe = %Bitrate::from(self.smoothed_bwe),
+        // TODO: organize time dependency here
+        let total_desired = self
+            .desired_bandwidth
+            .update(total_desired.into(), Instant::now());
+        tracing::debug!(
+            bwe = %Bitrate::from(self.available_bandwidth),
             budget = %Bitrate::from(budget),
             allocated = %Bitrate::from(total_allocated),
-            desired = %Bitrate::from(total_desired),
+            desired = %total_desired,
             "allocation summary"
         );
 
-        (Bitrate::from(total_allocated), Bitrate::from(total_desired))
+        (Bitrate::from(total_allocated), total_desired)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
