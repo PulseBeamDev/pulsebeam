@@ -182,153 +182,100 @@ impl DownstreamAllocator {
     //  1. Available bandwidth
     //  2. Video slots
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        const UPGRADE_MARGIN: f64 = 1.15;
-        let mut budget = self.smoothed_bwe;
+        // Pretend that we have some bandwidth so we can keep probing.
+        let budget = self.smoothed_bwe.max(300_000.0) as u64;
 
-        let mut total_allocated: u64 = 0;
-        let mut total_desired: u64 = 0;
-        let mut highest_priority_idx: Option<usize> = None;
+        // Prioritize filling more slots first
+        self.video_slots.sort_by_key(|s| s.priority);
 
-        // Prioritize high-resolution slots first
-        self.video_slots
-            .sort_by_key(|s| std::cmp::Reverse(s.priority));
-
-        for (idx, slot) in &mut self.video_slots.iter().enumerate() {
+        for slot in &self.video_slots {
             let Some(track_id) = &slot.assigned_track else {
-                tracing::trace!(slot_height = slot.priority, "no track assigned");
                 continue;
             };
+
             let Some(state) = self.tracks.get_mut(track_id) else {
-                tracing::warn!(track = %track_id, "track not found");
                 continue;
             };
+
             let track = &state.track;
-            if track.simulcast.is_empty() {
-                tracing::warn!(track = %track_id, "no simulcast layers");
-                continue;
-            }
+            let mut config = state.current();
+            let lowest_layer = track.lowest_quality();
+            config.target_rid = lowest_layer.rid;
+            config.paused = true;
+            state.update(|c| *c = config);
+        }
 
-            let config = state.current();
-            let Some(current_receiver) = track.by_rid(&config.target_rid) else {
-                tracing::warn!(target_rid = ?config.target_rid, "receiver to exist for target_rid");
-                continue;
-            };
+        loop {
+            let mut upgraded = false;
 
-            // Step 1: plan based on quality
-            let target_receiver = if config.paused {
+            let mut total_allocated: u64 = 0;
+            let mut total_desired: u64 = 0;
+
+            for slot in &self.video_slots {
+                let Some(track_id) = &slot.assigned_track else {
+                    continue;
+                };
+
+                let Some(state) = self.tracks.get_mut(track_id) else {
+                    continue;
+                };
+
+                let track = &state.track;
+                let mut config = state.current();
+
+                let Some(current_receiver) = track.by_rid(&config.target_rid) else {
+                    continue;
+                };
+
                 if current_receiver.state.is_inactive() {
                     continue;
                 }
 
-                // start gently after unpausing
-                track.lowest_quality()
-            } else {
-                match current_receiver.state.quality() {
+                // Calculate desired quality for total_desired tracking
+                let desired = match current_receiver.state.quality() {
                     StreamQuality::Bad => track.lowest_quality(),
                     StreamQuality::Good => current_receiver,
-                    StreamQuality::Excellent => {
-                        if let Some(next_layer) = track.higher_quality(&config.target_rid)
-                            && next_layer.state.quality() == StreamQuality::Excellent
-                        {
-                            next_layer
-                        } else {
-                            current_receiver
-                        }
-                    }
-                }
-            };
-
-            if highest_priority_idx.is_none() {
-                highest_priority_idx.replace(idx);
-            }
-
-            // Step 2: apply the plan according to available bandwidth
-
-            // adjust target_receiver to fit into available bandwidth
-            let mut adjusted_target_receiver = Some(target_receiver);
-            while let Some(target) = adjusted_target_receiver {
-                let target_bitrate = if track
-                    .is_upgrade(&current_receiver.rid, &target.rid)
-                    .unwrap_or_default()
-                {
-                    target.state.bitrate_bps() as f64 * UPGRADE_MARGIN
-                } else {
-                    target.state.bitrate_bps() as f64
+                    StreamQuality::Excellent => track
+                        .higher_quality(&config.target_rid)
+                        .filter(|next| {
+                            next.state.quality() == StreamQuality::Excellent
+                                && !next.state.is_inactive()
+                        })
+                        .unwrap_or(current_receiver),
                 };
-                if target_bitrate < budget {
-                    break;
-                }
 
-                adjusted_target_receiver = track.lower_quality(&target.rid);
+                let desired_bitrate = desired.state.bitrate_bps();
+                total_desired += desired_bitrate;
+                if total_desired < budget && (config.paused || desired.rid != current_receiver.rid)
+                {
+                    upgraded = true;
+                    total_allocated += desired_bitrate;
+                    config.target_rid = desired.rid;
+                    config.paused = false;
+
+                    tracing::info!(
+                        "upgrade simulcast layer: {:?} -> {:?}",
+                        current_receiver.rid,
+                        desired.rid,
+                    );
+                    state.update(|c| *c = config);
+                } else {
+                    total_allocated += current_receiver.state.bitrate_bps();
+                }
             }
 
-            let (target_rid, paused) = match adjusted_target_receiver {
-                Some(adjusted_target) => {
-                    if adjusted_target.rid != current_receiver.rid {
-                        tracing::info!(
-                            "change simulcast layer: {:?} -> {:?}",
-                            current_receiver.rid,
-                            adjusted_target.rid,
-                        );
-                    }
+            if !upgraded {
+                tracing::debug!(
+                    bwe = %Bitrate::from(self.smoothed_bwe),
+                    budget = %Bitrate::from(budget),
+                    allocated = %Bitrate::from(total_allocated),
+                    desired = %Bitrate::from(total_desired),
+                    "allocation summary"
+                );
 
-                    total_desired += target_receiver.state.bitrate_bps();
-                    let allocated = adjusted_target.state.bitrate_bps();
-                    total_allocated += allocated;
-                    budget -= allocated as f64;
-                    (adjusted_target.rid, false)
-                }
-                None => {
-                    tracing::info!(
-                        "paused track due to insufficient bandwidth: {}",
-                        track.meta.id
-                    );
-                    (current_receiver.rid, true)
-                }
-            };
-
-            state.update(|c| {
-                c.paused = paused;
-                c.target_rid = target_rid;
-            });
+                return (Bitrate::from(total_allocated), Bitrate::from(total_desired));
+            }
         }
-
-        // If all slots have been paused due to insufficient bandwidth,
-        // find the highest priority slot and force it to be unpaused at the lowest quality.
-        if total_allocated == 0
-            && let Some(highest_priority_idx) = highest_priority_idx
-        {
-            let track_id = self.video_slots[highest_priority_idx]
-                .assigned_track
-                .as_ref()
-                .unwrap();
-            let state = self.tracks.get_mut(track_id).unwrap();
-            let receiver = state.track.lowest_quality();
-
-            tracing::info!(
-                "no allocations due to insufficient bandwidth, keeping highest priority track to keep probing: {}",
-                track_id
-            );
-
-            let allocated = receiver.state.bitrate_bps();
-            total_desired += allocated;
-            total_allocated += allocated;
-            budget = 0.0;
-            state.update(|c| {
-                c.paused = false;
-                c.target_rid = receiver.rid;
-            });
-        }
-
-        tracing::debug!(
-            bwe = %Bitrate::from(self.smoothed_bwe),
-            budget = %Bitrate::from(budget),
-            allocated = %Bitrate::from(total_allocated),
-            desired = %Bitrate::from(total_desired),
-            "allocation summary"
-        );
-
-        (Bitrate::from(total_allocated), Bitrate::from(total_desired))
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
