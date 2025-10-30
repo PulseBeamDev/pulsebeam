@@ -182,6 +182,7 @@ impl DownstreamAllocator {
     //  1. Available bandwidth
     //  2. Video slots
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
+        const UPGRADE_MARGIN: f64 = 1.15;
         let mut budget = self.smoothed_bwe;
 
         let mut total_allocated: u64 = 0;
@@ -246,7 +247,15 @@ impl DownstreamAllocator {
             // adjust target_receiver to fit into available bandwidth
             let mut adjusted_target_receiver = Some(target_receiver);
             while let Some(target) = adjusted_target_receiver {
-                if (target.state.bitrate_bps() as f64) < budget {
+                let target_bitrate = if track
+                    .is_upgrade(&current_receiver.rid, &target.rid)
+                    .unwrap_or_default()
+                {
+                    target.state.bitrate_bps() as f64 * UPGRADE_MARGIN
+                } else {
+                    target.state.bitrate_bps() as f64
+                };
+                if target_bitrate < budget {
                     break;
                 }
 
@@ -255,19 +264,18 @@ impl DownstreamAllocator {
 
             let (target_rid, paused) = match adjusted_target_receiver {
                 Some(adjusted_target) => {
-                    total_desired += target_receiver.state.bitrate_bps();
-                    let allocated = adjusted_target.state.bitrate_bps();
-                    total_allocated += allocated;
-                    budget -= allocated as f64;
-
                     if adjusted_target.rid != current_receiver.rid {
                         tracing::info!(
-                            "changed simulcast layer: {:?} -> {:?}",
+                            "change simulcast layer: {:?} -> {:?}",
                             current_receiver.rid,
                             adjusted_target.rid,
                         );
                     }
 
+                    total_desired += target_receiver.state.bitrate_bps();
+                    let allocated = adjusted_target.state.bitrate_bps();
+                    total_allocated += allocated;
+                    budget -= allocated as f64;
                     (adjusted_target.rid, false)
                 }
                 None => {

@@ -155,6 +155,14 @@ impl TrackReceiver {
             .last()
             .expect("no lowest quality, there must be at least 1 layer for TrackReceiver to exist")
     }
+
+    pub fn is_upgrade(&self, from: &Option<Rid>, to: &Option<Rid>) -> Option<bool> {
+        let from_idx = self.simulcast.iter().position(|s| s.rid == *from)?;
+        let to_idx = self.simulcast.iter().position(|s| s.rid == *from)?;
+
+        // lower index means higher quality
+        Some(to_idx < from_idx)
+    }
 }
 
 pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
