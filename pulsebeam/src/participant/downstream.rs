@@ -184,9 +184,9 @@ impl DownstreamAllocator {
     //  1. Available bandwidth
     //  2. Video slots
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        const HEADROOM: f64 = 0.4; // 60% reserve margin
-
-        let budget = self.available_bandwidth * HEADROOM;
+        // pretend that we always have at least 300Kbps bandwidth so allocator
+        // should always have enough bandwidth for 1 slot to start probing the network.
+        let mut budget = self.available_bandwidth.max(300_000.0);
 
         let mut allocated: u64 = 0;
         let mut desired: u64 = 0;
@@ -243,29 +243,30 @@ impl DownstreamAllocator {
             // Step 2: apply the plan according to available bandwidth
 
             // adjust target_receiver to fit into available bandwidth
-            let mut target_receiver = Some(target_receiver);
-            while let Some(target) = target_receiver {
+            let mut adjusted_target_receiver = Some(target_receiver);
+            while let Some(target) = adjusted_target_receiver {
                 if (target.state.bitrate_bps() as f64) < budget {
                     break;
                 }
 
-                target_receiver = track.lower_quality(&target.rid);
+                adjusted_target_receiver = track.lower_quality(&target.rid);
             }
 
-            let (target_rid, paused) = match target_receiver {
-                Some(target) => {
-                    desired += target.state.bitrate_bps();
-                    allocated += current_receiver.state.bitrate_bps();
+            let (target_rid, paused) = match adjusted_target_receiver {
+                Some(adjusted_target) => {
+                    desired += target_receiver.state.bitrate_bps();
+                    allocated += adjusted_target.state.bitrate_bps();
+                    budget -= allocated as f64;
 
-                    if target.rid != current_receiver.rid {
+                    if adjusted_target.rid != current_receiver.rid {
                         tracing::info!(
                             "changed simulcast layer: {:?} -> {:?}",
                             current_receiver.rid,
-                            target.rid,
+                            adjusted_target.rid,
                         );
                     }
 
-                    (target.rid, false)
+                    (adjusted_target.rid, false)
                 }
                 None => {
                     tracing::info!(

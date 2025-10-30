@@ -142,12 +142,12 @@ impl TrackReceiver {
 
     pub fn higher_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
         let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        self.simulcast.get(idx - 1)
+        self.simulcast.get(idx.saturating_sub(1))
     }
 
     pub fn lower_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
         let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        self.simulcast.get(idx + 1)
+        self.simulcast.get(idx.saturating_add(1))
     }
 
     pub fn lowest_quality(&self) -> &SimulcastReceiver {
