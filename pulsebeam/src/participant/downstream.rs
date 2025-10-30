@@ -684,10 +684,12 @@ impl TrackReader {
                 active_index,
                 fallback_index,
             } => match new_active_index {
-                Some(new_idx) if new_idx != active_index => TrackReaderState::Transitioning {
-                    active_index: new_idx,
-                    fallback_index, // Keep the original fallback
-                },
+                Some(new_idx) if new_idx != active_index && new_idx != fallback_index => {
+                    TrackReaderState::Transitioning {
+                        active_index: new_idx,
+                        fallback_index, // Keep the original fallback
+                    }
+                }
                 Some(_) => self.state, // No change
                 None => TrackReaderState::Paused,
             },
