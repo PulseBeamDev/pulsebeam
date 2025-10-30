@@ -1,4 +1,4 @@
-use crate::participant::bitrate::BitrateController;
+use crate::participant::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::rtp_rewriter::RtpRewriter;
 use crate::rtp::{RtpPacket, TimingHeader};
@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
@@ -93,7 +94,7 @@ pub struct DownstreamAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<SlotState>,
     video_slots: Vec<SlotState>,
-    available_bandwidth: f64,
+    available_bandwidth: BitrateController,
     desired_bandwidth: BitrateController,
 }
 
@@ -104,8 +105,31 @@ impl DownstreamAllocator {
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
-            available_bandwidth: 300_000.0,
-            desired_bandwidth: BitrateController::default(),
+
+            available_bandwidth: BitrateControllerConfig {
+                min_bitrate: Bitrate::kbps(100),
+                max_bitrate: Bitrate::mbps(20),
+                headroom: 0.95,                  // trust 95% of measured BW
+                tau: 0.5,                        // faster EMA → tracks within ~1 s
+                max_ramp_up: Bitrate::mbps(3),   // ~1.5 Mb per 0.5 s tick
+                max_ramp_down: Bitrate::mbps(6), // quick reaction to congestion
+                hysteresis_up: 1.0,              // no hysteresis — just smooth
+                hysteresis_down: 1.0,
+                min_hold_time: Duration::from_millis(500),
+            }
+            .build(),
+            desired_bandwidth: BitrateControllerConfig {
+                min_bitrate: Bitrate::kbps(100),
+                max_bitrate: Bitrate::mbps(20),
+                headroom: 0.9,                         // slightly conservative
+                tau: 1.0,                              // ~2 s full response time
+                max_ramp_up: Bitrate::kbps(800),       // 400 kbps per 0.5 s tick
+                max_ramp_down: Bitrate::kbps(600),     // 300 kbps per tick
+                hysteresis_up: 1.05,                   // 5 % threshold to upgrade
+                hysteresis_down: 0.92,                 // 8 % drop to downgrade
+                min_hold_time: Duration::from_secs(2), // hold 2 s before layer flip
+            }
+            .build(),
         }
     }
 
@@ -169,9 +193,8 @@ impl DownstreamAllocator {
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
-        const ALPHA: f64 = 0.25;
-        let new_bwe = available_bandwidth.as_f64();
-        self.available_bandwidth = (1.0 - ALPHA) * self.available_bandwidth + ALPHA * new_bwe;
+        self.available_bandwidth
+            .update(available_bandwidth, Instant::now());
         self.update_allocations()
     }
 
@@ -181,7 +204,7 @@ impl DownstreamAllocator {
     //  3. update_allocations get polled every 500ms
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
         // Pretend that we have some bandwidth so we can keep probing.
-        let budget = self.available_bandwidth.max(300_000.0) as u64;
+        let budget = self.available_bandwidth.current().as_f64().max(300_000.0) as u64;
 
         // Prioritize filling more slots first
         self.video_slots.sort_by_key(|s| s.priority);
@@ -268,7 +291,6 @@ impl DownstreamAllocator {
             .desired_bandwidth
             .update(total_desired.into(), Instant::now());
         tracing::debug!(
-            bwe = %Bitrate::from(self.available_bandwidth),
             budget = %Bitrate::from(budget),
             allocated = %Bitrate::from(total_allocated),
             desired = %total_desired,

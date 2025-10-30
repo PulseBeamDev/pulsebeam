@@ -3,7 +3,7 @@ use str0m::bwe::Bitrate;
 use tokio::time::Instant;
 
 /// Controller config for stabilizing desired bitrate
-pub struct BirateControllerConfig {
+pub struct BitrateControllerConfig {
     pub min_bitrate: Bitrate,
     pub max_bitrate: Bitrate,
     pub headroom: f64,           // fraction of available bandwidth to target
@@ -15,7 +15,7 @@ pub struct BirateControllerConfig {
     pub min_hold_time: Duration, // min time between updates
 }
 
-impl Default for BirateControllerConfig {
+impl Default for BitrateControllerConfig {
     fn default() -> Self {
         Self {
             min_bitrate: Bitrate::kbps(300),
@@ -41,27 +41,32 @@ impl Default for BirateControllerConfig {
     }
 }
 
+impl BitrateControllerConfig {
+    pub fn build(self) -> BitrateController {
+        let init = self.min_bitrate;
+        BitrateController::new(self, init, Instant::now())
+    }
+}
+
 pub struct BitrateController {
-    config: BirateControllerConfig,
+    config: BitrateControllerConfig,
     smoothed_bw: f64,
-    desired_bitrate: f64,
+    bitrate: f64,
     last_change: Instant,
     last_update: Instant,
 }
 
 impl Default for BitrateController {
     fn default() -> Self {
-        let cfg = BirateControllerConfig::default();
-        let init = cfg.min_bitrate;
-        Self::new(cfg, init, Instant::now())
+        BitrateControllerConfig::default().build()
     }
 }
 
 impl BitrateController {
-    pub fn new(config: BirateControllerConfig, initial_bitrate: Bitrate, now: Instant) -> Self {
+    pub fn new(config: BitrateControllerConfig, initial_bitrate: Bitrate, now: Instant) -> Self {
         Self {
             smoothed_bw: initial_bitrate.as_f64(),
-            desired_bitrate: initial_bitrate.as_f64(),
+            bitrate: initial_bitrate.as_f64(),
             last_change: now,
             last_update: now,
             config,
@@ -85,32 +90,36 @@ impl BitrateController {
         );
 
         // 3️⃣ Rate-limit changes
-        let diff = target - self.desired_bitrate;
+        let diff = target - self.bitrate;
         let delta = if diff > 0.0 {
             diff.min(self.config.max_ramp_up.as_f64() * dt)
         } else {
             diff.max(-self.config.max_ramp_down.as_f64() * dt)
         };
-        let candidate_bitrate = self.desired_bitrate + delta;
+        let candidate_bitrate = self.bitrate + delta;
 
         // 4️⃣ Apply hysteresis and hold time
         let time_since_last = now.duration_since(self.last_change);
-        let mut new_bitrate = self.desired_bitrate;
+        let mut new_bitrate = self.bitrate;
 
-        if candidate_bitrate >= self.desired_bitrate * self.config.hysteresis_up {
+        if candidate_bitrate >= self.bitrate * self.config.hysteresis_up {
             if time_since_last >= self.config.min_hold_time {
                 new_bitrate = candidate_bitrate;
                 self.last_change = now;
             }
-        } else if candidate_bitrate <= self.desired_bitrate * self.config.hysteresis_down {
+        } else if candidate_bitrate <= self.bitrate * self.config.hysteresis_down {
             if time_since_last >= self.config.min_hold_time {
                 new_bitrate = candidate_bitrate;
                 self.last_change = now;
             }
         }
 
-        self.desired_bitrate = new_bitrate;
-        self.desired_bitrate.into()
+        self.bitrate = new_bitrate;
+        self.bitrate.into()
+    }
+
+    pub fn current(&self) -> Bitrate {
+        self.bitrate.into()
     }
 }
 
@@ -120,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_stable_desired_bitrate() {
-        let config = BirateControllerConfig {
+        let config = BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(100),
             max_bitrate: Bitrate::mbps(2),
             headroom: 0.85,
