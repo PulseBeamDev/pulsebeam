@@ -136,8 +136,24 @@ pub struct TrackReceiver {
 }
 
 impl TrackReceiver {
-    pub fn by_rid(&self, rid: Option<&Rid>) -> Option<&SimulcastReceiver> {
-        self.simulcast.iter().find(|s| s.rid.as_ref() == rid)
+    pub fn by_rid(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
+        self.simulcast.iter().find(|s| s.rid == *rid)
+    }
+
+    pub fn higher_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
+        let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
+        self.simulcast.get(idx - 1)
+    }
+
+    pub fn lower_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
+        let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
+        self.simulcast.get(idx + 1)
+    }
+
+    pub fn lowest_quality(&self) -> &SimulcastReceiver {
+        self.simulcast
+            .last()
+            .expect("no lowest quality, there must be at least 1 layer for TrackReceiver to exist")
     }
 }
 

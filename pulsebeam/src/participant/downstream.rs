@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
@@ -48,11 +49,13 @@ struct TrackState {
 impl TrackState {
     fn update<F>(&self, update_fn: F)
     where
-        F: FnOnce(&mut StreamConfig) -> bool,
+        F: FnOnce(&mut StreamConfig),
     {
         self.control_tx.send_if_modified(|config| {
-            let changed = update_fn(config);
-            if changed {
+            let old = *config;
+            update_fn(config);
+
+            if old.paused != config.paused || old.target_rid != config.target_rid {
                 config.generation = config.generation.wrapping_add(1);
                 tracing::debug!(?self.track.meta.id, "track state updated: {config:?}");
                 true
@@ -83,31 +86,21 @@ impl TrackState {
     }
 }
 
-/// Represents an active media slot in an SDP session.
-struct AudioSlotState {
-    mid: Mid,
-    assigned_track: Option<Arc<TrackId>>,
-}
-
 /// Per-subscriber video slot state.
 #[derive(Debug)]
-struct VideoSlotState {
+struct SlotState {
     mid: Mid,
     assigned_track: Option<Arc<TrackId>>,
-    max_height: u32,
-    last_switch_at: Option<Instant>,
-    last_assigned_bitrate: Option<f64>,
-    last_observed_quality: Option<StreamQuality>,
-    quality_stable_count: usize,
-    last_upgrade_at: Option<tokio::time::Instant>,
+    // video=max_height
+    priority: u32,
 }
 
 pub struct DownstreamAllocator {
     streams: SelectAll<TrackStream>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
-    audio_slots: Vec<AudioSlotState>,
-    video_slots: Vec<VideoSlotState>,
-    smoothed_bwe_bps: f64,
+    audio_slots: Vec<SlotState>,
+    video_slots: Vec<SlotState>,
+    available_bandwidth: f64,
 }
 
 impl DownstreamAllocator {
@@ -117,7 +110,7 @@ impl DownstreamAllocator {
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
-            smoothed_bwe_bps: 0.0,
+            available_bandwidth: 300_000.0,
         }
     }
 
@@ -157,21 +150,17 @@ impl DownstreamAllocator {
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
         match kind {
             MediaKind::Audio => {
-                self.audio_slots.push(AudioSlotState {
+                self.audio_slots.push(SlotState {
                     mid,
                     assigned_track: None,
+                    priority: 0,
                 });
             }
             MediaKind::Video => {
-                self.video_slots.push(VideoSlotState {
+                self.video_slots.push(SlotState {
                     mid,
                     assigned_track: None,
-                    max_height: 720,
-                    last_switch_at: None,
-                    last_assigned_bitrate: None,
-                    last_observed_quality: None,
-                    quality_stable_count: 0,
-                    last_upgrade_at: None,
+                    priority: 720,
                 });
             }
         }
@@ -180,261 +169,128 @@ impl DownstreamAllocator {
 
     pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
         if let Some(slot) = self.video_slots.iter_mut().find(|s| s.mid == mid) {
-            slot.max_height = max_height;
+            slot.priority = max_height;
         }
     }
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
-        const SMOOTHING_ALPHA: f64 = 0.15;
         let new_bwe = available_bandwidth.as_f64();
-
-        // Exponential smoothing
-        self.smoothed_bwe_bps =
-            (1.0 - SMOOTHING_ALPHA) * self.smoothed_bwe_bps + new_bwe * SMOOTHING_ALPHA;
+        self.available_bandwidth = new_bwe;
         self.update_allocations()
     }
 
+    // Update allocations based on the following events:
+    //  1. Available bandwidth
+    //  2. Video slots
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        // === CONFIGURATION CONSTANTS ===
+        const HEADROOM: f64 = 0.4; // 60% reserve margin
 
-        // Budget management
-        const BUDGET_HEADROOM: f64 = 0.85; // Conservative headroom for safety
+        let budget = self.available_bandwidth * HEADROOM;
 
-        // Timing constraints for stability
-        const MIN_DOWNGRADE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-        const MIN_UPGRADE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-        const UPGRADE_STABILIZATION_PERIOD: std::time::Duration =
-            std::time::Duration::from_secs(15);
+        let mut allocated: u64 = 0;
+        let mut desired: u64 = 0;
 
-        // Quality thresholds
-        const UPGRADE_BUDGET_MARGIN: f64 = 1.40; // Need 40% extra budget to upgrade
-        const UPGRADE_MIN_BITRATE_GAIN: f64 = 1.25; // Must be 25% better to justify upgrade
-        const DOWNGRADE_URGENCY_THRESHOLD: f64 = 0.80; // Immediate downgrade if over 80% budget
-
-        // Desired bitrate calculation - simplified since StreamMonitor handles quality
-        const STABLE_PUBLISHER_HEADROOM: f64 = 1.35; // Normal headroom for stable streams
-        const EXCELLENT_QUALITY_HEADROOM: f64 = 1.50; // More aggressive for excellent quality
-
-        // Quality stability tracking
-        const BAD_QUALITY_THRESHOLD: usize = 3; // Consecutive bad quality samples before action
-        const EXCELLENT_QUALITY_THRESHOLD: usize = 10; // Consecutive excellent samples before upgrade
-
-        let now = tokio::time::Instant::now();
-        let budget = self.smoothed_bwe_bps * BUDGET_HEADROOM;
-
-        let mut total_allocated = 0.0;
-        let mut total_desired = 0.0;
-
-        // Sort by priority (highest resolution first)
+        // Prioritize high-resolution slots first
         self.video_slots
-            .sort_by(|a, b| b.max_height.cmp(&a.max_height));
+            .sort_by_key(|s| std::cmp::Reverse(s.priority));
 
         for slot in &mut self.video_slots {
             let Some(track_id) = &slot.assigned_track else {
+                tracing::trace!(slot_height = slot.priority, "no track assigned");
                 continue;
             };
-            let Some(state) = self.tracks.get(track_id) else {
+            let Some(state) = self.tracks.get_mut(track_id) else {
+                tracing::warn!(track = %track_id, "track not found");
                 continue;
             };
+            let track = &state.track;
+            if track.simulcast.is_empty() {
+                tracing::warn!(track = %track_id, "no simulcast layers");
+                continue;
+            }
 
             let config = state.current();
-            let remaining_budget = budget - total_allocated;
-
-            let current_layer = state.track.by_rid(config.target_rid.as_ref());
-            let current_quality = current_layer.map_or(StreamQuality::Good, |l| l.state.quality());
-            let current_bitrate = if !config.paused {
-                current_layer.map_or(0.0, |l| l.state.bitrate_bps() as f64)
-            } else {
-                0.0
+            let Some(current_receiver) = track.by_rid(&config.target_rid) else {
+                tracing::warn!(target_rid = ?config.target_rid, "receiver to exist for target_rid");
+                continue;
             };
 
-            // === QUALITY TRACKING FOR STABILITY ===
-
-            // Track consecutive quality samples
-            if let Some(last_quality) = slot.last_observed_quality {
-                if last_quality == current_quality {
-                    slot.quality_stable_count = slot.quality_stable_count.saturating_add(1);
-                } else {
-                    slot.quality_stable_count = 1;
+            // Step 1: plan based on quality
+            let target_receiver = if config.paused {
+                if current_receiver.state.is_inactive() {
+                    continue;
                 }
+
+                // start gently after unpausing
+                track.lowest_quality()
             } else {
-                slot.quality_stable_count = 1;
-            }
-            slot.last_observed_quality = Some(current_quality);
-
-            // === COMPUTE DESIRED BITRATE (STABLE, FORWARD-LOOKING) ===
-            // Note: StreamMonitor already factors in bitrate stability via quality assessment
-
-            let desired_bitrate = if config.paused {
-                // When paused, desire the lowest layer to enable quick resume
-                state
-                    .track
-                    .simulcast
-                    .iter()
-                    .min_by_key(|l| l.state.bitrate_bps())
-                    .map_or(0.0, |l| l.state.bitrate_bps() as f64)
-            } else if let Some(layer) = current_layer {
-                match current_quality {
-                    StreamQuality::Excellent
-                        if slot.quality_stable_count >= EXCELLENT_QUALITY_THRESHOLD =>
-                    {
-                        // Excellent and stable - signal we want more
-                        // StreamMonitor has already verified bitrate stability
-                        layer.state.bitrate_bps() as f64 * EXCELLENT_QUALITY_HEADROOM
-                    }
-                    StreamQuality::Good | StreamQuality::Excellent => {
-                        // Good quality (includes stable bitrate check from StreamMonitor)
-                        layer.state.bitrate_bps() as f64 * STABLE_PUBLISHER_HEADROOM
-                    }
-                    StreamQuality::Bad => {
-                        // Bad quality - stay at current, don't inflate desired
-                        // StreamMonitor considers bitrate instability as Bad quality
-                        layer.state.bitrate_bps() as f64
-                    }
-                }
-            } else {
-                0.0
-            };
-
-            total_desired += desired_bitrate;
-
-            // === ALLOCATION DECISION (STABILITY-FOCUSED) ===
-
-            let mut new_rid = config.target_rid;
-            let mut new_bitrate = current_bitrate;
-            let mut new_paused = config.paused;
-
-            let lowest_layer = state
-                .track
-                .simulcast
-                .iter()
-                .min_by_key(|l| l.state.bitrate_bps());
-
-            if config.paused {
-                // === UNPAUSE DECISION ===
-                // Only unpause if we have stable budget and lowest layer fits comfortably
-                if let Some(layer) = lowest_layer {
-                    let layer_bitrate = layer.state.bitrate_bps() as f64;
-                    if layer_bitrate * 1.20 <= remaining_budget {
-                        // Need 20% margin
-                        new_paused = false;
-                        new_rid = layer.rid;
-                        new_bitrate = layer_bitrate;
-                    }
-                }
-            } else {
-                // === ACTIVE STREAM DECISIONS ===
-
-                let time_since_last_switch = slot.last_switch_at.map(|t| now.duration_since(t));
-
-                // Check if we can downgrade (aggressive) or upgrade (conservative)
-                let can_downgrade =
-                    time_since_last_switch.map_or(true, |d| d > MIN_DOWNGRADE_INTERVAL);
-                let can_upgrade = time_since_last_switch.map_or(true, |d| d > MIN_UPGRADE_INTERVAL);
-
-                // === CRITICAL: DOWNGRADE LOGIC (AGGRESSIVE) ===
-
-                let is_over_budget = current_bitrate > remaining_budget;
-                let is_critically_over =
-                    current_bitrate > remaining_budget * DOWNGRADE_URGENCY_THRESHOLD;
-                let has_bad_quality = current_quality == StreamQuality::Bad
-                    && slot.quality_stable_count >= BAD_QUALITY_THRESHOLD;
-
-                if is_critically_over
-                    || (is_over_budget && can_downgrade)
-                    || (has_bad_quality && can_downgrade)
-                {
-                    // Find best layer that fits in budget
-                    let best_fit = state
-                        .track
-                        .simulcast
-                        .iter()
-                        .filter(|l| {
-                            !l.state.is_inactive()
-                                && l.state.bitrate_bps() as f64 <= remaining_budget * 0.95 // 5% safety margin
-                        })
-                        .max_by_key(|l| l.state.bitrate_bps());
-
-                    if let Some(layer) = best_fit {
-                        new_rid = layer.rid;
-                        new_bitrate = layer.state.bitrate_bps() as f64;
-                    } else if is_critically_over {
-                        // No layer fits - must pause
-                        new_paused = true;
-                        new_bitrate = 0.0;
-                    } else if let Some(lowest) = lowest_layer {
-                        // Fall back to lowest layer
-                        new_rid = lowest.rid;
-                        new_bitrate = lowest.state.bitrate_bps() as f64;
-                    }
-                }
-                // === UPGRADE LOGIC (CONSERVATIVE) ===
-                else if can_upgrade
-                    && current_quality == StreamQuality::Excellent
-                    && slot.quality_stable_count >= EXCELLENT_QUALITY_THRESHOLD
-                {
-                    // Check if enough time has passed since last upgrade for stabilization
-                    let is_stabilized = slot.last_upgrade_at.map_or(true, |t| {
-                        now.duration_since(t) > UPGRADE_STABILIZATION_PERIOD
-                    });
-
-                    if is_stabilized {
-                        // Conservative upgrade budget
-                        let upgrade_budget = remaining_budget / UPGRADE_BUDGET_MARGIN;
-
-                        let upgrade_candidate = state
-                            .track
-                            .simulcast
-                            .iter()
-                            .filter(|l| {
-                                let l_bitrate = l.state.bitrate_bps() as f64;
-                                !l.state.is_inactive()
-                                && l.state.quality() == StreamQuality::Excellent // Publisher must be excellent (includes stability)
-                                && l_bitrate > current_bitrate * UPGRADE_MIN_BITRATE_GAIN // Must be significant gain
-                                && l_bitrate <= upgrade_budget
-                            })
-                            .min_by_key(|l| l.state.bitrate_bps()); // Take smallest qualifying upgrade
-
-                        if let Some(layer) = upgrade_candidate {
-                            new_rid = layer.rid;
-                            new_bitrate = layer.state.bitrate_bps() as f64;
-                            slot.last_upgrade_at = Some(now); // Track upgrade time
+                match current_receiver.state.quality() {
+                    StreamQuality::Bad => track.lowest_quality(),
+                    StreamQuality::Good => current_receiver,
+                    StreamQuality::Excellent => {
+                        if let Some(next_layer) = track.higher_quality(&config.target_rid)
+                            && next_layer.state.quality() == StreamQuality::Excellent
+                        {
+                            next_layer
+                        } else {
+                            current_receiver
                         }
                     }
                 }
-            }
+            };
 
-            // === APPLY CHANGES ===
+            // Step 2: apply the plan according to available bandwidth
 
-            if new_paused != config.paused || new_rid != config.target_rid {
-                let is_upgrade = !new_paused && !config.paused && new_bitrate > current_bitrate;
-
-                state.update(|c| {
-                    let changed = c.paused != new_paused || c.target_rid != new_rid;
-                    c.paused = new_paused;
-                    c.target_rid = new_rid;
-                    changed
-                });
-
-                slot.last_switch_at = Some(now);
-
-                // Reset quality tracking on layer switch to rebuild confidence
-                slot.quality_stable_count = 0;
-
-                if is_upgrade {
-                    slot.last_upgrade_at = Some(now);
+            // adjust target_receiver to fit into available bandwidth
+            let mut target_receiver = Some(target_receiver);
+            while let Some(target) = target_receiver {
+                if (target.state.bitrate_bps() as f64) < budget {
+                    break;
                 }
+
+                target_receiver = track.lower_quality(&target.rid);
             }
 
-            slot.last_assigned_bitrate = Some(new_bitrate);
-            total_allocated += new_bitrate;
+            let (target_rid, paused) = match target_receiver {
+                Some(target) => {
+                    desired += target.state.bitrate_bps();
+                    allocated += current_receiver.state.bitrate_bps();
+
+                    if target.rid != current_receiver.rid {
+                        tracing::info!(
+                            "changed simulcast layer: {:?} -> {:?}",
+                            current_receiver.rid,
+                            target.rid,
+                        );
+                    }
+
+                    (target.rid, false)
+                }
+                None => {
+                    tracing::info!(
+                        "paused track due to insufficient available bandwidth: {}",
+                        track.meta.id
+                    );
+                    (current_receiver.rid, true)
+                }
+            };
+
+            state.update(|c| {
+                c.paused = paused;
+                c.target_rid = target_rid;
+            });
         }
 
-        let current_total = Bitrate::from(total_allocated);
-        let desired_total = Bitrate::from(total_desired);
+        tracing::debug!(
+            bwe = %Bitrate::from(self.available_bandwidth),
+            budget = %Bitrate::from(budget),
+            allocated = %Bitrate::from(allocated),
+            desired = %Bitrate::from(desired),
+            "allocation summary"
+        );
 
-        (current_total, desired_total)
+        (Bitrate::from(allocated), Bitrate::from(desired))
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
@@ -534,21 +390,12 @@ impl DownstreamAllocator {
         for slot in &mut self.video_slots {
             if let Some(track_id) = &slot.assigned_track {
                 if !self.tracks.contains_key(track_id) {
-                    let mut tmp = AudioSlotState {
-                        mid: slot.mid,
-                        assigned_track: slot.assigned_track.clone(),
-                    };
-                    Self::perform_unassignment(&mut self.tracks, &mut tmp);
+                    Self::perform_unassignment(&mut self.tracks, slot);
                     slot.assigned_track = None;
                 }
-            }
-            if slot.assigned_track.is_none() {
+            } else {
                 if let Some(track_id) = unassigned_tracks.pop() {
-                    let mut tmp = AudioSlotState {
-                        mid: slot.mid,
-                        assigned_track: None,
-                    };
-                    Self::perform_assignment(&mut self.tracks, &mut tmp, &track_id);
+                    Self::perform_assignment(&mut self.tracks, slot, &track_id);
                     slot.assigned_track = Some(track_id);
                 }
             }
@@ -557,16 +404,14 @@ impl DownstreamAllocator {
 
     fn perform_assignment(
         tracks: &mut HashMap<Arc<TrackId>, TrackState>,
-        slot: &mut AudioSlotState,
+        slot: &mut SlotState,
         track_id: &Arc<TrackId>,
     ) {
         if let Some(state) = tracks.get_mut(track_id) {
             slot.assigned_track = Some(track_id.clone());
             state.assigned_mid = Some(slot.mid);
             state.update(|c| {
-                let changed = c.paused;
                 c.paused = false;
-                changed
             });
             tracing::info!(
                 %track_id,
@@ -577,17 +422,12 @@ impl DownstreamAllocator {
         }
     }
 
-    fn perform_unassignment(
-        tracks: &mut HashMap<Arc<TrackId>, TrackState>,
-        slot: &mut AudioSlotState,
-    ) {
+    fn perform_unassignment(tracks: &mut HashMap<Arc<TrackId>, TrackState>, slot: &mut SlotState) {
         if let Some(track_id) = slot.assigned_track.take() {
             if let Some(state) = tracks.get_mut(&track_id) {
                 state.assigned_mid = None;
                 state.update(|c| {
-                    let changed = !c.paused;
                     c.paused = true;
-                    changed
                 });
                 tracing::info!(
                     %track_id,
