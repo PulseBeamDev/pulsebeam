@@ -8,7 +8,7 @@ use tokio::time::Instant;
 use crate::rtp::{
     RtpPacket,
     jitter_buffer::{self, PollResult},
-    monitor::{HealthThresholds, StreamMonitor, StreamState},
+    monitor::{HealthThresholds, QualityMonitorConfig, StreamMonitor, StreamState},
 };
 
 #[derive(Debug, Clone)]
@@ -202,7 +202,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             }
         };
         let stream_state = StreamState::new(true, bitrate);
-        let monitor = StreamMonitor::new(stream_state.clone(), HealthThresholds::default());
+        let monitor = StreamMonitor::new(stream_state.clone(), QualityMonitorConfig::default());
         let jbc = if meta.kind == MediaKind::Video {
             jitter_buffer::JitterBufferConfig::video_interactive()
         } else {

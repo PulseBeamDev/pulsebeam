@@ -295,7 +295,7 @@ impl DownstreamAllocator {
         let total_desired = self
             .desired_bandwidth
             .update((total_desired as f64).into(), Instant::now());
-        tracing::debug!(
+        tracing::trace!(
             budget = %Bitrate::from(budget),
             allocated = %Bitrate::from(total_allocated),
             desired = %total_desired,
