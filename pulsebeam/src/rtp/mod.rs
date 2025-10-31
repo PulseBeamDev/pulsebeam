@@ -1,13 +1,13 @@
 pub mod jitter_buffer;
 pub mod monitor;
-pub mod rtp_rewriter;
+pub mod sequencer;
 
 use std::ops::{Deref, DerefMut};
 
 use str0m::{media::MediaTime, rtp::SeqNo};
 use tokio::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RtpPacket {
     inner: str0m::rtp::RtpPacket,
 }

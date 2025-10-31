@@ -17,7 +17,7 @@ IFB_IFACE ?= ifb0
 
 # Bad network presets (adjust these for your testing needs)
 LATENCY ?= 100ms
-PACKET_LOSS ?= 0%
+PACKET_LOSS ?= 2%
 UPLOAD ?= 1mbit
 DOWNLOAD ?= 2mbit
 
