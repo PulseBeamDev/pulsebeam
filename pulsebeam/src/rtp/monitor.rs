@@ -31,7 +31,7 @@ const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The size of the circular buffer used for the sliding window packet loss calculation.
 const LOSS_WINDOW_SIZE: usize = 256;
 /// Number of bitrate samples to track for stability measurement
-const BITRATE_HISTORY_SAMPLES: usize = 600; // ~3-5 seconds of data
+const BITRATE_HISTORY_SAMPLES: usize = 16; // ~3-5 seconds of data
 
 // --- Public-Facing Shared State ---
 
@@ -66,7 +66,7 @@ impl StreamState {
             inactive: Arc::new(AtomicBool::new(inactive)),
             bitrate_bps_p99: Arc::new(AtomicU64::new(bitrate_bps)),
             bitrate_bps_p50: Arc::new(AtomicU64::new(bitrate_bps)),
-            quality: Arc::new(AtomicU8::new(StreamQuality::Good as u8)),
+            quality: Arc::new(AtomicU8::new(StreamQuality::Bad as u8)),
         }
     }
 
@@ -464,17 +464,17 @@ impl Default for HealthThresholds {
     fn default() -> Self {
         Self {
             // Bad thresholds (degradation)
-            become_bad_loss_percent: 5.0,
+            become_bad_loss_percent: 0.1,
             become_bad_jitter_ms: 30,
             become_bad_bitrate_cv_percent: 30.0, // >30% CV = unstable
 
             // Good thresholds (recovery)
-            become_good_loss_percent: 2.0,
+            become_good_loss_percent: 0.01,
             become_good_jitter_ms: 20,
             become_good_bitrate_cv_percent: 20.0, // <20% CV = stable enough
 
             // Excellent thresholds (optimal)
-            become_excellent_loss_percent: 1.0,
+            become_excellent_loss_percent: 0.0,
             become_excellent_jitter_ms: 15,
             become_excellent_bitrate_cv_percent: 10.0, // <10% CV = very stable
         }
@@ -655,7 +655,7 @@ impl StreamMonitor {
 
                 // Check if ALL metrics are excellent
                 let has_excellent_loss =
-                    self.raw_loss_percent < self.thresholds.become_excellent_loss_percent;
+                    self.raw_loss_percent <= self.thresholds.become_excellent_loss_percent;
                 let has_excellent_jitter =
                     self.raw_jitter_ms < self.thresholds.become_excellent_jitter_ms;
                 let has_excellent_bitrate = !check_bitrate_stability
@@ -672,7 +672,7 @@ impl StreamMonitor {
             StreamQuality::Bad => {
                 // To recover to Good, ALL metrics must be good
                 let has_good_loss =
-                    self.raw_loss_percent < self.thresholds.become_good_loss_percent;
+                    self.raw_loss_percent <= self.thresholds.become_good_loss_percent;
                 let has_good_jitter = self.raw_jitter_ms < self.thresholds.become_good_jitter_ms;
                 let has_good_bitrate = !check_bitrate_stability
                     || self.raw_bitrate_cv_percent < self.thresholds.become_good_bitrate_cv_percent;
