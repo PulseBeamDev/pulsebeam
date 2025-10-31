@@ -143,7 +143,7 @@ impl ParticipantCore {
         &mut self,
         track_meta: Arc<TrackMeta>,
         hdr: TimingHeader,
-        pkt: &RtpPacket,
+        pkt: RtpPacket,
     ) {
         let Some(mid) = self
             .downstream_allocator
@@ -168,15 +168,17 @@ impl ParticipantCore {
             return;
         };
 
+        let inner: str0m::rtp::RtpPacket = pkt.into();
+
         let _ = writer.write_rtp(
             pt,
             hdr.seq_no,
             hdr.rtp_ts.numer() as u32,
             hdr.server_ts.into(),
-            pkt.header.marker,
-            pkt.header.ext_vals.clone(),
+            inner.header.marker,
+            inner.header.ext_vals,
             true,
-            pkt.payload.clone(),
+            inner.payload,
         );
     }
 

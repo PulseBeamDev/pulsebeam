@@ -3,7 +3,7 @@ use crate::rtp::monitor::StreamQuality;
 use crate::rtp::sequencer::RtpSequencer;
 use crate::rtp::{RtpPacket, TimingHeader};
 use futures::stream::{SelectAll, Stream, StreamExt};
-use pulsebeam_runtime::sync::spmc::{self, Slot};
+use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -509,13 +509,18 @@ pub struct TrackReader {
 impl TrackReader {
     fn new(track: TrackReceiver, mut control_rx: watch::Receiver<StreamConfig>) -> Self {
         let config = *control_rx.borrow_and_update();
+        let sequencer = if track.meta.kind.is_video() {
+            RtpSequencer::video()
+        } else {
+            RtpSequencer::audio()
+        };
         let mut this = Self {
             meta: track.meta.clone(),
             track,
             control_rx,
             state: TrackReaderState::Paused,
             config,
-            sequencer: RtpSequencer::new(),
+            sequencer,
         };
         // seed initial state
         this.update_state(config);
@@ -590,9 +595,9 @@ impl TrackReader {
                             match res {
                                 Ok(pkt) => {
                                     tracing::debug!(track_id = %self.meta.id, "First packet from new layer received, switch complete");
-                                    self.state = TrackReaderState::Streaming { active_index };
                                     if pkt.value.is_keyframe() {
                                         self.sequencer.push(pkt.value.clone(), true);
+                                        self.state = TrackReaderState::Streaming { active_index };
                                     }
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {

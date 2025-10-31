@@ -25,6 +25,7 @@ const MAX_SEQ_GAP: u64 = 3000;
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
 const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
+const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
 
 /// A high-performance buffer for reordering RTP packets and handling loss.
 #[derive(Debug)]
@@ -58,15 +59,18 @@ impl<T: PacketTiming> JitterBuffer<T> {
         }
 
         // If it's not there, check for a stall condition.
-        if let Some(entry) = self.buffer.first_entry() {
-            let (oldest_seq, (_, insertion_ts)) = (entry.key(), entry.get());
-
+        let mut stalled_seq = None;
+        if let Some((&oldest_seq, (_, insertion_ts))) = self.buffer.first_key_value() {
             // A stall is defined as having waited too long for a packet that is now in the past.
-            if insertion_ts.elapsed() > JITTER_MAX_WAIT && *oldest_seq > self.next_seq_no_to_pop {
-                let (packet, _) = entry.remove();
-                self.next_seq_no_to_pop = (*oldest_seq).wrapping_add(1).into();
-                return Some(packet);
+            if insertion_ts.elapsed() > JITTER_MAX_WAIT && oldest_seq > self.next_seq_no_to_pop {
+                stalled_seq = Some(oldest_seq);
             }
+        }
+
+        if let Some(oldest_seq) = stalled_seq {
+            let (packet, _) = self.buffer.remove(&oldest_seq).unwrap();
+            self.next_seq_no_to_pop = (*oldest_seq).wrapping_add(1).into();
+            return Some(packet);
         }
 
         None
@@ -106,17 +110,27 @@ pub struct RtpSequencer<T: PacketTiming + Debug> {
     last_output_seq: SeqNo,
     last_output_ts: MediaTime,
     last_forward_time: Instant,
+    frequency: Frequency,
 }
 
 impl<T: PacketTiming + Debug> Default for RtpSequencer<T> {
     fn default() -> Self {
-        Self::new()
+        Self::new(VIDEO_FREQUENCY)
     }
 }
 
 impl<T: PacketTiming + Debug> RtpSequencer<T> {
-    pub fn new() -> Self {
+    pub fn video() -> Self {
+        Self::new(VIDEO_FREQUENCY)
+    }
+
+    pub fn audio() -> Self {
+        Self::new(AUDIO_FREQUENCY)
+    }
+
+    pub fn new(frequency: Frequency) -> Self {
         Self {
+            frequency,
             buffer: JitterBuffer::new(0.into()),
             anchor: None,
             last_output_seq: 0.into(),
@@ -274,7 +288,7 @@ mod test {
     #[test]
     fn test_simple_reordering() {
         let start = Instant::now();
-        let mut seq = RtpSequencer::new();
+        let mut seq = RtpSequencer::default();
 
         seq.push(p(1, 1, 0, start), false);
         seq.push(p(3, 3, 20, start), false);
@@ -289,7 +303,7 @@ mod test {
     #[tokio::test]
     async fn test_packet_loss_and_stall_recovery() {
         let start = Instant::now();
-        let mut seq = RtpSequencer::new();
+        let mut seq = RtpSequencer::default();
 
         seq.push(p(1, 1, 0, start), false);
         seq.push(p(3, 3, 20, start), false);
@@ -317,7 +331,7 @@ mod test {
     #[tokio::test]
     async fn test_layer_switch_with_lost_keyframe_start() {
         let start = Instant::now();
-        let mut seq = RtpSequencer::new();
+        let mut seq = RtpSequencer::default();
 
         seq.push(p(1, 100, 0, start), false);
         let (s1, _, p1) = seq.pop().unwrap();
@@ -347,7 +361,7 @@ mod test {
     #[test]
     fn test_automatic_reset_on_massive_gap() {
         let start = Instant::now();
-        let mut seq = RtpSequencer::new();
+        let mut seq = RtpSequencer::default();
 
         seq.push(p(1, 1, 0, start), false);
         assert_eq!(seq.pop().unwrap().2.id, 1);
@@ -380,7 +394,7 @@ mod test {
     #[test]
     fn test_sequence_number_wrapping() {
         let start = Instant::now();
-        let mut seq = RtpSequencer::new();
+        let mut seq = RtpSequencer::default();
         let max = u16::MAX as u64;
 
         seq.push(p(1, max - 1, 0, start), false);

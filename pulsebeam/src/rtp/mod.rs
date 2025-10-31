@@ -32,6 +32,12 @@ impl From<str0m::rtp::RtpPacket> for RtpPacket {
     }
 }
 
+impl From<RtpPacket> for str0m::rtp::RtpPacket {
+    fn from(value: RtpPacket) -> Self {
+        value.inner
+    }
+}
+
 impl AsRef<str0m::rtp::RtpPacket> for RtpPacket {
     fn as_ref(&self) -> &str0m::rtp::RtpPacket {
         &self.inner
