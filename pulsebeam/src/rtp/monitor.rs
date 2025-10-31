@@ -32,6 +32,8 @@ const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
 const LOSS_WINDOW_SIZE: usize = 256;
 /// Number of bitrate samples to track for stability measurement
 const BITRATE_HISTORY_SAMPLES: usize = 16; // ~3-5 seconds of data
+/// Minimum number of samples before making quality decisions
+const MIN_SAMPLES_FOR_QUALITY: usize = 8; // ~2 seconds minimum
 
 // --- Health Thresholds & Config ---
 
@@ -55,10 +57,14 @@ pub struct QualityMonitorConfig {
     pub score_increment_scaler: f32,
     pub score_decrement_multiplier: f32,
 
-    // --- State Change Thresholds ---
-    pub bad_score_threshold: f32,
-    pub good_score_threshold: f32,
-    pub excellent_score_threshold: f32,
+    // --- State Change Thresholds with Hysteresis ---
+    // Downgrade thresholds (quick to react)
+    pub excellent_to_good_threshold: f32,
+    pub good_to_bad_threshold: f32,
+
+    // Upgrade thresholds (conservative, require sustained improvement)
+    pub bad_to_good_threshold: f32,
+    pub good_to_excellent_threshold: f32,
 
     // --- Hard Limits & Catastrophic Penalties ---
     pub min_usable_bitrate_bps: u64,
@@ -70,6 +76,12 @@ pub struct QualityMonitorConfig {
     pub loss_weight: f32,
     pub jitter_weight: f32,
     pub bitrate_cv_weight: f32,
+
+    // --- Stability Controls ---
+    /// Minimum consecutive polls at threshold before upgrading quality
+    pub upgrade_stability_count: u32,
+    /// Exponential moving average factor for metric smoothing (0-1, lower = more smoothing)
+    pub metric_smoothing_factor: f32,
 }
 
 impl Default for QualityMonitorConfig {
@@ -92,24 +104,32 @@ impl Default for QualityMonitorConfig {
             // Score engine dynamics
             score_max: 100.0,
             score_min: 0.0,
-            score_increment_scaler: 2.0, // A perfect interval adds 2.0 points to the score.
-            score_decrement_multiplier: 4.0, // A very bad interval can subtract up to 4.0 points.
+            score_increment_scaler: 1.5,     // Slower improvements
+            score_decrement_multiplier: 4.0, // Fast degradation
 
-            // Score thresholds that determine the public StreamQuality
-            bad_score_threshold: 40.0,
-            good_score_threshold: 60.0,
-            excellent_score_threshold: 90.0,
+            // Hysteresis thresholds - note the gaps to prevent oscillation
+            // Downgrades (quick)
+            excellent_to_good_threshold: 75.0, // Drop from Excellent below this
+            good_to_bad_threshold: 35.0,       // Drop from Good below this
+
+            // Upgrades (conservative, require higher score)
+            bad_to_good_threshold: 55.0,       // Rise from Bad above this
+            good_to_excellent_threshold: 92.0, // Rise from Good above this
 
             // "The Cliff": Instantaneous triggers for severe penalties
             min_usable_bitrate_bps: 150_000,
-            catastrophic_loss_percent: 20.0, // Over 20% loss is a disaster.
-            catastrophic_jitter_ms: 80,      // Over 80ms jitter is a disaster.
-            catastrophic_penalty: 30.0,      // Instantly subtract 30 points from the score.
+            catastrophic_loss_percent: 20.0,
+            catastrophic_jitter_ms: 80,
+            catastrophic_penalty: 30.0,
 
             // How much each metric contributes to the overall health score for an interval.
             loss_weight: 0.5,
             jitter_weight: 0.3,
             bitrate_cv_weight: 0.2,
+
+            // Stability controls
+            upgrade_stability_count: 6, // ~3 seconds of sustained good performance to upgrade
+            metric_smoothing_factor: 0.3, // Heavy smoothing to reduce noise
         }
     }
 }
@@ -253,7 +273,7 @@ impl BitrateHistory {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.filled
+        self.total_samples >= MIN_SAMPLES_FOR_QUALITY
     }
 
     pub fn reset(&mut self) {
@@ -396,11 +416,23 @@ pub struct StreamMonitor {
     jitter_last_rtp_time: Option<u64>,
     loss_window: PacketLossWindow,
     bitrate_history: BitrateHistory,
+
+    // Smoothed metrics (exponential moving average)
+    smoothed_loss_percent: f32,
+    smoothed_jitter_ms: f32,
+    smoothed_bitrate_cv_percent: f32,
+
+    // Raw metrics (for debugging)
     raw_loss_percent: f32,
     raw_jitter_ms: u32,
     raw_bitrate_cv_percent: f32,
+
     current_quality: StreamQuality,
     quality_score: f32,
+
+    // Stability tracking for upgrades
+    consecutive_upgrade_eligible_polls: u32,
+    last_downgrade_instant: Option<Instant>,
 }
 
 impl StreamMonitor {
@@ -419,11 +451,16 @@ impl StreamMonitor {
             jitter_last_rtp_time: None,
             loss_window: PacketLossWindow::new(LOSS_WINDOW_SIZE),
             bitrate_history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
+            smoothed_loss_percent: 0.0,
+            smoothed_jitter_ms: 0.0,
+            smoothed_bitrate_cv_percent: 0.0,
             raw_loss_percent: 0.0,
             raw_jitter_ms: 0,
             raw_bitrate_cv_percent: 0.0,
             current_quality: StreamQuality::Good,
-            quality_score: config.good_score_threshold,
+            quality_score: 50.0, // Start in middle
+            consecutive_upgrade_eligible_polls: 0,
+            last_downgrade_instant: None,
         }
     }
 
@@ -448,18 +485,33 @@ impl StreamMonitor {
             return;
         }
         self.update_derived_metrics(now);
-        let new_quality = self.determine_stream_quality();
+
+        // Only evaluate quality if we have enough data
+        if !self.loss_window.is_ready() || !self.bitrate_history.is_ready() {
+            return;
+        }
+
+        let new_quality = self.determine_stream_quality(now);
         if new_quality != self.current_quality {
-            tracing::debug!(
-                "changed stream quality: {:?} -> {:?} (score: {:.1})",
+            tracing::info!(
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, jitter: {}ms, cv: {:.1}%)",
                 self.current_quality,
                 new_quality,
-                self.quality_score
+                self.quality_score,
+                self.smoothed_loss_percent,
+                self.smoothed_jitter_ms as u32,
+                self.smoothed_bitrate_cv_percent
             );
             self.current_quality = new_quality;
             self.shared_state
                 .quality
                 .store(new_quality as u8, Ordering::Relaxed);
+
+            // Track downgrades for preventing rapid oscillation
+            if (new_quality as u8) < (self.current_quality as u8) {
+                self.last_downgrade_instant = Some(now);
+                self.consecutive_upgrade_eligible_polls = 0;
+            }
         }
     }
 
@@ -469,12 +521,17 @@ impl StreamMonitor {
         self.jitter_last_arrival = None;
         self.jitter_last_rtp_time = None;
         self.bitrate_history.reset();
+        self.smoothed_loss_percent = 0.0;
+        self.smoothed_jitter_ms = 0.0;
+        self.smoothed_bitrate_cv_percent = 0.0;
         self.raw_loss_percent = 0.0;
         self.raw_jitter_ms = 0;
         self.raw_bitrate_cv_percent = 0.0;
         self.bwe_interval_bytes = 0;
-        self.quality_score = self.config.good_score_threshold;
+        self.quality_score = 50.0;
         self.current_quality = StreamQuality::Good;
+        self.consecutive_upgrade_eligible_polls = 0;
+        self.last_downgrade_instant = None;
         self.shared_state
             .quality
             .store(StreamQuality::Good as u8, Ordering::Relaxed);
@@ -485,26 +542,23 @@ impl StreamMonitor {
     }
 
     pub fn get_loss_percent(&self) -> f32 {
-        self.raw_loss_percent
+        self.smoothed_loss_percent
     }
 
     pub fn get_jitter_ms(&self) -> u32 {
-        self.raw_jitter_ms
+        self.smoothed_jitter_ms as u32
     }
 
     pub fn get_bitrate_cv_percent(&self) -> f32 {
-        self.raw_bitrate_cv_percent
+        self.smoothed_bitrate_cv_percent
     }
 
     fn determine_inactive_state(&self, now: Instant) -> bool {
         self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
     }
 
-    fn determine_stream_quality(&mut self) -> StreamQuality {
-        if !self.loss_window.is_ready() || !self.bitrate_history.is_ready() {
-            return StreamQuality::Good;
-        }
-
+    fn determine_stream_quality(&mut self, now: Instant) -> StreamQuality {
+        // Calculate health scores
         let normalize = |value: f32, thresholds: HealthThresholds| -> f32 {
             if value <= thresholds.good {
                 1.0
@@ -515,14 +569,18 @@ impl StreamMonitor {
             }
         };
 
-        let loss_health = normalize(self.raw_loss_percent, self.config.loss);
-        let jitter_health = normalize(self.raw_jitter_ms as f32, self.config.jitter_ms);
-        let cv_health = normalize(self.raw_bitrate_cv_percent, self.config.bitrate_cv_percent);
+        let loss_health = normalize(self.smoothed_loss_percent, self.config.loss);
+        let jitter_health = normalize(self.smoothed_jitter_ms, self.config.jitter_ms);
+        let cv_health = normalize(
+            self.smoothed_bitrate_cv_percent,
+            self.config.bitrate_cv_percent,
+        );
 
         let instantaneous_health = (loss_health * self.config.loss_weight)
             + (jitter_health * self.config.jitter_weight)
             + (cv_health * self.config.bitrate_cv_weight);
 
+        // Check hard limits
         let final_health =
             if self.shared_state.bitrate_bps_p50() < self.config.min_usable_bitrate_bps {
                 -1.0
@@ -530,14 +588,16 @@ impl StreamMonitor {
                 instantaneous_health
             };
 
+        // Apply catastrophic penalties
         let mut catastrophic_penalty = 0.0;
-        if self.raw_loss_percent > self.config.catastrophic_loss_percent {
+        if self.smoothed_loss_percent > self.config.catastrophic_loss_percent {
             catastrophic_penalty += self.config.catastrophic_penalty;
         }
-        if self.raw_jitter_ms > self.config.catastrophic_jitter_ms {
+        if self.smoothed_jitter_ms > self.config.catastrophic_jitter_ms as f32 {
             catastrophic_penalty += self.config.catastrophic_penalty;
         }
 
+        // Update quality score
         if final_health >= 0.0 {
             self.quality_score += self.config.score_increment_scaler * final_health;
         } else {
@@ -549,13 +609,67 @@ impl StreamMonitor {
             .quality_score
             .clamp(self.config.score_min, self.config.score_max);
 
-        if self.quality_score < self.config.bad_score_threshold {
-            StreamQuality::Bad
-        } else if self.quality_score >= self.config.excellent_score_threshold {
-            StreamQuality::Excellent
-        } else {
-            StreamQuality::Good
-        }
+        // Determine new quality with hysteresis
+        let target_quality = match self.current_quality {
+            StreamQuality::Bad => {
+                // From Bad: only upgrade if score is well above threshold AND sustained
+                if self.quality_score >= self.config.bad_to_good_threshold {
+                    self.consecutive_upgrade_eligible_polls += 1;
+                    if self.consecutive_upgrade_eligible_polls
+                        >= self.config.upgrade_stability_count
+                    {
+                        StreamQuality::Good
+                    } else {
+                        StreamQuality::Bad
+                    }
+                } else {
+                    self.consecutive_upgrade_eligible_polls = 0;
+                    StreamQuality::Bad
+                }
+            }
+            StreamQuality::Good => {
+                // From Good: can downgrade quickly or upgrade slowly
+                if self.quality_score < self.config.good_to_bad_threshold {
+                    self.consecutive_upgrade_eligible_polls = 0;
+                    StreamQuality::Bad
+                } else if self.quality_score >= self.config.good_to_excellent_threshold {
+                    // Prevent upgrade too soon after a downgrade
+                    if let Some(last_downgrade) = self.last_downgrade_instant {
+                        if now.duration_since(last_downgrade) < Duration::from_secs(10) {
+                            return StreamQuality::Good;
+                        }
+                    }
+
+                    self.consecutive_upgrade_eligible_polls += 1;
+                    if self.consecutive_upgrade_eligible_polls
+                        >= self.config.upgrade_stability_count
+                    {
+                        StreamQuality::Excellent
+                    } else {
+                        StreamQuality::Good
+                    }
+                } else {
+                    self.consecutive_upgrade_eligible_polls = 0;
+                    StreamQuality::Good
+                }
+            }
+            StreamQuality::Excellent => {
+                // From Excellent: downgrade quickly if quality drops
+                if self.quality_score < self.config.excellent_to_good_threshold {
+                    self.consecutive_upgrade_eligible_polls = 0;
+                    // Check if we should go directly to Bad
+                    if self.quality_score < self.config.good_to_bad_threshold {
+                        StreamQuality::Bad
+                    } else {
+                        StreamQuality::Good
+                    }
+                } else {
+                    StreamQuality::Excellent
+                }
+            }
+        };
+
+        target_quality
     }
 
     fn update_derived_metrics(&mut self, now: Instant) {
@@ -579,8 +693,29 @@ impl StreamMonitor {
             self.bwe_interval_bytes = 0;
             self.bwe_last_update = now;
         }
+
+        // Update raw metrics
         self.raw_loss_percent = self.loss_window.calculate_loss_percent();
+        self.raw_jitter_ms = (self.jitter_estimate * 1000.0) as u32;
         self.raw_bitrate_cv_percent = self.bitrate_history.coefficient_of_variation_percent();
+
+        // Apply exponential moving average for smoothing
+        let alpha = self.config.metric_smoothing_factor;
+
+        if self.smoothed_loss_percent == 0.0 {
+            // First sample - initialize
+            self.smoothed_loss_percent = self.raw_loss_percent;
+            self.smoothed_jitter_ms = self.raw_jitter_ms as f32;
+            self.smoothed_bitrate_cv_percent = self.raw_bitrate_cv_percent;
+        } else {
+            // Exponential moving average: smoothed = alpha * raw + (1 - alpha) * smoothed
+            self.smoothed_loss_percent =
+                alpha * self.raw_loss_percent + (1.0 - alpha) * self.smoothed_loss_percent;
+            self.smoothed_jitter_ms =
+                alpha * (self.raw_jitter_ms as f32) + (1.0 - alpha) * self.smoothed_jitter_ms;
+            self.smoothed_bitrate_cv_percent = alpha * self.raw_bitrate_cv_percent
+                + (1.0 - alpha) * self.smoothed_bitrate_cv_percent;
+        }
     }
 
     fn discover_clock_rate(&mut self, packet: &impl PacketTiming) {
@@ -604,7 +739,6 @@ impl StreamMonitor {
             let rtp_diff = rtp_time.wrapping_sub(last_rtp_time) as f64 / self.clock_rate as f64;
             let transit_diff = arrival_diff - rtp_diff;
             self.jitter_estimate += (transit_diff.abs() - self.jitter_estimate) / 16.0;
-            self.raw_jitter_ms = (self.jitter_estimate * 1000.0) as u32;
         }
         self.jitter_last_arrival = Some(arrival);
         self.jitter_last_rtp_time = Some(rtp_time);
@@ -672,31 +806,15 @@ mod test {
     }
 
     #[test]
-    fn quality_becomes_bad_after_sustained_packet_loss() {
+    fn quality_does_not_oscillate_with_marginal_changes() {
         let (mut monitor, state) = setup();
         let start = Instant::now();
         monitor.set_manual_pause(false);
 
-        // Fill window first
-        for i in 0..(LOSS_WINDOW_SIZE as u64) {
-            monitor.process_packet(
-                &TestPacket {
-                    seq: i.into(),
-                    at: start,
-                    ts: MediaTime::from_90khz(0),
-                },
-                1200,
-            );
-        }
-        monitor.poll(start);
-        assert_eq!(state.quality(), StreamQuality::Good);
-
-        // Now, introduce sustained high loss
-        let mut seq = LOSS_WINDOW_SIZE as u64;
-        for i in 0..20 {
-            // Poll for 10 seconds
-            // 10% packet loss
-            for _ in 0..90 {
+        // Fill window and bitrate history
+        let mut seq = 0u64;
+        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
+            for _ in 0..100 {
                 monitor.process_packet(
                     &TestPacket {
                         seq: seq.into(),
@@ -707,36 +825,113 @@ mod test {
                 );
                 seq += 1;
             }
-            seq += 10; // Skip 10 packets
+            let poll_time = start + Duration::from_millis(500 * (i as u64 + 1));
+            monitor.poll(poll_time);
+        }
 
-            let poll_time = start + Duration::from_millis(500 * (i + 1));
+        // Should be in Good state
+        assert_eq!(state.quality(), StreamQuality::Good);
+
+        // Introduce marginal loss that hovers around threshold
+        let quality_before = state.quality();
+        for i in 0..20 {
+            // Alternate between 3% and 4% loss (around good threshold of 2%)
+            let loss_rate = if i % 2 == 0 { 3 } else { 4 };
+            for _ in 0..(100 - loss_rate) {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: start,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            seq += loss_rate; // Skip packets
+
+            let poll_time =
+                start + Duration::from_millis(500 * (i + BITRATE_HISTORY_SAMPLES * 2 + 1) as u64);
+            monitor.poll(poll_time);
+        }
+
+        // Should remain stable in Good due to hysteresis and smoothing
+        assert_eq!(
+            state.quality(),
+            quality_before,
+            "Quality should not oscillate with marginal metric changes"
+        );
+    }
+
+    #[test]
+    fn quality_downgrades_quickly_to_bad() {
+        let (mut monitor, state) = setup();
+        let start = Instant::now();
+        monitor.set_manual_pause(false);
+
+        // Start in Good state
+        let mut seq = 0u64;
+        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
+            for _ in 0..100 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: start,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            let poll_time = start + Duration::from_millis(500 * (i as u64 + 1));
+            monitor.poll(poll_time);
+        }
+        assert_eq!(state.quality(), StreamQuality::Good);
+
+        // Introduce severe sustained loss (15%)
+        for i in 0..5 {
+            for _ in 0..85 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: start,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            seq += 15; // Skip 15 packets
+
+            let poll_time =
+                start + Duration::from_millis(500 * (i + BITRATE_HISTORY_SAMPLES * 2 + 1) as u64);
             monitor.poll(poll_time);
         }
 
         assert_eq!(
             state.quality(),
             StreamQuality::Bad,
-            "Quality should be Bad after sustained high packet loss"
+            "Quality should downgrade quickly to Bad with severe loss"
         );
     }
 
     #[test]
-    fn quality_recovers_after_sustained_good_period() {
+    fn quality_upgrades_slowly_from_bad() {
         let (mut monitor, state) = setup();
         let start = Instant::now();
         monitor.set_manual_pause(false);
 
-        // Force quality to Bad first
+        // Force to Bad state
         monitor.quality_score = 0.0;
         monitor.current_quality = StreamQuality::Bad;
         state
             .quality
             .store(StreamQuality::Bad as u8, Ordering::Relaxed);
 
-        // Now simulate a perfect stream to recover
-        let mut seq = 0;
-        for i in 0..30 {
-            // Poll for 15 seconds
+        // Simulate perfect stream
+        let mut seq = 0u64;
+        let mut poll_count = 0;
+        for i in 0..40 {
             for _ in 0..100 {
                 monitor.process_packet(
                     &TestPacket {
@@ -750,35 +945,41 @@ mod test {
             }
             let poll_time = start + Duration::from_millis(500 * (i + 1));
             monitor.poll(poll_time);
-            if state.quality() == StreamQuality::Good {
-                break;
+            poll_count += 1;
+
+            // Should not upgrade too quickly
+            if poll_count < monitor.config.upgrade_stability_count + MIN_SAMPLES_FOR_QUALITY as u32
+            {
+                if state.quality() != StreamQuality::Bad {
+                    panic!("Quality upgraded too quickly (at poll {})", poll_count);
+                }
             }
         }
 
         assert_eq!(
             state.quality(),
             StreamQuality::Good,
-            "Quality should recover to Good after a sustained period of no loss"
+            "Quality should eventually upgrade to Good with sustained good performance"
         );
     }
 
     #[test]
-    fn quality_reaches_excellent_after_prolonged_perfect_conditions() {
+    fn quality_requires_stability_for_excellent() {
         let (mut monitor, state) = setup();
         let start = Instant::now();
         monitor.set_manual_pause(false);
 
-        // Start at Good
-        monitor.quality_score = monitor.config.good_score_threshold;
-        monitor.poll(start);
-        assert_eq!(state.quality(), StreamQuality::Good);
+        // Start in Good state with high score
+        monitor.quality_score = 85.0;
+        monitor.current_quality = StreamQuality::Good;
+        state
+            .quality
+            .store(StreamQuality::Good as u8, Ordering::Relaxed);
 
-        // Simulate a perfect stream
-        let mut seq = 0;
-        for i in 0..60 {
-            // Poll for 30 seconds
+        // Simulate perfect stream
+        let mut seq = 0u64;
+        for i in 0..20 {
             for _ in 0..100 {
-                // Simulate ~1.92 Mbps bitrate
                 monitor.process_packet(
                     &TestPacket {
                         seq: seq.into(),
@@ -791,60 +992,155 @@ mod test {
             }
             let poll_time = start + Duration::from_millis(500 * (i + 1));
             monitor.poll(poll_time);
+
+            // Check it doesn't upgrade too fast
+            if i < monitor.config.upgrade_stability_count as u64 {
+                assert_eq!(
+                    state.quality(),
+                    StreamQuality::Good,
+                    "Should not upgrade to Excellent before stability requirement is met"
+                );
+            }
         }
 
         assert_eq!(
             state.quality(),
             StreamQuality::Excellent,
-            "Quality should become Excellent after a long period of perfect conditions"
+            "Quality should eventually reach Excellent with perfect sustained performance"
         );
     }
 
     #[test]
-    fn catastrophic_loss_triggers_immediate_penalty() {
+    fn catastrophic_loss_triggers_immediate_downgrade() {
         let (mut monitor, state) = setup();
         let start = Instant::now();
         monitor.set_manual_pause(false);
-        monitor.quality_score = 80.0; // Start with a high score
-        monitor.poll(start);
 
-        // Fill window with good packets
-        for i in 0..(LOSS_WINDOW_SIZE as u64) {
-            monitor.process_packet(
-                &TestPacket {
-                    seq: i.into(),
-                    at: start,
-                    ts: MediaTime::from_90khz(0),
-                },
-                1200,
-            );
+        // Start in Excellent state
+        monitor.quality_score = 95.0;
+        monitor.current_quality = StreamQuality::Excellent;
+        state
+            .quality
+            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
+
+        // Fill history
+        let mut seq = 0u64;
+        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
+            for _ in 0..100 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: start,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            let poll_time = start + Duration::from_millis(500 * (i as u64 + 1));
+            monitor.poll(poll_time);
         }
 
-        // Drop 30% of packets in one go
-        let mut seq = LOSS_WINDOW_SIZE as u64;
-        for _ in 0..((LOSS_WINDOW_SIZE as f32 * 0.7) as u64) {
-            monitor.process_packet(
-                &TestPacket {
-                    seq: seq.into(),
-                    at: start,
-                    ts: MediaTime::from_90khz(0),
-                },
-                1200,
-            );
-            seq += 1;
+        // Introduce catastrophic loss (30%)
+        for i in 0..3 {
+            for _ in 0..70 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: start,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            seq += 30; // Skip 30 packets
+
+            let poll_time =
+                start + Duration::from_millis(500 * (i + BITRATE_HISTORY_SAMPLES * 2 + 1) as u64);
+            monitor.poll(poll_time);
         }
-        seq += (LOSS_WINDOW_SIZE as f32 * 0.3) as u64;
 
-        monitor.poll(start + Duration::from_millis(500));
-
-        assert!(
-            monitor.quality_score < 50.0,
-            "Score should drop significantly due to catastrophic penalty"
-        );
         assert_eq!(
             state.quality(),
             StreamQuality::Bad,
-            "Quality should drop to Bad immediately after catastrophic loss"
+            "Catastrophic loss should trigger immediate downgrade"
+        );
+    }
+
+    #[test]
+    fn prevents_rapid_oscillation_after_downgrade() {
+        let (mut monitor, state) = setup();
+        let start = Instant::now();
+        monitor.set_manual_pause(false);
+
+        // Start in Excellent
+        monitor.quality_score = 95.0;
+        monitor.current_quality = StreamQuality::Excellent;
+        state
+            .quality
+            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
+
+        let mut seq = 0u64;
+
+        // Fill history
+        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
+            for _ in 0..100 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: start,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            monitor.poll(start + Duration::from_millis(500 * (i as u64 + 1)));
+        }
+
+        // Trigger a downgrade with brief bad quality
+        let downgrade_time = start + Duration::from_secs(20);
+        for _ in 0..3 {
+            for _ in 0..80 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: downgrade_time,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            seq += 20; // High loss
+            monitor.poll(downgrade_time);
+        }
+
+        let quality_after_downgrade = state.quality();
+        assert_ne!(quality_after_downgrade, StreamQuality::Excellent);
+
+        // Now simulate perfect conditions immediately after
+        for i in 0..15 {
+            for _ in 0..100 {
+                monitor.process_packet(
+                    &TestPacket {
+                        seq: seq.into(),
+                        at: downgrade_time,
+                        ts: MediaTime::from_90khz(0),
+                    },
+                    1200,
+                );
+                seq += 1;
+            }
+            monitor.poll(downgrade_time + Duration::from_millis(500 * (i + 1)));
+        }
+
+        // Should NOT return to Excellent quickly due to cooldown
+        assert_ne!(
+            state.quality(),
+            StreamQuality::Excellent,
+            "Should not upgrade back to Excellent too quickly after a downgrade"
         );
     }
 }
