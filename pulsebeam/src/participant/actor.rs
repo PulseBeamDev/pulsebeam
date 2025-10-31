@@ -108,7 +108,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 },
                 Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
                 Some((meta, hdr, pkt)) = self.core.downstream_allocator.next() => {
-                    self.core.handle_forward_rtp(meta, hdr, &pkt.value);
+                    self.core.handle_forward_rtp(meta, hdr, pkt);
                 },
                 now = stats_interval.tick() => {
                     self.core.poll_stats(now);

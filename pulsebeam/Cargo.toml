@@ -43,6 +43,7 @@ async-stream = "0.3.6"
 futures-concurrency = "7.6.3"
 tokio-stream = "0.1.17"
 rand.workspace = true
+arrayvec = "0.7.6"
 
 [dev-dependencies]
 turmoil = "0.6.6"

@@ -1,13 +1,13 @@
 pub mod jitter_buffer;
 pub mod monitor;
-pub mod rtp_rewriter;
+pub mod sequencer;
 
 use std::ops::{Deref, DerefMut};
 
 use str0m::{media::MediaTime, rtp::SeqNo};
 use tokio::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RtpPacket {
     inner: str0m::rtp::RtpPacket,
 }
@@ -29,6 +29,12 @@ impl DerefMut for RtpPacket {
 impl From<str0m::rtp::RtpPacket> for RtpPacket {
     fn from(value: str0m::rtp::RtpPacket) -> Self {
         Self { inner: value }
+    }
+}
+
+impl From<RtpPacket> for str0m::rtp::RtpPacket {
+    fn from(value: RtpPacket) -> Self {
+        value.inner
     }
 }
 

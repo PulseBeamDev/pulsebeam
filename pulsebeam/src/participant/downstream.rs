@@ -1,9 +1,9 @@
 use crate::participant::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::rtp::monitor::StreamQuality;
-use crate::rtp::rtp_rewriter::RtpRewriter;
+use crate::rtp::sequencer::RtpSequencer;
 use crate::rtp::{RtpPacket, TimingHeader};
 use futures::stream::{SelectAll, Stream, StreamExt};
-use pulsebeam_runtime::sync::spmc::{self, Slot};
+use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 ///
 /// It includes the packet and a boolean marker to indicate if this is the first
 /// packet after a simulcast layer switch.
-type TrackStreamItem = (Arc<TrackMeta>, TimingHeader, Arc<Slot<RtpPacket>>);
+type TrackStreamItem = (Arc<TrackMeta>, TimingHeader, RtpPacket);
 type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 
 /// Configuration that each downstream receiver listens to.
@@ -503,19 +503,24 @@ pub struct TrackReader {
 
     state: TrackReaderState,
     config: StreamConfig,
-    rewriter: RtpRewriter,
+    sequencer: RtpSequencer<RtpPacket>,
 }
 
 impl TrackReader {
     fn new(track: TrackReceiver, mut control_rx: watch::Receiver<StreamConfig>) -> Self {
         let config = *control_rx.borrow_and_update();
+        let sequencer = if track.meta.kind.is_video() {
+            RtpSequencer::video()
+        } else {
+            RtpSequencer::audio()
+        };
         let mut this = Self {
             meta: track.meta.clone(),
             track,
             control_rx,
             state: TrackReaderState::Paused,
             config,
-            rewriter: RtpRewriter::new(),
+            sequencer,
         };
         // seed initial state
         this.update_state(config);
@@ -526,6 +531,12 @@ impl TrackReader {
     pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
         loop {
             self.maybe_update_state();
+            if let Some((seq_no, ts, pkt)) = self.sequencer.pop() {
+                let mut hdr: TimingHeader = (&pkt).into();
+                hdr.rtp_ts = ts;
+                hdr.seq_no = seq_no;
+                return Some((self.meta.clone(), hdr, pkt));
+            }
 
             match self.state {
                 TrackReaderState::Paused => {
@@ -547,9 +558,7 @@ impl TrackReader {
                         res = receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    if let Some(pkt) = self.rewrite(pkt, false) {
-                                        return Some(pkt);
-                                    }
+                                    self.sequencer.push(pkt.value.clone(), false);
                                 },
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.meta.id, "Receiver lagged {n}, requesting keyframe");
@@ -586,9 +595,9 @@ impl TrackReader {
                             match res {
                                 Ok(pkt) => {
                                     tracing::debug!(track_id = %self.meta.id, "First packet from new layer received, switch complete");
-                                    self.state = TrackReaderState::Streaming { active_index };
-                                    if let Some(pkt) = self.rewrite(pkt, true) {
-                                        return Some(pkt);
+                                    if pkt.value.is_keyframe() {
+                                        self.sequencer.push(pkt.value.clone(), true);
+                                        self.state = TrackReaderState::Streaming { active_index };
                                     }
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
@@ -608,9 +617,7 @@ impl TrackReader {
                             match res {
                                 Ok(pkt) => {
                                     tracing::trace!(track_id = %self.meta.id, "Forwarding fallback packet during transition");
-                                    if let Some(pkt) = self.rewrite(pkt, false) {
-                                        return Some(pkt);
-                                    }
+                                    self.sequencer.push(pkt.value.clone(), true);
                                 }
                                 Err(_) => {
                                     // Fallback stream ended. We must commit to the new active stream.
@@ -697,15 +704,6 @@ impl TrackReader {
                 );
             }
         }
-    }
-
-    /// Rewrites the packet and wraps it for forwarding.
-    fn rewrite(&mut self, pkt: Arc<Slot<RtpPacket>>, is_switch: bool) -> Option<TrackStreamItem> {
-        let (seq_no, ts) = self.rewriter.rewrite(&pkt.value, is_switch)?;
-        let mut hdr: TimingHeader = (&pkt.value).into();
-        hdr.rtp_ts = ts;
-        hdr.seq_no = seq_no;
-        Some((self.meta.clone(), hdr, pkt))
     }
 
     /// Safely gets mutable references to two different elements in a slice.
