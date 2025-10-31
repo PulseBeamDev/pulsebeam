@@ -63,6 +63,8 @@ impl RtpPacket {
             return false;
         }
 
+        // TODO: add a header to define codec
+        return is_h264_keyframe_start(payload);
         // You might have a payload type map if you know what codec is in use.
         // But most WebRTC or RTP demuxers heuristically detect codec by payload content.
         if looks_like_h264(payload) {

@@ -594,8 +594,8 @@ impl TrackReader {
                         res = active_receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    tracing::debug!(track_id = %self.meta.id, "First packet from new layer received, switch complete");
                                     if pkt.value.is_keyframe() {
+                                        tracing::debug!(track_id = %self.meta.id, "First packet from new layer received, switch complete");
                                         self.sequencer.push(pkt.value.clone(), true);
                                         self.state = TrackReaderState::Streaming { active_index };
                                     }
