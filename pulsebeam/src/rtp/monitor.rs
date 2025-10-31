@@ -54,8 +54,8 @@ pub struct StreamState {
     /// If true, this stream is considered inactive, either manually or due to timeout.
     /// This state is separate from stream quality.
     inactive: Arc<AtomicBool>,
-    /// Estimated bitrate of the stream in bits per second.
-    bitrate_bps: Arc<AtomicU64>,
+    bitrate_bps_p99: Arc<AtomicU64>,
+    bitrate_bps_p50: Arc<AtomicU64>,
     /// The current assessed quality of the stream (includes stability).
     quality: Arc<AtomicU8>,
 }
@@ -64,7 +64,8 @@ impl StreamState {
     pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
         Self {
             inactive: Arc::new(AtomicBool::new(inactive)),
-            bitrate_bps: Arc::new(AtomicU64::new(bitrate_bps)),
+            bitrate_bps_p99: Arc::new(AtomicU64::new(bitrate_bps)),
+            bitrate_bps_p50: Arc::new(AtomicU64::new(bitrate_bps)),
             quality: Arc::new(AtomicU8::new(StreamQuality::Good as u8)),
         }
     }
@@ -75,8 +76,12 @@ impl StreamState {
     }
 
     /// Returns the estimated bitrate in bits per second.
-    pub fn bitrate_bps(&self) -> u64 {
-        self.bitrate_bps.load(Ordering::Relaxed)
+    pub fn bitrate_bps_p99(&self) -> u64 {
+        self.bitrate_bps_p99.load(Ordering::Relaxed)
+    }
+
+    pub fn bitrate_bps_p50(&self) -> u64 {
+        self.bitrate_bps_p50.load(Ordering::Relaxed)
     }
 
     /// Returns the current quality of the stream.
@@ -569,6 +574,11 @@ impl StreamMonitor {
         // Update stream quality based on metrics (now includes bitrate stability)
         let new_quality = self.determine_stream_quality();
         if new_quality != self.current_quality {
+            tracing::debug!(
+                "changed stream quality: {:?} -> {:?}",
+                self.current_quality,
+                new_quality
+            );
             self.current_quality = new_quality;
             self.shared_state
                 .quality
@@ -691,8 +701,14 @@ impl StreamMonitor {
 
                 if let Some(p99) = self.bitrate_history.percentile(0.99) {
                     self.shared_state
-                        .bitrate_bps
+                        .bitrate_bps_p99
                         .store(p99 as u64, Ordering::Relaxed);
+                }
+
+                if let Some(p50) = self.bitrate_history.percentile(0.50) {
+                    self.shared_state
+                        .bitrate_bps_p50
+                        .store(p50 as u64, Ordering::Relaxed);
                 }
             }
             self.bwe_interval_bytes = 0;
@@ -801,7 +817,7 @@ mod test {
         monitor.poll(final_time);
 
         let expected_bps = (1200.0 * 10.0 * 8.0) / 0.501;
-        let actual_bps = state.bitrate_bps() as f64;
+        let actual_bps = state.bitrate_bps_p99() as f64;
         assert!(
             (actual_bps - expected_bps).abs() < 1000.0,
             "Bitrate calculation should be accurate (expected: {}, actual: {})",

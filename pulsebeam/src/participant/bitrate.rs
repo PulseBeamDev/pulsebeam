@@ -154,7 +154,7 @@ mod tests {
         ];
 
         for bw in samples {
-            let desired = controller.update(bw, dt, now);
+            let desired = controller.update(bw, now);
             println!("Available BW: {}, Desired: {}", bw, desired);
             now += Duration::from_secs_f64(dt);
         }

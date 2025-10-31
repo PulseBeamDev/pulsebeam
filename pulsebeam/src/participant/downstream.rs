@@ -109,11 +109,11 @@ impl DownstreamAllocator {
             available_bandwidth: BitrateControllerConfig {
                 min_bitrate: Bitrate::kbps(100),
                 max_bitrate: Bitrate::mbps(20),
-                headroom: 0.95,                  // trust 95% of measured BW
-                tau: 0.5,                        // faster EMA → tracks within ~1 s
-                max_ramp_up: Bitrate::mbps(3),   // ~1.5 Mb per 0.5 s tick
-                max_ramp_down: Bitrate::mbps(6), // quick reaction to congestion
-                hysteresis_up: 1.0,              // no hysteresis — just smooth
+                headroom: 0.95, // trust 95% of measured BW
+                tau: 0.5,       // faster EMA → tracks within ~1 s
+                max_ramp_up: Bitrate::mbps(3),
+                max_ramp_down: Bitrate::mbps(6),
+                hysteresis_up: 1.0, // no hysteresis — just smooth
                 hysteresis_down: 1.0,
                 min_hold_time: Duration::from_millis(500),
             }
@@ -121,10 +121,10 @@ impl DownstreamAllocator {
             desired_bandwidth: BitrateControllerConfig {
                 min_bitrate: Bitrate::kbps(100),
                 max_bitrate: Bitrate::mbps(20),
-                headroom: 0.9,                         // slightly conservative
-                tau: 1.0,                              // ~2 s full response time
-                max_ramp_up: Bitrate::kbps(800),       // 400 kbps per 0.5 s tick
-                max_ramp_down: Bitrate::kbps(600),     // 300 kbps per tick
+                headroom: 0.9,
+                tau: 1.0,
+                max_ramp_up: Bitrate::mbps(2),
+                max_ramp_down: Bitrate::mbps(1),
                 hysteresis_up: 1.05,                   // 5 % threshold to upgrade
                 hysteresis_down: 0.92,                 // 8 % drop to downgrade
                 min_hold_time: Duration::from_secs(2), // hold 2 s before layer flip
@@ -271,17 +271,22 @@ impl DownstreamAllocator {
                     }
                 };
 
-                let desired_bitrate = desired.state.bitrate_bps();
+                let is_upgrade = track.is_upgrade(&current_receiver.rid, &desired.rid);
+                let desired_bitrate = if is_upgrade.unwrap_or_default() {
+                    (desired.state.bitrate_bps_p99() as f64 * 1.5) as u64
+                } else {
+                    desired.state.bitrate_bps_p99()
+                };
                 total_desired += desired_bitrate;
                 if total_desired < budget && (config.paused || desired.rid != current_receiver.rid)
                 {
                     upgraded = true;
-                    total_allocated += desired_bitrate;
+                    total_allocated += desired.state.bitrate_bps_p50();
                     config.target_rid = desired.rid;
                     config.paused = false;
                     state.update(|c| *c = config);
                 } else {
-                    total_allocated += current_receiver.state.bitrate_bps();
+                    total_allocated += current_receiver.state.bitrate_bps_p50();
                 }
             }
         }
@@ -289,7 +294,7 @@ impl DownstreamAllocator {
         // TODO: organize time dependency here
         let total_desired = self
             .desired_bandwidth
-            .update(total_desired.into(), Instant::now());
+            .update((total_desired as f64).into(), Instant::now());
         tracing::debug!(
             budget = %Bitrate::from(budget),
             allocated = %Bitrate::from(total_allocated),
