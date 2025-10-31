@@ -168,7 +168,7 @@ impl<T: PacketTiming + Debug> RtpSequencer<T> {
                 .wrapping_add(seq_offset)
                 .into();
 
-            let ts_in_90khz = packet.rtp_timestamp().rebase(VIDEO_FREQUENCY);
+            let ts_in_90khz = packet.rtp_timestamp().rebase(self.frequency);
             let ts_offset = ts_in_90khz
                 .numer()
                 .wrapping_sub(anchor.stream_start_ts_in.numer());
@@ -177,7 +177,7 @@ impl<T: PacketTiming + Debug> RtpSequencer<T> {
                     .rewritten_start_ts_out
                     .numer()
                     .wrapping_add(ts_offset),
-                VIDEO_FREQUENCY,
+                self.frequency,
             );
 
             self.last_output_seq = rewritten_seq;
@@ -222,17 +222,17 @@ impl<T: PacketTiming + Debug> RtpSequencer<T> {
         if buffer_full || (timeout && !self.buffer.is_empty()) {
             if let Some(anchor_packet) = self.buffer.peek_first_packet() {
                 let stream_start_seq_in = anchor_packet.seq_no();
-                let stream_start_ts_in = anchor_packet.rtp_timestamp().rebase(VIDEO_FREQUENCY);
+                let stream_start_ts_in = anchor_packet.rtp_timestamp().rebase(self.frequency);
                 let rewritten_start_seq_out = self.last_output_seq.wrapping_add(1).into();
 
                 let time_since_last = anchor_packet
                     .arrival_timestamp()
                     .saturating_duration_since(self.last_forward_time);
                 let time_gap_ticks =
-                    duration_to_ticks(time_since_last, VIDEO_FREQUENCY.get() as u64);
+                    duration_to_ticks(time_since_last, self.frequency.get() as u64);
                 let rewritten_start_ts_out = MediaTime::new(
                     self.last_output_ts.numer().wrapping_add(time_gap_ticks),
-                    VIDEO_FREQUENCY,
+                    self.frequency,
                 );
 
                 self.anchor = Some(Anchor {
