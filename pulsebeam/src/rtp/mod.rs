@@ -4,7 +4,10 @@ pub mod sequencer;
 
 use std::ops::{Deref, DerefMut};
 
-use str0m::{media::MediaTime, rtp::SeqNo};
+use str0m::{
+    media::MediaTime,
+    rtp::{SeqNo, Ssrc},
+};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -255,7 +258,7 @@ fn is_vp9_keyframe_start(payload: &[u8]) -> bool {
     b_bit && !p_bit
 }
 
-pub trait PacketTiming {
+pub trait PacketTiming: Clone {
     fn seq_no(&self) -> SeqNo;
     fn rtp_timestamp(&self) -> MediaTime;
     fn arrival_timestamp(&self) -> Instant;
@@ -283,7 +286,9 @@ pub trait Packet: PacketTiming {
     fn marker(&self) -> bool;
 
     /// Heuristically detect whether this RTP packet appears to start a keyframe.
-    fn is_keyframe(&self) -> bool;
+    fn is_keyframe_start(&self) -> bool;
+
+    fn ssrc(&self) -> Ssrc;
 }
 
 impl Packet for RtpPacket {
@@ -293,8 +298,13 @@ impl Packet for RtpPacket {
     }
 
     #[inline]
-    fn is_keyframe(&self) -> bool {
+    fn is_keyframe_start(&self) -> bool {
         self.is_keyframe()
+    }
+
+    #[inline]
+    fn ssrc(&self) -> Ssrc {
+        self.header.ssrc
     }
 }
 
@@ -328,7 +338,7 @@ impl<T: Packet> From<&T> for TimingHeader {
             rtp_ts: value.rtp_timestamp(),
             server_ts: value.arrival_timestamp(),
             marker: value.marker(),
-            is_keyframe: value.is_keyframe(),
+            is_keyframe: value.is_keyframe_start(),
         }
     }
 }

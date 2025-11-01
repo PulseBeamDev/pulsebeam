@@ -750,6 +750,7 @@ mod test {
     use super::*;
     use str0m::media::MediaTime;
 
+    #[derive(Clone)]
     struct TestPacket {
         seq: SeqNo,
         ts: MediaTime,
