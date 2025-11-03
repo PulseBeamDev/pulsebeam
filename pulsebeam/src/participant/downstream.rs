@@ -683,23 +683,36 @@ impl TrackReader {
 
         if self.state != next_state {
             tracing::debug!(track_id = %self.meta.id, "TrackReader state changed from {:?} to {:?}", self.state, next_state);
-            self.state = next_state;
 
-            // If we are starting a transition, request a keyframe on the new target layer.
-            if let TrackReaderState::Transitioning {
-                active_index,
-                fallback_index,
-            } = self.state
-            {
-                let fallback_receiver_rid = { self.track.simulcast[fallback_index].rid };
-                let active_receiver = &mut self.track.simulcast[active_index];
-                active_receiver.channel.reset();
-                active_receiver.request_keyframe(KeyframeRequestKind::Fir);
-                tracing::info!(track_id = %self.meta.id,
-                    "switch simulcast layer: {:?} -> {:?}",
-                    fallback_receiver_rid, active_receiver.rid
-                );
+            match (self.state, next_state) {
+                (
+                    _,
+                    TrackReaderState::Transitioning {
+                        active_index,
+                        fallback_index,
+                    },
+                ) => {
+                    let fallback_receiver_rid = { self.track.simulcast[fallback_index].rid };
+                    let active_receiver = &mut self.track.simulcast[active_index];
+                    active_receiver.channel.reset();
+                    active_receiver.request_keyframe(KeyframeRequestKind::Fir);
+                    tracing::info!(track_id = %self.meta.id,
+                        "switch simulcast layer: {:?} -> {:?}",
+                        fallback_receiver_rid, active_receiver.rid
+                    );
+                }
+                (TrackReaderState::Paused, TrackReaderState::Streaming { active_index }) => {
+                    let active_receiver = &mut self.track.simulcast[active_index];
+                    active_receiver.channel.reset();
+                    active_receiver.request_keyframe(KeyframeRequestKind::Fir);
+                    tracing::info!(track_id = %self.meta.id,
+                        "resuming simulcast layer: {:?}",
+                        active_receiver.rid
+                    );
+                }
+                _ => {}
             }
+            self.state = next_state;
         }
     }
 
