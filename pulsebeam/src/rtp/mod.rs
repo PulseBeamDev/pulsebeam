@@ -308,7 +308,7 @@ impl Packet for RtpPacket {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub struct TimingHeader {
     pub seq_no: SeqNo,
     pub rtp_ts: MediaTime,

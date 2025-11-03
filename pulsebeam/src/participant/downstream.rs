@@ -531,10 +531,7 @@ impl TrackReader {
     pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
         loop {
             self.maybe_update_state();
-            if let Some((seq_no, ts, pkt)) = self.sequencer.pop() {
-                let mut hdr: TimingHeader = (&pkt).into();
-                hdr.rtp_ts = ts;
-                hdr.seq_no = seq_no;
+            if let Some((hdr, pkt)) = self.sequencer.pop() {
                 return Some((self.meta.clone(), hdr, pkt));
             }
 
@@ -558,7 +555,7 @@ impl TrackReader {
                         res = receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    self.sequencer.push(pkt.value.clone(), false);
+                                    self.sequencer.push(&pkt.value);
                                 },
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.meta.id, "Receiver lagged {n}, requesting keyframe");
@@ -594,11 +591,7 @@ impl TrackReader {
                         res = active_receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    if pkt.value.is_keyframe() {
-                                        tracing::debug!(track_id = %self.meta.id, "First packet from new layer received, switch complete");
-                                        self.sequencer.push(pkt.value.clone(), true);
-                                        self.state = TrackReaderState::Streaming { active_index };
-                                    }
+                                    self.sequencer.push(&pkt.value);
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.meta.id, "New active stream lagged {n}, completing switch anyway");
@@ -617,7 +610,7 @@ impl TrackReader {
                             match res {
                                 Ok(pkt) => {
                                     tracing::trace!(track_id = %self.meta.id, "Forwarding fallback packet during transition");
-                                    self.sequencer.push(pkt.value.clone(), true);
+                                    self.sequencer.push(&pkt.value.clone());
                                 }
                                 Err(_) => {
                                     // Fallback stream ended. We must commit to the new active stream.
@@ -625,6 +618,10 @@ impl TrackReader {
                                 }
                             }
                         }
+                    }
+
+                    if self.sequencer.is_stable() {
+                        self.state = TrackReaderState::Streaming { active_index };
                     }
                 }
             }
