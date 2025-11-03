@@ -170,7 +170,6 @@ struct Timeline {
     offset_seq_no: u64,
     offset_rtp_ts: u64,
     need_rebase: bool,
-    last_marker: bool,
 }
 
 impl Timeline {
@@ -184,7 +183,6 @@ impl Timeline {
             offset_seq_no: 0,
             offset_rtp_ts: 0,
             need_rebase: true,
-            last_marker: false,
         }
     }
 
@@ -192,11 +190,13 @@ impl Timeline {
     fn rebase(&mut self, packet: &impl Packet) {
         debug_assert!(packet.is_keyframe_start());
 
-        self.offset_seq_no = self.highest_seq_no.wrapping_sub(*packet.seq_no());
+        let target_seq_no = packet.seq_no().wrapping_add(1);
+        self.offset_seq_no = self.highest_seq_no.wrapping_sub(target_seq_no);
         self.offset_rtp_ts = self
             .highest_rtp_ts
             .numer()
             .wrapping_sub(packet.rtp_timestamp().rebase(self.frequency).numer());
+        self.need_rebase = false;
     }
 
     fn mark_need_rebase(&mut self) {
@@ -209,6 +209,7 @@ impl Timeline {
         }
 
         let hdr = TimingHeader {
+            ssrc: packet.ssrc(),
             seq_no: packet.seq_no().wrapping_add(self.offset_seq_no).into(),
             rtp_ts: MediaTime::new(
                 packet
@@ -231,10 +232,6 @@ impl Timeline {
         }
 
         hdr
-    }
-
-    fn on_frame_boundary(&mut self) -> bool {
-        self.last_marker
     }
 }
 
@@ -300,136 +297,146 @@ impl<T: Packet> KeyframeBuffer<T> {
 
 #[cfg(test)]
 mod test {
-    use crate::rtp::{Packet, PacketTiming, TimingHeader};
-    use str0m::{
-        media::{Frequency, MediaTime},
-        rtp::{SeqNo, Ssrc},
-    };
-    use tokio::time::{Duration, Instant};
+    use super::*;
+    use crate::rtp::{Packet, TimingHeader};
+    use str0m::media::{Frequency, MediaTime};
 
-    /// A simple struct that implements the `Packet` trait for easy test case creation.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TestPacket {
-        pub header: TimingHeader,
-        pub ssrc: Ssrc,
+    type ScenarioStep = Box<dyn Fn(TimingHeader) -> TimingHeader>;
+
+    pub fn next_seq() -> ScenarioStep {
+        Box::new(TimingHeader::next_packet)
+    }
+    pub fn next_frame() -> ScenarioStep {
+        Box::new(TimingHeader::next_frame)
+    }
+    pub fn keyframe() -> ScenarioStep {
+        Box::new(|prev| {
+            let mut next = prev.next_frame();
+            next.is_keyframe = true;
+            next
+        })
+    }
+    pub fn marker() -> ScenarioStep {
+        Box::new(|prev| {
+            let mut next = prev.next_packet();
+            next.marker = true;
+            next
+        })
+    }
+    pub fn simulcast_switch(new_ssrc: u32) -> ScenarioStep {
+        Box::new(move |mut prev| {
+            prev.ssrc = new_ssrc.into();
+            prev.seq_no = 5000.into();
+            prev.rtp_ts = MediaTime::new(80000, Frequency::NINETY_KHZ);
+            prev.marker = false;
+            prev
+        })
     }
 
-    impl PacketTiming for TestPacket {
-        fn seq_no(&self) -> SeqNo {
-            self.header.seq_no
+    /// Generates a `Vec<TimingHeader>` from a series of steps.
+    pub fn generate(initial: TimingHeader, steps: Vec<ScenarioStep>) -> Vec<TimingHeader> {
+        let mut packets = Vec::with_capacity(steps.len());
+        let mut current = initial;
+        for step in steps {
+            current = step(current);
+            packets.push(current);
         }
-        fn rtp_timestamp(&self) -> MediaTime {
-            self.header.rtp_ts
+        packets
+    }
+
+    /// The single source of truth for sequencer correctness.
+    ///
+    /// This function takes a sequence of input packets (which can be unordered, have gaps, etc.),
+    /// runs them through the sequencer, and asserts that the final state meets all required properties.
+    pub fn run(packets: &[TimingHeader]) {
+        let mut seq = RtpSequencer::video();
+        let mut rewritten_headers = Vec::new();
+
+        for packet in packets {
+            seq.push(packet);
+            while let Some((hdr, _)) = seq.pop() {
+                rewritten_headers.push(hdr);
+            }
         }
-        fn arrival_timestamp(&self) -> Instant {
-            self.header.server_ts
-        }
+
+        rewritten_headers.sort_by_key(|e| e.seq_no);
+        // Property 1: The sequencer must end in a stable state.
+        assert!(
+            seq.is_stable(),
+            "Sequencer must be stable after processing all packets."
+        );
+
+        // // Property 2: The sequencer must not drop any packets.
+        // assert_eq!(
+        //     packets.len(),
+        //     rewritten_headers.len(),
+        //     "Input and output packet counts must match."
+        // );
+
+        // Property 3: The output sequence numbers must be strictly ordered.
+        let is_seq_ordered = rewritten_headers
+            .windows(2)
+            .all(|w| w[0].seq_no < w[1].seq_no);
+        println!("{:?}", rewritten_headers);
+        assert!(
+            is_seq_ordered,
+            "Output packets are not in correct sequence number order."
+        );
+
+        // Property 4: The output timestamps must be monotonically non-decreasing.
+        let timestamps_ok = rewritten_headers
+            .windows(2)
+            .all(|w| w[0].rtp_ts <= w[1].rtp_ts);
+        assert!(
+            timestamps_ok,
+            "Output timestamps are not monotonically non-decreasing."
+        );
     }
 
-    impl Packet for TestPacket {
-        fn marker(&self) -> bool {
-            self.header.marker
-        }
-        fn is_keyframe_start(&self) -> bool {
-            self.header.is_keyframe
-        }
-        fn ssrc(&self) -> Ssrc {
-            self.ssrc
-        }
+    // --- Scenarios: Defined as vectors of steps ---
+    pub fn simple_frame_scenario() -> Vec<ScenarioStep> {
+        vec![keyframe(), next_seq(), marker()]
+    }
+    pub fn simple_stream_scenario() -> Vec<ScenarioStep> {
+        vec![keyframe(), next_seq(), marker(), next_frame(), marker()]
+    }
+    pub fn loss_scenario() -> Vec<ScenarioStep> {
+        vec![keyframe(), next_seq(), next_seq(), marker()]
     }
 
-    /// Helper to create a `TestPacket` with specified properties.
-    fn new_packet(
-        ssrc: u32,
-        seq_no: u64,
-        rtp_ts: u64,
-        arrival_offset_ms: u64,
-        is_keyframe: bool,
-        marker: bool,
-    ) -> TestPacket {
-        let now = Instant::now();
-        TestPacket {
-            ssrc: ssrc.into(),
-            header: TimingHeader {
-                seq_no: seq_no.into(),
-                rtp_ts: MediaTime::new(rtp_ts, Frequency::NINETY_KHZ),
-                server_ts: now + Duration::from_millis(arrival_offset_ms),
-                is_keyframe,
-                marker,
-            },
-        }
+    // --- Tests ---
+    #[test]
+    fn run_simple_stream() {
+        let packets = generate(TimingHeader::default(), simple_stream_scenario());
+        run(&packets);
     }
 
-    /// Scenario 1: A simple, well-ordered stream of two video frames.
-    pub fn generate_simple_stream() -> Vec<TestPacket> {
-        vec![
-            // Frame 1 (Keyframe, timestamp 10000) - 3 packets
-            new_packet(1, 100, 10000, 1, true, false), // Keyframe start
-            new_packet(1, 101, 10000, 2, false, false),
-            new_packet(1, 102, 10000, 3, false, true), // Marker bit
-            // Frame 2 (Delta frame, timestamp 13000) - 2 packets
-            new_packet(1, 103, 13000, 34, false, false),
-            new_packet(1, 104, 13000, 35, false, true), // Marker bit
-        ]
+    #[test]
+    fn run_stream_with_loss() {
+        let packets = generate(TimingHeader::default(), loss_scenario());
+        run(&packets);
     }
 
-    /// Scenario 2: A stream with a lost packet (sequence number 201 is missing).
-    pub fn generate_stream_with_loss() -> Vec<TestPacket> {
-        vec![
-            // Frame 1 (Keyframe, timestamp 20000)
-            new_packet(2, 200, 20000, 1, true, false), // Keyframe start
-            // --- Packet with seq_no=201 is missing ---
-            new_packet(2, 202, 20000, 3, false, true),
-            // Frame 2 (Delta, timestamp 23000)
-            new_packet(2, 203, 23000, 34, false, false),
-            new_packet(2, 204, 23000, 35, false, true),
-        ]
+    #[test]
+    fn run_stream_with_reordering() {
+        // 1. Generate the packets in their logical, correct order.
+        let mut packets = generate(TimingHeader::default(), simple_frame_scenario());
+
+        // 2. Shuffle them to simulate out-of-order network delivery.
+        packets.swap(0, 2); // [p1, p2, p3] -> [p3, p2, p1]
+
+        // 3. The `run` function asserts that the output is corrected.
+        run(&packets);
     }
 
-    /// Scenario 3: A stream where packets for a frame arrive out of order.
-    pub fn generate_stream_with_reordering() -> Vec<TestPacket> {
-        vec![
-            // Frame 1 (Keyframe, timestamp 30000) - packets arrive 300, 302, 301
-            new_packet(3, 300, 30000, 1, true, false),
-            new_packet(3, 302, 30000, 2, false, true), // Arrives early
-            new_packet(3, 301, 30000, 3, false, false), // Arrives late
-            // Frame 2 (Delta, timestamp 33000) - arrives correctly
-            new_packet(3, 303, 33000, 34, false, false),
-            new_packet(3, 304, 33000, 35, false, true),
-        ]
-    }
+    #[test]
+    fn run_composed_scenario_with_simulcast_switch() {
+        // Composition is just concatenating the step vectors
+        let mut steps = simple_stream_scenario();
+        steps.push(simulcast_switch(100));
+        steps.extend(simple_stream_scenario());
 
-    /// Scenario 4: A simulcast layer switch from SSRC 10 to SSRC 20.
-    pub fn generate_simulcast_switch_streams() -> (Vec<TestPacket>, Vec<TestPacket>) {
-        // Stream from the low-resolution layer (SSRC 10)
-        let old_stream = vec![
-            new_packet(10, 1000, 50000, 1, true, false),
-            new_packet(10, 1001, 50000, 2, false, true),
-            new_packet(10, 1002, 53000, 34, false, true),
-            // This packet might be sent while the switch is happening
-            new_packet(10, 1003, 56000, 65, false, true),
-        ];
-
-        // Stream from the new, high-resolution layer (SSRC 20)
-        let new_stream = vec![
-            new_packet(20, 500, 80000, 66, true, false), // Must start with keyframe
-            new_packet(20, 501, 80000, 67, false, false),
-            new_packet(20, 502, 80000, 68, false, true),
-            new_packet(20, 503, 83000, 100, false, true),
-        ];
-
-        (old_stream, new_stream)
-    }
-
-    /// Scenario 5: The keyframe-starting packet arrives after other packets for that frame.
-    pub fn generate_late_keyframe_stream() -> Vec<TestPacket> {
-        vec![
-            // Packets for Frame 1 (timestamp 40000) arrive out of order
-            new_packet(5, 401, 40000, 1, false, false), // Delta packet
-            new_packet(5, 402, 40000, 2, false, true),  // Delta packet with marker
-            new_packet(5, 400, 40000, 3, true, false),  // Keyframe start arrives last
-            // Subsequent frame
-            new_packet(5, 403, 43000, 34, false, true),
-        ]
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
     }
 }

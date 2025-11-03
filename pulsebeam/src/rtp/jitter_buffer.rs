@@ -305,6 +305,7 @@ mod test {
         now: Instant,
     ) -> TimingHeader {
         TimingHeader {
+            ssrc: 1.into(),
             seq_no: seq_no.into(),
             rtp_ts: MediaTime::from_millis(rtp_ts_ms),
             server_ts: now + Duration::from_millis(arrival_offset_ms),
@@ -387,6 +388,7 @@ mod test {
         let freq = Frequency::new(1000).unwrap();
 
         let m1 = TimingHeader {
+            ssrc: 1.into(),
             seq_no: 1.into(),
             rtp_ts: MediaTime::new(0, freq),
             server_ts: now,
@@ -397,6 +399,7 @@ mod test {
         assert_eq!(jb.jitter_estimate, 0.0);
 
         let m2 = TimingHeader {
+            ssrc: 1.into(),
             seq_no: 2.into(),
             rtp_ts: MediaTime::new(30, freq),
             server_ts: now + Duration::from_millis(30),
@@ -407,6 +410,7 @@ mod test {
         assert!(jb.jitter_estimate < 1e-9);
 
         let m3 = TimingHeader {
+            ssrc: 1.into(),
             seq_no: 3.into(),
             rtp_ts: MediaTime::new(60, freq),
             server_ts: now + Duration::from_millis(70),
