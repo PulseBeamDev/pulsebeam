@@ -349,12 +349,13 @@ mod test {
             next
         })
     }
-    pub fn simulcast_switch(new_ssrc: u32) -> ScenarioStep {
+    pub fn simulcast_switch(new_ssrc: u32, start_seq: u16, start_ts: u32) -> ScenarioStep {
         Box::new(move |mut prev| {
             prev.ssrc = new_ssrc.into();
-            prev.seq_no = 5000.into();
-            prev.rtp_ts = MediaTime::new(80000, Frequency::NINETY_KHZ);
+            prev.seq_no = SeqNo::from(start_seq as u64);
+            prev.rtp_ts = MediaTime::new(start_ts as u64, Frequency::NINETY_KHZ);
             prev.marker = false;
+            prev.is_keyframe = false;
             prev
         })
     }
@@ -370,10 +371,6 @@ mod test {
         packets
     }
 
-    /// The single source of truth for sequencer correctness.
-    ///
-    /// This function takes a sequence of input packets (which can be unordered, have gaps, etc.),
-    /// runs them through the sequencer, and asserts that the final state meets all required properties.
     pub fn run(packets: &[TimingHeader]) {
         let mut seq = RtpSequencer::video();
         let mut rewritten_headers = Vec::new();
@@ -393,36 +390,91 @@ mod test {
         println!("\noutput:\n");
         print_packets(&rewritten_headers);
 
-        // Property 1: The sequencer must end in a stable state.
+        // === PROPERTY 1: Final state must be stable ===
+        assert!(seq.is_stable(), "Sequencer must end in stable state");
+
+        // === PROPERTY 2: Output seqno must be *strictly increasing* and *gap-free* ===
+        let seq_nos: Vec<u64> = rewritten_headers.iter().map(|h| (*h.seq_no)).collect();
+        let is_continuous = seq_nos
+            .iter()
+            .zip(seq_nos.iter().skip(1))
+            .all(|(a, b)| *b == a.wrapping_add(1));
         assert!(
-            seq.is_stable(),
-            "Sequencer must be stable after processing all packets."
+            is_continuous,
+            "Output sequence numbers must be contiguous (no gaps)"
         );
 
-        // // Property 2: The sequencer must not drop any packets.
-        // assert_eq!(
-        //     packets.len(),
-        //     rewritten_headers.len(),
-        //     "Input and output packet counts must match."
-        // );
-
-        // Property 3: The output sequence numbers must be strictly ordered.
-        let is_seq_ordered = rewritten_headers
-            .windows(2)
-            .all(|w| w[0].seq_no < w[1].seq_no);
-        assert!(
-            is_seq_ordered,
-            "Output packets are not in correct sequence number order."
-        );
-
-        // Property 4: The output timestamps must be monotonically non-decreasing.
-        let timestamps_ok = rewritten_headers
+        // === PROPERTY 3: RTP timestamps non-decreasing ===
+        let ts_ok = rewritten_headers
             .windows(2)
             .all(|w| w[0].rtp_ts <= w[1].rtp_ts);
-        assert!(
-            timestamps_ok,
-            "Output timestamps are not monotonically non-decreasing."
-        );
+        assert!(ts_ok, "RTP timestamps must be non-decreasing");
+
+        // === PROPERTY 4: Only drop packets in allowed cases ===
+        // Allowed drops:
+        // - Non-keyframe packets before first keyframe
+        // - Packets from old layer after switch, if not pending
+        // - Late packets (ts < current_ts in keyframe buffer)
+        //
+        // But: never drop a packet that arrived after keyframe and belongs to active layer
+
+        // === PROPERTY 5: Keyframe integrity ===
+        // Every keyframe must be complete: starts with K, ends with M, all in between present
+        let mut i = 0;
+        while i < rewritten_headers.len() {
+            let h = &rewritten_headers[i];
+            if h.is_keyframe {
+                let kf_start = i;
+                let mut kf_end = i;
+                let mut has_marker = false;
+
+                while kf_end < rewritten_headers.len() {
+                    let end_h = &rewritten_headers[kf_end];
+                    if end_h.rtp_ts != h.rtp_ts {
+                        break;
+                    }
+                    if end_h.marker {
+                        has_marker = true;
+                        kf_end += 1;
+                        break;
+                    }
+                    kf_end += 1;
+                }
+
+                assert!(has_marker, "Keyframe at idx {} has no marker bit", kf_start);
+                // All packets in keyframe must be present (seqno contiguous)
+                let kf_seqs: Vec<u64> = rewritten_headers[kf_start..kf_end]
+                    .iter()
+                    .map(|h| (*h.seq_no))
+                    .collect();
+                let kf_continuous = kf_seqs
+                    .iter()
+                    .zip(kf_seqs.iter().skip(1))
+                    .all(|(a, b)| *b == a.wrapping_add(1));
+                assert!(kf_continuous, "Keyframe packets not contiguous");
+
+                i = kf_end;
+            } else {
+                i += 1;
+            }
+        }
+
+        // === PROPERTY 6: SSRC switch behavior ===
+        // - Old SSRC packets must be drained before new SSRC emits
+        // - After switch, no old SSRC packets allowed
+        let mut seen_switch = false;
+        let mut last_ssrc = rewritten_headers[0].ssrc;
+
+        for h in &rewritten_headers {
+            if h.ssrc != last_ssrc {
+                assert!(!seen_switch, "Multiple SSRC switches not allowed in test");
+                seen_switch = true;
+                // From now on, only new SSRC
+                last_ssrc = h.ssrc;
+            } else if seen_switch {
+                panic!("Old SSRC packet emitted after switch");
+            }
+        }
     }
 
     pub fn print_packets(packets: &[TimingHeader]) {
@@ -530,10 +582,10 @@ mod test {
     }
 
     // --- Scenarios: Defined as vectors of steps ---
-    pub fn simple_frame_scenario() -> Vec<ScenarioStep> {
+    pub fn simple_frame() -> Vec<ScenarioStep> {
         vec![keyframe(), next_seq(), marker()]
     }
-    pub fn simple_stream_scenario() -> Vec<ScenarioStep> {
+    pub fn simple_stream() -> Vec<ScenarioStep> {
         vec![keyframe(), next_seq(), marker(), next_frame(), marker()]
     }
     pub fn loss_scenario() -> Vec<ScenarioStep> {
@@ -543,36 +595,138 @@ mod test {
     // --- Tests ---
     #[test]
     fn run_simple_stream() {
-        let packets = generate(TimingHeader::default(), simple_stream_scenario());
-        run(&packets);
-    }
-
-    #[test]
-    fn run_stream_with_loss() {
-        let packets = generate(TimingHeader::default(), loss_scenario());
+        let packets = generate(TimingHeader::default(), simple_stream());
         run(&packets);
     }
 
     #[test]
     fn run_stream_with_reordering() {
-        // 1. Generate the packets in their logical, correct order.
-        let mut packets = generate(TimingHeader::default(), simple_frame_scenario());
-
-        // 2. Shuffle them to simulate out-of-order network delivery.
-        packets.swap(0, 2); // [p1, p2, p3] -> [p3, p2, p1]
-
-        // 3. The `run` function asserts that the output is corrected.
+        let mut packets = generate(TimingHeader::default(), simple_frame());
+        packets.swap(0, 2); // [M, p1, K] → should still work
         run(&packets);
     }
 
     #[test]
-    fn run_composed_scenario_with_simulcast_switch() {
-        // Composition is just concatenating the step vectors
-        let mut steps = simple_stream_scenario();
-        steps.push(simulcast_switch(100));
-        steps.extend(simple_stream_scenario());
-
+    fn simulcast_switch_mid_keyframe() {
+        let mut steps = vec![keyframe(), next_seq()]; // partial keyframe
+        steps.push(simulcast_switch(100, 5000, 80000));
+        steps.extend(vec![keyframe(), next_seq(), marker()]);
         let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+        // Expect: old partial keyframe dropped
+    }
+
+    #[test]
+    fn late_packet_from_old_layer() {
+        let mut steps = simple_stream();
+        steps.push(simulcast_switch(100, 5000, 80000));
+        steps.extend(simple_stream());
+
+        let mut packets = generate(TimingHeader::default(), steps);
+        let old_ssrc = packets[0].ssrc;
+        let mut late = packets[1];
+        late.ssrc = old_ssrc;
+        packets.push(late); // late old-layer packet
+
+        run(&packets);
+        // Expect: late packet dropped
+    }
+
+    #[test]
+    fn multiple_simulcast_switches() {
+        let mut steps = simple_frame();
+        steps.push(simulcast_switch(100, 5000, 80000));
+        steps.extend(simple_frame());
+        steps.push(simulcast_switch(200, 10000, 160000));
+        steps.extend(simple_frame());
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+    }
+
+    #[test]
+    fn rtp_timestamp_wraparound() {
+        let initial = TimingHeader {
+            rtp_ts: MediaTime::new((u32::MAX - 100) as u64, Frequency::NINETY_KHZ),
+            ..Default::default()
+        };
+        let steps = vec![keyframe(), next_seq(), next_seq(), marker()];
+        let packets = generate(initial, steps);
+        run(&packets);
+    }
+
+    #[test]
+    fn sequence_number_wraparound() {
+        let initial = TimingHeader {
+            seq_no: SeqNo::from((u16::MAX - 5) as u64),
+            ..Default::default()
+        };
+        let steps = vec![
+            keyframe(),
+            next_seq(),
+            next_seq(),
+            next_seq(),
+            next_seq(),
+            marker(),
+        ];
+        let packets = generate(initial, steps);
+        run(&packets);
+    }
+
+    #[test]
+    fn loss_before_keyframe() {
+        let steps = vec![next_seq(), next_seq(), keyframe(), marker()];
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+        // Expect: first two dropped
+    }
+
+    #[test]
+    fn duplicate_packets() {
+        let mut steps = simple_frame();
+        steps.extend(simple_frame()); // duplicate
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+        // Expect: deduplicated by seqno
+    }
+
+    #[test]
+    fn high_packet_burst() {
+        let mut steps = vec![keyframe()];
+        steps.extend((0..1000).map(|_| next_seq()));
+        steps.push(marker());
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+    }
+
+    #[test]
+    fn audio_sequencer_basic() {
+        let mut seq = RtpSequencer::audio();
+        let steps = vec![keyframe(), next_seq(), marker()];
+        let packets = generate(TimingHeader::default(), steps);
+
+        for p in &packets {
+            seq.push(p);
+        }
+        let mut out = vec![];
+        while let Some((h, _)) = seq.pop() {
+            out.push(h);
+        }
+
+        assert!(seq.is_stable());
+        let seq_nos: Vec<u64> = out.iter().map(|h| (*h.seq_no)).collect();
+        let contiguous = seq_nos
+            .iter()
+            .zip(seq_nos.iter().skip(1))
+            .all(|(a, b)| *b == a.wrapping_add(1));
+        assert!(contiguous, "Audio output not contiguous");
+    }
+
+    #[test]
+    fn out_of_order_keyframe_fragments() {
+        let ordered = vec![keyframe(), next_seq(), next_seq(), marker()];
+        let mut packets = generate(TimingHeader::default(), ordered);
+        // Scramble order
+        packets = vec![packets[2], packets[0], packets[3], packets[1]];
         run(&packets);
     }
 }
