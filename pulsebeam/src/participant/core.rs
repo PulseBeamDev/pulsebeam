@@ -165,12 +165,14 @@ impl ParticipantCore {
 
         let mut api = self.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
+            tracing::warn!(track_id = %track_meta.id, ssrc = %pkt.header.ssrc, "Dropping RTP for invalid stream mid");
             return;
         };
 
         let inner: str0m::rtp::RtpPacket = pkt.into();
 
-        let _ = writer.write_rtp(
+        tracing::trace!("forward rtp: {}", hdr.seq_no);
+        if let Err(err) = writer.write_rtp(
             pt,
             hdr.seq_no,
             hdr.rtp_ts.numer() as u32,
@@ -179,7 +181,9 @@ impl ParticipantCore {
             inner.header.ext_vals,
             true,
             inner.payload,
-        );
+        ) {
+            tracing::warn!(track_id = %track_meta.id, ssrc = %hdr.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+        }
     }
 
     fn handle_event(&mut self, event: Event) {

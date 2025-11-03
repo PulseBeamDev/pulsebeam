@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::{SeqNo, Ssrc};
 
@@ -38,22 +39,25 @@ impl<T: Packet> RtpSequencer<T> {
     }
 
     pub fn push(&mut self, packet: &T) {
-        let packet = packet.clone();
+        let cloned = packet.clone();
+        tracing::trace!("[{}] push: seqno={:?}", self.state, packet.seq_no());
         let new_state = match std::mem::replace(&mut self.state, SequencerState::Invalid) {
-            SequencerState::New(state) => state.process(packet),
-            SequencerState::Stable(state) => state.process(packet),
-            SequencerState::Switching(state) => state.process(packet),
+            SequencerState::New(state) => state.process(cloned),
+            SequencerState::Stable(state) => state.process(cloned),
+            SequencerState::Switching(state) => state.process(cloned),
             SequencerState::Invalid => unreachable!(),
         };
         self.state = new_state;
     }
 
     pub fn pop(&mut self) -> Option<(TimingHeader, T)> {
-        match &mut self.state {
+        let item = match &mut self.state {
             SequencerState::Stable(state) => state.poll(),
             SequencerState::Switching(state) => state.poll(),
             _ => None,
-        }
+        }?;
+        tracing::trace!("[{}] pop seqno={:?}", self.state, item.0.seq_no);
+        Some(item)
     }
 }
 
@@ -62,6 +66,17 @@ enum SequencerState<T> {
     Stable(StableState<T>),
     Switching(SwitchingState<T>),
     Invalid,
+}
+
+impl<T: Packet> Display for SequencerState<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::New(_) => f.write_str("new"),
+            Self::Stable(_) => f.write_str("stable"),
+            Self::Switching(_) => f.write_str("switching"),
+            Self::Invalid => f.write_str("invalid"),
+        }
+    }
 }
 
 struct NewState<T> {
@@ -96,9 +111,12 @@ struct StableState<T> {
 
 impl<T: Packet> StableState<T> {
     fn process(mut self, packet: T) -> SequencerState<T> {
-        if packet.ssrc() != self.active_ssrc {
+        if packet.ssrc() == self.active_ssrc {
+            self.pending.replace(packet);
+            SequencerState::Stable(self)
+        } else {
             let new_ssrc = packet.ssrc();
-            self.keyframe_buffer.clear();
+            self.keyframe_buffer.reset(packet.rtp_timestamp());
             self.keyframe_buffer.push(packet);
             SequencerState::Switching(SwitchingState {
                 pending: self.pending,
@@ -107,9 +125,6 @@ impl<T: Packet> StableState<T> {
                 new_ssrc,
                 old_ssrc: self.active_ssrc,
             })
-        } else {
-            self.pending.replace(packet);
-            SequencerState::Stable(self)
         }
     }
 
@@ -168,10 +183,11 @@ struct Timeline {
 
 impl Timeline {
     fn new(frequency: Frequency) -> Self {
+        let base_seq_no: u8 = rand::random();
         let base_ts: u32 = rand::random();
         Self {
             frequency,
-            highest_seq_no: SeqNo::new(),
+            highest_seq_no: SeqNo::from(base_seq_no as u64),
             highest_rtp_ts: MediaTime::new(base_ts.into(), frequency),
 
             offset_seq_no: 0,
@@ -184,8 +200,8 @@ impl Timeline {
     fn rebase(&mut self, packet: &impl Packet) {
         debug_assert!(packet.is_keyframe_start());
 
-        let target_seq_no = packet.seq_no().wrapping_add(1);
-        self.offset_seq_no = self.highest_seq_no.wrapping_sub(target_seq_no);
+        let target_seq_no = self.highest_seq_no.wrapping_add(1);
+        self.offset_seq_no = target_seq_no.wrapping_sub(*packet.seq_no());
         self.offset_rtp_ts = self
             .highest_rtp_ts
             .numer()
@@ -292,7 +308,7 @@ impl<T: Packet> KeyframeBuffer<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::rtp::{Packet, TimingHeader};
+    use crate::rtp::TimingHeader;
     use str0m::media::{Frequency, MediaTime};
 
     type ScenarioStep = Box<dyn Fn(TimingHeader) -> TimingHeader>;

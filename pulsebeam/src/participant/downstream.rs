@@ -610,7 +610,7 @@ impl TrackReader {
                             match res {
                                 Ok(pkt) => {
                                     tracing::trace!(track_id = %self.meta.id, "Forwarding fallback packet during transition");
-                                    self.sequencer.push(&pkt.value.clone());
+                                    self.sequencer.push(&pkt.value);
                                 }
                                 Err(_) => {
                                     // Fallback stream ended. We must commit to the new active stream.
