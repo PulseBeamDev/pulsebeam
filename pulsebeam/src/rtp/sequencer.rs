@@ -143,7 +143,7 @@ impl<T: Packet> SwitchingState<T> {
                     timeline: self.timeline,
                 });
             }
-        } else {
+        } else if packet.ssrc() == self.old_ssrc {
             self.pending.replace(packet);
         }
 
