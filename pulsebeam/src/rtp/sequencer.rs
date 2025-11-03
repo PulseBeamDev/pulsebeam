@@ -41,12 +41,16 @@ impl<T: Packet> RtpSequencer<T> {
     pub fn push(&mut self, packet: &T) {
         let cloned = packet.clone();
         tracing::trace!("[{}] push: seqno={:?}", self.state, packet.seq_no());
+        let state_id = self.state.id();
         let new_state = match std::mem::replace(&mut self.state, SequencerState::Invalid) {
             SequencerState::New(state) => state.process(cloned),
             SequencerState::Stable(state) => state.process(cloned),
             SequencerState::Switching(state) => state.process(cloned),
             SequencerState::Invalid => unreachable!(),
         };
+        if state_id != new_state.id() {
+            tracing::info!("updated sequencer state to {}", new_state);
+        }
         self.state = new_state;
     }
 
@@ -62,19 +66,31 @@ impl<T: Packet> RtpSequencer<T> {
 }
 
 enum SequencerState<T> {
+    Invalid,
     New(NewState<T>),
     Stable(StableState<T>),
     Switching(SwitchingState<T>),
-    Invalid,
 }
 
 impl<T: Packet> Display for SequencerState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Invalid => f.write_str("invalid"),
             Self::New(_) => f.write_str("new"),
             Self::Stable(_) => f.write_str("stable"),
             Self::Switching(_) => f.write_str("switching"),
-            Self::Invalid => f.write_str("invalid"),
+        }
+    }
+}
+
+impl<T: Packet> SequencerState<T> {
+    #[inline]
+    fn id(&self) -> usize {
+        match self {
+            Self::Invalid => 0,
+            Self::New(_) => 1,
+            Self::Stable(_) => 2,
+            Self::Switching(_) => 3,
         }
     }
 }

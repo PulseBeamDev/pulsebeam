@@ -284,8 +284,6 @@ impl UdpTransport {
             segment_size: Some(batch.segment_size),
             src_ip: None,
         };
-        tracing::trace!("try_send_batch: {}", transmit.contents.len());
-
         let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
             self.state.try_send((&self.sock).into(), &transmit)
         });
