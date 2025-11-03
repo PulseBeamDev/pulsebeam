@@ -382,14 +382,14 @@ impl TimingHeader {
         }
     }
 
-    fn next_packet(mut self) -> Self {
+    pub fn next_packet(mut self) -> Self {
         self.seq_no = self.seq_no.wrapping_add(1).into();
         self.marker = false;
         self.is_keyframe = false;
         self
     }
 
-    fn next_frame(self) -> Self {
+    pub fn next_frame(self) -> Self {
         let mut next = self.next_packet();
         let new_ts = next.rtp_ts.numer() + 3000;
         next.rtp_ts = MediaTime::new(new_ts, Frequency::NINETY_KHZ);

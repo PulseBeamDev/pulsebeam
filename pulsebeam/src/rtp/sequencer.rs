@@ -57,12 +57,6 @@ impl<T: Packet> RtpSequencer<T> {
     }
 }
 
-struct StreamState {
-    ssrc: Ssrc,
-    seq_no: SeqNo,
-    rtp_ts: MediaTime,
-}
-
 enum SequencerState<T> {
     New(NewState<T>),
     Stable(StableState<T>),
@@ -352,6 +346,9 @@ mod test {
         let mut seq = RtpSequencer::video();
         let mut rewritten_headers = Vec::new();
 
+        println!("input:\n");
+        print_packets(packets);
+
         for packet in packets {
             seq.push(packet);
             while let Some((hdr, _)) = seq.pop() {
@@ -360,6 +357,10 @@ mod test {
         }
 
         rewritten_headers.sort_by_key(|e| e.seq_no);
+
+        println!("\noutput:\n");
+        print_packets(&rewritten_headers);
+
         // Property 1: The sequencer must end in a stable state.
         assert!(
             seq.is_stable(),
@@ -377,7 +378,6 @@ mod test {
         let is_seq_ordered = rewritten_headers
             .windows(2)
             .all(|w| w[0].seq_no < w[1].seq_no);
-        println!("{:?}", rewritten_headers);
         assert!(
             is_seq_ordered,
             "Output packets are not in correct sequence number order."
@@ -391,6 +391,110 @@ mod test {
             timestamps_ok,
             "Output timestamps are not monotonically non-decreasing."
         );
+    }
+
+    pub fn print_packets(packets: &[TimingHeader]) {
+        use std::cmp::max;
+
+        println!("\n--- Packet Inspector ({} packets) ---", packets.len());
+
+        if packets.is_empty() {
+            println!("(No packets to display)");
+            println!("{}", "-".repeat(80));
+            return;
+        }
+
+        // Determine max width for each column dynamically
+        let mut max_idx = 3;
+        let mut max_ssrc = 4; // "SSRC"
+        let mut max_seq = 6; // "Seq No"
+        let mut max_dseq = 6; // "Δ Seq"
+        let mut max_ts = 9; // "Timestamp"
+        let mut max_dts = 6; // "Δ TS"
+
+        let mut rows = Vec::new();
+
+        for (i, current_header) in packets.iter().enumerate() {
+            let (delta_seq_str, delta_ts_str) = if i > 0 {
+                let prev_header = &packets[i - 1];
+                let delta_seq = current_header.seq_no.wrapping_sub(*prev_header.seq_no);
+                let delta_ts = current_header
+                    .rtp_ts
+                    .numer()
+                    .wrapping_sub(prev_header.rtp_ts.numer());
+                (
+                    format!("{:+}", delta_seq as i64),
+                    format!("{:+}", delta_ts as i64),
+                )
+            } else {
+                ("(base)".to_string(), "(base)".to_string())
+            };
+
+            let mut flags = String::new();
+            if current_header.is_keyframe {
+                flags.push('K');
+            }
+            if current_header.marker {
+                flags.push('M');
+            }
+
+            let ssrc = format!("{}", current_header.ssrc);
+            let seq = format!("{}", current_header.seq_no);
+            let ts = format!("{}", current_header.rtp_ts.numer());
+
+            // Track column width
+            max_idx = max(max_idx, i.to_string().len());
+            max_ssrc = max(max_ssrc, ssrc.len());
+            max_seq = max(max_seq, seq.len());
+            max_dseq = max(max_dseq, delta_seq_str.len());
+            max_ts = max(max_ts, ts.len());
+            max_dts = max(max_dts, delta_ts_str.len());
+
+            rows.push((i, ssrc, seq, delta_seq_str, ts, delta_ts_str, flags));
+        }
+
+        // Print header
+        println!(
+            "{:<width_idx$} | {:<width_ssrc$} | {:<width_seq$} | {:<width_dseq$} | {:<width_ts$} | {:<width_dts$} | {}",
+            "Idx",
+            "SSRC",
+            "Seq No",
+            "Δ Seq",
+            "Timestamp",
+            "Δ TS",
+            "Flags",
+            width_idx = max_idx,
+            width_ssrc = max_ssrc,
+            width_seq = max_seq,
+            width_dseq = max_dseq,
+            width_ts = max_ts,
+            width_dts = max_dts,
+        );
+
+        let total_width = max_idx + max_ssrc + max_seq + max_dseq + max_ts + max_dts + 6 * 3 + 7; // spacing & dividers
+        println!("{}", "-".repeat(total_width));
+
+        // Print rows
+        for (i, ssrc, seq, dseq, ts, dts, flags) in rows {
+            println!(
+                "{:<width_idx$} | {:<width_ssrc$} | {:<width_seq$} | {:<width_dseq$} | {:<width_ts$} | {:<width_dts$} | {}",
+                i,
+                ssrc,
+                seq,
+                dseq,
+                ts,
+                dts,
+                flags,
+                width_idx = max_idx,
+                width_ssrc = max_ssrc,
+                width_seq = max_seq,
+                width_dseq = max_dseq,
+                width_ts = max_ts,
+                width_dts = max_dts,
+            );
+        }
+
+        println!("{}", "-".repeat(total_width));
     }
 
     // --- Scenarios: Defined as vectors of steps ---
