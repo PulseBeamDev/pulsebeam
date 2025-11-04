@@ -31,7 +31,7 @@ const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The size of the circular buffer used for the sliding window packet loss calculation.
 const LOSS_WINDOW_SIZE: usize = 256;
 /// Number of bitrate samples to track for stability measurement
-const BITRATE_HISTORY_SAMPLES: usize = 16; // ~3-5 seconds of data
+const BITRATE_HISTORY_SAMPLES: usize = 128;
 /// Minimum number of samples before making quality decisions
 const MIN_SAMPLES_FOR_QUALITY: usize = 8; // ~2 seconds minimum
 

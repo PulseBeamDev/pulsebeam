@@ -120,10 +120,10 @@ impl ControllerActor {
             .clear_codecs()
             .set_rtp_mode(true)
             // TODO: enable bwe
-            // .enable_bwe(Some(str0m::bwe::Bitrate::mbps(3)))
+            .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300)))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            .set_ice_lite(false);
+            .set_ice_lite(true);
         let codec_config = rtc_config.codec_config();
         codec_config.enable_opus(true);
         // codec_config.enable_vp8(true);
