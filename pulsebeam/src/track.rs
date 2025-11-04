@@ -8,7 +8,7 @@ use tokio::time::Instant;
 use crate::rtp::{
     RtpPacket,
     jitter_buffer::{self, PollResult},
-    monitor::{HealthThresholds, QualityMonitorConfig, StreamMonitor, StreamState},
+    monitor::{QualityMonitorConfig, StreamMonitor, StreamState},
 };
 
 #[derive(Debug, Clone)]

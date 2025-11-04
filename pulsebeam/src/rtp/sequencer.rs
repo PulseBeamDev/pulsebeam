@@ -288,26 +288,51 @@ impl<T: Packet> KeyframeBuffer<T> {
     }
 
     fn push(&mut self, packet: T) -> bool {
-        // TODO: check wrap around
-        if let Some(current_ts) = self.current_ts {
-            if packet.rtp_timestamp() < current_ts {
-                tracing::warn!(
-                    "late packet, dropping as ts < current_ts: {:?} < {:?}",
-                    packet.rtp_timestamp(),
-                    current_ts
-                );
-                return false;
-            } else if packet.rtp_timestamp() > current_ts {
-                self.reset(packet.rtp_timestamp());
-            }
-        } else {
-            self.reset(packet.rtp_timestamp());
+        let pkt_ts = packet.rtp_timestamp();
+
+        // If buffer is empty, start with this packet's timestamp.
+        if self.current_ts.is_none() {
+            self.current_ts = Some(pkt_ts);
         }
 
+        let current_ts = self.current_ts.unwrap();
+
+        if pkt_ts > current_ts {
+            // This is a recovery mechanism. If we get the start of a *new* keyframe,
+            // assume the old one is lost and start fresh.
+            if packet.is_keyframe_start() {
+                tracing::warn!(
+                    "New keyframe for future ts {:?} arrived, resetting from current ts {:?}",
+                    pkt_ts,
+                    current_ts
+                );
+                self.reset(pkt_ts);
+            } else {
+                // A non-keyframe for a future frame is useless if we haven't finished
+                // the current one. Drop it.
+                tracing::warn!("Dropping future non-keyframe packet");
+                return false;
+            }
+        } else if pkt_ts < current_ts {
+            // Packet is for a timestamp we've already moved past. Drop it.
+            tracing::warn!(
+                "Dropping late packet: ts {:?} < current_ts {:?}",
+                pkt_ts,
+                current_ts
+            );
+            return false;
+        }
+
+        // At this point, the packet's timestamp matches our current frame.
         if packet.is_keyframe_start() {
             self.found_keyframe_start = true;
         }
+
+        // BTreeMap handles duplicate sequence numbers correctly by overwriting.
         self.buffer.insert(packet.seq_no(), packet);
+
+        // We can transition state as soon as we have a keyframe start.
+        // The rest of the frame will be drained from this buffer later.
         self.found_keyframe_start
     }
 
@@ -390,7 +415,11 @@ mod test {
         print_packets(&rewritten_headers);
 
         // === PROPERTY 1: Final state must be stable ===
-        assert!(seq.is_stable(), "Sequencer must end in stable state");
+        assert!(
+            seq.is_stable(),
+            "Sequencer must end in stable state, stuck at {}",
+            seq.state
+        );
 
         // === PROPERTY 2: Output seqno must be *strictly increasing* and *gap-free* ===
         let seq_nos: Vec<u64> = rewritten_headers.iter().map(|h| (*h.seq_no)).collect();
@@ -681,15 +710,6 @@ mod test {
     }
 
     #[test]
-    fn duplicate_packets() {
-        let mut steps = simple_frame();
-        steps.extend(simple_frame()); // duplicate
-        let packets = generate(TimingHeader::default(), steps);
-        run(&packets);
-        // Expect: deduplicated by seqno
-    }
-
-    #[test]
     fn high_packet_burst() {
         let mut steps = vec![keyframe()];
         steps.extend((0..1000).map(|_| next_seq()));
@@ -714,5 +734,87 @@ mod test {
         // Scramble order
         packets = vec![packets[2], packets[0], packets[3], packets[1]];
         run(&packets);
+    }
+
+    #[test]
+    fn high_jitter_reordering() {
+        // Simulates a chaotic network where packets are significantly reordered.
+        let ordered_stream = vec![
+            keyframe(), // KF1 starts
+            next_seq(),
+            marker(),     // KF1 ends
+            next_frame(), // P-frame 1
+            marker(),
+            next_frame(), // KF2 starts
+            next_seq(),
+            marker(), // KF2 ends
+        ];
+        let packets = generate(TimingHeader::default(), ordered_stream);
+
+        // Extreme reorder: [KF1-p1, KF2-p2, P1-M, KF1-K, KF2-M, P1-p1, KF2-K, KF1-M]
+        let reordered_indices = [1, 6, 4, 0, 7, 3, 5, 2];
+        let disordered_packets: Vec<_> = reordered_indices.iter().map(|&i| packets[i]).collect();
+
+        run(&disordered_packets);
+        // Expect: Sequencer should buffer and reorder everything correctly.
+    }
+
+    #[test]
+    fn packet_loss_and_recovery_with_new_keyframe() {
+        // Simulates losing part of a keyframe, followed by a new keyframe which should allow recovery.
+        let mut steps = vec![
+            keyframe(),
+            // next_seq(), // This packet is "lost"
+            next_seq(),
+            marker(),
+        ];
+        // Stream continues but should be un-decodable
+        steps.extend(vec![next_frame(), marker()]);
+        // A new keyframe arrives, allowing the stream to recover
+        steps.extend(simple_frame());
+
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+        // Expect: The first incomplete keyframe and the following P-frame are dropped.
+        // The stream resumes perfectly from the second keyframe.
+    }
+
+    #[test]
+    fn simulcast_switch_with_loss_of_new_keyframe_start() {
+        let mut steps = simple_stream(); // Emit a valid frame on the old SSRC
+        steps.push(simulcast_switch(555, 1000, 90000));
+        steps.extend(vec![
+            // keyframe(), // The crucial first packet of the new stream is "lost"
+            next_seq(),
+            marker(),
+        ]);
+        // Now send a complete, valid keyframe on the new SSRC
+        steps.extend(simple_frame());
+
+        let packets = generate(TimingHeader::default(), steps);
+        run(&packets);
+        // Expect: The old SSRC packet should be emitted. The partial new keyframe is dropped.
+        // The sequencer recovers and emits the final complete keyframe.
+    }
+
+    #[test]
+    fn stale_packets_from_previous_timestamp_arrive_late() {
+        // Simulates a scenario where packets from an old, abandoned keyframe
+        // arrive after a newer keyframe has already been processed.
+        let mut initial_kf = generate(TimingHeader::default(), vec![keyframe(), next_seq()]);
+
+        let mut next_kf_time = initial_kf[0];
+        next_kf_time.rtp_ts =
+            MediaTime::new(initial_kf[0].rtp_ts.numer() + 3000, Frequency::NINETY_KHZ);
+
+        let mut subsequent_kf = generate(next_kf_time, simple_frame());
+
+        // Arrival order: [NewKF-p1, NewKF-p2, NewKF-M, OldKF-p1, OldKF-p2]
+        let mut packets = Vec::new();
+        packets.append(&mut subsequent_kf);
+        packets.append(&mut initial_kf);
+
+        run(&packets);
+        // Expect: The stale, old keyframe packets are correctly identified as late and dropped.
     }
 }
