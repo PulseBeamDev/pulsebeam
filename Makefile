@@ -24,6 +24,8 @@ DOWNLOAD ?= 2mbit
 # Additional options
 JITTER ?= 10ms
 CORRUPTION ?= 0%
+REORDER_PROB  := 25%
+REORDER_CORR  := 50%
 
 
 # --- Targets ---
@@ -115,48 +117,51 @@ net-bad: net-verify net-clear
 	@echo "Applying BAD NETWORK simulation to $(IFACE)"
 	@echo "  Latency:      $(LATENCY) ± $(JITTER)"
 	@echo "  Packet Loss:  $(PACKET_LOSS)"
-	@echo "  Corruption:   $(CORRUPTION)"
+	@echo "  Reordering:   $(REORDER_PROB) with $(REORDER_CORR) correlation" # <-- New line
 	@echo "  Upload:       $(UPLOAD)"
 	@echo "  Download:     $(DOWNLOAD)"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "→ Loading IFB module..."
-	@sudo modprobe ifb numifbs=1 || { echo "ERROR: Failed to load ifb module"; exit 1; }
-	@sleep 0.5
-	@echo "→ Verifying $(IFB_IFACE) exists..."
-	@ip link show $(IFB_IFACE) >/dev/null 2>&1 || { \
-		echo "ERROR: $(IFB_IFACE) not found after loading module."; \
-		echo "Try: sudo ip link add $(IFB_IFACE) type ifb"; \
-		exit 1; \
-	}
-	@echo "→ Activating $(IFB_IFACE)..."
-	@sudo ip link set dev $(IFB_IFACE) up
-	@echo "→ Redirecting ingress traffic to $(IFB_IFACE)..."
-	@sudo tc qdisc add dev $(IFACE) handle ffff: ingress
-	@sudo tc filter add dev $(IFACE) parent ffff: protocol all u32 match u32 0 0 \
-		action mirred egress redirect dev $(IFB_IFACE)
+	# ... your modprobe and ip link setup ...
 	@echo "→ Applying egress (upload) rules to $(IFACE)..."
 	@sudo tc qdisc add dev $(IFACE) root netem \
 		delay $(LATENCY) $(JITTER) \
 		loss $(PACKET_LOSS) \
 		corrupt $(CORRUPTION) \
-		rate $(UPLOAD)
+		rate $(UPLOAD) \
+		reorder $(REORDER_PROB) $(REORDER_CORR) # <-- MODIFIED LINE
+
 	@echo "→ Applying ingress (download) rules to $(IFB_IFACE)..."
 	@sudo tc qdisc add dev $(IFB_IFACE) root netem \
 		delay $(LATENCY) $(JITTER) \
 		loss $(PACKET_LOSS) \
 		corrupt $(CORRUPTION) \
-		rate $(DOWNLOAD)
+		rate $(DOWNLOAD) \
+		reorder $(REORDER_PROB) $(REORDER_CORR) # <-- MODIFIED LINE
 	@echo ""
 	@echo "✓ Bad network simulation is ACTIVE (both directions)"
 	@echo "  Run 'make net-clear' to restore normal network"
 
-# --- Moderate Network ---
-net-moderate:
-	@$(MAKE) net-simple LATENCY=50ms PACKET_LOSS=1% JITTER=5ms UPLOAD=5mbit
+# Simulates a high-latency, cross-continent link like Seattle <-> Frankfurt
+net-cross-region:
+	@$(MAKE) net-bad \
+		LATENCY="100ms" \
+		JITTER="200ms" \
+		PACKET_LOSS="0%" \
+		UPLOAD="5mbit" \
+		DOWNLOAD="20mbit" \
+		REORDER_PROB="55%" \
+		REORDER_CORR="10%"
 
-# --- Extreme Network ---
-net-extreme:
-	@$(MAKE) net-simple LATENCY=300ms PACKET_LOSS=10% JITTER=50ms UPLOAD=500kbit
+# A preset for simulating a more moderate, domestic bad connection
+net-regional-bad:
+	@$(MAKE) net-bad \
+		LATENCY="25ms" \
+		JITTER="30ms" \
+		PACKET_LOSS="1%" \
+		UPLOAD="2mbit" \
+		DOWNLOAD="10mbit" \
+		REORDER_PROB="5%" \
+		REORDER_CORR="50%"
 
 # --- Clear All Network Simulation ---
 net-clear:
