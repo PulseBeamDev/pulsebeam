@@ -215,8 +215,8 @@ impl ParticipantCore {
     }
 
     fn update_desired_bitrate(&mut self) {
-        let (_, desired_bitrate) = self.downstream_allocator.update_allocations();
-        self.rtc.bwe().set_desired_bitrate(desired_bitrate);
+        let (_, desired) = self.downstream_allocator.update_allocations();
+        self.rtc.bwe().set_desired_bitrate(desired);
     }
 
     fn handle_media_added(&mut self, media: MediaAdded) {
