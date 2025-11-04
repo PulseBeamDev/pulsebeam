@@ -88,6 +88,11 @@ perf: profile
 
 
 # --- Network Simulation ---
+net-setup:
+	# needed for setting up ingress
+	modprobe ifb numifbs=1
+	# ip link set dev ifb0 up
+
 net-simple: net-verify net-clear
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "Applying SIMPLE BAD NETWORK to $(IFACE) (egress only)"
