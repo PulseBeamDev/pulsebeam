@@ -124,8 +124,8 @@ impl Default for QualityMonitorConfig {
 
             // How much each metric contributes to the overall health score for an interval.
             loss_weight: 0.5,
-            jitter_weight: 0.3,
-            bitrate_cv_weight: 0.2,
+            jitter_weight: 0.5,
+            bitrate_cv_weight: 0.0,
 
             // Stability controls
             upgrade_stability_count: 6, // ~3 seconds of sustained good performance to upgrade
