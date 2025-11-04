@@ -371,8 +371,7 @@ mod test {
         packets
     }
 
-    pub fn run(packets: &[TimingHeader]) {
-        let mut seq = RtpSequencer::video();
+    fn run_with(mut seq: RtpSequencer<TimingHeader>, packets: &[TimingHeader]) {
         let mut rewritten_headers = Vec::new();
 
         println!("input:\n");
@@ -471,6 +470,10 @@ mod test {
                 assert_ne!(a, c, "Multiple SSRC switches not allowed in test");
             }
         }
+    }
+
+    pub fn run(packets: &[TimingHeader]) {
+        run_with(RtpSequencer::video(), packets);
     }
 
     pub fn print_packets(packets: &[TimingHeader]) {
@@ -696,25 +699,11 @@ mod test {
 
     #[test]
     fn audio_sequencer_basic() {
-        let mut seq = RtpSequencer::audio();
         let steps = vec![keyframe(), next_seq(), marker()];
         let packets = generate(TimingHeader::default(), steps);
+        let seq = RtpSequencer::audio();
 
-        for p in &packets {
-            seq.push(p);
-        }
-        let mut out = vec![];
-        while let Some((h, _)) = seq.pop() {
-            out.push(h);
-        }
-
-        assert!(seq.is_stable());
-        let seq_nos: Vec<u64> = out.iter().map(|h| (*h.seq_no)).collect();
-        let contiguous = seq_nos
-            .iter()
-            .zip(seq_nos.iter().skip(1))
-            .all(|(a, b)| *b == a.wrapping_add(1));
-        assert!(contiguous, "Audio output not contiguous");
+        run_with(seq, &packets);
     }
 
     #[test]
