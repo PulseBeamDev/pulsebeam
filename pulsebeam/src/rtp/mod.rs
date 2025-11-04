@@ -4,7 +4,10 @@ pub mod sequencer;
 
 use std::ops::{Deref, DerefMut};
 
-use str0m::{media::MediaTime, rtp::SeqNo};
+use str0m::{
+    media::{Frequency, MediaTime},
+    rtp::{SeqNo, Ssrc},
+};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -255,7 +258,7 @@ fn is_vp9_keyframe_start(payload: &[u8]) -> bool {
     b_bit && !p_bit
 }
 
-pub trait PacketTiming {
+pub trait PacketTiming: Clone {
     fn seq_no(&self) -> SeqNo;
     fn rtp_timestamp(&self) -> MediaTime;
     fn arrival_timestamp(&self) -> Instant;
@@ -283,7 +286,9 @@ pub trait Packet: PacketTiming {
     fn marker(&self) -> bool;
 
     /// Heuristically detect whether this RTP packet appears to start a keyframe.
-    fn is_keyframe(&self) -> bool;
+    fn is_keyframe_start(&self) -> bool;
+
+    fn ssrc(&self) -> Ssrc;
 }
 
 impl Packet for RtpPacket {
@@ -293,13 +298,19 @@ impl Packet for RtpPacket {
     }
 
     #[inline]
-    fn is_keyframe(&self) -> bool {
+    fn is_keyframe_start(&self) -> bool {
         self.is_keyframe()
+    }
+
+    #[inline]
+    fn ssrc(&self) -> Ssrc {
+        self.header.ssrc
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub struct TimingHeader {
+    pub ssrc: Ssrc,
     pub seq_no: SeqNo,
     pub rtp_ts: MediaTime,
     pub server_ts: Instant,
@@ -321,14 +332,42 @@ impl PacketTiming for TimingHeader {
     }
 }
 
+impl Packet for TimingHeader {
+    fn marker(&self) -> bool {
+        self.marker
+    }
+
+    fn is_keyframe_start(&self) -> bool {
+        self.is_keyframe
+    }
+
+    fn ssrc(&self) -> Ssrc {
+        self.ssrc
+    }
+}
+
+impl Default for TimingHeader {
+    fn default() -> Self {
+        Self {
+            ssrc: 1.into(),
+            seq_no: 100.into(),
+            rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
+            marker: false,
+            is_keyframe: false,
+            server_ts: Instant::now(),
+        }
+    }
+}
+
 impl<T: Packet> From<&T> for TimingHeader {
     fn from(value: &T) -> Self {
         Self {
+            ssrc: value.ssrc(),
             seq_no: value.seq_no(),
             rtp_ts: value.rtp_timestamp(),
             server_ts: value.arrival_timestamp(),
             marker: value.marker(),
-            is_keyframe: value.is_keyframe(),
+            is_keyframe: value.is_keyframe_start(),
         }
     }
 }
@@ -339,8 +378,21 @@ impl TimingHeader {
             seq_no,
             rtp_ts,
             server_ts: arrival_ts,
-            marker: false,
-            is_keyframe: false,
+            ..Default::default()
         }
+    }
+
+    pub fn next_packet(mut self) -> Self {
+        self.seq_no = self.seq_no.wrapping_add(1).into();
+        self.marker = false;
+        self.is_keyframe = false;
+        self
+    }
+
+    pub fn next_frame(self) -> Self {
+        let mut next = self.next_packet();
+        let new_ts = next.rtp_ts.numer() + 3000;
+        next.rtp_ts = MediaTime::new(new_ts, Frequency::NINETY_KHZ);
+        next
     }
 }
