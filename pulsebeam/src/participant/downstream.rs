@@ -281,12 +281,12 @@ impl DownstreamAllocator {
                 if total_desired < budget && (config.paused || desired.rid != current_receiver.rid)
                 {
                     upgraded = true;
-                    total_allocated += desired.state.bitrate_bps_p50();
+                    total_allocated += desired.state.bitrate_bps_p99();
                     config.target_rid = desired.rid;
                     config.paused = false;
                     state.update(|c| *c = config);
                 } else {
-                    total_allocated += current_receiver.state.bitrate_bps_p50();
+                    total_allocated += current_receiver.state.bitrate_bps_p99();
                 }
             }
         }
@@ -294,7 +294,7 @@ impl DownstreamAllocator {
         // TODO: organize time dependency here
         let total_desired = self
             .desired_bandwidth
-            .update((total_desired as f64).into(), Instant::now());
+            .update((total_desired).into(), Instant::now());
         tracing::trace!(
             budget = %Bitrate::from(budget),
             allocated = %Bitrate::from(total_allocated),
