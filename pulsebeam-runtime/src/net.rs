@@ -72,15 +72,15 @@ impl<'a> RecvPacketBatch<'a> {
 
         for (i, m) in self.meta.iter().take(count).enumerate() {
             let buf = &self.slices[i];
-            let segments = m.len / m.stride;
-            for seg in 0..segments {
-                let start = seg * m.stride;
-                let end = start + m.stride;
+            let mut offset = 0;
+            while offset < m.len {
+                let seg_len = std::cmp::min(m.stride, m.len - offset);
                 out.push(RecvPacket {
                     src: m.addr,
                     dst: local_addr,
-                    buf: Bytes::copy_from_slice(&buf[start..end]),
+                    buf: Bytes::copy_from_slice(&buf[offset..offset + seg_len]),
                 });
+                offset += seg_len;
             }
         }
     }
