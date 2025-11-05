@@ -11,6 +11,27 @@ use crate::rtp::{
     monitor::{QualityMonitorConfig, StreamMonitor, StreamState},
 };
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum SimulcastQuality {
+    Undefined = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+}
+
+impl std::fmt::Debug for SimulcastQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let txt = match self {
+            Self::Undefined => "undefined",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        };
+        f.write_str(txt)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyframeRequest {
     pub request: str0m::media::KeyframeRequest,
@@ -27,6 +48,7 @@ pub struct TrackMeta {
 #[derive(Clone, Debug)]
 pub struct SimulcastReceiver {
     pub meta: Arc<TrackMeta>,
+    pub quality: SimulcastQuality,
     pub rid: Option<Rid>,
     pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
@@ -53,6 +75,7 @@ impl SimulcastReceiver {
 #[derive(Debug)]
 pub struct SimulcastSender {
     pub rid: Option<Rid>,
+    pub quality: SimulcastQuality,
     pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
     pub last_keyframe_requested_at: Option<Instant>,
     pub monitor: StreamMonitor,
@@ -151,12 +174,20 @@ impl TrackReceiver {
 
     pub fn higher_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
         let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        self.simulcast.get(idx.saturating_sub(1))
+        let higher = self.simulcast.get(idx.saturating_sub(1))?;
+        let current = self.by_rid(rid)?;
+
+        debug_assert!(higher.quality > current.quality);
+        Some(higher)
     }
 
     pub fn lower_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
         let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        self.simulcast.get(idx.saturating_add(1))
+        let lower = self.simulcast.get(idx.saturating_add(1))?;
+        let current = self.by_rid(rid)?;
+
+        debug_assert!(lower.quality < current.quality);
+        Some(lower)
     }
 
     pub fn lowest_quality(&self) -> &SimulcastReceiver {
@@ -190,15 +221,17 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         let (tx, rx) = spmc::channel(capacity);
         let (keyframe_tx, keyframe_rx) = watch::channel(None);
 
-        let bitrate = match (meta.kind, rid) {
-            (MediaKind::Audio, _) => 64_000,
-            (MediaKind::Video, None) => 500_000,
-            (MediaKind::Video, Some(r)) if r.starts_with('f') => 800_000,
-            (MediaKind::Video, Some(r)) if r.starts_with('h') => 300_000,
-            (MediaKind::Video, Some(r)) if r.starts_with('q') => 150_000,
+        let (quality, bitrate) = match (meta.kind, rid) {
+            (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000),
+            (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000),
+            (MediaKind::Video, Some(r)) if r.starts_with('f') => (SimulcastQuality::High, 800_000),
+            (MediaKind::Video, Some(r)) if r.starts_with('h') => {
+                (SimulcastQuality::Medium, 300_000)
+            }
+            (MediaKind::Video, Some(r)) if r.starts_with('q') => (SimulcastQuality::Low, 150_000),
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");
-                500_000
+                (SimulcastQuality::Undefined, 500_000)
             }
         };
         let stream_state = StreamState::new(true, bitrate);
@@ -211,6 +244,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
 
         senders.push(SimulcastSender {
             rid,
+            quality,
             channel: tx,
             keyframe_requests: keyframe_rx,
             last_keyframe_requested_at: None,
@@ -219,12 +253,15 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         });
         receivers.push(SimulcastReceiver {
             meta: meta.clone(),
+            quality,
             rid,
             channel: rx,
             keyframe_requester: keyframe_tx,
             state: stream_state,
         });
     }
+    senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
+    receivers.sort_by_key(|e| std::cmp::Reverse(e.quality));
 
     (
         TrackSender {
