@@ -144,12 +144,12 @@ net-bad: net-verify net-clear
 # Simulates a high-latency, cross-continent link like Seattle <-> Frankfurt
 net-cross-region:
 	@$(MAKE) net-bad \
-		LATENCY="100ms" \
-		JITTER="200ms" \
+		LATENCY="80ms" \
+		JITTER="100ms" \
 		PACKET_LOSS="0%" \
 		UPLOAD="5mbit" \
 		DOWNLOAD="20mbit" \
-		REORDER_PROB="55%" \
+		REORDER_PROB="25%" \
 		REORDER_CORR="10%"
 
 # A preset for simulating a more moderate, domestic bad connection

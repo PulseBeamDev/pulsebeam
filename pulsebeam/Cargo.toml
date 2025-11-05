@@ -51,10 +51,6 @@ turmoil = "0.6.6"
 [build-dependencies]
 prost-build = "0.14.1"
 
-# [patch.crates-io]
-# str0m = { path = "../str0m" }
-# [patch."https://github.com/algesten/str0m.git"]
-# str0m = { path = "../../str0m" }
 
 # Windows-specific str0m override
 [target.'cfg(windows)'.dependencies]
