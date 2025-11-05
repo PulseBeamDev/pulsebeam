@@ -2910,8 +2910,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "str0m"
 version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26890ff5b60e33eb8bedcf44792fc459c8f348ecbf2658edb19477571e547ac2"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.11.1#3e8302543bf06fdbc31efed0b89f60afc0c164de"
 dependencies = [
  "combine",
  "crc",
@@ -2931,8 +2930,7 @@ dependencies = [
 [[package]]
 name = "str0m-wincrypto"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "457d36c2642d30dc703e84a1eadd04d62af7d46c821da3937040eea8a52395fd"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.11.1#3e8302543bf06fdbc31efed0b89f60afc0c164de"
 dependencies = [
  "tracing",
  "windows",
