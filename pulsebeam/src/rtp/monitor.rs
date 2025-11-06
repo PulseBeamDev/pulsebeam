@@ -21,6 +21,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
+use str0m::bwe::Bitrate;
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
@@ -49,7 +50,6 @@ pub struct HealthThresholds {
 pub struct QualityMonitorConfig {
     pub loss: HealthThresholds,
     pub jitter_ms: HealthThresholds,
-    pub bitrate_cv_percent: HealthThresholds,
 
     // --- Score Engine Parameters ---
     pub score_max: f32,
@@ -75,7 +75,6 @@ pub struct QualityMonitorConfig {
     // --- Metric Weights ---
     pub loss_weight: f32,
     pub jitter_weight: f32,
-    pub bitrate_cv_weight: f32,
 
     // --- Stability Controls ---
     /// Minimum consecutive polls at threshold before upgrading quality
@@ -95,10 +94,6 @@ impl Default for QualityMonitorConfig {
             jitter_ms: HealthThresholds {
                 bad: 30.0,
                 good: 20.0,
-            },
-            bitrate_cv_percent: HealthThresholds {
-                bad: 35.0,
-                good: 25.0,
             },
 
             // Score engine dynamics
@@ -125,7 +120,6 @@ impl Default for QualityMonitorConfig {
             // How much each metric contributes to the overall health score for an interval.
             loss_weight: 0.5,
             jitter_weight: 0.5,
-            bitrate_cv_weight: 0.0,
 
             // Stability controls
             upgrade_stability_count: 6, // ~3 seconds of sustained good performance to upgrade
@@ -415,12 +409,11 @@ pub struct StreamMonitor {
     // Smoothed metrics (exponential moving average)
     smoothed_loss_percent: f32,
     smoothed_jitter_ms: f32,
-    smoothed_bitrate_cv_percent: f32,
+    smoothed_bitrate_bps: f64,
 
     // Raw metrics (for debugging)
     raw_loss_percent: f32,
     raw_jitter_ms: u32,
-    raw_bitrate_cv_percent: f32,
 
     current_quality: StreamQuality,
     quality_score: f32,
@@ -449,10 +442,9 @@ impl StreamMonitor {
             bitrate_history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
             smoothed_loss_percent: 0.0,
             smoothed_jitter_ms: 0.0,
-            smoothed_bitrate_cv_percent: 0.0,
+            smoothed_bitrate_bps: 0.0,
             raw_loss_percent: 0.0,
             raw_jitter_ms: 0,
-            raw_bitrate_cv_percent: 0.0,
             current_quality: StreamQuality::Good,
             quality_score: 50.0, // Start in middle
             consecutive_upgrade_eligible_polls: 0,
@@ -490,13 +482,13 @@ impl StreamMonitor {
         let new_quality = self.determine_stream_quality(now);
         if new_quality != self.current_quality {
             tracing::info!(
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, jitter: {}ms, cv: {:.1}%)",
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, jitter: {}ms, bitrate: {})",
                 self.current_quality,
                 new_quality,
                 self.quality_score,
                 self.smoothed_loss_percent,
                 self.smoothed_jitter_ms as u32,
-                self.smoothed_bitrate_cv_percent
+                Bitrate::from(self.smoothed_bitrate_bps),
             );
             self.current_quality = new_quality;
             self.shared_state
@@ -519,10 +511,7 @@ impl StreamMonitor {
         self.bitrate_history.reset();
         self.smoothed_loss_percent = 0.0;
         self.smoothed_jitter_ms = 0.0;
-        self.smoothed_bitrate_cv_percent = 0.0;
-        self.raw_loss_percent = 0.0;
         self.raw_jitter_ms = 0;
-        self.raw_bitrate_cv_percent = 0.0;
         self.bwe_interval_bytes = 0;
         self.quality_score = 50.0;
         self.current_quality = StreamQuality::Good;
@@ -545,10 +534,6 @@ impl StreamMonitor {
         self.smoothed_jitter_ms as u32
     }
 
-    pub fn get_bitrate_cv_percent(&self) -> f32 {
-        self.smoothed_bitrate_cv_percent
-    }
-
     fn determine_inactive_state(&self, now: Instant) -> bool {
         self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
     }
@@ -567,14 +552,9 @@ impl StreamMonitor {
 
         let loss_health = normalize(self.smoothed_loss_percent, self.config.loss);
         let jitter_health = normalize(self.smoothed_jitter_ms, self.config.jitter_ms);
-        let cv_health = normalize(
-            self.smoothed_bitrate_cv_percent,
-            self.config.bitrate_cv_percent,
-        );
 
-        let instantaneous_health = (loss_health * self.config.loss_weight)
-            + (jitter_health * self.config.jitter_weight)
-            + (cv_health * self.config.bitrate_cv_weight);
+        let instantaneous_health =
+            (loss_health * self.config.loss_weight) + (jitter_health * self.config.jitter_weight);
 
         // Check hard limits
         let final_health = if self.shared_state.bitrate_bps() < self.config.min_usable_bitrate_bps {
@@ -685,6 +665,7 @@ impl StreamMonitor {
                 // Average tends to suffer from outliers, so less than 1.0 multiplier to account
                 // for this.
                 let bps = p95.max(0.9 * self.bwe_bps_ewma);
+                self.smoothed_bitrate_bps = bps;
                 self.shared_state
                     .bitrate_bps
                     .store(bps as u64, Ordering::Relaxed);
@@ -698,7 +679,6 @@ impl StreamMonitor {
         // Update raw metrics
         self.raw_loss_percent = self.loss_window.calculate_loss_percent();
         self.raw_jitter_ms = (self.jitter_estimate * 1000.0) as u32;
-        self.raw_bitrate_cv_percent = self.bitrate_history.coefficient_of_variation_percent();
 
         // Apply exponential moving average for smoothing
         let alpha = self.config.metric_smoothing_factor;
@@ -707,15 +687,12 @@ impl StreamMonitor {
             // First sample - initialize
             self.smoothed_loss_percent = self.raw_loss_percent;
             self.smoothed_jitter_ms = self.raw_jitter_ms as f32;
-            self.smoothed_bitrate_cv_percent = self.raw_bitrate_cv_percent;
         } else {
             // Exponential moving average: smoothed = alpha * raw + (1 - alpha) * smoothed
             self.smoothed_loss_percent =
                 alpha * self.raw_loss_percent + (1.0 - alpha) * self.smoothed_loss_percent;
             self.smoothed_jitter_ms =
                 alpha * (self.raw_jitter_ms as f32) + (1.0 - alpha) * self.smoothed_jitter_ms;
-            self.smoothed_bitrate_cv_percent = alpha * self.raw_bitrate_cv_percent
-                + (1.0 - alpha) * self.smoothed_bitrate_cv_percent;
         }
     }
 
