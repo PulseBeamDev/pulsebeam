@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::rtp::{
-    RtpPacket,
+    Packet, RtpPacket,
     jitter_buffer::{self, PollResult},
     monitor::{QualityMonitorConfig, StreamMonitor, StreamState},
 };
@@ -72,34 +72,56 @@ impl SimulcastReceiver {
     }
 }
 
+/// Represents the state of a keyframe request.
+#[derive(Debug, Default)]
+enum KeyframeRequestState {
+    /// No keyframe has been requested.
+    #[default]
+    Idle,
+    /// A keyframe has been requested, and we are waiting for the debounce duration to pass.
+    Debouncing { requested_at: Instant },
+}
+
 #[derive(Debug)]
 pub struct SimulcastSender {
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
-    pub keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
-    pub last_keyframe_requested_at: Option<Instant>,
     pub monitor: StreamMonitor,
     channel: spmc::Sender<RtpPacket>,
     jb: jitter_buffer::JitterBuffer<RtpPacket>,
+
+    keyframe_request_state: KeyframeRequestState,
+    keyframe_debounce_duration: Duration,
+    keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
 }
 
 impl SimulcastSender {
+    /// Checks for and returns a keyframe request if the debounce conditions are met.
     pub fn get_keyframe_request(&mut self) -> Option<KeyframeRequest> {
-        if !self.keyframe_requests.has_changed().unwrap_or(false) {
-            return None;
-        }
-
-        let binding = self.keyframe_requests.borrow_and_update();
-        let update = binding.as_ref()?;
-
-        let now = Instant::now();
-        if let Some(last_request_time) = self.last_keyframe_requested_at {
-            if now.duration_since(last_request_time) < Duration::from_secs(1) {
-                return None;
+        // Check if a new request signal has arrived.
+        if self.keyframe_requests.has_changed().unwrap_or(false) {
+            // Borrow and update to mark this change as seen.
+            let binding = self.keyframe_requests.borrow_and_update();
+            if binding.is_some() {
+                // A new request came in. Start or reset the debounce timer.
+                self.keyframe_request_state = KeyframeRequestState::Debouncing {
+                    requested_at: Instant::now(),
+                };
             }
         }
-        self.last_keyframe_requested_at = Some(now);
-        Some(update.clone())
+
+        // Check if we are in the debouncing state and if the timer has elapsed.
+        if let KeyframeRequestState::Debouncing { requested_at } = self.keyframe_request_state
+            && Instant::now().duration_since(requested_at) >= self.keyframe_debounce_duration
+        {
+            // Debounce duration has passed. Transition to Idle and issue the request.
+            self.keyframe_request_state = KeyframeRequestState::Idle;
+
+            // Return the latest request from the channel.
+            return self.keyframe_requests.borrow().clone();
+        }
+
+        None
     }
 
     pub fn push(&mut self, pkt: RtpPacket) {
@@ -122,6 +144,12 @@ impl SimulcastSender {
     }
 
     fn forward(&mut self, pkt: RtpPacket) {
+        if let KeyframeRequestState::Debouncing { .. } = self.keyframe_request_state
+            && pkt.is_keyframe_start()
+        {
+            tracing::debug!("Keyframe received, cancelling pending request.");
+            self.keyframe_request_state = KeyframeRequestState::Idle;
+        }
         self.monitor
             .process_packet(&pkt, pkt.payload.len() + pkt.header.header_len);
         self.channel.send(pkt);
@@ -247,7 +275,8 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             quality,
             channel: tx,
             keyframe_requests: keyframe_rx,
-            last_keyframe_requested_at: None,
+            keyframe_request_state: KeyframeRequestState::default(),
+            keyframe_debounce_duration: Duration::from_millis(300),
             monitor,
             jb: jitter_buffer::JitterBuffer::new(jbc),
         });
