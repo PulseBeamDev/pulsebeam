@@ -612,8 +612,12 @@ impl TrackReader {
                                     tracing::trace!(track_id = %self.meta.id, "Forwarding fallback packet during transition");
                                     self.sequencer.push(&pkt.value);
                                 }
-                                Err(_) => {
-                                    // Fallback stream ended. We must commit to the new active stream.
+                                Err(spmc::RecvError::Lagged(n)) => {
+                                    tracing::warn!(track_id = %self.meta.id, "Fallback stream lagged by {n} packets during transition. Committing to active stream.");
+                                    self.state = TrackReaderState::Streaming { active_index };
+                                }
+                                Err(spmc::RecvError::Closed) => {
+                                    tracing::debug!(track_id = %self.meta.id, "Fallback stream closed during transition. Committing to active stream.");
                                     self.state = TrackReaderState::Streaming { active_index };
                                 }
                             }
