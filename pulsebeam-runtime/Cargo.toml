@@ -43,3 +43,6 @@ metrics = "0.24.2"
 [dev-dependencies]
 rcgen = "0.14.4"
 criterion = { version = "0.7.0", features = ["async", "async_tokio"] }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"

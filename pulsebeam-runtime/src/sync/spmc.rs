@@ -7,15 +7,11 @@
 //! - Lag detection and safe catching-up
 //! - Async wait via `tokio::Notify`
 
+use super::Arc;
+use super::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwapOption;
 use crossbeam_utils::CachePadded;
-use std::{
-    fmt::Debug,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-};
+use std::fmt::Debug;
 use tokio::sync::Notify;
 
 /// Errors returned by a receiver.

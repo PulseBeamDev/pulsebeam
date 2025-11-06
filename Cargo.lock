@@ -2260,6 +2260,7 @@ dependencies = [
  "crossbeam-utils",
  "futures",
  "futures-concurrency",
+ "loom",
  "metrics",
  "no-panic",
  "once_cell",
