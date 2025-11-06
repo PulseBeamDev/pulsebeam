@@ -241,6 +241,7 @@ impl ParticipantCore {
     }
 
     fn handle_incoming_rtp(&mut self, rtp: RtpPacket) {
+        tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
             return;

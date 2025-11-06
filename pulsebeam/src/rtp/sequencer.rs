@@ -40,7 +40,7 @@ impl<T: Packet> RtpSequencer<T> {
 
     pub fn push(&mut self, packet: &T) {
         let cloned = packet.clone();
-        tracing::trace!("[{}] push: seqno={:?}", self.state, packet.seq_no());
+        tracing::trace!("tracing:push={}", *packet.seq_no());
         let state_id = self.state.id();
         let new_state = match std::mem::replace(&mut self.state, SequencerState::Invalid) {
             SequencerState::New(state) => state.process(cloned),
@@ -60,7 +60,7 @@ impl<T: Packet> RtpSequencer<T> {
             SequencerState::Switching(state) => state.poll(),
             _ => None,
         }?;
-        tracing::trace!("[{}] pop seqno={:?}", self.state, item.0.seq_no);
+        tracing::trace!("tracing:pop={}", item.0.seq_no);
         Some(item)
     }
 }
