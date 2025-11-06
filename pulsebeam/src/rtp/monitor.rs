@@ -147,8 +147,7 @@ pub enum StreamQuality {
 #[derive(Debug, Clone)]
 pub struct StreamState {
     inactive: Arc<AtomicBool>,
-    bitrate_bps_p99: Arc<AtomicU64>,
-    bitrate_bps_p50: Arc<AtomicU64>,
+    bitrate_bps: Arc<AtomicU64>,
     quality: Arc<AtomicU8>,
 }
 
@@ -156,8 +155,7 @@ impl StreamState {
     pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
         Self {
             inactive: Arc::new(AtomicBool::new(inactive)),
-            bitrate_bps_p99: Arc::new(AtomicU64::new(bitrate_bps)),
-            bitrate_bps_p50: Arc::new(AtomicU64::new(bitrate_bps)),
+            bitrate_bps: Arc::new(AtomicU64::new(bitrate_bps)),
             quality: Arc::new(AtomicU8::new(StreamQuality::Bad as u8)),
         }
     }
@@ -166,12 +164,8 @@ impl StreamState {
         self.inactive.load(Ordering::Relaxed)
     }
 
-    pub fn bitrate_bps_p99(&self) -> u64 {
-        self.bitrate_bps_p99.load(Ordering::Relaxed)
-    }
-
-    pub fn bitrate_bps_p50(&self) -> u64 {
-        self.bitrate_bps_p50.load(Ordering::Relaxed)
+    pub fn bitrate_bps(&self) -> u64 {
+        self.bitrate_bps.load(Ordering::Relaxed)
     }
 
     pub fn quality(&self) -> StreamQuality {
@@ -411,6 +405,7 @@ pub struct StreamMonitor {
     clock_rate: u32,
     bwe_last_update: Instant,
     bwe_interval_bytes: usize,
+    bwe_bps_ewma: f64,
     jitter_estimate: f64,
     jitter_last_arrival: Option<Instant>,
     jitter_last_rtp_time: Option<u64>,
@@ -446,6 +441,7 @@ impl StreamMonitor {
             clock_rate: 0,
             bwe_last_update: now,
             bwe_interval_bytes: 0,
+            bwe_bps_ewma: 0.0,
             jitter_estimate: 0.0,
             jitter_last_arrival: None,
             jitter_last_rtp_time: None,
@@ -581,12 +577,11 @@ impl StreamMonitor {
             + (cv_health * self.config.bitrate_cv_weight);
 
         // Check hard limits
-        let final_health =
-            if self.shared_state.bitrate_bps_p50() < self.config.min_usable_bitrate_bps {
-                -1.0
-            } else {
-                instantaneous_health
-            };
+        let final_health = if self.shared_state.bitrate_bps() < self.config.min_usable_bitrate_bps {
+            -1.0
+        } else {
+            instantaneous_health
+        };
 
         // Apply catastrophic penalties
         let mut catastrophic_penalty = 0.0;
@@ -673,26 +668,32 @@ impl StreamMonitor {
     }
 
     fn update_derived_metrics(&mut self, now: Instant) {
+        const EWMA_ALPHA: f64 = 0.13;
         let elapsed = now.saturating_duration_since(self.bwe_last_update);
-        if elapsed >= Duration::from_millis(500) {
+
+        // Short Window Estimate
+        if elapsed >= Duration::from_millis(200) {
             let elapsed_secs = elapsed.as_secs_f64();
             if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
                 let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
+                self.bwe_bps_ewma = (1.0 - EWMA_ALPHA) * self.bwe_bps_ewma + EWMA_ALPHA * bps;
                 self.bitrate_history.push(bps);
-                if let Some(p99) = self.bitrate_history.percentile(0.99) {
-                    self.shared_state
-                        .bitrate_bps_p99
-                        .store(p99 as u64, Ordering::Relaxed);
-                }
-                if let Some(p50) = self.bitrate_history.percentile(0.50) {
-                    self.shared_state
-                        .bitrate_bps_p50
-                        .store(p50 as u64, Ordering::Relaxed);
-                }
+
+                // P99 is too noisy
+                let p95 = self.bitrate_history.percentile(0.95).unwrap_or_default();
+
+                // Average tends to suffer from outliers, so less than 1.0 multiplier to account
+                // for this.
+                let bps = p95.max(0.9 * self.bwe_bps_ewma);
+                self.shared_state
+                    .bitrate_bps
+                    .store(bps as u64, Ordering::Relaxed);
             }
             self.bwe_interval_bytes = 0;
             self.bwe_last_update = now;
         }
+
+        // Long Window Estimate
 
         // Update raw metrics
         self.raw_loss_percent = self.loss_window.calculate_loss_percent();
@@ -797,7 +798,7 @@ mod test {
         let final_time = start + Duration::from_millis(501);
         monitor.poll(final_time);
         let expected_bps = (1200.0 * 10.0 * 8.0) / 0.501;
-        let actual_bps = state.bitrate_bps_p99() as f64;
+        let actual_bps = state.bitrate_bps() as f64;
         assert!(
             (actual_bps - expected_bps).abs() < 1000.0,
             "Bitrate calculation should be accurate (expected: {}, actual: {})",

@@ -273,20 +273,20 @@ impl DownstreamAllocator {
 
                 let is_upgrade = track.is_upgrade(&current_receiver.rid, &desired.rid);
                 let desired_bitrate = if is_upgrade.unwrap_or_default() {
-                    (desired.state.bitrate_bps_p99() as f64 * 1.5) as u64
+                    (desired.state.bitrate_bps() as f64 * 1.5) as u64
                 } else {
-                    desired.state.bitrate_bps_p99()
+                    desired.state.bitrate_bps()
                 };
                 total_desired += desired_bitrate;
                 if total_desired < budget && (config.paused || desired.rid != current_receiver.rid)
                 {
                     upgraded = true;
-                    total_allocated += desired.state.bitrate_bps_p99();
+                    total_allocated += desired.state.bitrate_bps();
                     config.target_rid = desired.rid;
                     config.paused = false;
                     state.update(|c| *c = config);
                 } else {
-                    total_allocated += current_receiver.state.bitrate_bps_p99();
+                    total_allocated += current_receiver.state.bitrate_bps();
                 }
             }
         }
