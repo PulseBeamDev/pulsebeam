@@ -7,8 +7,8 @@
 //! - Lag detection and safe catching-up
 //! - Async wait via `tokio::Notify`
 
-use super::Arc;
-use super::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwapOption;
 use crossbeam_utils::CachePadded;
 use std::fmt::Debug;
@@ -61,7 +61,12 @@ impl<T: Send + Sync> Ring<T> {
             return;
         }
 
-        let seq = self.tail.load(Ordering::Relaxed);
+        // The ordering can't be Relaxed. There's no guarantee that
+        // the publisher will stay on the same thread in a work-stealing environment.
+        //
+        // t0 (thread-2) -> tail=0 new_tail=1
+        // t1 (thread-3) -> tail=0!!! (despite being the same publisher)
+        let seq = self.tail.load(Ordering::Acquire);
         let idx = (seq % self.capacity as u64) as usize;
 
         // Atomically publish a new slot

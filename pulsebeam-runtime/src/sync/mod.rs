@@ -1,19 +1,20 @@
 pub mod spmc;
 
-#[cfg(not(loom))]
+#[cfg(not(feature = "loom"))]
+mod primitives {
+    pub use std::sync::*;
+
+    pub mod atomic {
+        pub use std::sync::atomic::*;
+    }
+}
+
+#[cfg(feature = "loom")]
 mod primitives {
     pub use std::sync::Arc;
 
     pub mod atomic {
-        pub use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    }
-}
-
-#[cfg(loom)]
-mod primitives {
-    pub use loom::sync::Arc;
-    pub mod atomic {
-        pub use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        pub use loom::sync::atomic::*;
     }
 }
 
