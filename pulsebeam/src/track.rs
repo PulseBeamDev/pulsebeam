@@ -7,7 +7,6 @@ use tokio::time::Instant;
 
 use crate::rtp::{
     Packet, RtpPacket,
-    jitter_buffer::{self, PollResult},
     monitor::{QualityMonitorConfig, StreamMonitor, StreamState},
 };
 
@@ -88,7 +87,6 @@ pub struct SimulcastSender {
     pub quality: SimulcastQuality,
     pub monitor: StreamMonitor,
     channel: spmc::Sender<RtpPacket>,
-    jb: jitter_buffer::JitterBuffer<RtpPacket>,
 
     keyframe_request_state: KeyframeRequestState,
     keyframe_debounce_duration: Duration,
@@ -134,13 +132,7 @@ impl SimulcastSender {
     }
 
     pub fn poll(&mut self, now: Instant) -> Option<Instant> {
-        loop {
-            match self.jb.poll(now) {
-                PollResult::PacketReady(pkt) => self.forward(pkt),
-                PollResult::WaitUntil(deadline) => return Some(deadline),
-                PollResult::Empty => return None,
-            }
-        }
+        None
     }
 
     fn forward(&mut self, pkt: RtpPacket) {
@@ -264,11 +256,6 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         };
         let stream_state = StreamState::new(true, bitrate);
         let monitor = StreamMonitor::new(stream_state.clone(), QualityMonitorConfig::default());
-        let jbc = if meta.kind == MediaKind::Video {
-            jitter_buffer::JitterBufferConfig::video_interactive()
-        } else {
-            jitter_buffer::JitterBufferConfig::audio_interactive()
-        };
 
         senders.push(SimulcastSender {
             rid,
@@ -278,7 +265,6 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             keyframe_request_state: KeyframeRequestState::default(),
             keyframe_debounce_duration: Duration::from_millis(300),
             monitor,
-            jb: jitter_buffer::JitterBuffer::new(jbc),
         });
         receivers.push(SimulcastReceiver {
             meta: meta.clone(),
