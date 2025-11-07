@@ -10,6 +10,11 @@ use str0m::{
 };
 use tokio::time::Instant;
 
+/// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
+/// TODO: get these clocks from SDP instead
+pub const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
+pub const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
+
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
     inner: str0m::rtp::RtpPacket,

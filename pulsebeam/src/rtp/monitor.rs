@@ -22,10 +22,11 @@ use std::{
     },
 };
 use str0m::bwe::Bitrate;
+use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
-use crate::rtp::PacketTiming;
+use crate::rtp::{PacketTiming, VIDEO_FREQUENCY};
 
 /// Defines the wall-clock duration without packets after which a stream is considered inactive.
 const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -715,6 +716,72 @@ impl StreamMonitor {
 
         self.jitter_last_arrival = Some(arrival);
         self.jitter_last_rtp_time = Some(rtp_time);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PacketStatus {
+    seqno: SeqNo,
+    arrival: Instant,
+    rtp_ts: MediaTime,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct DeltaDeltaState {
+    head: SeqNo,
+    tail: SeqNo,
+    frequency: Frequency,
+}
+
+#[derive(Debug)]
+pub struct DeltaDeltaMonitor {
+    buffer: Vec<Option<PacketStatus>>,
+    state: Option<DeltaDeltaState>,
+}
+
+impl DeltaDeltaMonitor {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            buffer: vec![None; cap],
+            state: None,
+        }
+    }
+
+    pub fn update<T: PacketTiming>(&mut self, packet: &T) {
+        let state = match self.state {
+            Some(state) => state,
+            None => self.init(packet),
+        };
+
+        let seq = packet.seq_no();
+        let now = packet.arrival_timestamp();
+        let rtp_ts = packet.rtp_timestamp();
+    }
+
+    fn init<T: PacketTiming>(&mut self, packet: &T) -> DeltaDeltaState {
+        assert!(self.state.is_none(), "init must only be called once");
+
+        let state = DeltaDeltaState {
+            head: packet.seq_no(),
+            tail: packet.seq_no(),
+            frequency: packet.rtp_timestamp().frequency(),
+        };
+        self.state.replace(state);
+        state
+    }
+
+    fn as_index(&self, seq: SeqNo) -> usize {
+        (*seq % self.buffer.len() as u64) as usize
+    }
+
+    fn packet(&self, seq: SeqNo) -> &Option<PacketStatus> {
+        let index = self.as_index(seq);
+        &self.buffer[index]
+    }
+
+    fn packet_mut(&mut self, seq: SeqNo) -> &mut Option<PacketStatus> {
+        let index = self.as_index(seq);
+        &mut self.buffer[index]
     }
 }
 
