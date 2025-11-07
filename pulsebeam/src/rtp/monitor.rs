@@ -728,15 +728,58 @@ struct PacketStatus {
 
 #[derive(Debug, Copy, Clone)]
 struct DeltaDeltaState {
-    head: SeqNo,
-    tail: SeqNo,
-    frequency: Frequency,
+    head: SeqNo,          // Next expected seq
+    tail: SeqNo,          // Oldest seq in buffer
+    frequency: Frequency, // Clock rate (e.g., 90000)
+    last_rtp_ts: MediaTime,
+    last_arrival: Instant,
+    last_skew: f64,
+    dod_ewma: f64,
+    dod_abs_ewma: f64,
+}
+
+impl DeltaDeltaState {
+    fn init<T: PacketTiming>(packet: &T) -> Self {
+        let seq = packet.seq_no();
+        let rtp_ts = packet.rtp_timestamp();
+        let now = packet.arrival_timestamp();
+
+        Self {
+            head: seq.wrapping_add(1).into(),
+            tail: seq,
+            frequency: rtp_ts.frequency(),
+            last_rtp_ts: rtp_ts,
+            last_arrival: now,
+            last_skew: 0.0,
+            dod_ewma: 0.0,
+            dod_abs_ewma: 0.0,
+        }
+    }
+
+    fn advance(&mut self, pkt: &PacketStatus, alpha: f64) {
+        let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
+
+        let expected_ms = (pkt.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
+            * 1000.0
+            / self.frequency.get() as f64;
+
+        let skew = actual_ms - expected_ms;
+        let dod = skew - self.last_skew;
+
+        self.dod_ewma = alpha * dod + (1.0 - alpha) * self.dod_ewma;
+        self.dod_abs_ewma = alpha * dod.abs() + (1.0 - alpha) * self.dod_abs_ewma;
+
+        self.last_skew = skew;
+        self.last_arrival = pkt.arrival;
+        self.last_rtp_ts = pkt.rtp_ts;
+    }
 }
 
 #[derive(Debug)]
 pub struct DeltaDeltaMonitor {
     buffer: Vec<Option<PacketStatus>>,
     state: Option<DeltaDeltaState>,
+    alpha: f64,
 }
 
 impl DeltaDeltaMonitor {
@@ -744,30 +787,60 @@ impl DeltaDeltaMonitor {
         Self {
             buffer: vec![None; cap],
             state: None,
+            alpha: 0.1,
         }
     }
 
     pub fn update<T: PacketTiming>(&mut self, packet: &T) {
-        let state = match self.state {
-            Some(state) => state,
-            None => self.init(packet),
-        };
+        let mut state = *self
+            .state
+            .get_or_insert_with(|| DeltaDeltaState::init(packet));
 
         let seq = packet.seq_no();
-        let now = packet.arrival_timestamp();
+        if seq < state.tail {
+            tracing::warn!(
+                "{} is older than the current tail, {}, ignore it",
+                seq,
+                state.tail
+            );
+            return;
+        }
+
         let rtp_ts = packet.rtp_timestamp();
+        let arrival = packet.arrival_timestamp();
+
+        // no space
+        let tail = *state.tail;
+        if !(tail <= *seq && *seq < tail + self.buffer.len() as u64) {
+            let new_tail = tail + self.buffer.len() as u64;
+            self.process_until(&mut state, new_tail.into());
+        }
+
+        *self.packet_mut(seq) = Some(PacketStatus {
+            seqno: seq,
+            arrival,
+            rtp_ts,
+        });
+        self.process_in_order(&mut state);
+        self.state = Some(state);
     }
 
-    fn init<T: PacketTiming>(&mut self, packet: &T) -> DeltaDeltaState {
-        assert!(self.state.is_none(), "init must only be called once");
+    fn process_in_order(&mut self, state: &mut DeltaDeltaState) {
+        while let Some(pkt) = self.packet_mut(state.tail).take() {
+            state.advance(&pkt, self.alpha);
+            state.tail = state.tail.wrapping_add(1).into();
+        }
+    }
 
-        let state = DeltaDeltaState {
-            head: packet.seq_no(),
-            tail: packet.seq_no(),
-            frequency: packet.rtp_timestamp().frequency(),
-        };
-        self.state.replace(state);
-        state
+    fn process_until(&mut self, state: &mut DeltaDeltaState, end: SeqNo) {
+        for current in *state.tail..*end {
+            let Some(pkt) = self.packet_mut(current.into()).take() else {
+                continue;
+            };
+
+            state.advance(&pkt, self.alpha);
+        }
+        state.tail = end;
     }
 
     fn as_index(&self, seq: SeqNo) -> usize {
