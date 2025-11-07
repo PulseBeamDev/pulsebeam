@@ -67,7 +67,6 @@ pub struct QualityMonitorConfig {
     pub good_to_excellent_threshold: f32,
 
     // --- Hard Limits & Catastrophic Penalties ---
-    pub min_usable_bitrate_bps: u64,
     pub catastrophic_loss_percent: f32,
     pub catastrophic_jitter_ms: u32,
     pub catastrophic_penalty: f32,
@@ -92,37 +91,36 @@ impl Default for QualityMonitorConfig {
                 good: 2.0,
             },
             jitter_ms: HealthThresholds {
-                bad: 30.0,
-                good: 20.0,
+                bad: 50.0,
+                good: 30.0,
             },
 
             // Score engine dynamics
             score_max: 100.0,
             score_min: 0.0,
-            score_increment_scaler: 1.5,     // Slower improvements
+            score_increment_scaler: 3.0,     // Slower improvements
             score_decrement_multiplier: 4.0, // Fast degradation
 
             // Hysteresis thresholds - note the gaps to prevent oscillation
             // Downgrades (quick)
             excellent_to_good_threshold: 75.0, // Drop from Excellent below this
-            good_to_bad_threshold: 35.0,       // Drop from Good below this
+            good_to_bad_threshold: 40.0,       // Drop from Good below this
 
             // Upgrades (conservative, require higher score)
-            bad_to_good_threshold: 55.0,       // Rise from Bad above this
-            good_to_excellent_threshold: 92.0, // Rise from Good above this
+            bad_to_good_threshold: 60.0,       // Rise from Bad above this
+            good_to_excellent_threshold: 88.0, // Rise from Good above this
 
             // "The Cliff": Instantaneous triggers for severe penalties
-            min_usable_bitrate_bps: 150_000,
             catastrophic_loss_percent: 20.0,
-            catastrophic_jitter_ms: 80,
+            catastrophic_jitter_ms: 100,
             catastrophic_penalty: 30.0,
 
             // How much each metric contributes to the overall health score for an interval.
-            loss_weight: 0.5,
-            jitter_weight: 0.5,
+            loss_weight: 0.6,
+            jitter_weight: 0.4,
 
             // Stability controls
-            upgrade_stability_count: 6, // ~3 seconds of sustained good performance to upgrade
+            upgrade_stability_count: 10, // ~2 seconds of sustained good performance to upgrade
             metric_smoothing_factor: 0.3, // Heavy smoothing to reduce noise
         }
     }
@@ -150,7 +148,7 @@ impl StreamState {
         Self {
             inactive: Arc::new(AtomicBool::new(inactive)),
             bitrate_bps: Arc::new(AtomicU64::new(bitrate_bps)),
-            quality: Arc::new(AtomicU8::new(StreamQuality::Bad as u8)),
+            quality: Arc::new(AtomicU8::new(StreamQuality::Good as u8)),
         }
     }
 
@@ -158,8 +156,8 @@ impl StreamState {
         self.inactive.load(Ordering::Relaxed)
     }
 
-    pub fn bitrate_bps(&self) -> u64 {
-        self.bitrate_bps.load(Ordering::Relaxed)
+    pub fn bitrate_bps(&self) -> f64 {
+        self.bitrate_bps.load(Ordering::Relaxed) as f64
     }
 
     pub fn quality(&self) -> StreamQuality {
@@ -545,15 +543,8 @@ impl StreamMonitor {
         let loss_health = normalize(self.smoothed_loss_percent, self.config.loss);
         let jitter_health = normalize(self.smoothed_jitter_ms, self.config.jitter_ms);
 
-        let instantaneous_health =
+        let final_health =
             (loss_health * self.config.loss_weight) + (jitter_health * self.config.jitter_weight);
-
-        // Check hard limits
-        let final_health = if self.shared_state.bitrate_bps() < self.config.min_usable_bitrate_bps {
-            -1.0
-        } else {
-            instantaneous_health
-        };
 
         // Apply catastrophic penalties
         let mut catastrophic_penalty = 0.0;
@@ -656,10 +647,10 @@ impl StreamMonitor {
                 }
                 self.bitrate_history.push(bps);
 
-                // P99 is too noisy, and give headroom for VBR
-                let adjusted_p95 = 1.5 * self.bitrate_history.percentile(0.95).unwrap_or_default();
+                // P99 is too noisy + add headroom
+                let p95 = 1.5 * self.bitrate_history.percentile(0.95).unwrap_or_default();
 
-                let bps = adjusted_p95.max(self.bwe_bps_ewma);
+                let bps = p95.max(self.bwe_bps_ewma);
                 self.smoothed_bitrate_bps = bps;
                 self.shared_state
                     .bitrate_bps
@@ -701,16 +692,27 @@ impl StreamMonitor {
         }
         let arrival = packet.arrival_timestamp();
         let rtp_time = packet.rtp_timestamp().numer();
+
         if let (Some(last_arrival), Some(last_rtp_time)) =
             (self.jitter_last_arrival, self.jitter_last_rtp_time)
         {
+            // If the RTP timestamp is the same as the last packet, it's part of the same frame burst.
+            // Do not calculate jitter for these packets to avoid artificial spikes.
+            if rtp_time == last_rtp_time {
+                self.jitter_last_arrival = Some(arrival);
+                return; // Skip jitter calculation
+            }
+
             let arrival_diff = arrival
                 .saturating_duration_since(last_arrival)
                 .as_secs_f64();
             let rtp_diff = rtp_time.wrapping_sub(last_rtp_time) as f64 / self.clock_rate as f64;
             let transit_diff = arrival_diff - rtp_diff;
-            self.jitter_estimate += (transit_diff.abs() - self.jitter_estimate) / 16.0;
+
+            // Use a slightly more responsive smoothing factor
+            self.jitter_estimate += (transit_diff.abs() - self.jitter_estimate) / 8.0;
         }
+
         self.jitter_last_arrival = Some(arrival);
         self.jitter_last_rtp_time = Some(rtp_time);
     }

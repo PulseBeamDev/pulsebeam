@@ -95,6 +95,7 @@ pub struct DownstreamAllocator {
     audio_slots: Vec<SlotState>,
     video_slots: Vec<SlotState>,
     available_bandwidth: BitrateController,
+    ticks: u32,
 }
 
 impl DownstreamAllocator {
@@ -106,6 +107,7 @@ impl DownstreamAllocator {
             video_slots: Vec::new(),
 
             available_bandwidth: BitrateController::default(),
+            ticks: 0,
         }
     }
 
@@ -184,7 +186,7 @@ impl DownstreamAllocator {
         }
 
         // Pretend that we have some bandwidth so we can keep probing.
-        let budget = self.available_bandwidth.current().as_f64().max(300_000.0) as u64;
+        let budget = self.available_bandwidth.current().as_f64().max(300_000.0);
 
         // Prioritize filling more slots first
         self.video_slots.sort_by_key(|s| s.priority);
@@ -206,13 +208,13 @@ impl DownstreamAllocator {
             state.update(|c| *c = config);
         }
 
-        let mut total_allocated: u64 = 0;
-        let mut total_desired: u64 = 0;
+        let mut total_allocated: f64 = 0.0;
+        let mut total_desired: f64 = 0.0;
         let mut upgraded = true;
         while upgraded {
             upgraded = false;
-            total_allocated = 0;
-            total_desired = 0;
+            total_allocated = 0.0;
+            total_desired = 0.0;
 
             for slot in &self.video_slots {
                 let Some(track_id) = &slot.assigned_track else {
@@ -253,7 +255,7 @@ impl DownstreamAllocator {
 
                 let is_upgrade = track.is_upgrade(&current_receiver.rid, &desired.rid);
                 let desired_bitrate = if is_upgrade.unwrap_or_default() {
-                    (desired.state.bitrate_bps() as f64 * 1.5) as u64
+                    desired.state.bitrate_bps() * 1.25
                 } else {
                     desired.state.bitrate_bps()
                 };
@@ -273,13 +275,17 @@ impl DownstreamAllocator {
 
         let total_allocated = Bitrate::from(total_allocated);
         let total_desired = Bitrate::from(total_desired);
-        tracing::trace!(
-            available = %self.available_bandwidth.current(),
-            budget = %Bitrate::from(budget),
-            allocated = %total_allocated,
-            desired = %total_desired,
-            "allocation summary"
-        );
+
+        if self.ticks % 30 == 0 {
+            tracing::debug!(
+                available = %self.available_bandwidth.current(),
+                budget = %Bitrate::from(budget),
+                allocated = %total_allocated,
+                desired = %total_desired,
+                "allocation summary"
+            );
+        }
+        self.ticks += 1;
 
         (total_allocated, total_desired)
     }

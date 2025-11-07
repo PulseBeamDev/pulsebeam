@@ -36,14 +36,14 @@ impl Default for BitrateControllerConfig {
 
             // Hysteresis: Require a SIGNIFICANT and sustained improvement before upgrading.
             // A 15% increase in the smoothed, headroom-adjusted target is a strong signal.
-            hysteresis_up: 1.15,
+            hysteresis_up: 1.0,
 
             // Be slightly more sensitive to decreases. A 15% drop is also a clear signal.
             hysteresis_down: 0.85,
 
             // Hold time: After a change, wait a bit longer to observe its effect on the network.
             // This prevents the controller from chasing noisy BWE feedback too quickly.
-            min_hold_time: Duration::from_secs(2),
+            min_hold_time: Duration::ZERO,
         }
     }
 }
