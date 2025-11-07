@@ -95,7 +95,6 @@ pub struct DownstreamAllocator {
     audio_slots: Vec<SlotState>,
     video_slots: Vec<SlotState>,
     available_bandwidth: BitrateController,
-    desired_bandwidth: BitrateController,
 }
 
 impl DownstreamAllocator {
@@ -106,30 +105,7 @@ impl DownstreamAllocator {
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
 
-            available_bandwidth: BitrateControllerConfig {
-                min_bitrate: Bitrate::kbps(100),
-                max_bitrate: Bitrate::mbps(20),
-                headroom: 0.95, // trust 95% of measured BW
-                tau: 0.5,       // faster EMA → tracks within ~1 s
-                max_ramp_up: Bitrate::mbps(3),
-                max_ramp_down: Bitrate::mbps(6),
-                hysteresis_up: 1.0, // no hysteresis — just smooth
-                hysteresis_down: 1.0,
-                min_hold_time: Duration::from_millis(500),
-            }
-            .build(),
-            desired_bandwidth: BitrateControllerConfig {
-                min_bitrate: Bitrate::kbps(100),
-                max_bitrate: Bitrate::mbps(20),
-                headroom: 0.9,
-                tau: 1.0,
-                max_ramp_up: Bitrate::mbps(2),
-                max_ramp_down: Bitrate::mbps(1),
-                hysteresis_up: 1.05,                   // 5 % threshold to upgrade
-                hysteresis_down: 0.92,                 // 8 % drop to downgrade
-                min_hold_time: Duration::from_secs(2), // hold 2 s before layer flip
-            }
-            .build(),
+            available_bandwidth: BitrateController::default(),
         }
     }
 
@@ -203,6 +179,10 @@ impl DownstreamAllocator {
     //  2. Video slots
     //  3. update_allocations get polled every 500ms
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
+        if self.video_slots.is_empty() {
+            return (Bitrate::from(0), Bitrate::from(0));
+        }
+
         // Pretend that we have some bandwidth so we can keep probing.
         let budget = self.available_bandwidth.current().as_f64().max(300_000.0) as u64;
 
@@ -291,18 +271,17 @@ impl DownstreamAllocator {
             }
         }
 
-        // TODO: organize time dependency here
-        let total_desired = self
-            .desired_bandwidth
-            .update((total_desired).into(), Instant::now());
+        let total_allocated = Bitrate::from(total_allocated);
+        let total_desired = Bitrate::from(total_desired);
         tracing::trace!(
+            available = %self.available_bandwidth.current(),
             budget = %Bitrate::from(budget),
-            allocated = %Bitrate::from(total_allocated),
+            allocated = %total_allocated,
             desired = %total_desired,
             "allocation summary"
         );
 
-        (Bitrate::from(total_allocated), total_desired)
+        (total_allocated, total_desired)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {

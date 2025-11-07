@@ -21,22 +21,29 @@ impl Default for BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(300),
             max_bitrate: Bitrate::mbps(20),
 
-            // Headroom: conservative, avoids overshooting bandwidth
+            // Headroom: 15% is a safe and standard value.
             headroom: 0.85,
 
-            // EMA smoothing constant: 1s
+            // EMA smoothing
             tau: 1.0,
 
-            // Ramp limits (per second) - tick is 0.5s
-            max_ramp_up: Bitrate::kbps(150), // 0.5s tick → 75 kbps per tick
-            max_ramp_down: Bitrate::kbps(200), // 0.5s tick → 100 kbps per tick
+            // Ramp limits (per second): Be aggressive in our reactions.
+            // Allow ramping up reasonably fast to achieve good quality in a few seconds.
+            max_ramp_up: Bitrate::kbps(800),
 
-            // Hysteresis to prevent toggling
-            hysteresis_up: 1.03,   // 3% increase triggers upgrade
-            hysteresis_down: 0.90, // 10% decrease triggers downgrade
+            // React to congestion IMMEDIATELY. Allow dropping several megabits per second.
+            max_ramp_down: Bitrate::mbps(3),
 
-            // Hold time: minimum between desired bitrate changes
-            min_hold_time: Duration::from_secs(1), // allows faster upgrades
+            // Hysteresis: Require a SIGNIFICANT and sustained improvement before upgrading.
+            // A 15% increase in the smoothed, headroom-adjusted target is a strong signal.
+            hysteresis_up: 1.15,
+
+            // Be slightly more sensitive to decreases. A 15% drop is also a clear signal.
+            hysteresis_down: 0.85,
+
+            // Hold time: After a change, wait a bit longer to observe its effect on the network.
+            // This prevents the controller from chasing noisy BWE feedback too quickly.
+            min_hold_time: Duration::from_secs(2),
         }
     }
 }

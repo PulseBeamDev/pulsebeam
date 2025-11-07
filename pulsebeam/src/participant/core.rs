@@ -215,7 +215,8 @@ impl ParticipantCore {
     }
 
     fn update_desired_bitrate(&mut self) {
-        let (_, desired) = self.downstream_allocator.update_allocations();
+        let (current, desired) = self.downstream_allocator.update_allocations();
+        self.rtc.bwe().set_current_bitrate(current);
         self.rtc.bwe().set_desired_bitrate(desired);
     }
 

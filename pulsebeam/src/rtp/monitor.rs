@@ -526,14 +526,6 @@ impl StreamMonitor {
         self.manual_pause = paused;
     }
 
-    pub fn get_loss_percent(&self) -> f32 {
-        self.smoothed_loss_percent
-    }
-
-    pub fn get_jitter_ms(&self) -> u32 {
-        self.smoothed_jitter_ms as u32
-    }
-
     fn determine_inactive_state(&self, now: Instant) -> bool {
         self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
     }
@@ -648,7 +640,7 @@ impl StreamMonitor {
     }
 
     fn update_derived_metrics(&mut self, now: Instant) {
-        const EWMA_ALPHA: f64 = 0.13;
+        const EWMA_ALPHA: f64 = 0.8;
         let elapsed = now.saturating_duration_since(self.bwe_last_update);
 
         // Short Window Estimate
@@ -656,15 +648,18 @@ impl StreamMonitor {
             let elapsed_secs = elapsed.as_secs_f64();
             if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
                 let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
-                self.bwe_bps_ewma = (1.0 - EWMA_ALPHA) * self.bwe_bps_ewma + EWMA_ALPHA * bps;
+
+                if self.bwe_bps_ewma == 0.0 {
+                    self.bwe_bps_ewma = bps;
+                } else {
+                    self.bwe_bps_ewma = (1.0 - EWMA_ALPHA) * self.bwe_bps_ewma + EWMA_ALPHA * bps;
+                }
                 self.bitrate_history.push(bps);
 
-                // P99 is too noisy
-                let p95 = self.bitrate_history.percentile(0.95).unwrap_or_default();
+                // P99 is too noisy, and give headroom for VBR
+                let adjusted_p95 = 1.5 * self.bitrate_history.percentile(0.95).unwrap_or_default();
 
-                // Average tends to suffer from outliers, so less than 1.0 multiplier to account
-                // for this.
-                let bps = p95.max(0.9 * self.bwe_bps_ewma);
+                let bps = adjusted_p95.max(self.bwe_bps_ewma);
                 self.smoothed_bitrate_bps = bps;
                 self.shared_state
                     .bitrate_bps
@@ -673,8 +668,6 @@ impl StreamMonitor {
             self.bwe_interval_bytes = 0;
             self.bwe_last_update = now;
         }
-
-        // Long Window Estimate
 
         // Update raw metrics
         self.raw_loss_percent = self.loss_window.calculate_loss_percent();

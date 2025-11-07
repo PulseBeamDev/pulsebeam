@@ -76,7 +76,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 gateway_tx,
             ))
             .await;
-        let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
+        let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
 
         loop {
             let Some(deadline) = self.core.poll_rtc() else {
