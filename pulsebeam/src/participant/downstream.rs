@@ -1,4 +1,4 @@
-use crate::participant::bitrate::{BitrateController, BitrateControllerConfig};
+use crate::participant::bitrate::BitrateController;
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::sequencer::RtpSequencer;
 use crate::rtp::{RtpPacket, TimingHeader};
@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
@@ -181,6 +180,11 @@ impl DownstreamAllocator {
     //  2. Video slots
     //  3. update_allocations get polled every 500ms
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
+        // TODO: use downgrade Hysteresis
+        // --- Hysteresis Factors ---
+        const DOWNGRADE_HYSTERESIS_FACTOR: f64 = 0.85;
+        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.25;
+
         if self.video_slots.is_empty() {
             return (Bitrate::from(0), Bitrate::from(0));
         }
@@ -255,7 +259,7 @@ impl DownstreamAllocator {
 
                 let is_upgrade = track.is_upgrade(&current_receiver.rid, &desired.rid);
                 let desired_bitrate = if is_upgrade.unwrap_or_default() {
-                    desired.state.bitrate_bps() * 1.25
+                    desired.state.bitrate_bps() * UPGRADE_HYSTERESIS_FACTOR
                 } else {
                     desired.state.bitrate_bps()
                 };
