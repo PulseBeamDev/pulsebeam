@@ -1,18 +1,3 @@
-//! # Real-time Stream Quality Monitor
-//!
-//! ## Architecture
-//! This module implements a monitor that analyzes a single RTP stream to derive actionable
-//! quality metrics. The design pattern separates the system into two distinct components:
-//!
-//! 1.  `StreamMonitor`: A single-owner, stateful struct responsible for all calculations.
-//!     Its internal state is non-atomic for performance, as it is not intended to be shared.
-//!     It consumes packet metadata and synthesizes it into a continuous "Quality Score" that
-//!     integrates stream performance over time, providing robust state transitions.
-//!
-//! 2.  `StreamState`: A lightweight, thread-safe struct holding the final, shared conclusions
-//!     (e.g., quality and inactive status). It uses atomic types to allow for lock-free reads
-//!     from multiple downstream consumers, providing a simple and performant API for decision-making.
-
 use std::time::Duration;
 use std::{
     collections::BTreeMap,
@@ -504,7 +489,14 @@ impl DeltaDeltaMonitor {
             .get_or_insert_with(|| DeltaDeltaState::init(packet));
 
         let seq = packet.seq_no();
-        if seq < state.tail {
+
+        // Check if packet is older than tail using wrapping comparison
+        let tail_val = *state.tail;
+        let seq_val = *seq;
+        let seq_offset = seq_val.wrapping_sub(tail_val);
+
+        // If seq is more than half the u64 space behind tail, it's considered old
+        if seq_offset > (u64::MAX / 2) {
             tracing::warn!(
                 "{} is older than the current tail, {}, ignore it",
                 seq,
@@ -515,15 +507,23 @@ impl DeltaDeltaMonitor {
 
         let rtp_ts = packet.rtp_timestamp();
         let arrival = packet.arrival_timestamp();
+        let buffer_capacity = self.buffer.len() as u64;
 
-        if seq >= state.head {
+        // Update head if this packet is beyond it
+        let head_val = *state.head;
+        let seq_ahead_of_head = seq_val.wrapping_sub(head_val);
+
+        if seq_ahead_of_head < (u64::MAX / 2) || seq == state.head {
             state.head = seq.wrapping_add(1).into();
         }
 
-        // no space
-        let tail = *state.tail;
-        if !(tail <= *seq && *seq < tail + self.buffer.len() as u64) {
-            let new_tail = state.head.wrapping_sub(self.buffer.len() as u64);
+        // Check if there's space in the buffer for this packet
+        // Using wrapping arithmetic: offset < capacity means it's in range
+        let offset_from_tail = seq_val.wrapping_sub(tail_val);
+        if offset_from_tail >= buffer_capacity {
+            // No space - need to slide the window
+            // process_until is now optimized to only check each buffer slot once
+            let new_tail = state.head.wrapping_sub(buffer_capacity);
             self.process_until(&mut state, new_tail.into());
         }
 
@@ -537,17 +537,75 @@ impl DeltaDeltaMonitor {
     }
 
     fn process_in_order(&mut self, state: &mut DeltaDeltaState) {
-        while state.tail < state.head
-            && let Some(pkt) = self.packet_mut(state.tail).take()
-        {
+        // Process packets in sequence order starting from tail
+        loop {
+            let tail_val = *state.tail;
+            let head_val = *state.head;
+
+            // Check if we've caught up to head using wrapping arithmetic
+            let distance = head_val.wrapping_sub(tail_val);
+            if distance == 0 || distance > (u64::MAX / 2) {
+                // Either we're at head, or head is somehow behind us (shouldn't happen)
+                break;
+            }
+
+            // Try to get the packet at tail position
+            let Some(pkt) = self.packet_mut(state.tail).take() else {
+                // No packet at tail, can't continue processing in order
+                break;
+            };
+
             state.advance(&pkt, self.alpha);
             state.tail = state.tail.wrapping_add(1).into();
         }
     }
 
     fn process_until(&mut self, state: &mut DeltaDeltaState, end: SeqNo) {
-        assert!(state.tail < end);
-        for current in *state.tail..*end {
+        let tail_val = *state.tail;
+        let end_val = *end;
+
+        // Calculate how many sequence numbers to process
+        let count = end_val.wrapping_sub(tail_val);
+
+        // If count is 0 or seems like we're going backwards, something is wrong
+        if count == 0 || count > (u64::MAX / 2) {
+            if count != 0 {
+                tracing::warn!(
+                    "process_until: end {} appears to be before tail {}",
+                    end,
+                    state.tail
+                );
+            }
+            return;
+        }
+
+        let buffer_capacity = self.buffer.len() as u64;
+
+        // If the jump is larger than our buffer, we only need to check
+        // each buffer slot once. Limit iteration to buffer_capacity.
+        // Any packets beyond that are guaranteed to be lost anyway.
+        let iterations = count.min(buffer_capacity);
+
+        if count > buffer_capacity {
+            // We're skipping more packets than our buffer can hold
+            // Count the definitely-lost packets (everything before our buffer range)
+            let packets_definitely_lost = count - buffer_capacity;
+            state.packets_expected += packets_definitely_lost;
+
+            tracing::debug!(
+                "process_until: large jump of {} packets, {} definitely lost, checking last {} slots",
+                count,
+                packets_definitely_lost,
+                iterations
+            );
+        }
+
+        // Only process the last buffer_capacity worth of packets
+        // Start from (end - buffer_capacity) to end
+        let start_checking = end_val.wrapping_sub(iterations);
+
+        for i in 0..iterations {
+            let current = start_checking.wrapping_add(i);
             let Some(pkt) = self.packet_mut(current.into()).take() else {
                 state.packets_expected += 1;
                 continue;
@@ -578,7 +636,7 @@ impl DeltaDeltaMonitor {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
     use std::time::Duration;
     use tokio::time::Instant;
@@ -587,7 +645,7 @@ mod tests {
     const TEST_FREQ: Frequency = Frequency::NINETY_KHZ;
     const MS_PER_PACKET: u64 = 20; // 20ms per packet
     const RTP_TS_PER_PACKET: u64 = (TEST_FREQ.get() as u64 * MS_PER_PACKET) / 1000; // 1800
-    //
+
     #[derive(Clone)]
     struct TestPacket {
         seq: SeqNo,
@@ -610,25 +668,42 @@ mod tests {
     // Helper to create a stream of test packets
     struct PacketFactory {
         start_time: Instant,
+        start_seq: u64,
+        start_rtp_ts: u64,
     }
 
     impl PacketFactory {
         fn new() -> Self {
             Self {
                 start_time: Instant::now(),
+                start_seq: 1,
+                start_rtp_ts: 1000,
+            }
+        }
+
+        fn with_start_seq(start_seq: u64) -> Self {
+            Self {
+                start_time: Instant::now(),
+                start_seq,
+                start_rtp_ts: 1000,
             }
         }
 
         // Creates a packet with a given sequence number and an optional jitter in arrival time
         fn at(&self, seq: u64, arrival_jitter_ms: i64) -> TestPacket {
-            let rtp_ts = 1000 + (seq.wrapping_sub(1)).wrapping_mul(RTP_TS_PER_PACKET);
-            let ideal_arrival_ms = (seq.wrapping_sub(1)).wrapping_mul(MS_PER_PACKET);
+            // Use wrapping arithmetic to handle overflow correctly
+            let packets_since_start = seq.wrapping_sub(self.start_seq);
+            let rtp_ts = self
+                .start_rtp_ts
+                .wrapping_add(packets_since_start.wrapping_mul(RTP_TS_PER_PACKET));
+            let ideal_arrival_ms = packets_since_start.wrapping_mul(MS_PER_PACKET);
 
             let arrival_time = if arrival_jitter_ms >= 0 {
-                self.start_time + Duration::from_millis(ideal_arrival_ms + arrival_jitter_ms as u64)
+                self.start_time
+                    + Duration::from_millis(ideal_arrival_ms.wrapping_add(arrival_jitter_ms as u64))
             } else {
                 self.start_time + Duration::from_millis(ideal_arrival_ms)
-                    - Duration::from_millis(arrival_jitter_ms.abs() as u64)
+                    - Duration::from_millis(arrival_jitter_ms.unsigned_abs())
             };
 
             TestPacket {
@@ -648,8 +723,6 @@ mod tests {
         monitor.update(&pkt);
 
         let state = monitor.state.expect("State should be initialized");
-        // FIX: The first packet is immediately processed because it's at the tail.
-        // So, the tail should advance past it.
         assert_eq!(
             state.tail,
             2.into(),
@@ -667,13 +740,11 @@ mod tests {
 
         let pkt1 = factory.at(1, 0);
         monitor.update(&pkt1);
-        // FIX: Tail is now 2, as packet 1 was immediately processed.
         assert_eq!(monitor.state.unwrap().tail, 2.into());
 
         let pkt2 = factory.at(2, 0);
         monitor.update(&pkt2);
 
-        // FIX: With packet 2's arrival, the tail (at 2) can be processed, advancing tail to 3.
         let state = monitor.state.expect("State should exist");
         assert_eq!(state.tail, 3.into(), "Tail should advance to 3");
         assert_eq!(state.head, 3.into(), "Head should advance to 3");
@@ -689,12 +760,10 @@ mod tests {
         let pkt2 = factory.at(2, 0);
 
         monitor.update(&pkt1);
-        // FIX: Tail becomes 2 after processing packet 1.
         assert_eq!(monitor.state.unwrap().tail, 2.into());
         assert_eq!(monitor.state.unwrap().head, 2.into());
 
         monitor.update(&pkt3); // Packet 3 arrives
-        // FIX: Tail is now waiting for packet 2, so it stays at 2.
         assert_eq!(
             monitor.state.unwrap().tail,
             2.into(),
@@ -711,7 +780,6 @@ mod tests {
         );
 
         monitor.update(&pkt2); // Packet 2 arrives, filling the gap
-        // Now it can process 2, then 3.
         assert_eq!(
             monitor.state.unwrap().tail,
             4.into(),
@@ -730,7 +798,6 @@ mod tests {
         let factory = PacketFactory::new();
 
         monitor.update(&factory.at(1, 0));
-        // FIX: Tail is 2 after processing packet 1. It is now waiting for packet 2.
         assert_eq!(
             monitor.state.unwrap().tail,
             2.into(),
@@ -748,18 +815,12 @@ mod tests {
         // The head becomes 13. new_tail = 13 - 10 = 3.
         // process_until(3) is called. It processes from old_tail (2) up to 3 (exclusive).
         // It looks for packet 2, doesn't find it (loss), and sets tail to 3.
-        assert_eq!(
-            monitor.state.unwrap().tail,
-            3.into(),
-            "Tail should slide past the lost packet"
-        );
+        // Then process_in_order() runs and immediately processes packet 3, advancing tail to 4.
         assert_eq!(monitor.state.unwrap().head, 13.into());
-
-        // Since tail is 3 and pkt 3 is in the buffer, it gets processed immediately.
         assert_eq!(
             monitor.state.unwrap().tail,
             4.into(),
-            "Tail should process packet 3 which was waiting"
+            "Tail should be at 4 after sliding past lost packet 2 and processing packet 3"
         );
     }
 
@@ -769,7 +830,6 @@ mod tests {
         let factory = PacketFactory::new();
 
         monitor.update(&factory.at(1, 0));
-        // FIX: tail is 2 after processing the first packet. The valid window is [2, 12).
         assert_eq!(monitor.state.unwrap().tail, 2.into());
         assert_eq!(monitor.state.unwrap().head, 2.into());
 
@@ -777,9 +837,7 @@ mod tests {
         monitor.update(&pkt12);
 
         let state = monitor.state.unwrap();
-        // Head becomes 13. New window is [3, 13).
         assert_eq!(state.head, 13.into());
-        // `process_until` moves tail from 2 to 3, skipping the lost packet 2.
         assert_eq!(
             state.tail,
             3.into(),
@@ -803,7 +861,6 @@ mod tests {
         monitor.update(&factory.at(5, 0));
         monitor.update(&factory.at(6, 0));
 
-        // FIX: Pkt 5 is processed, tail becomes 6. Pkt 6 is processed, tail becomes 7.
         assert_eq!(monitor.state.unwrap().tail, 7.into());
         let state_before = monitor.state.unwrap();
 
@@ -830,15 +887,13 @@ mod tests {
 
         // Send packets 1 and 3, creating a gap for packet 2.
         monitor.update(&factory.at(1, 0));
-        monitor.update(&factory.at(3, 0)); // Arrives 39ms after start
+        monitor.update(&factory.at(3, 0));
 
-        // FIX: Tail is waiting at 2. Packet 3 is in the buffer.
         assert_eq!(monitor.state.unwrap().tail, 2.into());
         assert!(monitor.packet(3.into()).is_some());
 
         // Send a "duplicate" of 3, but with a different arrival time.
-        // This simulates a network duplicate arriving later.
-        let pkt3_dup = factory.at(3, 10); // Arrives 49ms after start
+        let pkt3_dup = factory.at(3, 10);
         monitor.update(&pkt3_dup);
         assert_eq!(
             monitor.packet(3.into()).as_ref().unwrap().arrival,
@@ -846,10 +901,9 @@ mod tests {
             "Duplicate should overwrite existing packet data"
         );
 
-        // Now, fill the gap with packet 2. This will trigger processing.
+        // Now, fill the gap with packet 2.
         monitor.update(&factory.at(2, 0));
 
-        // After processing, the last arrival time should be from packet 3 (the duplicate).
         let state = monitor.state.unwrap();
         assert_eq!(
             state.tail,
@@ -865,9 +919,9 @@ mod tests {
     #[test]
     fn test_sequence_number_wrap_around() {
         let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
-        // FIX: Use a factory that won't overflow u64 math.
-        let factory = PacketFactory::new();
-        let mut current_seq = u64::MAX - 5;
+        let start_seq = u64::MAX - 5;
+        let factory = PacketFactory::with_start_seq(start_seq);
+        let mut current_seq = start_seq;
 
         // Initialize the monitor
         monitor.update(&factory.at(current_seq, 0));
@@ -882,8 +936,8 @@ mod tests {
             monitor.update(&factory.at(current_seq, 0));
         }
 
-        let expected_tail = (u64::MAX - 5).wrapping_add(16);
-        let expected_head = (u64::MAX - 5).wrapping_add(16);
+        let expected_tail = start_seq.wrapping_add(16);
+        let expected_head = start_seq.wrapping_add(16);
         assert_eq!(monitor.state.unwrap().tail, expected_tail.into());
         assert_eq!(monitor.state.unwrap().head, expected_head.into());
     }

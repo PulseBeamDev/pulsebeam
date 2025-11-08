@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use crate::rtp::{
     Packet, RtpPacket,
-    monitor::{QualityMonitorConfig, StreamMonitor, StreamState},
+    monitor::{StreamMonitor, StreamState},
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,7 +255,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             }
         };
         let stream_state = StreamState::new(true, bitrate);
-        let monitor = StreamMonitor::new(stream_state.clone(), QualityMonitorConfig::default());
+        let monitor = StreamMonitor::new(stream_state.clone());
 
         senders.push(SimulcastSender {
             rid,
