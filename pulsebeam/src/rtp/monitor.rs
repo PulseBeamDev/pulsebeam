@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -123,6 +123,16 @@ impl StreamMonitor {
         let quality_score = metrics.quality_score();
         let new_quality = metrics.quality(quality_score);
 
+        tracing::trace!(
+            "stream_monitor={},{},{:3},{:3}",
+            self.stream_id,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            metrics.dod_ewma,
+            metrics.dod_abs_ewma
+        );
         if new_quality != self.current_quality {
             tracing::info!(
                 stream_id = %self.stream_id,
