@@ -68,6 +68,7 @@ impl StreamState {
 pub struct StreamMonitor {
     shared_state: StreamState,
 
+    stream_id: String,
     manual_pause: bool,
 
     delta_delta: DeltaDeltaMonitor,
@@ -78,9 +79,10 @@ pub struct StreamMonitor {
 }
 
 impl StreamMonitor {
-    pub fn new(shared_state: StreamState) -> Self {
+    pub fn new(stream_id: String, shared_state: StreamState) -> Self {
         let now = Instant::now();
         Self {
+            stream_id,
             shared_state,
             manual_pause: true,
             last_packet_at: now,
@@ -123,7 +125,8 @@ impl StreamMonitor {
 
         if new_quality != self.current_quality {
             tracing::info!(
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, delta_delta: {}ms, delta_delta_abs: {}ms, bitrate: {})",
+                stream_id = %self.stream_id,
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, delta_delta: {:.3}ms, delta_delta_abs: {:.3}ms, bitrate: {})",
                 self.current_quality,
                 new_quality,
                 quality_score,
@@ -355,7 +358,8 @@ impl RawMetrics {
     const QUALITY_SCORE_GOOD_THRESHOLD: f64 = 60.0;
 
     fn packet_loss(&self) -> f64 {
-        self.packets_actual as f64 / self.packets_expected as f64
+        self.packets_expected.saturating_sub(self.packets_actual) as f64
+            / self.packets_expected as f64
     }
 
     pub fn quality_score(&self) -> f64 {

@@ -255,7 +255,8 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             }
         };
         let stream_state = StreamState::new(true, bitrate);
-        let monitor = StreamMonitor::new(stream_state.clone());
+        let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
+        let monitor = StreamMonitor::new(stream_id, stream_state.clone());
 
         senders.push(SimulcastSender {
             rid,
