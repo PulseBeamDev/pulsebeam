@@ -26,7 +26,7 @@ use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
-use crate::rtp::{PacketTiming, VIDEO_FREQUENCY};
+use crate::rtp::PacketTiming;
 
 /// Defines the wall-clock duration without packets after which a stream is considered inactive.
 const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -34,100 +34,9 @@ const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
 const LOSS_WINDOW_SIZE: usize = 256;
 /// Number of bitrate samples to track for stability measurement
 const BITRATE_HISTORY_SAMPLES: usize = 128;
+const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 /// Minimum number of samples before making quality decisions
 const MIN_SAMPLES_FOR_QUALITY: usize = 8; // ~2 seconds minimum
-
-// --- Health Thresholds & Config ---
-
-/// Defines the thresholds for normalizing a raw metric into a health score.
-#[derive(Debug, Clone, Copy)]
-pub struct HealthThresholds {
-    pub bad: f32,
-    pub good: f32,
-}
-
-/// A fully tunable configuration for the quality monitor.
-#[derive(Debug, Clone, Copy)]
-pub struct QualityMonitorConfig {
-    pub loss: HealthThresholds,
-    pub jitter_ms: HealthThresholds,
-
-    // --- Score Engine Parameters ---
-    pub score_max: f32,
-    pub score_min: f32,
-    pub score_increment_scaler: f32,
-    pub score_decrement_multiplier: f32,
-
-    // --- State Change Thresholds with Hysteresis ---
-    // Downgrade thresholds (quick to react)
-    pub excellent_to_good_threshold: f32,
-    pub good_to_bad_threshold: f32,
-
-    // Upgrade thresholds (conservative, require sustained improvement)
-    pub bad_to_good_threshold: f32,
-    pub good_to_excellent_threshold: f32,
-
-    // --- Hard Limits & Catastrophic Penalties ---
-    pub catastrophic_loss_percent: f32,
-    pub catastrophic_jitter_ms: u32,
-    pub catastrophic_penalty: f32,
-
-    // --- Metric Weights ---
-    pub loss_weight: f32,
-    pub jitter_weight: f32,
-
-    // --- Stability Controls ---
-    /// Minimum consecutive polls at threshold before upgrading quality
-    pub upgrade_stability_count: u32,
-    /// Exponential moving average factor for metric smoothing (0-1, lower = more smoothing)
-    pub metric_smoothing_factor: f32,
-}
-
-impl Default for QualityMonitorConfig {
-    fn default() -> Self {
-        Self {
-            // Metric health boundaries (Bad = problem starts, Good = target for recovery)
-            loss: HealthThresholds {
-                bad: 5.0,
-                good: 2.0,
-            },
-            jitter_ms: HealthThresholds {
-                bad: 50.0,
-                good: 30.0,
-            },
-
-            // Score engine dynamics
-            score_max: 100.0,
-            score_min: 0.0,
-            score_increment_scaler: 3.0,     // Slower improvements
-            score_decrement_multiplier: 4.0, // Fast degradation
-
-            // Hysteresis thresholds - note the gaps to prevent oscillation
-            // Downgrades (quick)
-            excellent_to_good_threshold: 75.0, // Drop from Excellent below this
-            good_to_bad_threshold: 40.0,       // Drop from Good below this
-
-            // Upgrades (conservative, require higher score)
-            bad_to_good_threshold: 60.0,       // Rise from Bad above this
-            good_to_excellent_threshold: 88.0, // Rise from Good above this
-
-            // "The Cliff": Instantaneous triggers for severe penalties
-            catastrophic_loss_percent: 20.0,
-            catastrophic_jitter_ms: 100,
-            catastrophic_penalty: 30.0,
-
-            // How much each metric contributes to the overall health score for an interval.
-            loss_weight: 0.6,
-            jitter_weight: 0.4,
-
-            // Stability controls
-            upgrade_stability_count: 10, // ~2 seconds of sustained good performance to upgrade
-            metric_smoothing_factor: 0.3, // Heavy smoothing to reduce noise
-        }
-    }
-}
-
-// --- Public-Facing Shared State ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -170,7 +79,153 @@ impl StreamState {
     }
 }
 
-// --- Bitrate History for Stability Tracking ---
+#[derive(Debug)]
+pub struct StreamMonitor {
+    shared_state: StreamState,
+
+    manual_pause: bool,
+
+    delta_delta: DeltaDeltaMonitor,
+    last_packet_at: Instant,
+    bwe: BitrateEstimate,
+
+    current_quality: StreamQuality,
+}
+
+impl StreamMonitor {
+    pub fn new(shared_state: StreamState) -> Self {
+        let now = Instant::now();
+        Self {
+            shared_state,
+            manual_pause: true,
+            last_packet_at: now,
+            delta_delta: DeltaDeltaMonitor::new(DELTA_DELTA_WINDOW_SIZE),
+            bwe: BitrateEstimate::new(now),
+            current_quality: StreamQuality::Good,
+        }
+    }
+
+    pub fn process_packet(&mut self, packet: &impl PacketTiming, size_bytes: usize) {
+        self.last_packet_at = packet.arrival_timestamp();
+        self.bwe.record(size_bytes);
+
+        self.delta_delta.update(packet);
+    }
+
+    pub fn poll(&mut self, now: Instant) {
+        let was_inactive = self.shared_state.is_inactive();
+        let is_inactive = self.determine_inactive_state(now);
+        if is_inactive && !was_inactive {
+            self.reset();
+        }
+        self.shared_state
+            .inactive
+            .store(is_inactive, Ordering::Relaxed);
+        if is_inactive {
+            return;
+        }
+
+        self.bwe.poll(now);
+        self.shared_state
+            .bitrate_bps
+            .store(self.bwe.smoothed_bitrate_bps as u64, Ordering::Relaxed);
+
+        let Some(metrics) = self.delta_delta.raw_metrics() else {
+            return;
+        };
+        let quality_score = metrics.quality_score();
+        let new_quality = metrics.quality(quality_score);
+
+        if new_quality != self.current_quality {
+            tracing::info!(
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, delta_delta: {}ms, delta_delta_abs: {}ms, bitrate: {})",
+                self.current_quality,
+                new_quality,
+                quality_score,
+                metrics.packet_loss() * 100.0,
+                metrics.dod_ewma,
+                metrics.dod_abs_ewma,
+                Bitrate::from(self.bwe.smoothed_bitrate_bps),
+            );
+            self.current_quality = new_quality;
+            self.shared_state
+                .quality
+                .store(new_quality as u8, Ordering::Relaxed);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.bwe.reset();
+        self.current_quality = StreamQuality::Good;
+        self.shared_state
+            .quality
+            .store(StreamQuality::Good as u8, Ordering::Relaxed);
+    }
+
+    pub fn set_manual_pause(&mut self, paused: bool) {
+        self.manual_pause = paused;
+    }
+
+    fn determine_inactive_state(&self, now: Instant) -> bool {
+        self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
+    }
+}
+
+#[derive(Debug)]
+pub struct BitrateEstimate {
+    bwe_last_update: Instant,
+    bwe_interval_bytes: usize,
+    bwe_bps_ewma: f64,
+
+    smoothed_bitrate_bps: f64,
+    history: BitrateHistory,
+}
+
+impl BitrateEstimate {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            bwe_last_update: now,
+            bwe_interval_bytes: 0,
+            bwe_bps_ewma: 0.0,
+
+            smoothed_bitrate_bps: 0.0,
+            history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
+        }
+    }
+
+    pub fn record(&mut self, packet_len: usize) {
+        self.bwe_interval_bytes = self.bwe_interval_bytes.saturating_add(packet_len);
+    }
+
+    pub fn poll(&mut self, now: Instant) {
+        const EWMA_ALPHA: f64 = 0.8;
+        let elapsed = now.saturating_duration_since(self.bwe_last_update);
+
+        let elapsed_secs = elapsed.as_secs_f64();
+        if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
+            let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
+
+            if self.bwe_bps_ewma == 0.0 {
+                self.bwe_bps_ewma = bps;
+            } else {
+                self.bwe_bps_ewma = (1.0 - EWMA_ALPHA) * self.bwe_bps_ewma + EWMA_ALPHA * bps;
+            }
+            self.history.push(bps);
+
+            // P99 is too noisy + add headroom
+            let p95 = 1.5 * self.history.percentile(0.95).unwrap_or_default();
+
+            let bps = p95.max(self.bwe_bps_ewma);
+            self.smoothed_bitrate_bps = bps;
+            self.bwe_interval_bytes = 0;
+            self.bwe_last_update = now;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.history.reset();
+    }
+}
 
 #[derive(Debug)]
 pub struct BitrateHistory {
@@ -272,450 +327,96 @@ impl BitrateHistory {
     }
 }
 
-// --- Packet Loss Window (Bitmap-based) ---
-
-#[derive(Debug)]
-struct PacketLossWindow {
-    bitmap: Vec<u64>,
-    highest_seq: SeqNo,
-    initialized: bool,
-    window_size: usize,
-    packets_received: usize,
+struct RawMetrics {
+    pub dod_ewma: f64,
+    pub dod_abs_ewma: f64,
+    pub packets_actual: u64,
+    pub packets_expected: u64,
 }
 
-impl PacketLossWindow {
-    fn new(window_size: usize) -> Self {
-        let chunks_needed = (window_size + 63) / 64;
+impl From<&DeltaDeltaState> for RawMetrics {
+    fn from(value: &DeltaDeltaState) -> Self {
         Self {
-            bitmap: vec![0u64; chunks_needed],
-            highest_seq: 0.into(),
-            initialized: false,
-            window_size,
-            packets_received: 0,
+            dod_ewma: value.dod_ewma,
+            dod_abs_ewma: value.dod_abs_ewma,
+            packets_actual: value.packets_actual,
+            packets_expected: value.packets_expected,
         }
-    }
-
-    fn mark_received(&mut self, seq_no: SeqNo) {
-        if !self.initialized {
-            self.highest_seq = seq_no;
-            self.initialized = true;
-            self.set_bit(seq_no, true);
-            self.packets_received = 1;
-            return;
-        }
-        let seq_u64 = *seq_no;
-        let highest_u64 = *self.highest_seq;
-        let raw_diff = seq_u64.wrapping_sub(highest_u64);
-        let diff = if raw_diff > (u16::MAX as u64 / 2) {
-            -((u16::MAX as i64 + 1) - raw_diff as i64)
-        } else {
-            raw_diff as i64
-        };
-        if diff > 0 && diff < (self.window_size as i64) {
-            for i in 1..diff {
-                let intermediate_seq: SeqNo = highest_u64.wrapping_add(i as u64).into();
-                self.set_bit(intermediate_seq, false);
-            }
-            self.highest_seq = seq_no;
-            self.set_bit(seq_no, true);
-            self.packets_received = self.packets_received.saturating_add(1);
-        } else if diff <= 0 && diff > -(self.window_size as i64) {
-            if !self.get_bit(seq_no) {
-                self.set_bit(seq_no, true);
-                self.packets_received = self.packets_received.saturating_add(1);
-            }
-        } else if diff >= (self.window_size as i64) {
-            self.reset_with_seq(seq_no);
-        }
-    }
-
-    fn calculate_loss_percent(&self) -> f32 {
-        if !self.initialized || self.packets_received < self.window_size {
-            return 0.0;
-        }
-        let received_count = self.count_received_in_window();
-        let lost_count = self.window_size.saturating_sub(received_count);
-        (lost_count as f32 * 100.0) / (self.window_size as f32)
-    }
-
-    fn is_ready(&self) -> bool {
-        self.initialized && self.packets_received >= self.window_size
-    }
-
-    fn reset(&mut self) {
-        self.bitmap.fill(0);
-        self.initialized = false;
-        self.packets_received = 0;
-        self.highest_seq = 0.into();
-    }
-
-    fn reset_with_seq(&mut self, seq_no: SeqNo) {
-        self.reset();
-        self.highest_seq = seq_no;
-        self.set_bit(seq_no, true);
-        self.packets_received = 1;
-        self.initialized = true;
-    }
-
-    fn get_bit(&self, seq_no: SeqNo) -> bool {
-        let idx = (*seq_no as usize) % self.window_size;
-        let (chunk_idx, bit_idx) = (idx / 64, idx % 64);
-        if chunk_idx >= self.bitmap.len() {
-            return false;
-        }
-        (self.bitmap[chunk_idx] & (1u64 << bit_idx)) != 0
-    }
-
-    fn set_bit(&mut self, seq_no: SeqNo, value: bool) {
-        let idx = (*seq_no as usize) % self.window_size;
-        let (chunk_idx, bit_idx) = (idx / 64, idx % 64);
-        if chunk_idx >= self.bitmap.len() {
-            return;
-        }
-        if value {
-            self.bitmap[chunk_idx] |= 1u64 << bit_idx;
-        } else {
-            self.bitmap[chunk_idx] &= !(1u64 << bit_idx);
-        }
-    }
-
-    fn count_received_in_window(&self) -> usize {
-        self.bitmap
-            .iter()
-            .map(|chunk| chunk.count_ones() as usize)
-            .sum()
     }
 }
 
-// --- Stream Monitor ---
+impl RawMetrics {
+    // --- Scoring & Quality Constants (Tunable) ---
+    const QUALITY_MIN_PACKETS: u64 = 30;
 
-#[derive(Debug)]
-pub struct StreamMonitor {
-    shared_state: StreamState,
-    config: QualityMonitorConfig,
-    manual_pause: bool,
-    last_packet_at: Instant,
-    clock_rate: u32,
-    bwe_last_update: Instant,
-    bwe_interval_bytes: usize,
-    bwe_bps_ewma: f64,
-    jitter_estimate: f64,
-    jitter_last_arrival: Option<Instant>,
-    jitter_last_rtp_time: Option<u64>,
-    loss_window: PacketLossWindow,
-    bitrate_history: BitrateHistory,
+    // --- Weights for combining scores (must sum to 1.0) ---
+    /// Weight for packet loss, reflecting stream reliability.
+    const WEIGHT_LOSS: f64 = 0.3;
+    /// Weight for network instability (volatility), reflecting short-term jitter.
+    const WEIGHT_INSTABILITY: f64 = 0.5;
+    /// Weight for congestion trend, reflecting sustained delay increases (bufferbloat).
+    const WEIGHT_CONGESTION: f64 = 0.2;
 
-    // Smoothed metrics (exponential moving average)
-    smoothed_loss_percent: f32,
-    smoothed_jitter_ms: f32,
-    smoothed_bitrate_bps: f64,
+    // --- Normalization Thresholds (where the component score becomes 0) ---
+    /// Packet loss percentage at which the loss score component drops to 0.
+    const TERRIBLE_LOSS_PERCENT: f64 = 10.0;
+    /// Instability (dod_abs_ewma) in ms at which its score component drops to 0.
+    const TERRIBLE_INSTABILITY_MS: f64 = 5.0;
+    /// Congestion trend (abs(dod_ewma)) in ms at which its score component drops to 0.
+    const TERRIBLE_CONGESTION_TREND_MS: f64 = 1.5;
 
-    // Raw metrics (for debugging)
-    raw_loss_percent: f32,
-    raw_jitter_ms: u32,
+    // --- Final Score to Enum Mapping ---
+    const QUALITY_SCORE_EXCELLENT_THRESHOLD: f64 = 90.0;
+    const QUALITY_SCORE_GOOD_THRESHOLD: f64 = 60.0;
 
-    current_quality: StreamQuality,
-    quality_score: f32,
-
-    // Stability tracking for upgrades
-    consecutive_upgrade_eligible_polls: u32,
-    last_downgrade_instant: Option<Instant>,
-}
-
-impl StreamMonitor {
-    pub fn new(shared_state: StreamState, config: QualityMonitorConfig) -> Self {
-        let now = Instant::now();
-        Self {
-            shared_state,
-            config,
-            manual_pause: true,
-            last_packet_at: now,
-            clock_rate: 0,
-            bwe_last_update: now,
-            bwe_interval_bytes: 0,
-            bwe_bps_ewma: 0.0,
-            jitter_estimate: 0.0,
-            jitter_last_arrival: None,
-            jitter_last_rtp_time: None,
-            loss_window: PacketLossWindow::new(LOSS_WINDOW_SIZE),
-            bitrate_history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
-            smoothed_loss_percent: 0.0,
-            smoothed_jitter_ms: 0.0,
-            smoothed_bitrate_bps: 0.0,
-            raw_loss_percent: 0.0,
-            raw_jitter_ms: 0,
-            current_quality: StreamQuality::Good,
-            quality_score: 50.0, // Start in middle
-            consecutive_upgrade_eligible_polls: 0,
-            last_downgrade_instant: None,
-        }
+    fn packet_loss(&self) -> f64 {
+        self.packets_actual as f64 / self.packets_expected as f64
     }
 
-    pub fn process_packet(&mut self, packet: &impl PacketTiming, size_bytes: usize) {
-        self.last_packet_at = packet.arrival_timestamp();
-        self.discover_clock_rate(packet);
-        self.bwe_interval_bytes = self.bwe_interval_bytes.saturating_add(size_bytes);
-        self.loss_window.mark_received(packet.seq_no());
-        self.update_jitter(packet);
-    }
-
-    pub fn poll(&mut self, now: Instant) {
-        let was_inactive = self.shared_state.is_inactive();
-        let is_inactive = self.determine_inactive_state(now);
-        if is_inactive && !was_inactive {
-            self.reset();
-        }
-        self.shared_state
-            .inactive
-            .store(is_inactive, Ordering::Relaxed);
-        if is_inactive {
-            return;
-        }
-        self.update_derived_metrics(now);
-
-        // Only evaluate quality if we have enough data
-        if !self.loss_window.is_ready() || !self.bitrate_history.is_ready() {
-            return;
+    pub fn quality_score(&self) -> f64 {
+        if self.packets_expected < Self::QUALITY_MIN_PACKETS {
+            return 100.0;
         }
 
-        let new_quality = self.determine_stream_quality(now);
-        if new_quality != self.current_quality {
-            tracing::info!(
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, jitter: {}ms, bitrate: {})",
-                self.current_quality,
-                new_quality,
-                self.quality_score,
-                self.smoothed_loss_percent,
-                self.smoothed_jitter_ms as u32,
-                Bitrate::from(self.smoothed_bitrate_bps),
-            );
-            self.current_quality = new_quality;
-            self.shared_state
-                .quality
-                .store(new_quality as u8, Ordering::Relaxed);
+        // 1. Calculate the raw metric values.
+        let loss_percentage = (1.0 - self.packet_loss()) * 100.0;
+        let instability_ms = self.dod_abs_ewma;
+        // We only care about the magnitude of the trend, not its direction.
+        let congestion_trend_ms = self.dod_ewma.abs();
 
-            // Track downgrades for preventing rapid oscillation
-            if (new_quality as u8) < (self.current_quality as u8) {
-                self.last_downgrade_instant = Some(now);
-                self.consecutive_upgrade_eligible_polls = 0;
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.loss_window.reset();
-        self.jitter_estimate = 0.0;
-        self.jitter_last_arrival = None;
-        self.jitter_last_rtp_time = None;
-        self.bitrate_history.reset();
-        self.smoothed_loss_percent = 0.0;
-        self.smoothed_jitter_ms = 0.0;
-        self.raw_jitter_ms = 0;
-        self.bwe_interval_bytes = 0;
-        self.quality_score = 50.0;
-        self.current_quality = StreamQuality::Good;
-        self.consecutive_upgrade_eligible_polls = 0;
-        self.last_downgrade_instant = None;
-        self.shared_state
-            .quality
-            .store(StreamQuality::Good as u8, Ordering::Relaxed);
-    }
-
-    pub fn set_manual_pause(&mut self, paused: bool) {
-        self.manual_pause = paused;
-    }
-
-    fn determine_inactive_state(&self, now: Instant) -> bool {
-        self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
-    }
-
-    fn determine_stream_quality(&mut self, now: Instant) -> StreamQuality {
-        // Calculate health scores
-        let normalize = |value: f32, thresholds: HealthThresholds| -> f32 {
-            if value <= thresholds.good {
-                1.0
-            } else if value >= thresholds.bad {
-                -((value - thresholds.bad) / (thresholds.bad - thresholds.good)).min(1.0)
-            } else {
-                1.0 - (value - thresholds.good) / (thresholds.bad - thresholds.good)
-            }
+        // 2. Normalize each metric to a 0.0-100.0 score.
+        let loss_score = {
+            let scaled_loss = loss_percentage / Self::TERRIBLE_LOSS_PERCENT;
+            (1.0 - scaled_loss).max(0.0) * 100.0
         };
 
-        let loss_health = normalize(self.smoothed_loss_percent, self.config.loss);
-        let jitter_health = normalize(self.smoothed_jitter_ms, self.config.jitter_ms);
-
-        let final_health =
-            (loss_health * self.config.loss_weight) + (jitter_health * self.config.jitter_weight);
-
-        // Apply catastrophic penalties
-        let mut catastrophic_penalty = 0.0;
-        if self.smoothed_loss_percent > self.config.catastrophic_loss_percent {
-            catastrophic_penalty += self.config.catastrophic_penalty;
-        }
-        if self.smoothed_jitter_ms > self.config.catastrophic_jitter_ms as f32 {
-            catastrophic_penalty += self.config.catastrophic_penalty;
-        }
-
-        // Update quality score
-        if final_health >= 0.0 {
-            self.quality_score += self.config.score_increment_scaler * final_health;
-        } else {
-            self.quality_score -= final_health.abs() * self.config.score_decrement_multiplier;
-        }
-        self.quality_score -= catastrophic_penalty;
-
-        self.quality_score = self
-            .quality_score
-            .clamp(self.config.score_min, self.config.score_max);
-
-        // Determine new quality with hysteresis
-        let target_quality = match self.current_quality {
-            StreamQuality::Bad => {
-                // From Bad: only upgrade if score is well above threshold AND sustained
-                if self.quality_score >= self.config.bad_to_good_threshold {
-                    self.consecutive_upgrade_eligible_polls += 1;
-                    if self.consecutive_upgrade_eligible_polls
-                        >= self.config.upgrade_stability_count
-                    {
-                        StreamQuality::Good
-                    } else {
-                        StreamQuality::Bad
-                    }
-                } else {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    StreamQuality::Bad
-                }
-            }
-            StreamQuality::Good => {
-                // From Good: can downgrade quickly or upgrade slowly
-                if self.quality_score < self.config.good_to_bad_threshold {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    StreamQuality::Bad
-                } else if self.quality_score >= self.config.good_to_excellent_threshold {
-                    // Prevent upgrade too soon after a downgrade
-                    if let Some(last_downgrade) = self.last_downgrade_instant {
-                        if now.duration_since(last_downgrade) < Duration::from_secs(10) {
-                            return StreamQuality::Good;
-                        }
-                    }
-
-                    self.consecutive_upgrade_eligible_polls += 1;
-                    if self.consecutive_upgrade_eligible_polls
-                        >= self.config.upgrade_stability_count
-                    {
-                        StreamQuality::Excellent
-                    } else {
-                        StreamQuality::Good
-                    }
-                } else {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    StreamQuality::Good
-                }
-            }
-            StreamQuality::Excellent => {
-                // From Excellent: downgrade quickly if quality drops
-                if self.quality_score < self.config.excellent_to_good_threshold {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    // Check if we should go directly to Bad
-                    if self.quality_score < self.config.good_to_bad_threshold {
-                        StreamQuality::Bad
-                    } else {
-                        StreamQuality::Good
-                    }
-                } else {
-                    StreamQuality::Excellent
-                }
-            }
+        let instability_score = {
+            let scaled_instability = instability_ms / Self::TERRIBLE_INSTABILITY_MS;
+            (1.0 - scaled_instability).max(0.0) * 100.0
         };
 
-        target_quality
+        let congestion_score = {
+            let scaled_congestion = congestion_trend_ms / Self::TERRIBLE_CONGESTION_TREND_MS;
+            (1.0 - scaled_congestion).max(0.0) * 100.0
+        };
+
+        // 3. Combine the scores using the defined weights.
+        let final_score = (loss_score * Self::WEIGHT_LOSS)
+            + (instability_score * Self::WEIGHT_INSTABILITY)
+            + (congestion_score * Self::WEIGHT_CONGESTION);
+
+        final_score
     }
 
-    fn update_derived_metrics(&mut self, now: Instant) {
-        const EWMA_ALPHA: f64 = 0.8;
-        let elapsed = now.saturating_duration_since(self.bwe_last_update);
-
-        // Short Window Estimate
-        if elapsed >= Duration::from_millis(200) {
-            let elapsed_secs = elapsed.as_secs_f64();
-            if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
-                let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
-
-                if self.bwe_bps_ewma == 0.0 {
-                    self.bwe_bps_ewma = bps;
-                } else {
-                    self.bwe_bps_ewma = (1.0 - EWMA_ALPHA) * self.bwe_bps_ewma + EWMA_ALPHA * bps;
-                }
-                self.bitrate_history.push(bps);
-
-                // P99 is too noisy + add headroom
-                let p95 = 1.5 * self.bitrate_history.percentile(0.95).unwrap_or_default();
-
-                let bps = p95.max(self.bwe_bps_ewma);
-                self.smoothed_bitrate_bps = bps;
-                self.shared_state
-                    .bitrate_bps
-                    .store(bps as u64, Ordering::Relaxed);
-            }
-            self.bwe_interval_bytes = 0;
-            self.bwe_last_update = now;
-        }
-
-        // Update raw metrics
-        self.raw_loss_percent = self.loss_window.calculate_loss_percent();
-        self.raw_jitter_ms = (self.jitter_estimate * 1000.0) as u32;
-
-        // Apply exponential moving average for smoothing
-        let alpha = self.config.metric_smoothing_factor;
-
-        if self.smoothed_loss_percent == 0.0 {
-            // First sample - initialize
-            self.smoothed_loss_percent = self.raw_loss_percent;
-            self.smoothed_jitter_ms = self.raw_jitter_ms as f32;
+    /// Derives a `StreamQuality` enum from the numerical quality score.
+    pub fn quality(&self, score: f64) -> StreamQuality {
+        if score >= Self::QUALITY_SCORE_EXCELLENT_THRESHOLD {
+            StreamQuality::Excellent
+        } else if score >= Self::QUALITY_SCORE_GOOD_THRESHOLD {
+            StreamQuality::Good
         } else {
-            // Exponential moving average: smoothed = alpha * raw + (1 - alpha) * smoothed
-            self.smoothed_loss_percent =
-                alpha * self.raw_loss_percent + (1.0 - alpha) * self.smoothed_loss_percent;
-            self.smoothed_jitter_ms =
-                alpha * (self.raw_jitter_ms as f32) + (1.0 - alpha) * self.smoothed_jitter_ms;
+            StreamQuality::Bad
         }
-    }
-
-    fn discover_clock_rate(&mut self, packet: &impl PacketTiming) {
-        if self.clock_rate == 0 {
-            self.clock_rate = packet.rtp_timestamp().frequency().get();
-        }
-    }
-
-    fn update_jitter(&mut self, packet: &impl PacketTiming) {
-        if self.clock_rate == 0 {
-            return;
-        }
-        let arrival = packet.arrival_timestamp();
-        let rtp_time = packet.rtp_timestamp().numer();
-
-        if let (Some(last_arrival), Some(last_rtp_time)) =
-            (self.jitter_last_arrival, self.jitter_last_rtp_time)
-        {
-            // If the RTP timestamp is the same as the last packet, it's part of the same frame burst.
-            // Do not calculate jitter for these packets to avoid artificial spikes.
-            if rtp_time == last_rtp_time {
-                self.jitter_last_arrival = Some(arrival);
-                return; // Skip jitter calculation
-            }
-
-            let arrival_diff = arrival
-                .saturating_duration_since(last_arrival)
-                .as_secs_f64();
-            let rtp_diff = rtp_time.wrapping_sub(last_rtp_time) as f64 / self.clock_rate as f64;
-            let transit_diff = arrival_diff - rtp_diff;
-
-            // Use a slightly more responsive smoothing factor
-            self.jitter_estimate += (transit_diff.abs() - self.jitter_estimate) / 8.0;
-        }
-
-        self.jitter_last_arrival = Some(arrival);
-        self.jitter_last_rtp_time = Some(rtp_time);
     }
 }
 
@@ -760,10 +461,6 @@ impl DeltaDeltaState {
         }
     }
 
-    fn packet_loss(&self) -> f64 {
-        self.packets_actual as f64 / self.packets_expected as f64
-    }
-
     fn advance(&mut self, pkt: &PacketStatus, alpha: f64) {
         let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
 
@@ -793,86 +490,11 @@ pub struct DeltaDeltaMonitor {
 }
 
 impl DeltaDeltaMonitor {
-    // --- Scoring & Quality Constants (Tunable) ---
-    const QUALITY_MIN_PACKETS: u64 = 30;
-
-    // --- Weights for combining scores (must sum to 1.0) ---
-    /// Weight for packet loss, reflecting stream reliability.
-    const WEIGHT_LOSS: f64 = 0.3;
-    /// Weight for network instability (volatility), reflecting short-term jitter.
-    const WEIGHT_INSTABILITY: f64 = 0.5;
-    /// Weight for congestion trend, reflecting sustained delay increases (bufferbloat).
-    const WEIGHT_CONGESTION: f64 = 0.2;
-
-    // --- Normalization Thresholds (where the component score becomes 0) ---
-    /// Packet loss percentage at which the loss score component drops to 0.
-    const TERRIBLE_LOSS_PERCENT: f64 = 10.0;
-    /// Instability (dod_abs_ewma) in ms at which its score component drops to 0.
-    const TERRIBLE_INSTABILITY_MS: f64 = 5.0;
-    /// Congestion trend (abs(dod_ewma)) in ms at which its score component drops to 0.
-    const TERRIBLE_CONGESTION_TREND_MS: f64 = 1.5;
-
-    // --- Final Score to Enum Mapping ---
-    const QUALITY_SCORE_EXCELLENT_THRESHOLD: f64 = 90.0;
-    const QUALITY_SCORE_GOOD_THRESHOLD: f64 = 60.0;
-
     pub fn new(cap: usize) -> Self {
         Self {
             buffer: vec![None; cap],
             state: None,
             alpha: 0.1,
-        }
-    }
-
-    pub fn quality_score(&self) -> f64 {
-        let Some(state) = &self.state else {
-            return 100.0;
-        };
-
-        if state.packets_expected < Self::QUALITY_MIN_PACKETS {
-            return 100.0;
-        }
-
-        // 1. Calculate the raw metric values.
-        let loss_percentage = (1.0 - state.packet_loss()) * 100.0;
-        let instability_ms = state.dod_abs_ewma;
-        // We only care about the magnitude of the trend, not its direction.
-        let congestion_trend_ms = state.dod_ewma.abs();
-
-        // 2. Normalize each metric to a 0.0-100.0 score.
-        let loss_score = {
-            let scaled_loss = loss_percentage / Self::TERRIBLE_LOSS_PERCENT;
-            (1.0 - scaled_loss).max(0.0) * 100.0
-        };
-
-        let instability_score = {
-            let scaled_instability = instability_ms / Self::TERRIBLE_INSTABILITY_MS;
-            (1.0 - scaled_instability).max(0.0) * 100.0
-        };
-
-        let congestion_score = {
-            let scaled_congestion = congestion_trend_ms / Self::TERRIBLE_CONGESTION_TREND_MS;
-            (1.0 - scaled_congestion).max(0.0) * 100.0
-        };
-
-        // 3. Combine the scores using the defined weights.
-        let final_score = (loss_score * Self::WEIGHT_LOSS)
-            + (instability_score * Self::WEIGHT_INSTABILITY)
-            + (congestion_score * Self::WEIGHT_CONGESTION);
-
-        final_score
-    }
-
-    /// Derives a `StreamQuality` enum from the numerical quality score.
-    pub fn quality(&self) -> StreamQuality {
-        let score = self.quality_score();
-
-        if score >= Self::QUALITY_SCORE_EXCELLENT_THRESHOLD {
-            StreamQuality::Excellent
-        } else if score >= Self::QUALITY_SCORE_GOOD_THRESHOLD {
-            StreamQuality::Good
-        } else {
-            StreamQuality::Bad
         }
     }
 
@@ -934,6 +556,10 @@ impl DeltaDeltaMonitor {
             state.advance(&pkt, self.alpha);
         }
         state.tail = end;
+    }
+
+    fn raw_metrics(&self) -> Option<RawMetrics> {
+        self.state.map(|ref s| s.into())
     }
 
     fn as_index(&self, seq: SeqNo) -> usize {
