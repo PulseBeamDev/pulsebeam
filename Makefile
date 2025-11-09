@@ -15,13 +15,10 @@ BINARY = $(TARGET_DIR)/pulsebeam
 IFACE ?= lo
 IFB_IFACE ?= ifb0
 
-# Bad network presets (adjust these for your testing needs)
 LATENCY ?= 100ms
 PACKET_LOSS ?= 2%
 UPLOAD ?= 1mbit
 DOWNLOAD ?= 2mbit
-
-# Additional options
 JITTER ?= 10ms
 CORRUPTION ?= 0%
 REORDER_PROB  := 25%
@@ -141,27 +138,74 @@ net-bad: net-verify net-clear
 	@echo "✓ Bad network simulation is ACTIVE (both directions)"
 	@echo "  Run 'make net-clear' to restore normal network"
 
-# Simulates a high-latency, cross-continent link like Seattle <-> Frankfurt
-net-cross-region:
-	@$(MAKE) net-bad \
-		LATENCY="80ms" \
-		JITTER="100ms" \
-		PACKET_LOSS="0%" \
-		UPLOAD="5mbit" \
-		DOWNLOAD="20mbit" \
-		REORDER_PROB="25%" \
-		REORDER_CORR="10%"
+net-bad:
+	@$(MAKE) net-congested-wifi
 
-# A preset for simulating a more moderate, domestic bad connection
-net-regional-bad:
-	@$(MAKE) net-bad \
+# Pristine network with minimal issues.
+net-good-home-wifi:
+	@$(MAKE) net-apply \
+		LATENCY="20ms" \
+		JITTER="5ms" \
+		PACKET_LOSS="0%" \
+		UPLOAD="10mbit" \
+		DOWNLOAD="50mbit" \
+		REORDER_PROB="0.1%" \
+		REORDER_CORR="25%"
+
+# Simulates a home network with family members streaming, causing jitter and bandwidth contention.
+net-congested-wifi:
+	@$(MAKE) net-apply \
 		LATENCY="25ms" \
 		JITTER="30ms" \
-		PACKET_LOSS="1%" \
+		PACKET_LOSS="0%" \
 		UPLOAD="2mbit" \
 		DOWNLOAD="10mbit" \
 		REORDER_PROB="5%" \
 		REORDER_CORR="50%"
+
+# Simulates a stable 4G/5G connection with decent bandwidth but higher base latency than Wi-Fi.
+net-stable-mobile:
+	@$(MAKE) net-apply \
+		LATENCY="40ms" \
+		JITTER="15ms" \
+		PACKET_LOSS="0%" \
+		UPLOAD="8mbit" \
+		DOWNLOAD="40mbit" \
+		REORDER_PROB="1%" \
+		REORDER_CORR="25%"
+
+# Simulates a mobile connection while moving or with a weak signal, causing intermittent loss and high jitter.
+net-unstable-mobile:
+	@$(MAKE) net-apply \
+		LATENCY="70ms" \
+		JITTER="50ms" \
+		PACKET_LOSS="1%" \
+		UPLOAD="1mbit" \
+		DOWNLOAD="5mbit" \
+		REORDER_PROB="5%" \
+		REORDER_CORR="50%"
+
+# A stable but long-distance intercontinental link (e.g., US to Asia).
+net-cross-continent:
+	@$(MAKE) net-apply \
+		LATENCY="140ms" \
+		JITTER="20ms" \
+		PACKET_LOSS="0%" \
+		UPLOAD="10mbit" \
+		DOWNLOAD="50mbit" \
+		REORDER_PROB="0.5%" \
+		REORDER_CORR="50%"
+
+# A true "nightmare" scenario for resilience testing. A very broken connection.
+net-unusable:
+	@$(MAKE) net-apply \
+		LATENCY="100ms" \
+		JITTER="50ms" \
+		PACKET_LOSS="3%" \
+		UPLOAD="500kbit" \
+		DOWNLOAD="1mbit" \
+		REORDER_PROB="25%" \
+		REORDER_CORR="75%"
 
 # --- Clear All Network Simulation ---
 net-clear:
