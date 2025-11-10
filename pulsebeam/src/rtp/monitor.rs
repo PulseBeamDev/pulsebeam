@@ -2,7 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
@@ -111,18 +111,8 @@ impl StreamMonitor {
         let metrics: RawMetrics = (&self.delta_delta).into();
         let quality_score = metrics.calculate_jitter_score();
 
-        let new_quality = metrics.quality(quality_score);
+        let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
 
-        tracing::trace!(
-            "stream_monitor={},{},{:.3},{:.3}",
-            self.stream_id,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            metrics.m_hat,
-            quality_score
-        );
         if new_quality != self.current_quality {
             tracing::info!(
                 stream_id = %self.stream_id,
@@ -252,14 +242,33 @@ impl RawMetrics {
         score.max(0.0)
     }
 
-    /// Derives a `StreamQuality` enum from the numerical quality score.
-    pub fn quality(&self, score: f64) -> StreamQuality {
-        if score >= 80.0 {
-            StreamQuality::Excellent
-        } else if score >= 60.0 {
-            StreamQuality::Good
-        } else {
-            StreamQuality::Bad
+    pub fn quality_hysteresis(&self, score: f64, current: StreamQuality) -> StreamQuality {
+        match current {
+            StreamQuality::Excellent => {
+                // Must drop below 75 to go down to Good
+                if score < 75.0 {
+                    StreamQuality::Good
+                } else {
+                    StreamQuality::Excellent
+                }
+            }
+            StreamQuality::Good => {
+                if score >= 85.0 {
+                    StreamQuality::Excellent
+                } else if score < 55.0 {
+                    StreamQuality::Bad
+                } else {
+                    StreamQuality::Good
+                }
+            }
+            StreamQuality::Bad => {
+                // Must rise above 65 to go up to Good
+                if score >= 65.0 {
+                    StreamQuality::Good
+                } else {
+                    StreamQuality::Bad
+                }
+            }
         }
     }
 }
@@ -284,7 +293,6 @@ struct DeltaDeltaState {
     last_rtp_ts: MediaTime,
     last_arrival: Instant,
     last_skew: f64,
-    pub dod_abs_ewma: f64,
 
     m_hat: f64,     // The estimate of the queue delay trend, m_hat(i-1)
     e: f64,         // The variance of the estimate, e(i-1)
@@ -308,7 +316,6 @@ impl DeltaDeltaState {
             m_hat: 0.0,
             e: 0.1,         // Initial value from paper, Table 1: e(0) = 0.1
             var_v_hat: 1.0, // A reasonable starting default (var_v is clamped at 1)
-            dod_abs_ewma: 0.0,
             packets_actual: 0,
             packets_expected: 0,
             buffer: vec![None; cap],
