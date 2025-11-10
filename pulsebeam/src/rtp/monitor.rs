@@ -109,7 +109,8 @@ impl StreamMonitor {
             .store(self.bwe.bwe_bps_ewma as u64, Ordering::Relaxed);
 
         let metrics: RawMetrics = (&self.delta_delta).into();
-        let quality_score = metrics.quality_score();
+        let quality_score = metrics.calculate_jitter_score();
+
         let new_quality = metrics.quality(quality_score);
 
         tracing::trace!(
@@ -119,18 +120,18 @@ impl StreamMonitor {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis(),
-            metrics.dod_abs_ewma,
+            metrics.m_hat,
             quality_score
         );
         if new_quality != self.current_quality {
             tracing::info!(
                 stream_id = %self.stream_id,
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, delta_delta: {:.3}ms, bitrate: {})",
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
                 self.current_quality,
                 new_quality,
                 quality_score,
                 metrics.packet_loss() * 100.0,
-                metrics.dod_abs_ewma,
+                metrics.m_hat,
                 Bitrate::from(self.bwe.bwe_bps_ewma),
             );
             self.current_quality = new_quality;
@@ -204,7 +205,7 @@ impl BitrateEstimate {
 }
 
 struct RawMetrics {
-    pub dod_abs_ewma: f64,
+    pub m_hat: f64, // The Kalman-filtered queue delay trend
     pub packets_actual: u64,
     pub packets_expected: u64,
 }
@@ -212,7 +213,7 @@ struct RawMetrics {
 impl From<&DeltaDeltaState> for RawMetrics {
     fn from(value: &DeltaDeltaState) -> Self {
         Self {
-            dod_abs_ewma: value.dod_abs_ewma,
+            m_hat: value.m_hat,
             packets_actual: value.packets_actual,
             packets_expected: value.packets_expected,
         }
@@ -221,12 +222,34 @@ impl From<&DeltaDeltaState> for RawMetrics {
 
 impl RawMetrics {
     fn packet_loss(&self) -> f64 {
+        if self.packets_expected == 0 {
+            return 0.0;
+        }
         self.packets_expected.saturating_sub(self.packets_actual) as f64
             / self.packets_expected as f64
     }
 
-    pub fn quality_score(&self) -> f64 {
-        sigmoid(self.dod_abs_ewma, 100.0, 0.32, 10.75)
+    pub fn calculate_jitter_score(&self) -> f64 {
+        // We use its absolute value to penalize both overuse (positive)
+        // and underuse (negative, which can also indicate instability).
+        // The midpoint will need to be re-tuned. The paper RECOMMENDS
+        // a threshold of 12.5ms to detect overuse.
+        //
+        // midpoint=10.0ms to make it a bit more sensitive to measurement.
+        sigmoid(self.m_hat.abs(), 100.0, -0.2, 10.0)
+    }
+
+    pub fn calculate_loss_score(&self) -> f64 {
+        let loss_ratio = self.packet_loss();
+
+        // This is a highly punitive linear penalty.
+        // 1% loss = 25 point deduction.
+        // 2% loss = 50 point deduction.
+        // 4% loss or more = score of 0.
+        let loss_penalty_per_percent = 25.0;
+        let score = 100.0 - (loss_ratio * 100.0 * loss_penalty_per_percent);
+
+        score.max(0.0)
     }
 
     /// Derives a `StreamQuality` enum from the numerical quality score.
@@ -248,22 +271,9 @@ struct PacketStatus {
     rtp_ts: MediaTime,
 }
 
-/// Maps an input value to a specified range using an inverted logistic (sigmoid) function.
-///
-/// As the `value` increases, the output approaches the minimum of the range (0).
-/// As the `value` decreases, the output approaches the `range_max`.
-///
-/// # Arguments
-/// * `value` - The input value to map (e.g., dod_abs_ewma).
-/// * `range_max` - The maximum value of the output range (e.g., 100.0).
-/// * `k` - The steepness factor of the curve. Determines how quickly the output changes around the midpoint.
-/// * `midpoint` - The input `value` at which the output will be exactly `range_max / 2`.
-///
-/// # Returns
-/// The mapped value, which will be between 0.0 and `range_max`.
 #[inline]
 fn sigmoid(value: f64, range_max: f64, k: f64, midpoint: f64) -> f64 {
-    range_max / (1.0 + (k * (value - midpoint)).exp())
+    range_max / (1.0 + (-k * (value - midpoint)).exp())
 }
 
 #[derive(Debug)]
@@ -275,6 +285,11 @@ struct DeltaDeltaState {
     last_arrival: Instant,
     last_skew: f64,
     pub dod_abs_ewma: f64,
+
+    m_hat: f64,     // The estimate of the queue delay trend, m_hat(i-1)
+    e: f64,         // The variance of the estimate, e(i-1)
+    var_v_hat: f64, // The variance of the measurement noise, var_v_hat(i-1)
+
     packets_actual: u64,
     packets_expected: u64,
     buffer: Vec<Option<PacketStatus>>,
@@ -290,6 +305,9 @@ impl DeltaDeltaState {
             last_rtp_ts: MediaTime::from_90khz(0),
             last_arrival: Instant::now(),
             last_skew: 0.0,
+            m_hat: 0.0,
+            e: 0.1,         // Initial value from paper, Table 1: e(0) = 0.1
+            var_v_hat: 1.0, // A reasonable starting default (var_v is clamped at 1)
             dod_abs_ewma: 0.0,
             packets_actual: 0,
             packets_expected: 0,
@@ -357,28 +375,52 @@ impl DeltaDeltaState {
         self.head = seq.wrapping_add(1).into();
         self.tail = seq;
         self.frequency = rtp_ts.frequency();
+        self.last_rtp_ts = rtp_ts;
         self.last_arrival = arrival;
         self.initialized = true;
     }
 
+    /// Implements https://www.ietf.org/archive/id/draft-ietf-rmcat-gcc-02.txt.
     fn advance(&mut self, pkt: &PacketStatus) {
-        const ALPHA_DOWN: f64 = 0.01;
-        const ALPHA_UP: f64 = 0.1;
         let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
-
         let expected_ms = (pkt.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
             * 1000.0
             / self.frequency.get() as f64;
 
+        // This is `d(i)` from the GCC paper, the inter-group delay variation.
         let skew = actual_ms - expected_ms;
-        let dod_abs = (skew - self.last_skew).abs();
 
-        let alpha = if dod_abs > self.dod_abs_ewma {
-            ALPHA_UP
-        } else {
-            ALPHA_DOWN
-        };
-        self.dod_abs_ewma = (1.0 - alpha) * self.dod_abs_ewma + alpha * dod_abs;
+        // Kalman gain K is calculated based on the previous estimate's variance `e`
+        // and the previous measurement variance `var_v_hat`.
+        // Equation: k(i) = (e(i-1) + q(i)) / (var_v_hat(i) + e(i-1) + q(i))
+        // Note: The paper simplifies and assumes var_v_hat(i) is used, which is fine.
+        // q is the process noise, a constant.
+        const Q: f64 = 1e-3; // State noise covariance from paper, q = 10^-3
+        //
+        let k = (self.e + Q) / (self.var_v_hat + self.e + Q);
+
+        // Update the estimate of the queue delay trend, m_hat.
+        // This is the core output of the filter.
+        // Equation: m_hat(i) = m_hat(i-1) + z(i) * k(i)
+        // where z(i) = d(i) - m_hat(i-1)
+        let z = skew - self.m_hat;
+        self.m_hat += z * k;
+
+        // Update the variance of the estimate.
+        // Equation: e(i) = (1 - k(i)) * (e(i-1) + q(i))
+        self.e = (1.0 - k) * (self.e + Q);
+
+        // --- Update the Measurement Noise Variance (var_v_hat) ---
+        // This part allows the filter to adapt to changing network conditions.
+        // It's a modified EWMA.
+        // f_max is not easily available, so we use a simpler fixed alpha.
+        // A chi of 0.01 is a reasonable choice for smoothing.
+        const CHI: f64 = 0.01;
+        let alpha = (1.0 - CHI).powf(30.0 / 1000.0 * 50.0); // Assuming 50fps for f_max
+
+        // Outlier filter: Clamp the input to the variance calculation.
+        let z_clamped = z.abs().min(3.0 * self.var_v_hat.sqrt());
+        self.var_v_hat = (alpha * self.var_v_hat + (1.0 - alpha) * z_clamped.powi(2)).max(1.0);
 
         self.last_skew = skew;
         self.last_arrival = pkt.arrival;
