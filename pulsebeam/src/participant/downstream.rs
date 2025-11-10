@@ -180,8 +180,6 @@ impl DownstreamAllocator {
     //  2. Video slots
     //  3. update_allocations get polled every 500ms
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        // TODO: use downgrade Hysteresis
-        // --- Hysteresis Factors ---
         const DOWNGRADE_HYSTERESIS_FACTOR: f64 = 0.85;
         const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.25;
 
@@ -189,32 +187,13 @@ impl DownstreamAllocator {
             return (Bitrate::from(0), Bitrate::from(0));
         }
 
-        // Pretend that we have some bandwidth so we can keep probing.
         let budget = self.available_bandwidth.current().as_f64().max(300_000.0);
-
-        // Prioritize filling more slots first
         self.video_slots.sort_by_key(|s| s.priority);
 
-        for slot in &self.video_slots {
-            let Some(track_id) = &slot.assigned_track else {
-                continue;
-            };
-
-            let Some(state) = self.tracks.get_mut(track_id) else {
-                continue;
-            };
-
-            let track = &state.track;
-            let mut config = state.current();
-            let lowest_layer = track.lowest_quality();
-            config.target_rid = lowest_layer.rid;
-            config.paused = true;
-            state.update(|c| *c = config);
-        }
-
-        let mut total_allocated: f64 = 0.0;
-        let mut total_desired: f64 = 0.0;
+        let mut total_allocated = 0.0;
+        let mut total_desired = 0.0;
         let mut upgraded = true;
+
         while upgraded {
             upgraded = false;
             total_allocated = 0.0;
@@ -232,6 +211,11 @@ impl DownstreamAllocator {
                 let track = &state.track;
                 let mut config = state.current();
 
+                // If paused, initialize to lowest quality
+                if config.paused {
+                    config.target_rid = track.lowest_quality().rid;
+                }
+
                 let Some(current_receiver) = track.by_rid(&config.target_rid) else {
                     continue;
                 };
@@ -240,31 +224,35 @@ impl DownstreamAllocator {
                     continue;
                 }
 
-                // Calculate desired quality for total_desired tracking
-                let desired = if config.paused {
-                    current_receiver
-                } else {
-                    match current_receiver.state.quality() {
-                        StreamQuality::Bad => track.lowest_quality(),
-                        StreamQuality::Good => current_receiver,
-                        StreamQuality::Excellent => track
-                            .higher_quality(&config.target_rid)
-                            .filter(|next| {
-                                next.state.quality() == StreamQuality::Excellent
-                                    && !next.state.is_inactive()
-                            })
-                            .unwrap_or(current_receiver),
-                    }
+                // Conservative upgrade logic: only upgrade if higher layer is excellent
+                let desired = match current_receiver.state.quality() {
+                    StreamQuality::Bad => track.lowest_quality(),
+                    StreamQuality::Good => current_receiver, // Stay at current when good
+                    StreamQuality::Excellent => track
+                        .higher_quality(current_receiver.quality)
+                        .filter(|next| {
+                            next.state.quality() == StreamQuality::Excellent
+                                && !next.state.is_inactive()
+                        })
+                        .unwrap_or(current_receiver),
                 };
 
-                let is_upgrade = track.is_upgrade(&current_receiver.rid, &desired.rid);
-                let desired_bitrate = if is_upgrade.unwrap_or_default() {
+                let is_upgrade = desired.quality > current_receiver.quality;
+                let is_downgrade = desired.quality < current_receiver.quality;
+
+                // Apply hysteresis
+                let desired_bitrate = if is_upgrade {
                     desired.state.bitrate_bps() * UPGRADE_HYSTERESIS_FACTOR
+                } else if is_downgrade {
+                    desired.state.bitrate_bps() * DOWNGRADE_HYSTERESIS_FACTOR
                 } else {
                     desired.state.bitrate_bps()
                 };
+
                 total_desired += desired_bitrate;
-                if total_desired < budget && (config.paused || desired.rid != current_receiver.rid)
+
+                if total_allocated + desired_bitrate <= budget
+                    && (config.paused || desired.rid != current_receiver.rid)
                 {
                     upgraded = true;
                     total_allocated += desired.state.bitrate_bps();
@@ -272,6 +260,7 @@ impl DownstreamAllocator {
                     config.paused = false;
                     state.update(|c| *c = config);
                 } else {
+                    // Can't afford upgrade or change - stay at current
                     total_allocated += current_receiver.state.bitrate_bps();
                 }
             }

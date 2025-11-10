@@ -192,42 +192,40 @@ impl TrackReceiver {
         self.simulcast.iter().find(|s| s.rid == *rid)
     }
 
-    pub fn higher_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
-        let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        if idx == self.simulcast.len() - 1 {
-            return None;
+    pub fn higher_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
+        let next_quality = match current {
+            SimulcastQuality::Undefined => Some(SimulcastQuality::Low),
+            SimulcastQuality::Low => Some(SimulcastQuality::Medium),
+            SimulcastQuality::Medium => Some(SimulcastQuality::High),
+            SimulcastQuality::High => None,
+        };
+        if let Some(next) = next_quality {
+            self.simulcast.iter().find(|s| s.quality == next)
+        } else {
+            None
         }
-        let higher = self.simulcast.get(idx.saturating_add(1))?;
-        let current = self.by_rid(rid)?;
-
-        debug_assert!(higher.quality > current.quality);
-        Some(higher)
     }
 
-    pub fn lower_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
-        let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        if idx == 0 {
-            return None;
-        }
-        let lower = self.simulcast.get(idx.saturating_sub(1))?;
-        let current = self.by_rid(rid)?;
+    pub fn lower_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
+        let prev_quality = match current {
+            SimulcastQuality::High => Some(SimulcastQuality::Medium),
+            SimulcastQuality::Medium => Some(SimulcastQuality::Low),
+            SimulcastQuality::Low => Some(SimulcastQuality::Undefined),
+            SimulcastQuality::Undefined => None,
+        };
 
-        debug_assert!(lower.quality < current.quality);
-        Some(lower)
+        if let Some(prev) = prev_quality {
+            self.simulcast.iter().find(|s| s.quality == prev)
+        } else {
+            None
+        }
     }
 
     pub fn lowest_quality(&self) -> &SimulcastReceiver {
         self.simulcast
-            .last()
+            .iter()
+            .min_by_key(|s| s.quality)
             .expect("no lowest quality, there must be at least 1 layer for TrackReceiver to exist")
-    }
-
-    pub fn is_upgrade(&self, from: &Option<Rid>, to: &Option<Rid>) -> Option<bool> {
-        let from_idx = self.simulcast.iter().position(|s| s.rid == *from)?;
-        let to_idx = self.simulcast.iter().position(|s| s.rid == *from)?;
-
-        // lower index means higher quality
-        Some(to_idx < from_idx)
     }
 }
 
