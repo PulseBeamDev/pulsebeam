@@ -109,7 +109,7 @@ net-simple: net-verify net-clear
 	@echo "  Run 'make net-clear' to restore normal network"
 
 # --- Full Version (Egress + Ingress with IFB) ---
-net-bad: net-verify net-clear
+net-apply: net-verify net-clear
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "Applying BAD NETWORK simulation to $(IFACE)"
 	@echo "  Latency:      $(LATENCY) ± $(JITTER)"
