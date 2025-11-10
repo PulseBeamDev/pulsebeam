@@ -1,11 +1,8 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use str0m::bwe::Bitrate;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
@@ -128,19 +125,18 @@ impl StreamMonitor {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis(),
-            metrics.dod_ewma,
-            metrics.dod_abs_ewma
+            metrics.dod_abs_median,
+            quality_score
         );
         if new_quality != self.current_quality {
             tracing::info!(
                 stream_id = %self.stream_id,
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, delta_delta: {:.3}ms, delta_delta_abs: {:.3}ms, bitrate: {})",
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, delta_delta: {:.3}ms, bitrate: {})",
                 self.current_quality,
                 new_quality,
                 quality_score,
                 metrics.packet_loss() * 100.0,
-                metrics.dod_ewma,
-                metrics.dod_abs_ewma,
+                metrics.dod_abs_median,
                 Bitrate::from(self.bwe.smoothed_bitrate_bps),
             );
             self.current_quality = new_quality;
@@ -225,23 +221,21 @@ impl BitrateEstimate {
 
 #[derive(Debug)]
 pub struct Histogram {
-    samples: Vec<u64>,
-    value_counts: BTreeMap<u64, usize>,
+    samples: Vec<f64>,
+    sorted_samples: Vec<f64>,
     capacity: usize,
     index: usize,
     filled: bool,
-    total_samples: usize,
 }
 
 impl Histogram {
     pub fn new(capacity: usize) -> Self {
         Self {
-            samples: vec![0; capacity],
-            value_counts: BTreeMap::new(),
+            samples: vec![0.0; capacity],
+            sorted_samples: Vec::with_capacity(capacity),
             capacity,
             index: 0,
             filled: false,
-            total_samples: 0,
         }
     }
 
@@ -249,83 +243,93 @@ impl Histogram {
         if self.capacity == 0 {
             return;
         }
-        let new_val = value as u64;
 
         if self.filled {
             let old_val = self.samples[self.index];
-            if let Some(count) = self.value_counts.get_mut(&old_val) {
-                *count -= 1;
-                if *count == 0 {
-                    self.value_counts.remove(&old_val);
-                }
-            }
-        } else {
-            self.total_samples += 1;
-            if self.total_samples == self.capacity {
-                self.filled = true;
+            if let Ok(pos) = self
+                .sorted_samples
+                .binary_search_by(|v| v.partial_cmp(&old_val).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                self.sorted_samples.remove(pos);
             }
         }
-        self.samples[self.index] = new_val;
-        *self.value_counts.entry(new_val).or_insert(0) += 1;
+
+        self.samples[self.index] = value;
+
+        let insert_pos = self
+            .sorted_samples
+            .binary_search_by(|v| v.partial_cmp(&value).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or_else(|pos| pos);
+        self.sorted_samples.insert(insert_pos, value);
+
         self.index = (self.index + 1) % self.capacity;
+        if !self.filled && self.index == 0 {
+            self.filled = true;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.sorted_samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sorted_samples.is_empty()
     }
 
     pub fn percentile(&self, p: f64) -> Option<f64> {
-        if self.total_samples < 2 || !(0.0..=1.0).contains(&p) {
+        let len = self.len();
+        if len < 2 || !(0.0..=1.0).contains(&p) {
             return None;
         }
-        let target_rank = ((self.total_samples as f64 - 1.0) * p).round() as usize;
-        let mut current_rank = 0;
-        for (&value, &count) in &self.value_counts {
-            if current_rank + count > target_rank {
-                return Some(value as f64);
-            }
-            current_rank += count;
-        }
-        self.value_counts.last_key_value().map(|(&v, _)| v as f64)
+
+        let target_rank = ((len as f64 - 1.0) * p).round() as usize;
+        self.sorted_samples.get(target_rank).copied()
     }
 
-    pub fn coefficient_of_variation_percent(&self) -> f32 {
-        if self.total_samples < 2 {
-            return 0.0;
+    pub fn mean(&self) -> Option<f64> {
+        let len = self.len();
+        if len == 0 {
+            return None;
         }
-        let samples_slice = if self.filled {
-            &self.samples[..]
-        } else {
-            &self.samples[..self.total_samples]
-        };
-        let mean = samples_slice.iter().sum::<u64>() as f64 / self.total_samples as f64;
-        if mean < 1.0 {
-            return 0.0;
+        Some(self.sorted_samples.iter().sum::<f64>() / len as f64)
+    }
+
+    pub fn coefficient_of_variation_percent(&self) -> Option<f32> {
+        let len = self.len();
+        if len < 2 {
+            return None;
         }
-        let variance = samples_slice
+
+        let mean = self.sorted_samples.iter().sum::<f64>() / len as f64;
+
+        if mean.abs() < f64::EPSILON {
+            return Some(0.0);
+        }
+
+        let variance = self
+            .sorted_samples
             .iter()
             .map(|&v| {
-                let diff = v as f64 - mean;
+                let diff = v - mean;
                 diff * diff
             })
             .sum::<f64>()
-            / self.total_samples as f64;
-        let std_dev = variance.sqrt();
-        ((std_dev / mean) * 100.0) as f32
-    }
+            / len as f64;
 
-    pub fn is_ready(&self) -> bool {
-        self.total_samples >= MIN_SAMPLES_FOR_QUALITY
+        let std_dev = variance.sqrt();
+        Some(((std_dev / mean) * 100.0) as f32)
     }
 
     pub fn reset(&mut self) {
-        self.samples.fill(0);
-        self.value_counts.clear();
+        self.samples.fill(0.0);
+        self.sorted_samples.clear();
         self.index = 0;
         self.filled = false;
-        self.total_samples = 0;
     }
 }
 
 struct RawMetrics {
-    pub dod_ewma: f64,
-    pub dod_abs_ewma: f64,
+    pub dod_abs_median: f64,
     pub packets_actual: u64,
     pub packets_expected: u64,
 }
@@ -333,8 +337,7 @@ struct RawMetrics {
 impl From<&DeltaDeltaState> for RawMetrics {
     fn from(value: &DeltaDeltaState) -> Self {
         Self {
-            dod_ewma: value.dod_ewma,
-            dod_abs_ewma: value.dod_abs_ewma,
+            dod_abs_median: value.histogram.percentile(0.5).unwrap_or_default(),
             packets_actual: value.packets_actual,
             packets_expected: value.packets_expected,
         }
@@ -342,74 +345,20 @@ impl From<&DeltaDeltaState> for RawMetrics {
 }
 
 impl RawMetrics {
-    // --- Scoring & Quality Constants (Tunable) ---
-    const QUALITY_MIN_PACKETS: u64 = 30;
-
-    // --- Weights for combining scores (must sum to 1.0) ---
-    /// Weight for packet loss, reflecting stream reliability.
-    const WEIGHT_LOSS: f64 = 0.3;
-    /// Weight for network instability (volatility), reflecting short-term jitter.
-    const WEIGHT_INSTABILITY: f64 = 0.5;
-    /// Weight for congestion trend, reflecting sustained delay increases (bufferbloat).
-    const WEIGHT_CONGESTION: f64 = 0.2;
-
-    // --- Normalization Thresholds (where the component score becomes 0) ---
-    /// Packet loss percentage at which the loss score component drops to 0.
-    const TERRIBLE_LOSS_PERCENT: f64 = 10.0;
-    /// Instability (dod_abs_ewma) in ms at which its score component drops to 0.
-    const TERRIBLE_INSTABILITY_MS: f64 = 5.0;
-    /// Congestion trend (abs(dod_ewma)) in ms at which its score component drops to 0.
-    const TERRIBLE_CONGESTION_TREND_MS: f64 = 1.5;
-
-    // --- Final Score to Enum Mapping ---
-    const QUALITY_SCORE_EXCELLENT_THRESHOLD: f64 = 90.0;
-    const QUALITY_SCORE_GOOD_THRESHOLD: f64 = 60.0;
-
     fn packet_loss(&self) -> f64 {
         self.packets_expected.saturating_sub(self.packets_actual) as f64
             / self.packets_expected as f64
     }
 
     pub fn quality_score(&self) -> f64 {
-        if self.packets_expected < Self::QUALITY_MIN_PACKETS {
-            return 100.0;
-        }
-
-        // 1. Calculate the raw metric values.
-        let loss_percentage = (1.0 - self.packet_loss()) * 100.0;
-        let instability_ms = self.dod_abs_ewma;
-        // We only care about the magnitude of the trend, not its direction.
-        let congestion_trend_ms = self.dod_ewma.abs();
-
-        // 2. Normalize each metric to a 0.0-100.0 score.
-        let loss_score = {
-            let scaled_loss = loss_percentage / Self::TERRIBLE_LOSS_PERCENT;
-            (1.0 - scaled_loss).max(0.0) * 100.0
-        };
-
-        let instability_score = {
-            let scaled_instability = instability_ms / Self::TERRIBLE_INSTABILITY_MS;
-            (1.0 - scaled_instability).max(0.0) * 100.0
-        };
-
-        let congestion_score = {
-            let scaled_congestion = congestion_trend_ms / Self::TERRIBLE_CONGESTION_TREND_MS;
-            (1.0 - scaled_congestion).max(0.0) * 100.0
-        };
-
-        // 3. Combine the scores using the defined weights.
-        let final_score = (loss_score * Self::WEIGHT_LOSS)
-            + (instability_score * Self::WEIGHT_INSTABILITY)
-            + (congestion_score * Self::WEIGHT_CONGESTION);
-
-        final_score
+        sigmoid(self.dod_abs_median, 100.0, 0.32, 10.75)
     }
 
     /// Derives a `StreamQuality` enum from the numerical quality score.
     pub fn quality(&self, score: f64) -> StreamQuality {
-        if score >= Self::QUALITY_SCORE_EXCELLENT_THRESHOLD {
+        if score >= 80.0 {
             StreamQuality::Excellent
-        } else if score >= Self::QUALITY_SCORE_GOOD_THRESHOLD {
+        } else if score >= 60.0 {
             StreamQuality::Good
         } else {
             StreamQuality::Bad
@@ -455,6 +404,7 @@ struct DeltaDeltaState {
     packets_actual: u64,
     packets_expected: u64,
     buffer: Vec<Option<PacketStatus>>,
+    histogram: Histogram,
     initialized: bool,
 }
 
@@ -472,6 +422,7 @@ impl DeltaDeltaState {
             packets_actual: 0,
             packets_expected: 0,
             buffer: vec![None; cap],
+            histogram: Histogram::new(5),
             initialized: false,
         }
     }
@@ -549,9 +500,11 @@ impl DeltaDeltaState {
 
         let skew = actual_ms - expected_ms;
         let dod = skew - self.last_skew;
+        let dod_abs = dod.abs();
 
+        self.histogram.push(dod_abs);
         self.dod_ewma = ALPHA * dod + (1.0 - ALPHA) * self.dod_ewma;
-        self.dod_abs_ewma = ALPHA * dod.abs() + (1.0 - ALPHA) * self.dod_abs_ewma;
+        self.dod_abs_ewma = ALPHA * dod_abs + (1.0 - ALPHA) * self.dod_abs_ewma;
 
         self.last_skew = skew;
         self.last_arrival = pkt.arrival;
