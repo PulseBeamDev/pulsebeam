@@ -71,7 +71,7 @@ pub struct StreamMonitor {
     stream_id: String,
     manual_pause: bool,
 
-    delta_delta: DeltaDeltaMonitor,
+    delta_delta: DeltaDeltaState,
     last_packet_at: Instant,
     bwe: BitrateEstimate,
 
@@ -86,7 +86,7 @@ impl StreamMonitor {
             shared_state,
             manual_pause: true,
             last_packet_at: now,
-            delta_delta: DeltaDeltaMonitor::new(DELTA_DELTA_WINDOW_SIZE),
+            delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
             bwe: BitrateEstimate::new(now),
             current_quality: StreamQuality::Good,
         }
@@ -117,9 +117,7 @@ impl StreamMonitor {
             .bitrate_bps
             .store(self.bwe.smoothed_bitrate_bps as u64, Ordering::Relaxed);
 
-        let Some(metrics) = self.delta_delta.raw_metrics() else {
-            return;
-        };
+        let metrics: RawMetrics = (&self.delta_delta).into();
         let quality_score = metrics.quality_score();
         let new_quality = metrics.quality(quality_score);
 
@@ -444,7 +442,7 @@ fn sigmoid(value: f64, range_max: f64, k: f64, midpoint: f64) -> f64 {
     range_max / (1.0 + (k * (value - midpoint)).exp())
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug)]
 struct DeltaDeltaState {
     head: SeqNo,          // Next expected seq
     tail: SeqNo,          // Oldest seq in buffer
@@ -456,74 +454,36 @@ struct DeltaDeltaState {
     pub dod_abs_ewma: f64,
     packets_actual: u64,
     packets_expected: u64,
+    buffer: Vec<Option<PacketStatus>>,
+    initialized: bool,
 }
 
 impl DeltaDeltaState {
-    fn init<T: PacketTiming>(packet: &T) -> Self {
-        let seq = packet.seq_no();
-        let rtp_ts = packet.rtp_timestamp();
-        let now = packet.arrival_timestamp();
-
+    pub fn new(cap: usize) -> Self {
         Self {
-            head: seq.wrapping_add(1).into(),
-            tail: seq,
-            frequency: rtp_ts.frequency(),
-            last_rtp_ts: rtp_ts,
-            last_arrival: now,
+            head: 0.into(),
+            tail: 0.into(),
+            frequency: Frequency::NINETY_KHZ,
+            last_rtp_ts: MediaTime::from_90khz(0),
+            last_arrival: Instant::now(),
             last_skew: 0.0,
             dod_ewma: 0.0,
             dod_abs_ewma: 0.0,
             packets_actual: 0,
             packets_expected: 0,
-        }
-    }
-
-    fn advance(&mut self, pkt: &PacketStatus, alpha: f64) {
-        let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
-
-        let expected_ms = (pkt.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
-            * 1000.0
-            / self.frequency.get() as f64;
-
-        let skew = actual_ms - expected_ms;
-        let dod = skew - self.last_skew;
-
-        self.dod_ewma = alpha * dod + (1.0 - alpha) * self.dod_ewma;
-        self.dod_abs_ewma = alpha * dod.abs() + (1.0 - alpha) * self.dod_abs_ewma;
-
-        self.last_skew = skew;
-        self.last_arrival = pkt.arrival;
-        self.last_rtp_ts = pkt.rtp_ts;
-        self.packets_actual += 1;
-        self.packets_expected += 1;
-    }
-}
-
-#[derive(Debug)]
-pub struct DeltaDeltaMonitor {
-    buffer: Vec<Option<PacketStatus>>,
-    state: Option<DeltaDeltaState>,
-    alpha: f64,
-}
-
-impl DeltaDeltaMonitor {
-    pub fn new(cap: usize) -> Self {
-        Self {
             buffer: vec![None; cap],
-            state: None,
-            alpha: 0.1,
+            initialized: false,
         }
     }
 
     pub fn update<T: PacketTiming>(&mut self, packet: &T) {
-        let mut state = *self
-            .state
-            .get_or_insert_with(|| DeltaDeltaState::init(packet));
-
+        if !self.initialized {
+            self.init(packet);
+        }
         let seq = packet.seq_no();
 
         // Check if packet is older than tail using wrapping comparison
-        let tail_val = *state.tail;
+        let tail_val = *self.tail;
         let seq_val = *seq;
         let seq_offset = seq_val.wrapping_sub(tail_val);
 
@@ -532,7 +492,7 @@ impl DeltaDeltaMonitor {
             tracing::warn!(
                 "{} is older than the current tail, {}, ignore it",
                 seq,
-                state.tail
+                self.tail
             );
             return;
         }
@@ -542,11 +502,11 @@ impl DeltaDeltaMonitor {
         let buffer_capacity = self.buffer.len() as u64;
 
         // Update head if this packet is beyond it
-        let head_val = *state.head;
+        let head_val = *self.head;
         let seq_ahead_of_head = seq_val.wrapping_sub(head_val);
 
-        if seq_ahead_of_head < (u64::MAX / 2) || seq == state.head {
-            state.head = seq.wrapping_add(1).into();
+        if seq_ahead_of_head < (u64::MAX / 2) || seq == self.head {
+            self.head = seq.wrapping_add(1).into();
         }
 
         // Check if there's space in the buffer for this packet
@@ -555,8 +515,8 @@ impl DeltaDeltaMonitor {
         if offset_from_tail >= buffer_capacity {
             // No space - need to slide the window
             // process_until is now optimized to only check each buffer slot once
-            let new_tail = state.head.wrapping_sub(buffer_capacity);
-            self.process_until(&mut state, new_tail.into());
+            let new_tail = self.head.wrapping_sub(buffer_capacity);
+            self.process_until(new_tail.into());
         }
 
         *self.packet_mut(seq) = Some(PacketStatus {
@@ -564,15 +524,47 @@ impl DeltaDeltaMonitor {
             arrival,
             rtp_ts,
         });
-        self.process_in_order(&mut state);
-        self.state = Some(state);
+        self.process_in_order();
     }
 
-    fn process_in_order(&mut self, state: &mut DeltaDeltaState) {
+    fn init<T: PacketTiming>(&mut self, packet: &T) {
+        let seq = packet.seq_no();
+        let rtp_ts = packet.rtp_timestamp();
+        let arrival = packet.arrival_timestamp();
+
+        self.head = seq.wrapping_add(1).into();
+        self.tail = seq;
+        self.frequency = rtp_ts.frequency();
+        self.last_arrival = arrival;
+        self.initialized = true;
+    }
+
+    fn advance(&mut self, pkt: &PacketStatus) {
+        const ALPHA: f64 = 0.1;
+        let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
+
+        let expected_ms = (pkt.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
+            * 1000.0
+            / self.frequency.get() as f64;
+
+        let skew = actual_ms - expected_ms;
+        let dod = skew - self.last_skew;
+
+        self.dod_ewma = ALPHA * dod + (1.0 - ALPHA) * self.dod_ewma;
+        self.dod_abs_ewma = ALPHA * dod.abs() + (1.0 - ALPHA) * self.dod_abs_ewma;
+
+        self.last_skew = skew;
+        self.last_arrival = pkt.arrival;
+        self.last_rtp_ts = pkt.rtp_ts;
+        self.packets_actual += 1;
+        self.packets_expected += 1;
+    }
+
+    fn process_in_order(&mut self) {
         // Process packets in sequence order starting from tail
         loop {
-            let tail_val = *state.tail;
-            let head_val = *state.head;
+            let tail_val = *self.tail;
+            let head_val = *self.head;
 
             // Check if we've caught up to head using wrapping arithmetic
             let distance = head_val.wrapping_sub(tail_val);
@@ -582,18 +574,18 @@ impl DeltaDeltaMonitor {
             }
 
             // Try to get the packet at tail position
-            let Some(pkt) = self.packet_mut(state.tail).take() else {
+            let Some(pkt) = self.packet_mut(self.tail).take() else {
                 // No packet at tail, can't continue processing in order
                 break;
             };
 
-            state.advance(&pkt, self.alpha);
-            state.tail = state.tail.wrapping_add(1).into();
+            self.advance(&pkt);
+            self.tail = self.tail.wrapping_add(1).into();
         }
     }
 
-    fn process_until(&mut self, state: &mut DeltaDeltaState, end: SeqNo) {
-        let tail_val = *state.tail;
+    fn process_until(&mut self, end: SeqNo) {
+        let tail_val = *self.tail;
         let end_val = *end;
 
         // Calculate how many sequence numbers to process
@@ -605,7 +597,7 @@ impl DeltaDeltaMonitor {
                 tracing::warn!(
                     "process_until: end {} appears to be before tail {}",
                     end,
-                    state.tail
+                    self.tail
                 );
             }
             return;
@@ -622,7 +614,7 @@ impl DeltaDeltaMonitor {
             // We're skipping more packets than our buffer can hold
             // Count the definitely-lost packets (everything before our buffer range)
             let packets_definitely_lost = count - buffer_capacity;
-            state.packets_expected += packets_definitely_lost;
+            self.packets_expected += packets_definitely_lost;
 
             tracing::debug!(
                 "process_until: large jump of {} packets, {} definitely lost, checking last {} slots",
@@ -639,17 +631,13 @@ impl DeltaDeltaMonitor {
         for i in 0..iterations {
             let current = start_checking.wrapping_add(i);
             let Some(pkt) = self.packet_mut(current.into()).take() else {
-                state.packets_expected += 1;
+                self.packets_expected += 1;
                 continue;
             };
 
-            state.advance(&pkt, self.alpha);
+            self.advance(&pkt);
         }
-        state.tail = end;
-    }
-
-    fn raw_metrics(&self) -> Option<RawMetrics> {
-        self.state.map(|ref s| s.into())
+        self.tail = end;
     }
 
     fn as_index(&self, seq: SeqNo) -> usize {
@@ -748,43 +736,41 @@ mod test {
 
     #[test]
     fn test_initialization() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let factory = PacketFactory::new();
         let pkt = factory.at(1, 0);
 
         monitor.update(&pkt);
 
-        let state = monitor.state.expect("State should be initialized");
         assert_eq!(
-            state.tail,
+            monitor.tail,
             2.into(),
             "Tail should advance past the first packet"
         );
-        assert_eq!(state.head, 2.into(), "Head should be next expected seq");
-        assert_eq!(state.last_rtp_ts, pkt.rtp_timestamp());
-        assert_eq!(state.last_arrival, pkt.arrival_timestamp());
+        assert_eq!(monitor.head, 2.into(), "Head should be next expected seq");
+        assert_eq!(monitor.last_rtp_ts, pkt.rtp_timestamp());
+        assert_eq!(monitor.last_arrival, pkt.arrival_timestamp());
     }
 
     #[test]
     fn test_in_order_processing() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let factory = PacketFactory::new();
 
         let pkt1 = factory.at(1, 0);
         monitor.update(&pkt1);
-        assert_eq!(monitor.state.unwrap().tail, 2.into());
+        assert_eq!(monitor.tail, 2.into());
 
         let pkt2 = factory.at(2, 0);
         monitor.update(&pkt2);
 
-        let state = monitor.state.expect("State should exist");
-        assert_eq!(state.tail, 3.into(), "Tail should advance to 3");
-        assert_eq!(state.head, 3.into(), "Head should advance to 3");
+        assert_eq!(monitor.tail, 3.into(), "Tail should advance to 3");
+        assert_eq!(monitor.head, 3.into(), "Head should advance to 3");
     }
 
     #[test]
     fn test_out_of_order_within_buffer() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let factory = PacketFactory::new();
 
         let pkt1 = factory.at(1, 0);
@@ -792,20 +778,12 @@ mod test {
         let pkt2 = factory.at(2, 0);
 
         monitor.update(&pkt1);
-        assert_eq!(monitor.state.unwrap().tail, 2.into());
-        assert_eq!(monitor.state.unwrap().head, 2.into());
+        assert_eq!(monitor.tail, 2.into());
+        assert_eq!(monitor.head, 2.into());
 
         monitor.update(&pkt3); // Packet 3 arrives
-        assert_eq!(
-            monitor.state.unwrap().tail,
-            2.into(),
-            "Tail shouldn't move, waiting for 2"
-        );
-        assert_eq!(
-            monitor.state.unwrap().head,
-            4.into(),
-            "Head should jump to 4"
-        );
+        assert_eq!(monitor.tail, 2.into(), "Tail shouldn't move, waiting for 2");
+        assert_eq!(monitor.head, 4.into(), "Head should jump to 4");
         assert!(
             monitor.packet(3.into()).is_some(),
             "Packet 3 should be in buffer"
@@ -813,31 +791,23 @@ mod test {
 
         monitor.update(&pkt2); // Packet 2 arrives, filling the gap
         assert_eq!(
-            monitor.state.unwrap().tail,
+            monitor.tail,
             4.into(),
             "Tail should advance to 4 after processing 2, 3"
         );
-        assert_eq!(
-            monitor.state.unwrap().head,
-            4.into(),
-            "Head should remain 4"
-        );
+        assert_eq!(monitor.head, 4.into(), "Head should remain 4");
     }
 
     #[test]
     fn test_packet_loss() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let factory = PacketFactory::new();
 
         monitor.update(&factory.at(1, 0));
-        assert_eq!(
-            monitor.state.unwrap().tail,
-            2.into(),
-            "Tail is 2, waiting for packet 2"
-        );
+        assert_eq!(monitor.tail, 2.into(), "Tail is 2, waiting for packet 2");
         monitor.update(&factory.at(3, 0));
         assert_eq!(
-            monitor.state.unwrap().tail,
+            monitor.tail,
             2.into(),
             "Tail should still be 2, waiting for 2"
         );
@@ -848,9 +818,9 @@ mod test {
         // process_until(3) is called. It processes from old_tail (2) up to 3 (exclusive).
         // It looks for packet 2, doesn't find it (loss), and sets tail to 3.
         // Then process_in_order() runs and immediately processes packet 3, advancing tail to 4.
-        assert_eq!(monitor.state.unwrap().head, 13.into());
+        assert_eq!(monitor.head, 13.into());
         assert_eq!(
-            monitor.state.unwrap().tail,
+            monitor.tail,
             4.into(),
             "Tail should be at 4 after sliding past lost packet 2 and processing packet 3"
         );
@@ -858,20 +828,19 @@ mod test {
 
     #[test]
     fn test_buffer_wraparound_and_making_space() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP); // Capacity is 10
+        let mut monitor = DeltaDeltaState::new(TEST_CAP); // Capacity is 10
         let factory = PacketFactory::new();
 
         monitor.update(&factory.at(1, 0));
-        assert_eq!(monitor.state.unwrap().tail, 2.into());
-        assert_eq!(monitor.state.unwrap().head, 2.into());
+        assert_eq!(monitor.tail, 2.into());
+        assert_eq!(monitor.head, 2.into());
 
         let pkt12 = factory.at(12, 0);
         monitor.update(&pkt12);
 
-        let state = monitor.state.unwrap();
-        assert_eq!(state.head, 13.into());
+        assert_eq!(monitor.head, 13.into());
         assert_eq!(
-            state.tail,
+            monitor.tail,
             3.into(),
             "Tail should be moved forward to make space"
         );
@@ -887,41 +856,36 @@ mod test {
 
     #[test]
     fn test_ignore_old_packet() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let factory = PacketFactory::new();
 
         monitor.update(&factory.at(5, 0));
         monitor.update(&factory.at(6, 0));
 
-        assert_eq!(monitor.state.unwrap().tail, 7.into());
-        let state_before = monitor.state.unwrap();
+        assert_eq!(monitor.tail, 7.into());
+        let before_last_arrival = monitor.last_arrival;
 
         // Send a packet older than the current tail
         monitor.update(&factory.at(4, 0));
 
         // State should not have changed
-        let state_after = monitor.state.unwrap();
+        assert_eq!(monitor.tail, 7.into(), "Old packet should not change tail");
         assert_eq!(
-            state_after.tail,
-            7.into(),
-            "Old packet should not change tail"
-        );
-        assert_eq!(
-            state_after.last_arrival, state_before.last_arrival,
+            monitor.last_arrival, before_last_arrival,
             "State should not be updated by an old packet"
         );
     }
 
     #[test]
     fn test_duplicate_packet_overwrite() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let factory = PacketFactory::new();
 
         // Send packets 1 and 3, creating a gap for packet 2.
         monitor.update(&factory.at(1, 0));
         monitor.update(&factory.at(3, 0));
 
-        assert_eq!(monitor.state.unwrap().tail, 2.into());
+        assert_eq!(monitor.tail, 2.into());
         assert!(monitor.packet(3.into()).is_some());
 
         // Send a "duplicate" of 3, but with a different arrival time.
@@ -936,41 +900,36 @@ mod test {
         // Now, fill the gap with packet 2.
         monitor.update(&factory.at(2, 0));
 
-        let state = monitor.state.unwrap();
         assert_eq!(
-            state.tail,
+            monitor.tail,
             4.into(),
             "Tail should have processed up to packet 3"
         );
         assert_eq!(
-            state.last_arrival, pkt3_dup.arrival,
+            monitor.last_arrival, pkt3_dup.arrival,
             "The monitor should have used the overwritten packet's data"
         );
     }
 
     #[test]
     fn test_sequence_number_wrap_around() {
-        let mut monitor = DeltaDeltaMonitor::new(TEST_CAP);
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let start_seq = u64::MAX - 5;
         let factory = PacketFactory::with_start_seq(start_seq);
         let mut current_seq = start_seq;
 
         // Initialize the monitor
         monitor.update(&factory.at(current_seq, 0));
-        assert_eq!(
-            monitor.state.unwrap().tail,
-            (current_seq.wrapping_add(1)).into()
-        );
+        assert_eq!(monitor.tail, (current_seq.wrapping_add(1)).into());
 
         // Process several packets, wrapping around u64::MAX
         for _ in 0..15 {
             current_seq = current_seq.wrapping_add(1);
             monitor.update(&factory.at(current_seq, 0));
         }
-
         let expected_tail = start_seq.wrapping_add(16);
         let expected_head = start_seq.wrapping_add(16);
-        assert_eq!(monitor.state.unwrap().tail, expected_tail.into());
-        assert_eq!(monitor.state.unwrap().head, expected_head.into());
+        assert_eq!(monitor.tail, expected_tail.into());
+        assert_eq!(monitor.head, expected_head.into());
     }
 }
