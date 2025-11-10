@@ -176,7 +176,7 @@ pub struct BitrateEstimate {
     bwe_bps_ewma: f64,
 
     smoothed_bitrate_bps: f64,
-    history: BitrateHistory,
+    history: Histogram,
 }
 
 impl BitrateEstimate {
@@ -187,7 +187,7 @@ impl BitrateEstimate {
             bwe_bps_ewma: 0.0,
 
             smoothed_bitrate_bps: 0.0,
-            history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
+            history: Histogram::new(BITRATE_HISTORY_SAMPLES),
         }
     }
 
@@ -226,7 +226,7 @@ impl BitrateEstimate {
 }
 
 #[derive(Debug)]
-pub struct BitrateHistory {
+pub struct Histogram {
     samples: Vec<u64>,
     value_counts: BTreeMap<u64, usize>,
     capacity: usize,
@@ -235,7 +235,7 @@ pub struct BitrateHistory {
     total_samples: usize,
 }
 
-impl BitrateHistory {
+impl Histogram {
     pub fn new(capacity: usize) -> Self {
         Self {
             samples: vec![0; capacity],
@@ -424,6 +424,24 @@ struct PacketStatus {
     seqno: SeqNo,
     arrival: Instant,
     rtp_ts: MediaTime,
+}
+
+/// Maps an input value to a specified range using an inverted logistic (sigmoid) function.
+///
+/// As the `value` increases, the output approaches the minimum of the range (0).
+/// As the `value` decreases, the output approaches the `range_max`.
+///
+/// # Arguments
+/// * `value` - The input value to map (e.g., dod_abs_ewma).
+/// * `range_max` - The maximum value of the output range (e.g., 100.0).
+/// * `k` - The steepness factor of the curve. Determines how quickly the output changes around the midpoint.
+/// * `midpoint` - The input `value` at which the output will be exactly `range_max / 2`.
+///
+/// # Returns
+/// The mapped value, which will be between 0.0 and `range_max`.
+#[inline]
+fn sigmoid(value: f64, range_max: f64, k: f64, midpoint: f64) -> f64 {
+    range_max / (1.0 + (k * (value - midpoint)).exp())
 }
 
 #[derive(Debug, Copy, Clone)]
