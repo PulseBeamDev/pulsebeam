@@ -20,8 +20,8 @@ str0m = { workspace = true }
 bytes = { workspace = true }
 
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-axum = { version = "0.8.3", features = ["macros"] }
-axum-extra = { version = "0.10.1", features = ["typed-header"] }
+axum = { version = "0.8.6", features = ["macros"] }
+axum-extra = { version = "0.12.1", features = ["typed-header"] }
 systemstat = "0.2.5"
 tower-http = { version = "0.6.6", features = ["cors"] }
 hex = "0.4.3"
@@ -32,7 +32,7 @@ metrics = "0.24.2"
 mimalloc = { version = "0.1.48", features = ["v3"] }
 hyper = "1.7.0"
 pulsebeam-runtime = { version = "^0.1.0", path = "../pulsebeam-runtime" }
-tokio-util = "0.7.16"
+tokio-util = "0.7.17"
 num_cpus = "1.17.0"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 metrics-exporter-prometheus = "0.17.2"
@@ -46,7 +46,7 @@ rand.workspace = true
 arrayvec = "0.7.6"
 
 [dev-dependencies]
-turmoil = "0.6.6"
+turmoil = "0.7.0"
 
 [build-dependencies]
 prost-build = "0.14.1"
