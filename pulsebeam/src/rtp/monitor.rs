@@ -275,7 +275,6 @@ impl RawMetrics {
 
 #[derive(Clone, Debug)]
 struct PacketStatus {
-    seqno: SeqNo,
     arrival: Instant,
     rtp_ts: MediaTime,
 }
@@ -292,7 +291,6 @@ struct DeltaDeltaState {
     frequency: Frequency, // Clock rate (e.g., 90000)
     last_rtp_ts: MediaTime,
     last_arrival: Instant,
-    last_skew: f64,
 
     m_hat: f64,     // The estimate of the queue delay trend, m_hat(i-1)
     e: f64,         // The variance of the estimate, e(i-1)
@@ -312,7 +310,6 @@ impl DeltaDeltaState {
             frequency: Frequency::NINETY_KHZ,
             last_rtp_ts: MediaTime::from_90khz(0),
             last_arrival: Instant::now(),
-            last_skew: 0.0,
             m_hat: 0.0,
             e: 0.1,         // Initial value from paper, Table 1: e(0) = 0.1
             var_v_hat: 1.0, // A reasonable starting default (var_v is clamped at 1)
@@ -366,11 +363,7 @@ impl DeltaDeltaState {
             self.process_until(new_tail.into());
         }
 
-        *self.packet_mut(seq) = Some(PacketStatus {
-            seqno: seq,
-            arrival,
-            rtp_ts,
-        });
+        *self.packet_mut(seq) = Some(PacketStatus { arrival, rtp_ts });
         self.process_in_order();
     }
 
@@ -429,7 +422,6 @@ impl DeltaDeltaState {
         let z_clamped = z.abs().min(3.0 * self.var_v_hat.sqrt());
         self.var_v_hat = (alpha * self.var_v_hat + (1.0 - alpha) * z_clamped.powi(2)).max(1.0);
 
-        self.last_skew = skew;
         self.last_arrival = pkt.arrival;
         self.last_rtp_ts = pkt.rtp_ts;
         self.packets_actual += 1;
@@ -522,7 +514,7 @@ impl DeltaDeltaState {
 
     fn packet(&mut self, seq: SeqNo) -> &Option<PacketStatus> {
         let index = self.as_index(seq);
-        &mut self.buffer[index]
+        &self.buffer[index]
     }
 
     fn packet_mut(&mut self, seq: SeqNo) -> &mut Option<PacketStatus> {
