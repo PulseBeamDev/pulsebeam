@@ -1,27 +1,10 @@
-//! # Real-time Stream Quality Monitor
-//!
-//! ## Architecture
-//! This module implements a monitor that analyzes a single RTP stream to derive actionable
-//! quality metrics. The design pattern separates the system into two distinct components:
-//!
-//! 1.  `StreamMonitor`: A single-owner, stateful struct responsible for all calculations.
-//!     Its internal state is non-atomic for performance, as it is not intended to be shared.
-//!     It consumes packet metadata and synthesizes it into a continuous "Quality Score" that
-//!     integrates stream performance over time, providing robust state transitions.
-//!
-//! 2.  `StreamState`: A lightweight, thread-safe struct holding the final, shared conclusions
-//!     (e.g., quality and inactive status). It uses atomic types to allow for lock-free reads
-//!     from multiple downstream consumers, providing a simple and performant API for decision-making.
-
-use std::time::Duration;
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+use std::time::Duration;
 use str0m::bwe::Bitrate;
+use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
@@ -29,104 +12,7 @@ use crate::rtp::PacketTiming;
 
 /// Defines the wall-clock duration without packets after which a stream is considered inactive.
 const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
-/// The size of the circular buffer used for the sliding window packet loss calculation.
-const LOSS_WINDOW_SIZE: usize = 256;
-/// Number of bitrate samples to track for stability measurement
-const BITRATE_HISTORY_SAMPLES: usize = 128;
-/// Minimum number of samples before making quality decisions
-const MIN_SAMPLES_FOR_QUALITY: usize = 8; // ~2 seconds minimum
-
-// --- Health Thresholds & Config ---
-
-/// Defines the thresholds for normalizing a raw metric into a health score.
-#[derive(Debug, Clone, Copy)]
-pub struct HealthThresholds {
-    pub bad: f32,
-    pub good: f32,
-}
-
-/// A fully tunable configuration for the quality monitor.
-#[derive(Debug, Clone, Copy)]
-pub struct QualityMonitorConfig {
-    pub loss: HealthThresholds,
-    pub jitter_ms: HealthThresholds,
-
-    // --- Score Engine Parameters ---
-    pub score_max: f32,
-    pub score_min: f32,
-    pub score_increment_scaler: f32,
-    pub score_decrement_multiplier: f32,
-
-    // --- State Change Thresholds with Hysteresis ---
-    // Downgrade thresholds (quick to react)
-    pub excellent_to_good_threshold: f32,
-    pub good_to_bad_threshold: f32,
-
-    // Upgrade thresholds (conservative, require sustained improvement)
-    pub bad_to_good_threshold: f32,
-    pub good_to_excellent_threshold: f32,
-
-    // --- Hard Limits & Catastrophic Penalties ---
-    pub catastrophic_loss_percent: f32,
-    pub catastrophic_jitter_ms: u32,
-    pub catastrophic_penalty: f32,
-
-    // --- Metric Weights ---
-    pub loss_weight: f32,
-    pub jitter_weight: f32,
-
-    // --- Stability Controls ---
-    /// Minimum consecutive polls at threshold before upgrading quality
-    pub upgrade_stability_count: u32,
-    /// Exponential moving average factor for metric smoothing (0-1, lower = more smoothing)
-    pub metric_smoothing_factor: f32,
-}
-
-impl Default for QualityMonitorConfig {
-    fn default() -> Self {
-        Self {
-            // Metric health boundaries (Bad = problem starts, Good = target for recovery)
-            loss: HealthThresholds {
-                bad: 5.0,
-                good: 2.0,
-            },
-            jitter_ms: HealthThresholds {
-                bad: 50.0,
-                good: 30.0,
-            },
-
-            // Score engine dynamics
-            score_max: 100.0,
-            score_min: 0.0,
-            score_increment_scaler: 3.0,     // Slower improvements
-            score_decrement_multiplier: 4.0, // Fast degradation
-
-            // Hysteresis thresholds - note the gaps to prevent oscillation
-            // Downgrades (quick)
-            excellent_to_good_threshold: 75.0, // Drop from Excellent below this
-            good_to_bad_threshold: 40.0,       // Drop from Good below this
-
-            // Upgrades (conservative, require higher score)
-            bad_to_good_threshold: 60.0,       // Rise from Bad above this
-            good_to_excellent_threshold: 88.0, // Rise from Good above this
-
-            // "The Cliff": Instantaneous triggers for severe penalties
-            catastrophic_loss_percent: 20.0,
-            catastrophic_jitter_ms: 100,
-            catastrophic_penalty: 30.0,
-
-            // How much each metric contributes to the overall health score for an interval.
-            loss_weight: 0.6,
-            jitter_weight: 0.4,
-
-            // Stability controls
-            upgrade_stability_count: 10, // ~2 seconds of sustained good performance to upgrade
-            metric_smoothing_factor: 0.3, // Heavy smoothing to reduce noise
-        }
-    }
-}
-
-// --- Public-Facing Shared State ---
+const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -169,293 +55,39 @@ impl StreamState {
     }
 }
 
-// --- Bitrate History for Stability Tracking ---
-
-#[derive(Debug)]
-pub struct BitrateHistory {
-    samples: Vec<u64>,
-    value_counts: BTreeMap<u64, usize>,
-    capacity: usize,
-    index: usize,
-    filled: bool,
-    total_samples: usize,
-}
-
-impl BitrateHistory {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            samples: vec![0; capacity],
-            value_counts: BTreeMap::new(),
-            capacity,
-            index: 0,
-            filled: false,
-            total_samples: 0,
-        }
-    }
-
-    pub fn push(&mut self, value: f64) {
-        if self.capacity == 0 {
-            return;
-        }
-        let new_val = value as u64;
-
-        if self.filled {
-            let old_val = self.samples[self.index];
-            if let Some(count) = self.value_counts.get_mut(&old_val) {
-                *count -= 1;
-                if *count == 0 {
-                    self.value_counts.remove(&old_val);
-                }
-            }
-        } else {
-            self.total_samples += 1;
-            if self.total_samples == self.capacity {
-                self.filled = true;
-            }
-        }
-        self.samples[self.index] = new_val;
-        *self.value_counts.entry(new_val).or_insert(0) += 1;
-        self.index = (self.index + 1) % self.capacity;
-    }
-
-    pub fn percentile(&self, p: f64) -> Option<f64> {
-        if self.total_samples < 2 || !(0.0..=1.0).contains(&p) {
-            return None;
-        }
-        let target_rank = ((self.total_samples as f64 - 1.0) * p).round() as usize;
-        let mut current_rank = 0;
-        for (&value, &count) in &self.value_counts {
-            if current_rank + count > target_rank {
-                return Some(value as f64);
-            }
-            current_rank += count;
-        }
-        self.value_counts.last_key_value().map(|(&v, _)| v as f64)
-    }
-
-    pub fn coefficient_of_variation_percent(&self) -> f32 {
-        if self.total_samples < 2 {
-            return 0.0;
-        }
-        let samples_slice = if self.filled {
-            &self.samples[..]
-        } else {
-            &self.samples[..self.total_samples]
-        };
-        let mean = samples_slice.iter().sum::<u64>() as f64 / self.total_samples as f64;
-        if mean < 1.0 {
-            return 0.0;
-        }
-        let variance = samples_slice
-            .iter()
-            .map(|&v| {
-                let diff = v as f64 - mean;
-                diff * diff
-            })
-            .sum::<f64>()
-            / self.total_samples as f64;
-        let std_dev = variance.sqrt();
-        ((std_dev / mean) * 100.0) as f32
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.total_samples >= MIN_SAMPLES_FOR_QUALITY
-    }
-
-    pub fn reset(&mut self) {
-        self.samples.fill(0);
-        self.value_counts.clear();
-        self.index = 0;
-        self.filled = false;
-        self.total_samples = 0;
-    }
-}
-
-// --- Packet Loss Window (Bitmap-based) ---
-
-#[derive(Debug)]
-struct PacketLossWindow {
-    bitmap: Vec<u64>,
-    highest_seq: SeqNo,
-    initialized: bool,
-    window_size: usize,
-    packets_received: usize,
-}
-
-impl PacketLossWindow {
-    fn new(window_size: usize) -> Self {
-        let chunks_needed = (window_size + 63) / 64;
-        Self {
-            bitmap: vec![0u64; chunks_needed],
-            highest_seq: 0.into(),
-            initialized: false,
-            window_size,
-            packets_received: 0,
-        }
-    }
-
-    fn mark_received(&mut self, seq_no: SeqNo) {
-        if !self.initialized {
-            self.highest_seq = seq_no;
-            self.initialized = true;
-            self.set_bit(seq_no, true);
-            self.packets_received = 1;
-            return;
-        }
-        let seq_u64 = *seq_no;
-        let highest_u64 = *self.highest_seq;
-        let raw_diff = seq_u64.wrapping_sub(highest_u64);
-        let diff = if raw_diff > (u16::MAX as u64 / 2) {
-            -((u16::MAX as i64 + 1) - raw_diff as i64)
-        } else {
-            raw_diff as i64
-        };
-        if diff > 0 && diff < (self.window_size as i64) {
-            for i in 1..diff {
-                let intermediate_seq: SeqNo = highest_u64.wrapping_add(i as u64).into();
-                self.set_bit(intermediate_seq, false);
-            }
-            self.highest_seq = seq_no;
-            self.set_bit(seq_no, true);
-            self.packets_received = self.packets_received.saturating_add(1);
-        } else if diff <= 0 && diff > -(self.window_size as i64) {
-            if !self.get_bit(seq_no) {
-                self.set_bit(seq_no, true);
-                self.packets_received = self.packets_received.saturating_add(1);
-            }
-        } else if diff >= (self.window_size as i64) {
-            self.reset_with_seq(seq_no);
-        }
-    }
-
-    fn calculate_loss_percent(&self) -> f32 {
-        if !self.initialized || self.packets_received < self.window_size {
-            return 0.0;
-        }
-        let received_count = self.count_received_in_window();
-        let lost_count = self.window_size.saturating_sub(received_count);
-        (lost_count as f32 * 100.0) / (self.window_size as f32)
-    }
-
-    fn is_ready(&self) -> bool {
-        self.initialized && self.packets_received >= self.window_size
-    }
-
-    fn reset(&mut self) {
-        self.bitmap.fill(0);
-        self.initialized = false;
-        self.packets_received = 0;
-        self.highest_seq = 0.into();
-    }
-
-    fn reset_with_seq(&mut self, seq_no: SeqNo) {
-        self.reset();
-        self.highest_seq = seq_no;
-        self.set_bit(seq_no, true);
-        self.packets_received = 1;
-        self.initialized = true;
-    }
-
-    fn get_bit(&self, seq_no: SeqNo) -> bool {
-        let idx = (*seq_no as usize) % self.window_size;
-        let (chunk_idx, bit_idx) = (idx / 64, idx % 64);
-        if chunk_idx >= self.bitmap.len() {
-            return false;
-        }
-        (self.bitmap[chunk_idx] & (1u64 << bit_idx)) != 0
-    }
-
-    fn set_bit(&mut self, seq_no: SeqNo, value: bool) {
-        let idx = (*seq_no as usize) % self.window_size;
-        let (chunk_idx, bit_idx) = (idx / 64, idx % 64);
-        if chunk_idx >= self.bitmap.len() {
-            return;
-        }
-        if value {
-            self.bitmap[chunk_idx] |= 1u64 << bit_idx;
-        } else {
-            self.bitmap[chunk_idx] &= !(1u64 << bit_idx);
-        }
-    }
-
-    fn count_received_in_window(&self) -> usize {
-        self.bitmap
-            .iter()
-            .map(|chunk| chunk.count_ones() as usize)
-            .sum()
-    }
-}
-
-// --- Stream Monitor ---
-
 #[derive(Debug)]
 pub struct StreamMonitor {
     shared_state: StreamState,
-    config: QualityMonitorConfig,
+
+    stream_id: String,
     manual_pause: bool,
+
+    delta_delta: DeltaDeltaState,
     last_packet_at: Instant,
-    clock_rate: u32,
-    bwe_last_update: Instant,
-    bwe_interval_bytes: usize,
-    bwe_bps_ewma: f64,
-    jitter_estimate: f64,
-    jitter_last_arrival: Option<Instant>,
-    jitter_last_rtp_time: Option<u64>,
-    loss_window: PacketLossWindow,
-    bitrate_history: BitrateHistory,
-
-    // Smoothed metrics (exponential moving average)
-    smoothed_loss_percent: f32,
-    smoothed_jitter_ms: f32,
-    smoothed_bitrate_bps: f64,
-
-    // Raw metrics (for debugging)
-    raw_loss_percent: f32,
-    raw_jitter_ms: u32,
+    bwe: BitrateEstimate,
 
     current_quality: StreamQuality,
-    quality_score: f32,
-
-    // Stability tracking for upgrades
-    consecutive_upgrade_eligible_polls: u32,
-    last_downgrade_instant: Option<Instant>,
 }
 
 impl StreamMonitor {
-    pub fn new(shared_state: StreamState, config: QualityMonitorConfig) -> Self {
+    pub fn new(stream_id: String, shared_state: StreamState) -> Self {
         let now = Instant::now();
         Self {
+            stream_id,
             shared_state,
-            config,
             manual_pause: true,
             last_packet_at: now,
-            clock_rate: 0,
-            bwe_last_update: now,
-            bwe_interval_bytes: 0,
-            bwe_bps_ewma: 0.0,
-            jitter_estimate: 0.0,
-            jitter_last_arrival: None,
-            jitter_last_rtp_time: None,
-            loss_window: PacketLossWindow::new(LOSS_WINDOW_SIZE),
-            bitrate_history: BitrateHistory::new(BITRATE_HISTORY_SAMPLES),
-            smoothed_loss_percent: 0.0,
-            smoothed_jitter_ms: 0.0,
-            smoothed_bitrate_bps: 0.0,
-            raw_loss_percent: 0.0,
-            raw_jitter_ms: 0,
+            delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
+            bwe: BitrateEstimate::new(now),
             current_quality: StreamQuality::Good,
-            quality_score: 50.0, // Start in middle
-            consecutive_upgrade_eligible_polls: 0,
-            last_downgrade_instant: None,
         }
     }
 
     pub fn process_packet(&mut self, packet: &impl PacketTiming, size_bytes: usize) {
         self.last_packet_at = packet.arrival_timestamp();
-        self.discover_clock_rate(packet);
-        self.bwe_interval_bytes = self.bwe_interval_bytes.saturating_add(size_bytes);
-        self.loss_window.mark_received(packet.seq_no());
-        self.update_jitter(packet);
+        self.bwe.record(size_bytes);
+
+        self.delta_delta.update(packet);
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -470,51 +102,37 @@ impl StreamMonitor {
         if is_inactive {
             return;
         }
-        self.update_derived_metrics(now);
 
-        // Only evaluate quality if we have enough data
-        if !self.loss_window.is_ready() || !self.bitrate_history.is_ready() {
-            return;
-        }
+        self.bwe.poll(now);
+        self.shared_state
+            .bitrate_bps
+            .store(self.bwe.bwe_bps_ewma as u64, Ordering::Relaxed);
 
-        let new_quality = self.determine_stream_quality(now);
+        let metrics: RawMetrics = (&self.delta_delta).into();
+        let quality_score = metrics.calculate_jitter_score();
+
+        let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
+
         if new_quality != self.current_quality {
             tracing::info!(
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, jitter: {}ms, bitrate: {})",
+                stream_id = %self.stream_id,
+                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
                 self.current_quality,
                 new_quality,
-                self.quality_score,
-                self.smoothed_loss_percent,
-                self.smoothed_jitter_ms as u32,
-                Bitrate::from(self.smoothed_bitrate_bps),
+                quality_score,
+                metrics.packet_loss() * 100.0,
+                metrics.m_hat,
+                Bitrate::from(self.bwe.bwe_bps_ewma),
             );
             self.current_quality = new_quality;
             self.shared_state
                 .quality
                 .store(new_quality as u8, Ordering::Relaxed);
-
-            // Track downgrades for preventing rapid oscillation
-            if (new_quality as u8) < (self.current_quality as u8) {
-                self.last_downgrade_instant = Some(now);
-                self.consecutive_upgrade_eligible_polls = 0;
-            }
         }
     }
 
     fn reset(&mut self) {
-        self.loss_window.reset();
-        self.jitter_estimate = 0.0;
-        self.jitter_last_arrival = None;
-        self.jitter_last_rtp_time = None;
-        self.bitrate_history.reset();
-        self.smoothed_loss_percent = 0.0;
-        self.smoothed_jitter_ms = 0.0;
-        self.raw_jitter_ms = 0;
-        self.bwe_interval_bytes = 0;
-        self.quality_score = 50.0;
         self.current_quality = StreamQuality::Good;
-        self.consecutive_upgrade_eligible_polls = 0;
-        self.last_downgrade_instant = None;
         self.shared_state
             .quality
             .store(StreamQuality::Good as u8, Ordering::Relaxed);
@@ -527,207 +145,400 @@ impl StreamMonitor {
     fn determine_inactive_state(&self, now: Instant) -> bool {
         self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
     }
+}
 
-    fn determine_stream_quality(&mut self, now: Instant) -> StreamQuality {
-        // Calculate health scores
-        let normalize = |value: f32, thresholds: HealthThresholds| -> f32 {
-            if value <= thresholds.good {
-                1.0
-            } else if value >= thresholds.bad {
-                -((value - thresholds.bad) / (thresholds.bad - thresholds.good)).min(1.0)
+#[derive(Debug)]
+pub struct BitrateEstimate {
+    bwe_last_update: Instant,
+    bwe_interval_bytes: usize,
+    bwe_bps_ewma: f64,
+}
+
+impl BitrateEstimate {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            bwe_last_update: now,
+            bwe_interval_bytes: 0,
+            bwe_bps_ewma: 0.0,
+        }
+    }
+
+    pub fn record(&mut self, packet_len: usize) {
+        self.bwe_interval_bytes = self.bwe_interval_bytes.saturating_add(packet_len);
+    }
+
+    pub fn poll(&mut self, now: Instant) {
+        const ALPHA_UP: f64 = 0.7;
+        const ALPHA_DOWN: f64 = 0.1;
+
+        let elapsed = now.saturating_duration_since(self.bwe_last_update);
+
+        let elapsed_secs = elapsed.as_secs_f64();
+        if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
+            let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
+
+            if self.bwe_bps_ewma == 0.0 {
+                self.bwe_bps_ewma = bps;
             } else {
-                1.0 - (value - thresholds.good) / (thresholds.bad - thresholds.good)
-            }
-        };
-
-        let loss_health = normalize(self.smoothed_loss_percent, self.config.loss);
-        let jitter_health = normalize(self.smoothed_jitter_ms, self.config.jitter_ms);
-
-        let final_health =
-            (loss_health * self.config.loss_weight) + (jitter_health * self.config.jitter_weight);
-
-        // Apply catastrophic penalties
-        let mut catastrophic_penalty = 0.0;
-        if self.smoothed_loss_percent > self.config.catastrophic_loss_percent {
-            catastrophic_penalty += self.config.catastrophic_penalty;
-        }
-        if self.smoothed_jitter_ms > self.config.catastrophic_jitter_ms as f32 {
-            catastrophic_penalty += self.config.catastrophic_penalty;
-        }
-
-        // Update quality score
-        if final_health >= 0.0 {
-            self.quality_score += self.config.score_increment_scaler * final_health;
-        } else {
-            self.quality_score -= final_health.abs() * self.config.score_decrement_multiplier;
-        }
-        self.quality_score -= catastrophic_penalty;
-
-        self.quality_score = self
-            .quality_score
-            .clamp(self.config.score_min, self.config.score_max);
-
-        // Determine new quality with hysteresis
-        let target_quality = match self.current_quality {
-            StreamQuality::Bad => {
-                // From Bad: only upgrade if score is well above threshold AND sustained
-                if self.quality_score >= self.config.bad_to_good_threshold {
-                    self.consecutive_upgrade_eligible_polls += 1;
-                    if self.consecutive_upgrade_eligible_polls
-                        >= self.config.upgrade_stability_count
-                    {
-                        StreamQuality::Good
-                    } else {
-                        StreamQuality::Bad
-                    }
+                let alpha = if bps > self.bwe_bps_ewma {
+                    ALPHA_UP
                 } else {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    StreamQuality::Bad
-                }
+                    ALPHA_DOWN
+                };
+                self.bwe_bps_ewma = (1.0 - alpha) * self.bwe_bps_ewma + alpha * bps;
             }
-            StreamQuality::Good => {
-                // From Good: can downgrade quickly or upgrade slowly
-                if self.quality_score < self.config.good_to_bad_threshold {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    StreamQuality::Bad
-                } else if self.quality_score >= self.config.good_to_excellent_threshold {
-                    // Prevent upgrade too soon after a downgrade
-                    if let Some(last_downgrade) = self.last_downgrade_instant {
-                        if now.duration_since(last_downgrade) < Duration::from_secs(10) {
-                            return StreamQuality::Good;
-                        }
-                    }
 
-                    self.consecutive_upgrade_eligible_polls += 1;
-                    if self.consecutive_upgrade_eligible_polls
-                        >= self.config.upgrade_stability_count
-                    {
-                        StreamQuality::Excellent
-                    } else {
-                        StreamQuality::Good
-                    }
-                } else {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    StreamQuality::Good
-                }
-            }
+            self.bwe_interval_bytes = 0;
+            self.bwe_last_update = now;
+        }
+    }
+}
+
+struct RawMetrics {
+    pub m_hat: f64, // The Kalman-filtered queue delay trend
+    pub packets_actual: u64,
+    pub packets_expected: u64,
+}
+
+impl From<&DeltaDeltaState> for RawMetrics {
+    fn from(value: &DeltaDeltaState) -> Self {
+        Self {
+            m_hat: value.m_hat,
+            packets_actual: value.packets_actual,
+            packets_expected: value.packets_expected,
+        }
+    }
+}
+
+impl RawMetrics {
+    fn packet_loss(&self) -> f64 {
+        if self.packets_expected == 0 {
+            return 0.0;
+        }
+        self.packets_expected.saturating_sub(self.packets_actual) as f64
+            / self.packets_expected as f64
+    }
+
+    pub fn calculate_jitter_score(&self) -> f64 {
+        // We use its absolute value to penalize both overuse (positive)
+        // and underuse (negative, which can also indicate instability).
+        // The midpoint will need to be re-tuned. The paper RECOMMENDS
+        // a threshold of 12.5ms to detect overuse.
+        //
+        // midpoint=10.0ms to make it a bit more sensitive to measurement.
+        sigmoid(self.m_hat.abs(), 100.0, -0.2, 10.0)
+    }
+
+    pub fn calculate_loss_score(&self) -> f64 {
+        let loss_ratio = self.packet_loss();
+
+        // This is a highly punitive linear penalty.
+        // 1% loss = 25 point deduction.
+        // 2% loss = 50 point deduction.
+        // 4% loss or more = score of 0.
+        let loss_penalty_per_percent = 25.0;
+        let score = 100.0 - (loss_ratio * 100.0 * loss_penalty_per_percent);
+
+        score.max(0.0)
+    }
+
+    pub fn quality_hysteresis(&self, score: f64, current: StreamQuality) -> StreamQuality {
+        match current {
             StreamQuality::Excellent => {
-                // From Excellent: downgrade quickly if quality drops
-                if self.quality_score < self.config.excellent_to_good_threshold {
-                    self.consecutive_upgrade_eligible_polls = 0;
-                    // Check if we should go directly to Bad
-                    if self.quality_score < self.config.good_to_bad_threshold {
-                        StreamQuality::Bad
-                    } else {
-                        StreamQuality::Good
-                    }
+                // Must drop below 75 to go down to Good
+                if score < 75.0 {
+                    StreamQuality::Good
                 } else {
                     StreamQuality::Excellent
                 }
             }
-        };
-
-        target_quality
-    }
-
-    fn update_derived_metrics(&mut self, now: Instant) {
-        const EWMA_ALPHA: f64 = 0.8;
-        let elapsed = now.saturating_duration_since(self.bwe_last_update);
-
-        // Short Window Estimate
-        if elapsed >= Duration::from_millis(200) {
-            let elapsed_secs = elapsed.as_secs_f64();
-            if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
-                let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
-
-                if self.bwe_bps_ewma == 0.0 {
-                    self.bwe_bps_ewma = bps;
+            StreamQuality::Good => {
+                if score >= 85.0 {
+                    StreamQuality::Excellent
+                } else if score < 55.0 {
+                    StreamQuality::Bad
                 } else {
-                    self.bwe_bps_ewma = (1.0 - EWMA_ALPHA) * self.bwe_bps_ewma + EWMA_ALPHA * bps;
+                    StreamQuality::Good
                 }
-                self.bitrate_history.push(bps);
-
-                // P99 is too noisy + add headroom
-                let p95 = 1.5 * self.bitrate_history.percentile(0.95).unwrap_or_default();
-
-                let bps = p95.max(self.bwe_bps_ewma);
-                self.smoothed_bitrate_bps = bps;
-                self.shared_state
-                    .bitrate_bps
-                    .store(bps as u64, Ordering::Relaxed);
             }
-            self.bwe_interval_bytes = 0;
-            self.bwe_last_update = now;
+            StreamQuality::Bad => {
+                // Must rise above 65 to go up to Good
+                if score >= 65.0 {
+                    StreamQuality::Good
+                } else {
+                    StreamQuality::Bad
+                }
+            }
         }
+    }
+}
 
-        // Update raw metrics
-        self.raw_loss_percent = self.loss_window.calculate_loss_percent();
-        self.raw_jitter_ms = (self.jitter_estimate * 1000.0) as u32;
+#[derive(Clone, Debug)]
+struct PacketStatus {
+    arrival: Instant,
+    rtp_ts: MediaTime,
+}
 
-        // Apply exponential moving average for smoothing
-        let alpha = self.config.metric_smoothing_factor;
+#[inline]
+fn sigmoid(value: f64, range_max: f64, k: f64, midpoint: f64) -> f64 {
+    range_max / (1.0 + (-k * (value - midpoint)).exp())
+}
 
-        if self.smoothed_loss_percent == 0.0 {
-            // First sample - initialize
-            self.smoothed_loss_percent = self.raw_loss_percent;
-            self.smoothed_jitter_ms = self.raw_jitter_ms as f32;
-        } else {
-            // Exponential moving average: smoothed = alpha * raw + (1 - alpha) * smoothed
-            self.smoothed_loss_percent =
-                alpha * self.raw_loss_percent + (1.0 - alpha) * self.smoothed_loss_percent;
-            self.smoothed_jitter_ms =
-                alpha * (self.raw_jitter_ms as f32) + (1.0 - alpha) * self.smoothed_jitter_ms;
+#[derive(Debug)]
+struct DeltaDeltaState {
+    head: SeqNo,          // Next expected seq
+    tail: SeqNo,          // Oldest seq in buffer
+    frequency: Frequency, // Clock rate (e.g., 90000)
+    last_rtp_ts: MediaTime,
+    last_arrival: Instant,
+
+    m_hat: f64,     // The estimate of the queue delay trend, m_hat(i-1)
+    e: f64,         // The variance of the estimate, e(i-1)
+    var_v_hat: f64, // The variance of the measurement noise, var_v_hat(i-1)
+
+    packets_actual: u64,
+    packets_expected: u64,
+    buffer: Vec<Option<PacketStatus>>,
+    initialized: bool,
+}
+
+impl DeltaDeltaState {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            head: 0.into(),
+            tail: 0.into(),
+            frequency: Frequency::NINETY_KHZ,
+            last_rtp_ts: MediaTime::from_90khz(0),
+            last_arrival: Instant::now(),
+            m_hat: 0.0,
+            e: 0.1,         // Initial value from paper, Table 1: e(0) = 0.1
+            var_v_hat: 1.0, // A reasonable starting default (var_v is clamped at 1)
+            packets_actual: 0,
+            packets_expected: 0,
+            buffer: vec![None; cap],
+            initialized: false,
         }
     }
 
-    fn discover_clock_rate(&mut self, packet: &impl PacketTiming) {
-        if self.clock_rate == 0 {
-            self.clock_rate = packet.rtp_timestamp().frequency().get();
+    pub fn update<T: PacketTiming>(&mut self, packet: &T) {
+        if !self.initialized {
+            self.init(packet);
         }
-    }
+        let seq = packet.seq_no();
 
-    fn update_jitter(&mut self, packet: &impl PacketTiming) {
-        if self.clock_rate == 0 {
+        // Check if packet is older than tail using wrapping comparison
+        let tail_val = *self.tail;
+        let seq_val = *seq;
+        let seq_offset = seq_val.wrapping_sub(tail_val);
+
+        // If seq is more than half the u64 space behind tail, it's considered old
+        if seq_offset > (u64::MAX / 2) {
+            tracing::warn!(
+                "{} is older than the current tail, {}, ignore it",
+                seq,
+                self.tail
+            );
             return;
         }
+
+        let rtp_ts = packet.rtp_timestamp();
         let arrival = packet.arrival_timestamp();
-        let rtp_time = packet.rtp_timestamp().numer();
+        let buffer_capacity = self.buffer.len() as u64;
 
-        if let (Some(last_arrival), Some(last_rtp_time)) =
-            (self.jitter_last_arrival, self.jitter_last_rtp_time)
-        {
-            // If the RTP timestamp is the same as the last packet, it's part of the same frame burst.
-            // Do not calculate jitter for these packets to avoid artificial spikes.
-            if rtp_time == last_rtp_time {
-                self.jitter_last_arrival = Some(arrival);
-                return; // Skip jitter calculation
-            }
+        // Update head if this packet is beyond it
+        let head_val = *self.head;
+        let seq_ahead_of_head = seq_val.wrapping_sub(head_val);
 
-            let arrival_diff = arrival
-                .saturating_duration_since(last_arrival)
-                .as_secs_f64();
-            let rtp_diff = rtp_time.wrapping_sub(last_rtp_time) as f64 / self.clock_rate as f64;
-            let transit_diff = arrival_diff - rtp_diff;
-
-            // Use a slightly more responsive smoothing factor
-            self.jitter_estimate += (transit_diff.abs() - self.jitter_estimate) / 8.0;
+        if seq_ahead_of_head < (u64::MAX / 2) || seq == self.head {
+            self.head = seq.wrapping_add(1).into();
         }
 
-        self.jitter_last_arrival = Some(arrival);
-        self.jitter_last_rtp_time = Some(rtp_time);
+        // Check if there's space in the buffer for this packet
+        // Using wrapping arithmetic: offset < capacity means it's in range
+        let offset_from_tail = seq_val.wrapping_sub(tail_val);
+        if offset_from_tail >= buffer_capacity {
+            // No space - need to slide the window
+            // process_until is now optimized to only check each buffer slot once
+            let new_tail = self.head.wrapping_sub(buffer_capacity);
+            self.process_until(new_tail.into());
+        }
+
+        *self.packet_mut(seq) = Some(PacketStatus { arrival, rtp_ts });
+        self.process_in_order();
+    }
+
+    fn init<T: PacketTiming>(&mut self, packet: &T) {
+        let seq = packet.seq_no();
+        let rtp_ts = packet.rtp_timestamp();
+        let arrival = packet.arrival_timestamp();
+
+        self.head = seq.wrapping_add(1).into();
+        self.tail = seq;
+        self.frequency = rtp_ts.frequency();
+        self.last_rtp_ts = rtp_ts;
+        self.last_arrival = arrival;
+        self.initialized = true;
+    }
+
+    /// Implements https://www.ietf.org/archive/id/draft-ietf-rmcat-gcc-02.txt.
+    fn advance(&mut self, pkt: &PacketStatus) {
+        let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
+        let expected_ms = (pkt.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
+            * 1000.0
+            / self.frequency.get() as f64;
+
+        // This is `d(i)` from the GCC paper, the inter-group delay variation.
+        let skew = actual_ms - expected_ms;
+
+        // Kalman gain K is calculated based on the previous estimate's variance `e`
+        // and the previous measurement variance `var_v_hat`.
+        // Equation: k(i) = (e(i-1) + q(i)) / (var_v_hat(i) + e(i-1) + q(i))
+        // Note: The paper simplifies and assumes var_v_hat(i) is used, which is fine.
+        // q is the process noise, a constant.
+        const Q: f64 = 1e-3; // State noise covariance from paper, q = 10^-3
+        //
+        let k = (self.e + Q) / (self.var_v_hat + self.e + Q);
+
+        // Update the estimate of the queue delay trend, m_hat.
+        // This is the core output of the filter.
+        // Equation: m_hat(i) = m_hat(i-1) + z(i) * k(i)
+        // where z(i) = d(i) - m_hat(i-1)
+        let z = skew - self.m_hat;
+        self.m_hat += z * k;
+
+        // Update the variance of the estimate.
+        // Equation: e(i) = (1 - k(i)) * (e(i-1) + q(i))
+        self.e = (1.0 - k) * (self.e + Q);
+
+        // --- Update the Measurement Noise Variance (var_v_hat) ---
+        // This part allows the filter to adapt to changing network conditions.
+        // It's a modified EWMA.
+        // f_max is not easily available, so we use a simpler fixed alpha.
+        // A chi of 0.01 is a reasonable choice for smoothing.
+        const CHI: f64 = 0.01;
+        let alpha = (1.0 - CHI).powf(30.0 / 1000.0 * 50.0); // Assuming 50fps for f_max
+
+        // Outlier filter: Clamp the input to the variance calculation.
+        let z_clamped = z.abs().min(3.0 * self.var_v_hat.sqrt());
+        self.var_v_hat = (alpha * self.var_v_hat + (1.0 - alpha) * z_clamped.powi(2)).max(1.0);
+
+        self.last_arrival = pkt.arrival;
+        self.last_rtp_ts = pkt.rtp_ts;
+        self.packets_actual += 1;
+        self.packets_expected += 1;
+    }
+
+    fn process_in_order(&mut self) {
+        // Process packets in sequence order starting from tail
+        loop {
+            let tail_val = *self.tail;
+            let head_val = *self.head;
+
+            // Check if we've caught up to head using wrapping arithmetic
+            let distance = head_val.wrapping_sub(tail_val);
+            if distance == 0 || distance > (u64::MAX / 2) {
+                // Either we're at head, or head is somehow behind us (shouldn't happen)
+                break;
+            }
+
+            // Try to get the packet at tail position
+            let Some(pkt) = self.packet_mut(self.tail).take() else {
+                // No packet at tail, can't continue processing in order
+                break;
+            };
+
+            self.advance(&pkt);
+            self.tail = self.tail.wrapping_add(1).into();
+        }
+    }
+
+    fn process_until(&mut self, end: SeqNo) {
+        let tail_val = *self.tail;
+        let end_val = *end;
+
+        // Calculate how many sequence numbers to process
+        let count = end_val.wrapping_sub(tail_val);
+
+        // If count is 0 or seems like we're going backwards, something is wrong
+        if count == 0 || count > (u64::MAX / 2) {
+            if count != 0 {
+                tracing::warn!(
+                    "process_until: end {} appears to be before tail {}",
+                    end,
+                    self.tail
+                );
+            }
+            return;
+        }
+
+        let buffer_capacity = self.buffer.len() as u64;
+
+        // If the jump is larger than our buffer, we only need to check
+        // each buffer slot once. Limit iteration to buffer_capacity.
+        // Any packets beyond that are guaranteed to be lost anyway.
+        let iterations = count.min(buffer_capacity);
+
+        if count > buffer_capacity {
+            // We're skipping more packets than our buffer can hold
+            // Count the definitely-lost packets (everything before our buffer range)
+            let packets_definitely_lost = count - buffer_capacity;
+            self.packets_expected += packets_definitely_lost;
+
+            tracing::debug!(
+                "process_until: large jump of {} packets, {} definitely lost, checking last {} slots",
+                count,
+                packets_definitely_lost,
+                iterations
+            );
+        }
+
+        // Only process the last buffer_capacity worth of packets
+        // Start from (end - buffer_capacity) to end
+        let start_checking = end_val.wrapping_sub(iterations);
+
+        for i in 0..iterations {
+            let current = start_checking.wrapping_add(i);
+            let Some(pkt) = self.packet_mut(current.into()).take() else {
+                self.packets_expected += 1;
+                continue;
+            };
+
+            self.advance(&pkt);
+        }
+        self.tail = end;
+    }
+
+    fn as_index(&self, seq: SeqNo) -> usize {
+        (*seq % self.buffer.len() as u64) as usize
+    }
+
+    fn packet(&mut self, seq: SeqNo) -> &Option<PacketStatus> {
+        let index = self.as_index(seq);
+        &self.buffer[index]
+    }
+
+    fn packet_mut(&mut self, seq: SeqNo) -> &mut Option<PacketStatus> {
+        let index = self.as_index(seq);
+        &mut self.buffer[index]
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use str0m::media::MediaTime;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const TEST_CAP: usize = 10;
+    const TEST_FREQ: Frequency = Frequency::NINETY_KHZ;
+    const MS_PER_PACKET: u64 = 20; // 20ms per packet
+    const RTP_TS_PER_PACKET: u64 = (TEST_FREQ.get() as u64 * MS_PER_PACKET) / 1000; // 1800
 
     #[derive(Clone)]
     struct TestPacket {
         seq: SeqNo,
-        ts: MediaTime,
-        at: Instant,
+        rtp_ts: MediaTime,
+        arrival: Instant,
     }
 
     impl PacketTiming for TestPacket {
@@ -735,391 +546,258 @@ mod test {
             self.seq
         }
         fn rtp_timestamp(&self) -> MediaTime {
-            self.ts
+            self.rtp_ts
         }
         fn arrival_timestamp(&self) -> Instant {
-            self.at
+            self.arrival
         }
     }
 
-    fn setup() -> (StreamMonitor, StreamState) {
-        let config = QualityMonitorConfig::default();
-        let state = StreamState::new(true, 0);
-        let monitor = StreamMonitor::new(state.clone(), config);
-        (monitor, state)
+    // Helper to create a stream of test packets
+    struct PacketFactory {
+        start_time: Instant,
+        start_seq: u64,
+        start_rtp_ts: u64,
     }
 
-    #[test]
-    #[ignore]
-    fn becomes_active_and_calculates_bitrate() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
-        monitor.poll(start);
-        assert!(!state.is_inactive(), "Should become active immediately");
+    impl PacketFactory {
+        fn new() -> Self {
+            Self {
+                start_time: Instant::now(),
+                start_seq: 1,
+                start_rtp_ts: 1000,
+            }
+        }
 
-        for i in 0..10 {
-            let arrival_time = start + Duration::from_millis(i * 50);
-            let pkt = TestPacket {
-                seq: (i as u64).into(),
-                ts: MediaTime::from_90khz(0),
-                at: arrival_time,
+        fn with_start_seq(start_seq: u64) -> Self {
+            Self {
+                start_time: Instant::now(),
+                start_seq,
+                start_rtp_ts: 1000,
+            }
+        }
+
+        // Creates a packet with a given sequence number and an optional jitter in arrival time
+        fn at(&self, seq: u64, arrival_jitter_ms: i64) -> TestPacket {
+            // Use wrapping arithmetic to handle overflow correctly
+            let packets_since_start = seq.wrapping_sub(self.start_seq);
+            let rtp_ts = self
+                .start_rtp_ts
+                .wrapping_add(packets_since_start.wrapping_mul(RTP_TS_PER_PACKET));
+            let ideal_arrival_ms = packets_since_start.wrapping_mul(MS_PER_PACKET);
+
+            let arrival_time = if arrival_jitter_ms >= 0 {
+                self.start_time
+                    + Duration::from_millis(ideal_arrival_ms.wrapping_add(arrival_jitter_ms as u64))
+            } else {
+                self.start_time + Duration::from_millis(ideal_arrival_ms)
+                    - Duration::from_millis(arrival_jitter_ms.unsigned_abs())
             };
-            monitor.process_packet(&pkt, 1200);
+
+            TestPacket {
+                seq: seq.into(),
+                rtp_ts: MediaTime::new(rtp_ts, TEST_FREQ),
+                arrival: arrival_time,
+            }
         }
-        let final_time = start + Duration::from_millis(501);
-        monitor.poll(final_time);
-        let expected_bps = (1200.0 * 10.0 * 8.0) / 0.501;
-        let actual_bps = state.bitrate_bps() as f64;
+    }
+
+    #[test]
+    fn test_initialization() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let factory = PacketFactory::new();
+        let pkt = factory.at(1, 0);
+
+        monitor.update(&pkt);
+
+        assert_eq!(
+            monitor.tail,
+            2.into(),
+            "Tail should advance past the first packet"
+        );
+        assert_eq!(monitor.head, 2.into(), "Head should be next expected seq");
+        assert_eq!(monitor.last_rtp_ts, pkt.rtp_timestamp());
+        assert_eq!(monitor.last_arrival, pkt.arrival_timestamp());
+    }
+
+    #[test]
+    fn test_in_order_processing() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let factory = PacketFactory::new();
+
+        let pkt1 = factory.at(1, 0);
+        monitor.update(&pkt1);
+        assert_eq!(monitor.tail, 2.into());
+
+        let pkt2 = factory.at(2, 0);
+        monitor.update(&pkt2);
+
+        assert_eq!(monitor.tail, 3.into(), "Tail should advance to 3");
+        assert_eq!(monitor.head, 3.into(), "Head should advance to 3");
+    }
+
+    #[test]
+    fn test_out_of_order_within_buffer() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let factory = PacketFactory::new();
+
+        let pkt1 = factory.at(1, 0);
+        let pkt3 = factory.at(3, 0);
+        let pkt2 = factory.at(2, 0);
+
+        monitor.update(&pkt1);
+        assert_eq!(monitor.tail, 2.into());
+        assert_eq!(monitor.head, 2.into());
+
+        monitor.update(&pkt3); // Packet 3 arrives
+        assert_eq!(monitor.tail, 2.into(), "Tail shouldn't move, waiting for 2");
+        assert_eq!(monitor.head, 4.into(), "Head should jump to 4");
         assert!(
-            (actual_bps - expected_bps).abs() < 1000.0,
-            "Bitrate calculation should be accurate (expected: {}, actual: {})",
-            expected_bps,
-            actual_bps
+            monitor.packet(3.into()).is_some(),
+            "Packet 3 should be in buffer"
         );
-        assert!(!state.is_inactive(), "Should remain active when healthy");
-    }
 
-    #[test]
-    fn quality_does_not_oscillate_with_marginal_changes() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
-
-        // Fill window and bitrate history
-        let mut seq = 0u64;
-        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            let poll_time = start + Duration::from_millis(500 * (i as u64 + 1));
-            monitor.poll(poll_time);
-        }
-
-        // Should be in Good state
-        assert_eq!(state.quality(), StreamQuality::Good);
-
-        // Introduce marginal loss that hovers around threshold
-        let quality_before = state.quality();
-        for i in 0..20 {
-            // Alternate between 3% and 4% loss (around good threshold of 2%)
-            let loss_rate = if i % 2 == 0 { 3 } else { 4 };
-            for _ in 0..(100 - loss_rate) {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            seq += loss_rate; // Skip packets
-
-            let poll_time =
-                start + Duration::from_millis(500 * (i + BITRATE_HISTORY_SAMPLES * 2 + 1) as u64);
-            monitor.poll(poll_time);
-        }
-
-        // Should remain stable in Good due to hysteresis and smoothing
+        monitor.update(&pkt2); // Packet 2 arrives, filling the gap
         assert_eq!(
-            state.quality(),
-            quality_before,
-            "Quality should not oscillate with marginal metric changes"
+            monitor.tail,
+            4.into(),
+            "Tail should advance to 4 after processing 2, 3"
         );
+        assert_eq!(monitor.head, 4.into(), "Head should remain 4");
     }
 
     #[test]
-    #[ignore]
-    fn quality_downgrades_quickly_to_bad() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
+    fn test_packet_loss() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let factory = PacketFactory::new();
 
-        // Start in Good state
-        let mut seq = 0u64;
-        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            let poll_time = start + Duration::from_millis(500 * (i as u64 + 1));
-            monitor.poll(poll_time);
-        }
-        assert_eq!(state.quality(), StreamQuality::Good);
-
-        // Introduce severe sustained loss (15%)
-        for i in 0..5 {
-            for _ in 0..85 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            seq += 15; // Skip 15 packets
-
-            let poll_time =
-                start + Duration::from_millis(500 * (i + BITRATE_HISTORY_SAMPLES * 2 + 1) as u64);
-            monitor.poll(poll_time);
-        }
-
+        monitor.update(&factory.at(1, 0));
+        assert_eq!(monitor.tail, 2.into(), "Tail is 2, waiting for packet 2");
+        monitor.update(&factory.at(3, 0));
         assert_eq!(
-            state.quality(),
-            StreamQuality::Bad,
-            "Quality should downgrade quickly to Bad with severe loss"
+            monitor.tail,
+            2.into(),
+            "Tail should still be 2, waiting for 2"
+        );
+
+        monitor.update(&factory.at(12, 0)); // This packet is outside the window [2, 2+10)
+
+        // The head becomes 13. new_tail = 13 - 10 = 3.
+        // process_until(3) is called. It processes from old_tail (2) up to 3 (exclusive).
+        // It looks for packet 2, doesn't find it (loss), and sets tail to 3.
+        // Then process_in_order() runs and immediately processes packet 3, advancing tail to 4.
+        assert_eq!(monitor.head, 13.into());
+        assert_eq!(
+            monitor.tail,
+            4.into(),
+            "Tail should be at 4 after sliding past lost packet 2 and processing packet 3"
         );
     }
 
     #[test]
-    #[ignore]
-    fn quality_upgrades_slowly_from_bad() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
+    fn test_buffer_wraparound_and_making_space() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP); // Capacity is 10
+        let factory = PacketFactory::new();
 
-        // Force to Bad state
-        monitor.quality_score = 0.0;
-        monitor.current_quality = StreamQuality::Bad;
-        state
-            .quality
-            .store(StreamQuality::Bad as u8, Ordering::Relaxed);
+        monitor.update(&factory.at(1, 0));
+        assert_eq!(monitor.tail, 2.into());
+        assert_eq!(monitor.head, 2.into());
 
-        // Simulate perfect stream
-        let mut seq = 0u64;
-        let mut poll_count = 0;
-        for i in 0..40 {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            let poll_time = start + Duration::from_millis(500 * (i + 1));
-            monitor.poll(poll_time);
-            poll_count += 1;
+        let pkt12 = factory.at(12, 0);
+        monitor.update(&pkt12);
 
-            // Should not upgrade too quickly
-            if poll_count < monitor.config.upgrade_stability_count + MIN_SAMPLES_FOR_QUALITY as u32
-            {
-                if state.quality() != StreamQuality::Bad {
-                    panic!("Quality upgraded too quickly (at poll {})", poll_count);
-                }
-            }
-        }
+        assert_eq!(monitor.head, 13.into());
+        assert_eq!(
+            monitor.tail,
+            3.into(),
+            "Tail should be moved forward to make space"
+        );
+        assert!(
+            monitor.packet(1.into()).is_none(),
+            "Packet 1 should have been processed and removed"
+        );
+        assert!(
+            monitor.packet(12.into()).is_some(),
+            "Packet 12 should now be in the buffer"
+        );
+    }
+
+    #[test]
+    fn test_ignore_old_packet() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let factory = PacketFactory::new();
+
+        monitor.update(&factory.at(5, 0));
+        monitor.update(&factory.at(6, 0));
+
+        assert_eq!(monitor.tail, 7.into());
+        let before_last_arrival = monitor.last_arrival;
+
+        // Send a packet older than the current tail
+        monitor.update(&factory.at(4, 0));
+
+        // State should not have changed
+        assert_eq!(monitor.tail, 7.into(), "Old packet should not change tail");
+        assert_eq!(
+            monitor.last_arrival, before_last_arrival,
+            "State should not be updated by an old packet"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_packet_overwrite() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let factory = PacketFactory::new();
+
+        // Send packets 1 and 3, creating a gap for packet 2.
+        monitor.update(&factory.at(1, 0));
+        monitor.update(&factory.at(3, 0));
+
+        assert_eq!(monitor.tail, 2.into());
+        assert!(monitor.packet(3.into()).is_some());
+
+        // Send a "duplicate" of 3, but with a different arrival time.
+        let pkt3_dup = factory.at(3, 10);
+        monitor.update(&pkt3_dup);
+        assert_eq!(
+            monitor.packet(3.into()).as_ref().unwrap().arrival,
+            pkt3_dup.arrival,
+            "Duplicate should overwrite existing packet data"
+        );
+
+        // Now, fill the gap with packet 2.
+        monitor.update(&factory.at(2, 0));
 
         assert_eq!(
-            state.quality(),
-            StreamQuality::Good,
-            "Quality should eventually upgrade to Good with sustained good performance"
+            monitor.tail,
+            4.into(),
+            "Tail should have processed up to packet 3"
         );
-    }
-
-    #[test]
-    #[ignore]
-    fn quality_requires_stability_for_excellent() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
-
-        // Start in Good state with high score
-        monitor.quality_score = 85.0;
-        monitor.current_quality = StreamQuality::Good;
-        state
-            .quality
-            .store(StreamQuality::Good as u8, Ordering::Relaxed);
-
-        // Simulate perfect stream
-        let mut seq = 0u64;
-        for i in 0..20 {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            let poll_time = start + Duration::from_millis(500 * (i + 1));
-            monitor.poll(poll_time);
-
-            // Check it doesn't upgrade too fast
-            if i < monitor.config.upgrade_stability_count as u64 {
-                assert_eq!(
-                    state.quality(),
-                    StreamQuality::Good,
-                    "Should not upgrade to Excellent before stability requirement is met"
-                );
-            }
-        }
-
         assert_eq!(
-            state.quality(),
-            StreamQuality::Excellent,
-            "Quality should eventually reach Excellent with perfect sustained performance"
+            monitor.last_arrival, pkt3_dup.arrival,
+            "The monitor should have used the overwritten packet's data"
         );
     }
 
     #[test]
-    #[ignore]
-    fn catastrophic_loss_triggers_immediate_downgrade() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
+    fn test_sequence_number_wrap_around() {
+        let mut monitor = DeltaDeltaState::new(TEST_CAP);
+        let start_seq = u64::MAX - 5;
+        let factory = PacketFactory::with_start_seq(start_seq);
+        let mut current_seq = start_seq;
 
-        // Start in Excellent state
-        monitor.quality_score = 95.0;
-        monitor.current_quality = StreamQuality::Excellent;
-        state
-            .quality
-            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
+        // Initialize the monitor
+        monitor.update(&factory.at(current_seq, 0));
+        assert_eq!(monitor.tail, (current_seq.wrapping_add(1)).into());
 
-        // Fill history
-        let mut seq = 0u64;
-        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            let poll_time = start + Duration::from_millis(500 * (i as u64 + 1));
-            monitor.poll(poll_time);
+        // Process several packets, wrapping around u64::MAX
+        for _ in 0..15 {
+            current_seq = current_seq.wrapping_add(1);
+            monitor.update(&factory.at(current_seq, 0));
         }
-
-        // Introduce catastrophic loss (30%)
-        for i in 0..3 {
-            for _ in 0..70 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            seq += 30; // Skip 30 packets
-
-            let poll_time =
-                start + Duration::from_millis(500 * (i + BITRATE_HISTORY_SAMPLES * 2 + 1) as u64);
-            monitor.poll(poll_time);
-        }
-
-        assert_eq!(
-            state.quality(),
-            StreamQuality::Bad,
-            "Catastrophic loss should trigger immediate downgrade"
-        );
-    }
-
-    #[test]
-    fn prevents_rapid_oscillation_after_downgrade() {
-        let (mut monitor, state) = setup();
-        let start = Instant::now();
-        monitor.set_manual_pause(false);
-
-        // Start in Excellent
-        monitor.quality_score = 95.0;
-        monitor.current_quality = StreamQuality::Excellent;
-        state
-            .quality
-            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
-
-        let mut seq = 0u64;
-
-        // Fill history
-        for i in 0..(BITRATE_HISTORY_SAMPLES * 2) {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: start,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            monitor.poll(start + Duration::from_millis(500 * (i as u64 + 1)));
-        }
-
-        // Trigger a downgrade with brief bad quality
-        let downgrade_time = start + Duration::from_secs(20);
-        for _ in 0..3 {
-            for _ in 0..80 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: downgrade_time,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            seq += 20; // High loss
-            monitor.poll(downgrade_time);
-        }
-
-        let quality_after_downgrade = state.quality();
-        assert_ne!(quality_after_downgrade, StreamQuality::Excellent);
-
-        // Now simulate perfect conditions immediately after
-        for i in 0..15 {
-            for _ in 0..100 {
-                monitor.process_packet(
-                    &TestPacket {
-                        seq: seq.into(),
-                        at: downgrade_time,
-                        ts: MediaTime::from_90khz(0),
-                    },
-                    1200,
-                );
-                seq += 1;
-            }
-            monitor.poll(downgrade_time + Duration::from_millis(500 * (i + 1)));
-        }
-
-        // Should NOT return to Excellent quickly due to cooldown
-        assert_ne!(
-            state.quality(),
-            StreamQuality::Excellent,
-            "Should not upgrade back to Excellent too quickly after a downgrade"
-        );
+        let expected_tail = start_seq.wrapping_add(16);
+        let expected_head = start_seq.wrapping_add(16);
+        assert_eq!(monitor.tail, expected_tail.into());
+        assert_eq!(monitor.head, expected_head.into());
     }
 }

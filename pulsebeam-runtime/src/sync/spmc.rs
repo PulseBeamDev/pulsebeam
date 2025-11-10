@@ -1,12 +1,3 @@
-//! High-performance, race-free single-producer / multi-consumer broadcast channel.
-//!
-//! Design goals:
-//! - Single producer, multiple concurrent consumers
-//! - Atomic publication via `ArcSwapOption<Slot<T>>`
-//! - Lock-free, race-free
-//! - Lag detection and safe catching-up
-//! - Async wait via `tokio::Notify`
-
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwapOption;

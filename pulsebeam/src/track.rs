@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use crate::rtp::{
     Packet, RtpPacket,
-    monitor::{QualityMonitorConfig, StreamMonitor, StreamState},
+    monitor::{StreamMonitor, StreamState},
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -194,7 +194,10 @@ impl TrackReceiver {
 
     pub fn higher_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
         let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        let higher = self.simulcast.get(idx.saturating_sub(1))?;
+        if idx == self.simulcast.len() - 1 {
+            return None;
+        }
+        let higher = self.simulcast.get(idx.saturating_add(1))?;
         let current = self.by_rid(rid)?;
 
         debug_assert!(higher.quality > current.quality);
@@ -203,7 +206,10 @@ impl TrackReceiver {
 
     pub fn lower_quality(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
         let idx = self.simulcast.iter().position(|s| s.rid == *rid)?;
-        let lower = self.simulcast.get(idx.saturating_add(1))?;
+        if idx == 0 {
+            return None;
+        }
+        let lower = self.simulcast.get(idx.saturating_sub(1))?;
         let current = self.by_rid(rid)?;
 
         debug_assert!(lower.quality < current.quality);
@@ -255,7 +261,8 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
             }
         };
         let stream_state = StreamState::new(true, bitrate);
-        let monitor = StreamMonitor::new(stream_state.clone(), QualityMonitorConfig::default());
+        let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
+        let monitor = StreamMonitor::new(stream_id, stream_state.clone());
 
         senders.push(SimulcastSender {
             rid,

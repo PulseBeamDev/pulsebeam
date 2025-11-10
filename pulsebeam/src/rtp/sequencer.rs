@@ -3,11 +3,7 @@ use std::fmt::Display;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::{SeqNo, Ssrc};
 
-use crate::rtp::{Packet, TimingHeader};
-
-/// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
-const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
-const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
+use crate::rtp::{AUDIO_FREQUENCY, Packet, TimingHeader, VIDEO_FREQUENCY};
 
 pub struct RtpSequencer<T> {
     state: SequencerState<T>,
