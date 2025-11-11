@@ -184,7 +184,7 @@ impl UnifiedSocket {
 
     /// Sends a batch of packets.
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> bool {
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::SimUdp(inner) => inner.try_send_batch(batch),
@@ -275,7 +275,7 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> bool {
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
         let transmit = quinn_udp::Transmit {
             destination: batch.dst,
@@ -292,13 +292,12 @@ impl UdpTransport {
             Ok(_) => {
                 metrics::histogram!("network_send_batch_bytes", "transport" => "udp")
                     .record(batch.buf.len() as f64);
-                true
+                Ok(true)
             }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(err) => {
-                if err.kind() != ErrorKind::WouldBlock {
-                    tracing::warn!("try_send_batch failed with {err}");
-                }
-                false
+                tracing::warn!("try_send_batch failed with {err}");
+                Err(err)
             }
         }
     }
@@ -384,7 +383,7 @@ impl TokioUdpTransport {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> bool {
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
         let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
             self.sock.try_send_to(batch.buf, batch.dst)
@@ -394,15 +393,12 @@ impl TokioUdpTransport {
             Ok(_) => {
                 metrics::histogram!("network_send_batch_bytes", "transport" => "tokio_udp")
                     .record(batch.buf.len() as f64);
-                true
+                Ok(true)
             }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(err) => {
-                if err.kind() != ErrorKind::WouldBlock {
-                    tracing::warn!("try_send_batch failed with {err}");
-                    false
-                } else {
-                    true
-                }
+                tracing::warn!("try_send_batch failed with {err}");
+                Err(err)
             }
         }
     }
@@ -481,7 +477,7 @@ impl SimUdpTransport {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> bool {
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         assert!(batch.segment_size != 0);
         assert!(batch.buf.len() == batch.segment_size);
 
@@ -489,12 +485,12 @@ impl SimUdpTransport {
             Ok(_) => {
                 metrics::histogram!("network_send_batch_bytes", "transport" => "sim_udp")
                     .record(batch.buf.len() as f64);
-                true
+                Ok(true)
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => false,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(e) => {
                 tracing::warn!("Receive packet failed: {}", e);
-                false
+                Err(e)
             }
         }
     }

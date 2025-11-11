@@ -72,15 +72,17 @@ impl Batcher {
     pub fn flush(&mut self, socket: &net::UnifiedSocket) {
         let start = tokio::time::Instant::now();
         while let Some(state) = self.front() {
-            if socket.try_send_batch(&net::SendPacketBatch {
+            let res = socket.try_send_batch(&net::SendPacketBatch {
                 dst: state.dst,
                 buf: &state.buf,
                 segment_size: state.segment_size,
-            }) {
-                let state = self.pop_front().unwrap();
-                self.reclaim(state);
-            } else {
-                break;
+            });
+            match res {
+                Ok(true) | Err(_) => {
+                    let state = self.pop_front().unwrap();
+                    self.reclaim(state);
+                }
+                Ok(false) => break,
             }
         }
         let elapsed = start.elapsed().as_micros();
