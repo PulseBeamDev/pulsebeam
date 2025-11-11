@@ -134,19 +134,26 @@ impl ControllerActor {
         // Level 3.1 to 4.1. This is mainly to support clients that don't handle
         // level-asymmetry-allowed=true properly.
         let baseline_levels = [0x1f, 0x20, 0x28, 0x29];
+        let mut pt = 96; // start around 96–127 range for dynamic types
+
         for level in &baseline_levels {
+            // Baseline
             codec_config.add_h264(
-                127.into(),       // PT for video
-                Some(121.into()), // RTX PT
-                true,             // packetization-mode = 1
-                0x42e000 | level, // Baseline
+                pt.into(),
+                Some((pt + 1).into()), // RTX PT
+                true,
+                0x420000 | level,
             );
+            pt += 2;
+
+            // Constrained Baseline
             codec_config.add_h264(
-                108.into(),       // PT for video
-                Some(109.into()), // RTX PT
-                true,             // packetization-mode = 1
-                0x420000 | level, // Constrained Baseline
+                pt.into(),
+                Some((pt + 1).into()), // RTX PT
+                true,
+                0x42e000 | level,
             );
+            pt += 2;
         }
 
         // TODO: OBS only supports Baseline level 3.1
