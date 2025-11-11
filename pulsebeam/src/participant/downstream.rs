@@ -220,21 +220,22 @@ impl DownstreamAllocator {
                     continue;
                 };
 
-                if current_receiver.state.is_inactive() {
-                    continue;
-                }
-
-                // Conservative upgrade logic: only upgrade if higher layer is excellent
-                let desired = match current_receiver.state.quality() {
-                    StreamQuality::Bad => track.lowest_quality(),
-                    StreamQuality::Good => current_receiver, // Stay at current when good
-                    StreamQuality::Excellent => track
-                        .higher_quality(current_receiver.quality)
-                        .filter(|next| {
-                            next.state.quality() == StreamQuality::Excellent
-                                && !next.state.is_inactive()
-                        })
-                        .unwrap_or(current_receiver),
+                let desired = if current_receiver.state.is_inactive() {
+                    // very likely the sender can't keep up with sending higher resolution.
+                    track.lowest_quality()
+                } else {
+                    // Conservative upgrade logic: only upgrade if higher layer is excellent
+                    match current_receiver.state.quality() {
+                        StreamQuality::Bad => track.lowest_quality(),
+                        StreamQuality::Good => current_receiver, // Stay at current when good
+                        StreamQuality::Excellent => track
+                            .higher_quality(current_receiver.quality)
+                            .filter(|next| {
+                                next.state.quality() == StreamQuality::Excellent
+                                    && !next.state.is_inactive()
+                            })
+                            .unwrap_or(current_receiver),
+                    }
                 };
 
                 let is_upgrade = desired.quality > current_receiver.quality;
