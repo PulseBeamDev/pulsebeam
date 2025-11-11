@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use crate::rtp::PacketTiming;
 
 /// Defines the wall-clock duration without packets after which a stream is considered inactive.
-const INACTIVE_TIMEOUT: Duration = Duration::from_secs(2);
+const INACTIVE_TIMEOUT: Duration = Duration::from_millis(500);
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +94,7 @@ impl StreamMonitor {
         let was_inactive = self.shared_state.is_inactive();
         let is_inactive = self.determine_inactive_state(now);
         if is_inactive && !was_inactive {
-            self.reset();
+            self.reset(now);
         }
         self.shared_state
             .inactive
@@ -131,11 +131,18 @@ impl StreamMonitor {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, now: Instant) {
+        tracing::info!(
+            stream_id = %self.stream_id,
+            "Stream inactive, resetting all metrics. Quality was: {:?}", self.current_quality);
+        self.delta_delta = DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE);
+        self.bwe = BitrateEstimate::new(now);
         self.current_quality = StreamQuality::Good;
         self.shared_state
             .quality
             .store(StreamQuality::Good as u8, Ordering::Relaxed);
+
+        self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
     }
 
     pub fn set_manual_pause(&mut self, paused: bool) {
