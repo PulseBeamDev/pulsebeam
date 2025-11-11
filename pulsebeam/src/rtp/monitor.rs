@@ -106,7 +106,7 @@ impl StreamMonitor {
         self.bwe.poll(now);
         self.shared_state
             .bitrate_bps
-            .store(self.bwe.bwe_bps_ewma as u64, Ordering::Relaxed);
+            .store(self.bwe.estimate_bps() as u64, Ordering::Relaxed);
 
         let metrics: RawMetrics = (&self.delta_delta).into();
         let quality_score = metrics.calculate_jitter_score();
@@ -152,6 +152,8 @@ pub struct BitrateEstimate {
     bwe_last_update: Instant,
     bwe_interval_bytes: usize,
     bwe_bps_ewma: f64,
+    bwe_bps_peak: f64,
+    peak_decay_time: Instant,
 }
 
 impl BitrateEstimate {
@@ -160,6 +162,8 @@ impl BitrateEstimate {
             bwe_last_update: now,
             bwe_interval_bytes: 0,
             bwe_bps_ewma: 0.0,
+            bwe_bps_peak: 0.0,
+            peak_decay_time: now,
         }
     }
 
@@ -168,15 +172,18 @@ impl BitrateEstimate {
     }
 
     pub fn poll(&mut self, now: Instant) {
-        const ALPHA_UP: f64 = 0.7;
+        const ALPHA_UP: f64 = 0.9;
         const ALPHA_DOWN: f64 = 0.1;
+        const PEAK_DECAY_INTERVAL: Duration = Duration::from_secs(5);
+        const PEAK_DECAY_FACTOR: f64 = 0.95;
 
         let elapsed = now.saturating_duration_since(self.bwe_last_update);
-
         let elapsed_secs = elapsed.as_secs_f64();
+
         if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
             let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
 
+            // Update EWMA
             if self.bwe_bps_ewma == 0.0 {
                 self.bwe_bps_ewma = bps;
             } else {
@@ -188,9 +195,27 @@ impl BitrateEstimate {
                 self.bwe_bps_ewma = (1.0 - alpha) * self.bwe_bps_ewma + alpha * bps;
             }
 
+            // Update peak
+            if bps > self.bwe_bps_peak {
+                self.bwe_bps_peak = bps;
+                self.peak_decay_time = now;
+            }
+
             self.bwe_interval_bytes = 0;
             self.bwe_last_update = now;
         }
+
+        // Decay peak slowly over time
+        let peak_age = now.saturating_duration_since(self.peak_decay_time);
+        if peak_age > PEAK_DECAY_INTERVAL {
+            self.bwe_bps_peak *= PEAK_DECAY_FACTOR;
+            self.peak_decay_time = now;
+        }
+    }
+
+    pub fn estimate_bps(&self) -> f64 {
+        // Use max of EWMA and decayed peak for pacing
+        self.bwe_bps_ewma.max(self.bwe_bps_peak)
     }
 }
 
