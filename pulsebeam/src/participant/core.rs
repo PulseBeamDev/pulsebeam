@@ -199,14 +199,20 @@ impl ParticipantCore {
                 self.rtc.bwe().set_current_bitrate(current);
                 self.rtc.bwe().set_desired_bitrate(desired);
             }
-            Event::StreamPaused(e) => {
-                let Some(track) = self.upstream_allocator.get_track_mut(&e.mid) else {
-                    return;
-                };
-                let Some(layer) = track.by_rid_mut(&e.rid) else {
-                    return;
-                };
-                layer.monitor.set_manual_pause(e.paused);
+            // rtp monitor handles this
+            Event::StreamPaused(_) => {
+                //     if e.paused {
+                //         return;
+                //     }
+                //
+                //     let Some(track) = self.upstream_allocator.get_track_mut(&e.mid) else {
+                //         return;
+                //     };
+                //     let Some(layer) = track.by_rid_mut(&e.rid) else {
+                //         return;
+                //     };
+                //
+                //     layer.monitor.set_manual_pause(e.paused);
             }
             e => {
                 tracing::warn!("unhandled event: {e:?}");

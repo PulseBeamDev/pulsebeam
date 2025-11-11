@@ -10,8 +10,7 @@ use tokio::time::Instant;
 
 use crate::rtp::PacketTiming;
 
-/// Defines the wall-clock duration without packets after which a stream is considered inactive.
-const INACTIVE_TIMEOUT: Duration = Duration::from_millis(500);
+const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 15;
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +59,6 @@ pub struct StreamMonitor {
     shared_state: StreamState,
 
     stream_id: String,
-    manual_pause: bool,
 
     delta_delta: DeltaDeltaState,
     last_packet_at: Instant,
@@ -75,7 +73,6 @@ impl StreamMonitor {
         Self {
             stream_id,
             shared_state,
-            manual_pause: true,
             last_packet_at: now,
             delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
             bwe: BitrateEstimate::new(now),
@@ -91,8 +88,15 @@ impl StreamMonitor {
     }
 
     pub fn poll(&mut self, now: Instant) {
+        self.bwe.poll(now);
+        self.shared_state
+            .bitrate_bps
+            .store(self.bwe.estimate_bps() as u64, Ordering::Relaxed);
+
+        let metrics: RawMetrics = (&self.delta_delta).into();
         let was_inactive = self.shared_state.is_inactive();
-        let is_inactive = self.determine_inactive_state(now);
+        let is_inactive = self
+            .determine_inactive_state(now, metrics.frame_duration * INACTIVE_TIMEOUT_MULTIPLIER);
         if is_inactive && !was_inactive {
             self.reset(now);
         }
@@ -103,14 +107,7 @@ impl StreamMonitor {
             return;
         }
 
-        self.bwe.poll(now);
-        self.shared_state
-            .bitrate_bps
-            .store(self.bwe.estimate_bps() as u64, Ordering::Relaxed);
-
-        let metrics: RawMetrics = (&self.delta_delta).into();
         let quality_score = metrics.calculate_jitter_score();
-
         let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
 
         if new_quality != self.current_quality {
@@ -145,12 +142,8 @@ impl StreamMonitor {
         self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
     }
 
-    pub fn set_manual_pause(&mut self, paused: bool) {
-        self.manual_pause = paused;
-    }
-
-    fn determine_inactive_state(&self, now: Instant) -> bool {
-        self.manual_pause || now.saturating_duration_since(self.last_packet_at) > INACTIVE_TIMEOUT
+    fn determine_inactive_state(&self, now: Instant, timeout: Duration) -> bool {
+        now.saturating_duration_since(self.last_packet_at) > timeout
     }
 }
 
@@ -228,6 +221,7 @@ impl BitrateEstimate {
 
 struct RawMetrics {
     pub m_hat: f64, // The Kalman-filtered queue delay trend
+    pub frame_duration: Duration,
     pub packets_actual: u64,
     pub packets_expected: u64,
 }
@@ -236,6 +230,7 @@ impl From<&DeltaDeltaState> for RawMetrics {
     fn from(value: &DeltaDeltaState) -> Self {
         Self {
             m_hat: value.m_hat,
+            frame_duration: Duration::from_millis(value.frame_duration_ms_ewma as u64),
             packets_actual: value.packets_actual,
             packets_expected: value.packets_expected,
         }
@@ -330,6 +325,8 @@ struct DeltaDeltaState {
 
     packets_actual: u64,
     packets_expected: u64,
+    frame_duration_ms_ewma: f64,
+
     buffer: Vec<Option<PacketStatus>>,
     initialized: bool,
 }
@@ -347,6 +344,7 @@ impl DeltaDeltaState {
             var_v_hat: 1.0, // A reasonable starting default (var_v is clamped at 1)
             packets_actual: 0,
             packets_expected: 0,
+            frame_duration_ms_ewma: 1000.0,
             buffer: vec![None; cap],
             initialized: false,
         }
@@ -458,6 +456,24 @@ impl DeltaDeltaState {
         self.last_rtp_ts = pkt.rtp_ts;
         self.packets_actual += 1;
         self.packets_expected += 1;
+
+        if expected_ms != 0.0 {
+            const ALPHA_UP: f64 = 0.1;
+            const ALPHA_DOWN: f64 = 0.01;
+
+            let new_duration = if expected_ms > self.frame_duration_ms_ewma {
+                (1.0 - ALPHA_UP) * self.frame_duration_ms_ewma + ALPHA_UP * expected_ms
+            } else {
+                (1.0 - ALPHA_DOWN) * self.frame_duration_ms_ewma + ALPHA_DOWN * expected_ms
+            };
+
+            if (new_duration - self.frame_duration_ms_ewma).abs() > 0.1 {
+                let from = self.frame_duration_ms_ewma * INACTIVE_TIMEOUT_MULTIPLIER as f64;
+                let to = new_duration * INACTIVE_TIMEOUT_MULTIPLIER as f64;
+                tracing::debug!("new inactivity timeout: {:.3}ms -> {:.3}ms", from, to);
+            }
+            self.frame_duration_ms_ewma = new_duration;
+        }
     }
 
     fn process_in_order(&mut self) {
