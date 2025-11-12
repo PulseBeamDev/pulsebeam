@@ -2,6 +2,7 @@ pub mod jitter_buffer;
 pub mod monitor;
 pub mod sequencer;
 pub mod switcher;
+pub mod sync;
 
 use std::ops::{Deref, DerefMut};
 
