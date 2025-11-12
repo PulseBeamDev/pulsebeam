@@ -1,7 +1,7 @@
 pub mod jitter_buffer;
-pub mod mixer;
 pub mod monitor;
 pub mod sequencer;
+pub mod switcher;
 
 use std::ops::{Deref, DerefMut};
 
