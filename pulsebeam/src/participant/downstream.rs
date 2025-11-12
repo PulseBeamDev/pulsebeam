@@ -6,6 +6,7 @@ use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
@@ -21,7 +22,7 @@ use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 ///
 /// It includes the packet and a boolean marker to indicate if this is the first
 /// packet after a simulcast layer switch.
-type TrackStreamItem = (Arc<TrackMeta>, TimingHeader, RtpPacket);
+type TrackStreamItem = (Arc<TrackId>, TimingHeader, RtpPacket);
 type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 
 /// Configuration that each downstream receiver listens to.
@@ -86,6 +87,7 @@ struct SlotState {
     assigned_track: Option<Arc<TrackId>>,
     // video=max_height
     priority: u32,
+    sequencer: RtpSequencer<RtpPacket>,
 }
 
 pub struct DownstreamAllocator {
@@ -149,6 +151,7 @@ impl DownstreamAllocator {
                     mid,
                     assigned_track: None,
                     priority: 0,
+                    sequencer: RtpSequencer::audio(),
                 });
             }
             MediaKind::Video => {
@@ -156,6 +159,7 @@ impl DownstreamAllocator {
                     mid,
                     assigned_track: None,
                     priority: 720,
+                    sequencer: RtpSequencer::video(),
                 });
             }
         }
@@ -300,12 +304,12 @@ impl DownstreamAllocator {
         state.request_keyframe(req.kind);
     }
 
-    pub fn handle_rtp(&mut self, meta: &Arc<TrackMeta>, hdr: &RtpHeader) -> Option<Mid> {
-        let assigned_mid = self.tracks.get(&meta.id).and_then(|s| s.assigned_mid);
+    pub fn handle_rtp(&mut self, track_id: &TrackId, hdr: &RtpHeader) -> Option<Mid> {
+        let assigned_mid = self.tracks.get(track_id).and_then(|s| s.assigned_mid);
 
         let mut needs_rebalance = false;
-        if let Some(track_state) = self.tracks.get_mut(&meta.id) {
-            if meta.kind == MediaKind::Audio {
+        if let Some(track_state) = self.tracks.get_mut(track_id) {
+            if track_state.track.meta.kind == MediaKind::Audio {
                 let new_level = hdr.ext_vals.audio_level.unwrap_or(-127);
                 if track_state.audio_level.0 != new_level as i32 {
                     track_state.audio_level = AudioLevel(new_level as i32);
@@ -476,7 +480,7 @@ enum TrackReaderState {
 
 /// Manages reading RTP packets from a TrackReceiver with dynamic layer switching.
 pub struct TrackReader {
-    meta: Arc<TrackMeta>,
+    id: Arc<TrackId>,
     track: TrackReceiver,
     control_rx: watch::Receiver<StreamConfig>,
 
@@ -494,7 +498,7 @@ impl TrackReader {
             RtpSequencer::audio()
         };
         let mut this = Self {
-            meta: track.meta.clone(),
+            id: track.meta.id.clone(),
             track,
             control_rx,
             state: TrackReaderState::Paused,
@@ -511,7 +515,7 @@ impl TrackReader {
         loop {
             self.maybe_update_state();
             if let Some((hdr, pkt)) = self.sequencer.pop() {
-                return Some((self.meta.clone(), hdr, pkt));
+                return Some((self.id.clone(), hdr, pkt));
             }
 
             match self.state {
@@ -537,11 +541,11 @@ impl TrackReader {
                                     self.sequencer.push(&pkt.value);
                                 },
                                 Err(spmc::RecvError::Lagged(n)) => {
-                                    tracing::warn!(track_id = %self.meta.id, "Receiver lagged {n}, requesting keyframe");
+                                    tracing::warn!(track_id = %self.id, "Receiver lagged {n}, requesting keyframe");
                                     receiver.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
                                 }
                                 Err(spmc::RecvError::Closed) => {
-                                    tracing::warn!(track_id = %self.meta.id, "Channel closed, ending stream");
+                                    tracing::warn!(track_id = %self.id, "Channel closed, ending stream");
                                     return None;
                                 }
                             }
@@ -573,12 +577,12 @@ impl TrackReader {
                                     self.sequencer.push(&pkt.value);
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
-                                    tracing::warn!(track_id = %self.meta.id, "New active stream lagged {n}, completing switch anyway");
+                                    tracing::warn!(track_id = %self.id, "New active stream lagged {n}, completing switch anyway");
                                     active_receiver.request_keyframe(KeyframeRequestKind::Pli);
                                     self.state = TrackReaderState::Streaming { active_index }; // Commit to the switch
                                 }
                                 Err(spmc::RecvError::Closed) => {
-                                    tracing::warn!(track_id = %self.meta.id, "New active stream closed, reverting to fallback");
+                                    tracing::warn!(track_id = %self.id, "New active stream closed, reverting to fallback");
                                     self.state = TrackReaderState::Streaming { active_index: fallback_index };
                                 }
                             }
@@ -588,15 +592,15 @@ impl TrackReader {
                         res = fallback_receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    tracing::trace!(track_id = %self.meta.id, "Forwarding fallback packet during transition");
+                                    tracing::trace!(track_id = %self.id, "Forwarding fallback packet during transition");
                                     self.sequencer.push(&pkt.value);
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
-                                    tracing::warn!(track_id = %self.meta.id, "Fallback stream lagged by {n} packets during transition. Committing to active stream.");
+                                    tracing::warn!(track_id = %self.id, "Fallback stream lagged by {n} packets during transition. Committing to active stream.");
                                     self.state = TrackReaderState::Streaming { active_index };
                                 }
                                 Err(spmc::RecvError::Closed) => {
-                                    tracing::debug!(track_id = %self.meta.id, "Fallback stream closed during transition. Committing to active stream.");
+                                    tracing::debug!(track_id = %self.id, "Fallback stream closed during transition. Committing to active stream.");
                                     self.state = TrackReaderState::Streaming { active_index };
                                 }
                             }
@@ -623,7 +627,7 @@ impl TrackReader {
 
     fn update_state(&mut self, current: StreamConfig) {
         self.config = current;
-        tracing::debug!(track_id = %self.meta.id, "Applying new stream config: {current:?}");
+        tracing::debug!(track_id = %self.id, "Applying new stream config: {current:?}");
 
         let new_active_index = if current.paused {
             None
@@ -665,7 +669,7 @@ impl TrackReader {
         };
 
         if self.state != next_state {
-            tracing::debug!(track_id = %self.meta.id, "TrackReader state changed from {:?} to {:?}", self.state, next_state);
+            tracing::debug!(track_id = %self.id, "TrackReader state changed from {:?} to {:?}", self.state, next_state);
 
             match (self.state, next_state) {
                 (
@@ -679,7 +683,7 @@ impl TrackReader {
                     let active_receiver = &mut self.track.simulcast[active_index];
                     active_receiver.channel.reset();
                     active_receiver.request_keyframe(KeyframeRequestKind::Fir);
-                    tracing::info!(track_id = %self.meta.id,
+                    tracing::info!(track_id = %self.id,
                         "switch simulcast layer: {:?} -> {:?}",
                         fallback_receiver_rid, active_receiver.rid
                     );
@@ -688,7 +692,7 @@ impl TrackReader {
                     let active_receiver = &mut self.track.simulcast[active_index];
                     active_receiver.channel.reset();
                     active_receiver.request_keyframe(KeyframeRequestKind::Fir);
-                    tracing::info!(track_id = %self.meta.id,
+                    tracing::info!(track_id = %self.id,
                         "resuming simulcast layer: {:?}",
                         active_receiver.rid
                     );

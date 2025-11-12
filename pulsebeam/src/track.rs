@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
-use str0m::media::{KeyframeRequestKind, MediaKind, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -31,15 +31,10 @@ impl std::fmt::Debug for SimulcastQuality {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct KeyframeRequest {
-    pub request: str0m::media::KeyframeRequest,
-    pub requested_at: Instant,
-}
-
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct TrackMeta {
     pub id: Arc<crate::entity::TrackId>,
+    pub origin_participant: Arc<crate::entity::ParticipantId>,
     pub kind: MediaKind,
     pub simulcast_rids: Option<Vec<Rid>>,
 }
@@ -50,23 +45,14 @@ pub struct SimulcastReceiver {
     pub quality: SimulcastQuality,
     pub rid: Option<Rid>,
     pub channel: spmc::Receiver<RtpPacket>,
-    pub keyframe_requester: watch::Sender<Option<KeyframeRequest>>,
+    pub keyframe_requester: watch::Sender<Option<KeyframeRequestKind>>,
     pub state: StreamState,
 }
 
 impl SimulcastReceiver {
     pub fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        let request = str0m::media::KeyframeRequest {
-            mid: self.meta.id.origin_mid,
-            rid: self.rid,
-            kind,
-        };
-        let wrapped = KeyframeRequest {
-            request,
-            requested_at: Instant::now(),
-        };
-        if self.keyframe_requester.send(Some(wrapped)).is_err() {
-            tracing::warn!(?request, "feedback channel is unavailable");
+        if self.keyframe_requester.send(Some(kind)).is_err() {
+            tracing::warn!(?kind, "feedback channel is unavailable");
         }
     }
 }
@@ -83,6 +69,7 @@ enum KeyframeRequestState {
 
 #[derive(Debug)]
 pub struct SimulcastSender {
+    pub mid: Mid,
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
     pub monitor: StreamMonitor,
@@ -90,7 +77,7 @@ pub struct SimulcastSender {
 
     keyframe_request_state: KeyframeRequestState,
     keyframe_debounce_duration: Duration,
-    keyframe_requests: watch::Receiver<Option<KeyframeRequest>>,
+    keyframe_requests: watch::Receiver<Option<KeyframeRequestKind>>,
 }
 
 impl SimulcastSender {
@@ -116,7 +103,12 @@ impl SimulcastSender {
             self.keyframe_request_state = KeyframeRequestState::Idle;
 
             // Return the latest request from the channel.
-            return self.keyframe_requests.borrow().clone();
+            let kind = self.keyframe_requests.borrow();
+            return kind.map(|k| KeyframeRequest {
+                kind: k,
+                rid: self.rid,
+                mid: self.mid,
+            });
         }
 
         None
@@ -229,7 +221,7 @@ impl TrackReceiver {
     }
 }
 
-pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
+pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
     let mut simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
         rids.iter().map(|rid| Some(*rid)).collect()
     } else {
@@ -263,6 +255,7 @@ pub fn new(meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver
         let monitor = StreamMonitor::new(stream_id, stream_state.clone());
 
         senders.push(SimulcastSender {
+            mid,
             rid,
             quality,
             channel: tx,

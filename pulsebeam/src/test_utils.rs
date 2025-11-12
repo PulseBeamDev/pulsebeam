@@ -44,6 +44,5 @@ pub async fn create_node_ctx() -> node::NodeContext {
 }
 
 pub fn create_track_id() -> Arc<entity::TrackId> {
-    let participant_id = create_participant_id();
-    Arc::new(entity::TrackId::new(participant_id, Mid::new()))
+    Arc::new(entity::TrackId::new())
 }

@@ -9,7 +9,7 @@ use str0m::{
     media::{Direction, MediaAdded},
 };
 
-use crate::entity;
+use crate::entity::{self, TrackId};
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
@@ -91,7 +91,7 @@ impl ParticipantCore {
         tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
     ) {
         for track_handle in tracks.values() {
-            if track_handle.meta.id.origin_participant != self.participant_id {
+            if track_handle.meta.origin_participant != self.participant_id {
                 self.downstream_allocator.add_track(track_handle.clone());
             }
         }
@@ -141,15 +141,12 @@ impl ParticipantCore {
 
     pub fn handle_forward_rtp(
         &mut self,
-        track_meta: Arc<TrackMeta>,
+        track_id: Arc<TrackId>,
         hdr: TimingHeader,
         pkt: RtpPacket,
     ) {
-        let Some(mid) = self
-            .downstream_allocator
-            .handle_rtp(&track_meta, &pkt.header)
-        else {
-            tracing::warn!(track_id = %track_meta.id, ssrc = %pkt.header.ssrc, "Dropping RTP for inactive track");
+        let Some(mid) = self.downstream_allocator.handle_rtp(&track_id, &pkt.header) else {
+            tracing::warn!(track_id = %track_id, ssrc = %pkt.header.ssrc, "Dropping RTP for inactive track");
             return;
         };
 
@@ -165,7 +162,7 @@ impl ParticipantCore {
 
         let mut api = self.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
-            tracing::warn!(track_id = %track_meta.id, ssrc = %pkt.header.ssrc, "Dropping RTP for invalid stream mid");
+            tracing::warn!(track_id = %track_id, ssrc = %pkt.header.ssrc, "Dropping RTP for invalid stream mid");
             return;
         };
 
@@ -182,7 +179,7 @@ impl ParticipantCore {
             true,
             inner.payload,
         ) {
-            tracing::warn!(track_id = %track_meta.id, ssrc = %hdr.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+            tracing::warn!(track_id = %track_id, ssrc = %hdr.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
     }
 
@@ -229,15 +226,15 @@ impl ParticipantCore {
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id =
-                    Arc::new(entity::TrackId::new(self.participant_id.clone(), media.mid));
+                let track_id = Arc::new(entity::TrackId::new());
                 let track_meta = Arc::new(track::TrackMeta {
                     id: track_id,
+                    origin_participant: self.participant_id.clone(),
                     kind: media.kind,
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 });
-                let (tx, rx) = track::new(track_meta, 64);
-                self.upstream_allocator.add_published_track(tx);
+                let (tx, rx) = track::new(media.mid, track_meta, 64);
+                self.upstream_allocator.add_published_track(media.mid, tx);
                 self.events.push(CoreEvent::SpawnTrack(rx));
             }
             Direction::SendOnly => {

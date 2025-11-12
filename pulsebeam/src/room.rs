@@ -198,7 +198,7 @@ impl RoomActor {
         let Some(origin) = self
             .state
             .participants
-            .get_mut(&track_handle.meta.id.origin_participant)
+            .get_mut(&track_handle.meta.origin_participant)
         else {
             tracing::warn!(
                 "{} is missing from participants, ignoring track",
@@ -235,7 +235,7 @@ impl RoomActor {
         if let Some(meta) = self
             .state
             .participants
-            .get_mut(&track_meta.id.origin_participant)
+            .get_mut(&track_meta.origin_participant)
         {
             meta.tracks.remove(&track_meta.id);
         }

@@ -4,7 +4,7 @@ use tokio::time::Instant;
 use crate::rtp::RtpPacket;
 use str0m::media::Mid;
 
-use crate::track::{KeyframeRequest, TrackSender};
+use crate::track::TrackSender;
 
 /// Manages all upstream tracks published by this participant.
 ///
@@ -27,9 +27,8 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, track: TrackSender) {
-        self.published_tracks
-            .insert(track.meta.id.origin_mid, track);
+    pub fn add_published_track(&mut self, mid: Mid, track: TrackSender) {
+        self.published_tracks.insert(mid, track);
     }
 
     pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut TrackSender> {
@@ -78,11 +77,11 @@ impl UpstreamAllocator {
                 };
 
                 let mut api = rtc.direct_api();
-                if let Some(stream) = api.stream_rx_by_mid(key.request.mid, key.request.rid) {
-                    stream.request_keyframe(key.request.kind);
-                    tracing::debug!(?key.request, "requested keyframe for upstream");
+                if let Some(stream) = api.stream_rx_by_mid(key.mid, key.rid) {
+                    stream.request_keyframe(key.kind);
+                    tracing::debug!(?key, "requested keyframe for upstream");
                 } else {
-                    tracing::warn!(?key.request, "stream not found for keyframe request");
+                    tracing::warn!(?key, "stream not found for keyframe request");
                 }
             }
         }

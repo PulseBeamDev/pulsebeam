@@ -299,20 +299,16 @@ impl AsRef<str> for ExternalParticipantId {
     }
 }
 
-#[derive(PartialOrd, Ord, Eq, PartialEq, Hash)]
+#[derive(PartialOrd, Ord, Eq, PartialEq, Hash, Clone)]
 pub struct TrackId {
     pub internal: Arc<EntityId>,
-    pub origin_participant: Arc<ParticipantId>,
-    pub origin_mid: Mid,
 }
 
 impl TrackId {
-    pub fn new(participant_id: Arc<ParticipantId>, mid: Mid) -> Self {
+    pub fn new() -> Self {
         let internal = new_entity_id(prefix::TRACK_ID);
         Self {
             internal: Arc::new(internal),
-            origin_participant: participant_id,
-            origin_mid: mid,
         }
     }
 }

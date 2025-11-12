@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::{SeqNo, Ssrc};
 
 use crate::rtp::{AUDIO_FREQUENCY, Packet, TimingHeader, VIDEO_FREQUENCY};
 
+#[derive(Debug)]
 pub struct RtpSequencer<T> {
     state: SequencerState<T>,
 }
@@ -68,7 +69,18 @@ enum SequencerState<T> {
     Switching(SwitchingState<T>),
 }
 
-impl<T: Packet> Display for SequencerState<T> {
+impl<T> Display for SequencerState<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid => f.write_str("invalid"),
+            Self::New(_) => f.write_str("new"),
+            Self::Stable(_) => f.write_str("stable"),
+            Self::Switching(_) => f.write_str("switching"),
+        }
+    }
+}
+
+impl<T> Debug for SequencerState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid => f.write_str("invalid"),
