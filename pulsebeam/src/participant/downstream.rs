@@ -6,7 +6,6 @@ use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
@@ -16,7 +15,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
+use crate::track::{SimulcastReceiver, TrackReceiver};
 
 /// The event produced by the DownstreamAllocator stream.
 ///

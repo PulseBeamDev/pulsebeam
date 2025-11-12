@@ -1,4 +1,5 @@
 pub mod jitter_buffer;
+pub mod mixer;
 pub mod monitor;
 pub mod sequencer;
 
