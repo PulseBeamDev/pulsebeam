@@ -169,7 +169,7 @@ impl ParticipantCore {
             pt,
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
-            pkt.arrival_ts.into(),
+            pkt.playout_time.unwrap_or(pkt.arrival_ts).into(),
             pkt.raw_header.marker,
             pkt.raw_header.ext_vals,
             true,

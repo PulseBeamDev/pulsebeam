@@ -1,6 +1,6 @@
 use crate::rtp::{Frequency, RtpPacket};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use str0m::media::MediaTime;
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
@@ -18,20 +18,16 @@ struct RtpAnchor {
     rtp_ts: MediaTime,
 }
 
-/// The internal state of the switcher.
+/// The internal state of the implicit switcher.
 #[derive(Debug, PartialEq, Eq)]
 enum State {
-    /// The switcher is waiting for the first keyframe from the initial stream.
-    Bootstrap { ssrc: u32 },
+    /// Waiting for the very first keyframe from any stream.
+    Bootstrap,
     /// Actively streaming packets from a single, continuous source.
     Streaming { ssrc: u32 },
-    /// A switch has been requested. We are forwarding the old stream while waiting
-    /// for a keyframe from the new target stream.
-    Switching { from_ssrc: u32, to_ssrc: u32 },
 }
 
 /// A wrapper for `RtpPacket` to implement a min-heap based on `playout_time`.
-/// The `BinaryHeap` is a max-heap by default, so we reverse the ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferedPacket(RtpPacket);
 
@@ -50,123 +46,106 @@ impl PartialOrd for BufferedPacket {
 
 /// Manages switching between multiple RTP input streams to produce a single,
 /// continuous, and smoothly rewritten output RTP stream.
+/// This version uses an "implicit" control model, inferring the desired stream
+/// from the packets it receives.
+#[derive(Debug)]
 pub struct Switcher {
-    // The configured clock rate for this media stream (e.g., 90kHz for video).
     clock_rate: Frequency,
     state: State,
-    // A min-heap of packets, ordered by their playout_time.
     buffer: BinaryHeap<BufferedPacket>,
-    // The anchor for rewriting RTP timestamps.
     anchor: Option<RtpAnchor>,
-    // The continuous, rewritten sequence number for the output stream.
     output_seq_no: SeqNo,
 }
 
 impl Switcher {
-    /// Creates a new `Switcher` that will start by forwarding the stream with `initial_ssrc`
-    /// using the provided `clock_rate` for all timestamp calculations.
-    pub fn new(initial_ssrc: u32, clock_rate: Frequency) -> Self {
+    /// Creates a new `Switcher` using the provided `clock_rate`.
+    /// It starts in a bootstrap state, waiting for any keyframe.
+    pub fn new(clock_rate: Frequency) -> Self {
         Self {
             clock_rate,
-            state: State::Bootstrap { ssrc: initial_ssrc },
+            state: State::Bootstrap,
             buffer: BinaryHeap::new(),
             anchor: None,
-            // Start with a random sequence number for security (prevents sequence number guessing).
             output_seq_no: SeqNo::from(rand::random::<u16>() as u64),
         }
     }
 
     /// Pushes a synchronized packet into the switcher's buffer for consideration.
     pub fn push(&mut self, packet: RtpPacket) {
-        // We cannot do anything with a packet that hasn't been synchronized.
         if packet.playout_time.is_none() {
             return;
         }
-
         self.buffer.push(BufferedPacket(packet));
     }
 
     /// Pops the next available packet in the rewritten sequence.
-    ///
-    /// This method should be called repeatedly in a loop to drain ready packets, as
-    /// pushing a single new packet might make multiple older packets ready to be emitted.
     pub fn pop(&mut self) -> Option<RtpPacket> {
-        loop {
-            let next_packet = self.buffer.peek()?;
+        // Use a temporary drain buffer to allow for rewinding logic on switch.
+        let mut temp_drain: VecDeque<BufferedPacket> = VecDeque::new();
 
-            // Purge old packets to prevent buffer bloat and head-of-line blocking.
-            if let Some(anchor) = self.anchor
-                && anchor.playout_time + MAX_BUFFER_DURATION < next_packet.0.playout_time.unwrap()
-            {
-                self.buffer.pop();
-                continue; // Check the next packet
+        loop {
+            // If the main buffer is empty, process anything we drained.
+            if self.buffer.is_empty() {
+                self.buffer.extend(temp_drain);
+                return None;
             }
 
-            let candidate = &next_packet.0;
-            let ssrc = *candidate.raw_header.ssrc;
-            let is_keyframe = candidate.is_keyframe_start;
+            // Purge old packets first.
+            if let Some(anchor) = self.anchor {
+                if let Some(next_packet) = self.buffer.peek() {
+                    if anchor.playout_time + MAX_BUFFER_DURATION
+                        < next_packet.0.playout_time.unwrap()
+                    {
+                        self.buffer.pop();
+                        continue;
+                    }
+                }
+            }
+
+            let candidate_packet = self.buffer.peek().unwrap();
+            let ssrc = *candidate_packet.0.raw_header.ssrc;
+            let is_keyframe = candidate_packet.0.is_keyframe_start;
 
             let should_emit = match self.state {
-                State::Bootstrap { ssrc: target_ssrc } => ssrc == target_ssrc && is_keyframe,
-                State::Streaming { ssrc: current_ssrc } => ssrc == current_ssrc,
-                State::Switching { from_ssrc, to_ssrc } => {
-                    (ssrc == to_ssrc && is_keyframe) || ssrc == from_ssrc
-                }
+                State::Bootstrap => is_keyframe,
+                State::Streaming { ssrc: current_ssrc } => ssrc == current_ssrc || is_keyframe,
             };
 
             if should_emit {
                 let mut packet = self.buffer.pop().unwrap().0;
-                let ssrc: u32 = *packet.raw_header.ssrc;
+                let new_ssrc: u32 = *packet.raw_header.ssrc;
 
-                match self.state {
-                    State::Bootstrap { .. } => self.state = State::Streaming { ssrc },
-                    State::Switching { to_ssrc, .. } if ssrc == to_ssrc => {
-                        let from_ssrc = self.state_from_ssrc();
-                        self.buffer.retain(|p| *p.0.raw_header.ssrc != from_ssrc);
-                        self.state = State::Streaming { ssrc };
-                    }
-                    _ => {}
+                let is_switching = match self.state {
+                    State::Streaming { ssrc: old_ssrc } => new_ssrc != old_ssrc,
+                    _ => false,
+                };
+
+                // Transition to the new state.
+                self.state = State::Streaming { ssrc: new_ssrc };
+                self.rewrite_packet(&mut packet);
+
+                if is_switching {
+                    // A switch just occurred. The main buffer contains a mix of old and new packets.
+                    // 1. Drain everything from the main buffer into our temp buffer.
+                    temp_drain.extend(self.buffer.drain());
+                    // 2. Filter the temp buffer, keeping only packets from the NEW stream.
+                    temp_drain.retain(|p| *p.0.raw_header.ssrc == new_ssrc);
+                    // 3. Put the cleaned packets back into the main buffer for the next pop() call.
+                    self.buffer.extend(temp_drain);
                 }
 
-                self.rewrite_packet(&mut packet);
                 return Some(packet);
             } else {
-                // The next packet in time cannot be emitted yet; wait for more packets.
-                return None;
+                // The next packet is a delta from a non-active stream. Buffer it temporarily.
+                temp_drain.push_back(self.buffer.pop().unwrap());
             }
         }
     }
 
-    /// Requests a switch to the stream identified by `ssrc`.
-    ///
-    /// The switch will only be executed when a keyframe from the new stream is received.
-    /// This method will do nothing if a switch to the same SSRC is already pending
-    /// or active.
-    pub fn switch_to(&mut self, ssrc: u32) {
-        self.state = match self.state {
-            State::Bootstrap { ssrc: current_ssrc } if current_ssrc != ssrc => {
-                State::Bootstrap { ssrc }
-            }
-            State::Streaming { ssrc: current_ssrc } if current_ssrc != ssrc => State::Switching {
-                from_ssrc: current_ssrc,
-                to_ssrc: ssrc,
-            },
-            // If we are already switching, update the target.
-            State::Switching { from_ssrc, .. } if from_ssrc != ssrc => State::Switching {
-                from_ssrc,
-                to_ssrc: ssrc,
-            },
-            // No change needed in other cases.
-            _ => return,
-        };
-    }
-
-    /// Returns `true` if the switcher is in a stable `Streaming` state and can
-    /// accept a new `switch_to` command.
-    ///
-    /// A higher level should wait for this to be `true` before requesting another switch
-    /// to avoid flapping.
-    pub fn safe_to_switch(&self) -> bool {
+    /// Returns `true` if the switcher is in a stable `Streaming` state.
+    /// This can be used by higher levels to know when it's safe to potentially
+    /// trigger a switch by sending a new keyframe.
+    pub fn is_stable(&self) -> bool {
         matches!(self.state, State::Streaming { .. })
     }
 
@@ -199,14 +178,6 @@ impl Switcher {
 
         packet.raw_header.sequence_number = *packet.seq_no as u16;
         packet.raw_header.timestamp = packet.rtp_ts.numer() as u32;
-    }
-
-    fn state_from_ssrc(&self) -> u32 {
-        if let State::Switching { from_ssrc, .. } = self.state {
-            from_ssrc
-        } else {
-            0
-        }
     }
 }
 
@@ -242,69 +213,59 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_stream_forwarding_with_push_pop() {
+    fn test_implicit_start() {
         let ssrc1 = 1111;
-        let mut switcher = Switcher::new(ssrc1, VIDEO_FREQUENCY);
+        let mut switcher = Switcher::new(VIDEO_FREQUENCY);
 
-        let packets = generate(
-            create_synced_packet(ssrc1, 100, 1000, 0, true),
-            vec![next_frame(), next_frame(), next_frame()],
-        );
+        // Push a delta frame, nothing should come out.
+        let p1 = create_synced_packet(ssrc1, 100, 1000, 0, false);
+        switcher.push(p1);
+        assert!(switcher.pop().is_none());
+        assert!(!switcher.is_stable());
 
-        let mut output = vec![];
-        for p in packets {
-            switcher.push(p);
-            // In a simple forwarding case, pop will yield a packet as soon as it's pushed
-            // (after the initial keyframe).
-            while let Some(out) = switcher.pop() {
-                output.push(out);
-            }
-        }
-
-        assert_eq!(output.len(), 4);
-        assert!(switcher.safe_to_switch());
-        for i in 1..output.len() {
-            assert_eq!(*output[i].seq_no, *output[i - 1].seq_no + 1);
-        }
+        // Push a keyframe, now it should start streaming.
+        let p2 = create_synced_packet(ssrc1, 101, 4000, 33, true);
+        switcher.push(p2);
+        let out = switcher.pop().unwrap();
+        assert_eq!(*out.raw_header.ssrc, ssrc1);
+        assert_eq!(switcher.state, State::Streaming { ssrc: ssrc1 });
+        assert!(switcher.is_stable());
     }
 
     #[test]
-    fn test_simple_switch_with_push_pop() {
+    fn test_implicit_switch() {
         let ssrc1 = 1111;
         let ssrc2 = 2222;
-        let mut switcher = Switcher::new(ssrc1, VIDEO_FREQUENCY);
+        let mut switcher = Switcher::new(VIDEO_FREQUENCY);
 
-        let p1 = create_synced_packet(ssrc1, 100, 1000, 0, true);
-        switcher.push(p1);
+        // Start with stream 1
+        switcher.push(create_synced_packet(ssrc1, 100, 1000, 0, true));
         let out1 = switcher.pop().unwrap();
-        assert!(switcher.safe_to_switch());
         assert_eq!(*out1.raw_header.ssrc, ssrc1);
+        assert!(switcher.is_stable());
 
-        switcher.switch_to(ssrc2);
-        assert!(!switcher.safe_to_switch());
-
-        let p2 = create_synced_packet(ssrc1, 101, 4000, 33, false);
-        switcher.push(p2);
+        // Push a delta from stream 1 (should be forwarded)
+        switcher.push(create_synced_packet(ssrc1, 101, 4000, 33, false));
         let out2 = switcher.pop().unwrap();
         assert_eq!(*out2.raw_header.ssrc, ssrc1);
 
-        // At this point, pop returns None because it's waiting for a keyframe from ssrc2
+        // Push a delta from stream 2 (should be buffered, nothing emitted)
+        switcher.push(create_synced_packet(ssrc2, 500, 50000, 66, false));
         assert!(switcher.pop().is_none());
 
-        let p3 = create_synced_packet(ssrc2, 500, 50000, 66, true);
-        switcher.push(p3);
-        let out3 = switcher.pop().unwrap(); // Now the switch can complete
-        assert_eq!(*out3.raw_header.ssrc, ssrc2);
-        assert!(switcher.safe_to_switch());
+        // Push a keyframe from stream 2 that is later in time (should trigger switch)
+        switcher.push(create_synced_packet(ssrc2, 501, 53000, 99, true));
 
-        assert_eq!(*out2.seq_no + 1, *out3.seq_no);
-        let playout_delta_ms = out3
-            .playout_time
-            .unwrap()
-            .duration_since(out2.playout_time.unwrap())
-            .as_millis();
-        let rtp_ts_delta = out3.rtp_ts.numer().wrapping_sub(out2.rtp_ts.numer());
-        let expected_ts_delta = playout_delta_ms as u64 * (VIDEO_FREQUENCY.get() / 1000) as u64;
-        assert!((rtp_ts_delta as i64 - expected_ts_delta as i64).abs() < 90);
+        // The next packet popped should be the keyframe from ssrc2
+        let out3 = switcher.pop().unwrap();
+        assert_eq!(*out3.raw_header.ssrc, ssrc2);
+        assert_eq!(*out3.seq_no, *out2.seq_no + 1);
+        assert_eq!(switcher.state, State::Streaming { ssrc: ssrc2 });
+
+        // The delta frame from stream 2 that arrived before the keyframe should NOT have been purged.
+        // It should be the next packet out.
+        let out4 = switcher.pop().unwrap();
+        assert_eq!(*out4.raw_header.ssrc, ssrc2);
+        assert_eq!(*out4.seq_no, *out3.seq_no + 1);
     }
 }
