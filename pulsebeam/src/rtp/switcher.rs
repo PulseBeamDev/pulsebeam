@@ -76,53 +76,21 @@ impl Switcher {
         }
     }
 
-    /// Processes an incoming `RtpPacket` from any stream.
-    ///
-    /// It may buffer the packet and return `None`, or it may return a rewritten
-    /// packet if it's the next one in the synchronized sequence.
-    pub fn process(&mut self, packet: RtpPacket) -> Option<RtpPacket> {
+    /// Pushes a synchronized packet into the switcher's buffer for consideration.
+    pub fn push(&mut self, packet: RtpPacket) {
         // We cannot do anything with a packet that hasn't been synchronized.
-        packet.playout_time?;
+        if packet.playout_time.is_none() {
+            return;
+        }
 
         self.buffer.push(BufferedPacket(packet));
-        self.try_emit_packet()
     }
 
-    /// Requests a switch to the stream identified by `ssrc`.
+    /// Pops the next available packet in the rewritten sequence.
     ///
-    /// The switch will only be executed when a keyframe from the new stream is received.
-    /// This method will do nothing if a switch to the same SSRC is already pending
-    /// or active.
-    pub fn switch_to(&mut self, ssrc: u32) {
-        self.state = match self.state {
-            State::Bootstrap { ssrc: current_ssrc } if current_ssrc != ssrc => {
-                State::Bootstrap { ssrc }
-            }
-            State::Streaming { ssrc: current_ssrc } if current_ssrc != ssrc => State::Switching {
-                from_ssrc: current_ssrc,
-                to_ssrc: ssrc,
-            },
-            // If we are already switching, update the target.
-            State::Switching { from_ssrc, .. } if from_ssrc != ssrc => State::Switching {
-                from_ssrc,
-                to_ssrc: ssrc,
-            },
-            // No change needed in other cases.
-            _ => return,
-        };
-    }
-
-    /// Returns `true` if the switcher is in a stable `Streaming` state and can
-    /// accept a new `switch_to` command.
-    ///
-    /// A higher level should wait for this to be `true` before requesting another switch
-    /// to avoid flapping.
-    pub fn safe_to_switch(&self) -> bool {
-        matches!(self.state, State::Streaming { .. })
-    }
-
-    /// The core logic loop. Tries to emit the next packet from the buffer if conditions are met.
-    fn try_emit_packet(&mut self) -> Option<RtpPacket> {
+    /// This method should be called repeatedly in a loop to drain ready packets, as
+    /// pushing a single new packet might make multiple older packets ready to be emitted.
+    pub fn pop(&mut self) -> Option<RtpPacket> {
         loop {
             let next_packet = self.buffer.peek()?;
 
@@ -163,9 +131,43 @@ impl Switcher {
                 self.rewrite_packet(&mut packet);
                 return Some(packet);
             } else {
+                // The next packet in time cannot be emitted yet; wait for more packets.
                 return None;
             }
         }
+    }
+
+    /// Requests a switch to the stream identified by `ssrc`.
+    ///
+    /// The switch will only be executed when a keyframe from the new stream is received.
+    /// This method will do nothing if a switch to the same SSRC is already pending
+    /// or active.
+    pub fn switch_to(&mut self, ssrc: u32) {
+        self.state = match self.state {
+            State::Bootstrap { ssrc: current_ssrc } if current_ssrc != ssrc => {
+                State::Bootstrap { ssrc }
+            }
+            State::Streaming { ssrc: current_ssrc } if current_ssrc != ssrc => State::Switching {
+                from_ssrc: current_ssrc,
+                to_ssrc: ssrc,
+            },
+            // If we are already switching, update the target.
+            State::Switching { from_ssrc, .. } if from_ssrc != ssrc => State::Switching {
+                from_ssrc,
+                to_ssrc: ssrc,
+            },
+            // No change needed in other cases.
+            _ => return,
+        };
+    }
+
+    /// Returns `true` if the switcher is in a stable `Streaming` state and can
+    /// accept a new `switch_to` command.
+    ///
+    /// A higher level should wait for this to be `true` before requesting another switch
+    /// to avoid flapping.
+    pub fn safe_to_switch(&self) -> bool {
+        matches!(self.state, State::Streaming { .. })
     }
 
     /// Rewrites the RTP headers to be continuous and updates the internal state.
@@ -240,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_stream_forwarding() {
+    fn test_basic_stream_forwarding_with_push_pop() {
         let ssrc1 = 1111;
         let mut switcher = Switcher::new(ssrc1, VIDEO_FREQUENCY);
 
@@ -251,7 +253,10 @@ mod tests {
 
         let mut output = vec![];
         for p in packets {
-            if let Some(out) = switcher.process(p) {
+            switcher.push(p);
+            // In a simple forwarding case, pop will yield a packet as soon as it's pushed
+            // (after the initial keyframe).
+            while let Some(out) = switcher.pop() {
                 output.push(out);
             }
         }
@@ -264,13 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_switch() {
+    fn test_simple_switch_with_push_pop() {
         let ssrc1 = 1111;
         let ssrc2 = 2222;
         let mut switcher = Switcher::new(ssrc1, VIDEO_FREQUENCY);
 
         let p1 = create_synced_packet(ssrc1, 100, 1000, 0, true);
-        let out1 = switcher.process(p1).unwrap();
+        switcher.push(p1);
+        let out1 = switcher.pop().unwrap();
         assert!(switcher.safe_to_switch());
         assert_eq!(*out1.raw_header.ssrc, ssrc1);
 
@@ -278,11 +284,16 @@ mod tests {
         assert!(!switcher.safe_to_switch());
 
         let p2 = create_synced_packet(ssrc1, 101, 4000, 33, false);
-        let out2 = switcher.process(p2).unwrap();
+        switcher.push(p2);
+        let out2 = switcher.pop().unwrap();
         assert_eq!(*out2.raw_header.ssrc, ssrc1);
 
+        // At this point, pop returns None because it's waiting for a keyframe from ssrc2
+        assert!(switcher.pop().is_none());
+
         let p3 = create_synced_packet(ssrc2, 500, 50000, 66, true);
-        let out3 = switcher.process(p3).unwrap();
+        switcher.push(p3);
+        let out3 = switcher.pop().unwrap(); // Now the switch can complete
         assert_eq!(*out3.raw_header.ssrc, ssrc2);
         assert!(switcher.safe_to_switch());
 
@@ -292,7 +303,7 @@ mod tests {
             .unwrap()
             .duration_since(out2.playout_time.unwrap())
             .as_millis();
-        let rtp_ts_delta = out3.rtp_ts.numer().wrapping_sub(out2.rtp_ts.numer()) as u64;
+        let rtp_ts_delta = out3.rtp_ts.numer().wrapping_sub(out2.rtp_ts.numer());
         let expected_ts_delta = playout_delta_ms as u64 * (VIDEO_FREQUENCY.get() / 1000) as u64;
         assert!((rtp_ts_delta as i64 - expected_ts_delta as i64).abs() < 90);
     }
