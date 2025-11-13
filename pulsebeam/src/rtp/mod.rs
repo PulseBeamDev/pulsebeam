@@ -28,6 +28,10 @@ pub struct RtpPacket {
     pub seq_no: SeqNo,
     pub rtp_ts: MediaTime,
     pub arrival_ts: Instant,
+
+    /// Scheduled playout time for the packet, in the server's monotonic clock domain.
+    /// Since all streams in this process share the same monotonic clock, this time can
+    /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Option<Instant>,
     pub is_keyframe_start: bool,
     pub last_sender_info: Option<SenderInfo>,
