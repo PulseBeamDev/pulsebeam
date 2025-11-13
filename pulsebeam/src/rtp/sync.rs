@@ -85,10 +85,10 @@ impl Synchronizer {
                 return;
             }
             // Rate-limit updates to avoid jitter spikes
-            if let Some(correction) = &self.correction {
-                if now.duration_since(correction.start_time) < MIN_SR_UPDATE_INTERVAL {
-                    return;
-                }
+            if let Some(correction) = &self.correction
+                && now.duration_since(correction.start_time) < MIN_SR_UPDATE_INTERVAL
+            {
+                return;
             }
         }
 
@@ -99,31 +99,28 @@ impl Synchronizer {
         };
 
         // If the current offset is just a provisional guess, we start a smooth convergence.
-        if self.is_provisional {
-            if let Some(provisional_offset) = self.rtp_offset {
-                self.is_provisional = false;
+        if self.is_provisional
+            && let Some(provisional_offset) = self.rtp_offset
+        {
+            self.is_provisional = false;
 
-                let provisional_playout = self.calculate_playout_time_with_offset(
-                    mapping.rtp_time,
-                    now,
-                    provisional_offset,
-                );
-                let accurate_playout =
-                    self.calculate_playout_time_with_offset(mapping.rtp_time, now, mapping);
+            let provisional_playout =
+                self.calculate_playout_time_with_offset(mapping.rtp_time, now, provisional_offset);
+            let accurate_playout =
+                self.calculate_playout_time_with_offset(mapping.rtp_time, now, mapping);
 
-                let (adjustment, is_negative) = if accurate_playout > provisional_playout {
-                    (accurate_playout - provisional_playout, false)
-                } else {
-                    (provisional_playout - accurate_playout, true)
-                };
+            let (adjustment, is_negative) = if accurate_playout > provisional_playout {
+                (accurate_playout - provisional_playout, false)
+            } else {
+                (provisional_playout - accurate_playout, true)
+            };
 
-                self.correction = Some(Correction {
-                    start_time: now,
-                    adjustment,
-                    is_negative,
-                    final_offset: mapping,
-                });
-            }
+            self.correction = Some(Correction {
+                start_time: now,
+                adjustment,
+                is_negative,
+                final_offset: mapping,
+            });
         }
 
         if let Some(last) = self.sr_history.back() {
@@ -246,10 +243,10 @@ impl Synchronizer {
             );
             return Some(now + MAX_PLAYOUT_FUTURE);
         }
-        if let Some(past_limit) = now.checked_sub(MAX_PLAYOUT_PAST) {
-            if playout_time < past_limit {
-                return Some(past_limit);
-            }
+        if let Some(past_limit) = now.checked_sub(MAX_PLAYOUT_PAST)
+            && playout_time < past_limit
+        {
+            return Some(past_limit);
         }
         Some(playout_time)
     }
