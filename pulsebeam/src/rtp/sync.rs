@@ -145,38 +145,54 @@ impl Synchronizer {
     }
 
     fn compute_clock_drift(last: &ClockReference, current: &ClockReference) -> f64 {
-        let server_delta = current
-            .server_time
-            .duration_since(last.server_time)
-            .as_secs_f64();
+        // This is the number of RTP ticks that the sender's media clock advanced.
         let sender_rtp_delta = current.rtp_time.numer().wrapping_sub(last.rtp_time.numer()) as i64;
-        let sender_ntp_delta = current
+
+        // This is the wall-clock time that the sender claims has passed between the two reports.
+        // This is our most reliable measure of the interval duration.
+        let sender_ntp_delta_secs = current
             .ntp_time
             .duration_since(last.ntp_time)
             .unwrap_or(Duration::from_secs(0))
             .as_secs_f64();
 
-        if sender_ntp_delta == 0.0 || server_delta == 0.0 {
+        if sender_ntp_delta_secs <= 0.0 {
             return 0.0;
         }
 
-        // Expected RTP ticks based on server time
-        let expected_rtp_delta = (server_delta * last.rtp_time.frequency().get() as f64) as i64;
-        let delta_diff = (sender_rtp_delta - expected_rtp_delta).abs();
-        let acceptable_error = ((expected_rtp_delta.abs() as f64 * MAX_SR_CLOCK_DEVIATION) as i64)
-            .max(MIN_SR_ERROR_TOLERANCE);
+        // Based on the wall-clock time passed, this is how many ticks a PERFECT clock should have generated.
+        let expected_rtp_delta = sender_ntp_delta_secs * last.rtp_time.frequency().get() as f64;
 
-        // Correct small drift automatically
-        if delta_diff > acceptable_error {
-            warn!(
-                "Large clock deviation detected: {} ticks, correcting",
-                delta_diff
-            );
+        // The drift is the difference between what we observed and what we expected,
+        // as a fraction of the expected amount.
+        let drift_ratio = (sender_rtp_delta as f64 - expected_rtp_delta) / expected_rtp_delta;
+
+        // Clock Drift Unit = PPM (Parts Per Million)
+        drift_ratio * 1_000_000.0
+    }
+
+    // The change to the more precise inverse formula should also be kept.
+    fn calculate_playout_time_with_offset(
+        &self,
+        rtp_ts: MediaTime,
+        now: Instant,
+        offset: ClockReference,
+    ) -> Instant {
+        let rtp_delta = rtp_ts.numer().wrapping_sub(offset.rtp_time.numer()) as i32;
+
+        let drift = self.estimated_clock_drift_ppm / 1_000_000.0;
+        let drift_correction = 1.0 / (1.0 + drift);
+
+        let seconds_delta = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
+
+        if seconds_delta >= 0.0 {
+            offset.server_time + Duration::from_secs_f64(seconds_delta)
+        } else {
+            offset
+                .server_time
+                .checked_sub(Duration::from_secs_f64(-seconds_delta))
+                .unwrap_or(now)
         }
-
-        // Clock Drift Unit = PPM, aka microseconds faster per second
-        ((sender_rtp_delta as f64 - expected_rtp_delta as f64) / expected_rtp_delta as f64)
-            * 1_000_000.0
     }
 
     fn calculate_playout_time(&mut self, rtp_ts: MediaTime, now: Instant) -> Instant {
@@ -221,34 +237,6 @@ impl Synchronizer {
         }
 
         playout_time
-    }
-
-    /// Helper to calculate playout time based on a specific clock reference.
-    fn calculate_playout_time_with_offset(
-        &self,
-        rtp_ts: MediaTime,
-        now: Instant,
-        offset: ClockReference,
-    ) -> Instant {
-        let rtp_delta = rtp_ts.numer().wrapping_sub(offset.rtp_time.numer()) as i32;
-
-        // Apply drift correction: scale RTP delta by measured clock drift
-        // Note: Drift is only applied once we are fully synchronized, not during provisional/correction phases.
-        let drift_correction = if self.is_synchronized() {
-            1.0 - self.estimated_clock_drift_ppm / 1_000_000.0
-        } else {
-            1.0
-        };
-        let seconds_delta = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
-
-        if seconds_delta >= 0.0 {
-            offset.server_time + Duration::from_secs_f64(seconds_delta)
-        } else {
-            offset
-                .server_time
-                .checked_sub(Duration::from_secs_f64(-seconds_delta))
-                .unwrap_or(now)
-        }
     }
 
     fn validate_playout_time(&self, playout_time: Instant, now: Instant) -> Option<Instant> {
@@ -387,81 +375,254 @@ mod tests {
         assert_eq!(packet4.playout_time, Some(expected_accurate_playout_4));
     }
 
-    /// This test proves the synchronizer works correctly regardless of the NTP timestamp base.
-    /// It simulates two independent streams: one with a proper "absolute" wall-clock and one
-    /// with a "relative" clock that starts from zero, and confirms drift is calculated correctly for both.
+    /// This is the definitive end-to-end test. It proves that the ultimate goal—producing
+    /// synchronized playout times from multiple streams with different clock drifts—is achieved.
     #[test]
-    fn test_independent_streams_with_different_ntp_bases() {
+    fn test_playout_time_is_synchronized_across_drifting_streams() {
+        let base_time = Instant::now();
+        let ntp_base = UNIX_EPOCH + Duration::from_secs(NTP_UNIX_OFFSET_SECS + 1_000_000);
+
+        let mut sync_perfect = Synchronizer::new(VIDEO_FREQUENCY);
+        let mut sync_drifting = Synchronizer::new(VIDEO_FREQUENCY);
+
+        // Use integer rates to prevent test-side float inaccuracies
+        let perfect_ticks_per_sec: u64 = 90_000;
+        let drifting_ticks_per_sec: u64 = 90_090; // Exactly +1000 PPM
+
+        // --- Phase 1 & 2: Synchronization and Drift Measurement ---
+        // We simulate the clock differentially for maximum accuracy.
+        let mut last_time = base_time;
+        let mut last_ntp = ntp_base;
+        let mut last_rtp_perfect: u64 = 0;
+        let mut last_rtp_drifting: u64 = 0;
+
+        // Process initial SR to get out of provisional state
+        sync_perfect.process(
+            RtpPacket {
+                last_sender_info: Some(create_sr(
+                    MediaTime::from_90khz(last_rtp_perfect),
+                    last_ntp,
+                )),
+                ..Default::default()
+            },
+            last_time,
+        );
+        sync_drifting.process(
+            RtpPacket {
+                last_sender_info: Some(create_sr(
+                    MediaTime::from_90khz(last_rtp_drifting),
+                    last_ntp,
+                )),
+                ..Default::default()
+            },
+            last_time,
+        );
+
+        // Wait for smear to finish
+        last_time += CLOCK_SMEAR_DURATION + Duration::from_millis(100);
+        sync_perfect.process(RtpPacket::default(), last_time);
+        sync_drifting.process(RtpPacket::default(), last_time);
+
+        // Send a few more SRs to get a stable drift measurement
+        for _ in 0..3 {
+            let interval = Duration::from_secs(1);
+            last_time += interval;
+            last_ntp += interval;
+
+            last_rtp_perfect += perfect_ticks_per_sec;
+            last_rtp_drifting += drifting_ticks_per_sec;
+
+            sync_perfect.process(
+                RtpPacket {
+                    last_sender_info: Some(create_sr(
+                        MediaTime::from_90khz(last_rtp_perfect),
+                        last_ntp,
+                    )),
+                    ..Default::default()
+                },
+                last_time,
+            );
+            sync_drifting.process(
+                RtpPacket {
+                    last_sender_info: Some(create_sr(
+                        MediaTime::from_90khz(last_rtp_drifting),
+                        last_ntp,
+                    )),
+                    ..Default::default()
+                },
+                last_time,
+            );
+        }
+
+        // --- Phase 3: Verification ---
+        assert_eq!(sync_perfect.estimated_clock_drift_ppm.round() as i64, 0);
+        assert_eq!(sync_drifting.estimated_clock_drift_ppm.round() as i64, 1000);
+
+        // --- Phase 4: The Simultaneous Event ---
+        let event_time = base_time + Duration::from_secs(10);
+        let elapsed_for_event = event_time.duration_since(base_time).as_secs_f64();
+
+        let rtp_perfect = (elapsed_for_event * perfect_ticks_per_sec as f64) as u64;
+        let mut packet_perfect = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(rtp_perfect),
+            ..Default::default()
+        };
+        packet_perfect = sync_perfect.process(packet_perfect, event_time);
+
+        let rtp_drifting = (elapsed_for_event * (drifting_ticks_per_sec as f64)) as u64;
+        let mut packet_drifting = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(rtp_drifting),
+            ..Default::default()
+        };
+        packet_drifting = sync_drifting.process(packet_drifting, event_time);
+
+        let playout_perfect = packet_perfect.playout_time.unwrap();
+        let playout_drifting = packet_drifting.playout_time.unwrap();
+        let diff = if playout_perfect > playout_drifting {
+            playout_perfect - playout_drifting
+        } else {
+            playout_drifting - playout_perfect
+        };
+
+        assert!(
+            diff < Duration::from_micros(1),
+            "Playout times are not synchronized! Diff: {:?}",
+            diff
+        );
+    }
+
+    /// This is the most comprehensive test. It proves that playout time is synchronized
+    /// for two independent streams, even when one has a drifting clock AND they use
+    /// different NTP time bases (absolute vs. relative). This is the ultimate goal.
+    #[test]
+    fn test_playout_sync_across_drifting_streams_with_different_ntp_bases() {
         let base_time = Instant::now();
 
-        // --- Stream A: Absolute Clock, No Drift ---
-        let mut sync_absolute = Synchronizer::new(VIDEO_FREQUENCY);
-        let absolute_ntp_base = UNIX_EPOCH + Duration::from_secs(1_700_000_000); // A realistic modern time
+        // --- Setup: Two streams with different characteristics ---
+        let mut sync_absolute_perfect = Synchronizer::new(VIDEO_FREQUENCY);
+        let mut sync_relative_drifting = Synchronizer::new(VIDEO_FREQUENCY);
 
-        // SR 1 (Absolute)
-        let sr1_abs = create_sr(
-            MediaTime::from_90khz(90_000),
-            absolute_ntp_base + Duration::from_secs(1),
-        );
-        sync_absolute.process(
+        // A realistic modern timestamp vs. a simple uptime-based one
+        let absolute_ntp_base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let relative_ntp_base = UNIX_EPOCH + Duration::from_secs(300); // e.g., server was up for 5 mins
+
+        // Perfect clock vs. a clock that is 0.1% fast (+1000 PPM)
+        let perfect_ticks_per_sec: u64 = 90_000;
+        let drifting_ticks_per_sec: u64 = 90_090;
+
+        // --- Phase 1 & 2: Synchronization and Drift Measurement ---
+        let mut last_time = base_time;
+        let mut last_ntp_absolute = absolute_ntp_base;
+        let mut last_ntp_relative = relative_ntp_base;
+        let mut last_rtp_perfect: u64 = 0;
+        let mut last_rtp_drifting: u64 = 0;
+
+        // Process initial SRs to get out of provisional state
+        sync_absolute_perfect.process(
             RtpPacket {
-                last_sender_info: Some(sr1_abs),
+                last_sender_info: Some(create_sr(
+                    MediaTime::from_90khz(last_rtp_perfect),
+                    last_ntp_absolute,
+                )),
                 ..Default::default()
             },
-            base_time,
+            last_time,
         );
-
-        // SR 2 (Absolute), 1 second later, perfect clock
-        let sr2_abs = create_sr(
-            MediaTime::from_90khz(180_000),
-            absolute_ntp_base + Duration::from_secs(2),
-        );
-        sync_absolute.process(
+        sync_relative_drifting.process(
             RtpPacket {
-                last_sender_info: Some(sr2_abs),
+                last_sender_info: Some(create_sr(
+                    MediaTime::from_90khz(last_rtp_drifting),
+                    last_ntp_relative,
+                )),
                 ..Default::default()
             },
-            base_time + Duration::from_secs(1),
+            last_time,
         );
 
-        // --- Stream B: Relative Clock, Positive Drift ---
-        let mut sync_relative = Synchronizer::new(VIDEO_FREQUENCY);
-        let relative_ntp_base = UNIX_EPOCH; // Simulates starting from a zero-base
+        // Wait for smear to finish
+        last_time += CLOCK_SMEAR_DURATION + Duration::from_millis(100);
+        sync_absolute_perfect.process(RtpPacket::default(), last_time);
+        sync_relative_drifting.process(RtpPacket::default(), last_time);
 
-        // SR 1 (Relative)
-        let sr1_rel = create_sr(
-            MediaTime::from_90khz(5_000),
-            relative_ntp_base + Duration::from_secs(1),
+        // Send a few more SRs to get a stable drift measurement
+        for _ in 0..3 {
+            let interval = Duration::from_secs(1);
+            last_time += interval;
+            last_ntp_absolute += interval;
+            last_ntp_relative += interval;
+
+            last_rtp_perfect += perfect_ticks_per_sec;
+            last_rtp_drifting += drifting_ticks_per_sec;
+
+            sync_absolute_perfect.process(
+                RtpPacket {
+                    last_sender_info: Some(create_sr(
+                        MediaTime::from_90khz(last_rtp_perfect),
+                        last_ntp_absolute,
+                    )),
+                    ..Default::default()
+                },
+                last_time,
+            );
+            sync_relative_drifting.process(
+                RtpPacket {
+                    last_sender_info: Some(create_sr(
+                        MediaTime::from_90khz(last_rtp_drifting),
+                        last_ntp_relative,
+                    )),
+                    ..Default::default()
+                },
+                last_time,
+            );
+        }
+
+        // --- Phase 3: Verification of Drift Calculation ---
+        assert!(sync_absolute_perfect.is_synchronized());
+        assert!(sync_relative_drifting.is_synchronized());
+        assert_eq!(
+            sync_absolute_perfect.estimated_clock_drift_ppm.round() as i64,
+            0
         );
-        sync_relative.process(
-            RtpPacket {
-                last_sender_info: Some(sr1_rel),
-                ..Default::default()
-            },
-            base_time,
+        assert_eq!(
+            sync_relative_drifting.estimated_clock_drift_ppm.round() as i64,
+            1000
         );
 
-        // SR 2 (Relative), 1 second later, but sender's RTP clock is fast
-        let drifted_rtp = 5_000 + 90_090; // 90000 (1s) + 90 extra ticks
-        let sr2_rel = create_sr(
-            MediaTime::from_90khz(drifted_rtp),
-            relative_ntp_base + Duration::from_secs(2),
-        );
-        sync_relative.process(
-            RtpPacket {
-                last_sender_info: Some(sr2_rel),
-                ..Default::default()
-            },
-            base_time + Duration::from_secs(1),
-        );
+        // --- Phase 4: The Simultaneous Event and Final Assertion ---
+        let event_time = base_time + Duration::from_secs(10);
+        let elapsed_for_event = event_time.duration_since(base_time).as_secs_f64();
 
-        // --- Assertions ---
-        // Absolute stream should have ~0 drift.
-        assert_eq!(sync_absolute.estimated_clock_drift_ppm.round() as i64, 0);
+        // Packet from the perfect-clock, absolute-NTP stream
+        let rtp_perfect = (elapsed_for_event * perfect_ticks_per_sec as f64) as u64;
+        let mut packet_perfect = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(rtp_perfect),
+            ..Default::default()
+        };
+        packet_perfect = sync_absolute_perfect.process(packet_perfect, event_time);
 
-        // Relative stream should have detected the positive drift.
-        // Drift = (90090 - 90000) / 90000 * 1e6 = 1000 PPM
-        assert_eq!(sync_relative.estimated_clock_drift_ppm.round() as i64, 1000);
+        // Packet from the drifting-clock, relative-NTP stream
+        let rtp_drifting = (elapsed_for_event * (drifting_ticks_per_sec as f64)) as u64;
+        let mut packet_drifting = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(rtp_drifting),
+            ..Default::default()
+        };
+        packet_drifting = sync_relative_drifting.process(packet_drifting, event_time);
+
+        // THE CRITICAL ASSERTION:
+        // Despite different NTP bases and a drifting clock, the final playout times must be aligned.
+        let playout_perfect = packet_perfect.playout_time.unwrap();
+        let playout_drifting = packet_drifting.playout_time.unwrap();
+        let diff = if playout_perfect > playout_drifting {
+            playout_perfect - playout_drifting
+        } else {
+            playout_drifting - playout_perfect
+        };
+
+        assert!(
+            diff < Duration::from_micros(1),
+            "Playout times are not synchronized across different NTP bases! Diff: {:?}",
+            diff
+        );
     }
 
     #[test]
