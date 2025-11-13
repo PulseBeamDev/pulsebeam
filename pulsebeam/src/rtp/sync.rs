@@ -201,7 +201,7 @@ impl Synchronizer {
 
                 // Apply the smear: either add or subtract the adjustment from the base time.
                 playout_time = if correction.is_negative {
-                    playout_time.saturating_sub(smear_adjustment)
+                    playout_time.checked_sub(smear_adjustment).unwrap_or(now)
                 } else {
                     playout_time + smear_adjustment
                 };
@@ -277,10 +277,14 @@ impl Synchronizer {
 mod tests {
     use super::*;
     use crate::rtp::{RtpPacket, VIDEO_FREQUENCY};
-    use std::time::UNIX_EPOCH;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn create_sr(rtp_ts: MediaTime, ntp_secs_since_epoch: u64) -> SenderInfo {
-        let ntp_time = UNIX_EPOCH + Duration::from_secs(ntp_secs_since_epoch);
+    // NTP epoch is 1900-01-01 00:00:00 UTC.
+    // Unix epoch is 1970-01-01 00:00:00 UTC.
+    // The difference is 2,208,988,800 seconds.
+    const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
+
+    fn create_sr(rtp_ts: MediaTime, ntp_time: SystemTime) -> SenderInfo {
         SenderInfo {
             ssrc: 1.into(),
             rtp_time: rtp_ts,
@@ -290,57 +294,218 @@ mod tests {
         }
     }
 
+    /// This comprehensive test validates the entire lifecycle of the synchronizer:
+    /// 1. Starts in a provisional state.
+    /// 2. Enters a converging state upon receiving the first SR.
+    /// 3. Smoothly adjusts the clock during the convergence period.
+    /// 4. Snaps to the final accurate clock and enters the synchronized state.
     #[test]
-    fn test_initialization_and_first_sr() {
+    fn test_provisional_to_converging_to_synchronized() {
         let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
         let base_time = Instant::now();
+        let clock_rate = VIDEO_FREQUENCY.get() as f64;
 
-        let mut packet = RtpPacket::default();
-        packet.rtp_ts = MediaTime::new(1000, VIDEO_FREQUENCY);
-        packet = sync.process(packet, base_time);
+        // STEP 1: First packet arrives. We are now in the PROVISIONAL state.
+        let first_packet_ts = MediaTime::from_90khz(1000);
+        let mut packet1 = RtpPacket {
+            rtp_ts: first_packet_ts,
+            ..Default::default()
+        };
+        packet1 = sync.process(packet1, base_time);
 
-        assert_eq!(packet.playout_time, Some(base_time));
+        assert_eq!(packet1.playout_time, Some(base_time));
+        assert!(sync.is_provisional);
         assert!(!sync.is_synchronized());
 
-        let mut packet2 = RtpPacket::default();
-        packet2.rtp_ts = MediaTime::new(2000, VIDEO_FREQUENCY);
-        packet2.last_sender_info = Some(create_sr(MediaTime::from_90khz(1800), 10));
-        let sr_time = base_time + Duration::from_millis(300);
-        packet2 = sync.process(packet2, sr_time);
+        // STEP 2: An SR arrives. We start CONVERGING.
+        let sr_arrival_time = base_time + Duration::from_millis(100);
+        let sr_rtp_ts = MediaTime::from_90khz(9000); // Corresponds to 100ms of media
+        let sr_ntp_time = UNIX_EPOCH + Duration::from_secs(NTP_UNIX_OFFSET_SECS + 10);
+        let sr_info = create_sr(sr_rtp_ts, sr_ntp_time);
 
-        let expected_delta = (2000 - 1800) as f64 / VIDEO_FREQUENCY.get() as f64;
-        assert_eq!(
-            packet2.playout_time,
-            Some(sr_time + Duration::from_secs_f64(expected_delta))
+        let second_packet_ts = MediaTime::from_90khz(9180); // 2ms after SR
+        let mut packet2 = RtpPacket {
+            rtp_ts: second_packet_ts,
+            last_sender_info: Some(sr_info),
+            ..Default::default()
+        };
+        packet2 = sync.process(packet2, sr_arrival_time);
+
+        let expected_provisional_delta = (9180 - 1000) as f64 / clock_rate;
+        let expected_provisional_playout =
+            base_time + Duration::from_secs_f64(expected_provisional_delta);
+
+        assert_eq!(packet2.playout_time, Some(expected_provisional_playout));
+        assert!(!sync.is_provisional);
+        assert!(sync.correction.is_some());
+        assert!(!sync.is_synchronized());
+
+        // STEP 3: A packet arrives mid-convergence.
+        let mid_smear_time = sr_arrival_time + CLOCK_SMEAR_DURATION / 2; // Halfway through
+        let third_packet_ts = MediaTime::from_90khz(31500); // Some time later
+        let mut packet3 = RtpPacket {
+            rtp_ts: third_packet_ts,
+            ..Default::default()
+        };
+        packet3 = sync.process(packet3, mid_smear_time);
+
+        let provisional_delta_3 = (31500 - 1000) as f64 / clock_rate;
+        let provisional_playout_3 = base_time + Duration::from_secs_f64(provisional_delta_3);
+
+        let accurate_delta_3 = (31500 - 9000) as f64 / clock_rate;
+        let accurate_playout_3 = sr_arrival_time + Duration::from_secs_f64(accurate_delta_3);
+
+        let midpoint_playout_3 =
+            provisional_playout_3 + (accurate_playout_3 - provisional_playout_3) / 2;
+
+        let playout_diff = if packet3.playout_time.unwrap() > midpoint_playout_3 {
+            packet3.playout_time.unwrap() - midpoint_playout_3
+        } else {
+            midpoint_playout_3 - packet3.playout_time.unwrap()
+        };
+        assert!(
+            playout_diff < Duration::from_millis(1),
+            "Playout time is not halfway"
         );
-        assert!(sync.is_synchronized());
+
+        // STEP 4: A packet arrives AFTER convergence. We are now SYNCHRONIZED.
+        let post_smear_time = sr_arrival_time + CLOCK_SMEAR_DURATION + Duration::from_millis(50);
+        let fourth_packet_ts = MediaTime::from_90khz(54000);
+        let mut packet4 = RtpPacket {
+            rtp_ts: fourth_packet_ts,
+            ..Default::default()
+        };
+        packet4 = sync.process(packet4, post_smear_time);
+
+        assert!(sync.correction.is_none(), "Correction should be finished");
+        assert!(sync.is_synchronized(), "Should now be synchronized");
+
+        let expected_accurate_delta_4 = (54000 - 9000) as f64 / clock_rate;
+        let expected_accurate_playout_4 =
+            sr_arrival_time + Duration::from_secs_f64(expected_accurate_delta_4);
+
+        assert_eq!(packet4.playout_time, Some(expected_accurate_playout_4));
     }
 
+    /// This test proves the synchronizer works correctly regardless of the NTP timestamp base.
+    /// It simulates two independent streams: one with a proper "absolute" wall-clock and one
+    /// with a "relative" clock that starts from zero, and confirms drift is calculated correctly for both.
     #[test]
-    fn test_clock_drift_detection() {
-        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+    fn test_independent_streams_with_different_ntp_bases() {
         let base_time = Instant::now();
 
-        sync.process(
+        // --- Stream A: Absolute Clock, No Drift ---
+        let mut sync_absolute = Synchronizer::new(VIDEO_FREQUENCY);
+        let absolute_ntp_base = UNIX_EPOCH + Duration::from_secs(1_700_000_000); // A realistic modern time
+
+        // SR 1 (Absolute)
+        let sr1_abs = create_sr(
+            MediaTime::from_90khz(90_000),
+            absolute_ntp_base + Duration::from_secs(1),
+        );
+        sync_absolute.process(
             RtpPacket {
-                last_sender_info: Some(create_sr(MediaTime::from_90khz(0), 100)),
+                last_sender_info: Some(sr1_abs),
                 ..Default::default()
             },
             base_time,
         );
+
+        // SR 2 (Absolute), 1 second later, perfect clock
+        let sr2_abs = create_sr(
+            MediaTime::from_90khz(180_000),
+            absolute_ntp_base + Duration::from_secs(2),
+        );
+        sync_absolute.process(
+            RtpPacket {
+                last_sender_info: Some(sr2_abs),
+                ..Default::default()
+            },
+            base_time + Duration::from_secs(1),
+        );
+
+        // --- Stream B: Relative Clock, Positive Drift ---
+        let mut sync_relative = Synchronizer::new(VIDEO_FREQUENCY);
+        let relative_ntp_base = UNIX_EPOCH; // Simulates starting from a zero-base
+
+        // SR 1 (Relative)
+        let sr1_rel = create_sr(
+            MediaTime::from_90khz(5_000),
+            relative_ntp_base + Duration::from_secs(1),
+        );
+        sync_relative.process(
+            RtpPacket {
+                last_sender_info: Some(sr1_rel),
+                ..Default::default()
+            },
+            base_time,
+        );
+
+        // SR 2 (Relative), 1 second later, but sender's RTP clock is fast
+        let drifted_rtp = 5_000 + 90_090; // 90000 (1s) + 90 extra ticks
+        let sr2_rel = create_sr(
+            MediaTime::from_90khz(drifted_rtp),
+            relative_ntp_base + Duration::from_secs(2),
+        );
+        sync_relative.process(
+            RtpPacket {
+                last_sender_info: Some(sr2_rel),
+                ..Default::default()
+            },
+            base_time + Duration::from_secs(1),
+        );
+
+        // --- Assertions ---
+        // Absolute stream should have ~0 drift.
+        assert_eq!(sync_absolute.estimated_clock_drift_ppm.round() as i64, 0);
+
+        // Relative stream should have detected the positive drift.
+        // Drift = (90090 - 90000) / 90000 * 1e6 = 1000 PPM
+        assert_eq!(sync_relative.estimated_clock_drift_ppm.round() as i64, 1000);
+    }
+
+    #[test]
+    fn test_clock_drift_detection() {
+        // This test remains valid as it already tests the differential calculation.
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+        let base_time = Instant::now();
+        let ntp_base_time = UNIX_EPOCH + Duration::from_secs(100);
+
+        // First SR establishes the baseline
+        sync.process(
+            RtpPacket {
+                last_sender_info: Some(create_sr(MediaTime::from_90khz(0), ntp_base_time)),
+                ..Default::default()
+            },
+            base_time,
+        );
+
+        // We need to wait for the smear to finish before the clock is stable
+        let after_smear_time = base_time + CLOCK_SMEAR_DURATION + Duration::from_millis(100);
+        sync.process(RtpPacket::default(), after_smear_time);
+        assert!(sync.is_synchronized());
+
+        // Second SR is used to calculate the first drift estimate
         let sr2_time = base_time + Duration::from_secs(1);
         sync.process(
             RtpPacket {
-                last_sender_info: Some(create_sr(MediaTime::from_90khz(90000), 101)),
+                last_sender_info: Some(create_sr(
+                    MediaTime::from_90khz(90000),
+                    ntp_base_time + Duration::from_secs(1),
+                )),
                 ..Default::default()
             },
             sr2_time,
         );
 
+        // Third SR is used to calculate a more stable drift
         let sr3_time = base_time + Duration::from_secs(2);
         sync.process(
             RtpPacket {
-                last_sender_info: Some(create_sr(MediaTime::from_90khz(180090), 102)),
+                last_sender_info: Some(create_sr(
+                    MediaTime::from_90khz(180090),
+                    ntp_base_time + Duration::from_secs(2),
+                )),
                 ..Default::default()
             },
             sr3_time,
