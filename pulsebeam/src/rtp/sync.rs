@@ -118,7 +118,7 @@ impl Synchronizer {
             // This reference will be corrected as soon as the first valid SR arrives.
             warn!(
                 stream_id = %self.stream_id,
-                rtp_ts = %packet.rtp_ts,
+                rtp_ts = ?packet.rtp_ts,
                 "First packet seen without a Sender Report. Establishing temporary time reference."
             );
 
@@ -150,7 +150,7 @@ impl Synchronizer {
             // If the calculated time is unreasonable, fall back to the current time.
             warn!(
                 stream_id = %self.stream_id,
-                rtp_ts = %packet.rtp_ts,
+                rtp_ts = ?packet.rtp_ts,
                 calculated_playout = ?playout_time,
                 "Playout time validation failed, using current time as fallback."
             );
@@ -166,7 +166,7 @@ impl Synchronizer {
     fn add_sender_report(&mut self, sr: SenderInfo, now: Instant) {
         debug!(
             stream_id = %self.stream_id,
-            rtp_ts = %sr.rtp_time,
+            rtp_ts = ?sr.rtp_time,
             ntp_ts = ?sr.ntp_time,
             "Processing Sender Report"
         );
@@ -222,7 +222,7 @@ impl Synchronizer {
                 Err(reason) => {
                     error!(
                         stream_id = %self.stream_id,
-                        rtp_ts = %sr.rtp_time,
+                        rtp_ts = ?sr.rtp_time,
                         ntp_ts = ?sr.ntp_time,
                         reason = %reason,
                         "Sender Report failed consistency check, ignoring."
@@ -237,7 +237,7 @@ impl Synchronizer {
         if self.last_sr_ntp.is_none() {
             info!(
                 stream_id = %self.stream_id,
-                rtp_ts = %sr.rtp_time,
+                rtp_ts = ?sr.rtp_time,
                 ntp_ts = ?sr.ntp_time,
                 "Received first valid Sender Report. Timeline established."
             );
@@ -380,18 +380,18 @@ impl Synchronizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtp::VIDEO_FREQUENCY;
-    use rtp_packet::RtpPacket;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::rtp::{RtpPacket, VIDEO_FREQUENCY};
+    use std::time::UNIX_EPOCH;
 
     /// Helper to create a `SenderInfo` for testing.
-    fn create_sr(rtp_ts_num: u32, ntp_secs_since_epoch: u64) -> SenderInfo {
+    fn create_sr(rtp_ts: MediaTime, ntp_secs_since_epoch: u64) -> SenderInfo {
         let ntp_time = UNIX_EPOCH + Duration::from_secs(ntp_secs_since_epoch);
         SenderInfo {
-            rtp_time: MediaTime::new(rtp_ts_num as u64, VIDEO_FREQUENCY),
+            ssrc: 1.into(),
+            rtp_time: rtp_ts,
             ntp_time,
-            packet_count: 0,
-            octet_count: 0,
+            sender_packet_count: 0,
+            sender_octet_count: 0,
         }
     }
 
@@ -415,7 +415,7 @@ mod tests {
         let sr_time = base_time + Duration::from_millis(300);
         let mut packet2 = RtpPacket::default();
         packet2.rtp_ts = MediaTime::new(2000, VIDEO_FREQUENCY);
-        packet2.last_sender_info = Some(create_sr(1800, 10)); // SR corresponds to RTP 1800
+        packet2.last_sender_info = Some(create_sr(MediaTime::from_90khz(1800), 10)); // SR corresponds to RTP 1800
         packet2 = sync.process(packet2, sr_time);
 
         // Playout time should now be based on the SR's reference.
@@ -433,7 +433,7 @@ mod tests {
 
         // 1. Process a valid SR, establishing the timeline with NTP time 101.
         let mut packet_new = RtpPacket::default();
-        packet_new.last_sender_info = Some(create_sr(90000, 101));
+        packet_new.last_sender_info = Some(create_sr(MediaTime::from_90khz(90000), 101));
         sync.process(packet_new.clone(), base_time);
 
         let initial_offset = sync.rtp_offset.unwrap();
@@ -445,7 +445,7 @@ mod tests {
         // 2. Process an older SR that arrived late (NTP time 100).
         let late_packet_time = base_time + Duration::from_millis(300);
         let mut packet_old = RtpPacket::default();
-        packet_old.last_sender_info = Some(create_sr(45000, 100)); // Older NTP time
+        packet_old.last_sender_info = Some(create_sr(MediaTime::from_90khz(45000), 100)); // Older NTP time
         sync.process(packet_old, late_packet_time);
 
         // 3. Assert that the synchronizer ignored the old SR and its offset is unchanged.
@@ -468,7 +468,7 @@ mod tests {
 
         // 1. Establish initial timeline.
         let mut initial_packet = RtpPacket::default();
-        initial_packet.last_sender_info = Some(create_sr(1000, 200));
+        initial_packet.last_sender_info = Some(create_sr(MediaTime::from_90khz(1000), 200));
         sync.process(initial_packet, base_time);
 
         // 2. 5 seconds later, a new SR arrives.
@@ -573,7 +573,7 @@ mod tests {
         // 4. A third SR arrives 250ms after the first (above threshold) and should be accepted.
         let sr3_time = base_time + Duration::from_millis(250);
         let mut packet3 = RtpPacket::default();
-        packet3.last_sender_info = Some(create_sr(112500, 102));
+        packet3.last_sender_info = Some(create_sr(MediaTime::from_90khz(112500), 102));
         sync.process(packet3, sr3_time);
 
         // 5. The offset should have been updated.
@@ -591,7 +591,7 @@ mod tests {
         // SR 1: Baseline
         sync.process(
             RtpPacket {
-                last_sender_info: Some(create_sr(0, 100)),
+                last_sender_info: Some(create_sr(MediaTime::from_90khz(0), 100)),
                 ..Default::default()
             },
             base_time,
@@ -601,7 +601,7 @@ mod tests {
         let sr2_time = base_time + Duration::from_secs(1);
         sync.process(
             RtpPacket {
-                last_sender_info: Some(create_sr(90000, 101)),
+                last_sender_info: Some(create_sr(MediaTime::from_90khz(90000), 101)),
                 ..Default::default()
             },
             sr2_time,
@@ -612,7 +612,7 @@ mod tests {
         let sr3_time = base_time + Duration::from_secs(2);
         sync.process(
             RtpPacket {
-                last_sender_info: Some(create_sr(180090, 102)),
+                last_sender_info: Some(create_sr(MediaTime::from_90khz(180090), 102)),
                 ..Default::default()
             },
             sr3_time,
