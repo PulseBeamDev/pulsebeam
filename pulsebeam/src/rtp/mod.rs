@@ -36,10 +36,12 @@ pub struct RtpPacket {
 
 impl Default for RtpPacket {
     fn default() -> Self {
-        let mut header = RtpHeader::default();
-        header.sequence_number = 1;
-        header.timestamp = 0;
-        header.ssrc = 1234.into(); // arbitrary but stable for testing
+        let header = RtpHeader {
+            sequence_number: 1,
+            timestamp: 0,
+            ssrc: 1234.into(),
+            ..RtpHeader::default()
+        };
 
         Self {
             raw_header: header.clone(),
@@ -210,7 +212,7 @@ pub mod test_utils {
             let mut new_packet = self.next_seq();
             // Assuming 30fps, so 90000 / 30 = 3000 per frame
             new_packet.rtp_ts = MediaTime::new(
-                new_packet.rtp_ts.numer().wrapping_add(3000) as u64,
+                new_packet.rtp_ts.numer().wrapping_add(3000),
                 new_packet.rtp_ts.frequency(),
             );
             new_packet.raw_header.timestamp = new_packet.rtp_ts.numer() as u32;
