@@ -202,6 +202,8 @@ fn is_vp9_keyframe_start(payload: &[u8]) -> bool {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::time::Duration;
+
     use super::*;
 
     impl RtpPacket {
@@ -214,12 +216,24 @@ pub mod test_utils {
 
         fn next_frame(&self) -> Self {
             let mut new_packet = self.next_seq();
-            // Assuming 30fps, so 90000 / 30 = 3000 per frame
+
+            // Assuming 30fps video for test purposes.
+            let rtp_ts_delta = 90_000 / 30; // 3000 ticks per frame
+            let playout_time_delta = Duration::from_millis(1000 / 30);
+
             new_packet.rtp_ts = MediaTime::new(
-                new_packet.rtp_ts.numer().wrapping_add(3000),
+                new_packet.rtp_ts.numer().wrapping_add(rtp_ts_delta),
                 new_packet.rtp_ts.frequency(),
             );
             new_packet.raw_header.timestamp = new_packet.rtp_ts.numer() as u32;
+
+            if let Some(pt) = new_packet.playout_time {
+                new_packet.playout_time = Some(pt + playout_time_delta);
+            }
+            if let Some(at) = new_packet.arrival_ts.checked_add(playout_time_delta) {
+                new_packet.arrival_ts = at;
+            }
+
             new_packet
         }
     }
@@ -262,6 +276,7 @@ pub mod test_utils {
     pub fn generate(initial: RtpPacket, steps: Vec<ScenarioStep>) -> Vec<RtpPacket> {
         let mut packets = Vec::with_capacity(steps.len());
         let mut current = initial;
+        packets.push(current.clone());
         for step in steps {
             current = step(&current);
             packets.push(current.clone());
