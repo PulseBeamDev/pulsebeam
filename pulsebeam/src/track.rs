@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::rtp::{
-    Packet, RtpPacket,
+    RtpPacket,
     monitor::{StreamMonitor, StreamState},
 };
 
@@ -129,13 +129,13 @@ impl SimulcastSender {
 
     fn forward(&mut self, pkt: RtpPacket) {
         if let KeyframeRequestState::Debouncing { .. } = self.keyframe_request_state
-            && pkt.is_keyframe_start()
+            && pkt.is_keyframe_start
         {
             tracing::debug!("Keyframe received, cancelling pending request.");
             self.keyframe_request_state = KeyframeRequestState::Idle;
         }
         self.monitor
-            .process_packet(&pkt, pkt.payload.len() + pkt.header.header_len);
+            .process_packet(&pkt, pkt.payload.len() + pkt.raw_header.header_len);
         self.channel.send(pkt);
     }
 }

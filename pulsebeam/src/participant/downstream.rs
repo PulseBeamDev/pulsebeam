@@ -1,7 +1,7 @@
 use crate::participant::bitrate::BitrateController;
+use crate::rtp::RtpPacket;
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::sequencer::RtpSequencer;
-use crate::rtp::{RtpPacket, TimingHeader};
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use crate::track::{SimulcastReceiver, TrackReceiver};
 ///
 /// It includes the packet and a boolean marker to indicate if this is the first
 /// packet after a simulcast layer switch.
-type TrackStreamItem = (Arc<TrackId>, TimingHeader, RtpPacket);
+type TrackStreamItem = (Arc<TrackId>, RtpPacket);
 type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 
 /// Configuration that each downstream receiver listens to.
@@ -86,7 +86,7 @@ struct SlotState {
     assigned_track: Option<Arc<TrackId>>,
     // video=max_height
     priority: u32,
-    sequencer: RtpSequencer<RtpPacket>,
+    sequencer: RtpSequencer,
 }
 
 pub struct DownstreamAllocator {
@@ -485,7 +485,7 @@ pub struct TrackReader {
 
     state: TrackReaderState,
     config: StreamConfig,
-    sequencer: RtpSequencer<RtpPacket>,
+    sequencer: RtpSequencer,
 }
 
 impl TrackReader {
@@ -513,8 +513,8 @@ impl TrackReader {
     pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
         loop {
             self.maybe_update_state();
-            if let Some((hdr, pkt)) = self.sequencer.pop() {
-                return Some((self.id.clone(), hdr, pkt));
+            if let Some(pkt) = self.sequencer.pop() {
+                return Some((self.id.clone(), pkt));
             }
 
             match self.state {

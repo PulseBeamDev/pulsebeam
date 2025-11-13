@@ -8,7 +8,7 @@ use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
-use crate::rtp::PacketTiming;
+use crate::rtp::RtpPacket;
 
 const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 15;
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
@@ -80,8 +80,8 @@ impl StreamMonitor {
         }
     }
 
-    pub fn process_packet(&mut self, packet: &impl PacketTiming, size_bytes: usize) {
-        self.last_packet_at = packet.arrival_timestamp();
+    pub fn process_packet(&mut self, packet: &RtpPacket, size_bytes: usize) {
+        self.last_packet_at = packet.arrival_ts;
         self.bwe.record(size_bytes);
 
         self.delta_delta.update(packet);
@@ -350,11 +350,11 @@ impl DeltaDeltaState {
         }
     }
 
-    pub fn update<T: PacketTiming>(&mut self, packet: &T) {
+    pub fn update(&mut self, packet: &RtpPacket) {
         if !self.initialized {
             self.init(packet);
         }
-        let seq = packet.seq_no();
+        let seq = packet.seq_no;
 
         // Check if packet is older than tail using wrapping comparison
         let tail_val = *self.tail;
@@ -371,8 +371,8 @@ impl DeltaDeltaState {
             return;
         }
 
-        let rtp_ts = packet.rtp_timestamp();
-        let arrival = packet.arrival_timestamp();
+        let rtp_ts = packet.rtp_ts;
+        let arrival = packet.arrival_ts;
         let buffer_capacity = self.buffer.len() as u64;
 
         // Update head if this packet is beyond it
@@ -397,10 +397,10 @@ impl DeltaDeltaState {
         self.process_in_order();
     }
 
-    fn init<T: PacketTiming>(&mut self, packet: &T) {
-        let seq = packet.seq_no();
-        let rtp_ts = packet.rtp_timestamp();
-        let arrival = packet.arrival_timestamp();
+    fn init(&mut self, packet: &RtpPacket) {
+        let seq = packet.seq_no;
+        let rtp_ts = packet.rtp_ts;
+        let arrival = packet.arrival_ts;
 
         self.head = seq.wrapping_add(1).into();
         self.tail = seq;
@@ -582,25 +582,6 @@ mod test {
     const MS_PER_PACKET: u64 = 20; // 20ms per packet
     const RTP_TS_PER_PACKET: u64 = (TEST_FREQ.get() as u64 * MS_PER_PACKET) / 1000; // 1800
 
-    #[derive(Clone)]
-    struct TestPacket {
-        seq: SeqNo,
-        rtp_ts: MediaTime,
-        arrival: Instant,
-    }
-
-    impl PacketTiming for TestPacket {
-        fn seq_no(&self) -> SeqNo {
-            self.seq
-        }
-        fn rtp_timestamp(&self) -> MediaTime {
-            self.rtp_ts
-        }
-        fn arrival_timestamp(&self) -> Instant {
-            self.arrival
-        }
-    }
-
     // Helper to create a stream of test packets
     struct PacketFactory {
         start_time: Instant,
@@ -626,7 +607,7 @@ mod test {
         }
 
         // Creates a packet with a given sequence number and an optional jitter in arrival time
-        fn at(&self, seq: u64, arrival_jitter_ms: i64) -> TestPacket {
+        fn at(&self, seq: u64, arrival_jitter_ms: i64) -> RtpPacket {
             // Use wrapping arithmetic to handle overflow correctly
             let packets_since_start = seq.wrapping_sub(self.start_seq);
             let rtp_ts = self
@@ -642,10 +623,11 @@ mod test {
                     - Duration::from_millis(arrival_jitter_ms.unsigned_abs())
             };
 
-            TestPacket {
-                seq: seq.into(),
+            RtpPacket {
+                seq_no: seq.into(),
                 rtp_ts: MediaTime::new(rtp_ts, TEST_FREQ),
-                arrival: arrival_time,
+                arrival_ts: arrival_time.into(),
+                ..Default::default()
             }
         }
     }
@@ -664,8 +646,8 @@ mod test {
             "Tail should advance past the first packet"
         );
         assert_eq!(monitor.head, 2.into(), "Head should be next expected seq");
-        assert_eq!(monitor.last_rtp_ts, pkt.rtp_timestamp());
-        assert_eq!(monitor.last_arrival, pkt.arrival_timestamp());
+        assert_eq!(monitor.last_rtp_ts, pkt.rtp_ts);
+        assert_eq!(monitor.last_arrival, pkt.arrival_ts);
     }
 
     #[test]
@@ -809,7 +791,7 @@ mod test {
         monitor.update(&pkt3_dup);
         assert_eq!(
             monitor.packet(3.into()).as_ref().unwrap().arrival,
-            pkt3_dup.arrival,
+            pkt3_dup.arrival_ts,
             "Duplicate should overwrite existing packet data"
         );
 
@@ -822,7 +804,7 @@ mod test {
             "Tail should have processed up to packet 3"
         );
         assert_eq!(
-            monitor.last_arrival, pkt3_dup.arrival,
+            monitor.last_arrival, pkt3_dup.arrival_ts,
             "The monitor should have used the overwritten packet's data"
         );
     }
