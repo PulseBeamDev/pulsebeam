@@ -240,7 +240,7 @@ mod tests {
             },
             seq_no: (seq as u64).into(),
             rtp_ts: MediaTime::new(ts as u64, VIDEO_FREQUENCY),
-            playout_time: Some(Instant::now()),
+            playout_time: Instant::now(),
             is_keyframe_start: is_key,
             ..Default::default()
         }

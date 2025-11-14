@@ -234,21 +234,21 @@ impl Synchronizer {
         playout_time
     }
 
-    fn validate_playout_time(&self, playout_time: Instant, now: Instant) -> Option<Instant> {
+    fn validate_playout_time(&self, playout_time: Instant, now: Instant) -> Instant {
         if playout_time > now + MAX_PLAYOUT_FUTURE {
             warn!(
                 "Far future playout_time: {:?}. Limiting to {:?}.",
                 playout_time,
                 now + MAX_PLAYOUT_FUTURE
             );
-            return Some(now + MAX_PLAYOUT_FUTURE);
+            return now + MAX_PLAYOUT_FUTURE;
         }
         if let Some(past_limit) = now.checked_sub(MAX_PLAYOUT_PAST)
             && playout_time < past_limit
         {
-            return Some(past_limit);
+            return past_limit;
         }
-        Some(playout_time)
+        playout_time
     }
 
     pub fn is_synchronized(&self) -> bool {
@@ -296,7 +296,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(packet1.playout_time, Some(base_time));
+        assert_eq!(packet1.playout_time, base_time);
         assert!(sync.is_provisional);
         assert!(!sync.is_synchronized());
 
@@ -318,7 +318,7 @@ mod tests {
         let expected_provisional_playout =
             base_time + Duration::from_secs_f64(expected_provisional_delta);
 
-        assert_eq!(packet2.playout_time, Some(expected_provisional_playout));
+        assert_eq!(packet2.playout_time, expected_provisional_playout);
         assert!(!sync.is_provisional);
         assert!(sync.correction.is_some());
         assert!(!sync.is_synchronized());
@@ -341,10 +341,10 @@ mod tests {
         let midpoint_playout_3 =
             provisional_playout_3 + (accurate_playout_3 - provisional_playout_3) / 2;
 
-        let playout_diff = if packet3.playout_time.unwrap() > midpoint_playout_3 {
-            packet3.playout_time.unwrap() - midpoint_playout_3
+        let playout_diff = if packet3.playout_time > midpoint_playout_3 {
+            packet3.playout_time - midpoint_playout_3
         } else {
-            midpoint_playout_3 - packet3.playout_time.unwrap()
+            midpoint_playout_3 - packet3.playout_time
         };
         assert!(
             playout_diff < Duration::from_millis(1),
@@ -367,7 +367,7 @@ mod tests {
         let expected_accurate_playout_4 =
             sr_arrival_time + Duration::from_secs_f64(expected_accurate_delta_4);
 
-        assert_eq!(packet4.playout_time, Some(expected_accurate_playout_4));
+        assert_eq!(packet4.playout_time, expected_accurate_playout_4);
     }
 
     /// This is the definitive end-to-end test. It proves that the ultimate goal—producing
@@ -465,8 +465,8 @@ mod tests {
             ..Default::default()
         });
 
-        let playout_perfect = packet_perfect.playout_time.unwrap();
-        let playout_drifting = packet_drifting.playout_time.unwrap();
+        let playout_perfect = packet_perfect.playout_time;
+        let playout_drifting = packet_drifting.playout_time;
         let diff = if playout_perfect > playout_drifting {
             playout_perfect - playout_drifting
         } else {
@@ -597,8 +597,8 @@ mod tests {
 
         // THE CRITICAL ASSERTION:
         // Despite different NTP bases and a drifting clock, the final playout times must be aligned.
-        let playout_perfect = packet_perfect.playout_time.unwrap();
-        let playout_drifting = packet_drifting.playout_time.unwrap();
+        let playout_perfect = packet_perfect.playout_time;
+        let playout_drifting = packet_drifting.playout_time;
         let diff = if playout_perfect > playout_drifting {
             playout_perfect - playout_drifting
         } else {

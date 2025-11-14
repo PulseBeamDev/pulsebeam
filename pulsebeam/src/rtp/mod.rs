@@ -32,7 +32,7 @@ pub struct RtpPacket {
     /// Scheduled playout time for the packet, in the server's monotonic clock domain.
     /// Since all streams in this process share the same monotonic clock, this time can
     /// be compared directly between unrelated streams for scheduling or synchronization.
-    pub playout_time: Option<Instant>,
+    pub playout_time: Instant,
     pub is_keyframe_start: bool,
     pub last_sender_info: Option<SenderInfo>,
     pub payload: Vec<u8>,
@@ -52,7 +52,7 @@ impl Default for RtpPacket {
             seq_no: SeqNo::from(header.sequence_number as u64),
             rtp_ts: MediaTime::new(header.timestamp as u64, VIDEO_FREQUENCY),
             arrival_ts: Instant::now(),
-            playout_time: None,
+            playout_time: Instant::now(),
             is_keyframe_start: false,
             last_sender_info: None,
             payload: vec![0u8; 1200], // 1.2KB payload for test realism
@@ -73,7 +73,7 @@ impl RtpPacket {
             seq_no: rtp.seq_no,
             rtp_ts: rtp.time,
             arrival_ts: rtp.timestamp.into(),
-            playout_time: None,
+            playout_time: rtp.timestamp.into(),
             is_keyframe_start,
             last_sender_info: None,
             payload: rtp.payload,
@@ -81,7 +81,7 @@ impl RtpPacket {
     }
 
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
-        self.playout_time = Some(playout_time);
+        self.playout_time = playout_time;
         self
     }
 }
@@ -227,9 +227,7 @@ pub mod test_utils {
             );
             new_packet.raw_header.timestamp = new_packet.rtp_ts.numer() as u32;
 
-            if let Some(pt) = new_packet.playout_time {
-                new_packet.playout_time = Some(pt + playout_time_delta);
-            }
+            new_packet.playout_time = new_packet.playout_time + playout_time_delta;
             if let Some(at) = new_packet.arrival_ts.checked_add(playout_time_delta) {
                 new_packet.arrival_ts = at;
             }

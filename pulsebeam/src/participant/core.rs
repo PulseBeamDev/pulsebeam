@@ -164,18 +164,17 @@ impl ParticipantCore {
             return;
         };
 
-        let wallclock = pkt.playout_time.unwrap_or(pkt.arrival_ts);
         tracing::trace!(
-            "forward rtp: seqno={},rtp_ts={:?},wallclock={:?}",
+            "forward rtp: seqno={},rtp_ts={:?},playout_time={:?}",
             pkt.seq_no,
             pkt.rtp_ts,
-            wallclock
+            pkt.playout_time
         );
         if let Err(err) = writer.write_rtp(
             pt,
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
-            wallclock.into(),
+            pkt.playout_time.into(),
             pkt.raw_header.marker,
             pkt.raw_header.ext_vals,
             true,
