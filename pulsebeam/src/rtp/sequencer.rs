@@ -3,14 +3,14 @@ use std::fmt::{Debug, Display};
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::{SeqNo, Ssrc};
 
-use crate::rtp::{AUDIO_FREQUENCY, Packet, TimingHeader, VIDEO_FREQUENCY};
+use crate::rtp::{AUDIO_FREQUENCY, RtpPacket, VIDEO_FREQUENCY};
 
 #[derive(Debug)]
-pub struct RtpSequencer<T> {
-    state: SequencerState<T>,
+pub struct RtpSequencer {
+    state: SequencerState,
 }
 
-impl<T: Packet> RtpSequencer<T> {
+impl RtpSequencer {
     pub fn video() -> Self {
         Self::new(VIDEO_FREQUENCY)
     }
@@ -35,9 +35,9 @@ impl<T: Packet> RtpSequencer<T> {
         matches!(&self.state, SequencerState::Stable(_))
     }
 
-    pub fn push(&mut self, packet: &T) {
+    pub fn push(&mut self, packet: &RtpPacket) {
         let cloned = packet.clone();
-        tracing::trace!("tracing:push={}", *packet.seq_no());
+        tracing::trace!("tracing:push={}", *packet.seq_no);
         let state_id = self.state.id();
         let new_state = match std::mem::replace(&mut self.state, SequencerState::Invalid) {
             SequencerState::New(state) => state.process(cloned),
@@ -51,25 +51,25 @@ impl<T: Packet> RtpSequencer<T> {
         self.state = new_state;
     }
 
-    pub fn pop(&mut self) -> Option<(TimingHeader, T)> {
+    pub fn pop(&mut self) -> Option<RtpPacket> {
         let item = match &mut self.state {
             SequencerState::Stable(state) => state.poll(),
             SequencerState::Switching(state) => state.poll(),
             _ => None,
         }?;
-        tracing::trace!("tracing:pop={}", item.0.seq_no);
+        tracing::trace!("tracing:pop={}", item.seq_no);
         Some(item)
     }
 }
 
-enum SequencerState<T> {
+enum SequencerState {
     Invalid,
-    New(NewState<T>),
-    Stable(StableState<T>),
-    Switching(SwitchingState<T>),
+    New(NewState),
+    Stable(StableState),
+    Switching(SwitchingState),
 }
 
-impl<T> Display for SequencerState<T> {
+impl Display for SequencerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid => f.write_str("invalid"),
@@ -80,7 +80,7 @@ impl<T> Display for SequencerState<T> {
     }
 }
 
-impl<T> Debug for SequencerState<T> {
+impl Debug for SequencerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid => f.write_str("invalid"),
@@ -91,7 +91,7 @@ impl<T> Debug for SequencerState<T> {
     }
 }
 
-impl<T: Packet> SequencerState<T> {
+impl SequencerState {
     #[inline]
     fn id(&self) -> usize {
         match self {
@@ -103,14 +103,14 @@ impl<T: Packet> SequencerState<T> {
     }
 }
 
-struct NewState<T> {
+struct NewState {
     timeline: Timeline,
-    keyframe_buffer: KeyframeBuffer<T>,
+    keyframe_buffer: KeyframeBuffer,
 }
 
-impl<T: Packet> NewState<T> {
-    fn process(mut self, packet: T) -> SequencerState<T> {
-        let new_ssrc = packet.ssrc();
+impl NewState {
+    fn process(mut self, packet: RtpPacket) -> SequencerState {
+        let new_ssrc = packet.raw_header.ssrc;
         if self.keyframe_buffer.push(packet) {
             self.timeline.mark_need_rebase();
             SequencerState::Stable(StableState {
@@ -125,21 +125,21 @@ impl<T: Packet> NewState<T> {
     }
 }
 
-struct StableState<T> {
-    pending: Option<T>,
+struct StableState {
+    pending: Option<RtpPacket>,
     timeline: Timeline,
-    keyframe_buffer: KeyframeBuffer<T>,
+    keyframe_buffer: KeyframeBuffer,
 
     active_ssrc: Ssrc,
 }
 
-impl<T: Packet> StableState<T> {
-    fn process(mut self, packet: T) -> SequencerState<T> {
-        if packet.ssrc() == self.active_ssrc {
+impl StableState {
+    fn process(mut self, packet: RtpPacket) -> SequencerState {
+        if packet.raw_header.ssrc == self.active_ssrc {
             self.pending.replace(packet);
             SequencerState::Stable(self)
         } else {
-            let new_ssrc = packet.ssrc();
+            let new_ssrc = packet.raw_header.ssrc;
             self.keyframe_buffer.reset();
             self.keyframe_buffer.push(packet);
             SequencerState::Switching(SwitchingState {
@@ -152,27 +152,27 @@ impl<T: Packet> StableState<T> {
         }
     }
 
-    fn poll(&mut self) -> Option<(TimingHeader, T)> {
+    fn poll(&mut self) -> Option<RtpPacket> {
         let pkt = self.keyframe_buffer.pop().or_else(|| self.pending.take())?;
-        let hdr = self.timeline.rewrite(&pkt);
-        Some((hdr, pkt))
+        let pkt = self.timeline.rewrite(pkt);
+        Some(pkt)
     }
 }
 
-struct SwitchingState<T> {
-    pending: Option<T>,
+struct SwitchingState {
+    pending: Option<RtpPacket>,
     timeline: Timeline,
-    keyframe_buffer: KeyframeBuffer<T>,
+    keyframe_buffer: KeyframeBuffer,
 
     new_ssrc: Ssrc,
     old_ssrc: Ssrc,
 }
 
-impl<T: Packet> SwitchingState<T> {
-    fn process(mut self, packet: T) -> SequencerState<T> {
+impl SwitchingState {
+    fn process(mut self, packet: RtpPacket) -> SequencerState {
         assert!(self.new_ssrc != self.old_ssrc);
 
-        if packet.ssrc() == self.new_ssrc {
+        if packet.raw_header.ssrc == self.new_ssrc {
             if self.keyframe_buffer.push(packet) {
                 self.timeline.mark_need_rebase();
                 return SequencerState::Stable(StableState {
@@ -182,17 +182,17 @@ impl<T: Packet> SwitchingState<T> {
                     timeline: self.timeline,
                 });
             }
-        } else if packet.ssrc() == self.old_ssrc {
+        } else if packet.raw_header.ssrc == self.old_ssrc {
             self.pending.replace(packet);
         }
 
         SequencerState::Switching(self)
     }
 
-    fn poll(&mut self) -> Option<(TimingHeader, T)> {
+    fn poll(&mut self) -> Option<RtpPacket> {
         let pkt = self.pending.take()?;
-        let hdr = self.timeline.rewrite(&pkt);
-        Some((hdr, pkt))
+        let pkt = self.timeline.rewrite(pkt);
+        Some(pkt)
     }
 }
 
@@ -221,15 +221,15 @@ impl Timeline {
     }
 
     // packet is guaranteed to be the first packet after a marker and is a keyframe
-    fn rebase(&mut self, packet: &impl Packet) {
-        debug_assert!(packet.is_keyframe_start());
+    fn rebase(&mut self, packet: &RtpPacket) {
+        debug_assert!(packet.is_keyframe_start);
 
         let target_seq_no = self.highest_seq_no.wrapping_add(1);
-        self.offset_seq_no = target_seq_no.wrapping_sub(*packet.seq_no());
+        self.offset_seq_no = target_seq_no.wrapping_sub(*packet.seq_no);
         self.offset_rtp_ts = self
             .highest_rtp_ts
             .numer()
-            .wrapping_sub(packet.rtp_timestamp().rebase(self.frequency).numer());
+            .wrapping_sub(packet.rtp_ts.rebase(self.frequency).numer());
         self.need_rebase = false;
     }
 
@@ -237,46 +237,37 @@ impl Timeline {
         self.need_rebase = true;
     }
 
-    fn rewrite(&mut self, packet: &impl Packet) -> TimingHeader {
+    fn rewrite(&mut self, mut pkt: RtpPacket) -> RtpPacket {
         if self.need_rebase {
-            self.rebase(packet);
+            self.rebase(&pkt);
         }
 
-        let hdr = TimingHeader {
-            ssrc: packet.ssrc(),
-            seq_no: packet.seq_no().wrapping_add(self.offset_seq_no).into(),
-            rtp_ts: MediaTime::new(
-                packet
-                    .rtp_timestamp()
-                    .numer()
-                    .wrapping_add(self.offset_rtp_ts),
-                self.frequency,
-            ),
-            marker: packet.marker(),
-            is_keyframe: packet.is_keyframe_start(),
-            server_ts: packet.arrival_timestamp(),
-        };
+        pkt.seq_no = pkt.seq_no.wrapping_add(self.offset_seq_no).into();
+        pkt.rtp_ts = MediaTime::new(
+            pkt.rtp_ts.numer().wrapping_add(self.offset_rtp_ts),
+            self.frequency,
+        );
 
-        if hdr.seq_no > self.highest_seq_no {
-            self.highest_seq_no = hdr.seq_no;
+        if pkt.seq_no > self.highest_seq_no {
+            self.highest_seq_no = pkt.seq_no;
         }
 
-        if hdr.rtp_ts > self.highest_rtp_ts {
-            self.highest_rtp_ts = hdr.rtp_ts;
+        if pkt.rtp_ts > self.highest_rtp_ts {
+            self.highest_rtp_ts = pkt.rtp_ts;
         }
 
-        hdr
+        pkt
     }
 }
 
 /// A buffer for a single frame, corresponding to one RTP timestamp.
-struct FrameBuffer<T> {
-    packets: BTreeMap<SeqNo, T>,
+struct FrameBuffer {
+    packets: BTreeMap<SeqNo, RtpPacket>,
     has_keyframe_start: bool,
     has_marker: bool,
 }
 
-impl<T: Packet> FrameBuffer<T> {
+impl FrameBuffer {
     fn new() -> Self {
         Self {
             packets: BTreeMap::new(),
@@ -285,14 +276,14 @@ impl<T: Packet> FrameBuffer<T> {
         }
     }
 
-    fn push(&mut self, packet: T) {
-        if packet.is_keyframe_start() {
+    fn push(&mut self, packet: RtpPacket) {
+        if packet.is_keyframe_start {
             self.has_keyframe_start = true;
         }
-        if packet.marker() {
+        if packet.raw_header.marker {
             self.has_marker = true;
         }
-        self.packets.insert(packet.seq_no(), packet);
+        self.packets.insert(packet.seq_no, packet);
     }
 
     fn is_complete(&self) -> bool {
@@ -306,9 +297,9 @@ impl<T: Packet> FrameBuffer<T> {
 
 /// A buffer that can hold multiple frames, sorted by timestamp, and intelligently
 /// decides which frame is ready to be emitted.
-struct KeyframeBuffer<T> {
+struct KeyframeBuffer {
     /// Buffers sorted by timestamp, allowing us to process frames in order.
-    buffers: BTreeMap<MediaTime, FrameBuffer<T>>,
+    buffers: BTreeMap<MediaTime, FrameBuffer>,
     /// Tracks if we've successfully started the stream with a keyframe.
     has_emitted_keyframe: bool,
     /// The timestamp of the last packet popped from the buffer. This is the "high water mark"
@@ -316,7 +307,7 @@ struct KeyframeBuffer<T> {
     last_popped_ts: Option<MediaTime>,
 }
 
-impl<T: Packet> KeyframeBuffer<T> {
+impl KeyframeBuffer {
     fn new() -> Self {
         Self {
             buffers: BTreeMap::new(),
@@ -337,8 +328,8 @@ impl<T: Packet> KeyframeBuffer<T> {
 
     /// Pushes a packet into the correct frame buffer based on its timestamp.
     /// Returns true if, after this push, there is a frame ready to be popped.
-    fn push(&mut self, packet: T) -> bool {
-        let pkt_ts = packet.rtp_timestamp();
+    fn push(&mut self, packet: RtpPacket) -> bool {
+        let pkt_ts = packet.rtp_ts;
 
         // **THE FIX**: Check against the high water mark. If this packet is from a timestamp
         // we have already moved past, drop it immediately.
@@ -387,7 +378,7 @@ impl<T: Packet> KeyframeBuffer<T> {
     }
 
     /// Pops the next packet from the next ready frame.
-    fn pop(&mut self) -> Option<T> {
+    fn pop(&mut self) -> Option<RtpPacket> {
         let mut clear_before_ts = None;
         let mut pop_from_ts = None;
 
@@ -420,8 +411,7 @@ impl<T: Packet> KeyframeBuffer<T> {
 
             let (_, packet) = frame.packets.pop_first()?;
 
-            // **THE FIX**: Update the high water mark with the timestamp of the packet we are returning.
-            self.last_popped_ts = Some(packet.rtp_timestamp());
+            self.last_popped_ts = Some(packet.rtp_ts);
 
             if frame.packets.is_empty() {
                 self.buffers.remove(&ts);
@@ -436,54 +426,10 @@ impl<T: Packet> KeyframeBuffer<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::rtp::TimingHeader;
+    use crate::rtp::test_utils::*;
     use str0m::media::{Frequency, MediaTime};
 
-    type ScenarioStep = Box<dyn Fn(TimingHeader) -> TimingHeader>;
-
-    pub fn next_seq() -> ScenarioStep {
-        Box::new(TimingHeader::next_packet)
-    }
-    pub fn next_frame() -> ScenarioStep {
-        Box::new(TimingHeader::next_frame)
-    }
-    pub fn keyframe() -> ScenarioStep {
-        Box::new(|prev| {
-            let mut next = prev.next_frame();
-            next.is_keyframe = true;
-            next
-        })
-    }
-    pub fn marker() -> ScenarioStep {
-        Box::new(|prev| {
-            let mut next = prev.next_packet();
-            next.marker = true;
-            next
-        })
-    }
-    pub fn simulcast_switch(new_ssrc: u32, start_seq: u16, start_ts: u32) -> ScenarioStep {
-        Box::new(move |mut prev| {
-            prev.ssrc = new_ssrc.into();
-            prev.seq_no = SeqNo::from(start_seq as u64);
-            prev.rtp_ts = MediaTime::new(start_ts as u64, Frequency::NINETY_KHZ);
-            prev.marker = false;
-            prev.is_keyframe = false;
-            prev
-        })
-    }
-
-    /// Generates a `Vec<TimingHeader>` from a series of steps.
-    pub fn generate(initial: TimingHeader, steps: Vec<ScenarioStep>) -> Vec<TimingHeader> {
-        let mut packets = Vec::with_capacity(steps.len());
-        let mut current = initial;
-        for step in steps {
-            current = step(current);
-            packets.push(current);
-        }
-        packets
-    }
-
-    fn run_with(mut seq: RtpSequencer<TimingHeader>, packets: &[TimingHeader]) {
+    fn run_with(mut seq: RtpSequencer, packets: &[RtpPacket]) {
         let mut rewritten_headers = Vec::new();
 
         // Inputs must not have duplications. Deduplication is already handled at this layer.
@@ -492,8 +438,8 @@ mod test {
 
         for packet in packets {
             seq.push(packet);
-            while let Some((hdr, _)) = seq.pop() {
-                rewritten_headers.push(hdr);
+            while let Some(pkt) = seq.pop() {
+                rewritten_headers.push(pkt);
             }
         }
 
@@ -539,7 +485,7 @@ mod test {
         let mut i = 0;
         while i < rewritten_headers.len() {
             let h = &rewritten_headers[i];
-            if h.is_keyframe {
+            if h.is_keyframe_start {
                 let kf_start = i;
                 let mut kf_end = i;
                 let mut has_marker = false;
@@ -549,7 +495,7 @@ mod test {
                     if end_h.rtp_ts != h.rtp_ts {
                         break;
                     }
-                    if end_h.marker {
+                    if end_h.raw_header.marker {
                         has_marker = true;
                         kf_end += 1;
                         break;
@@ -583,17 +529,17 @@ mod test {
                 continue;
             };
 
-            if b.ssrc != c.ssrc {
+            if b.raw_header.ssrc != c.raw_header.ssrc {
                 assert_ne!(a, c, "Multiple SSRC switches not allowed in test");
             }
         }
     }
 
-    pub fn run(packets: &[TimingHeader]) {
+    pub fn run(packets: &[RtpPacket]) {
         run_with(RtpSequencer::video(), packets);
     }
 
-    pub fn print_packets(packets: &[TimingHeader]) {
+    pub fn print_packets(packets: &[RtpPacket]) {
         use std::cmp::max;
 
         println!("\n--- Packet Inspector ({} packets) ---", packets.len());
@@ -631,14 +577,14 @@ mod test {
             };
 
             let mut flags = String::new();
-            if current_header.is_keyframe {
+            if current_header.is_keyframe_start {
                 flags.push('K');
             }
-            if current_header.marker {
+            if current_header.raw_header.marker {
                 flags.push('M');
             }
 
-            let ssrc = format!("{}", current_header.ssrc);
+            let ssrc = format!("{}", current_header.raw_header.ssrc);
             let seq = format!("{}", current_header.seq_no);
             let ts = format!("{}", current_header.rtp_ts.numer());
 
@@ -711,13 +657,13 @@ mod test {
     // --- Tests ---
     #[test]
     fn run_simple_stream() {
-        let packets = generate(TimingHeader::default(), simple_stream());
+        let packets = generate(RtpPacket::default(), simple_stream());
         run(&packets);
     }
 
     #[test]
     fn run_stream_with_reordering() {
-        let mut packets = generate(TimingHeader::default(), simple_frame());
+        let mut packets = generate(RtpPacket::default(), simple_frame());
         packets.swap(0, 2); // [M, p1, K] → should still work
         run(&packets);
     }
@@ -727,7 +673,7 @@ mod test {
         let mut steps = vec![keyframe(), next_seq()]; // partial keyframe
         steps.push(simulcast_switch(100, 5000, 80000));
         steps.extend(vec![keyframe(), next_seq(), marker()]);
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         run(&packets);
         // Expect: old partial keyframe dropped
     }
@@ -739,7 +685,7 @@ mod test {
         steps.extend(simple_stream());
 
         // TODO: harden against old packets
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         // let old_ssrc = packets[0].ssrc;
         // let mut late = packets[1];
         // late.ssrc = old_ssrc;
@@ -756,13 +702,13 @@ mod test {
         steps.extend(simple_frame());
         steps.push(simulcast_switch(200, 10000, 160000));
         steps.extend(simple_frame());
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         run(&packets);
     }
 
     #[test]
     fn rtp_timestamp_wraparound() {
-        let initial = TimingHeader {
+        let initial = RtpPacket {
             rtp_ts: MediaTime::new((u32::MAX - 100) as u64, Frequency::NINETY_KHZ),
             ..Default::default()
         };
@@ -773,7 +719,7 @@ mod test {
 
     #[test]
     fn sequence_number_wraparound() {
-        let initial = TimingHeader {
+        let initial = RtpPacket {
             seq_no: SeqNo::from((u16::MAX - 5) as u64),
             ..Default::default()
         };
@@ -792,7 +738,7 @@ mod test {
     #[test]
     fn loss_before_keyframe() {
         let steps = vec![next_seq(), next_seq(), keyframe(), marker()];
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         run(&packets);
         // Expect: first two dropped
     }
@@ -802,14 +748,14 @@ mod test {
         let mut steps = vec![keyframe()];
         steps.extend((0..1000).map(|_| next_seq()));
         steps.push(marker());
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         run(&packets);
     }
 
     #[test]
     fn audio_sequencer_basic() {
         let steps = vec![keyframe(), next_seq(), marker()];
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         let seq = RtpSequencer::audio();
 
         run_with(seq, &packets);
@@ -818,9 +764,14 @@ mod test {
     #[test]
     fn out_of_order_keyframe_fragments() {
         let ordered = vec![keyframe(), next_seq(), next_seq(), marker()];
-        let mut packets = generate(TimingHeader::default(), ordered);
+        let mut packets = generate(RtpPacket::default(), ordered);
         // Scramble order
-        packets = vec![packets[2], packets[0], packets[3], packets[1]];
+        packets = vec![
+            packets[2].clone(),
+            packets[0].clone(),
+            packets[3].clone(),
+            packets[1].clone(),
+        ];
         run(&packets);
     }
 
@@ -837,11 +788,14 @@ mod test {
             next_seq(),
             marker(), // KF2 ends
         ];
-        let packets = generate(TimingHeader::default(), ordered_stream);
+        let packets = generate(RtpPacket::default(), ordered_stream);
 
         // Extreme reorder: [KF1-p1, KF2-p2, P1-M, KF1-K, KF2-M, P1-p1, KF2-K, KF1-M]
         let reordered_indices = [1, 6, 4, 0, 7, 3, 5, 2];
-        let disordered_packets: Vec<_> = reordered_indices.iter().map(|&i| packets[i]).collect();
+        let disordered_packets: Vec<_> = reordered_indices
+            .iter()
+            .map(|&i| packets[i].clone())
+            .collect();
 
         run(&disordered_packets);
         // Expect: Sequencer should buffer and reorder everything correctly.
@@ -861,7 +815,7 @@ mod test {
         // A new keyframe arrives, allowing the stream to recover
         steps.extend(simple_frame());
 
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         run(&packets);
         // Expect: The first incomplete keyframe and the following P-frame are dropped.
         // The stream resumes perfectly from the second keyframe.
@@ -879,7 +833,7 @@ mod test {
         // Now send a complete, valid keyframe on the new SSRC
         steps.extend(simple_frame());
 
-        let packets = generate(TimingHeader::default(), steps);
+        let packets = generate(RtpPacket::default(), steps);
         run(&packets);
         // Expect: The old SSRC packet should be emitted. The partial new keyframe is dropped.
         // The sequencer recovers and emits the final complete keyframe.
@@ -890,9 +844,9 @@ mod test {
     fn stale_packets_from_previous_timestamp_arrive_late() {
         // Simulates a scenario where packets from an old, abandoned keyframe
         // arrive after a newer keyframe has already been processed.
-        let mut initial_kf = generate(TimingHeader::default(), vec![keyframe(), next_seq()]);
+        let mut initial_kf = generate(RtpPacket::default(), vec![keyframe(), next_seq()]);
 
-        let mut next_kf_time = initial_kf[0];
+        let mut next_kf_time = initial_kf[0].clone();
         next_kf_time.rtp_ts =
             MediaTime::new(initial_kf[0].rtp_ts.numer() + 3000, Frequency::NINETY_KHZ);
 

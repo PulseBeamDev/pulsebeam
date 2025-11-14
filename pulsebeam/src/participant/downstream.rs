@@ -1,12 +1,11 @@
 use crate::participant::bitrate::BitrateController;
 use crate::rtp::monitor::StreamQuality;
-use crate::rtp::sequencer::RtpSequencer;
-use crate::rtp::{RtpPacket, TimingHeader};
+use crate::rtp::switcher::Switcher;
+use crate::rtp::{self, RtpPacket};
 use futures::stream::{SelectAll, Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
@@ -16,13 +15,13 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
+use crate::track::{SimulcastReceiver, TrackReceiver};
 
 /// The event produced by the DownstreamAllocator stream.
 ///
 /// It includes the packet and a boolean marker to indicate if this is the first
 /// packet after a simulcast layer switch.
-type TrackStreamItem = (Arc<TrackId>, TimingHeader, RtpPacket);
+type TrackStreamItem = (Arc<TrackId>, RtpPacket);
 type TrackStream = Pin<Box<dyn Stream<Item = TrackStreamItem> + Send>>;
 
 /// Configuration that each downstream receiver listens to.
@@ -87,7 +86,7 @@ struct SlotState {
     assigned_track: Option<Arc<TrackId>>,
     // video=max_height
     priority: u32,
-    sequencer: RtpSequencer<RtpPacket>,
+    switcher: Switcher,
 }
 
 pub struct DownstreamAllocator {
@@ -151,7 +150,7 @@ impl DownstreamAllocator {
                     mid,
                     assigned_track: None,
                     priority: 0,
-                    sequencer: RtpSequencer::audio(),
+                    switcher: Switcher::new(rtp::AUDIO_FREQUENCY),
                 });
             }
             MediaKind::Video => {
@@ -159,7 +158,7 @@ impl DownstreamAllocator {
                     mid,
                     assigned_track: None,
                     priority: 720,
-                    sequencer: RtpSequencer::video(),
+                    switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
                 });
             }
         }
@@ -486,24 +485,24 @@ pub struct TrackReader {
 
     state: TrackReaderState,
     config: StreamConfig,
-    sequencer: RtpSequencer<RtpPacket>,
+    switcher: Switcher,
 }
 
 impl TrackReader {
     fn new(track: TrackReceiver, mut control_rx: watch::Receiver<StreamConfig>) -> Self {
         let config = *control_rx.borrow_and_update();
-        let sequencer = if track.meta.kind.is_video() {
-            RtpSequencer::video()
-        } else {
-            RtpSequencer::audio()
+        let clock_rate = match track.meta.kind {
+            MediaKind::Audio => rtp::AUDIO_FREQUENCY,
+            MediaKind::Video => rtp::VIDEO_FREQUENCY,
         };
+        let switcher = Switcher::new(clock_rate);
         let mut this = Self {
             id: track.meta.id.clone(),
             track,
             control_rx,
             state: TrackReaderState::Paused,
             config,
-            sequencer,
+            switcher,
         };
         // seed initial state
         this.update_state(config);
@@ -514,8 +513,8 @@ impl TrackReader {
     pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
         loop {
             self.maybe_update_state();
-            if let Some((hdr, pkt)) = self.sequencer.pop() {
-                return Some((self.id.clone(), hdr, pkt));
+            if let Some(pkt) = self.switcher.pop() {
+                return Some((self.id.clone(), pkt));
             }
 
             match self.state {
@@ -538,7 +537,7 @@ impl TrackReader {
                         res = receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    self.sequencer.push(&pkt.value);
+                                    self.switcher.push(pkt.value.clone());
                                 },
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.id, "Receiver lagged {n}, requesting keyframe");
@@ -574,7 +573,7 @@ impl TrackReader {
                         res = active_receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    self.sequencer.push(&pkt.value);
+                                    self.switcher.push(pkt.value.clone());
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.id, "New active stream lagged {n}, completing switch anyway");
@@ -593,7 +592,7 @@ impl TrackReader {
                             match res {
                                 Ok(pkt) => {
                                     tracing::trace!(track_id = %self.id, "Forwarding fallback packet during transition");
-                                    self.sequencer.push(&pkt.value);
+                                    self.switcher.push(pkt.value.clone());
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.id, "Fallback stream lagged by {n} packets during transition. Committing to active stream.");
@@ -607,7 +606,7 @@ impl TrackReader {
                         }
                     }
 
-                    if self.sequencer.is_stable() {
+                    if self.switcher.is_stable() {
                         self.state = TrackReaderState::Streaming { active_index };
                     }
                 }

@@ -1,403 +1,286 @@
-pub mod jitter_buffer;
 pub mod monitor;
 pub mod sequencer;
+pub mod switcher;
+pub mod sync;
 
-use std::ops::{Deref, DerefMut};
-
-use str0m::{
-    media::{Frequency, MediaTime},
-    rtp::{SeqNo, Ssrc},
-};
+use str0m::media::{Frequency, MediaTime};
+use str0m::rtp::rtcp::SenderInfo;
+use str0m::rtp::{RtpHeader, SeqNo};
 use tokio::time::Instant;
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
-/// TODO: get these clocks from SDP instead
+/// TODO: get these clocks from SDP instead.
 pub const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
 pub const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub enum Codec {
+    H264,
+    VP8,
+    VP9,
+}
+
+/// Unified internal RTP packet representation used across the SFU.
+/// This struct is designed for mutability and composition in middleware.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpPacket {
-    inner: str0m::rtp::RtpPacket,
+    pub raw_header: RtpHeader,
+    pub seq_no: SeqNo,
+    pub rtp_ts: MediaTime,
+    pub arrival_ts: Instant,
+
+    /// Scheduled playout time for the packet, in the server's monotonic clock domain.
+    /// Since all streams in this process share the same monotonic clock, this time can
+    /// be compared directly between unrelated streams for scheduling or synchronization.
+    pub playout_time: Option<Instant>,
+    pub is_keyframe_start: bool,
+    pub last_sender_info: Option<SenderInfo>,
+    pub payload: Vec<u8>,
 }
 
-impl Deref for RtpPacket {
-    type Target = str0m::rtp::RtpPacket;
+impl Default for RtpPacket {
+    fn default() -> Self {
+        let header = RtpHeader {
+            sequence_number: 1,
+            timestamp: 0,
+            ssrc: 1234.into(),
+            ..RtpHeader::default()
+        };
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for RtpPacket {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl From<str0m::rtp::RtpPacket> for RtpPacket {
-    fn from(value: str0m::rtp::RtpPacket) -> Self {
-        Self { inner: value }
-    }
-}
-
-impl From<RtpPacket> for str0m::rtp::RtpPacket {
-    fn from(value: RtpPacket) -> Self {
-        value.inner
-    }
-}
-
-impl AsRef<str0m::rtp::RtpPacket> for RtpPacket {
-    fn as_ref(&self) -> &str0m::rtp::RtpPacket {
-        &self.inner
+        Self {
+            raw_header: header.clone(),
+            seq_no: SeqNo::from(header.sequence_number as u64),
+            rtp_ts: MediaTime::new(header.timestamp as u64, VIDEO_FREQUENCY),
+            arrival_ts: Instant::now(),
+            playout_time: None,
+            is_keyframe_start: false,
+            last_sender_info: None,
+            payload: vec![0u8; 1200], // 1.2KB payload for test realism
+        }
     }
 }
 
 impl RtpPacket {
-    /// Heuristically detect whether this RTP packet appears to start a full intra (keyframe).
-    ///
-    /// Notes:
-    /// - Stateless: only inspects this RTP packet.
-    /// - For H.264, detects IDR slices or the start fragment (FU-A with NAL type 5).
-    /// - For VP8/VP9, checks the "keyframe" and "start of frame" bits.
-    /// - Out-of-order packets are fine: detection is opportunistic, not sequential.
-    ///
-    /// Reference specs:
-    /// - H.264: RFC 6184 §5.2
-    /// - VP8:  RFC 7741 §4.2
-    /// - VP9:  W3C WebRTC VP9 RTP Payload Format
-    pub fn is_keyframe(&self) -> bool {
-        let payload = &self.payload;
-        if payload.is_empty() {
-            return false;
-        }
+    pub fn from_str0m(rtp: str0m::rtp::RtpPacket, codec: Codec) -> Self {
+        let is_keyframe_start = match codec {
+            Codec::H264 => is_h264_keyframe_start(&rtp.payload),
+            Codec::VP8 => is_vp8_keyframe_start(&rtp.payload),
+            Codec::VP9 => is_vp9_keyframe_start(&rtp.payload),
+        };
 
-        // TODO: add a header to define codec
-        return is_h264_keyframe_start(payload);
-        // You might have a payload type map if you know what codec is in use.
-        // But most WebRTC or RTP demuxers heuristically detect codec by payload content.
-        if looks_like_h264(payload) {
-            return is_h264_keyframe_start(payload);
+        Self {
+            raw_header: rtp.header,
+            seq_no: rtp.seq_no,
+            rtp_ts: rtp.time,
+            arrival_ts: rtp.timestamp.into(),
+            playout_time: None,
+            is_keyframe_start,
+            last_sender_info: None,
+            payload: rtp.payload,
         }
+    }
 
-        if looks_like_vp8(payload) {
-            return is_vp8_keyframe_start(payload);
-        }
-
-        if looks_like_vp9(payload) {
-            return is_vp9_keyframe_start(payload);
-        }
-
-        false
+    pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
+        self.playout_time = Some(playout_time);
+        self
     }
 }
 
-/// Roughly guess H.264 by looking for NALU start patterns.
-fn looks_like_h264(payload: &[u8]) -> bool {
-    if payload.is_empty() {
-        return false;
-    }
-    let nal_type = payload[0] & 0x1F;
-    (1..=23).contains(&nal_type) || nal_type == 28
-}
-
-/// Detects if an H264 payload is a keyframe.
-/// This code was taken from https://github.com/jech/galene/blob/codecs/rtpconn/rtpreader.go#L45
-/// All credits belong to Juliusz Chroboczek @jech and the awesome Galene SFU.
+/// Checks if an H.264 payload represents the start of a keyframe.
+///
+/// This function is hardened to prevent panics by using safe slicing and `get()`
+/// methods, ensuring it can handle malformed or unexpected RTP payloads gracefully.
+///
+/// It supports:
+/// - **Single NAL Units (SPS):** NALU type 7 is a Sequence Parameter Set, a key component of a keyframe.
+/// - **Aggregation Packets (STAP-A, STAP-B):** Scans aggregated NALUs for an SPS.
+/// - **Fragmentation Units (FU-A):** Checks if a starting fragment contains an SPS.
 fn is_h264_keyframe_start(payload: &[u8]) -> bool {
-    if payload.is_empty() {
+    let Some(first_byte) = payload.first() else {
         return false;
-    }
+    };
 
-    let nalu = payload[0] & 0x1F;
+    let nalu_type = first_byte & 0x1F;
 
-    match nalu {
-        0 => {
-            // reserved
-            false
-        }
+    match nalu_type {
+        // NALU types 1-23 are single NAL units.
         1..=23 => {
-            // Simple NALU
-            // NALU type 7 is a Sequence Parameter Set (SPS), which indicates a keyframe.
-            nalu == 7
+            // Type 7 (Sequence Parameter Set) and Type 5 (IDR Slice) are indicators of a keyframe.
+            // While SPS is the most reliable signal, IDR is also a definitive start.
+            nalu_type == 7 || nalu_type == 5
         }
-        24..=27 => {
-            // STAP-A, STAP-B, MTAP16, or MTAP24
-            let mut i = 1;
-            if nalu >= 25 {
-                // Skip DON (Decoding Order Number)
-                i += 2;
+
+        // STAP-A (24) and STAP-B (25) are aggregation packets, containing multiple NALUs.
+        24 | 25 => {
+            // We need to parse the series of NALUs within this single RTP packet.
+            // The format is: [STAP Header (1 byte)] [NALU 1 Size (2 bytes)] [NALU 1 Data] [NALU 2 Size] ...
+            let mut remaining_payload = &payload[1..];
+
+            // For STAP-B, there's an additional 16-bit DON (Decoding Order Number). Skip it.
+            if nalu_type == 25 {
+                remaining_payload = remaining_payload.get(2..).unwrap_or(&[]);
             }
 
-            while i < payload.len() {
-                if i + 2 > payload.len() {
+            while !remaining_payload.is_empty() {
+                // Each NALU is preceded by a 2-byte length field.
+                // Safely check if we have enough bytes for the length field.
+                let Some(nalu_size_bytes) = remaining_payload.get(0..2) else {
+                    // Malformed packet: not enough bytes for a NALU size.
                     return false;
-                }
-                // Read the 16-bit length of the NAL unit
-                let length = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-                i += 2;
+                };
+                let nalu_size =
+                    u16::from_be_bytes([nalu_size_bytes[0], nalu_size_bytes[1]]) as usize;
 
-                if i + length > payload.len() {
+                // Move slice past the size field.
+                remaining_payload = &remaining_payload[2..];
+
+                // Safely get the NALU data itself.
+                let Some(nalu_data) = remaining_payload.get(0..nalu_size) else {
+                    // Malformed packet: declared NALU size is larger than the remaining payload.
                     return false;
+                };
+
+                // Check the NALU type of the inner packet.
+                if let Some(nalu_header) = nalu_data.first() {
+                    let inner_nalu_type = nalu_header & 0x1F;
+                    if inner_nalu_type == 7 || inner_nalu_type == 5 {
+                        return true;
+                    }
                 }
 
-                let mut offset = 0;
-                if nalu == 26 {
-                    // MTAP16
-                    offset = 3;
-                } else if nalu == 27 {
-                    // MTAP24
-                    offset = 4;
-                }
+                // Move the slice to the start of the next NALU.
+                remaining_payload = &remaining_payload[nalu_size..];
+            }
+            false
+        }
 
-                if offset >= length {
-                    return false;
-                }
+        // FU-A (28) and FU-B (29) are for fragmentation.
+        // A large NALU is split across multiple RTP packets.
+        28 | 29 => {
+            // We need at least two bytes: [FU Indicator] + [FU Header].
+            let Some(fu_header) = payload.get(1) else {
+                return false;
+            };
 
-                let n = payload[i + offset] & 0x1F;
-                if n == 7 {
+            // The Start bit (S) must be 1 to indicate the first fragment of a NALU.
+            let is_start_fragment = (fu_header & 0x80) != 0;
+
+            if is_start_fragment {
+                // The NALU type is contained in the FU header.
+                let fragmented_nalu_type = fu_header & 0x1F;
+                if fragmented_nalu_type == 7 || fragmented_nalu_type == 5 {
                     return true;
                 }
-                // The original Go code has a debug log here for n >= 24.
-
-                i += length;
             }
-
-            // If we've processed all aggregated NALUs and found no keyframe indicator
             false
         }
-        28 | 29 => {
-            // FU-A or FU-B
-            if payload.len() < 2 {
-                return false;
-            }
-            // Check for the start bit
-            if (payload[1] & 0x80) == 0 {
-                // Not a starting fragment
-                return false;
-            }
-            // Check if the fragmented NALU type is an SPS
-            (payload[1] & 0x1F) == 7
-        }
-        _ => false, // 30, 31 are reserved or undefined
+
+        // Other NALU types are not considered keyframe starts.
+        _ => false,
     }
 }
 
-/// Rough VP8 detection — first byte pattern with 0x10 (start of partition).
-fn looks_like_vp8(payload: &[u8]) -> bool {
-    let b0 = payload[0];
-    // For VP8, bits 0..2 are usually 0b000 or 0b001 for normal streams.
-    b0 & 0b1110_0000 == 0b0000_0000 || b0 & 0b1110_0000 == 0b0010_0000
-}
-
-/// Detect if this VP8 RTP packet appears to start a keyframe.
-///
-/// VP8 RTP Payload (RFC 7741):
-/// - Bit 0 (P): 0 = keyframe, 1 = interframe.
-/// - Bit 4..7 (PartID): 0 means start of a new frame.
-/// - Optional X field may follow.
 fn is_vp8_keyframe_start(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
     }
-
     let b0 = payload[0];
-    let x_bit = (b0 & 0x80) != 0;
-    let p_bit = (b0 & 0x01) != 0; // 0 = keyframe
+    let p_bit = b0 & 0x01 != 0;
     let part_id = (b0 >> 4) & 0x0F;
-    let start_of_frame = part_id == 0;
-
-    if !start_of_frame || p_bit {
-        return false;
-    }
-
-    // Optionally skip extended control fields (rare but valid)
-    let mut idx = 1;
-    if x_bit && payload.len() > 1 {
-        let x_field = payload[idx];
-        idx += 1;
-        if x_field & 0x80 != 0 {
-            // PictureID
-            if idx >= payload.len() {
-                return false;
-            }
-            let picid = payload[idx];
-            idx += 1;
-            if picid & 0x80 != 0 {
-                idx += 1; // long PictureID
-            }
-        }
-        if x_field & 0x40 != 0 {
-            idx += 1; // TL0PICIDX
-        }
-        if x_field & 0x20 != 0 {
-            idx += 1; // TID/Y/KEYIDX
-        }
-    }
-
-    // If we reached here, it's the first packet of a keyframe
-    true
+    !p_bit && part_id == 0
 }
 
-/// Rough VP9 detection — first byte often starts with I|P|L|F|B|E|V|Z bits.
-fn looks_like_vp9(payload: &[u8]) -> bool {
-    let b0 = payload[0];
-    // I bit is MSB; P bit next. B bit marks beginning of frame.
-    (b0 & 0xE0) == 0x80 || (b0 & 0xC0) == 0x00
-}
-
-/// Detect if this VP9 RTP packet appears to start a keyframe.
-///
-/// VP9 RTP Payload:
-/// - I bit (MSB): 1 if PictureID present
-/// - P bit: 0 = keyframe, 1 = interframe
-/// - B bit: 1 = beginning of frame
 fn is_vp9_keyframe_start(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
     }
-
     let b0 = payload[0];
-    let b_bit = (b0 & 0x08) != 0; // beginning of frame
-    let p_bit = (b0 & 0x40) != 0; // inter-frame indicator (1 = inter, 0 = keyframe)
-
+    let b_bit = b0 & 0x08 != 0;
+    let p_bit = b0 & 0x40 != 0;
     b_bit && !p_bit
 }
 
-pub trait PacketTiming: Clone {
-    fn seq_no(&self) -> SeqNo;
-    fn rtp_timestamp(&self) -> MediaTime;
-    fn arrival_timestamp(&self) -> Instant;
-}
+#[cfg(test)]
+pub mod test_utils {
+    use std::time::Duration;
 
-impl PacketTiming for RtpPacket {
-    #[inline]
-    fn seq_no(&self) -> SeqNo {
-        self.inner.seq_no
-    }
+    use super::*;
 
-    #[inline]
-    fn rtp_timestamp(&self) -> MediaTime {
-        self.inner.time
-    }
-
-    #[inline]
-    fn arrival_timestamp(&self) -> Instant {
-        self.inner.timestamp.into()
-    }
-}
-
-pub trait Packet: PacketTiming {
-    /// True if this is the last packet of a video frame.
-    fn marker(&self) -> bool;
-
-    /// Heuristically detect whether this RTP packet appears to start a keyframe.
-    fn is_keyframe_start(&self) -> bool;
-
-    fn ssrc(&self) -> Ssrc;
-}
-
-impl Packet for RtpPacket {
-    #[inline]
-    fn marker(&self) -> bool {
-        self.inner.header.marker
-    }
-
-    #[inline]
-    fn is_keyframe_start(&self) -> bool {
-        self.is_keyframe()
-    }
-
-    #[inline]
-    fn ssrc(&self) -> Ssrc {
-        self.header.ssrc
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
-pub struct TimingHeader {
-    pub ssrc: Ssrc,
-    pub seq_no: SeqNo,
-    pub rtp_ts: MediaTime,
-    pub server_ts: Instant,
-    pub marker: bool,
-    pub is_keyframe: bool,
-}
-
-impl PacketTiming for TimingHeader {
-    fn seq_no(&self) -> SeqNo {
-        self.seq_no
-    }
-
-    fn rtp_timestamp(&self) -> MediaTime {
-        self.rtp_ts
-    }
-
-    fn arrival_timestamp(&self) -> Instant {
-        self.server_ts
-    }
-}
-
-impl Packet for TimingHeader {
-    fn marker(&self) -> bool {
-        self.marker
-    }
-
-    fn is_keyframe_start(&self) -> bool {
-        self.is_keyframe
-    }
-
-    fn ssrc(&self) -> Ssrc {
-        self.ssrc
-    }
-}
-
-impl Default for TimingHeader {
-    fn default() -> Self {
-        Self {
-            ssrc: 1.into(),
-            seq_no: 100.into(),
-            rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
-            marker: false,
-            is_keyframe: false,
-            server_ts: Instant::now(),
+    impl RtpPacket {
+        fn next_seq(&self) -> Self {
+            let mut new_packet = self.clone();
+            new_packet.seq_no = self.seq_no.wrapping_add(1).into();
+            new_packet.raw_header.sequence_number = *new_packet.seq_no as u16;
+            new_packet
         }
-    }
-}
 
-impl<T: Packet> From<&T> for TimingHeader {
-    fn from(value: &T) -> Self {
-        Self {
-            ssrc: value.ssrc(),
-            seq_no: value.seq_no(),
-            rtp_ts: value.rtp_timestamp(),
-            server_ts: value.arrival_timestamp(),
-            marker: value.marker(),
-            is_keyframe: value.is_keyframe_start(),
-        }
-    }
-}
+        fn next_frame(&self) -> Self {
+            let mut new_packet = self.next_seq();
 
-impl TimingHeader {
-    pub fn new(seq_no: SeqNo, rtp_ts: MediaTime, arrival_ts: Instant) -> Self {
-        Self {
-            seq_no,
-            rtp_ts,
-            server_ts: arrival_ts,
-            ..Default::default()
+            // Assuming 30fps video for test purposes.
+            let rtp_ts_delta = 90_000 / 30; // 3000 ticks per frame
+            let playout_time_delta = Duration::from_millis(1000 / 30);
+
+            new_packet.rtp_ts = MediaTime::new(
+                new_packet.rtp_ts.numer().wrapping_add(rtp_ts_delta),
+                new_packet.rtp_ts.frequency(),
+            );
+            new_packet.raw_header.timestamp = new_packet.rtp_ts.numer() as u32;
+
+            if let Some(pt) = new_packet.playout_time {
+                new_packet.playout_time = Some(pt + playout_time_delta);
+            }
+            if let Some(at) = new_packet.arrival_ts.checked_add(playout_time_delta) {
+                new_packet.arrival_ts = at;
+            }
+
+            new_packet
         }
     }
 
-    pub fn next_packet(mut self) -> Self {
-        self.seq_no = self.seq_no.wrapping_add(1).into();
-        self.marker = false;
-        self.is_keyframe = false;
-        self
+    pub type ScenarioStep = Box<dyn Fn(&RtpPacket) -> RtpPacket>;
+
+    pub fn next_seq() -> ScenarioStep {
+        Box::new(RtpPacket::next_seq)
+    }
+    pub fn next_frame() -> ScenarioStep {
+        Box::new(RtpPacket::next_frame)
+    }
+    pub fn keyframe() -> ScenarioStep {
+        Box::new(|prev| {
+            let mut next = prev.next_frame();
+            next.is_keyframe_start = true;
+            next
+        })
+    }
+    pub fn marker() -> ScenarioStep {
+        Box::new(|prev| {
+            let mut next = prev.next_seq();
+            next.raw_header.marker = true;
+            next
+        })
+    }
+    pub fn simulcast_switch(new_ssrc: u32, start_seq: u16, start_ts: u32) -> ScenarioStep {
+        Box::new(move |prev| {
+            let mut prev = prev.clone();
+            prev.raw_header.ssrc = new_ssrc.into();
+            prev.seq_no = SeqNo::from(start_seq as u64);
+            prev.rtp_ts = MediaTime::new(start_ts as u64, Frequency::NINETY_KHZ);
+            prev.raw_header.marker = false;
+            prev.is_keyframe_start = false;
+            prev
+        })
     }
 
-    pub fn next_frame(self) -> Self {
-        let mut next = self.next_packet();
-        let new_ts = next.rtp_ts.numer() + 3000;
-        next.rtp_ts = MediaTime::new(new_ts, Frequency::NINETY_KHZ);
-        next
+    /// Generates a `Vec<RtpPacket>` from a series of steps.
+    pub fn generate(initial: RtpPacket, steps: Vec<ScenarioStep>) -> Vec<RtpPacket> {
+        let mut packets = Vec::with_capacity(steps.len());
+        let mut current = initial;
+        packets.push(current.clone());
+        for step in steps {
+            current = step(&current);
+            packets.push(current.clone());
+        }
+        packets
     }
 }

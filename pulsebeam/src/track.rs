@@ -1,13 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
+use str0m::media::{Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::rtp::{
-    Packet, RtpPacket,
+    self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
+    sync::Synchronizer,
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -73,6 +74,7 @@ pub struct SimulcastSender {
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
     pub monitor: StreamMonitor,
+    synchronizer: Synchronizer,
     channel: spmc::Sender<RtpPacket>,
 
     keyframe_request_state: KeyframeRequestState,
@@ -119,8 +121,8 @@ impl SimulcastSender {
         self.forward(pkt);
     }
 
-    pub fn poll_stats(&mut self, now: Instant) {
-        self.monitor.poll(now);
+    pub fn poll_stats(&mut self, now: Instant, is_any_sibling_active: bool) {
+        self.monitor.poll(now, is_any_sibling_active);
     }
 
     pub fn poll(&mut self, now: Instant) -> Option<Instant> {
@@ -129,13 +131,16 @@ impl SimulcastSender {
 
     fn forward(&mut self, pkt: RtpPacket) {
         if let KeyframeRequestState::Debouncing { .. } = self.keyframe_request_state
-            && pkt.is_keyframe_start()
+            && pkt.is_keyframe_start
         {
             tracing::debug!("Keyframe received, cancelling pending request.");
             self.keyframe_request_state = KeyframeRequestState::Idle;
         }
+
+        // RTP Pipeline
+        let pkt = self.synchronizer.process(pkt);
         self.monitor
-            .process_packet(&pkt, pkt.payload.len() + pkt.header.header_len);
+            .process_packet(&pkt, pkt.payload.len() + pkt.raw_header.header_len);
         self.channel.send(pkt);
     }
 }
@@ -167,9 +172,22 @@ impl TrackSender {
     }
 
     pub fn poll_stats(&mut self, now: Instant) {
-        self.simulcast
-            .iter_mut()
-            .for_each(|layer| layer.poll_stats(now));
+        let total_active_streams = self
+            .simulcast
+            .iter()
+            .filter(|s| !s.monitor.shared_state().is_inactive())
+            .count();
+
+        for layer in self.simulcast.iter_mut() {
+            let is_current_layer_active = !layer.monitor.shared_state().is_inactive();
+            let is_any_sibling_active = if is_current_layer_active {
+                total_active_streams > 1
+            } else {
+                total_active_streams > 0
+            };
+
+            layer.poll_stats(now, is_any_sibling_active);
+        }
     }
 }
 
@@ -237,6 +255,11 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
         let (tx, rx) = spmc::channel(capacity);
         let (keyframe_tx, keyframe_rx) = watch::channel(None);
 
+        // TODO: get this from SDP instead
+        let clock_rate = match meta.kind {
+            MediaKind::Audio => rtp::AUDIO_FREQUENCY,
+            MediaKind::Video => rtp::VIDEO_FREQUENCY,
+        };
         let (quality, bitrate) = match (meta.kind, rid) {
             (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000),
             (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000),
@@ -258,6 +281,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
             mid,
             rid,
             quality,
+            synchronizer: Synchronizer::new(clock_rate),
             channel: tx,
             keyframe_requests: keyframe_rx,
             keyframe_request_state: KeyframeRequestState::default(),

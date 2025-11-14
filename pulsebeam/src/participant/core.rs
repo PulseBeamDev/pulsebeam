@@ -13,8 +13,8 @@ use crate::entity::{self, TrackId};
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
-use crate::rtp::{RtpPacket, TimingHeader};
-use crate::track::{self, TrackMeta, TrackReceiver};
+use crate::rtp::RtpPacket;
+use crate::track::{self, TrackReceiver};
 
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
@@ -139,14 +139,12 @@ impl ParticipantCore {
         None
     }
 
-    pub fn handle_forward_rtp(
-        &mut self,
-        track_id: Arc<TrackId>,
-        hdr: TimingHeader,
-        pkt: RtpPacket,
-    ) {
-        let Some(mid) = self.downstream_allocator.handle_rtp(&track_id, &pkt.header) else {
-            tracing::warn!(track_id = %track_id, ssrc = %pkt.header.ssrc, "Dropping RTP for inactive track");
+    pub fn handle_forward_rtp(&mut self, track_id: Arc<TrackId>, pkt: RtpPacket) {
+        let Some(mid) = self
+            .downstream_allocator
+            .handle_rtp(&track_id, &pkt.raw_header)
+        else {
+            tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for inactive track");
             return;
         };
 
@@ -162,24 +160,28 @@ impl ParticipantCore {
 
         let mut api = self.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
-            tracing::warn!(track_id = %track_id, ssrc = %pkt.header.ssrc, "Dropping RTP for invalid stream mid");
+            tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid stream mid");
             return;
         };
 
-        let inner: str0m::rtp::RtpPacket = pkt.into();
-
-        tracing::trace!("forward rtp: {}", hdr.seq_no);
+        let wallclock = pkt.playout_time.unwrap_or(pkt.arrival_ts);
+        tracing::trace!(
+            "forward rtp: seqno={},rtp_ts={:?},wallclock={:?}",
+            pkt.seq_no,
+            pkt.rtp_ts,
+            wallclock
+        );
         if let Err(err) = writer.write_rtp(
             pt,
-            hdr.seq_no,
-            hdr.rtp_ts.numer() as u32,
-            hdr.server_ts.into(),
-            inner.header.marker,
-            inner.header.ext_vals,
+            pkt.seq_no,
+            pkt.rtp_ts.numer() as u32,
+            wallclock.into(),
+            pkt.raw_header.marker,
+            pkt.raw_header.ext_vals,
             true,
-            inner.payload,
+            pkt.payload,
         ) {
-            tracing::warn!(track_id = %track_id, ssrc = %hdr.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+            tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
     }
 
@@ -189,7 +191,9 @@ impl ParticipantCore {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
-            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp.into()),
+            Event::RtpPacket(rtp) => {
+                self.handle_incoming_rtp(RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264))
+            }
             Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 let (current, desired) = self.downstream_allocator.update_bitrate(available);
@@ -247,7 +251,7 @@ impl ParticipantCore {
     fn handle_incoming_rtp(&mut self, rtp: RtpPacket) {
         tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
-        let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
+        let Some(stream) = api.stream_rx(&rtp.raw_header.ssrc) else {
             return;
         };
         let (mid, rid) = (stream.mid(), stream.rid());

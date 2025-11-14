@@ -8,12 +8,16 @@ use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
-use crate::rtp::PacketTiming;
+use crate::rtp::RtpPacket;
 
+const MAX_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(20);
+const BASE_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(6);
+const QUALITY_TRANSITION_LOCKOUT_DURATION: Duration = Duration::from_secs(4);
+const LOCKOUT_BACKOFF_FACTOR: u32 = 2;
 const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 15;
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum StreamQuality {
     Bad = 0,
@@ -65,6 +69,9 @@ pub struct StreamMonitor {
     bwe: BitrateEstimate,
 
     current_quality: StreamQuality,
+    bad_quality_lockout_until: Option<Instant>,
+    bad_quality_lockout_duration: Duration,
+    quality_transition_lockout_until: Option<Instant>,
 }
 
 impl StreamMonitor {
@@ -77,17 +84,24 @@ impl StreamMonitor {
             delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
             bwe: BitrateEstimate::new(now),
             current_quality: StreamQuality::Good,
+            bad_quality_lockout_until: None,
+            bad_quality_lockout_duration: BASE_BAD_QUALITY_LOCKOUT_DURATION,
+            quality_transition_lockout_until: None,
         }
     }
 
-    pub fn process_packet(&mut self, packet: &impl PacketTiming, size_bytes: usize) {
-        self.last_packet_at = packet.arrival_timestamp();
+    pub fn process_packet(&mut self, packet: &RtpPacket, size_bytes: usize) {
+        self.last_packet_at = packet.arrival_ts;
         self.bwe.record(size_bytes);
 
         self.delta_delta.update(packet);
     }
 
-    pub fn poll(&mut self, now: Instant) {
+    pub fn shared_state(&self) -> &StreamState {
+        &self.shared_state
+    }
+
+    pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
         self.shared_state
             .bitrate_bps
@@ -97,35 +111,120 @@ impl StreamMonitor {
         let was_inactive = self.shared_state.is_inactive();
         let is_inactive = self
             .determine_inactive_state(now, metrics.frame_duration * INACTIVE_TIMEOUT_MULTIPLIER);
-        if is_inactive && !was_inactive {
-            self.reset(now);
-        }
+
         self.shared_state
             .inactive
             .store(is_inactive, Ordering::Relaxed);
+
         if is_inactive {
+            if is_any_sibling_active {
+                // This stream is inactive, but its siblings are active. This is our
+                // heuristic for a sender-side bandwidth limitation.
+                // We mark the quality as Bad but don't reset all metrics,
+                // as it might come back online shortly.
+                if self.current_quality != StreamQuality::Bad {
+                    tracing::warn!(
+                        stream_id = %self.stream_id,
+                        "Stream inactive while siblings are active. Locking quality to Bad for {:?}.",
+                        self.bad_quality_lockout_duration,
+                    );
+                    self.current_quality = StreamQuality::Bad;
+                    self.shared_state
+                        .quality
+                        .store(StreamQuality::Bad as u8, Ordering::Relaxed);
+                    self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
+
+                    // SET THE LOCKOUT TIMER. This prevents sender from flopping
+                    self.bad_quality_lockout_until = Some(now + self.bad_quality_lockout_duration);
+                    self.bad_quality_lockout_duration = (LOCKOUT_BACKOFF_FACTOR
+                        * self.bad_quality_lockout_duration)
+                        .min(MAX_BAD_QUALITY_LOCKOUT_DURATION);
+                }
+            } else {
+                // This stream is inactive, and so are all its siblings.
+                // This is a legitimate pause. Reset if it was previously active.
+                if !was_inactive {
+                    self.reset(now);
+                }
+            }
             return;
+        }
+
+        // Enforce the lockout if the timer is active.
+        if let Some(lockout_until) = self.bad_quality_lockout_until {
+            if now < lockout_until {
+                // We are still in the lockout period. Do nothing and keep the quality as Bad.
+                // This prevents the quality from flapping back to Good.
+                return;
+            } else {
+                // The lockout has expired. Allow normal quality assessment to resume.
+                tracing::info!(stream_id = %self.stream_id, "Bad quality lockout expired.");
+                self.bad_quality_lockout_until = None;
+            }
+        }
+
+        // Enforce the quality transition lockout.
+        if let Some(lockout_until) = self.quality_transition_lockout_until {
+            if now < lockout_until {
+                // We are in a cooldown period after a quality drop. Do not assess for an upgrade.
+                return;
+            } else {
+                // Cooldown expired, clear it and allow normal assessment to proceed.
+                self.quality_transition_lockout_until = None;
+            }
         }
 
         let quality_score = metrics.calculate_jitter_score();
         let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
 
-        if new_quality != self.current_quality {
-            tracing::info!(
-                stream_id = %self.stream_id,
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
-                self.current_quality,
-                new_quality,
-                quality_score,
-                metrics.packet_loss() * 100.0,
-                metrics.m_hat,
-                Bitrate::from(self.bwe.bwe_bps_ewma),
-            );
-            self.current_quality = new_quality;
-            self.shared_state
-                .quality
-                .store(new_quality as u8, Ordering::Relaxed);
+        if new_quality == self.current_quality {
+            return;
         }
+        // A state change is proposed. Now we apply the lockout logic.
+        let is_upgrade = new_quality > self.current_quality;
+
+        if is_upgrade {
+            // This is an UPGRADE attempt. Check if we are in a quality transition lockout.
+            if let Some(lockout_until) = self.quality_transition_lockout_until {
+                if now < lockout_until {
+                    // YES. We are in a lockout. Block the upgrade and do nothing.
+                    return;
+                } else {
+                    // The lockout has expired. Clear it so the upgrade can proceed.
+                    self.quality_transition_lockout_until = None;
+                }
+            }
+        }
+
+        // If we are here, the transition is allowed. It's either:
+        // a) A downgrade (which is always permitted).
+        // b) An upgrade, but we are not in a lockout period.
+
+        // If this transition is a downgrade to Bad, set the lockout for the *next* upgrade attempt.
+        if new_quality < self.current_quality && new_quality == StreamQuality::Bad {
+            tracing::warn!(
+                stream_id = %self.stream_id,
+                "Quality downgraded to Bad. Locking future upgrades for {:?}.",
+                QUALITY_TRANSITION_LOCKOUT_DURATION
+            );
+            self.quality_transition_lockout_until = Some(now + QUALITY_TRANSITION_LOCKOUT_DURATION);
+        }
+
+        // Finally, commit the state change.
+        tracing::info!(
+            stream_id = %self.stream_id,
+            "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
+            self.current_quality,
+            new_quality,
+            quality_score,
+            metrics.packet_loss() * 100.0,
+            metrics.m_hat,
+            Bitrate::from(self.bwe.bwe_bps_ewma),
+        );
+        self.current_quality = new_quality;
+        self.shared_state
+            .quality
+            .store(new_quality as u8, Ordering::Relaxed);
     }
 
     fn reset(&mut self, now: Instant) {
@@ -133,6 +232,9 @@ impl StreamMonitor {
             stream_id = %self.stream_id,
             "Stream inactive, resetting all metrics. Quality was: {:?}", self.current_quality);
         self.delta_delta = DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE);
+        self.bad_quality_lockout_until = None;
+        self.bad_quality_lockout_duration = BASE_BAD_QUALITY_LOCKOUT_DURATION;
+        self.quality_transition_lockout_until = None;
         self.bwe = BitrateEstimate::new(now);
         self.current_quality = StreamQuality::Good;
         self.shared_state
@@ -350,11 +452,11 @@ impl DeltaDeltaState {
         }
     }
 
-    pub fn update<T: PacketTiming>(&mut self, packet: &T) {
+    pub fn update(&mut self, packet: &RtpPacket) {
         if !self.initialized {
             self.init(packet);
         }
-        let seq = packet.seq_no();
+        let seq = packet.seq_no;
 
         // Check if packet is older than tail using wrapping comparison
         let tail_val = *self.tail;
@@ -371,8 +473,8 @@ impl DeltaDeltaState {
             return;
         }
 
-        let rtp_ts = packet.rtp_timestamp();
-        let arrival = packet.arrival_timestamp();
+        let rtp_ts = packet.rtp_ts;
+        let arrival = packet.arrival_ts;
         let buffer_capacity = self.buffer.len() as u64;
 
         // Update head if this packet is beyond it
@@ -397,10 +499,10 @@ impl DeltaDeltaState {
         self.process_in_order();
     }
 
-    fn init<T: PacketTiming>(&mut self, packet: &T) {
-        let seq = packet.seq_no();
-        let rtp_ts = packet.rtp_timestamp();
-        let arrival = packet.arrival_timestamp();
+    fn init(&mut self, packet: &RtpPacket) {
+        let seq = packet.seq_no;
+        let rtp_ts = packet.rtp_ts;
+        let arrival = packet.arrival_ts;
 
         self.head = seq.wrapping_add(1).into();
         self.tail = seq;
@@ -582,25 +684,6 @@ mod test {
     const MS_PER_PACKET: u64 = 20; // 20ms per packet
     const RTP_TS_PER_PACKET: u64 = (TEST_FREQ.get() as u64 * MS_PER_PACKET) / 1000; // 1800
 
-    #[derive(Clone)]
-    struct TestPacket {
-        seq: SeqNo,
-        rtp_ts: MediaTime,
-        arrival: Instant,
-    }
-
-    impl PacketTiming for TestPacket {
-        fn seq_no(&self) -> SeqNo {
-            self.seq
-        }
-        fn rtp_timestamp(&self) -> MediaTime {
-            self.rtp_ts
-        }
-        fn arrival_timestamp(&self) -> Instant {
-            self.arrival
-        }
-    }
-
     // Helper to create a stream of test packets
     struct PacketFactory {
         start_time: Instant,
@@ -626,7 +709,7 @@ mod test {
         }
 
         // Creates a packet with a given sequence number and an optional jitter in arrival time
-        fn at(&self, seq: u64, arrival_jitter_ms: i64) -> TestPacket {
+        fn at(&self, seq: u64, arrival_jitter_ms: i64) -> RtpPacket {
             // Use wrapping arithmetic to handle overflow correctly
             let packets_since_start = seq.wrapping_sub(self.start_seq);
             let rtp_ts = self
@@ -642,10 +725,11 @@ mod test {
                     - Duration::from_millis(arrival_jitter_ms.unsigned_abs())
             };
 
-            TestPacket {
-                seq: seq.into(),
+            RtpPacket {
+                seq_no: seq.into(),
                 rtp_ts: MediaTime::new(rtp_ts, TEST_FREQ),
-                arrival: arrival_time,
+                arrival_ts: arrival_time.into(),
+                ..Default::default()
             }
         }
     }
@@ -664,8 +748,8 @@ mod test {
             "Tail should advance past the first packet"
         );
         assert_eq!(monitor.head, 2.into(), "Head should be next expected seq");
-        assert_eq!(monitor.last_rtp_ts, pkt.rtp_timestamp());
-        assert_eq!(monitor.last_arrival, pkt.arrival_timestamp());
+        assert_eq!(monitor.last_rtp_ts, pkt.rtp_ts);
+        assert_eq!(monitor.last_arrival, pkt.arrival_ts);
     }
 
     #[test]
@@ -809,7 +893,7 @@ mod test {
         monitor.update(&pkt3_dup);
         assert_eq!(
             monitor.packet(3.into()).as_ref().unwrap().arrival,
-            pkt3_dup.arrival,
+            pkt3_dup.arrival_ts,
             "Duplicate should overwrite existing packet data"
         );
 
@@ -822,7 +906,7 @@ mod test {
             "Tail should have processed up to packet 3"
         );
         assert_eq!(
-            monitor.last_arrival, pkt3_dup.arrival,
+            monitor.last_arrival, pkt3_dup.arrival_ts,
             "The monitor should have used the overwritten packet's data"
         );
     }
