@@ -12,11 +12,12 @@ use crate::rtp::RtpPacket;
 
 const MAX_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(20);
 const BASE_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(6);
+const QUALITY_TRANSITION_LOCKOUT_DURATION: Duration = Duration::from_secs(4);
 const LOCKOUT_BACKOFF_FACTOR: u32 = 2;
 const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 15;
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum StreamQuality {
     Bad = 0,
@@ -70,6 +71,7 @@ pub struct StreamMonitor {
     current_quality: StreamQuality,
     bad_quality_lockout_until: Option<Instant>,
     bad_quality_lockout_duration: Duration,
+    quality_transition_lockout_until: Option<Instant>,
 }
 
 impl StreamMonitor {
@@ -84,6 +86,7 @@ impl StreamMonitor {
             current_quality: StreamQuality::Good,
             bad_quality_lockout_until: None,
             bad_quality_lockout_duration: BASE_BAD_QUALITY_LOCKOUT_DURATION,
+            quality_transition_lockout_until: None,
         }
     }
 
@@ -160,25 +163,68 @@ impl StreamMonitor {
             }
         }
 
+        // Enforce the quality transition lockout.
+        if let Some(lockout_until) = self.quality_transition_lockout_until {
+            if now < lockout_until {
+                // We are in a cooldown period after a quality drop. Do not assess for an upgrade.
+                return;
+            } else {
+                // Cooldown expired, clear it and allow normal assessment to proceed.
+                self.quality_transition_lockout_until = None;
+            }
+        }
+
         let quality_score = metrics.calculate_jitter_score();
         let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
 
-        if new_quality != self.current_quality {
-            tracing::info!(
-                stream_id = %self.stream_id,
-                "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
-                self.current_quality,
-                new_quality,
-                quality_score,
-                metrics.packet_loss() * 100.0,
-                metrics.m_hat,
-                Bitrate::from(self.bwe.bwe_bps_ewma),
-            );
-            self.current_quality = new_quality;
-            self.shared_state
-                .quality
-                .store(new_quality as u8, Ordering::Relaxed);
+        if new_quality == self.current_quality {
+            return;
         }
+        // A state change is proposed. Now we apply the lockout logic.
+        let is_upgrade = new_quality > self.current_quality;
+
+        if is_upgrade {
+            // This is an UPGRADE attempt. Check if we are in a quality transition lockout.
+            if let Some(lockout_until) = self.quality_transition_lockout_until {
+                if now < lockout_until {
+                    // YES. We are in a lockout. Block the upgrade and do nothing.
+                    return;
+                } else {
+                    // The lockout has expired. Clear it so the upgrade can proceed.
+                    self.quality_transition_lockout_until = None;
+                }
+            }
+        }
+
+        // If we are here, the transition is allowed. It's either:
+        // a) A downgrade (which is always permitted).
+        // b) An upgrade, but we are not in a lockout period.
+
+        // If this transition is a downgrade to Bad, set the lockout for the *next* upgrade attempt.
+        if new_quality < self.current_quality && new_quality == StreamQuality::Bad {
+            tracing::warn!(
+                stream_id = %self.stream_id,
+                "Quality downgraded to Bad. Locking future upgrades for {:?}.",
+                QUALITY_TRANSITION_LOCKOUT_DURATION
+            );
+            self.quality_transition_lockout_until = Some(now + QUALITY_TRANSITION_LOCKOUT_DURATION);
+        }
+
+        // Finally, commit the state change.
+        tracing::info!(
+            stream_id = %self.stream_id,
+            "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
+            self.current_quality,
+            new_quality,
+            quality_score,
+            metrics.packet_loss() * 100.0,
+            metrics.m_hat,
+            Bitrate::from(self.bwe.bwe_bps_ewma),
+        );
+        self.current_quality = new_quality;
+        self.shared_state
+            .quality
+            .store(new_quality as u8, Ordering::Relaxed);
     }
 
     fn reset(&mut self, now: Instant) {
@@ -188,6 +234,7 @@ impl StreamMonitor {
         self.delta_delta = DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE);
         self.bad_quality_lockout_until = None;
         self.bad_quality_lockout_duration = BASE_BAD_QUALITY_LOCKOUT_DURATION;
+        self.quality_transition_lockout_until = None;
         self.bwe = BitrateEstimate::new(now);
         self.current_quality = StreamQuality::Good;
         self.shared_state
