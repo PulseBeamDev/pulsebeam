@@ -226,8 +226,8 @@ impl Switcher {
 mod tests {
     use super::*;
     use crate::rtp::{RtpPacket, VIDEO_FREQUENCY};
-    use std::time::Instant;
     use str0m::rtp::RtpHeader;
+    use tokio::time::Instant;
 
     fn create_packet(ssrc: u32, seq: u16, ts: u32, is_key: bool, marker: bool) -> RtpPacket {
         RtpPacket {

@@ -10,6 +10,9 @@ use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
 
+const MAX_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(20);
+const BASE_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(6);
+const LOCKOUT_BACKOFF_FACTOR: u32 = 2;
 const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 15;
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
@@ -65,6 +68,8 @@ pub struct StreamMonitor {
     bwe: BitrateEstimate,
 
     current_quality: StreamQuality,
+    bad_quality_lockout_until: Option<Instant>,
+    bad_quality_lockout_duration: Duration,
 }
 
 impl StreamMonitor {
@@ -77,6 +82,8 @@ impl StreamMonitor {
             delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
             bwe: BitrateEstimate::new(now),
             current_quality: StreamQuality::Good,
+            bad_quality_lockout_until: None,
+            bad_quality_lockout_duration: BASE_BAD_QUALITY_LOCKOUT_DURATION,
         }
     }
 
@@ -87,7 +94,11 @@ impl StreamMonitor {
         self.delta_delta.update(packet);
     }
 
-    pub fn poll(&mut self, now: Instant) {
+    pub fn shared_state(&self) -> &StreamState {
+        &self.shared_state
+    }
+
+    pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
         self.shared_state
             .bitrate_bps
@@ -97,14 +108,56 @@ impl StreamMonitor {
         let was_inactive = self.shared_state.is_inactive();
         let is_inactive = self
             .determine_inactive_state(now, metrics.frame_duration * INACTIVE_TIMEOUT_MULTIPLIER);
-        if is_inactive && !was_inactive {
-            self.reset(now);
-        }
+
         self.shared_state
             .inactive
             .store(is_inactive, Ordering::Relaxed);
+
         if is_inactive {
+            if is_any_sibling_active {
+                // This stream is inactive, but its siblings are active. This is our
+                // heuristic for a sender-side bandwidth limitation.
+                // We mark the quality as Bad but don't reset all metrics,
+                // as it might come back online shortly.
+                if self.current_quality != StreamQuality::Bad {
+                    tracing::warn!(
+                        stream_id = %self.stream_id,
+                        "Stream inactive while siblings are active. Locking quality to Bad for {:?}.",
+                        self.bad_quality_lockout_duration,
+                    );
+                    self.current_quality = StreamQuality::Bad;
+                    self.shared_state
+                        .quality
+                        .store(StreamQuality::Bad as u8, Ordering::Relaxed);
+                    self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
+
+                    // SET THE LOCKOUT TIMER. This prevents sender from flopping
+                    self.bad_quality_lockout_until = Some(now + self.bad_quality_lockout_duration);
+                    self.bad_quality_lockout_duration = (LOCKOUT_BACKOFF_FACTOR
+                        * self.bad_quality_lockout_duration)
+                        .min(MAX_BAD_QUALITY_LOCKOUT_DURATION);
+                }
+            } else {
+                // This stream is inactive, and so are all its siblings.
+                // This is a legitimate pause. Reset if it was previously active.
+                if !was_inactive {
+                    self.reset(now);
+                }
+            }
             return;
+        }
+
+        // Enforce the lockout if the timer is active.
+        if let Some(lockout_until) = self.bad_quality_lockout_until {
+            if now < lockout_until {
+                // We are still in the lockout period. Do nothing and keep the quality as Bad.
+                // This prevents the quality from flapping back to Good.
+                return;
+            } else {
+                // The lockout has expired. Allow normal quality assessment to resume.
+                tracing::info!(stream_id = %self.stream_id, "Bad quality lockout expired.");
+                self.bad_quality_lockout_until = None;
+            }
         }
 
         let quality_score = metrics.calculate_jitter_score();
@@ -133,6 +186,8 @@ impl StreamMonitor {
             stream_id = %self.stream_id,
             "Stream inactive, resetting all metrics. Quality was: {:?}", self.current_quality);
         self.delta_delta = DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE);
+        self.bad_quality_lockout_until = None;
+        self.bad_quality_lockout_duration = BASE_BAD_QUALITY_LOCKOUT_DURATION;
         self.bwe = BitrateEstimate::new(now);
         self.current_quality = StreamQuality::Good;
         self.shared_state

@@ -121,8 +121,8 @@ impl SimulcastSender {
         self.forward(pkt);
     }
 
-    pub fn poll_stats(&mut self, now: Instant) {
-        self.monitor.poll(now);
+    pub fn poll_stats(&mut self, now: Instant, is_any_sibling_active: bool) {
+        self.monitor.poll(now, is_any_sibling_active);
     }
 
     pub fn poll(&mut self, now: Instant) -> Option<Instant> {
@@ -172,9 +172,22 @@ impl TrackSender {
     }
 
     pub fn poll_stats(&mut self, now: Instant) {
-        self.simulcast
-            .iter_mut()
-            .for_each(|layer| layer.poll_stats(now));
+        let total_active_streams = self
+            .simulcast
+            .iter()
+            .filter(|s| !s.monitor.shared_state().is_inactive())
+            .count();
+
+        for layer in self.simulcast.iter_mut() {
+            let is_current_layer_active = !layer.monitor.shared_state().is_inactive();
+            let is_any_sibling_active = if is_current_layer_active {
+                total_active_streams > 1
+            } else {
+                total_active_streams > 0
+            };
+
+            layer.poll_stats(now, is_any_sibling_active);
+        }
     }
 }
 
