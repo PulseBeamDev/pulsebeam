@@ -519,7 +519,7 @@ mod test {
             buf: &packet.buf,
             segment_size: packet.buf.len(),
         };
-        assert!(sock.try_send_batch(&batch));
+        assert!(sock.try_send_batch(&batch).unwrap());
 
         sock.readable().await.unwrap();
         let mut storage = RecvBatchStorage::new(1);
