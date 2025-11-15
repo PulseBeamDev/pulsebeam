@@ -30,6 +30,15 @@ impl<T: Clone> RingBuffer<T> {
         self.tail
     }
 
+    /// Returns the number of sequence number slots between the tail and the head.
+    /// This represents the span of the buffer, including any empty (lost) packets.
+    pub fn len(&self) -> u64 {
+        if !self.initialized {
+            return 0;
+        }
+        self.head.wrapping_sub(self.tail)
+    }
+
     fn initialize(&mut self, seq: u64) {
         self.head = seq.wrapping_add(1);
         self.tail = seq;
@@ -478,5 +487,34 @@ mod tests {
         assert!(buffer.get_mut(12).is_some());
         assert_eq!(buffer.tail(), 10);
         assert_eq!(buffer.head(), 13);
+    }
+
+    #[test]
+    fn test_len() {
+        let mut buffer = RingBuffer::<i32>::new(10);
+        assert_eq!(buffer.len(), 0);
+
+        buffer.insert(100, 1); // tail=100, head=101
+        assert_eq!(buffer.len(), 1);
+
+        buffer.insert(101, 2); // tail=100, head=102
+        assert_eq!(buffer.len(), 2);
+
+        buffer.insert(105, 6); // tail=100, head=106
+        assert_eq!(buffer.len(), 6); // Length is the span, not the count of items
+
+        let _ = buffer.pop_front(); // tail=101, head=106
+        assert_eq!(buffer.len(), 5);
+
+        // Test wrap-around
+        let mut buffer = RingBuffer::<i32>::new(10);
+        let start_seq = u64::MAX - 1;
+        buffer.insert(start_seq, 1);
+        buffer.insert(start_seq.wrapping_add(1), 2); // u64::MAX
+        buffer.insert(start_seq.wrapping_add(2), 3); // 0
+
+        assert_eq!(buffer.tail(), start_seq);
+        assert_eq!(buffer.head(), start_seq.wrapping_add(3));
+        assert_eq!(buffer.len(), 3);
     }
 }

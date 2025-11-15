@@ -1,6 +1,7 @@
 use crate::rtp::RtpPacket;
 use pulsebeam_runtime::collections::ring::RingBuffer;
 use str0m::rtp::SeqNo;
+use tokio::time::Instant;
 
 const KEYFRAME_BUFFER_CAPACITY: usize = 256;
 
@@ -32,7 +33,7 @@ pub struct KeyframeBuffer {
     ring: RingBuffer<RtpPacket>,
     state: State,
     /// The sequence number of the keyframe that we are currently buffering or draining.
-    keyframe_start_seq: Option<SeqNo>,
+    keyframe_segment: Option<(SeqNo, Instant)>,
     /// The next sequence number we expect to pop. This is used to handle out-of-order
     /// packets and to detect and skip gaps.
     next_pop_seq: Option<SeqNo>,
@@ -49,14 +50,19 @@ impl KeyframeBuffer {
         Self {
             ring: RingBuffer::new(KEYFRAME_BUFFER_CAPACITY),
             state: State::Waiting,
-            keyframe_start_seq: None,
+            keyframe_segment: None,
             next_pop_seq: None,
         }
     }
 
     /// Returns `true` if a keyframe has been received and the buffer is ready to be drained.
-    pub fn is_ready(&self) -> bool {
-        self.state == State::Buffering || self.state == State::Draining
+    pub fn is_ready(&self, target_playout: Instant) -> bool {
+        self.state == State::Buffering
+            && self
+                .keyframe_segment
+                .map(|s| s.1 >= target_playout)
+                .unwrap_or_default()
+            || self.state == State::Draining
     }
 
     /// Adds an RTP packet to the buffer, applying state-specific logic.
@@ -65,12 +71,15 @@ impl KeyframeBuffer {
             // A new keyframe has arrived. We must handle it based on our current state.
             match self.state {
                 State::Waiting | State::Buffering => {
-                    // If we were waiting for a keyframe, or buffering an old one that
-                    // the consumer hasn't started reading yet, we reset to this new keyframe.
-                    self.ring.advance_tail_to(*pkt.seq_no); // Evict any older packets.
-                    self.keyframe_start_seq = Some(pkt.seq_no);
-                    self.next_pop_seq = Some(pkt.seq_no);
-                    self.state = State::Buffering;
+                    if *pkt.seq_no > self.ring.head() {
+                        // If we were waiting for a keyframe, or buffering an old one that
+                        // the consumer hasn't started reading yet, we reset to this new keyframe.
+                        self.ring.advance_tail_to(*pkt.seq_no); // Evict any older packets.
+                        self.keyframe_segment
+                            .replace((pkt.seq_no, pkt.playout_time));
+                        self.next_pop_seq = Some(pkt.seq_no);
+                        self.state = State::Buffering;
+                    }
                 }
                 State::Draining => {
                     // We are already draining a keyframe. We will buffer this new one,
@@ -113,8 +122,8 @@ impl KeyframeBuffer {
         let mut next_seq = self.next_pop_seq?;
 
         // Search for the next available packet, starting from `next_pop_seq`.
-        // We limit the search to the buffer's capacity to prevent infinite loops.
-        for _ in 0..KEYFRAME_BUFFER_CAPACITY {
+        // We limit the search to the buffer's len to prevent infinite loops.
+        for _ in 0..self.ring.len() {
             if let Some(pkt) = self.ring.remove(*next_seq) {
                 // Found the next packet. Update our expected sequence and return it.
                 self.next_pop_seq = Some(next_seq.wrapping_add(1).into());
