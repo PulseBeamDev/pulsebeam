@@ -82,6 +82,28 @@ impl<T: Clone> RingBuffer<T> {
         slid
     }
 
+    /// Returns a mutable reference to an item at a specific sequence number, if it exists.
+    /// This does not affect the head or tail pointers.
+    pub fn get_mut(&mut self, seq: u64) -> Option<&mut T> {
+        if !self.initialized {
+            return None;
+        }
+
+        // A sequence number `s` is within the valid range `[tail, head)` if and only if
+        // the distance from the tail to `s` is less than the distance from the tail to the head.
+        // This check correctly handles the u64 wrap-around.
+        let distance_from_tail = seq.wrapping_sub(self.tail);
+        let buffer_length = self.head.wrapping_sub(self.tail);
+
+        if distance_from_tail >= buffer_length {
+            // The sequence number is outside the valid range (either too old or too new).
+            return None;
+        }
+
+        let index = (seq % self.capacity()) as usize;
+        self.buffer[index].as_mut()
+    }
+
     /// Removes and returns an item at a specific sequence number, if it exists.
     /// This does not affect the head or tail pointers. It is useful for cherry-picking
     /// items from the buffer without advancing the read cursor (`tail`).
@@ -427,5 +449,34 @@ mod tests {
         assert_eq!(buffer.remove(start_seq.wrapping_add(3)), Some(4));
         assert_eq!(buffer.remove(start_seq.wrapping_add(2)), None);
         assert_eq!(buffer.remove(start_seq), Some(1));
+    }
+
+    #[test]
+    fn test_get_mut() {
+        let mut buffer = RingBuffer::new(10);
+        assert!(buffer.get_mut(10).is_none()); // Uninitialized
+
+        buffer.insert(10, 100); // tail=10, head=11
+        buffer.insert(12, 120); // tail=10, head=13
+
+        // Get and modify an existing item
+        if let Some(val) = buffer.get_mut(10) {
+            *val = 101;
+        }
+        assert_eq!(buffer.remove(10), Some(101));
+
+        // Get a non-existent item (gap)
+        assert!(buffer.get_mut(11).is_none());
+
+        // Get an item older than tail
+        assert!(buffer.get_mut(9).is_none());
+
+        // Get an item newer than head
+        assert!(buffer.get_mut(13).is_none());
+
+        // Ensure get_mut doesn't change state
+        assert!(buffer.get_mut(12).is_some());
+        assert_eq!(buffer.tail(), 10);
+        assert_eq!(buffer.head(), 13);
     }
 }
