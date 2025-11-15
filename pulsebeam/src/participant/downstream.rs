@@ -446,8 +446,8 @@ impl DownstreamAllocator {
     ) -> TrackStream {
         async_stream::stream! {
             let mut reader = TrackReader::new(track, control_rx);
-            while let Some(item) = reader.next_packet().await {
-                yield item;
+            while let Some(pkt) = reader.next_packet().await {
+                yield (reader.id.clone(), pkt);
             }
         }
         .boxed()
@@ -467,8 +467,13 @@ impl Stream for DownstreamAllocator {
 enum TrackReaderState {
     /// The stream is paused and waiting for a new configuration.
     Paused,
+    Resuming {
+        active_index: usize,
+    },
     /// Actively streaming from a single, stable layer.
-    Streaming { active_index: usize },
+    Streaming {
+        active_index: usize,
+    },
     /// Attempting to switch to a new layer (`active_index`) while forwarding packets
     /// from the old layer (`fallback_index`) until the new one becomes active.
     Transitioning {
@@ -483,9 +488,9 @@ pub struct TrackReader {
     track: TrackReceiver,
     control_rx: watch::Receiver<StreamConfig>,
 
+    switcher: Switcher,
     state: TrackReaderState,
     config: StreamConfig,
-    switcher: Switcher,
 }
 
 impl TrackReader {
@@ -495,14 +500,13 @@ impl TrackReader {
             MediaKind::Audio => rtp::AUDIO_FREQUENCY,
             MediaKind::Video => rtp::VIDEO_FREQUENCY,
         };
-        let switcher = Switcher::new(clock_rate);
         let mut this = Self {
             id: track.meta.id.clone(),
             track,
             control_rx,
+            switcher: Switcher::new(clock_rate),
             state: TrackReaderState::Paused,
             config,
-            switcher,
         };
         // seed initial state
         this.update_state(config);
@@ -510,11 +514,11 @@ impl TrackReader {
     }
 
     /// Poll for the next RTP packet, handling fallback and layer switching.
-    pub async fn next_packet(&mut self) -> Option<TrackStreamItem> {
+    pub async fn next_packet(&mut self) -> Option<RtpPacket> {
         loop {
             self.maybe_update_state();
             if let Some(pkt) = self.switcher.pop() {
-                return Some((self.id.clone(), pkt));
+                return Some(pkt);
             }
 
             match self.state {
@@ -522,6 +526,37 @@ impl TrackReader {
                     // While paused, the only thing we can do is wait for the configuration to change.
                     if self.control_rx.changed().await.is_err() {
                         return None;
+                    }
+                }
+                TrackReaderState::Resuming { active_index } => {
+                    let receiver = &mut self.track.simulcast[active_index];
+                    tokio::select! {
+                        biased;
+
+                        res = self.control_rx.changed() => {
+                            if res.is_err() { return None; }
+                            continue; // Re-evaluate state on next loop iteration
+                        },
+
+                        res = receiver.channel.recv() => {
+                            match res {
+                                Ok(pkt) => {
+                                    self.switcher.stage(pkt.value.clone());
+                                },
+                                Err(spmc::RecvError::Lagged(n)) => {
+                                    tracing::warn!(track_id = %self.id, "Receiver lagged {n}, requesting keyframe");
+                                    receiver.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                                }
+                                Err(spmc::RecvError::Closed) => {
+                                    tracing::warn!(track_id = %self.id, "Channel closed, ending stream");
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+
+                    if self.switcher.is_ready() {
+                        self.state = TrackReaderState::Streaming { active_index };
                     }
                 }
                 TrackReaderState::Streaming { active_index } => {
@@ -573,7 +608,7 @@ impl TrackReader {
                         res = active_receiver.channel.recv() => {
                             match res {
                                 Ok(pkt) => {
-                                    self.switcher.push(pkt.value.clone());
+                                    self.switcher.stage(pkt.value.clone());
                                 }
                                 Err(spmc::RecvError::Lagged(n)) => {
                                     tracing::warn!(track_id = %self.id, "New active stream lagged {n}, completing switch anyway");
@@ -606,7 +641,7 @@ impl TrackReader {
                         }
                     }
 
-                    if self.switcher.is_stable() {
+                    if self.switcher.is_ready() {
                         self.state = TrackReaderState::Streaming { active_index };
                     }
                 }
@@ -640,8 +675,16 @@ impl TrackReader {
         // Determine the next state based on the current state and the new config.
         let next_state = match self.state {
             TrackReaderState::Paused => new_active_index
-                .map(|idx| TrackReaderState::Streaming { active_index: idx })
+                .map(|idx| TrackReaderState::Resuming { active_index: idx })
                 .unwrap_or(TrackReaderState::Paused),
+            TrackReaderState::Resuming { active_index } => match new_active_index {
+                // TODO: double check if this is safe to resume to a different index here
+                Some(new_idx) if new_idx != active_index => {
+                    TrackReaderState::Resuming { active_index }
+                }
+                Some(_) => self.state,
+                None => TrackReaderState::Paused,
+            },
             TrackReaderState::Streaming { active_index } => {
                 match new_active_index {
                     Some(new_idx) if new_idx != active_index => TrackReaderState::Transitioning {
@@ -670,14 +713,20 @@ impl TrackReader {
         if self.state != next_state {
             tracing::debug!(track_id = %self.id, "TrackReader state changed from {:?} to {:?}", self.state, next_state);
 
-            match (self.state, next_state) {
-                (
-                    _,
-                    TrackReaderState::Transitioning {
-                        active_index,
-                        fallback_index,
-                    },
-                ) => {
+            match next_state {
+                TrackReaderState::Resuming { active_index } => {
+                    let active_receiver = &mut self.track.simulcast[active_index];
+                    active_receiver.channel.reset();
+                    active_receiver.request_keyframe(KeyframeRequestKind::Fir);
+                    tracing::info!(track_id = %self.id,
+                        "resuming simulcast layer: {:?}",
+                        active_receiver.rid
+                    );
+                }
+                TrackReaderState::Transitioning {
+                    active_index,
+                    fallback_index,
+                } => {
                     let fallback_receiver_rid = { self.track.simulcast[fallback_index].rid };
                     let active_receiver = &mut self.track.simulcast[active_index];
                     active_receiver.channel.reset();
@@ -685,15 +734,6 @@ impl TrackReader {
                     tracing::info!(track_id = %self.id,
                         "switch simulcast layer: {:?} -> {:?}",
                         fallback_receiver_rid, active_receiver.rid
-                    );
-                }
-                (TrackReaderState::Paused, TrackReaderState::Streaming { active_index }) => {
-                    let active_receiver = &mut self.track.simulcast[active_index];
-                    active_receiver.channel.reset();
-                    active_receiver.request_keyframe(KeyframeRequestKind::Fir);
-                    tracing::info!(track_id = %self.id,
-                        "resuming simulcast layer: {:?}",
-                        active_receiver.rid
                     );
                 }
                 _ => {}

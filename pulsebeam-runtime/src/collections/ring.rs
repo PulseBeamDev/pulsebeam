@@ -82,6 +82,30 @@ impl<T: Clone> RingBuffer<T> {
         slid
     }
 
+    /// Removes and returns an item at a specific sequence number, if it exists.
+    /// This does not affect the head or tail pointers. It is useful for cherry-picking
+    /// items from the buffer without advancing the read cursor (`tail`).
+    pub fn remove(&mut self, seq: u64) -> Option<T> {
+        if !self.initialized {
+            return None;
+        }
+
+        // A sequence number `s` is within the valid range `[tail, head)` if and only if
+        // the distance from the tail to `s` is less than the distance from the tail to the head.
+        // This check correctly handles the u64 wrap-around.
+        let distance_from_tail = seq.wrapping_sub(self.tail);
+        let buffer_length = self.head.wrapping_sub(self.tail);
+
+        if distance_from_tail >= buffer_length {
+            // The sequence number is outside the valid range (either too old or too new).
+            return None;
+        }
+
+        // The sequence number is within our valid range, so we can calculate the index.
+        let index = (seq % self.capacity()) as usize;
+        self.buffer[index].take()
+    }
+
     /// Takes the item at the current tail, advancing the tail if successful.
     pub fn pop_front(&mut self) -> Option<T> {
         if self.tail == self.head {
@@ -357,5 +381,51 @@ mod tests {
         assert_eq!(buffer.tail(), 2);
 
         assert_eq!(buffer.pop_front(), None);
+    }
+
+    #[test]
+    fn test_remove() {
+        let mut buffer = RingBuffer::new(10);
+        buffer.insert(10, 100); // tail=10, head=11
+        buffer.insert(12, 120); // tail=10, head=13
+
+        // Remove an existing item
+        assert_eq!(buffer.remove(10), Some(100));
+        // The buffer should now contain a None at that position
+        assert!(buffer.buffer[(10 % 10) as usize].is_none());
+        // Pointers should be unchanged
+        assert_eq!(buffer.tail(), 10);
+        assert_eq!(buffer.head(), 13);
+
+        // Try to remove it again
+        assert_eq!(buffer.remove(10), None);
+
+        // Remove another existing item
+        assert_eq!(buffer.remove(12), Some(120));
+        assert!(buffer.buffer[(12 % 10) as usize].is_none());
+
+        // Try to remove an item that was never there (a gap)
+        assert_eq!(buffer.remove(11), None);
+
+        // Try to remove an item older than tail
+        assert_eq!(buffer.remove(9), None);
+
+        // Try to remove an item that is at or newer than head
+        assert_eq!(buffer.remove(13), None);
+        assert_eq!(buffer.remove(14), None);
+
+        // Test remove on wrap around
+        let mut buffer = RingBuffer::new(10);
+        let start_seq = u64::MAX - 2;
+        buffer.insert(start_seq, 1);
+        buffer.insert(start_seq.wrapping_add(1), 2);
+        buffer.insert(start_seq.wrapping_add(3), 4); // seq=0
+
+        assert_eq!(buffer.tail(), start_seq);
+        assert_eq!(buffer.head(), start_seq.wrapping_add(4)); // seq=1
+
+        assert_eq!(buffer.remove(start_seq.wrapping_add(3)), Some(4));
+        assert_eq!(buffer.remove(start_seq.wrapping_add(2)), None);
+        assert_eq!(buffer.remove(start_seq), Some(1));
     }
 }

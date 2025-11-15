@@ -3,6 +3,7 @@ pub mod monitor;
 pub mod sequencer;
 pub mod switcher;
 pub mod sync;
+pub mod timeline;
 
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::rtcp::SenderInfo;
