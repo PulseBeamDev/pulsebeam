@@ -22,8 +22,8 @@ DOWNLOAD ?= 2mbit
 JITTER ?= 10ms
 CORRUPTION ?= 0%
 DUPLICATE_PROB ?= 0%
-REORDER_PROB  := 25%
-REORDER_CORR  := 50%
+REORDER_PROB  := 0%
+REORDER_CORR  := 0%
 
 
 # --- Targets ---
@@ -188,6 +188,14 @@ net-lte-1bar:
 		REORDER_PROB="5%" \
 		REORDER_CORR="50%" \
 		DUPLICATE_PROB="0.1%"
+
+net-high-latency:
+	@$(MAKE) net-apply \
+		LATENCY="160ms" \
+		JITTER="75ms" \
+		PACKET_LOSS="1%" \
+		UPLOAD="1mbit" \
+		DOWNLOAD="4mbit"
 
 # Simulates a mobile connection while moving or with a weak signal, causing intermittent loss and high jitter.
 net-unstable-mobile:
