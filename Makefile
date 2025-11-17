@@ -21,6 +21,7 @@ UPLOAD ?= 1mbit
 DOWNLOAD ?= 2mbit
 JITTER ?= 10ms
 CORRUPTION ?= 0%
+DUPLICATE_PROB ?= 0%
 REORDER_PROB  := 25%
 REORDER_CORR  := 50%
 
@@ -114,26 +115,29 @@ net-apply: net-verify net-clear
 	@echo "Applying BAD NETWORK simulation to $(IFACE)"
 	@echo "  Latency:      $(LATENCY) ± $(JITTER)"
 	@echo "  Packet Loss:  $(PACKET_LOSS)"
-	@echo "  Reordering:   $(REORDER_PROB) with $(REORDER_CORR) correlation" # <-- New line
+	@echo "  Corruption:   $(CORRUPTION)"
+	@echo "  Duplication:  $(DUPLICATE_PROB)"
+	@echo "  Reordering:   $(REORDER_PROB) with $(REORDER_CORR) correlation"
 	@echo "  Upload:       $(UPLOAD)"
 	@echo "  Download:     $(DOWNLOAD)"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	# ... your modprobe and ip link setup ...
 	@echo "→ Applying egress (upload) rules to $(IFACE)..."
 	@sudo tc qdisc add dev $(IFACE) root netem \
 		delay $(LATENCY) $(JITTER) \
 		loss $(PACKET_LOSS) \
 		corrupt $(CORRUPTION) \
+		duplicate $(DUPLICATE_PROB) \
 		rate $(UPLOAD) \
-		reorder $(REORDER_PROB) $(REORDER_CORR) # <-- MODIFIED LINE
+		reorder $(REORDER_PROB) $(REORDER_CORR)
 
 	@echo "→ Applying ingress (download) rules to $(IFB_IFACE)..."
 	@sudo tc qdisc add dev $(IFB_IFACE) root netem \
 		delay $(LATENCY) $(JITTER) \
 		loss $(PACKET_LOSS) \
 		corrupt $(CORRUPTION) \
+		duplicate $(DUPLICATE_PROB) \
 		rate $(DOWNLOAD) \
-		reorder $(REORDER_PROB) $(REORDER_CORR) # <-- MODIFIED LINE
+		reorder $(REORDER_PROB) $(REORDER_CORR)
 	@echo ""
 	@echo "✓ Bad network simulation is ACTIVE (both directions)"
 	@echo "  Run 'make net-clear' to restore normal network"
@@ -173,6 +177,17 @@ net-stable-mobile:
 		DOWNLOAD="40mbit" \
 		REORDER_PROB="1%" \
 		REORDER_CORR="25%"
+
+net-lte-1bar:
+	@$(MAKE) net-apply \
+		LATENCY="60ms" \
+		JITTER="75ms" \
+		PACKET_LOSS="1.6%" \
+		UPLOAD="1mbit" \
+		DOWNLOAD="4mbit" \
+		REORDER_PROB="5%" \
+		REORDER_CORR="50%" \
+		DUPLICATE_PROB="0.1%"
 
 # Simulates a mobile connection while moving or with a weak signal, causing intermittent loss and high jitter.
 net-unstable-mobile:
