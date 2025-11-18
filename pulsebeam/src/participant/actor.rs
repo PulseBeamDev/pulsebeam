@@ -1,6 +1,7 @@
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use futures::stream::SelectAll;
 use once_cell::sync::Lazy;
 use pulsebeam_runtime::{actor, mailbox, net, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
@@ -77,6 +78,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ))
             .await;
         let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
+        let slot_selector = SelectAll::new();
+        slot_selector.push(&mut self.core.downstream_allocator.video_slots[0]);
 
         loop {
             let Some(deadline) = self.core.poll_rtc() else {

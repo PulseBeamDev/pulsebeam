@@ -22,7 +22,7 @@ pub struct DownstreamAllocator {
     streams: SelectAll<SlotStream>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<Slot>,
-    video_slots: Vec<Slot>,
+    pub video_slots: Vec<Slot>,
     available_bandwidth: BitrateController,
     ticks: u32,
 }
