@@ -14,7 +14,7 @@ const MAX_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(20);
 const BASE_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(6);
 const QUALITY_TRANSITION_LOCKOUT_DURATION: Duration = Duration::from_secs(4);
 const LOCKOUT_BACKOFF_FACTOR: u32 = 2;
-const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 15;
+const INACTIVE_TIMEOUT_MULTIPLIER: u32 = 10;
 const DELTA_DELTA_WINDOW_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

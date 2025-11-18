@@ -43,8 +43,8 @@ pub struct TrackMeta {
 #[derive(Clone, Debug)]
 pub struct SimulcastReceiver {
     pub meta: Arc<TrackMeta>,
-    pub quality: SimulcastQuality,
     pub rid: Option<Rid>,
+    pub quality: SimulcastQuality,
     pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: watch::Sender<Option<KeyframeRequestKind>>,
     pub state: StreamState,

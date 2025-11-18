@@ -3,6 +3,7 @@ use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwapOption;
 use crossbeam_utils::CachePadded;
 use std::fmt::Debug;
+use std::task::{Context, Poll};
 use tokio::sync::Notify;
 
 /// Errors returned by a receiver.
@@ -158,23 +159,28 @@ pub struct Receiver<T: Send + Sync> {
 }
 
 impl<T: Send + Sync> Receiver<T> {
-    pub async fn recv(&mut self) -> Result<Arc<Slot<T>>, RecvError> {
-        loop {
-            match self.ring.get_next(&mut self.next_seq) {
-                Ok(Some(slot)) => return Ok(slot),
-                Err(e) => return Err(e),
-                Ok(None) => {}
-            }
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<Slot<T>>, RecvError>> {
+        match self.ring.get_next(&mut self.next_seq) {
+            Ok(Some(slot)) => return Poll::Ready(Ok(slot)),
+            Err(e) => return Poll::Ready(Err(e)),
+            Ok(None) => {}
+        }
 
-            let notified = self.ring.notify.notified();
+        let notified = self.ring.notify.notified();
+        tokio::pin!(notified);
 
-            // Double-check before awaiting.
-            match self.ring.get_next(&mut self.next_seq) {
-                Ok(Some(slot)) => return Ok(slot),
-                Err(e) => return Err(e),
-                Ok(None) => notified.await,
+        match self.ring.get_next(&mut self.next_seq) {
+            Ok(Some(slot)) => Poll::Ready(Ok(slot)),
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(None) => {
+                let _ = notified.poll(cx);
+                Poll::Pending
             }
         }
+    }
+
+    pub async fn recv(&mut self) -> Result<Arc<Slot<T>>, RecvError> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
     pub fn try_recv(&mut self) -> Result<Option<Arc<Slot<T>>>, RecvError> {
