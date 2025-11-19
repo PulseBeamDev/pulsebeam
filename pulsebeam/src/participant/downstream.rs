@@ -1,9 +1,10 @@
 use crate::participant::bitrate::BitrateController;
-use crate::rtp::monitor::StreamQuality;
+use crate::rtp::monitor::{StreamQuality, StreamState};
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use futures::stream::{Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,14 +12,14 @@ use std::task::ready;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
-use str0m::rtp::RtpHeader;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastQuality, SimulcastReceiver, TrackReceiver};
 
 pub struct DownstreamAllocator {
-    tracks: HashMap<Arc<TrackId>, TrackState>,
+    audio_tracks: HashMap<Arc<TrackId>, TrackState>,
+    video_tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<Slot>,
     video_slots: Vec<Slot>,
     available_bandwidth: BitrateController,
@@ -29,7 +30,8 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new() -> Self {
         Self {
-            tracks: HashMap::new(),
+            audio_tracks: HashMap::new(),
+            video_tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
 
@@ -40,24 +42,43 @@ impl DownstreamAllocator {
     }
 
     pub fn add_track(&mut self, track: TrackReceiver) {
-        if self.tracks.contains_key(&track.meta.id) {
-            return;
-        }
+        match track.meta.kind {
+            MediaKind::Audio => {
+                if self.audio_tracks.contains_key(&track.meta.id) {
+                    return;
+                }
 
-        self.tracks.insert(
-            track.meta.id.clone(),
-            TrackState {
-                track,
-                audio_level: AudioLevel(-127),
-                assigned_mid: None,
-            },
-        );
-        self.rebalance_assignments();
+                self.audio_tracks.insert(
+                    track.meta.id.clone(),
+                    TrackState {
+                        track,
+                        assigned_mid: None,
+                    },
+                );
+                self.rebalance_audio();
+            }
+            MediaKind::Video => {
+                if self.video_tracks.contains_key(&track.meta.id) {
+                    return;
+                }
+
+                self.video_tracks.insert(
+                    track.meta.id.clone(),
+                    TrackState {
+                        track,
+                        assigned_mid: None,
+                    },
+                );
+                self.rebalance_video();
+            }
+        }
     }
 
     pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
-        if self.tracks.remove(track_id).is_some() {
-            self.rebalance_assignments();
+        if self.audio_tracks.remove(track_id).is_some() {
+            self.rebalance_audio();
+        } else if self.video_tracks.remove(track_id).is_some() {
+            self.rebalance_video();
         }
     }
 
@@ -111,26 +132,23 @@ impl DownstreamAllocator {
             total_allocated = 0.0;
             total_desired = 0.0;
 
-            for slot in &self.video_slots {
-                let Some(track_id) = &slot.assigned_track else {
+            for slot in &mut self.video_slots {
+                let Some(current_receiver) = slot.target_receiver() else {
                     continue;
                 };
 
-                let Some(state) = self.tracks.get_mut(track_id) else {
+                let Some(state) = self.video_tracks.get_mut(&current_receiver.meta.id) else {
                     continue;
                 };
 
+                let mut target_receiver = current_receiver;
                 let track = &state.track;
-                let mut config = state.current();
+                let paused = slot.is_paused();
 
                 // If paused, initialize to lowest quality
-                if config.paused {
-                    config.target_rid = track.lowest_quality().rid;
+                if paused {
+                    target_receiver = track.lowest_quality();
                 }
-
-                let Some(current_receiver) = track.by_rid(&config.target_rid) else {
-                    continue;
-                };
 
                 let desired = if current_receiver.state.is_inactive() {
                     // very likely the sender can't keep up with sending higher resolution.
@@ -165,13 +183,11 @@ impl DownstreamAllocator {
                 total_desired += desired_bitrate;
 
                 if total_allocated + desired_bitrate <= budget
-                    && (config.paused || desired.rid != current_receiver.rid)
+                    && (paused || desired.rid != current_receiver.rid)
                 {
                     upgraded = true;
                     total_allocated += desired.state.bitrate_bps();
-                    config.target_rid = desired.rid;
-                    config.paused = false;
-                    state.update(|c| *c = config);
+                    slot.switch_to(target_receiver.clone());
                 } else {
                     // Can't afford upgrade or change - stay at current
                     total_allocated += current_receiver.state.bitrate_bps();
@@ -202,36 +218,7 @@ impl DownstreamAllocator {
             tracing::warn!(?req, "no video slot found for keyframe request");
             return;
         };
-        let Some(track) = &slot.assigned_track else {
-            tracing::warn!(?req, "no assigned track, ignore keyframe request");
-            return;
-        };
-        let Some(state) = self.tracks.get(track) else {
-            tracing::warn!(?req, "no track state found, ignore keyframe request");
-            return;
-        };
-        state.request_keyframe(req.kind);
-    }
-
-    pub fn handle_rtp(&mut self, track_id: &TrackId, hdr: &RtpHeader) -> Option<Mid> {
-        let assigned_mid = self.tracks.get(track_id).and_then(|s| s.assigned_mid);
-
-        let mut needs_rebalance = false;
-        if let Some(track_state) = self.tracks.get_mut(track_id) {
-            if track_state.track.meta.kind == MediaKind::Audio {
-                let new_level = hdr.ext_vals.audio_level.unwrap_or(-127);
-                if track_state.audio_level.0 != new_level as i32 {
-                    track_state.audio_level = AudioLevel(new_level as i32);
-                    needs_rebalance = true;
-                }
-            }
-        }
-
-        if needs_rebalance {
-            self.rebalance_assignments();
-        }
-
-        assigned_mid
+        slot.request_keyframe(req.kind);
     }
 
     fn rebalance_assignments(&mut self) {
@@ -239,116 +226,74 @@ impl DownstreamAllocator {
         self.rebalance_video();
     }
 
-    fn rebalance_audio(&mut self) {
-        let mut audio_tracks: Vec<_> = self
-            .tracks
-            .iter()
-            .filter(|(_, state)| state.track.meta.kind == MediaKind::Audio)
-            .map(|(id, state)| (id.clone(), state.audio_level))
-            .collect();
-        audio_tracks.sort_unstable_by_key(|k| k.1);
-
-        let active_speakers: HashMap<_, _> = audio_tracks
-            .into_iter()
-            .take(self.audio_slots.len())
-            .map(|(id, _)| (id, ()))
-            .collect();
-
-        for slot in &mut self.audio_slots {
-            if let Some(track_id) = slot.assigned_track.as_ref() {
-                if !active_speakers.contains_key(track_id) {
-                    Self::perform_unassignment(&mut self.tracks, slot);
-                }
-            }
-        }
-
-        let mut speakers_to_assign: Vec<_> = active_speakers
-            .keys()
-            .filter(|id| {
-                self.tracks
-                    .get(*id)
-                    .map_or(false, |s| s.assigned_mid.is_none())
-            })
-            .cloned()
-            .collect();
-
-        for slot in &mut self.audio_slots {
-            if slot.assigned_track.is_none() {
-                if let Some(track_id) = speakers_to_assign.pop() {
-                    Self::perform_assignment(&mut self.tracks, slot, &track_id);
-                }
-            }
-        }
-    }
+    fn rebalance_audio(&mut self) {}
 
     fn rebalance_video(&mut self) {
-        let mut unassigned_tracks: Vec<_> = self
-            .tracks
-            .iter()
-            .filter(|(_, state)| {
-                state.track.meta.kind == MediaKind::Video && state.assigned_mid.is_none()
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let mut unassigned_tracks = self.video_tracks.iter_mut().filter(|(_, state)| {
+            assert!(state.track.meta.kind.is_video());
+            state.assigned_mid.is_none()
+        });
 
         for slot in &mut self.video_slots {
-            if let Some(track_id) = &slot.assigned_track {
-                if !self.tracks.contains_key(track_id) {
-                    Self::perform_unassignment(&mut self.tracks, slot);
-                    slot.assigned_track = None;
-                }
-            } else {
-                if let Some(track_id) = unassigned_tracks.pop() {
-                    Self::perform_assignment(&mut self.tracks, slot, &track_id);
-                    slot.assigned_track = Some(track_id);
-                }
+            if !slot.is_idle() {
+                continue;
             }
+
+            let Some(next_track) = unassigned_tracks.next() else {
+                break;
+            };
+
+            next_track.1.assigned_mid.replace(slot.mid);
+            slot.switch_to(next_track.1.track.lowest_quality().clone());
         }
     }
+}
 
-    fn perform_assignment(
-        tracks: &mut HashMap<Arc<TrackId>, TrackState>,
-        slot: &mut SlotState,
-        track_id: &Arc<TrackId>,
-    ) {
-        if let Some(state) = tracks.get_mut(track_id) {
-            slot.assigned_track = Some(track_id.clone());
-            state.assigned_mid = Some(slot.mid);
-            state.update(|c| {
-                c.paused = false;
-            });
-            tracing::info!(
-                %track_id,
-                mid = %slot.mid,
-                kind = ?state.track.meta.kind,
-                "Assigned track to slot"
-            );
+fn compare_audio(a: &StreamState, b: &StreamState) -> Ordering {
+    // Thresholds for stability
+    const SPEECH_THRESHOLD: f32 = 0.01; // Minimum envelope to count as "talking"
+    const ENVELOPE_EPSILON: f32 = 0.05; // 5% diff required to swap active speakers
+    const SILENCE_EPSILON_MS: u128 = 500; // 500ms diff required to swap silent speakers
+
+    let env_a = a.audio_envelope();
+    let env_b = b.audio_envelope();
+    let silence_a = a.silence_duration();
+    let silence_b = b.silence_duration();
+
+    let a_is_talking = env_a > SPEECH_THRESHOLD;
+    let b_is_talking = env_b > SPEECH_THRESHOLD;
+
+    // 1. BINARY PRIORITY: Active Speaker > Silent User
+    if a_is_talking != b_is_talking {
+        return if a_is_talking {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+
+    // 2. MOMENTUM: Compare Intensity (if both active)
+    if a_is_talking && b_is_talking {
+        let diff = (env_a - env_b).abs();
+        if diff > ENVELOPE_EPSILON {
+            // Significant difference: Louder wins
+            return env_b.partial_cmp(&env_a).unwrap();
         }
+        // If difference is small (< 5%), treat as tied and fall through to Recency
     }
 
-    fn perform_unassignment(tracks: &mut HashMap<Arc<TrackId>, TrackState>, slot: &mut SlotState) {
-        if let Some(track_id) = slot.assigned_track.take() {
-            if let Some(state) = tracks.get_mut(&track_id) {
-                state.assigned_mid = None;
-                state.update(|c| {
-                    c.paused = true;
-                });
-                tracing::info!(
-                    %track_id,
-                    mid = %slot.mid,
-                    kind = ?state.track.meta.kind,
-                    "Unassigned track from slot"
-                );
-            }
-        }
+    // 3. RECENCY: Compare Silence Duration (Who spoke last?)
+    let ms_a = silence_a.as_millis();
+    let ms_b = silence_b.as_millis();
+    let diff_ms = ms_a.abs_diff(ms_b);
+
+    if diff_ms > SILENCE_EPSILON_MS {
+        // Significant difference: More recent (lower duration) wins
+        return ms_a.cmp(&ms_b);
     }
 
-    fn find_default_rid(simulcast: &[SimulcastReceiver]) -> Option<Rid> {
-        simulcast
-            .iter()
-            .find(|s| s.rid.is_none() || s.rid.unwrap().starts_with('q'))
-            .and_then(|s| s.rid)
-    }
+    // 4. TIE: Effectively identical audio state
+    Ordering::Equal
 }
 
 impl Stream for DownstreamAllocator {
@@ -393,14 +338,9 @@ impl Stream for DownstreamAllocator {
     }
 }
 
-/// Used for comparing and sorting active speakers.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct AudioLevel(i32);
-
 #[derive(Debug)]
 struct TrackState {
     track: TrackReceiver,
-    audio_level: AudioLevel,
     assigned_mid: Option<Mid>,
 }
 
@@ -498,6 +438,14 @@ impl Slot {
                 staging: receiver,
             },
         };
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self.state, SlotState::Idle | SlotState::Paused { .. })
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, SlotState::Idle)
     }
 
     pub fn stop(&mut self) {

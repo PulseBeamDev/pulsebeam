@@ -142,6 +142,14 @@ impl StreamMonitor {
         self.bwe.record(size_bytes);
 
         self.delta_delta.update(packet);
+        if let Some(audio_monitor) = self.audio_monitor.as_mut() {
+            let ext = &packet.raw_header.ext_vals;
+            audio_monitor.process_packet(
+                packet.arrival_ts,
+                ext.voice_activity.unwrap_or_default(),
+                ext.audio_level.unwrap_or_default(),
+            );
+        }
     }
 
     pub fn shared_state(&self) -> &StreamState {
@@ -739,7 +747,11 @@ impl DeltaDeltaState {
 /// Tuning constants for the "Leaky Integrator"
 const AUDIO_ATTACK_RATE: f32 = 0.2; // How fast we react to new speech (0.0-1.0)
 const AUDIO_DECAY_RATE: f32 = 0.05; // How fast we fade out (keeps user in Top-N during pauses)
-const NOISE_THRESHOLD_DBOV: u8 = 50; // Ignore sounds quieter than -50dBov (127=quiet, 0=loud)
+
+// Anything quieter than -50dB is considered background noise and clipped to 0.0.
+const NOISE_THRESHOLD_DB: i8 = -50;
+// The theoretical floor for silence in this integer scale (-127dB).
+const SILENCE_DB_FLOOR: f32 = -127.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AudioDerivedMetrics {
@@ -775,11 +787,11 @@ impl AudioMonitor {
         }
     }
 
-    /// Process an RFC 6464 Audio Level header extension.
+    /// Process audio level.
     ///
     /// * `vad_bit`: True if the encoder detects voice.
-    /// * `level`: 0 (max volume) to 127 (silence).
-    pub fn process_packet(&mut self, now: Instant, vad_bit: bool, level: u8) {
+    /// * `level`: i8 dBov. 0 is Max, -30 is normal, -127 is silence.
+    pub fn process_packet(&mut self, now: Instant, vad_bit: bool, level: i8) {
         // 1. Calculate time delta for frame-independent decay
         // (Assuming roughly 20ms packets, but handling jitter/loss)
         let dt_secs = now
@@ -787,19 +799,19 @@ impl AudioMonitor {
             .as_secs_f32();
         self.last_packet_at = now;
 
-        // 2. Normalize Level: 0.0 (Silence) -> 1.0 (Max Volume)
-        // RFC 6464: 127 is silence, 0 is max.
-        // We clip anything below NOISE_THRESHOLD_DBOV to 0.0 to ignore background hum.
-        let raw_vol = if level > (127 - NOISE_THRESHOLD_DBOV) {
+        // 2. Normalize Level
+        // Range: -127 (Silence) -> 0 (Max).
+        // We clip anything below NOISE_THRESHOLD_DB (-50) to 0.0.
+        let raw_vol = if level < NOISE_THRESHOLD_DB {
             0.0
         } else {
-            // Invert logic: 127 - level gives us 0..127 where 127 is loud
-            (127 - level) as f32 / 127.0
+            // Normalize linear range [-127, 0] to [0.0, 1.0]
+            // Example: -30dB -> (-30 - (-127)) / 127 = 97/127 = ~0.76
+            (level as f32 - SILENCE_DB_FLOOR) / (0.0 - SILENCE_DB_FLOOR)
         };
 
         // 3. Update "Last Speech" Timer
         // We require BOTH the VAD bit AND significant volume.
-        // This filters out "encoder noise" where VAD is active but volume is 0.
         let is_speaking = vad_bit && raw_vol > 0.0;
 
         if is_speaking {
@@ -807,12 +819,10 @@ impl AudioMonitor {
 
             // ATTACK: Rapidly increase envelope based on volume intensity
             // We add to the envelope, but clamp at 1.0.
-            // Louder speech charges the "dominance battery" faster.
             self.envelope += raw_vol * AUDIO_ATTACK_RATE;
         } else {
             // DECAY: Exponential decay based on time delta.
-            // A generic 50Hz packet rate is approx 0.02s.
-            // We normalize decay so it works regardless of packet rate.
+            // Normalize decay to work regardless of packet rate (target ~50Hz).
             let decay_factor = 1.0 - (AUDIO_DECAY_RATE * (dt_secs / 0.02));
             self.envelope *= decay_factor.max(0.0);
         }
@@ -841,7 +851,6 @@ impl AudioMonitor {
         AudioDerivedMetrics {
             speech_intensity_envelope: self.envelope,
             // Derive a simple volume for UI from the current envelope or raw input
-            // (Using envelope here provides a smoother UI experience)
             normalized_volume: self.envelope,
             silence_duration: now.saturating_duration_since(self.last_speech_at),
         }

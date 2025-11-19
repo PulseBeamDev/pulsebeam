@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use str0m::media::Mid;
+use str0m::media::{MediaKind, Mid};
 use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
@@ -10,7 +10,7 @@ use str0m::{
     media::{Direction, MediaAdded},
 };
 
-use crate::entity::{self, TrackId};
+use crate::entity;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
@@ -183,9 +183,7 @@ impl ParticipantCore {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
             Event::MediaAdded(media) => self.handle_media_added(media),
-            Event::RtpPacket(rtp) => {
-                self.handle_incoming_rtp(RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264))
-            }
+            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
             Event::KeyframeRequest(req) => self.downstream.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 let (current, desired) = self.downstream.update_bitrate(available);
@@ -240,13 +238,22 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_incoming_rtp(&mut self, rtp: RtpPacket) {
+    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket) {
         tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
-        let Some(stream) = api.stream_rx(&rtp.raw_header.ssrc) else {
+        let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
             return;
         };
         let (mid, rid) = (stream.mid(), stream.rid());
+
+        let Some(media) = self.rtc.media(mid) else {
+            return;
+        };
+
+        let rtp = match media.kind() {
+            MediaKind::Audio => RtpPacket::from_str0m(rtp, crate::rtp::Codec::Opus),
+            MediaKind::Video => RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264),
+        };
         self.upstream.handle_incoming_rtp(mid, rid.as_ref(), rtp);
     }
 
