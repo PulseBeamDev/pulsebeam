@@ -103,8 +103,8 @@ impl ParticipantCore {
         &mut self,
         tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
     ) {
-        for track_id in tracks.keys() {
-            self.downstream.remove_track(track_id);
+        for track in tracks.values() {
+            self.downstream.remove_track(track);
         }
         self.update_desired_bitrate();
     }
