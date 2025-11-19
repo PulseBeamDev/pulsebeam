@@ -35,8 +35,8 @@ pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
     pub rtc: Rtc,
     pub batcher: Batcher,
-    pub upstream_allocator: UpstreamAllocator,
-    pub downstream_allocator: DownstreamAllocator,
+    pub upstream: UpstreamAllocator,
+    pub downstream: DownstreamAllocator,
     disconnect_reason: Option<DisconnectReason>,
     events: Vec<CoreEvent>,
 }
@@ -51,8 +51,8 @@ impl ParticipantCore {
             participant_id,
             rtc,
             batcher: Batcher::with_capacity(batcher_capacity),
-            upstream_allocator: UpstreamAllocator::new(),
-            downstream_allocator: DownstreamAllocator::new(),
+            upstream: UpstreamAllocator::new(),
+            downstream: DownstreamAllocator::new(),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
         }
@@ -92,7 +92,7 @@ impl ParticipantCore {
     ) {
         for track_handle in tracks.values() {
             if track_handle.meta.origin_participant != self.participant_id {
-                self.downstream_allocator.add_track(track_handle.clone());
+                self.downstream.add_track(track_handle.clone());
             }
         }
         self.update_desired_bitrate();
@@ -103,14 +103,14 @@ impl ParticipantCore {
         tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
     ) {
         for track_id in tracks.keys() {
-            self.downstream_allocator.remove_track(track_id);
+            self.downstream.remove_track(track_id);
         }
         self.update_desired_bitrate();
     }
 
     pub fn poll_stats(&mut self, now: Instant) {
         self.update_desired_bitrate();
-        self.upstream_allocator.poll_stats(now);
+        self.upstream.poll_stats(now);
     }
 
     pub fn poll_rtc(&mut self) -> Option<Instant> {
@@ -118,7 +118,7 @@ impl ParticipantCore {
             return None;
         }
 
-        self.upstream_allocator.poll(&mut self.rtc, Instant::now());
+        self.upstream.poll(&mut self.rtc, Instant::now());
 
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
@@ -140,10 +140,7 @@ impl ParticipantCore {
     }
 
     pub fn handle_forward_rtp(&mut self, track_id: Arc<TrackId>, pkt: RtpPacket) {
-        let Some(mid) = self
-            .downstream_allocator
-            .handle_rtp(&track_id, &pkt.raw_header)
-        else {
+        let Some(mid) = self.downstream.handle_rtp(&track_id, &pkt.raw_header) else {
             tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for inactive track");
             return;
         };
@@ -193,9 +190,9 @@ impl ParticipantCore {
             Event::RtpPacket(rtp) => {
                 self.handle_incoming_rtp(RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264))
             }
-            Event::KeyframeRequest(req) => self.downstream_allocator.handle_keyframe_request(req),
+            Event::KeyframeRequest(req) => self.downstream.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                let (current, desired) = self.downstream_allocator.update_bitrate(available);
+                let (current, desired) = self.downstream.update_bitrate(available);
                 self.rtc.bwe().set_current_bitrate(current);
                 self.rtc.bwe().set_desired_bitrate(desired);
             }
@@ -221,7 +218,7 @@ impl ParticipantCore {
     }
 
     fn update_desired_bitrate(&mut self) {
-        let (current, desired) = self.downstream_allocator.update_allocations();
+        let (current, desired) = self.downstream.update_allocations();
         self.rtc.bwe().set_current_bitrate(current);
         self.rtc.bwe().set_desired_bitrate(desired);
     }
@@ -237,11 +234,11 @@ impl ParticipantCore {
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 });
                 let (tx, rx) = track::new(media.mid, track_meta, 64);
-                self.upstream_allocator.add_published_track(media.mid, tx);
+                self.upstream.add_published_track(media.mid, tx);
                 self.events.push(CoreEvent::SpawnTrack(rx));
             }
             Direction::SendOnly => {
-                self.downstream_allocator.add_slot(media.mid, media.kind);
+                self.downstream.add_slot(media.mid, media.kind);
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
@@ -254,8 +251,7 @@ impl ParticipantCore {
             return;
         };
         let (mid, rid) = (stream.mid(), stream.rid());
-        self.upstream_allocator
-            .handle_incoming_rtp(mid, rid.as_ref(), rtp);
+        self.upstream.handle_incoming_rtp(mid, rid.as_ref(), rtp);
     }
 
     fn disconnect(&mut self, reason: DisconnectReason) {

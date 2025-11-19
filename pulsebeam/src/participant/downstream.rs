@@ -2,41 +2,40 @@ use crate::participant::bitrate::BitrateController;
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
-use futures::stream::{SelectAll, Stream, StreamExt};
+use futures::stream::{Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::ready;
 use std::task::{Context, Poll};
-use std::task::{Waker, ready};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastReceiver, TrackReceiver};
 
 pub struct DownstreamAllocator {
-    streams: SelectAll<SlotStream>,
     tracks: HashMap<Arc<TrackId>, TrackState>,
     audio_slots: Vec<Slot>,
-    pub video_slots: Vec<Slot>,
+    video_slots: Vec<Slot>,
     available_bandwidth: BitrateController,
     ticks: u32,
+    rr_cursor: usize,
 }
 
 impl DownstreamAllocator {
     pub fn new() -> Self {
         Self {
-            streams: SelectAll::new(),
             tracks: HashMap::new(),
             audio_slots: Vec::new(),
             video_slots: Vec::new(),
 
             available_bandwidth: BitrateController::default(),
             ticks: 0,
+            rr_cursor: 0,
         }
     }
 
@@ -360,13 +359,49 @@ impl DownstreamAllocator {
             .find(|s| s.rid.is_none() || s.rid.unwrap().starts_with('q'))
             .and_then(|s| s.rid)
     }
+
+    fn poll_next_entry(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+        for slot in &mut self.audio_slots {
+            if let Poll::Ready(Some(pkt)) = slot.poll_next_unpin(cx) {
+                return Poll::Ready(Some((slot.mid, pkt)));
+            }
+        }
+
+        let mut checked_count = 0;
+        while checked_count < self.video_slots.len() {
+            if self.rr_cursor >= self.video_slots.len() {
+                self.rr_cursor = 0;
+            }
+
+            let slot = &mut self.video_slots[self.rr_cursor];
+
+            match slot.poll_next_unpin(cx) {
+                Poll::Ready(Some(pkt)) => {
+                    // ensure each frame to be flushed before moving to another stream,
+                    // this allows related contexts to stay in L1/L2 caches longer.
+                    return Poll::Ready(Some((slot.mid, pkt)));
+                }
+                Poll::Ready(None) => {
+                    self.rr_cursor += 1;
+                    checked_count += 1;
+                }
+                Poll::Pending => {
+                    self.rr_cursor += 1;
+                    checked_count += 1;
+                }
+            }
+        }
+
+        // If we checked everyone and found nothing.
+        Poll::Pending
+    }
 }
 
 impl Stream for DownstreamAllocator {
-    type Item = SlotStreamItem;
+    type Item = (Mid, RtpPacket);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.streams.poll_next_unpin(cx)
+        self.poll_next_entry(cx)
     }
 }
 
@@ -374,47 +409,11 @@ impl Stream for DownstreamAllocator {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct AudioLevel(i32);
 
-/// Tracks the allocation and control state for one published track.
 #[derive(Debug)]
 struct TrackState {
     track: TrackReceiver,
-    control_tx: watch::Sender<StreamConfig>,
     audio_level: AudioLevel,
     assigned_mid: Option<Mid>,
-}
-
-impl TrackState {
-    fn update<F>(&self, update_fn: F)
-    where
-        F: FnOnce(&mut StreamConfig),
-    {
-        self.control_tx.send_if_modified(|config| {
-            let old = *config;
-            update_fn(config);
-
-            old != *config
-        });
-    }
-
-    fn current(&self) -> StreamConfig {
-        *self.control_tx.borrow()
-    }
-
-    fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        let config = self.current();
-        if config.paused {
-            return;
-        }
-
-        if let Some(receiver) = self
-            .track
-            .simulcast
-            .iter()
-            .find(|r| r.rid == config.target_rid)
-        {
-            receiver.request_keyframe(kind);
-        }
-    }
 }
 
 pub struct Slot {
@@ -445,12 +444,22 @@ impl Slot {
             switcher: Switcher::new(clock_rate),
         }
     }
+
+    fn request_keyframe(&self, kind: KeyframeRequestKind) {
+        if self.paused {
+            return;
+        }
+
+        let Some(receiver) = &self.active else {
+            return;
+        };
+
+        receiver.request_keyframe(kind);
+    }
 }
 
-type SlotStreamItem = (Mid, RtpPacket);
-type SlotStream = Pin<Box<dyn Stream<Item = SlotStreamItem> + Send>>;
 impl Stream for Slot {
-    type Item = SlotStreamItem;
+    type Item = RtpPacket;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -461,7 +470,7 @@ impl Stream for Slot {
             }
 
             if let Some(pkt) = self.switcher.pop() {
-                return Poll::Ready(Some((self.mid, pkt)));
+                return Poll::Ready(Some(pkt));
             }
 
             if let Some(stream) = self.stage.as_mut() {
