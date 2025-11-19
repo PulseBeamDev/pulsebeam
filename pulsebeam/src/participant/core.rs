@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use str0m::media::Mid;
 use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
@@ -139,12 +140,7 @@ impl ParticipantCore {
         None
     }
 
-    pub fn handle_forward_rtp(&mut self, track_id: Arc<TrackId>, pkt: RtpPacket) {
-        let Some(mid) = self.downstream.handle_rtp(&track_id, &pkt.raw_header) else {
-            tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for inactive track");
-            return;
-        };
-
+    pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: RtpPacket) {
         let pt = {
             let Some(media) = self.rtc.media(mid) else {
                 return;
@@ -157,7 +153,7 @@ impl ParticipantCore {
 
         let mut api = self.rtc.direct_api();
         let Some(writer) = api.stream_tx_by_mid(mid, None) else {
-            tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid stream mid");
+            tracing::warn!(%mid, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid stream mid");
             return;
         };
 
@@ -177,7 +173,7 @@ impl ParticipantCore {
             true,
             pkt.payload,
         ) {
-            tracing::warn!(track_id = %track_id, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+            tracing::warn!(%mid, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
     }
 

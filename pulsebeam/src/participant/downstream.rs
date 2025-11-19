@@ -52,12 +52,12 @@ impl DownstreamAllocator {
                 assigned_mid: None,
             },
         );
-        self.rebalance_allocations();
+        self.rebalance_assignments();
     }
 
     pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
         if self.tracks.remove(track_id).is_some() {
-            self.rebalance_allocations();
+            self.rebalance_assignments();
         }
     }
 
@@ -71,7 +71,7 @@ impl DownstreamAllocator {
             }
         }
 
-        self.rebalance_allocations();
+        self.rebalance_assignments();
     }
 
     pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
@@ -228,13 +228,13 @@ impl DownstreamAllocator {
         }
 
         if needs_rebalance {
-            self.rebalance_allocations();
+            self.rebalance_assignments();
         }
 
         assigned_mid
     }
 
-    fn rebalance_allocations(&mut self) {
+    fn rebalance_assignments(&mut self) {
         self.rebalance_audio();
         self.rebalance_video();
     }

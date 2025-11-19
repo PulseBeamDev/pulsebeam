@@ -1,11 +1,10 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-};
+use pulsebeam_runtime::sync::Arc;
+use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::ops::Deref;
 use std::time::Duration;
-use str0m::bwe::Bitrate;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
+use str0m::{bwe::Bitrate, media::MediaKind};
 use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
@@ -26,18 +25,48 @@ pub enum StreamQuality {
 }
 
 #[derive(Debug, Clone)]
-pub struct StreamState {
-    inactive: Arc<AtomicBool>,
-    bitrate_bps: Arc<AtomicU64>,
-    quality: Arc<AtomicU8>,
-}
+pub struct StreamState(Arc<StreamStateInner>);
 
 impl StreamState {
     pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
+        Self(Arc::new(StreamStateInner::new(inactive, bitrate_bps)))
+    }
+}
+
+impl Deref for StreamState {
+    type Target = StreamStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<StreamStateInner> for StreamState {
+    fn as_ref(&self) -> &StreamStateInner {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
+pub struct StreamStateInner {
+    inactive: AtomicBool,
+    bitrate_bps: AtomicU64,
+    quality: AtomicU8,
+
+    audio_envelope_bits: AtomicU32,
+    silence_duration_ms: AtomicU64,
+    normalized_volume_bits: AtomicU32,
+}
+
+impl StreamStateInner {
+    pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
         Self {
-            inactive: Arc::new(AtomicBool::new(inactive)),
-            bitrate_bps: Arc::new(AtomicU64::new(bitrate_bps)),
-            quality: Arc::new(AtomicU8::new(StreamQuality::Good as u8)),
+            inactive: AtomicBool::new(inactive),
+            bitrate_bps: AtomicU64::new(bitrate_bps),
+            quality: AtomicU8::new(StreamQuality::Good as u8),
+            audio_envelope_bits: AtomicU32::new(0.0f32.to_bits()),
+            silence_duration_ms: AtomicU64::new(0),
+            normalized_volume_bits: AtomicU32::new(0.0f32.to_bits()),
         }
     }
 
@@ -47,6 +76,18 @@ impl StreamState {
 
     pub fn bitrate_bps(&self) -> f64 {
         self.bitrate_bps.load(Ordering::Relaxed) as f64
+    }
+
+    pub fn audio_envelope(&self) -> f32 {
+        f32::from_bits(self.audio_envelope_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn silence_duration(&self) -> Duration {
+        Duration::from_millis(self.silence_duration_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn normalized_volume(&self) -> f32 {
+        f32::from_bits(self.normalized_volume_bits.load(Ordering::Relaxed))
     }
 
     pub fn quality(&self) -> StreamQuality {
@@ -67,6 +108,7 @@ pub struct StreamMonitor {
     delta_delta: DeltaDeltaState,
     last_packet_at: Instant,
     bwe: BitrateEstimate,
+    audio_monitor: Option<AudioMonitor>,
 
     current_quality: StreamQuality,
     bad_quality_lockout_until: Option<Instant>,
@@ -75,13 +117,18 @@ pub struct StreamMonitor {
 }
 
 impl StreamMonitor {
-    pub fn new(stream_id: String, shared_state: StreamState) -> Self {
+    pub fn new(kind: MediaKind, stream_id: String, shared_state: StreamState) -> Self {
         let now = Instant::now();
+        let audio_monitor = match kind {
+            MediaKind::Audio => Some(AudioMonitor::new()),
+            MediaKind::Video => None,
+        };
         Self {
             stream_id,
             shared_state,
             last_packet_at: now,
             delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
+            audio_monitor,
             bwe: BitrateEstimate::new(now),
             current_quality: StreamQuality::Good,
             bad_quality_lockout_until: None,
@@ -106,6 +153,22 @@ impl StreamMonitor {
         self.shared_state
             .bitrate_bps
             .store(self.bwe.estimate_bps() as u64, Ordering::Relaxed);
+
+        if let Some(audio_monitor) = self.audio_monitor.as_mut() {
+            audio_monitor.poll(now);
+            let audio_metrics = audio_monitor.get_metrics(now);
+            self.shared_state.audio_envelope_bits.store(
+                audio_metrics.speech_intensity_envelope.to_bits(),
+                Ordering::Relaxed,
+            );
+            self.shared_state
+                .normalized_volume_bits
+                .store(audio_metrics.normalized_volume.to_bits(), Ordering::Relaxed);
+            self.shared_state.silence_duration_ms.store(
+                audio_metrics.silence_duration.as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
 
         let metrics: RawMetrics = (&self.delta_delta).into();
         let was_inactive = self.shared_state.is_inactive();
@@ -670,6 +733,118 @@ impl DeltaDeltaState {
     fn packet_mut(&mut self, seq: SeqNo) -> &mut Option<PacketStatus> {
         let index = self.as_index(seq);
         &mut self.buffer[index]
+    }
+}
+
+/// Tuning constants for the "Leaky Integrator"
+const AUDIO_ATTACK_RATE: f32 = 0.2; // How fast we react to new speech (0.0-1.0)
+const AUDIO_DECAY_RATE: f32 = 0.05; // How fast we fade out (keeps user in Top-N during pauses)
+const NOISE_THRESHOLD_DBOV: u8 = 50; // Ignore sounds quieter than -50dBov (127=quiet, 0=loud)
+
+#[derive(Debug, Clone, Copy)]
+pub struct AudioDerivedMetrics {
+    /// A stable score (0.0-1.0) representing "Dominance".
+    /// High during speech, decays slowly during pauses.
+    /// USE THIS for sorting Top-N.
+    pub speech_intensity_envelope: f32,
+
+    /// The instantaneous volume (0.0-1.0), normalized and noise-gated.
+    /// USE THIS for visualizers (green borders/audio bars).
+    pub normalized_volume: f32,
+
+    /// Time elapsed since the last "active" voice frame was detected.
+    /// USE THIS for tie-breaking active speakers.
+    pub silence_duration: Duration,
+}
+
+#[derive(Debug)]
+pub struct AudioMonitor {
+    // Internal State
+    envelope: f32,
+    last_packet_at: Instant,
+    last_speech_at: Instant,
+}
+
+impl AudioMonitor {
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            envelope: 0.0,
+            last_packet_at: now,
+            last_speech_at: now, // Initialize to now so we don't start with infinite silence
+        }
+    }
+
+    /// Process an RFC 6464 Audio Level header extension.
+    ///
+    /// * `vad_bit`: True if the encoder detects voice.
+    /// * `level`: 0 (max volume) to 127 (silence).
+    pub fn process_packet(&mut self, now: Instant, vad_bit: bool, level: u8) {
+        // 1. Calculate time delta for frame-independent decay
+        // (Assuming roughly 20ms packets, but handling jitter/loss)
+        let dt_secs = now
+            .saturating_duration_since(self.last_packet_at)
+            .as_secs_f32();
+        self.last_packet_at = now;
+
+        // 2. Normalize Level: 0.0 (Silence) -> 1.0 (Max Volume)
+        // RFC 6464: 127 is silence, 0 is max.
+        // We clip anything below NOISE_THRESHOLD_DBOV to 0.0 to ignore background hum.
+        let raw_vol = if level > (127 - NOISE_THRESHOLD_DBOV) {
+            0.0
+        } else {
+            // Invert logic: 127 - level gives us 0..127 where 127 is loud
+            (127 - level) as f32 / 127.0
+        };
+
+        // 3. Update "Last Speech" Timer
+        // We require BOTH the VAD bit AND significant volume.
+        // This filters out "encoder noise" where VAD is active but volume is 0.
+        let is_speaking = vad_bit && raw_vol > 0.0;
+
+        if is_speaking {
+            self.last_speech_at = now;
+
+            // ATTACK: Rapidly increase envelope based on volume intensity
+            // We add to the envelope, but clamp at 1.0.
+            // Louder speech charges the "dominance battery" faster.
+            self.envelope += raw_vol * AUDIO_ATTACK_RATE;
+        } else {
+            // DECAY: Exponential decay based on time delta.
+            // A generic 50Hz packet rate is approx 0.02s.
+            // We normalize decay so it works regardless of packet rate.
+            let decay_factor = 1.0 - (AUDIO_DECAY_RATE * (dt_secs / 0.02));
+            self.envelope *= decay_factor.max(0.0);
+        }
+
+        // Clamp envelope to 0.0 - 1.0
+        self.envelope = self.envelope.clamp(0.0, 1.0);
+    }
+
+    /// Poll function to force decay if no packets are arriving
+    /// (e.g., if the user went on mute or network died).
+    pub fn poll(&mut self, now: Instant) {
+        let dt_secs = now
+            .saturating_duration_since(self.last_packet_at)
+            .as_secs_f32();
+
+        // If we haven't seen a packet in > 200ms, force decay
+        if dt_secs > 0.2 {
+            let decay_factor = 1.0 - (AUDIO_DECAY_RATE * (dt_secs / 0.02));
+            self.envelope *= decay_factor.max(0.0);
+            self.envelope = self.envelope.clamp(0.0, 1.0);
+            self.last_packet_at = now; // Reset tick
+        }
+    }
+
+    pub fn get_metrics(&self, now: Instant) -> AudioDerivedMetrics {
+        AudioDerivedMetrics {
+            speech_intensity_envelope: self.envelope,
+            // Derive a simple volume for UI from the current envelope or raw input
+            // (Using envelope here provides a smoother UI experience)
+            normalized_volume: self.envelope,
+            silence_duration: now.saturating_duration_since(self.last_speech_at),
+        }
     }
 }
 
