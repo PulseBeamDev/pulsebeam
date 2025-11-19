@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
-use str0m::media::{Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::watch;
 use tokio::time::Instant;
 

@@ -15,7 +15,7 @@ use str0m::rtp::RtpHeader;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastReceiver, TrackReceiver};
+use crate::track::{SimulcastQuality, SimulcastReceiver, TrackReceiver};
 
 pub struct DownstreamAllocator {
     tracks: HashMap<Arc<TrackId>, TrackState>,
@@ -64,24 +64,13 @@ impl DownstreamAllocator {
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
         match kind {
             MediaKind::Audio => {
-                self.audio_slots.push(SlotState {
-                    mid,
-                    assigned_track: None,
-                    priority: 0,
-                    switcher: Switcher::new(rtp::AUDIO_FREQUENCY),
-                });
+                self.audio_slots.push(Slot::new(mid, kind));
             }
             MediaKind::Video => {
-                self.video_slots.push(SlotState {
-                    mid,
-                    assigned_track: None,
-                    priority: 720,
-                    switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
-                });
+                self.video_slots.push(Slot::new(mid, kind));
             }
         }
 
-        self.streams.push(Slot::new(mid, kind));
         self.rebalance_allocations();
     }
 
@@ -193,7 +182,7 @@ impl DownstreamAllocator {
         let total_allocated = Bitrate::from(total_allocated);
         let total_desired = Bitrate::from(total_desired);
 
-        if self.ticks % 30 == 0 {
+        if self.ticks >= 30 {
             tracing::debug!(
                 available = %self.available_bandwidth.current(),
                 budget = %Bitrate::from(budget),
@@ -201,6 +190,7 @@ impl DownstreamAllocator {
                 desired = %total_desired,
                 "allocation summary"
             );
+            self.ticks = 0;
         }
         self.ticks += 1;
 
@@ -359,21 +349,27 @@ impl DownstreamAllocator {
             .find(|s| s.rid.is_none() || s.rid.unwrap().starts_with('q'))
             .and_then(|s| s.rid)
     }
+}
 
-    fn poll_next_entry(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        for slot in &mut self.audio_slots {
+impl Stream for DownstreamAllocator {
+    type Item = (Mid, RtpPacket);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        for slot in &mut this.audio_slots {
             if let Poll::Ready(Some(pkt)) = slot.poll_next_unpin(cx) {
                 return Poll::Ready(Some((slot.mid, pkt)));
             }
         }
 
         let mut checked_count = 0;
-        while checked_count < self.video_slots.len() {
-            if self.rr_cursor >= self.video_slots.len() {
-                self.rr_cursor = 0;
+        while checked_count < this.video_slots.len() {
+            if this.rr_cursor >= this.video_slots.len() {
+                this.rr_cursor = 0;
             }
 
-            let slot = &mut self.video_slots[self.rr_cursor];
+            let slot = &mut this.video_slots[this.rr_cursor];
 
             match slot.poll_next_unpin(cx) {
                 Poll::Ready(Some(pkt)) => {
@@ -382,11 +378,11 @@ impl DownstreamAllocator {
                     return Poll::Ready(Some((slot.mid, pkt)));
                 }
                 Poll::Ready(None) => {
-                    self.rr_cursor += 1;
+                    this.rr_cursor += 1;
                     checked_count += 1;
                 }
                 Poll::Pending => {
-                    self.rr_cursor += 1;
+                    this.rr_cursor += 1;
                     checked_count += 1;
                 }
             }
@@ -394,14 +390,6 @@ impl DownstreamAllocator {
 
         // If we checked everyone and found nothing.
         Poll::Pending
-    }
-}
-
-impl Stream for DownstreamAllocator {
-    type Item = (Mid, RtpPacket);
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.poll_next_entry(cx)
     }
 }
 
@@ -416,16 +404,30 @@ struct TrackState {
     assigned_mid: Option<Mid>,
 }
 
+pub enum SlotState {
+    Idle,
+    Paused {
+        active: SimulcastReceiver,
+    },
+    Resuming {
+        staging: SimulcastReceiver,
+    },
+    Streaming {
+        active: SimulcastReceiver,
+    },
+    Switching {
+        active: SimulcastReceiver,
+        staging: SimulcastReceiver,
+    },
+}
+
 pub struct Slot {
     mid: Mid,
     kind: MediaKind,
 
     priority: u32,
-    paused: bool,
-    active: Option<SimulcastReceiver>,
-    stage: Option<SimulcastReceiver>,
-
     switcher: Switcher,
+    state: SlotState,
 }
 
 impl Slot {
@@ -438,74 +440,189 @@ impl Slot {
             mid,
             kind,
             priority: 0,
-            paused: true,
-            active: None,
-            stage: None,
             switcher: Switcher::new(clock_rate),
+            state: SlotState::Idle,
         }
     }
 
-    fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        if self.paused {
-            return;
+    /// Helper to get the "Forward Looking" receiver.
+    /// If we are switching or resuming, this returns the staging receiver.
+    /// If we are streaming or paused, it returns the active one.
+    fn target_receiver(&self) -> Option<&SimulcastReceiver> {
+        match &self.state {
+            SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => Some(staging),
+            SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
+            SlotState::Idle => None,
+        }
+    }
+
+    pub fn track_id(&self) -> Option<&Arc<TrackId>> {
+        self.target_receiver().map(|r| &r.meta.id)
+    }
+
+    pub fn rid(&self) -> Option<Rid> {
+        self.target_receiver().and_then(|r| r.rid)
+    }
+
+    pub fn quality(&self) -> SimulcastQuality {
+        self.target_receiver()
+            .map(|r| r.quality)
+            .unwrap_or(SimulcastQuality::Undefined)
+    }
+
+    pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
+        // Check if we are already playing (or trying to play) this exact stream
+        if let Some(current) = self.target_receiver() {
+            if current.rid == receiver.rid && current.meta.id == receiver.meta.id {
+                // If we are Paused, we must wake up (continue to transition logic).
+                // If we are already Streaming or Switching to this, do nothing.
+                if !matches!(self.state, SlotState::Paused { .. }) {
+                    return;
+                }
+            }
         }
 
-        let Some(receiver) = &self.active else {
-            return;
-        };
+        let old_state = std::mem::replace(&mut self.state, SlotState::Idle);
 
-        receiver.request_keyframe(kind);
+        receiver.channel.reset();
+        receiver.request_keyframe(KeyframeRequestKind::Fir);
+        self.state = match old_state {
+            SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
+            SlotState::Streaming { active } => SlotState::Switching {
+                active,
+                staging: receiver,
+            },
+            SlotState::Resuming { .. } => SlotState::Resuming { staging: receiver },
+            SlotState::Switching { active, .. } => SlotState::Switching {
+                active,
+                staging: receiver,
+            },
+        };
+    }
+
+    pub fn stop(&mut self) {
+        self.state = SlotState::Idle;
+    }
+
+    fn request_keyframe(&self, kind: KeyframeRequestKind) {
+        // Priority: Request from the new stream we are waiting for.
+        match &self.state {
+            SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => {
+                staging.request_keyframe(kind);
+            }
+            SlotState::Streaming { active } => {
+                active.request_keyframe(kind);
+            }
+            SlotState::Paused { .. } | SlotState::Idle => {}
+        }
     }
 }
 
 impl Stream for Slot {
     type Item = RtpPacket;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            if self.paused {
-                self.switcher.drain();
-                // The driver also controls paused flag, so it is safe to not hold a waker here
-                return Poll::Pending;
-            }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
 
-            if let Some(pkt) = self.switcher.pop() {
+        loop {
+            if let Some(pkt) = this.switcher.pop() {
                 return Poll::Ready(Some(pkt));
             }
 
-            if let Some(stream) = self.stage.as_mut() {
-                match stream.channel.poll_recv(cx) {
+            match &mut this.state {
+                SlotState::Idle => return Poll::Pending,
+
+                SlotState::Paused { .. } => {
+                    this.switcher.drain();
+                    return Poll::Pending;
+                }
+
+                SlotState::Resuming { staging } => match staging.channel.poll_recv(cx) {
                     Poll::Ready(Ok(pkt)) => {
-                        self.switcher.stage(pkt.value.clone());
-                        if self.switcher.is_ready() {
-                            self.active = self.stage.take();
+                        this.switcher.stage(pkt.value.clone());
+                        if this.switcher.is_ready() {
+                            tracing::info!(mid = %this.mid, rid = ?staging.rid, "Resuming complete");
+                            this.state = SlotState::Streaming {
+                                active: staging.clone(),
+                            };
                         }
-                        continue;
                     }
                     Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
-                        tracing::warn!("lagged by {} packets, pausing the stream", n);
-                        self.stage = None;
+                        tracing::warn!(mid = %this.mid, skipped = n, "Resuming lagged, pausing");
+                        this.state = SlotState::Paused {
+                            active: staging.clone(),
+                        };
                     }
                     Poll::Ready(Err(spmc::RecvError::Closed)) => {
-                        self.stage = None;
+                        tracing::warn!(mid = %this.mid, "Resuming closed");
+                        this.state = SlotState::Idle;
                     }
-                    Poll::Pending => {
-                        // explicit pass through, let active stream to continue
-                    }
-                }
-            }
+                    Poll::Pending => return Poll::Pending,
+                },
 
-            let stream = self.active.as_mut().unwrap();
-            match ready!(stream.channel.poll_recv(cx)) {
-                Ok(pkt) => {
-                    self.switcher.push(pkt.value.clone());
-                }
-                Err(spmc::RecvError::Lagged(n)) => {
-                    tracing::warn!("lagged by {} packets, pausing the stream", n);
-                    self.paused = true;
-                }
-                Err(spmc::RecvError::Closed) => {
-                    self.paused = true;
+                SlotState::Streaming { active } => match ready!(active.channel.poll_recv(cx)) {
+                    Ok(pkt) => this.switcher.push(pkt.value.clone()),
+                    Err(spmc::RecvError::Lagged(n)) => {
+                        tracing::warn!(mid = %this.mid, skipped = n, "Streaming lagged, pausing");
+                        this.state = SlotState::Paused {
+                            active: active.clone(),
+                        };
+                    }
+                    Err(spmc::RecvError::Closed) => {
+                        tracing::info!(mid = %this.mid, "Streaming closed");
+                        this.state = SlotState::Idle;
+                    }
+                },
+
+                SlotState::Switching { active, staging } => {
+                    match staging.channel.poll_recv(cx) {
+                        Poll::Ready(Ok(pkt)) => {
+                            this.switcher.stage(pkt.value.clone());
+                            if this.switcher.is_ready() {
+                                tracing::info!(
+                                    mid = %this.mid,
+                                    from = ?active.rid,
+                                    to = ?staging.rid,
+                                    "Switch complete"
+                                );
+                                this.state = SlotState::Streaming {
+                                    active: staging.clone(),
+                                };
+                            }
+                            continue;
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
+                            tracing::warn!(mid = %this.mid, skipped = n, "Staging lagged, pausing");
+                            this.state = SlotState::Paused {
+                                active: staging.clone(),
+                            };
+                            continue;
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
+                            tracing::warn!(mid = %this.mid, "Staging closed during switch");
+                            this.state = SlotState::Streaming {
+                                active: active.clone(),
+                            };
+                            continue;
+                        }
+                        Poll::Pending => {}
+                    }
+
+                    match ready!(active.channel.poll_recv(cx)) {
+                        Ok(pkt) => this.switcher.push(pkt.value.clone()),
+                        Err(spmc::RecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %this.mid, skipped = n, "Active lagged during switch, pausing");
+                            this.state = SlotState::Paused {
+                                active: active.clone(),
+                            };
+                        }
+                        Err(spmc::RecvError::Closed) => {
+                            tracing::warn!(mid = %this.mid, "Active closed, forcing resume");
+                            this.state = SlotState::Resuming {
+                                staging: staging.clone(),
+                            };
+                        }
+                    }
                 }
             }
         }
