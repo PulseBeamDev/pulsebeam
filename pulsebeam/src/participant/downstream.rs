@@ -7,8 +7,8 @@ use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::ready;
 use std::task::{Context, Poll};
+use std::task::{Waker, ready};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use str0m::rtp::RtpHeader;
@@ -456,6 +456,7 @@ impl Stream for Slot {
         loop {
             if self.paused {
                 self.switcher.drain();
+                // The driver also controls paused flag, so it is safe to not hold a waker here
                 return Poll::Pending;
             }
 
@@ -489,16 +490,13 @@ impl Stream for Slot {
             match ready!(stream.channel.poll_recv(cx)) {
                 Ok(pkt) => {
                     self.switcher.push(pkt.value.clone());
-                    continue;
                 }
                 Err(spmc::RecvError::Lagged(n)) => {
                     tracing::warn!("lagged by {} packets, pausing the stream", n);
                     self.paused = true;
-                    continue;
                 }
                 Err(spmc::RecvError::Closed) => {
                     self.paused = true;
-                    continue;
                 }
             }
         }
