@@ -311,7 +311,6 @@ impl Slot {
 
         let new_state = match old_state {
             SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
-            // Move 'active' from old state to new state without cloning
             SlotState::Streaming { active } => SlotState::Switching {
                 active,
                 staging: receiver,
