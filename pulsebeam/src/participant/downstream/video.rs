@@ -390,7 +390,7 @@ impl Slot {
                 SlotState::Resuming { mut staging } => {
                     match staging.channel.poll_recv(cx) {
                         Poll::Ready(Ok(pkt)) => {
-                            self.switcher.stage(pkt.value.clone());
+                            self.switcher.stage(pkt);
                             if self.switcher.is_ready() {
                                 tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
                                 // Transition: Move staging to active
@@ -418,7 +418,7 @@ impl Slot {
 
                 SlotState::Streaming { mut active } => match active.channel.poll_recv(cx) {
                     Poll::Ready(Ok(pkt)) => {
-                        self.switcher.push(pkt.value.clone());
+                        self.switcher.push(pkt);
                         self.state = Some(SlotState::Streaming { active });
                     }
                     Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
@@ -443,7 +443,7 @@ impl Slot {
                     let staging_poll = staging.channel.poll_recv(cx);
                     match staging_poll {
                         Poll::Ready(Ok(pkt)) => {
-                            self.switcher.stage(pkt.value.clone());
+                            self.switcher.stage(pkt);
                             if self.switcher.is_ready() {
                                 tracing::info!(mid = %self.mid, from = ?active.rid, to = ?staging.rid, "Switch complete");
                                 // Transition: Move staging to active, Drop old active
@@ -470,7 +470,7 @@ impl Slot {
                     // 2. Poll Active
                     match active.channel.poll_recv(cx) {
                         Poll::Ready(Ok(pkt)) => {
-                            self.switcher.push(pkt.value.clone());
+                            self.switcher.push(pkt);
                             self.state = Some(SlotState::Switching { active, staging });
                         }
                         Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {

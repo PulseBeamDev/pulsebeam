@@ -1,241 +1,185 @@
-use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use arc_swap::ArcSwapOption;
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
-use std::fmt::Debug;
-use std::task::{Context, Poll, Waker};
+use event_listener::{Event, EventListener};
+use parking_lot::RwLock;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
-/// Errors returned by a receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
-    /// Receiver lagged too far and was advanced to the tail.
     Lagged(u64),
-    /// The channel is closed and no further messages will be sent.
     Closed,
 }
 
-/// A published message slot.
 #[derive(Debug)]
-pub struct Slot<T> {
-    pub seq: u64,
-    pub value: T,
+struct Slot<T> {
+    seq: u64,
+    val: Option<T>,
 }
 
-/// The shared ring buffer.
-struct Ring<T: Send + Sync> {
-    tail: CachePadded<AtomicU64>, // producer’s sequence
-    capacity: usize,
-    slots: Box<[ArcSwapOption<Slot<T>>]>,
-    closed: CachePadded<AtomicBool>,
-    wakers: SegQueue<Waker>,
+#[derive(Debug)]
+struct Ring<T> {
+    head: AtomicU64,
+    mask: usize,
+    slots: Vec<CachePadded<RwLock<Slot<T>>>>,
+    event: Event,
+    closed: AtomicU64,
 }
 
-impl<T: Send + Sync> Ring<T> {
+impl<T> Ring<T> {
     fn new(capacity: usize) -> Arc<Self> {
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "Capacity must be power of 2"
+        );
+
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            slots.push(ArcSwapOption::from(None));
+            slots.push(CachePadded::new(RwLock::new(Slot { seq: 0, val: None })));
         }
 
         Arc::new(Self {
-            tail: CachePadded::new(AtomicU64::new(0)),
-            capacity,
-            slots: slots.into_boxed_slice(),
-            closed: CachePadded::new(AtomicBool::new(false)),
-            wakers: SegQueue::new(),
+            head: AtomicU64::new(0),
+            mask: capacity - 1,
+            slots,
+            event: Event::new(),
+            closed: AtomicU64::new(0),
         })
     }
+}
 
-    /// Push a new message into the ring.
-    fn push(&self, value: T) {
-        if self.closed.load(Ordering::Acquire) {
+#[derive(Debug)]
+pub struct Sender<T> {
+    ring: Arc<Ring<T>>,
+    head: u64,
+}
+
+impl<T> Sender<T> {
+    pub fn send(&mut self, val: T) {
+        if self.ring.closed.load(Ordering::Relaxed) == 1 {
             return;
         }
 
-        // The ordering can't be Relaxed. There's no guarantee that
-        // the publisher will stay on the same thread in a work-stealing environment.
-        //
-        // t0 (thread-2) -> tail=0 new_tail=1
-        // t1 (thread-3) -> tail=0!!! (despite being the same publisher)
-        let seq = self.tail.load(Ordering::Acquire);
-        let idx = (seq % self.capacity as u64) as usize;
+        let idx = (self.head as usize) & self.ring.mask;
 
-        // Atomically publish a new slot
-        self.slots[idx].store(Some(Arc::new(Slot { seq, value })));
-
-        // Advance tail
-        self.tail.store(seq + 1, Ordering::Release);
-
-        self.notify_waiters();
-    }
-
-    /// Attempt to fetch the next available message for a receiver.
-    fn get_next(&self, next_seq: &mut u64) -> Result<Option<Arc<Slot<T>>>, RecvError> {
-        let tail = self.tail.load(Ordering::Acquire);
-        let earliest = tail.saturating_sub(self.capacity as u64);
-
-        // If the receiver is too far behind, jump ahead.
-        if *next_seq < earliest {
-            *next_seq = tail;
-            return Err(RecvError::Lagged(tail));
+        {
+            let mut slot = self.ring.slots[idx].write();
+            slot.val = Some(val);
+            slot.seq = self.head;
         }
 
-        // Nothing new yet.
-        if *next_seq >= tail {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(RecvError::Closed);
-            }
-            return Ok(None);
-        }
-
-        // Try reading the slot.
-        let idx = (*next_seq % self.capacity as u64) as usize;
-        if let Some(slot) = self.slots[idx].load_full() {
-            if slot.seq == *next_seq {
-                *next_seq += 1;
-                return Ok(Some(slot));
-            } else {
-                // Overwritten before we could see it.
-                *next_seq = tail;
-                return Err(RecvError::Lagged(tail));
-            }
-        }
-
-        // Slot not yet written.
-        if self.closed.load(Ordering::Acquire) {
-            Err(RecvError::Closed)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn notify_waiters(&self) {
-        while let Some(waker) = self.wakers.pop() {
-            waker.wake();
-        }
-    }
-
-    fn wait(&self, waker: Waker) {
-        self.wakers.push(waker);
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.notify_waiters();
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.ring.head.store(self.head + 1, Ordering::Release);
+        self.head += 1;
+        self.ring.event.notify(usize::MAX);
     }
 }
 
-/// The sending handle — single producer.
-pub struct Sender<T: Send + Sync> {
-    ring: Arc<Ring<T>>,
-}
-
-impl<T: Send + Sync> Sender<T> {
-    pub fn send(&self, value: T) {
-        self.ring.push(value);
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.ring.is_closed()
-    }
-}
-
-impl<T: Send + Sync> Drop for Sender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.ring.close();
+        self.ring.closed.store(1, Ordering::Release);
+        self.ring.event.notify(usize::MAX);
     }
 }
 
-impl<T: Send + Sync> Debug for Sender<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sender")
-            .field("capacity", &self.ring.capacity)
-            .field("tail", &self.ring.tail.load(Ordering::Relaxed))
-            .field("closed", &self.ring.closed.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-/// The receiving handle — multi-consumer.
-pub struct Receiver<T: Send + Sync> {
+#[derive(Debug)]
+pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
+    listener: Option<EventListener>,
 }
 
-impl<T: Send + Sync> Receiver<T> {
-    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<Slot<T>>, RecvError>> {
-        match self.ring.get_next(&mut self.next_seq) {
-            Ok(Some(slot)) => return Poll::Ready(Ok(slot)),
-            Err(e) => return Poll::Ready(Err(e)),
-            Ok(None) => {}
-        }
-
-        self.ring.wait(cx.waker().clone());
-
-        match self.ring.get_next(&mut self.next_seq) {
-            Ok(Some(slot)) => return Poll::Ready(Ok(slot)),
-            Err(e) => return Poll::Ready(Err(e)),
-            Ok(None) => {}
-        }
-
-        Poll::Pending
+impl<T: Clone> Receiver<T> {
+    pub fn reset(&mut self) {
+        self.next_seq = self.ring.head.load(Ordering::Acquire);
     }
 
-    pub async fn recv(&mut self) -> Result<Arc<Slot<T>>, RecvError> {
+    pub async fn recv(&mut self) -> Result<T, RecvError> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    pub fn try_recv(&mut self) -> Result<Option<Arc<Slot<T>>>, RecvError> {
-        self.ring.get_next(&mut self.next_seq)
-    }
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+        loop {
+            let head = self.ring.head.load(Ordering::Acquire);
 
-    pub fn is_closed(&self) -> bool {
-        self.ring.is_closed()
-    }
+            if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= head {
+                return Poll::Ready(Err(RecvError::Closed));
+            }
 
-    pub fn reset(&mut self) {
-        self.next_seq = self.ring.tail.load(Ordering::Acquire);
-    }
-}
+            let capacity = self.ring.mask as u64 + 1;
+            let earliest = head.saturating_sub(capacity);
 
-impl<T: Send + Sync> Clone for Receiver<T> {
-    fn clone(&self) -> Self {
-        Self {
-            ring: Arc::clone(&self.ring),
-            next_seq: self.ring.tail.load(Ordering::Acquire),
+            if self.next_seq < earliest {
+                self.next_seq = head;
+                return Poll::Ready(Err(RecvError::Lagged(head)));
+            }
+
+            if self.next_seq >= head {
+                match &mut self.listener {
+                    Some(l) => {
+                        if Pin::new(l).poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        self.listener = None;
+                        continue;
+                    }
+                    None => {
+                        // recheck, make sure to not miss a notification
+                        let listener = self.ring.event.listen();
+                        self.listener = Some(listener);
+                        continue;
+                    }
+                }
+            }
+
+            // At this point, we're a bit behind than the producer - keep reading until we catch up.
+            self.listener = None;
+
+            let idx = (self.next_seq as usize) & self.ring.mask;
+            let slot_lock = self.ring.slots[idx].read();
+
+            if slot_lock.seq != self.next_seq {
+                drop(slot_lock);
+                self.next_seq = head;
+                return Poll::Ready(Err(RecvError::Lagged(head)));
+            }
+
+            if let Some(val) = &slot_lock.val {
+                let msg = val.clone();
+                drop(slot_lock);
+                self.next_seq += 1;
+                return Poll::Ready(Ok(msg));
+            } else {
+                drop(slot_lock);
+                self.next_seq = head;
+                return Poll::Ready(Err(RecvError::Lagged(head)));
+            }
         }
     }
 }
 
-impl<T: Send + Sync> Debug for Receiver<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Receiver")
-            .field("capacity", &self.ring.capacity)
-            .field("next_seq", &self.next_seq)
-            .field("tail", &self.ring.tail.load(Ordering::Relaxed))
-            .field("closed", &self.ring.closed.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
+impl<T: Clone> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: self.ring.clone(),
+            next_seq: self.ring.head.load(Ordering::Acquire),
+            listener: None,
+        }
     }
 }
 
-/// Create a new SP/MC broadcast channel.
-pub fn channel<T: Send + Sync>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    assert!(capacity > 0, "capacity must be > 0");
+pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let ring = Ring::new(capacity);
-    let tail = ring.tail.load(Ordering::Acquire);
-
     (
         Sender {
-            ring: Arc::clone(&ring),
+            ring: ring.clone(),
+            head: 0,
         },
         Receiver {
-            ring,
-            next_seq: tail,
+            ring: ring.clone(),
+            next_seq: 0,
+            listener: None,
         },
     )
 }
@@ -243,82 +187,163 @@ pub fn channel<T: Send + Sync>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn basic_send_recv() {
-        let (tx, mut rx) = channel::<u64>(8);
+        let (mut tx, mut rx) = channel::<u64>(8);
+
         tx.send(42);
-        let slot = rx.recv().await.unwrap();
-        assert_eq!(slot.value, 42);
+        assert_eq!(rx.recv().await, Ok(42));
+
+        tx.send(123);
+        assert_eq!(rx.recv().await, Ok(123));
     }
 
     #[tokio::test]
-    async fn multi_subscribers_get_same_message() {
-        let (tx, rx) = channel::<String>(4);
+    async fn multi_consumer_broadcast() {
+        let (mut tx, rx) = channel::<String>(8);
         let mut rx1 = rx.clone();
         let mut rx2 = rx.clone();
 
-        tx.send("hello".to_string());
-        let s1 = rx1.recv().await.unwrap();
-        let s2 = rx2.recv().await.unwrap();
+        tx.send("alpha".to_string());
+        tx.send("beta".to_string());
 
-        assert_eq!(s1.value, s2.value);
-        assert!(Arc::ptr_eq(&s1, &s2)); // both point to same slot Arc
+        assert_eq!(rx1.recv().await, Ok("alpha".to_string()));
+        assert_eq!(rx1.recv().await, Ok("beta".to_string()));
+
+        assert_eq!(rx2.recv().await, Ok("alpha".to_string()));
+        assert_eq!(rx2.recv().await, Ok("beta".to_string()));
     }
 
     #[tokio::test]
-    async fn lagging_receiver_is_caught_up() {
-        const CAP: usize = 4;
-        const N: u64 = 12;
-        let (tx, mut rx) = channel::<u64>(CAP);
+    async fn buffer_wrap_around_behavior() {
+        // Capacity 4.
+        let (mut tx, mut rx) = channel::<u64>(4);
 
-        for i in 0..N {
+        // 1. Fill buffer completely [0, 1, 2, 3]
+        for i in 0..4 {
             tx.send(i);
         }
 
+        // 2. Consume first two [0, 1]
+        assert_eq!(rx.recv().await, Ok(0));
+        assert_eq!(rx.recv().await, Ok(1));
+
+        // Receiver is now expecting seq 2.
+        // Head is 4. Earliest valid is 4-4=0.
+        // 2 > 0, so no lag yet.
+
+        // 3. Overwrite the first two slots [4, 5]
+        // Slot indices 0 and 1 are overwritten.
+        tx.send(4);
+        tx.send(5);
+
+        // Head is now 6. Earliest valid is 6-4=2.
+        // Receiver expects 2. 2 >= 2. Still safe!
+        // The slots it wants (2 and 3) are still valid in the buffer.
+
+        assert_eq!(rx.recv().await, Ok(2));
+        assert_eq!(rx.recv().await, Ok(3));
+
+        // Now verify it reads the wrapped values correctly
+        assert_eq!(rx.recv().await, Ok(4));
+        assert_eq!(rx.recv().await, Ok(5));
+    }
+
+    #[tokio::test]
+    async fn lagging_receiver_jumps_to_head() {
+        // Capacity 4
+        let (mut tx, mut rx) = channel::<u64>(4);
+
+        // Send 6 items [0, 1, 2, 3, 4, 5]
+        // Buffer holds [2, 3, 4, 5].
+        // Head is 6. Earliest is 2.
+        for i in 0..6 {
+            tx.send(i);
+        }
+
+        // Receiver is at 0.
+        // 0 < Earliest(2). LAG detected.
+        // Implementation behavior: Jump to Head (6).
+        match rx.recv().await {
+            Err(RecvError::Lagged(seq)) => assert_eq!(seq, 6),
+            _ => panic!("Expected lag error"),
+        }
+
+        // Receiver is now at 6. Buffer only goes up to 5.
+        // Receiver should wait for new data.
+
+        let h = tokio::spawn(async move {
+            tx.send(6);
+        });
+
+        // Should receive the new item immediately
+        assert_eq!(rx.recv().await, Ok(6));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receiver_detects_overwrite_during_read() {
+        // This tests the race condition where the producer overwrites
+        // the exact slot the receiver is trying to read.
+        // Since RwLock prevents this physically, this test verifies
+        // the sequence check logic handles the logical mismatch if lock contention happens.
+
+        let (mut tx, mut rx) = channel::<u64>(2); // Small cap to force collisions
+
+        tx.send(0);
+
+        // Verify we can read 0
+        assert_eq!(rx.recv().await, Ok(0));
+
+        // Now simulate a scenario where rx is slow.
+        // We manually advance tx far ahead.
+        tx.send(1); // Slot 1
+        tx.send(2); // Slot 0 (Overwrites 0) -> Rx expecting 1 (Slot 1) is fine.
+        tx.send(3); // Slot 1 (Overwrites 1) -> Rx expecting 1 is now LAGGED.
+
+        // Rx expects seq 1.
+        // Head is 4. Earliest is 4-2=2.
+        // 1 < 2.
+        // Should return Lagged(4).
+        match rx.recv().await {
+            Err(RecvError::Lagged(s)) => assert_eq!(s, 4),
+            Ok(v) => panic!("Should have lagged, got {}", v),
+            Err(e) => panic!("Unexpected error {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_signal_drains_then_stops() {
+        let (mut tx, mut rx) = channel::<u64>(4);
+
+        tx.send(1);
+        tx.send(2);
         drop(tx);
-        let mut received = 0;
 
-        loop {
-            match rx.recv().await {
-                Ok(slot) => received += 1,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => break,
-            }
-        }
-
-        assert!(received >= 0);
+        assert_eq!(rx.recv().await, Ok(1));
+        assert_eq!(rx.recv().await, Ok(2));
+        assert_eq!(rx.recv().await, Err(RecvError::Closed));
+        // Subsequent calls should still be Closed
+        assert_eq!(rx.recv().await, Err(RecvError::Closed));
     }
 
     #[tokio::test]
-    async fn receiver_detects_immediate_overwrite() {
-        // Small capacity so we can easily force overwrites.
-        const CAP: usize = 2;
-        let (tx, mut rx) = channel::<u64>(CAP);
+    async fn async_waker_notification() {
+        let (mut tx, mut rx) = channel::<u64>(4);
 
-        // Fill the ring several times over its capacity quickly.
-        for i in 0..CAP as u64 * 4 {
-            tx.send(i);
-        }
+        let h = tokio::spawn(async move {
+            // This should block until main thread sends
+            rx.recv().await
+        });
 
-        // The receiver has not consumed any yet, so it's definitely lagged.
-        match rx.try_recv() {
-            Err(RecvError::Lagged(seq)) => {
-                // It should jump directly to the tail.
-                let tail_now = seq;
-                let tail_expected = tx.ring.tail.load(std::sync::atomic::Ordering::Acquire);
-                assert_eq!(
-                    tail_now, tail_expected,
-                    "lagged seq should equal current tail"
-                );
-            }
-            other => panic!("expected immediate Lagged, got {:?}", other),
-        }
+        // Ensure the task has likely polled and parked
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // After recovering, new sends should be received normally.
-        let next_val = 1234;
-        tx.send(next_val);
-        let slot = rx.recv().await.expect("should receive new message");
-        assert_eq!(slot.value, next_val);
+        tx.send(99);
+
+        let result = h.await.unwrap();
+        assert_eq!(result, Ok(99));
     }
 }

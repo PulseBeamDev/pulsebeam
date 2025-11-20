@@ -41,6 +41,8 @@ crossbeam-utils = "0.8.21"
 metrics = "0.24.2"
 loom = { version = "0.7", optional = true, features = ["futures", "checkpoint"] }
 crossbeam-queue = "0.3.12"
+event-listener = "5.4.1"
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 rcgen = "0.14.4"

@@ -153,7 +153,7 @@ impl Stream for IdentifyStream {
         let this = self.get_mut();
         loop {
             match ready!(this.inner.channel.poll_recv(cx)) {
-                Ok(pkt) => return Poll::Ready(Some((this.id.clone(), pkt.value.clone()))),
+                Ok(pkt) => return Poll::Ready(Some((this.id.clone(), pkt))),
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(track_id = %this.id, "audio stream is lagging by {}", n);
                     // will continue to read from the latest

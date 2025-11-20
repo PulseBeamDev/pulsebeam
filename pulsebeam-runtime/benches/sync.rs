@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::{StreamExt, future::join_all};
 use futures_concurrency::stream::Merge;
-use rand::{Rng, seq::index};
+use rand::seq::index;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -20,7 +20,6 @@ criterion_group!(
     benches,
     // bench_interactive_room_mesh_mpsc_fanout,
     bench_interactive_room_mesh_futures_unordered,
-    bench_interactive_room_mesh_poll,
     bench_interactive_room_mesh_spawn,
 );
 criterion_main!(benches);
@@ -183,7 +182,7 @@ async fn run_interactive_room_mesh_spawn_test() {
                     loop {
                         match receiver.recv().await {
                             Ok(res) => {
-                                if tx_clone.send(res.value.1.elapsed()).await.is_err() {
+                                if tx_clone.send(res.1.elapsed()).await.is_err() {
                                     break;
                                 }
                             }
@@ -278,7 +277,7 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
                     loop {
                         match receiver.recv().await {
                             Ok(res) => {
-                                yield res.value.1.elapsed();
+                                yield res.1.elapsed();
                             }
                             Err(RecvError::Lagged(_)) => continue,
                             Err(RecvError::Closed) => break,
@@ -289,140 +288,6 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
             let latencies = futs.merge();
             latencies.collect().await
         });
-        subscriber_tasks.push(handle);
-    }
-
-    let mut publisher_tasks = Vec::with_capacity(senders.len());
-    for tx in senders {
-        let handle = task::spawn(create_publisher_load(tx, NUM_PACKETS_PER_PUBLISHER));
-        publisher_tasks.push(handle);
-    }
-
-    let simulation_start = Instant::now();
-    join_all(publisher_tasks).await;
-    let total_send_duration = simulation_start.elapsed();
-
-    let all_latencies = aggregate_latencies(subscriber_tasks).await;
-    let total_possible_deliveries =
-        NUM_PACKETS_PER_PUBLISHER * SUBSCRIPTIONS_PER_SUBSCRIBER * NUM_SUBSCRIBERS;
-    print_metrics(
-        "Interactive Room (Mesh-Spawn)",
-        total_send_duration,
-        all_latencies,
-        total_possible_deliveries,
-    );
-}
-
-fn bench_interactive_room_mesh_poll(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("spmc_interactive_room_mesh_poll");
-    group.measurement_time(Duration::from_secs(30));
-    group.sample_size(10);
-    group.bench_function(
-        format!(
-            "{NUM_PUBLISHERS}_pubs_{NUM_SUBSCRIBERS}_subs_{NUM_PACKETS_PER_PUBLISHER}_pkts_{SUBSCRIPTIONS_PER_SUBSCRIBER}_persub_poll"
-        ),
-        |b| {
-            b.to_async(&rt).iter_custom(|iters| async move {
-                run_test_loop(iters, run_interactive_room_mesh_poll_test).await
-            });
-        },
-    );
-    group.finish();
-}
-
-async fn run_interactive_room_mesh_poll_test() {
-    let mut senders = Vec::with_capacity(NUM_PUBLISHERS);
-    let mut initial_receivers = Vec::with_capacity(NUM_PUBLISHERS);
-    for _ in 0..NUM_PUBLISHERS {
-        let (tx, rx) = channel::<(usize, Instant)>(256);
-        senders.push(tx);
-        initial_receivers.push(rx);
-    }
-
-    let mut rng = rand::rng();
-
-    let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
-    for _ in 0..NUM_SUBSCRIBERS {
-        let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
-
-        let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
-        for i in random_indices.iter() {
-            subs_receivers.push(initial_receivers[i].clone());
-        }
-
-        let handle = task::spawn(async move {
-            let mut latencies = Vec::new();
-
-            // --- TUNING PARAMETERS ---
-            // 1. Busy Budget: How many times to 'continue' draining before forced yield.
-            // Prevents starvation when under heavy load.
-            const BUSY_BUDGET_MAX: u32 = 16;
-
-            // 2. Idle Spins: How many times to 'yield_now' before resorting to sleep.
-            // Keeps latency low during short gaps between packets.
-            const IDLE_SPINS_MAX: u32 = 50;
-
-            // 3. Sleep Backoff: Only used during long silences (between frames).
-            // Kept very low to catch the start of the next frame quickly.
-            let min_sleep = Duration::from_micros(50);
-            let max_sleep = Duration::from_millis(1); // Max 1ms sleep
-
-            // --- STATE ---
-            let mut busy_budget = BUSY_BUDGET_MAX;
-            let mut idle_spins = 0;
-            let mut current_sleep = min_sleep;
-
-            loop {
-                if subs_receivers.is_empty() {
-                    break;
-                }
-
-                let mut work_done = false;
-
-                // Greedy non-blocking drain
-                for receiver in subs_receivers.iter_mut() {
-                    while let Ok(Some(msg)) = receiver.try_recv() {
-                        latencies.push(msg.value.1.elapsed());
-                        work_done = true;
-                    }
-                }
-                subs_receivers.retain(|receiver| !receiver.is_closed());
-
-                if work_done {
-                    // --- BUSY STATE ---
-                    // Reset idle counters because we found work.
-                    idle_spins = 0;
-                    current_sleep = min_sleep;
-
-                    busy_budget -= 1;
-                    if busy_budget == 0 {
-                        // Exhausted budget, yield to prevent starvation.
-                        busy_budget = BUSY_BUDGET_MAX;
-                        tokio::task::yield_now().await;
-                    } else {
-                        // Stay hot, check again immediately.
-                        continue;
-                    }
-                } else {
-                    // --- IDLE STATE ---
-                    // Reset busy budget.
-                    busy_budget = BUSY_BUDGET_MAX;
-
-                    if idle_spins < IDLE_SPINS_MAX {
-                        // Phase 1: Spin/Yield. High CPU, very low latency.
-                        idle_spins += 1;
-                        tokio::task::yield_now().await;
-                    } else {
-                        // Phase 2: Sleep. Saves CPU during the ~30ms gap between frames.
-                        tokio::time::sleep(current_sleep).await;
-                        current_sleep = (current_sleep * 2).min(max_sleep);
-                    }
-                }
-            }
-            latencies
-        });
-
         subscriber_tasks.push(handle);
     }
 
@@ -465,7 +330,7 @@ where
     total_duration
 }
 
-async fn create_publisher_load(tx: Sender<(usize, Instant)>, num_packets: usize) {
+async fn create_publisher_load(mut tx: Sender<(usize, Instant)>, num_packets: usize) {
     // --- SFU WORKLOAD SIMULATION ---
 
     // Define the characteristics of the simulated video stream.
