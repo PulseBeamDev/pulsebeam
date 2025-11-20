@@ -1,21 +1,17 @@
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
-use futures::stream::SelectAll;
-use futures::{Stream, StreamExt};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::task::{Waker, ready};
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Rid};
 use tokio::sync::watch;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastQuality, SimulcastReceiver, TrackReceiver};
-
-type SlotStreamItem = (Mid, RtpPacket);
-type SlotStream = Pin<Box<dyn Stream<Item = SlotStreamItem> + Send>>;
 
 #[derive(Default)]
 pub struct VideoAllocator {
@@ -23,7 +19,8 @@ pub struct VideoAllocator {
     slots: Vec<Slot>,
 
     ticks: u32,
-    select_all: SelectAll<SlotStream>,
+    rr_cursor: usize,
+    waker: Option<Waker>,
 }
 
 impl VideoAllocator {
@@ -64,21 +61,12 @@ impl VideoAllocator {
 
     pub fn add_slot(&mut self, mid: Mid) {
         tracing::info!(%mid, "video slot added");
-
-        let (tx, rx) = watch::channel(SlotConfig {
-            paused: true,
-            target: None,
-        });
-
-        let mut reader = SlotReader::new(mid, rx);
-        let stream = async_stream::stream! {
-            while let Some(item) = reader.next().await {
-                yield item;
-            }
-        };
-        self.select_all.push(stream.boxed());
-        self.slots.push(Slot::new(mid, tx));
+        self.slots.push(Slot::new(mid));
         self.rebalance();
+
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     fn rebalance(&mut self) {
@@ -213,8 +201,37 @@ impl VideoAllocator {
         slot.request_keyframe(req.kind);
     }
 
-    pub async fn next(&mut self) -> Option<SlotStreamItem> {
-        self.select_all.next().await
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+        if self.slots.is_empty() {
+            self.waker.replace(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        let mut checked_count = 0;
+        while checked_count < self.slots.len() {
+            if self.rr_cursor >= self.slots.len() {
+                self.rr_cursor = 0;
+            }
+
+            let slot = &mut self.slots[self.rr_cursor];
+
+            match slot.poll_next(cx) {
+                Poll::Ready(Some(pkt)) => {
+                    // ensure each frame to be flushed before moving to another stream,
+                    // allows related contexts to stay in L1/L2 caches longer.
+                    return Poll::Ready(Some((slot.mid, pkt)));
+                }
+                Poll::Ready(None) => {
+                    self.rr_cursor += 1;
+                    checked_count += 1;
+                }
+                Poll::Pending => {
+                    self.rr_cursor += 1;
+                    checked_count += 1;
+                }
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -227,26 +244,134 @@ struct TrackState {
 #[derive(Debug, Clone)]
 struct SlotConfig {
     paused: bool,
-    target: Option<SimulcastReceiver>,
+    target: SimulcastReceiver,
 }
 
 struct Slot {
     mid: Mid,
-    max_height: u32,
 
-    config_tx: watch::Sender<SlotConfig>,
+    max_height: u32,
+    switcher: Switcher,
+    state: SlotState,
+
+    pending_allocation: Option<SimulcastReceiver>,
+    waker: Option<Waker>,
 }
 
 impl Slot {
-    fn new(mid: Mid, config_tx: watch::Sender<SlotConfig>) -> Self {
+    fn new(mid: Mid) -> Self {
         Self {
             mid,
             max_height: 0,
-            config_tx,
+            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
+            state: SlotState::Idle,
+            pending_allocation: None,
+            waker: None,
         }
     }
 
-    fn request_keyframe(&self, kind: KeyframeRequestKind) {}
+    fn pending(&self) -> Option<&SimulcastReceiver> {
+        self.pending_allocation.as_ref()
+    }
+
+    /// Helper to get the "Forward Looking" receiver.
+    /// If we are switching or resuming, this returns the staging receiver.
+    /// If we are streaming or paused, it returns the active one.
+    fn target_receiver(&self) -> Option<&SimulcastReceiver> {
+        match &self.state {
+            SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => Some(staging),
+            SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
+            SlotState::Idle => None,
+        }
+    }
+
+    pub fn track_id(&self) -> Option<&Arc<TrackId>> {
+        self.target_receiver().map(|r| &r.meta.id)
+    }
+
+    pub fn rid(&self) -> Option<Rid> {
+        self.target_receiver().and_then(|r| r.rid)
+    }
+
+    pub fn quality(&self) -> SimulcastQuality {
+        self.target_receiver()
+            .map(|r| r.quality)
+            .unwrap_or(SimulcastQuality::Undefined)
+    }
+
+    pub fn prepare(&mut self, receiver: SimulcastReceiver) {
+        self.pending_allocation.replace(receiver);
+    }
+
+    pub fn commit(&mut self) {
+        if let Some(receiver) = self.pending_allocation.take() {
+            self.switch_to(receiver);
+        }
+    }
+
+    pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
+        // Check if we are already playing (or trying to play) this exact stream
+        // If we are Paused, we must wake up (continue to transition logic).
+        // If we are already Streaming or Switching to this, do nothing.
+        if let Some(current) = self.target_receiver()
+            && current.rid == receiver.rid
+            && current.meta.id == receiver.meta.id
+            && !matches!(self.state, SlotState::Paused { .. })
+        {
+            return;
+        }
+
+        let old_state = std::mem::replace(&mut self.state, SlotState::Idle);
+
+        tracing::info!(
+            mid = %self.mid,
+            to_rid = ?receiver.rid,
+            track = %receiver.meta.id,
+            "switch_to: initiating switch"
+        );
+        receiver.channel.reset();
+        receiver.request_keyframe(KeyframeRequestKind::Fir);
+        self.state = match old_state {
+            SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
+            SlotState::Streaming { active } => SlotState::Switching {
+                active,
+                staging: receiver,
+            },
+            SlotState::Resuming { .. } => SlotState::Resuming { staging: receiver },
+            SlotState::Switching { active, .. } => SlotState::Switching {
+                active,
+                staging: receiver,
+            },
+        };
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self.state, SlotState::Idle | SlotState::Paused { .. })
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, SlotState::Idle)
+    }
+
+    pub fn stop(&mut self) {
+        self.state = SlotState::Idle;
+    }
+
+    fn request_keyframe(&self, kind: KeyframeRequestKind) {
+        // Priority: Request from the new stream we are waiting for.
+        match &self.state {
+            SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => {
+                staging.request_keyframe(kind);
+            }
+            SlotState::Streaming { active } => {
+                active.request_keyframe(kind);
+            }
+            SlotState::Paused { .. } | SlotState::Idle => {}
+        }
+    }
 }
 
 enum SlotState {

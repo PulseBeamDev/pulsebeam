@@ -2203,7 +2203,6 @@ name = "pulsebeam"
 version = "0.2.16"
 dependencies = [
  "anyhow",
- "async-stream",
  "axum",
  "axum-extra",
  "bs58",
