@@ -18,7 +18,7 @@ const SUBSCRIPTIONS_PER_SUBSCRIBER: usize = 1;
 // --- Benchmark Group Definition ---
 criterion_group!(
     benches,
-    bench_interactive_room_mesh_mpsc_fanout,
+    // bench_interactive_room_mesh_mpsc_fanout,
     bench_interactive_room_mesh_futures_unordered,
     bench_interactive_room_mesh_poll,
     bench_interactive_room_mesh_spawn,

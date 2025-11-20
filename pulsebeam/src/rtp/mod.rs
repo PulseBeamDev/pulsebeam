@@ -20,6 +20,7 @@ pub enum Codec {
     H264,
     VP8,
     VP9,
+    Opus,
 }
 
 /// Unified internal RTP packet representation used across the SFU.
@@ -68,6 +69,7 @@ impl RtpPacket {
             Codec::H264 => is_h264_keyframe_start(&rtp.payload),
             Codec::VP8 => is_vp8_keyframe_start(&rtp.payload),
             Codec::VP9 => is_vp9_keyframe_start(&rtp.payload),
+            Codec::Opus => true, // audio frame has not dependencies,
         };
 
         Self {

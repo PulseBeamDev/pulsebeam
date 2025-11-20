@@ -81,4 +81,9 @@ impl Switcher {
 
         None
     }
+
+    pub fn drain(&mut self) {
+        // TODO: probably less primitive than this..
+        while let Some(_) = self.pop() {}
+    }
 }

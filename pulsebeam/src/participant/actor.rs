@@ -1,12 +1,11 @@
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
-use once_cell::sync::Lazy;
+use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
-use tokio::time::{Instant, Interval};
+use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
-use tokio_stream::StreamExt;
 
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, node, room, track};
@@ -107,7 +106,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     self.core.batcher.flush(&self.egress);
                 },
                 Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
-                Some((meta, pkt)) = self.core.downstream_allocator.next() => {
+                Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
                 },
                 now = stats_interval.tick() => {

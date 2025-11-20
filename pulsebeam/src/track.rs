@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
-use str0m::media::{Frequency, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -43,8 +43,8 @@ pub struct TrackMeta {
 #[derive(Clone, Debug)]
 pub struct SimulcastReceiver {
     pub meta: Arc<TrackMeta>,
-    pub quality: SimulcastQuality,
     pub rid: Option<Rid>,
+    pub quality: SimulcastQuality,
     pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: watch::Sender<Option<KeyframeRequestKind>>,
     pub state: StreamState,
@@ -76,6 +76,7 @@ pub struct SimulcastSender {
     pub monitor: StreamMonitor,
     synchronizer: Synchronizer,
     channel: spmc::Sender<RtpPacket>,
+    filter: PacketFilter,
 
     keyframe_request_state: KeyframeRequestState,
     keyframe_debounce_duration: Duration,
@@ -141,7 +142,9 @@ impl SimulcastSender {
         let pkt = self.synchronizer.process(pkt);
         self.monitor
             .process_packet(&pkt, pkt.payload.len() + pkt.raw_header.header_len);
-        self.channel.send(pkt);
+        if (self.filter)(&pkt) {
+            self.channel.send(pkt);
+        }
     }
 }
 
@@ -256,9 +259,9 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
         let (keyframe_tx, keyframe_rx) = watch::channel(None);
 
         // TODO: get this from SDP instead
-        let clock_rate = match meta.kind {
-            MediaKind::Audio => rtp::AUDIO_FREQUENCY,
-            MediaKind::Video => rtp::VIDEO_FREQUENCY,
+        let (clock_rate, filter) = match meta.kind {
+            MediaKind::Audio => (rtp::AUDIO_FREQUENCY, should_forward_audio as PacketFilter),
+            MediaKind::Video => (rtp::VIDEO_FREQUENCY, should_forward_noop as PacketFilter),
         };
         let (quality, bitrate) = match (meta.kind, rid) {
             (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000),
@@ -275,12 +278,13 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
         };
         let stream_state = StreamState::new(true, bitrate);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
-        let monitor = StreamMonitor::new(stream_id, stream_state.clone());
+        let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
 
         senders.push(SimulcastSender {
             mid,
             rid,
             quality,
+            filter,
             synchronizer: Synchronizer::new(clock_rate),
             channel: tx,
             keyframe_requests: keyframe_rx,
@@ -310,4 +314,41 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
             simulcast: receivers,
         },
     )
+}
+
+type PacketFilter = fn(packet: &RtpPacket) -> bool;
+
+/// Determines if an audio packet is essential (Speech or DTX) and should be forwarded.
+#[inline]
+pub fn should_forward_audio(packet: &RtpPacket) -> bool {
+    const DTX_THRESHOLD: usize = 12;
+    // -50dBov is a standard noise floor. Anything quieter is background hiss.
+    const NOISE_FLOOR_DB: i8 = -50;
+
+    // 1. Always relay tiny packets (Comfort Noise / DTX)
+    if packet.payload.len() < DTX_THRESHOLD {
+        return true;
+    }
+
+    let ext = &packet.raw_header.ext_vals;
+
+    // 2. Strict VAD Check (Priority)
+    // If the V bit is present, trust it explicitly.
+    if let Some(vad) = ext.voice_activity {
+        return vad;
+    }
+
+    // 3. Noise Gate Fallback
+    // If VAD is missing but we have levels, drop silence/background noise.
+    if let Some(level) = ext.audio_level {
+        return level > NOISE_FLOOR_DB;
+    }
+
+    // 4. Fallback: No metadata, assumed active.
+    true
+}
+
+#[inline]
+fn should_forward_noop(_: &RtpPacket) -> bool {
+    true
 }
