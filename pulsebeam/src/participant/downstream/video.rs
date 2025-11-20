@@ -100,7 +100,7 @@ impl VideoAllocator {
         let budget = available_bandwidth.as_f64().max(300_000.0);
 
         // Sort by priority (max_height) so important slots get budget first
-        self.slots.sort_by_key(|s| s.max_height);
+        self.slots.sort_by_key(|s| std::cmp::Reverse(s.max_height));
 
         let mut total_allocated = 0.0;
         let mut total_desired = 0.0;

@@ -74,9 +74,6 @@ impl Stream for DownstreamAllocator {
         let this = self.get_mut();
 
         if let Poll::Ready(item) = this.audio.poll_next(cx) {
-            if item.is_none() {
-                panic!("didn't expect a none item here");
-            }
             return Poll::Ready(item);
         }
 
