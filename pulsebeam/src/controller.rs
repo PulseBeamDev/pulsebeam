@@ -123,7 +123,8 @@ impl ControllerActor {
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300)))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            .set_ice_lite(true);
+            // enable for compatibility, some clients don't support remote ice-lite
+            .set_ice_lite(false);
         let codec_config = rtc_config.codec_config();
         codec_config.enable_opus(true);
         // codec_config.enable_vp8(true);
