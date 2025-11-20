@@ -4,8 +4,8 @@ use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::task::Waker;
 use std::task::{Context, Poll};
-use std::task::{Waker, ready};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Rid};
 
@@ -88,10 +88,7 @@ impl VideoAllocator {
         }
     }
 
-    // Update allocations based on the following events:
-    //  1. Available bandwidth
-    //  2. Video slots
-    //  3. update_allocations get polled every 500ms
+    // based on Greedy Knapsack
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
         const DOWNGRADE_HYSTERESIS_FACTOR: f64 = 0.85;
         const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.25;
@@ -101,77 +98,67 @@ impl VideoAllocator {
         }
 
         let budget = available_bandwidth.as_f64().max(300_000.0);
+
+        // Sort by priority (max_height) so important slots get budget first
         self.slots.sort_by_key(|s| s.max_height);
 
         let mut total_allocated = 0.0;
         let mut total_desired = 0.0;
-        let mut upgraded = true;
-
-        while upgraded {
-            upgraded = false;
-            total_allocated = 0.0;
-            total_desired = 0.0;
-
-            for slot in &mut self.slots {
-                let Some(current_receiver) = slot.target_receiver() else {
-                    // next slot assignment will handle this
-                    continue;
-                };
-
-                let Some(state) = self.tracks.get_mut(&current_receiver.meta.id) else {
-                    continue;
-                };
-
-                let track = &state.track;
-                let paused = slot.is_paused();
-
-                let desired = if current_receiver.state.is_inactive() {
-                    // very likely the sender can't keep up with sending higher resolution.
-                    track.lowest_quality()
-                } else {
-                    // Conservative upgrade logic: only upgrade if higher layer is excellent
-                    match current_receiver.state.quality() {
-                        StreamQuality::Bad => track.lowest_quality(),
-                        StreamQuality::Good => current_receiver, // Stay at current when good
-                        StreamQuality::Excellent => track
-                            .higher_quality(current_receiver.quality)
-                            .filter(|next| {
-                                next.state.quality() == StreamQuality::Excellent
-                                    && !next.state.is_inactive()
-                            })
-                            .unwrap_or(current_receiver),
-                    }
-                };
-
-                let is_upgrade = desired.quality > current_receiver.quality;
-                let is_downgrade = desired.quality < current_receiver.quality;
-
-                // Apply hysteresis
-                let desired_bitrate = if is_upgrade {
-                    desired.state.bitrate_bps() * UPGRADE_HYSTERESIS_FACTOR
-                } else if is_downgrade {
-                    desired.state.bitrate_bps() * DOWNGRADE_HYSTERESIS_FACTOR
-                } else {
-                    desired.state.bitrate_bps()
-                };
-
-                total_desired += desired_bitrate;
-
-                if total_allocated + desired_bitrate <= budget
-                    && (paused || desired.rid != current_receiver.rid)
-                {
-                    upgraded = true;
-                    total_allocated += desired.state.bitrate_bps();
-                    slot.prepare(desired.clone());
-                } else {
-                    // Can't afford upgrade or change - stay at current
-                    total_allocated += current_receiver.state.bitrate_bps();
-                }
-            }
-        }
 
         for slot in &mut self.slots {
-            slot.commit();
+            let Some(current_receiver) = slot.target_receiver() else {
+                continue;
+            };
+
+            let Some(state) = self.tracks.get_mut(&current_receiver.meta.id) else {
+                continue;
+            };
+
+            let track = &state.track;
+            let paused = slot.is_paused();
+
+            let desired = if current_receiver.state.is_inactive() {
+                track.lowest_quality()
+            } else {
+                match current_receiver.state.quality() {
+                    StreamQuality::Bad => track.lowest_quality(),
+                    StreamQuality::Good => current_receiver,
+                    StreamQuality::Excellent => track
+                        .higher_quality(current_receiver.quality)
+                        .filter(|next| {
+                            next.state.quality() == StreamQuality::Excellent
+                                && !next.state.is_inactive()
+                        })
+                        .unwrap_or(current_receiver),
+                }
+            };
+
+            let is_upgrade = desired.quality > current_receiver.quality;
+            let is_downgrade = desired.quality < current_receiver.quality;
+
+            let desired_bitrate = if is_upgrade {
+                desired.state.bitrate_bps() * UPGRADE_HYSTERESIS_FACTOR
+            } else if is_downgrade {
+                desired.state.bitrate_bps() * DOWNGRADE_HYSTERESIS_FACTOR
+            } else {
+                desired.state.bitrate_bps()
+            };
+
+            total_desired += desired_bitrate;
+
+            // Greedy allocation: If it fits, take it.
+            // Note: Because we sorted by max_height above, high priority tracks
+            // are processed first and claim the budget.
+            if total_allocated + desired_bitrate <= budget
+                && (paused || desired.rid != current_receiver.rid)
+            {
+                total_allocated += desired.state.bitrate_bps();
+                slot.switch_to(desired.clone());
+            } else {
+                // Can't afford upgrade, or no change needed.
+                // We must account for the cost of keeping the *current* stream.
+                total_allocated += current_receiver.state.bitrate_bps();
+            }
         }
 
         let total_allocated = Bitrate::from(total_allocated);
@@ -261,7 +248,6 @@ struct Slot {
     max_height: u32,
     switcher: Switcher,
     state: Option<SlotState>,
-    pending_allocation: Option<SimulcastReceiver>,
     waker: Option<Waker>,
 }
 
@@ -272,17 +258,12 @@ impl Slot {
             max_height: 0,
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             state: Some(SlotState::Idle),
-            pending_allocation: None,
             waker: None,
         }
     }
 
     fn state(&self) -> &SlotState {
         self.state.as_ref().expect("State invalid outside poll")
-    }
-
-    fn pending(&self) -> Option<&SimulcastReceiver> {
-        self.pending_allocation.as_ref()
     }
 
     fn target_receiver(&self) -> Option<&SimulcastReceiver> {
@@ -305,16 +286,6 @@ impl Slot {
         self.target_receiver()
             .map(|r| r.quality)
             .unwrap_or(SimulcastQuality::Undefined)
-    }
-
-    pub fn prepare(&mut self, receiver: SimulcastReceiver) {
-        self.pending_allocation.replace(receiver);
-    }
-
-    pub fn commit(&mut self) {
-        if let Some(receiver) = self.pending_allocation.take() {
-            self.switch_to(receiver);
-        }
     }
 
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
