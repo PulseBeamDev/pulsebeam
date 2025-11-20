@@ -40,8 +40,10 @@ arc-swap = "1.7.1"
 crossbeam-utils = "0.8.21"
 metrics = "0.24.2"
 loom = { version = "0.7", optional = true, features = ["futures", "checkpoint"] }
+crossbeam-queue = "0.3.12"
 
 [dev-dependencies]
 rcgen = "0.14.4"
 criterion = { version = "0.7.0", features = ["async", "async_tokio"] }
 futures-concurrency = "7.6.3"
+async-stream = "0.3.6"

@@ -1,10 +1,10 @@
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwapOption;
+use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 use std::fmt::Debug;
-use std::task::{Context, Poll};
-use tokio::sync::Notify;
+use std::task::{Context, Poll, Waker};
 
 /// Errors returned by a receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,8 +27,8 @@ struct Ring<T: Send + Sync> {
     tail: CachePadded<AtomicU64>, // producer’s sequence
     capacity: usize,
     slots: Box<[ArcSwapOption<Slot<T>>]>,
-    notify: CachePadded<Notify>,
     closed: CachePadded<AtomicBool>,
+    wakers: SegQueue<Waker>,
 }
 
 impl<T: Send + Sync> Ring<T> {
@@ -42,8 +42,8 @@ impl<T: Send + Sync> Ring<T> {
             tail: CachePadded::new(AtomicU64::new(0)),
             capacity,
             slots: slots.into_boxed_slice(),
-            notify: CachePadded::new(Notify::new()),
             closed: CachePadded::new(AtomicBool::new(false)),
+            wakers: SegQueue::new(),
         })
     }
 
@@ -67,8 +67,7 @@ impl<T: Send + Sync> Ring<T> {
         // Advance tail
         self.tail.store(seq + 1, Ordering::Release);
 
-        // Notify all waiters
-        self.notify.notify_waiters();
+        self.notify_waiters();
     }
 
     /// Attempt to fetch the next available message for a receiver.
@@ -111,9 +110,19 @@ impl<T: Send + Sync> Ring<T> {
         }
     }
 
+    fn notify_waiters(&self) {
+        while let Some(waker) = self.wakers.pop() {
+            waker.wake();
+        }
+    }
+
+    fn wait(&self, waker: Waker) {
+        self.wakers.push(waker);
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+        self.notify_waiters();
     }
 
     fn is_closed(&self) -> bool {
@@ -166,8 +175,7 @@ impl<T: Send + Sync> Receiver<T> {
             Ok(None) => {}
         }
 
-        let notified = self.ring.notify.notified();
-        tokio::pin!(notified);
+        self.ring.wait(cx.waker().clone());
 
         match self.ring.get_next(&mut self.next_seq) {
             Ok(Some(slot)) => return Poll::Ready(Ok(slot)),
@@ -175,10 +183,7 @@ impl<T: Send + Sync> Receiver<T> {
             Ok(None) => {}
         }
 
-        match notified.as_mut().poll(cx) {
-            Poll::Ready(_) => Poll::Pending,
-            Poll::Pending => Poll::Pending,
-        }
+        Poll::Pending
     }
 
     pub async fn recv(&mut self) -> Result<Arc<Slot<T>>, RecvError> {
