@@ -8,7 +8,6 @@ use std::task::{Context, Poll};
 use std::task::{Waker, ready};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Rid};
-use tokio::sync::watch;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastQuality, SimulcastReceiver, TrackReceiver};
@@ -63,10 +62,6 @@ impl VideoAllocator {
         tracing::info!(%mid, "video slot added");
         self.slots.push(Slot::new(mid));
         self.rebalance();
-
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
     }
 
     fn rebalance(&mut self) {
@@ -75,6 +70,7 @@ impl VideoAllocator {
             state.assigned_mid.is_none()
         });
 
+        let mut updated = false;
         for slot in &mut self.slots {
             if !slot.is_idle() {
                 continue;
@@ -86,6 +82,11 @@ impl VideoAllocator {
 
             next_track.1.assigned_mid.replace(slot.mid);
             slot.switch_to(next_track.1.track.lowest_quality().clone());
+            updated = true;
+        }
+
+        if updated && let Some(waker) = self.waker.take() {
+            waker.wake();
         }
     }
 
@@ -202,10 +203,7 @@ impl VideoAllocator {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        if self.slots.is_empty() {
-            self.waker.replace(cx.waker().clone());
-            return Poll::Pending;
-        }
+        self.waker.replace(cx.waker().clone());
 
         let mut checked_count = 0;
         while checked_count < self.slots.len() {
@@ -241,10 +239,21 @@ struct TrackState {
     assigned_mid: Option<Mid>,
 }
 
-#[derive(Debug, Clone)]
-struct SlotConfig {
-    paused: bool,
-    target: SimulcastReceiver,
+enum SlotState {
+    Idle,
+    Paused {
+        active: SimulcastReceiver,
+    },
+    Resuming {
+        staging: SimulcastReceiver,
+    },
+    Streaming {
+        active: SimulcastReceiver,
+    },
+    Switching {
+        active: SimulcastReceiver,
+        staging: SimulcastReceiver,
+    },
 }
 
 struct Slot {
@@ -372,226 +381,109 @@ impl Slot {
             SlotState::Paused { .. } | SlotState::Idle => {}
         }
     }
-}
 
-enum SlotState {
-    Idle,
-    Paused {
-        active: SimulcastReceiver,
-    },
-    Resuming {
-        staging: SimulcastReceiver,
-    },
-    Streaming {
-        active: SimulcastReceiver,
-    },
-    Switching {
-        active: SimulcastReceiver,
-        staging: SimulcastReceiver,
-    },
-}
-
-struct SlotReader {
-    mid: Mid,
-    switcher: Switcher,
-    state: Option<SlotState>,
-
-    config_rx: watch::Receiver<SlotConfig>,
-}
-
-impl SlotReader {
-    fn new(mid: Mid, config_rx: watch::Receiver<SlotConfig>) -> Self {
-        Self {
-            mid,
-            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
-            state: Some(SlotState::Idle),
-            config_rx,
-        }
-    }
-
-    async fn next(&mut self) -> Option<(Mid, RtpPacket)> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
+        self.waker.replace(cx.waker().clone());
         loop {
             if let Some(pkt) = self.switcher.pop() {
-                return Some((self.mid, pkt));
+                return Poll::Ready(Some(pkt));
             }
 
-            let state = self.state.take().expect("SlotReader state invalid");
+            match &mut self.state {
+                SlotState::Idle => return Poll::Pending,
 
-            let next_state = match state {
-                SlotState::Idle => {
+                SlotState::Paused { .. } => {
                     self.switcher.drain();
-                    if self.config_rx.changed().await.is_ok() {
-                        self.reconcile(SlotState::Idle)
-                    } else {
-                        SlotState::Idle
+                    return Poll::Pending;
+                }
+
+                SlotState::Resuming { staging } => match ready!(staging.channel.poll_recv(cx)) {
+                    Ok(pkt) => {
+                        self.switcher.stage(pkt.value.clone());
+                        if self.switcher.is_ready() {
+                            tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
+                            self.state = SlotState::Streaming {
+                                active: staging.clone(),
+                            };
+                        }
                     }
-                }
-
-                SlotState::Paused { active } => {
-                    self.switcher.drain();
-                    if self.config_rx.changed().await.is_ok() {
-                        self.reconcile(SlotState::Paused { active })
-                    } else {
-                        SlotState::Paused { active }
+                    Err(spmc::RecvError::Lagged(n)) => {
+                        tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, pausing");
+                        self.state = SlotState::Paused {
+                            active: staging.clone(),
+                        };
                     }
-                }
-
-                SlotState::Resuming { mut staging } => {
-                    tokio::select! {
-                        biased;
-                        Ok(_) = self.config_rx.changed() => self.reconcile(SlotState::Resuming { staging }),
-                        res = staging.channel.recv() => self.handle_staging(res, staging, None),
+                    Err(spmc::RecvError::Closed) => {
+                        tracing::warn!(mid = %self.mid, "Resuming closed");
+                        self.state = SlotState::Idle;
                     }
-                }
+                },
 
-                SlotState::Streaming { mut active } => {
-                    tokio::select! {
-                        biased;
-                        Ok(_) = self.config_rx.changed() => self.reconcile(SlotState::Streaming { active }),
-                        res = active.channel.recv() => self.handle_active(res, active, None),
+                SlotState::Streaming { active } => match ready!(active.channel.poll_recv(cx)) {
+                    Ok(pkt) => self.switcher.push(pkt.value.clone()),
+                    Err(spmc::RecvError::Lagged(n)) => {
+                        tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
+                        self.state = SlotState::Paused {
+                            active: active.clone(),
+                        };
                     }
-                }
-
-                SlotState::Switching {
-                    mut active,
-                    mut staging,
-                } => {
-                    tokio::select! {
-                        biased;
-                        Ok(_) = self.config_rx.changed() => self.reconcile(SlotState::Switching { active, staging }),
-                        res = staging.channel.recv() => self.handle_staging(res, staging, Some(active)),
-                        res = active.channel.recv() => self.handle_active(res, active, Some(staging)),
+                    Err(spmc::RecvError::Closed) => {
+                        tracing::info!(mid = %self.mid, "Streaming closed");
+                        self.state = SlotState::Idle;
                     }
-                }
-            };
+                },
 
-            self.state = Some(next_state);
-        }
-    }
+                SlotState::Switching { active, staging } => {
+                    match staging.channel.poll_recv(cx) {
+                        Poll::Ready(Ok(pkt)) => {
+                            self.switcher.stage(pkt.value.clone());
+                            if self.switcher.is_ready() {
+                                tracing::info!(
+                                    mid = %self.mid,
+                                    from = ?active.rid,
+                                    to = ?staging.rid,
+                                    "Switch complete"
+                                );
+                                self.state = SlotState::Streaming {
+                                    active: staging.clone(),
+                                };
+                            }
+                            continue;
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
+                            self.state = SlotState::Paused {
+                                active: staging.clone(),
+                            };
+                            continue;
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
+                            tracing::warn!(mid = %self.mid, "Staging closed during switch");
+                            self.state = SlotState::Streaming {
+                                active: active.clone(),
+                            };
+                            continue;
+                        }
+                        Poll::Pending => {}
+                    }
 
-    #[inline]
-    fn handle_active(
-        &mut self,
-        res: Result<Arc<spmc::Slot<RtpPacket>>, spmc::RecvError>,
-        active: SimulcastReceiver,
-        staging: Option<SimulcastReceiver>,
-    ) -> SlotState {
-        match res {
-            Ok(pkt) => {
-                self.switcher.push(pkt.value.clone());
-                match staging {
-                    Some(s) => SlotState::Switching { active, staging: s },
-                    None => SlotState::Streaming { active },
-                }
-            }
-            Err(spmc::RecvError::Lagged(n)) => {
-                tracing::warn!(mid = %self.mid, skipped = n, "Active lagged");
-                SlotState::Paused { active }
-            }
-            Err(spmc::RecvError::Closed) => {
-                tracing::info!(mid = %self.mid, "Active closed");
-                match staging {
-                    Some(s) => SlotState::Resuming { staging: s },
-                    None => SlotState::Idle,
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn handle_staging(
-        &mut self,
-        res: Result<Arc<spmc::Slot<RtpPacket>>, spmc::RecvError>,
-        staging: SimulcastReceiver,
-        active: Option<SimulcastReceiver>,
-    ) -> SlotState {
-        match res {
-            Ok(pkt) => {
-                self.switcher.stage(pkt.value.clone());
-                if self.switcher.is_ready() {
-                    tracing::info!(mid = %self.mid, rid = ?staging.rid, "Switch complete");
-                    SlotState::Streaming { active: staging }
-                } else {
-                    match active {
-                        Some(a) => SlotState::Switching { active: a, staging },
-                        None => SlotState::Resuming { staging },
+                    match ready!(active.channel.poll_recv(cx)) {
+                        Ok(pkt) => self.switcher.push(pkt.value.clone()),
+                        Err(spmc::RecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Active lagged during switch, pausing");
+                            self.state = SlotState::Paused {
+                                active: active.clone(),
+                            };
+                        }
+                        Err(spmc::RecvError::Closed) => {
+                            tracing::warn!(mid = %self.mid, "Active closed, forcing resume");
+                            self.state = SlotState::Resuming {
+                                staging: staging.clone(),
+                            };
+                        }
                     }
                 }
             }
-            Err(spmc::RecvError::Lagged(n)) => {
-                tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged");
-                SlotState::Paused { active: staging }
-            }
-            Err(spmc::RecvError::Closed) => {
-                tracing::warn!(mid = %self.mid, "Staging closed");
-                match active {
-                    Some(a) => SlotState::Streaming { active: a },
-                    None => SlotState::Idle,
-                }
-            }
-        }
-    }
-
-    fn reconcile(&mut self, current_state: SlotState) -> SlotState {
-        let config = self.config_rx.borrow_and_update();
-
-        // If config requests pause, we unconditionally pause the current/target stream
-        if config.paused {
-            let active = match current_state {
-                SlotState::Idle => config.target.clone(),
-                SlotState::Paused { active } => active,
-                SlotState::Streaming { active } => active,
-                SlotState::Resuming { staging } => staging,
-                SlotState::Switching { active, .. } => active, // Fallback to active on pause
-            };
-
-            return SlotState::Paused { active };
-        }
-
-        // Identify the current "target" of the state machine
-        let current_target = match &current_state {
-            SlotState::Idle => None,
-            SlotState::Paused { active } => Some(active),
-            SlotState::Streaming { active } => Some(active),
-            SlotState::Resuming { staging } => Some(staging),
-            SlotState::Switching { staging, .. } => Some(staging),
-        };
-
-        // Check if we are already playing (or trying to play) this exact stream
-        if let Some(current) = current_target {
-            if current.rid == config.target.rid && current.meta.id == config.target.meta.id {
-                // If we are Paused, we must wake up (Unpause).
-                // If we are Idle, Streaming, or Switching, we stay as is.
-                if !matches!(current_state, SlotState::Paused { .. }) {
-                    return current_state;
-                }
-            }
-        }
-
-        // Initiate Switch
-        tracing::info!(
-            mid = %self.mid,
-            to_rid = ?config.target.rid,
-            track = %config.target.meta.id,
-            "Reconcile: initiating switch"
-        );
-
-        let mut new_rx = config.target.clone();
-        new_rx.channel.reset();
-        new_rx.request_keyframe(KeyframeRequestKind::Fir);
-
-        match current_state {
-            SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: new_rx },
-            SlotState::Streaming { active } => SlotState::Switching {
-                active,
-                staging: new_rx,
-            },
-            // TODO: we should buffer transitioning in a transition
-            SlotState::Resuming { .. } => SlotState::Resuming { staging: new_rx },
-            SlotState::Switching { active, .. } => SlotState::Switching {
-                active,
-                staging: new_rx,
-            },
         }
     }
 }
