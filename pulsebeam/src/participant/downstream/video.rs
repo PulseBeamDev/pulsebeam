@@ -360,7 +360,8 @@ impl Slot {
 
         loop {
             if budget == 0 {
-                self.waker.replace(cx.waker().clone());
+                // yield now, let others run first.
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             budget -= 1;

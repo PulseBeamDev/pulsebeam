@@ -1,9 +1,9 @@
 use futures::StreamExt;
 use futures::stream::SelectAll;
 use futures::stream::Stream;
-use std::cmp::Ordering;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Waker;
 use std::task::ready;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -13,19 +13,15 @@ use tokio::time::Instant;
 use crate::entity::TrackId;
 use crate::rtp;
 use crate::rtp::RtpPacket;
-use crate::rtp::monitor::StreamState;
 use crate::rtp::timeline::Timeline;
 use crate::track::SimulcastReceiver;
 use crate::track::TrackReceiver;
 use pulsebeam_runtime::sync::spmc::RecvError;
 
 pub struct AudioAllocator {
-    // Merges N streams into 1.
-    // If all inputs are Pending (silence), this is Pending (0 CPU).
     inputs: SelectAll<IdentifyStream>,
-
-    // Fixed output slots (e.g., 3)
     slots: Vec<AudioSlot>,
+    waker: Option<Waker>,
 }
 
 impl AudioAllocator {
@@ -33,6 +29,7 @@ impl AudioAllocator {
         Self {
             inputs: SelectAll::new(),
             slots: Vec::new(),
+            waker: None,
         }
     }
 
@@ -41,18 +38,12 @@ impl AudioAllocator {
             id: track.meta.id.clone(),
             inner: track.lowest_quality().clone(),
         });
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     pub fn remove_track(&mut self, id: &Arc<TrackId>) {
-        // SelectAll doesn't support random removal easily.
-        // However, since TrackReceiver is a channel, dropping the Sender (upstream)
-        // will close the Receiver, causing SelectAll to drop it automatically
-        // on the next poll.
-        //
-        // If you need explicit removal, you have to rebuild the SelectAll
-        // or use a wrapper that supports cancellation signals.
-        //
-        // For this implementation, we lazily clear the Slot ownership:
         for slot in &mut self.slots {
             if slot.current_track_id.as_ref() == Some(id) {
                 slot.current_track_id = None;
@@ -65,17 +56,30 @@ impl AudioAllocator {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+        // SelectAll will return Ready(None) with an empty list
+        if self.inputs.is_empty() {
+            self.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        let mut budget = 10;
         loop {
-            // 1. Wait for ANY loud packet from ANY track
+            if budget == 0 {
+                // Force a wake so we return immediately after the runtime
+                // polls other tasks (like Video).
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            budget -= 1;
+
             let (track_id, packet) = match self.inputs.poll_next_unpin(cx) {
                 Poll::Ready(Some(val)) => val,
-                Poll::Ready(None) => return Poll::Ready(None), // All tracks gone
-                Poll::Pending => return Poll::Pending,         // Sleep
+                Poll::Ready(None) => return Poll::Ready(None), // All inputs closed
+                Poll::Pending => return Poll::Pending,         // No audio data
             };
 
             let now = Instant::now();
 
-            // 2. PRIORITY 1: Is this track already assigned?
             if let Some(slot) = self
                 .slots
                 .iter_mut()
@@ -84,21 +88,14 @@ impl AudioAllocator {
                 return Poll::Ready(Some(slot.process(&track_id, packet)));
             }
 
-            // 3. PRIORITY 2: Is there an empty slot?
             if let Some(slot) = self.slots.iter_mut().find(|s| s.current_track_id.is_none()) {
                 return Poll::Ready(Some(slot.process(&track_id, packet)));
             }
 
-            // 4. PRIORITY 3: Can we evict someone?
-            // Since slots are full, we check if anyone is stale.
             if let Some(slot) = self.slots.iter_mut().find(|s| s.can_evict(now)) {
                 // Take the seat
                 return Poll::Ready(Some(slot.process(&track_id, packet)));
             }
-
-            // 5. PRIORITY 4: Full & Active
-            // Everyone is talking. Drop the packet.
-            // Continue loop to drain other pending packets if any.
             continue;
         }
     }
@@ -115,25 +112,17 @@ impl AudioSlot {
     fn new(mid: Mid) -> Self {
         Self {
             mid,
-            // Audio clock rate is typically 48000
             timeline: Timeline::new(rtp::AUDIO_FREQUENCY),
             current_track_id: None,
             last_active_at: Instant::now(),
         }
     }
 
-    fn process(&mut self, track_id: &Arc<TrackId>, mut packet: RtpPacket) -> (Mid, RtpPacket) {
+    fn process(&mut self, track_id: &Arc<TrackId>, packet: RtpPacket) -> (Mid, RtpPacket) {
         let now = Instant::now();
 
-        // Check if we are switching sources
         if self.current_track_id.as_ref() != Some(track_id) {
-            // New speaker takes the chair
             self.current_track_id = Some(track_id.clone());
-
-            // REBASE TIMELINE
-            // We treat this packet as the "Keyframe" (sync point) for the switch.
-            // We ensure the packet flag is set so your Timeline assertion passes.
-            packet.is_keyframe_start = true;
             self.timeline.rebase(&packet);
         }
 
@@ -143,7 +132,6 @@ impl AudioSlot {
         (self.mid, rewritten)
     }
 
-    /// Checks if the slot owner has timed out.
     fn can_evict(&self, now: Instant) -> bool {
         const HANGOVER: Duration = Duration::from_millis(350);
         match self.current_track_id {
@@ -153,7 +141,6 @@ impl AudioSlot {
     }
 }
 
-/// Wraps a TrackReceiver to attach the TrackId to every packet.
 struct IdentifyStream {
     id: Arc<TrackId>,
     inner: SimulcastReceiver,
@@ -175,51 +162,4 @@ impl Stream for IdentifyStream {
             };
         }
     }
-}
-
-fn compare_audio(a: &StreamState, b: &StreamState) -> Ordering {
-    // Thresholds for stability
-    const SPEECH_THRESHOLD: f32 = 0.01; // Minimum envelope to count as "talking"
-    const ENVELOPE_EPSILON: f32 = 0.05; // 5% diff required to swap active speakers
-    const SILENCE_EPSILON_MS: u128 = 500; // 500ms diff required to swap silent speakers
-
-    let env_a = a.audio_envelope();
-    let env_b = b.audio_envelope();
-    let silence_a = a.silence_duration();
-    let silence_b = b.silence_duration();
-
-    let a_is_talking = env_a > SPEECH_THRESHOLD;
-    let b_is_talking = env_b > SPEECH_THRESHOLD;
-
-    // 1. BINARY PRIORITY: Active Speaker > Silent User
-    if a_is_talking != b_is_talking {
-        return if a_is_talking {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        };
-    }
-
-    // 2. MOMENTUM: Compare Intensity (if both active)
-    if a_is_talking && b_is_talking {
-        let diff = (env_a - env_b).abs();
-        if diff > ENVELOPE_EPSILON {
-            // Significant difference: Louder wins
-            return env_b.partial_cmp(&env_a).unwrap();
-        }
-        // If difference is small (< 5%), treat as tied and fall through to Recency
-    }
-
-    // 3. RECENCY: Compare Silence Duration (Who spoke last?)
-    let ms_a = silence_a.as_millis();
-    let ms_b = silence_b.as_millis();
-    let diff_ms = ms_a.abs_diff(ms_b);
-
-    if diff_ms > SILENCE_EPSILON_MS {
-        // Significant difference: More recent (lower duration) wins
-        return ms_a.cmp(&ms_b);
-    }
-
-    // 4. TIE: Effectively identical audio state
-    Ordering::Equal
 }
