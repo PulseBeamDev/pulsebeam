@@ -62,6 +62,10 @@ impl VideoAllocator {
         tracing::info!(%mid, "video slot added");
         self.slots.push(Slot::new(mid));
         self.rebalance();
+
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     fn rebalance(&mut self) {
@@ -70,7 +74,6 @@ impl VideoAllocator {
             state.assigned_mid.is_none()
         });
 
-        let mut updated = false;
         for slot in &mut self.slots {
             if !slot.is_idle() {
                 continue;
@@ -82,11 +85,6 @@ impl VideoAllocator {
 
             next_track.1.assigned_mid.replace(slot.mid);
             slot.switch_to(next_track.1.track.lowest_quality().clone());
-            updated = true;
-        }
-
-        if updated && let Some(waker) = self.waker.take() {
-            waker.wake();
         }
     }
 
@@ -203,7 +201,10 @@ impl VideoAllocator {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        self.waker.replace(cx.waker().clone());
+        if self.slots.is_empty() {
+            self.waker.replace(cx.waker().clone());
+            return Poll::Pending;
+        }
 
         let mut checked_count = 0;
         while checked_count < self.slots.len() {
@@ -212,7 +213,6 @@ impl VideoAllocator {
             }
 
             let slot = &mut self.slots[self.rr_cursor];
-
             match slot.poll_next(cx) {
                 Poll::Ready(Some(pkt)) => {
                     // ensure each frame to be flushed before moving to another stream,
@@ -258,11 +258,9 @@ enum SlotState {
 
 struct Slot {
     mid: Mid,
-
     max_height: u32,
     switcher: Switcher,
-    state: SlotState,
-
+    state: Option<SlotState>,
     pending_allocation: Option<SimulcastReceiver>,
     waker: Option<Waker>,
 }
@@ -273,21 +271,22 @@ impl Slot {
             mid,
             max_height: 0,
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
-            state: SlotState::Idle,
+            state: Some(SlotState::Idle),
             pending_allocation: None,
             waker: None,
         }
+    }
+
+    fn state(&self) -> &SlotState {
+        self.state.as_ref().expect("State invalid outside poll")
     }
 
     fn pending(&self) -> Option<&SimulcastReceiver> {
         self.pending_allocation.as_ref()
     }
 
-    /// Helper to get the "Forward Looking" receiver.
-    /// If we are switching or resuming, this returns the staging receiver.
-    /// If we are streaming or paused, it returns the active one.
     fn target_receiver(&self) -> Option<&SimulcastReceiver> {
-        match &self.state {
+        match self.state() {
             SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => Some(staging),
             SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
             SlotState::Idle => None,
@@ -319,18 +318,16 @@ impl Slot {
     }
 
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
-        // Check if we are already playing (or trying to play) this exact stream
-        // If we are Paused, we must wake up (continue to transition logic).
-        // If we are already Streaming or Switching to this, do nothing.
         if let Some(current) = self.target_receiver()
             && current.rid == receiver.rid
             && current.meta.id == receiver.meta.id
-            && !matches!(self.state, SlotState::Paused { .. })
+            && !matches!(self.state(), SlotState::Paused { .. })
         {
             return;
         }
 
-        let old_state = std::mem::replace(&mut self.state, SlotState::Idle);
+        // Take ownership of state to move internals
+        let old_state = self.state.take().unwrap_or(SlotState::Idle);
 
         tracing::info!(
             mid = %self.mid,
@@ -340,8 +337,10 @@ impl Slot {
         );
         receiver.channel.reset();
         receiver.request_keyframe(KeyframeRequestKind::Fir);
-        self.state = match old_state {
+
+        let new_state = match old_state {
             SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
+            // Move 'active' from old state to new state without cloning
             SlotState::Streaming { active } => SlotState::Switching {
                 active,
                 staging: receiver,
@@ -352,26 +351,28 @@ impl Slot {
                 staging: receiver,
             },
         };
+
+        self.state = Some(new_state);
+
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
     }
 
     pub fn is_paused(&self) -> bool {
-        matches!(self.state, SlotState::Idle | SlotState::Paused { .. })
+        matches!(self.state(), SlotState::Idle | SlotState::Paused { .. })
     }
 
     pub fn is_idle(&self) -> bool {
-        matches!(self.state, SlotState::Idle)
+        matches!(self.state(), SlotState::Idle)
     }
 
     pub fn stop(&mut self) {
-        self.state = SlotState::Idle;
+        self.state = Some(SlotState::Idle);
     }
 
     fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        // Priority: Request from the new stream we are waiting for.
-        match &self.state {
+        match self.state() {
             SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => {
                 staging.request_keyframe(kind);
             }
@@ -383,103 +384,136 @@ impl Slot {
     }
 
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
-        self.waker.replace(cx.waker().clone());
+        // Process a limited number of iterations to ensure fairness
+        let mut budget = 10;
+
         loop {
+            if budget == 0 {
+                self.waker.replace(cx.waker().clone());
+                return Poll::Pending;
+            }
+            budget -= 1;
+
             if let Some(pkt) = self.switcher.pop() {
                 return Poll::Ready(Some(pkt));
             }
 
-            match &mut self.state {
-                SlotState::Idle => return Poll::Pending,
+            // Take the state to perform transitions by move
+            let state = self.state.take().unwrap();
 
-                SlotState::Paused { .. } => {
+            match state {
+                SlotState::Idle => {
+                    self.waker.replace(cx.waker().clone());
                     self.switcher.drain();
+                    self.state = Some(SlotState::Idle);
                     return Poll::Pending;
                 }
 
-                SlotState::Resuming { staging } => match ready!(staging.channel.poll_recv(cx)) {
-                    Ok(pkt) => {
-                        self.switcher.stage(pkt.value.clone());
-                        if self.switcher.is_ready() {
-                            tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
-                            self.state = SlotState::Streaming {
-                                active: staging.clone(),
-                            };
-                        }
-                    }
-                    Err(spmc::RecvError::Lagged(n)) => {
-                        tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, pausing");
-                        self.state = SlotState::Paused {
-                            active: staging.clone(),
-                        };
-                    }
-                    Err(spmc::RecvError::Closed) => {
-                        tracing::warn!(mid = %self.mid, "Resuming closed");
-                        self.state = SlotState::Idle;
-                    }
-                },
+                SlotState::Paused { active } => {
+                    self.waker.replace(cx.waker().clone());
+                    self.switcher.drain();
+                    self.state = Some(SlotState::Paused { active });
+                    return Poll::Pending;
+                }
 
-                SlotState::Streaming { active } => match ready!(active.channel.poll_recv(cx)) {
-                    Ok(pkt) => self.switcher.push(pkt.value.clone()),
-                    Err(spmc::RecvError::Lagged(n)) => {
-                        tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
-                        self.state = SlotState::Paused {
-                            active: active.clone(),
-                        };
-                    }
-                    Err(spmc::RecvError::Closed) => {
-                        tracing::info!(mid = %self.mid, "Streaming closed");
-                        self.state = SlotState::Idle;
-                    }
-                },
-
-                SlotState::Switching { active, staging } => {
+                SlotState::Resuming { mut staging } => {
                     match staging.channel.poll_recv(cx) {
                         Poll::Ready(Ok(pkt)) => {
                             self.switcher.stage(pkt.value.clone());
                             if self.switcher.is_ready() {
-                                tracing::info!(
-                                    mid = %self.mid,
-                                    from = ?active.rid,
-                                    to = ?staging.rid,
-                                    "Switch complete"
-                                );
-                                self.state = SlotState::Streaming {
-                                    active: staging.clone(),
-                                };
+                                tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
+                                // Transition: Move staging to active
+                                self.state = Some(SlotState::Streaming { active: staging });
+                            } else {
+                                // Stay
+                                self.state = Some(SlotState::Resuming { staging });
+                            }
+                            // Continue loop to drain switcher or process more
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, pausing");
+                            self.state = Some(SlotState::Paused { active: staging });
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
+                            tracing::warn!(mid = %self.mid, "Resuming closed");
+                            self.state = Some(SlotState::Idle);
+                        }
+                        Poll::Pending => {
+                            self.state = Some(SlotState::Resuming { staging });
+                            return Poll::Pending;
+                        }
+                    }
+                }
+
+                SlotState::Streaming { mut active } => match active.channel.poll_recv(cx) {
+                    Poll::Ready(Ok(pkt)) => {
+                        self.switcher.push(pkt.value.clone());
+                        self.state = Some(SlotState::Streaming { active });
+                    }
+                    Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
+                        tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
+                        self.state = Some(SlotState::Paused { active });
+                    }
+                    Poll::Ready(Err(spmc::RecvError::Closed)) => {
+                        tracing::info!(mid = %self.mid, "Streaming closed");
+                        self.state = Some(SlotState::Idle);
+                    }
+                    Poll::Pending => {
+                        self.state = Some(SlotState::Streaming { active });
+                        return Poll::Pending;
+                    }
+                },
+
+                SlotState::Switching {
+                    mut active,
+                    mut staging,
+                } => {
+                    // 1. Poll Staging (Priority)
+                    let staging_poll = staging.channel.poll_recv(cx);
+                    match staging_poll {
+                        Poll::Ready(Ok(pkt)) => {
+                            self.switcher.stage(pkt.value.clone());
+                            if self.switcher.is_ready() {
+                                tracing::info!(mid = %self.mid, from = ?active.rid, to = ?staging.rid, "Switch complete");
+                                // Transition: Move staging to active, Drop old active
+                                self.state = Some(SlotState::Streaming { active: staging });
+                            } else {
+                                self.state = Some(SlotState::Switching { active, staging });
                             }
                             continue;
                         }
                         Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
                             tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
-                            self.state = SlotState::Paused {
-                                active: staging.clone(),
-                            };
+                            self.state = Some(SlotState::Paused { active: staging });
                             continue;
                         }
                         Poll::Ready(Err(spmc::RecvError::Closed)) => {
                             tracing::warn!(mid = %self.mid, "Staging closed during switch");
-                            self.state = SlotState::Streaming {
-                                active: active.clone(),
-                            };
+                            // Revert to streaming active
+                            self.state = Some(SlotState::Streaming { active });
                             continue;
                         }
-                        Poll::Pending => {}
+                        Poll::Pending => { /* Check active next */ }
                     }
 
-                    match ready!(active.channel.poll_recv(cx)) {
-                        Ok(pkt) => self.switcher.push(pkt.value.clone()),
-                        Err(spmc::RecvError::Lagged(n)) => {
-                            tracing::warn!(mid = %self.mid, skipped = n, "Active lagged during switch, pausing");
-                            self.state = SlotState::Paused {
-                                active: active.clone(),
-                            };
+                    // 2. Poll Active
+                    match active.channel.poll_recv(cx) {
+                        Poll::Ready(Ok(pkt)) => {
+                            self.switcher.push(pkt.value.clone());
+                            self.state = Some(SlotState::Switching { active, staging });
                         }
-                        Err(spmc::RecvError::Closed) => {
+                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Active lagged during switch, pausing");
+                            self.state = Some(SlotState::Paused { active });
+                        }
+                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
                             tracing::warn!(mid = %self.mid, "Active closed, forcing resume");
-                            self.state = SlotState::Resuming {
-                                staging: staging.clone(),
-                            };
+                            self.state = Some(SlotState::Resuming { staging });
+                        }
+                        Poll::Pending => {
+                            // Both are pending, restore state and return
+                            self.state = Some(SlotState::Switching { active, staging });
+                            return Poll::Pending;
                         }
                     }
                 }
