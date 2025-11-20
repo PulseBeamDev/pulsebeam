@@ -73,9 +73,9 @@ impl Stream for DownstreamAllocator {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if let Poll::Ready(item) = this.audio.poll_next(cx) {
-            return Poll::Ready(item);
-        }
+        // if let Poll::Ready(item) = this.audio.poll_next(cx) {
+        //     return Poll::Ready(item);
+        // }
 
         this.video.poll_next(cx)
     }

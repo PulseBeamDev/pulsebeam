@@ -1,8 +1,10 @@
+use futures::StreamExt;
 use futures::stream::SelectAll;
 use futures::stream::Stream;
 use std::cmp::Ordering;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::ready;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::media::Mid;
@@ -13,7 +15,9 @@ use crate::rtp;
 use crate::rtp::RtpPacket;
 use crate::rtp::monitor::StreamState;
 use crate::rtp::timeline::Timeline;
+use crate::track::SimulcastReceiver;
 use crate::track::TrackReceiver;
+use pulsebeam_runtime::sync::spmc::RecvError;
 
 pub struct AudioAllocator {
     // Merges N streams into 1.
@@ -35,7 +39,7 @@ impl AudioAllocator {
     pub fn add_track(&mut self, track: TrackReceiver) {
         self.inputs.push(IdentifyStream {
             id: track.meta.id.clone(),
-            inner: track,
+            inner: track.lowest_quality().clone(),
         });
     }
 
@@ -152,17 +156,23 @@ impl AudioSlot {
 /// Wraps a TrackReceiver to attach the TrackId to every packet.
 struct IdentifyStream {
     id: Arc<TrackId>,
-    inner: TrackReceiver,
+    inner: SimulcastReceiver,
 }
 
 impl Stream for IdentifyStream {
     type Item = (Arc<TrackId>, RtpPacket);
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.poll_next_unpin(cx) {
-            Poll::Ready(Some(pkt)) => Poll::Ready(Some((self.id.clone(), pkt))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match ready!(this.inner.channel.poll_recv(cx)) {
+                Ok(pkt) => return Poll::Ready(Some((this.id.clone(), pkt.value.clone()))),
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(track_id = %this.id, "audio stream is lagging by {}", n);
+                    // will continue to read from the latest
+                }
+                Err(RecvError::Closed) => return Poll::Ready(None),
+            };
         }
     }
 }

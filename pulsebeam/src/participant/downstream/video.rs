@@ -4,8 +4,8 @@ use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::task::ready;
 use std::task::{Context, Poll};
+use std::task::{Waker, ready};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Rid};
 
@@ -19,6 +19,7 @@ pub struct VideoAllocator {
 
     ticks: u32,
     rr_cursor: usize,
+    waker: Option<Waker>,
 }
 
 impl VideoAllocator {
@@ -33,6 +34,10 @@ impl VideoAllocator {
             return;
         }
 
+        tracing::info!(
+            track = %track.meta.id,
+            "video track added"
+        );
         self.tracks.insert(
             track.meta.id.clone(),
             TrackState {
@@ -45,11 +50,16 @@ impl VideoAllocator {
 
     pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
         if self.tracks.remove(track_id).is_some() {
+            tracing::info!(
+                track = %track_id,
+                "video track removed"
+            );
             self.rebalance();
         }
     }
 
     pub fn add_slot(&mut self, mid: Mid) {
+        tracing::info!(%mid, "video slot added");
         self.slots.push(Slot::new(mid));
         self.rebalance();
     }
@@ -60,6 +70,7 @@ impl VideoAllocator {
             state.assigned_mid.is_none()
         });
 
+        let mut updated = false;
         for slot in &mut self.slots {
             if !slot.is_idle() {
                 continue;
@@ -71,6 +82,11 @@ impl VideoAllocator {
 
             next_track.1.assigned_mid.replace(slot.mid);
             slot.switch_to(next_track.1.track.lowest_quality().clone());
+            updated = true;
+        }
+
+        if updated && let Some(waker) = self.waker.take() {
+            waker.wake();
         }
     }
 
@@ -100,6 +116,7 @@ impl VideoAllocator {
 
             for slot in &mut self.slots {
                 let Some(current_receiver) = slot.target_receiver() else {
+                    // next slot assignment will handle this
                     continue;
                 };
 
@@ -107,14 +124,8 @@ impl VideoAllocator {
                     continue;
                 };
 
-                let mut target_receiver = current_receiver;
                 let track = &state.track;
                 let paused = slot.is_paused();
-
-                // If paused, initialize to lowest quality
-                if paused {
-                    target_receiver = track.lowest_quality();
-                }
 
                 let desired = if current_receiver.state.is_inactive() {
                     // very likely the sender can't keep up with sending higher resolution.
@@ -153,12 +164,16 @@ impl VideoAllocator {
                 {
                     upgraded = true;
                     total_allocated += desired.state.bitrate_bps();
-                    slot.switch_to(target_receiver.clone());
+                    slot.prepare(desired.clone());
                 } else {
                     // Can't afford upgrade or change - stay at current
                     total_allocated += current_receiver.state.bitrate_bps();
                 }
             }
+        }
+
+        for slot in &mut self.slots {
+            slot.commit();
         }
 
         let total_allocated = Bitrate::from(total_allocated);
@@ -188,6 +203,8 @@ impl VideoAllocator {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+        self.waker.replace(cx.waker().clone());
+
         let mut checked_count = 0;
         while checked_count < self.slots.len() {
             if self.rr_cursor >= self.slots.len() {
@@ -245,6 +262,9 @@ struct Slot {
     max_height: u32,
     switcher: Switcher,
     state: SlotState,
+
+    pending_allocation: Option<SimulcastReceiver>,
+    waker: Option<Waker>,
 }
 
 impl Slot {
@@ -254,7 +274,13 @@ impl Slot {
             max_height: 0,
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             state: SlotState::Idle,
+            pending_allocation: None,
+            waker: None,
         }
+    }
+
+    fn pending(&self) -> Option<&SimulcastReceiver> {
+        self.pending_allocation.as_ref()
     }
 
     /// Helper to get the "Forward Looking" receiver.
@@ -282,20 +308,36 @@ impl Slot {
             .unwrap_or(SimulcastQuality::Undefined)
     }
 
+    pub fn prepare(&mut self, receiver: SimulcastReceiver) {
+        self.pending_allocation.replace(receiver);
+    }
+
+    pub fn commit(&mut self) {
+        if let Some(receiver) = self.pending_allocation.take() {
+            self.switch_to(receiver);
+        }
+    }
+
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
         // Check if we are already playing (or trying to play) this exact stream
-        if let Some(current) = self.target_receiver() {
-            if current.rid == receiver.rid && current.meta.id == receiver.meta.id {
-                // If we are Paused, we must wake up (continue to transition logic).
-                // If we are already Streaming or Switching to this, do nothing.
-                if !matches!(self.state, SlotState::Paused { .. }) {
-                    return;
-                }
-            }
+        // If we are Paused, we must wake up (continue to transition logic).
+        // If we are already Streaming or Switching to this, do nothing.
+        if let Some(current) = self.target_receiver()
+            && current.rid == receiver.rid
+            && current.meta.id == receiver.meta.id
+            && !matches!(self.state, SlotState::Paused { .. })
+        {
+            return;
         }
 
         let old_state = std::mem::replace(&mut self.state, SlotState::Idle);
 
+        tracing::info!(
+            mid = %self.mid,
+            to_rid = ?receiver.rid,
+            track = %receiver.meta.id,
+            "switch_to: initiating switch"
+        );
         receiver.channel.reset();
         receiver.request_keyframe(KeyframeRequestKind::Fir);
         self.state = match old_state {
@@ -310,6 +352,9 @@ impl Slot {
                 staging: receiver,
             },
         };
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -338,6 +383,7 @@ impl Slot {
     }
 
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
+        self.waker.replace(cx.waker().clone());
         loop {
             if let Some(pkt) = self.switcher.pop() {
                 return Poll::Ready(Some(pkt));
@@ -351,8 +397,8 @@ impl Slot {
                     return Poll::Pending;
                 }
 
-                SlotState::Resuming { staging } => match staging.channel.poll_recv(cx) {
-                    Poll::Ready(Ok(pkt)) => {
+                SlotState::Resuming { staging } => match ready!(staging.channel.poll_recv(cx)) {
+                    Ok(pkt) => {
                         self.switcher.stage(pkt.value.clone());
                         if self.switcher.is_ready() {
                             tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
@@ -361,17 +407,16 @@ impl Slot {
                             };
                         }
                     }
-                    Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
+                    Err(spmc::RecvError::Lagged(n)) => {
                         tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, pausing");
                         self.state = SlotState::Paused {
                             active: staging.clone(),
                         };
                     }
-                    Poll::Ready(Err(spmc::RecvError::Closed)) => {
+                    Err(spmc::RecvError::Closed) => {
                         tracing::warn!(mid = %self.mid, "Resuming closed");
                         self.state = SlotState::Idle;
                     }
-                    Poll::Pending => return Poll::Pending,
                 },
 
                 SlotState::Streaming { active } => match ready!(active.channel.poll_recv(cx)) {
