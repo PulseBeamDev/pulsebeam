@@ -170,12 +170,14 @@ impl<T: Send + Sync> Receiver<T> {
         tokio::pin!(notified);
 
         match self.ring.get_next(&mut self.next_seq) {
-            Ok(Some(slot)) => Poll::Ready(Ok(slot)),
-            Err(e) => Poll::Ready(Err(e)),
-            Ok(None) => {
-                let _ = notified.poll(cx);
-                Poll::Pending
-            }
+            Ok(Some(slot)) => return Poll::Ready(Ok(slot)),
+            Err(e) => return Poll::Ready(Err(e)),
+            Ok(None) => {}
+        }
+
+        match notified.as_mut().poll(cx) {
+            Poll::Ready(_) => Poll::Pending,
+            Poll::Pending => Poll::Pending,
         }
     }
 
