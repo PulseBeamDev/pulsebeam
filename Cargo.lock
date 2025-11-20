@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "axum",
@@ -2939,7 +2939,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "str0m"
 version = "0.11.1"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=fix%2Foff-by-one#021694d5fd25571a63498a29ced50696dc1c83e5"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#563209bd75a9a5535d1c66175b77eb9387a09cd8"
 dependencies = [
  "combine",
  "crc",
@@ -2958,7 +2958,7 @@ dependencies = [
 [[package]]
 name = "str0m-wincrypto"
 version = "0.2.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=fix%2Foff-by-one#021694d5fd25571a63498a29ced50696dc1c83e5"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#563209bd75a9a5535d1c66175b77eb9387a09cd8"
 dependencies = [
  "tracing",
  "windows",
