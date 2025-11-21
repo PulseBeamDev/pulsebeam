@@ -1,6 +1,5 @@
 pub mod buffer;
 pub mod monitor;
-pub mod sequencer;
 pub mod switcher;
 pub mod sync;
 pub mod timeline;
