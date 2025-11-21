@@ -1,6 +1,6 @@
 [package]
 name = "pulsebeam"
-version = "0.2.18"
+version = "0.2.19"
 
 edition.workspace = true
 homepage.workspace = true
