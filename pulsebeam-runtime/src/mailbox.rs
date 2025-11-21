@@ -51,7 +51,7 @@ impl fmt::Display for TryRecvError {
 
 /// A handle to send messages to an actor's mailbox.
 pub struct Sender<T> {
-    sender: tokio::sync::mpsc::Sender<T>,
+    sender: flume::Sender<T>,
 }
 
 impl<T> Clone for Sender<T> {
@@ -68,9 +68,9 @@ impl<T> Sender<T> {
     /// Returns a `SendError` only if the receiving actor has terminated.
     pub async fn send(&mut self, message: T) -> Result<(), SendError<T>> {
         self.sender
-            .send(message)
+            .send_async(message)
             .await
-            .map_err(|tokio::sync::mpsc::error::SendError(e)| SendError(e))
+            .map_err(|flume::SendError(e)| SendError(e))
     }
 
     /// Attempts to immediately send a message.
@@ -79,34 +79,34 @@ impl<T> Sender<T> {
     /// receiving actor has terminated.
     pub fn try_send(&mut self, message: T) -> Result<(), TrySendError<T>> {
         self.sender.try_send(message).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(e) => TrySendError::Full(e),
-            tokio::sync::mpsc::error::TrySendError::Closed(e) => TrySendError::Closed(e),
+            flume::TrySendError::Full(e) => TrySendError::Full(e),
+            flume::TrySendError::Disconnected(e) => TrySendError::Closed(e),
         })
     }
 }
 
 /// An actor's mailbox for receiving messages.
 pub struct Receiver<T> {
-    receiver: tokio::sync::mpsc::Receiver<T>,
+    receiver: flume::Receiver<T>,
 }
 
 impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
-        self.receiver.recv().await
+        self.receiver.recv_async().await.ok()
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         self.receiver.try_recv().map_err(|e| match e {
-            tokio::sync::mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
-            tokio::sync::mpsc::error::TryRecvError::Disconnected => TryRecvError::Disconnected,
+            flume::TryRecvError::Empty => TryRecvError::Empty,
+            flume::TryRecvError::Disconnected => TryRecvError::Disconnected,
         })
     }
 }
 
 /// Creates a new mailbox and a corresponding sender handle.
 pub fn new<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
-    let (sender, receiver) = tokio::sync::mpsc::channel(buffer);
+    let (sender, receiver) = flume::bounded(buffer);
     (Sender { sender }, Receiver { receiver })
 }
 

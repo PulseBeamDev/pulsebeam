@@ -43,6 +43,7 @@ loom = { version = "0.7", optional = true, features = ["futures", "checkpoint"] 
 crossbeam-queue = "0.3.12"
 event-listener = "5.4.1"
 parking_lot = "0.12.5"
+flume = "0.11.1"
 
 [dev-dependencies]
 rcgen = "0.14.4"
