@@ -53,11 +53,14 @@ impl AudioAllocator {
 
     pub fn add_slot(&mut self, mid: Mid) {
         self.slots.push(AudioSlot::new(mid));
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
         // SelectAll will return Ready(None) with an empty list
-        if self.inputs.is_empty() {
+        if self.inputs.is_empty() || self.slots.is_empty() {
             self.waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
