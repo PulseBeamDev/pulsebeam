@@ -73,6 +73,8 @@ impl<'a> RecvPacketBatch<'a> {
         for (i, m) in self.meta.iter().take(count).enumerate() {
             let buf = &self.slices[i];
             let mut offset = 0;
+            metrics::histogram!("network_recv_batch_bytes_per_ioslice", "transport" => "udp")
+                .record(m.len as f64);
             while offset < m.len {
                 let seg_len = std::cmp::min(m.stride, m.len - offset);
                 out.push(RecvPacket {
