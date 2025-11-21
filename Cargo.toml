@@ -31,7 +31,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"]}
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_debug"] }
 futures = "0.3.31"
 rand = "0.9"
 bytes = "1.10.1"
