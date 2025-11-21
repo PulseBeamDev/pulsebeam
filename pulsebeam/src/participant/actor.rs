@@ -81,7 +81,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             let Some(deadline) = self.core.poll_rtc() else {
                 break;
             };
-            let delay = Instant::now().saturating_duration_since(deadline);
+            let delay = deadline.saturating_duration_since(Instant::now());
 
             let events: Vec<_> = self.core.drain_events().collect();
             for event in events {
