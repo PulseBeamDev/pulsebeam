@@ -67,15 +67,16 @@ async function start(endpoint: string) {
         console.log(`Remote track ended: ${e.track.kind}`);
         remoteVideo.srcObject = null;
       };
-      e.track.onmute = () => {
-        console.log(`Remote track muted: ${e.track.kind}`);
-        remoteVideo.srcObject = null;
-      };
-      e.track.onunmute = () => {
-        console.log(`Remote track unmuted: ${e.track.kind}`);
-        remoteVideo.srcObject = remoteVideoStream;
-      };
+      // e.track.onmute = () => {
+      //   console.log(`Remote track muted: ${e.track.kind}`);
+      //   remoteVideo.srcObject = null;
+      // };
+      // e.track.onunmute = () => {
+      //   console.log(`Remote track unmuted: ${e.track.kind}`);
+      //   remoteVideo.srcObject = remoteVideoStream;
+      // };
       remoteVideoStream.addTrack(e.track);
+      remoteVideo.srcObject = remoteVideoStream;
     } else if (e.track.kind === "audio") {
       remoteAudioStream.addTrack(e.track);
     }
