@@ -354,17 +354,7 @@ impl Slot {
     }
 
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
-        // Process a limited number of iterations to ensure fairness
-        let mut budget = 10;
-
         loop {
-            if budget == 0 {
-                // yield now, let others run first.
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            budget -= 1;
-
             if let Some(pkt) = self.switcher.pop() {
                 return Poll::Ready(Some(pkt));
             }
