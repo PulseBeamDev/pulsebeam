@@ -86,7 +86,7 @@ async fn join_room(
     let participant_id = Arc::new(ParticipantId::new());
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    con.send_high(controller::ControllerMessage::Allocate(
+    con.send(controller::ControllerMessage::Allocate(
         room_id.clone(),
         participant_id.clone(),
         raw_offer,
@@ -120,7 +120,7 @@ async fn leave_room(
     let participant_id = Arc::new(participant_id);
 
     let _ = con
-        .send_high(controller::ControllerMessage::RemoveParticipant(
+        .send(controller::ControllerMessage::RemoveParticipant(
             room_id,
             participant_id,
         ))

@@ -33,8 +33,7 @@ pub struct RoomMessageSet;
 
 impl actor::MessageSet for RoomMessageSet {
     type Meta = Arc<RoomId>;
-    type HighPriorityMsg = RoomMessage;
-    type LowPriorityMsg = ();
+    type Msg = RoomMessage;
     type ObservableState = RoomState;
 }
 
@@ -101,7 +100,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         Ok(())
     }
 
-    async fn on_high_priority(
+    async fn on_msg(
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
         msg: RoomMessage,
@@ -165,7 +164,7 @@ impl RoomActor {
         // if we failed to send a message, this means that participant has exited. The cleanup
         // step will remove this participant from internal state.
         let _ = participant_handle
-            .send_high(participant::ParticipantControlMessage::TracksSnapshot(
+            .send(participant::ParticipantControlMessage::TracksSnapshot(
                 self.state.tracks.clone(),
             ))
             .await;
@@ -183,7 +182,7 @@ impl RoomActor {
 
         self.node_ctx
             .gateway
-            .send_high(gateway::GatewayControlMessage::RemoveParticipant(
+            .send(gateway::GatewayControlMessage::RemoveParticipant(
                 participant_id,
             ))
             .await;
@@ -251,7 +250,7 @@ impl RoomActor {
         // TODO: handle large scale room by batching with a fixed interval driven by the
         // room instead of reactive.
         for participant in self.state.participants.values_mut() {
-            let _ = participant.handle.send_high(msg.clone()).await;
+            let _ = participant.handle.send(msg.clone()).await;
         }
     }
 }

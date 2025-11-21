@@ -28,14 +28,10 @@ pub enum ParticipantControlMessage {
     TrackPublishRejected(track::TrackReceiver),
 }
 
-#[derive(Debug)]
-pub enum ParticipantDataMessage {}
-
 pub struct ParticipantMessageSet;
 
 impl actor::MessageSet for ParticipantMessageSet {
-    type HighPriorityMsg = ParticipantControlMessage;
-    type LowPriorityMsg = ParticipantDataMessage;
+    type Msg = ParticipantControlMessage;
     type Meta = Arc<entity::ParticipantId>;
     type ObservableState = ();
 }
@@ -69,7 +65,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let _ = self
             .node_ctx
             .gateway
-            .send_high(gateway::GatewayControlMessage::AddParticipant(
+            .send(gateway::GatewayControlMessage::AddParticipant(
                 self.meta(),
                 ufrag.clone(),
                 gateway_tx,
@@ -114,7 +110,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         None => break,
                     }
                 }
-                Some(msg) = ctx.hi_rx.recv() => self.handle_control_message(msg).await,
+                Some(msg) = ctx.rx.recv() => self.handle_control_message(msg).await,
                 Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
                 },
@@ -163,7 +159,7 @@ impl ParticipantActor {
             CoreEvent::SpawnTrack(rx) => {
                 let _ = self
                     .room_handle
-                    .send_high(room::RoomMessage::PublishTrack(rx))
+                    .send(room::RoomMessage::PublishTrack(rx))
                     .await;
             }
         }

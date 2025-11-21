@@ -1,6 +1,6 @@
 use crate::actor_loop;
 use futures::FutureExt;
-use std::any::{Any, type_name_of_val};
+use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
@@ -84,14 +84,12 @@ pub enum SystemMsg<S> {
 
 pub struct ActorContext<M: MessageSet> {
     pub sys_rx: mailbox::Receiver<SystemMsg<M::ObservableState>>,
-    pub hi_rx: mailbox::Receiver<M::HighPriorityMsg>,
-    pub lo_rx: mailbox::Receiver<M::LowPriorityMsg>,
+    pub rx: mailbox::Receiver<M::Msg>,
     pub handle: ActorHandle<M>,
 }
 
 pub trait MessageSet: Sized + Send + 'static {
-    type HighPriorityMsg: Send + 'static;
-    type LowPriorityMsg: Send + 'static;
+    type Msg: Send + 'static;
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
     type ObservableState: Debug + Send + Clone;
 }
@@ -120,18 +118,10 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
         async move {}
     }
 
-    fn on_high_priority(
+    fn on_msg(
         &mut self,
         _ctx: &mut ActorContext<M>,
-        _msg: M::HighPriorityMsg,
-    ) -> impl futures::Future<Output = ()> + Send {
-        async move {}
-    }
-
-    fn on_low_priority(
-        &mut self,
-        _ctx: &mut ActorContext<M>,
-        _msg: M::LowPriorityMsg,
+        _msg: M::Msg,
     ) -> impl futures::Future<Output = ()> + Send {
         async move {}
     }
@@ -139,8 +129,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
 
 pub struct ActorHandle<M: MessageSet> {
     pub sys_tx: mailbox::Sender<SystemMsg<M::ObservableState>>,
-    pub hi_tx: mailbox::Sender<M::HighPriorityMsg>,
-    pub lo_tx: mailbox::Sender<M::LowPriorityMsg>,
+    pub tx: mailbox::Sender<M::Msg>,
     pub meta: M::Meta,
 }
 
@@ -148,8 +137,7 @@ impl<M: MessageSet> Clone for ActorHandle<M> {
     fn clone(&self) -> Self {
         Self {
             sys_tx: self.sys_tx.clone(),
-            hi_tx: self.hi_tx.clone(),
-            lo_tx: self.lo_tx.clone(),
+            tx: self.tx.clone(),
             meta: self.meta.clone(),
         }
     }
@@ -162,32 +150,12 @@ impl<M: MessageSet> Debug for ActorHandle<M> {
 }
 
 impl<M: MessageSet> ActorHandle<M> {
-    pub async fn send_high(
-        &mut self,
-        msg: M::HighPriorityMsg,
-    ) -> Result<(), mailbox::SendError<M::HighPriorityMsg>> {
-        self.hi_tx.send(msg).await
+    pub async fn send(&mut self, msg: M::Msg) -> Result<(), mailbox::SendError<M::Msg>> {
+        self.tx.send(msg).await
     }
 
-    pub fn try_send_high(
-        &mut self,
-        msg: M::HighPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<M::HighPriorityMsg>> {
-        self.hi_tx.try_send(msg)
-    }
-
-    pub async fn send_low(
-        &mut self,
-        msg: M::LowPriorityMsg,
-    ) -> Result<(), mailbox::SendError<M::LowPriorityMsg>> {
-        self.lo_tx.send(msg).await
-    }
-
-    pub fn try_send_low(
-        &mut self,
-        msg: M::LowPriorityMsg,
-    ) -> Result<(), mailbox::TrySendError<M::LowPriorityMsg>> {
-        self.lo_tx.try_send(msg)
+    pub fn try_send(&mut self, msg: M::Msg) -> Result<(), mailbox::TrySendError<M::Msg>> {
+        self.tx.try_send(msg)
     }
 
     pub async fn get_state(&mut self) -> Result<M::ObservableState, ActorError> {
@@ -240,21 +208,18 @@ where
     M: MessageSet,
     A: Actor<M>,
 {
-    let (lo_tx, lo_rx) = mailbox::new(config.lo_cap);
-    let (hi_tx, hi_rx) = mailbox::new(config.hi_cap);
+    let (tx, rx) = mailbox::new(config.lo_cap);
     let (sys_tx, sys_rx) = mailbox::new(1);
 
     let handle = ActorHandle::<M> {
-        hi_tx,
-        lo_tx,
+        tx,
         sys_tx,
         meta: a.meta(),
     };
 
     let ctx = ActorContext {
         sys_rx,
-        hi_rx,
-        lo_rx,
+        rx,
         handle: handle.clone(),
     };
 
@@ -343,8 +308,7 @@ macro_rules! actor_loop {
                         None => break,
                     }
                 }
-                res = $ctx.hi_rx.recv() => { if let Some(msg) = res { $actor.on_high_priority($ctx, msg).await } else { break; } }
-                res = $ctx.lo_rx.recv() => { if let Some(msg) = res { $actor.on_low_priority($ctx, msg).await } else { break; } }
+                res = $ctx.rx.recv() => { if let Some(msg) = res { $actor.on_msg($ctx, msg).await } else { break; } }
                 $($extra)*
                 else => break,
             }

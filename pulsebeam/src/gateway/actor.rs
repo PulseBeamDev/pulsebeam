@@ -13,8 +13,7 @@ pub enum GatewayControlMessage {
 pub struct GatewayMessageSet;
 
 impl actor::MessageSet for GatewayMessageSet {
-    type HighPriorityMsg = GatewayControlMessage;
-    type LowPriorityMsg = ();
+    type Msg = GatewayControlMessage;
     type Meta = String;
     type ObservableState = ();
 }
@@ -60,13 +59,13 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         Ok(())
     }
 
-    async fn on_high_priority(
+    async fn on_msg(
         &mut self,
         _ctx: &mut actor::ActorContext<GatewayMessageSet>,
         msg: GatewayControlMessage,
     ) -> () {
         for worker in &mut self.workers {
-            worker.hi_tx.send(msg.clone()).await;
+            worker.tx.send(msg.clone()).await;
         }
     }
 }
@@ -121,10 +120,10 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         Ok(())
     }
 
-    async fn on_high_priority(
+    async fn on_msg(
         &mut self,
         _ctx: &mut actor::ActorContext<GatewayMessageSet>,
-        msg: <GatewayMessageSet as actor::MessageSet>::HighPriorityMsg,
+        msg: <GatewayMessageSet as actor::MessageSet>::Msg,
     ) -> () {
         match msg {
             GatewayControlMessage::AddParticipant(participant_id, ufrag, handle) => {

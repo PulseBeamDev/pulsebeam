@@ -42,8 +42,7 @@ pub enum ControllerMessage {
 pub struct ControllerMessageSet;
 
 impl actor::MessageSet for ControllerMessageSet {
-    type HighPriorityMsg = ControllerMessage;
-    type LowPriorityMsg = ();
+    type Msg = ControllerMessage;
     type Meta = Arc<String>;
     type ObservableState = ();
 }
@@ -84,7 +83,7 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
         Ok(())
     }
 
-    async fn on_high_priority(
+    async fn on_msg(
         &mut self,
         ctx: &mut actor::ActorContext<ControllerMessageSet>,
         msg: ControllerMessage,
@@ -98,7 +97,7 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
                 if let Some(room_handle) = self.rooms.get_mut(&room_id) {
                     // if the room has exited, the participants have already cleaned up too.
                     let _ = room_handle
-                        .send_high(room::RoomMessage::RemoveParticipant(participant_id))
+                        .send(room::RoomMessage::RemoveParticipant(participant_id))
                         .await;
                 }
             }
@@ -184,7 +183,7 @@ impl ControllerActor {
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .send_high(room::RoomMessage::AddParticipant(participant_id, rtc))
+            .send(room::RoomMessage::AddParticipant(participant_id, rtc))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
