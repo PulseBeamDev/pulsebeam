@@ -3,7 +3,6 @@ use std::{fmt, hash, str::FromStr, sync::Arc};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::rand;
 use sha3::{Digest, Sha3_256};
-use str0m::media::Mid;
 
 pub type EntityId = String;
 

@@ -5,7 +5,7 @@ use crate::{
     node, room,
 };
 use futures::stream::FuturesUnordered;
-use pulsebeam_runtime::actor;
+use pulsebeam_runtime::actor::{self, ActorKind};
 use pulsebeam_runtime::prelude::*;
 use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError};
 use tokio::sync::oneshot;
@@ -61,6 +61,10 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
     fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
         static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
         MONITOR.clone()
+    }
+
+    fn kind() -> ActorKind {
+        "controller"
     }
 
     fn meta(&self) -> Arc<String> {

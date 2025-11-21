@@ -4,7 +4,7 @@ use futures::{
     future::Either,
     stream::{FuturesUnordered, StreamExt},
 };
-use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::{actor::ActorKind, prelude::*};
 use str0m::Rtc;
 
 use crate::{
@@ -62,6 +62,10 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
     fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
         static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
         MONITOR.clone()
+    }
+
+    fn kind() -> ActorKind {
+        "room"
     }
 
     fn meta(&self) -> Arc<RoomId> {

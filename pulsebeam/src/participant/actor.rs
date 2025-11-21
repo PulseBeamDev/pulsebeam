@@ -1,6 +1,7 @@
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use str0m::{Rtc, RtcError, error::SdpError};
@@ -47,6 +48,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
     fn monitor() -> Arc<TaskMonitor> {
         static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
         MONITOR.clone()
+    }
+
+    fn kind() -> ActorKind {
+        "participant"
     }
 
     fn meta(&self) -> Arc<entity::ParticipantId> {

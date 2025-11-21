@@ -1,5 +1,6 @@
 use crate::{entity::ParticipantId, gateway::demux::Demuxer};
 use futures::{StreamExt, stream::FuturesUnordered};
+use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use std::{io, sync::Arc};
@@ -31,8 +32,12 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         MONITOR.clone()
     }
 
+    fn kind() -> ActorKind {
+        "gateway_controller"
+    }
+
     fn meta(&self) -> String {
-        "gateway-controller".to_string()
+        "main".to_string()
     }
 
     fn get_observable_state(&self) {}
@@ -97,8 +102,12 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         MONITOR.clone()
     }
 
+    fn kind() -> ActorKind {
+        "gateway_worker"
+    }
+
     fn meta(&self) -> String {
-        format!("gateway-{}", self.id)
+        self.id.to_string()
     }
 
     fn get_observable_state(&self) {}

@@ -21,7 +21,6 @@ fn main() {
         .with_env_filter(env_filter)
         .with_target(true)
         .with_ansi(false)
-        .compact()
         .init();
 
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);

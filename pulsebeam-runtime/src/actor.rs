@@ -1,6 +1,8 @@
 use crate::actor_loop;
 use futures::FutureExt;
 use std::any::Any;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
@@ -10,6 +12,17 @@ use thiserror::Error;
 use tokio_metrics::TaskMonitor;
 
 use crate::mailbox;
+
+pub type ActorKind = &'static str;
+
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    pub tags: HashMap<ActorKind, String>,
+}
+
+tokio::task_local! {
+    static CURRENT_SCOPE: RefCell<Scope>;
+}
 
 pub struct JoinHandle<M: MessageSet> {
     inner: Pin<Box<dyn futures::Future<Output = (M::Meta, ActorStatus)> + Send>>,
@@ -98,6 +111,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
     fn meta(&self) -> M::Meta;
     fn get_observable_state(&self) -> M::ObservableState;
 
+    fn kind() -> ActorKind;
     fn monitor() -> Arc<TaskMonitor>;
 
     fn run(
@@ -225,10 +239,26 @@ where
 
     let monitor = A::monitor();
     let actor_id = a.meta().clone();
-    let runnable = tracing::Instrument::instrument(
-        monitor.instrument(run(a, ctx)),
-        tracing::span!(tracing::Level::INFO, "run", %actor_id),
+
+    let mut active_scope = CURRENT_SCOPE
+        .try_with(|s| s.borrow().clone())
+        .unwrap_or_default();
+    active_scope.tags.insert(A::kind(), actor_id.to_string());
+
+    let parent_span = tracing::Span::current();
+    let span = tracing::info_span!(
+        parent: None,
+        "actor",
+        ctx = ?active_scope.tags
     );
+    span.follows_from(parent_span);
+
+    let scope_for_child = active_scope.clone();
+
+    let runnable = CURRENT_SCOPE.scope(RefCell::new(scope_for_child), run(a, ctx));
+    let runnable = monitor.instrument(runnable);
+    let runnable = tracing::Instrument::instrument(runnable, span);
+
     let join = tokio::spawn(runnable);
     let abort_handle = join.abort_handle();
 
@@ -266,14 +296,18 @@ where
 
     let status = match run_result {
         Ok(Ok(())) => ActorStatus::ExitedGracefully,
-        Ok(Err(_)) => ActorStatus::ExitedWithError,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Actor exited with logic error");
+            ActorStatus::ExitedWithError
+        }
         Err(p) => {
-            tracing::error!("Actor panicked: {:?}", extract_panic_message(&p));
+            let panic_msg = extract_panic_message(&p);
+            tracing::error!(panic.message = %panic_msg, "Actor panicked");
             ActorStatus::Panicked
         }
     };
 
-    tracing::info!(status = %status, "Actor exited");
+    tracing::info!(final_status = ?status, "Actor exited");
     status
 }
 
