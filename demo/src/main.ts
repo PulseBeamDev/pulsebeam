@@ -39,9 +39,9 @@ async function start(endpoint: string) {
     direction: "sendonly",
     // Define scalability layers (low, medium, high)
     sendEncodings: [
-      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 }, // quarter res, ~150kbps
-      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 }, // half res, ~500kbps
-      { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_500_000 }, // full res, ~1.5Mbps
+      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 100_000 },
+      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 400_000 },
+      { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_200_000 },
     ],
   });
   const audioTrans = pc.addTransceiver("audio", { direction: "sendonly" });
