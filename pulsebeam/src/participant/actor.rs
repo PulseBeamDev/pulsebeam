@@ -11,6 +11,9 @@ use tokio_metrics::TaskMonitor;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, node, room, track};
 
+// The hard limit of IPv4/IPv6 total packet size is 65535
+// a bit lower to be less bursty and safer from possible off-by-one errors
+const MAX_GSO_SIZE: usize = 65507;
 const MAX_MTU: usize = 1500;
 
 #[derive(thiserror::Error, Debug)]
@@ -150,7 +153,8 @@ impl ParticipantActor {
     ) -> Self {
         let egress = node_ctx.allocate_egress();
         let gso_segments = egress.max_gso_segments();
-        let core = ParticipantCore::new(participant_id, rtc, gso_segments * MAX_MTU);
+        let batch_size_limit = std::cmp::min(gso_segments * MAX_MTU, MAX_GSO_SIZE);
+        let core = ParticipantCore::new(participant_id, rtc, batch_size_limit);
         Self {
             core,
             node_ctx,
