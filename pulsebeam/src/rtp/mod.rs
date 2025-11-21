@@ -4,6 +4,7 @@ pub mod switcher;
 pub mod sync;
 pub mod timeline;
 
+use bytes::Bytes;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::rtcp::SenderInfo;
 use str0m::rtp::{RtpHeader, SeqNo};
@@ -37,7 +38,7 @@ pub struct RtpPacket {
     pub playout_time: Instant,
     pub is_keyframe_start: bool,
     pub last_sender_info: Option<SenderInfo>,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl Default for RtpPacket {
@@ -57,7 +58,7 @@ impl Default for RtpPacket {
             playout_time: Instant::now(),
             is_keyframe_start: false,
             last_sender_info: None,
-            payload: vec![0u8; 1200], // 1.2KB payload for test realism
+            payload: Bytes::from_static(&[0u8; 1200]), // 1.2KB payload for test realism
         }
     }
 }
@@ -79,7 +80,7 @@ impl RtpPacket {
             playout_time: rtp.timestamp.into(),
             is_keyframe_start,
             last_sender_info: None,
-            payload: rtp.payload,
+            payload: Bytes::from(rtp.payload),
         }
     }
 

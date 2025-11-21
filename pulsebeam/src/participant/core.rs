@@ -171,7 +171,7 @@ impl ParticipantCore {
             pkt.raw_header.marker,
             pkt.raw_header.ext_vals,
             true,
-            pkt.payload,
+            pkt.payload.to_vec(),
         ) {
             tracing::warn!(%mid, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
