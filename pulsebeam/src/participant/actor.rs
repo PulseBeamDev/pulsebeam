@@ -81,7 +81,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             .await;
         let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
         let mut current_deadline = Instant::now() + Duration::from_secs(1);
-        let mut rtc_timer = Box::pin(tokio::time::sleep_until(current_deadline));
+        let rtc_timer = tokio::time::sleep_until(current_deadline);
+        tokio::pin!(rtc_timer);
 
         loop {
             let Some(new_deadline) = self.core.poll_rtc() else {
