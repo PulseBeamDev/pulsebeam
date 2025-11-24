@@ -101,7 +101,6 @@ impl KeyframeBuffer {
         }
 
         if pkt.is_keyframe_start {
-            tracing::warn!("KEYFRAME FOUND: {}", pkt.seq_no);
             self.segment = match self.segment.take() {
                 Some(segment) if pkt.seq_no > segment.0 => Some((pkt.seq_no, pkt.arrival_ts)),
                 None => Some((pkt.seq_no, pkt.arrival_ts)),
