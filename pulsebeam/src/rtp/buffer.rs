@@ -1,3 +1,5 @@
+use std::{cmp, collections::BTreeMap};
+
 use crate::rtp::RtpPacket;
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
@@ -9,7 +11,7 @@ pub struct KeyframeBuffer {
     ring: Vec<Option<RtpPacket>>,
     head: SeqNo,
     tail: SeqNo,
-    segment: Option<(SeqNo, Instant)>,
+    segments: BTreeMap<SeqNo, Instant>,
     initialized: bool,
 }
 
@@ -25,14 +27,15 @@ impl KeyframeBuffer {
             ring: vec![None; KEYFRAME_BUFFER_CAPACITY],
             head: 0.into(),
             tail: 0.into(),
-            segment: None,
+            segments: BTreeMap::new(),
             initialized: false,
         }
     }
 
     pub fn is_ready(&self, target_playout: Instant) -> bool {
-        self.segment
-            .map(|s| s.1 >= target_playout)
+        self.segments
+            .first_key_value()
+            .map(|s| *s.1 >= target_playout)
             .unwrap_or_default()
     }
 
@@ -40,7 +43,7 @@ impl KeyframeBuffer {
         self.head = seq_no.wrapping_add(1).into();
         self.tail = seq_no;
         self.ring.fill(None);
-        self.segment = None;
+        self.segments.clear();
     }
 
     pub fn clear(&mut self) {
@@ -77,11 +80,8 @@ impl KeyframeBuffer {
                     pkt.seq_no,
                     to_drop
                 );
-                for _ in 0..to_drop {
-                    let idx = self.as_index(self.tail);
-                    self.ring[idx] = None;
-                    self.tail = (*self.tail + 1).into();
-                }
+                let new_tail = (*self.tail + to_drop as u64).into();
+                self.advance_to(new_tail);
             }
             self.head = (*pkt.seq_no + 1).into();
         }
@@ -92,7 +92,7 @@ impl KeyframeBuffer {
 
         if pkt.is_keyframe_start {
             tracing::warn!("KEYFRAME FOUND: {}", pkt.seq_no);
-            self.segment = Some((pkt.seq_no, pkt.playout_time));
+            self.segments.insert(pkt.seq_no, pkt.playout_time);
         }
 
         let idx = self.as_index(pkt.seq_no);
@@ -100,8 +100,7 @@ impl KeyframeBuffer {
     }
 
     pub fn pop(&mut self) -> Option<RtpPacket> {
-        let segment = self.segment?;
-
+        let segment = *self.segments.first_key_value()?.0;
         while self.tail < self.head {
             let idx = self.as_index(self.tail);
             let item = &mut self.ring[idx];
@@ -111,7 +110,7 @@ impl KeyframeBuffer {
             };
 
             // packets before the keyframe must be dropped, they are not renderable
-            if pkt.playout_time < segment.1 {
+            if pkt.seq_no < segment {
                 continue;
             }
 
@@ -119,6 +118,17 @@ impl KeyframeBuffer {
         }
 
         None
+    }
+
+    fn advance_to(&mut self, new_tail: SeqNo) {
+        let to_drop = *new_tail - *self.tail;
+        self.segments = self.segments.split_off(&new_tail);
+
+        for _ in 0..to_drop {
+            let idx = self.as_index(self.tail);
+            self.ring[idx] = None;
+            self.tail = (*self.tail + 1).into();
+        }
     }
 
     fn as_index(&self, seq: SeqNo) -> usize {
