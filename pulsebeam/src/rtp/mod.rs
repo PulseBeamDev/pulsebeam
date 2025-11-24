@@ -90,98 +90,82 @@ impl RtpPacket {
     }
 }
 
-/// Checks if an H.264 payload represents the start of a keyframe.
-///
-/// This function is hardened to prevent panics by using safe slicing and `get()`
-/// methods, ensuring it can handle malformed or unexpected RTP payloads gracefully.
-///
-/// It supports:
-/// - **Single NAL Units (SPS):** NALU type 7 is a Sequence Parameter Set, a key component of a keyframe.
-/// - **Aggregation Packets (STAP-A, STAP-B):** Scans aggregated NALUs for an SPS.
-/// - **Fragmentation Units (FU-A):** Checks if a starting fragment contains an SPS.
+// adapted from Galene, https://github.com/jech/galene/blob/e09b135cd2ff240626b8619913bb9b2b3bba242b/codecs/codecs.go
 fn is_h264_keyframe_start(payload: &[u8]) -> bool {
-    let Some(first_byte) = payload.first() else {
+    let nalu = payload[0] & 0x1F;
+
+    if nalu == 0 {
+        // Reserved
         return false;
-    };
+    } else if nalu <= 23 {
+        // Simple NALU.
+        return nalu == 7;
+    } else if nalu >= 24 && nalu <= 27 {
+        // STAP-A (24), STAP-B (25), MTAP16 (26), MTAP24 (27)
+        let mut i = 1;
 
-    let nalu_type = first_byte & 0x1F;
-
-    match nalu_type {
-        // NALU types 1-23 are single NAL units.
-        1..=23 => {
-            // Type 7 (Sequence Parameter Set) and Type 5 (IDR Slice) are indicators of a keyframe.
-            // While SPS is the most reliable signal, IDR is also a definitive start.
-            nalu_type == 7 || nalu_type == 5
+        // Skip DON (Decoding Order Number) for STAP-B, MTAP16, MTAP24
+        if nalu == 25 || nalu == 26 || nalu == 27 {
+            i += 2;
         }
 
-        // STAP-A (24) and STAP-B (25) are aggregation packets, containing multiple NALUs.
-        24 | 25 => {
-            // We need to parse the series of NALUs within this single RTP packet.
-            // The format is: [STAP Header (1 byte)] [NALU 1 Size (2 bytes)] [NALU 1 Data] [NALU 2 Size] ...
-            let mut remaining_payload = &payload[1..];
-
-            // For STAP-B, there's an additional 16-bit DON (Decoding Order Number). Skip it.
-            if nalu_type == 25 {
-                remaining_payload = remaining_payload.get(2..).unwrap_or(&[]);
-            }
-
-            while !remaining_payload.is_empty() {
-                // Each NALU is preceded by a 2-byte length field.
-                // Safely check if we have enough bytes for the length field.
-                let Some(nalu_size_bytes) = remaining_payload.get(0..2) else {
-                    // Malformed packet: not enough bytes for a NALU size.
-                    return false;
-                };
-                let nalu_size =
-                    u16::from_be_bytes([nalu_size_bytes[0], nalu_size_bytes[1]]) as usize;
-
-                // Move slice past the size field.
-                remaining_payload = &remaining_payload[2..];
-
-                // Safely get the NALU data itself.
-                let Some(nalu_data) = remaining_payload.get(0..nalu_size) else {
-                    // Malformed packet: declared NALU size is larger than the remaining payload.
-                    return false;
-                };
-
-                // Check the NALU type of the inner packet.
-                if let Some(nalu_header) = nalu_data.first() {
-                    let inner_nalu_type = nalu_header & 0x1F;
-                    if inner_nalu_type == 7 || inner_nalu_type == 5 {
-                        return true;
-                    }
-                }
-
-                // Move the slice to the start of the next NALU.
-                remaining_payload = &remaining_payload[nalu_size..];
-            }
-            false
-        }
-
-        // FU-A (28) and FU-B (29) are for fragmentation.
-        // A large NALU is split across multiple RTP packets.
-        28 | 29 => {
-            // We need at least two bytes: [FU Indicator] + [FU Header].
-            let Some(fu_header) = payload.get(1) else {
+        while i < payload.len() {
+            // Need at least 2 bytes for length
+            if i + 2 > payload.len() {
                 return false;
-            };
-
-            // The Start bit (S) must be 1 to indicate the first fragment of a NALU.
-            let is_start_fragment = (fu_header & 0x80) != 0;
-
-            if is_start_fragment {
-                // The NALU type is contained in the FU header.
-                let fragmented_nalu_type = fu_header & 0x1F;
-                if fragmented_nalu_type == 7 || fragmented_nalu_type == 5 {
-                    return true;
-                }
             }
-            false
+
+            // Read big-endian u16 length
+            let length = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
+            i += 2;
+
+            if i + length > payload.len() {
+                return false;
+            }
+
+            let mut offset = 0;
+            if nalu == 26 {
+                offset = 3; // MTAP16 TS offset
+            } else if nalu == 27 {
+                offset = 4; // MTAP24 TS offset
+            }
+
+            if offset >= length {
+                // Malformed or empty NALU inside
+                return false;
+            }
+
+            let inner_nalu_header = payload[i + offset];
+            let n = inner_nalu_header & 0x1F;
+
+            // STRICT PORT: Only checking for SPS (7)
+            if n == 7 {
+                return true;
+            } else if n >= 24 {
+                // Illegal nested aggregation
+                return false;
+            }
+
+            i += length;
+        }
+        return false;
+    } else if nalu == 28 || nalu == 29 {
+        // FU-A (28) or FU-B (29)
+        if payload.len() < 2 {
+            return false;
+        }
+        let fu_header = payload[1];
+
+        // Check Start Bit (0x80)
+        if (fu_header & 0x80) == 0 {
+            return false;
         }
 
-        // Other NALU types are not considered keyframe starts.
-        _ => false,
+        // STRICT PORT: Check if the original NALU type was 7 (SPS)
+        return (fu_header & 0x1F) == 7;
     }
+
+    false
 }
 
 fn is_vp8_keyframe_start(payload: &[u8]) -> bool {
