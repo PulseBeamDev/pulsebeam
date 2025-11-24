@@ -33,20 +33,22 @@ impl KeyframeBuffer {
     }
 
     pub fn is_ready(&self, target_playout: Instant) -> bool {
-        let Some(segment) = self.segment.as_ref() else {
-            return false;
-        };
-
-        if segment.1 < target_playout {
-            tracing::debug!(
-                "segment is behind the target_playout: {:?} < {:?}",
-                segment.1,
-                target_playout
-            );
-            return false;
-        }
-
-        true
+        // TODO: use target_playout to decide
+        self.segment.is_some()
+        // let Some(segment) = self.segment.as_ref() else {
+        //     return false;
+        // };
+        //
+        // if segment.1 < target_playout {
+        //     tracing::debug!(
+        //         "segment is behind the target_playout: {:?} < {:?}",
+        //         segment.1,
+        //         target_playout
+        //     );
+        //     return false;
+        // }
+        //
+        // true
     }
 
     pub fn reset_to(&mut self, seq_no: SeqNo) {
@@ -83,13 +85,13 @@ impl KeyframeBuffer {
                 tracing::warn!("very large jump detected, reset to {}", pkt.seq_no);
             } else if diff >= self.ring.len() {
                 let to_drop = (diff - self.ring.len()) + 1;
-                tracing::warn!(
-                    head = *self.head,
-                    tail = *self.tail,
-                    "large jump detected seq_no={}, has to drop {} packets",
-                    pkt.seq_no,
-                    to_drop
-                );
+                // tracing::warn!(
+                //     head = *self.head,
+                //     tail = *self.tail,
+                //     "large jump detected seq_no={}, has to drop {} packets",
+                //     pkt.seq_no,
+                //     to_drop
+                // );
                 let new_tail = (*self.tail + to_drop as u64).into();
                 self.advance_to(new_tail);
             }
