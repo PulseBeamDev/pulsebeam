@@ -323,6 +323,7 @@ impl Slot {
         };
 
         self.state = Some(new_state);
+        self.switcher.clear();
 
         if let Some(waker) = self.waker.take() {
             waker.wake();

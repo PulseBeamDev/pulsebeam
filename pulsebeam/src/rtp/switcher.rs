@@ -74,7 +74,7 @@ impl Switcher {
                 }
                 return Some(self.timeline.rewrite(staged_pkt));
             } else {
-                self.staging = None;
+                self.clear();
                 return None;
             }
         }
@@ -82,7 +82,9 @@ impl Switcher {
         None
     }
 
-    pub fn clear(&mut self) {}
+    pub fn clear(&mut self) {
+        self.staging = None;
+    }
 }
 
 #[cfg(test)]
