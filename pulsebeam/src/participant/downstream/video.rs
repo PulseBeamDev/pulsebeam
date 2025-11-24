@@ -323,6 +323,7 @@ impl Slot {
         };
 
         self.state = Some(new_state);
+        self.switcher.clear();
 
         if let Some(waker) = self.waker.take() {
             waker.wake();
@@ -365,14 +366,14 @@ impl Slot {
             match state {
                 SlotState::Idle => {
                     self.waker.replace(cx.waker().clone());
-                    self.switcher.drain();
+                    self.switcher.clear();
                     self.state = Some(SlotState::Idle);
                     return Poll::Pending;
                 }
 
                 SlotState::Paused { active } => {
                     self.waker.replace(cx.waker().clone());
-                    self.switcher.drain();
+                    self.switcher.clear();
                     self.state = Some(SlotState::Paused { active });
                     return Poll::Pending;
                 }

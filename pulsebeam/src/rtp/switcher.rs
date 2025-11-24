@@ -1,9 +1,15 @@
+use std::time::Duration;
+
 use str0m::media::Frequency;
 use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
 use crate::rtp::buffer::KeyframeBuffer;
 use crate::rtp::timeline::Timeline;
+
+// It's possible for the new stream packets to arrive later than the old stream despite
+// having a playout time that is earlier.
+const PLAYOUT_JITTER_TOLERANCE: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub struct Switcher {
@@ -46,15 +52,20 @@ impl Switcher {
 
     /// Returns true if the new stream has received a keyframe and is ready to be popped.
     pub fn is_ready(&self) -> bool {
-        self.staging
-            .as_ref()
-            .map(|s| s.is_ready(self.latest_playout))
-            .unwrap_or(false)
+        let Some(staging) = self.staging.as_ref() else {
+            return false;
+        };
+
+        staging.is_ready(
+            self.latest_playout
+                .checked_sub(PLAYOUT_JITTER_TOLERANCE)
+                .unwrap_or(self.latest_playout),
+        )
     }
 
     /// Pops the next available packet, prioritizing the old stream to ensure a smooth drain.
     pub fn pop(&mut self) -> Option<RtpPacket> {
-        // --- Priority 1: Drain the pending packet from the OLD stream. ---
+        // 1. Drain the pending packet from the OLD stream.
         if let Some(pending_pkt) = self.pending.take() {
             if pending_pkt.playout_time > self.latest_playout {
                 self.latest_playout = pending_pkt.playout_time;
@@ -66,7 +77,7 @@ impl Switcher {
             return None;
         }
 
-        // --- Priority 2: Pop packets from the NEW stream if a switch is in progress. ---
+        // 2. Pop packets from the NEW stream if a switch is in progress.
         if let Some(staging) = &mut self.staging {
             if let Some(staged_pkt) = staging.pop() {
                 if staged_pkt.is_keyframe_start {
@@ -74,7 +85,7 @@ impl Switcher {
                 }
                 return Some(self.timeline.rewrite(staged_pkt));
             } else {
-                self.staging = None;
+                self.clear();
                 return None;
             }
         }
@@ -82,9 +93,8 @@ impl Switcher {
         None
     }
 
-    pub fn drain(&mut self) {
-        // TODO: probably less primitive than this..
-        while let Some(_) = self.pop() {}
+    pub fn clear(&mut self) {
+        self.staging = None;
     }
 }
 
