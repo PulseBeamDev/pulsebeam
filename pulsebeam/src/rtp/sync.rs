@@ -277,11 +277,11 @@ mod tests {
         }
     }
 
-    /// This comprehensive test validates the entire lifecycle of the synchronizer:
-    /// 1. Starts in a provisional state.
-    /// 2. Enters a converging state upon receiving the first SR.
-    /// 3. Smoothly adjusts the clock during the convergence period.
-    /// 4. Snaps to the final accurate clock and enters the synchronized state.
+    /// Validates the synchronizer lifecycle:
+    /// 1. Starts provisional.
+    /// 2. Converges on first SR.
+    /// 3. Adjusts clock during convergence.
+    /// 4. Snaps to final clock and synchronizes.
     #[test]
     fn test_provisional_to_converging_to_synchronized() {
         let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
@@ -370,8 +370,7 @@ mod tests {
         assert_eq!(packet4.playout_time, expected_accurate_playout_4);
     }
 
-    /// This is the definitive end-to-end test. It proves that the ultimate goal—producing
-    /// synchronized playout times from multiple streams with different clock drifts—is achieved.
+    /// Verifies synchronized playout from multiple streams with different clock drifts.
     #[test]
     fn test_playout_time_is_synchronized_across_drifting_streams() {
         let base_time = Instant::now();
@@ -480,9 +479,7 @@ mod tests {
         );
     }
 
-    /// This is the most comprehensive test. It proves that playout time is synchronized
-    /// for two independent streams, even when one has a drifting clock AND they use
-    /// different NTP time bases (absolute vs. relative). This is the ultimate goal.
+    /// Verifies playout synchronization for independent streams with drifting clocks and different NTP bases.
     #[test]
     fn test_playout_sync_across_drifting_streams_with_different_ntp_bases() {
         let base_time = Instant::now();

@@ -189,8 +189,8 @@ impl StreamMonitor {
 
         if is_inactive {
             if is_any_sibling_active {
-                // This stream is inactive, but its siblings are active. This is our
-                // heuristic for a sender-side bandwidth limitation.
+                // This stream is inactive, but its siblings are active.
+                // This suggests a sender-side bandwidth limitation.
                 // We mark the quality as Bad but don't reset all metrics,
                 // as it might come back online shortly.
                 if self.current_quality != StreamQuality::Bad {
@@ -225,7 +225,6 @@ impl StreamMonitor {
         if let Some(lockout_until) = self.bad_quality_lockout_until {
             if now < lockout_until {
                 // We are still in the lockout period. Do nothing and keep the quality as Bad.
-                // This prevents the quality from flapping back to Good.
                 return;
             } else {
                 // The lockout has expired. Allow normal quality assessment to resume.
@@ -255,7 +254,7 @@ impl StreamMonitor {
         let is_upgrade = new_quality > self.current_quality;
 
         if is_upgrade {
-            // This is an UPGRADE attempt. Check if we are in a quality transition lockout.
+            // UPGRADE attempt. Check if we are in a quality transition lockout.
             if let Some(lockout_until) = self.quality_transition_lockout_until {
                 if now < lockout_until {
                     // YES. We are in a lockout. Block the upgrade and do nothing.
@@ -432,7 +431,7 @@ impl RawMetrics {
     pub fn calculate_loss_score(&self) -> f64 {
         let loss_ratio = self.packet_loss();
 
-        // This is a highly punitive linear penalty.
+        // Linear penalty:
         // 1% loss = 25 point deduction.
         // 2% loss = 50 point deduction.
         // 4% loss or more = score of 0.
@@ -590,7 +589,7 @@ impl DeltaDeltaState {
             * 1000.0
             / self.frequency.get() as f64;
 
-        // This is `d(i)` from the GCC paper, the inter-group delay variation.
+        // `d(i)` from the GCC paper (inter-group delay variation).
         let skew = actual_ms - expected_ms;
 
         // Kalman gain K is calculated based on the previous estimate's variance `e`
@@ -603,7 +602,6 @@ impl DeltaDeltaState {
         let k = (self.e + Q) / (self.var_v_hat + self.e + Q);
 
         // Update the estimate of the queue delay trend, m_hat.
-        // This is the core output of the filter.
         // Equation: m_hat(i) = m_hat(i-1) + z(i) * k(i)
         // where z(i) = d(i) - m_hat(i-1)
         let z = skew - self.m_hat;
@@ -614,7 +612,7 @@ impl DeltaDeltaState {
         self.e = (1.0 - k) * (self.e + Q);
 
         // --- Update the Measurement Noise Variance (var_v_hat) ---
-        // This part allows the filter to adapt to changing network conditions.
+        // Allows the filter to adapt to changing network conditions.
         // It's a modified EWMA.
         // f_max is not easily available, so we use a simpler fixed alpha.
         // A chi of 0.01 is a reasonable choice for smoothing.
