@@ -38,7 +38,7 @@ impl KeyframeBuffer {
         };
 
         if segment.1 < target_playout {
-            tracing::warn!(
+            tracing::debug!(
                 "segment is behind the target_playout: {:?} < {:?}",
                 segment.1,
                 target_playout
