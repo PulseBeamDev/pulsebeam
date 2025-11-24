@@ -311,15 +311,28 @@ impl Slot {
 
         let new_state = match old_state {
             SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
+
             SlotState::Streaming { active } => SlotState::Switching {
                 active,
                 staging: receiver,
             },
+
             SlotState::Resuming { .. } => SlotState::Resuming { staging: receiver },
-            SlotState::Switching { active, .. } => SlotState::Switching {
+
+            SlotState::Switching {
                 active,
-                staging: receiver,
-            },
+                staging: _old_staging,
+            } => {
+                if active.rid == receiver.rid && active.meta.id == receiver.meta.id {
+                    tracing::info!("Cancelling switch, reverting to active stream");
+                    SlotState::Streaming { active }
+                } else {
+                    SlotState::Switching {
+                        active,
+                        staging: receiver,
+                    }
+                }
+            }
         };
 
         self.state = Some(new_state);
