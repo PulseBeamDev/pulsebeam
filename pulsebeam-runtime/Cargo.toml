@@ -28,11 +28,11 @@ tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 futures.workspace = true
-tokio-rustls = "0.26.2"
-rustls = "0.23.31"
-turmoil = "0.6.6"
+tokio-rustls = "0.26.4"
+rustls = "0.23.35"
+turmoil = "0.7.0"
 quinn-udp = "0.5.14"
-socket2 = "0.6.0"
+socket2 = "0.6.1"
 no-panic = "0.1.35"
 tokio-metrics = { version = "0.4.5", features = ["metrics-rs-integration"] }
 once_cell = "1.21.3"
@@ -46,7 +46,7 @@ parking_lot = "0.12.5"
 flume = "0.11.1"
 
 [dev-dependencies]
-rcgen = "0.14.4"
+rcgen = "0.14.5"
 criterion = { version = "0.7.0", features = ["async", "async_tokio"] }
 futures-concurrency = "7.6.3"
 async-stream = "0.3.6"
