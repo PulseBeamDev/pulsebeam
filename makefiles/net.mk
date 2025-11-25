@@ -91,18 +91,17 @@ net-stable-mobile:
 		UPLOAD_PACKET_LOSS="0%" \
 		DOWNLOAD_PACKET_LOSS="0.1%"
 
-# Simulates a very weak and unstable LTE connection.
-# Min RTT: ~80ms, Avg RTT: ~160ms+, MDEV: ~75ms
 net-lte-1bar:
 	@$(MAKE) net-apply \
-		UPLOAD_RATE="1mbit" \
-		DOWNLOAD_RATE="4mbit" \
-		UPLOAD_LATENCY="40ms" \
+		UPLOAD_RATE="1.7mbit" \
+		DOWNLOAD_RATE="50mbit" \
+		UPLOAD_LATENCY="50ms" \
 		DOWNLOAD_LATENCY="40ms" \
-		UPLOAD_JITTER="160ms" \
-		DOWNLOAD_JITTER="160ms" \
-		UPLOAD_PACKET_LOSS="0%" \
+		UPLOAD_JITTER="80ms 25% distribution pareto" \
+		DOWNLOAD_JITTER="30ms 25% distribution pareto" \
+		UPLOAD_PACKET_LOSS="0.5%" \
 		DOWNLOAD_PACKET_LOSS="0%"
+
 
 # A stable but long-distance intercontinental link.
 # Target RTT: ~140ms
