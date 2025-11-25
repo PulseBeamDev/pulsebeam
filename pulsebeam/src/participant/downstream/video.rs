@@ -297,6 +297,11 @@ impl Slot {
             return;
         }
 
+        // there are buffered packets, we must flush them first before dropping packets
+        if !self.switcher.ready_to_switch() {
+            return;
+        }
+
         // Take ownership of state to move internals
         let old_state = self.state.take().unwrap_or(SlotState::Idle);
 
@@ -405,7 +410,7 @@ impl Slot {
                     match staging.channel.poll_recv(cx) {
                         Poll::Ready(Ok(pkt)) => {
                             self.switcher.stage(pkt);
-                            if self.switcher.is_ready() {
+                            if self.switcher.ready_to_stream() {
                                 tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
                                 // Transition: Move staging to active
                                 self.state = Some(SlotState::Streaming { active: staging });
@@ -458,7 +463,7 @@ impl Slot {
                     match staging_poll {
                         Poll::Ready(Ok(pkt)) => {
                             self.switcher.stage(pkt);
-                            if self.switcher.is_ready() {
+                            if self.switcher.ready_to_stream() {
                                 tracing::info!(mid = %self.mid, from = ?active.rid, to = ?staging.rid, "Switch complete");
                                 // Transition: Move staging to active, Drop old active
                                 self.state = Some(SlotState::Streaming { active: staging });

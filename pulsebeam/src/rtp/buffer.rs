@@ -62,6 +62,10 @@ impl KeyframeBuffer {
         self.reset_to(0.into());
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tail >= self.head
+    }
+
     pub fn push(&mut self, pkt: RtpPacket) {
         if !self.initialized {
             self.reset_to(pkt.seq_no);

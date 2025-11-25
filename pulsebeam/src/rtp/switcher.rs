@@ -50,8 +50,12 @@ impl Switcher {
         staging.push(pkt);
     }
 
+    pub fn ready_to_switch(&mut self) -> bool {
+        self.staging.is_none()
+    }
+
     /// Returns true if the new stream has received a keyframe and is ready to be popped.
-    pub fn is_ready(&self) -> bool {
+    pub fn ready_to_stream(&self) -> bool {
         let Some(staging) = self.staging.as_ref() else {
             return false;
         };
@@ -73,7 +77,7 @@ impl Switcher {
             return Some(self.timeline.rewrite(pending_pkt));
         }
 
-        if !self.is_ready() {
+        if !self.ready_to_stream() {
             return None;
         }
 
@@ -143,7 +147,7 @@ mod test {
 
                 seq.stage(pkt);
 
-                if seq.is_ready() {
+                if seq.ready_to_stream() {
                     // Switch complete. Promote staging to active.
                     active_ssrc = Some(current_ssrc);
                     staging_ssrc = None;
@@ -163,7 +167,7 @@ mod test {
 
         // === PROPERTY 1: Final state must be stable ===
         // The switcher should be drained (not holding staged data) at the end of a successful run.
-        assert!(!seq.is_ready(), "Switcher must end in drained state");
+        assert!(!seq.ready_to_stream(), "Switcher must end in drained state");
 
         // === PROPERTY 2: Output seqno must be *strictly increasing* and *gap-free* ===
         let seq_nos: Vec<u64> = rewritten_headers.iter().map(|h| (*h.seq_no)).collect();
