@@ -101,20 +101,17 @@ impl<T: Clone> Receiver<T> {
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
         loop {
+            // Snapshot producer head
             let head = self.ring.head.load(Ordering::Acquire);
+            let capacity = self.ring.mask as u64 + 1;
+            let earliest = head.saturating_sub(capacity);
 
+            // Closed and nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= head {
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
-            let capacity = self.ring.mask as u64 + 1;
-            let earliest = head.saturating_sub(capacity);
-
-            if self.next_seq < earliest {
-                self.next_seq = head;
-                return Poll::Ready(Err(RecvError::Lagged(head)));
-            }
-
+            // No new items — wait
             if self.next_seq >= head {
                 match &mut self.listener {
                     Some(l) => {
@@ -125,36 +122,44 @@ impl<T: Clone> Receiver<T> {
                         continue;
                     }
                     None => {
-                        // recheck, make sure to not miss a notification
-                        let listener = self.ring.event.listen();
-                        self.listener = Some(listener);
+                        self.listener = Some(self.ring.event.listen());
                         continue;
                     }
                 }
             }
 
-            // At this point, we're a bit behind than the producer - keep reading until we catch up.
-            self.listener = None;
-
+            // Read slot for next_seq
             let idx = (self.next_seq as usize) & self.ring.mask;
-            let slot_lock = self.ring.slots[idx].read();
+            let slot = self.ring.slots[idx].read();
+            let slot_seq = slot.seq;
 
-            if slot_lock.seq != self.next_seq {
-                drop(slot_lock);
+            // Slot overwritten before we got here
+            if slot_seq < earliest {
+                drop(slot);
                 self.next_seq = head;
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
-            if let Some(val) = &slot_lock.val {
-                let msg = val.clone();
-                drop(slot_lock);
+            // Seq mismatch — producer overwrote after head snapshot
+            if slot_seq != self.next_seq {
+                drop(slot);
+                self.next_seq = head;
+                return Poll::Ready(Err(RecvError::Lagged(head)));
+            }
+
+            // Valid message
+            if let Some(v) = &slot.val {
+                let out = v.clone();
+                drop(slot);
                 self.next_seq += 1;
-                return Poll::Ready(Ok(msg));
-            } else {
-                drop(slot_lock);
-                self.next_seq = head;
-                return Poll::Ready(Err(RecvError::Lagged(head)));
+                return Poll::Ready(Ok(out));
             }
+
+            // This shouldn't never happen, but just in case..
+            // Seq was correct but value missing — treat as lag
+            drop(slot);
+            self.next_seq = head;
+            return Poll::Ready(Err(RecvError::Lagged(head)));
         }
     }
 }
