@@ -93,15 +93,14 @@ net-stable-mobile:
 
 net-lte-1bar:
 	@$(MAKE) net-apply \
-		UPLOAD_RATE="1.7mbit" \
-		DOWNLOAD_RATE="50mbit" \
-		UPLOAD_LATENCY="50ms" \
-		DOWNLOAD_LATENCY="40ms" \
-		UPLOAD_JITTER="80ms 25% distribution pareto" \
-		DOWNLOAD_JITTER="30ms 25% distribution pareto" \
-		UPLOAD_PACKET_LOSS="0.5%" \
-		DOWNLOAD_PACKET_LOSS="0%"
-
+		UPLOAD_RATE="1.5mbit" \
+		DOWNLOAD_RATE="10mbit" \
+		UPLOAD_LATENCY="38ms" \
+		DOWNLOAD_LATENCY="38ms" \
+		UPLOAD_JITTER="75ms 50% distribution pareto" \
+		DOWNLOAD_JITTER="75ms 50% distribution pareto" \
+		UPLOAD_PACKET_LOSS="0.15%" \
+		DOWNLOAD_PACKET_LOSS="0.15%"
 
 # A stable but long-distance intercontinental link.
 # Target RTT: ~140ms
