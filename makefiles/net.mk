@@ -90,18 +90,20 @@ net-stable-mobile:
 		DOWNLOAD_PACKET_LOSS="0.2%"
 
 # Simulates LTE with 1 bar signal - harsh bufferbloat environment
-# Base RTT: ~90ms, but with severe tail latency spikes to 300-650ms
-# The key is Pareto distribution creating non-deterministic bufferbloat bursts
+# Real-world reference: Min ~75ms, Avg ~116ms, Max ~650ms, Loss ~0.3%
+# Calibration: TARGET 90ms sets the correct mode/baseline. 
+# Jitter 70ms with paretonormal provides the heavy tail without dragging the Min/Avg too far.
+# 25% correlation simulates the "clumping" of latency spikes seen in the log.
 net-lte-1bar:
 	@$(MAKE) net-apply \
 		TARGET_RTT="90ms" \
 		TARGET_LATENCY="90" \
 		UPLOAD_RATE="3mbit" \
 		DOWNLOAD_RATE="15mbit" \
-		UPLOAD_JITTER="50ms 25% distribution pareto" \
-		DOWNLOAD_JITTER="100ms 25% distribution pareto" \
-		UPLOAD_PACKET_LOSS="0.3%" \
-		DOWNLOAD_PACKET_LOSS="0.3%"
+		UPLOAD_JITTER="70ms 25% distribution pareto" \
+		DOWNLOAD_JITTER="70ms 25% distribution pareto" \
+		UPLOAD_PACKET_LOSS="0.15%" \
+		DOWNLOAD_PACKET_LOSS="0.15%"  
 
 # A stable but long-distance intercontinental link.
 # Target RTT: ~140ms
