@@ -7,7 +7,11 @@ use std::{io, sync::Arc};
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(Arc<ParticipantId>, String, mailbox::Sender<net::RecvPacket>),
+    AddParticipant(
+        Arc<ParticipantId>,
+        String,
+        mailbox::Sender<net::RecvPacketBatch>,
+    ),
     RemoveParticipant(Arc<ParticipantId>),
 }
 
@@ -92,7 +96,7 @@ pub struct GatewayWorkerActor {
     id: usize,
     socket: Arc<net::UnifiedSocket>,
     demuxer: Demuxer,
-    recv_batch: Vec<net::RecvPacket>,
+    recv_batches: Vec<net::RecvPacketBatch>,
     storage: net::RecvBatchStorage,
 }
 
@@ -153,7 +157,7 @@ impl GatewayWorkerActor {
     // Cooperative Multitasking Budget:
     // How many batches to process before forcibly yielding to the Tokio runtime.
     // 16 * 64 = 1024 packets.
-    const BUDGET_BATCHES: usize = 16;
+    const BUDGET_BATCHES: usize = 1;
 
     // Threshold for "Emergency Yielding".
     // If we drop this many packets in a single loop, downstream is overwhelmed.
@@ -161,7 +165,6 @@ impl GatewayWorkerActor {
     const DROP_THRESHOLD: usize = 100;
 
     pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
-        // ... (same as before)
         let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
         let gro_segments = socket.gro_segments();
         let storage = net::RecvBatchStorage::new(gro_segments);
@@ -169,7 +172,7 @@ impl GatewayWorkerActor {
         Self {
             id,
             socket,
-            recv_batch,
+            recv_batches: recv_batch,
             storage,
             demuxer: Demuxer::new(),
         }
@@ -186,10 +189,13 @@ impl GatewayWorkerActor {
                 total_drops_in_loop = 0;
             }
 
-            self.recv_batch.clear();
+            self.recv_batches.clear();
 
-            let mut batch = net::RecvPacketBatch::new(&mut self.storage);
-            match self.socket.try_recv_batch(&mut batch, &mut self.recv_batch) {
+            let mut batch = net::RecvPacketBatcher::new(&mut self.storage);
+            match self
+                .socket
+                .try_recv_batch(&mut batch, &mut self.recv_batches)
+            {
                 Ok(_) => {
                     // Data received, continue to process
                 }
@@ -199,8 +205,8 @@ impl GatewayWorkerActor {
                 Err(e) => return Err(e),
             }
 
-            for packet in self.recv_batch.drain(..) {
-                let success = self.demuxer.demux(packet);
+            for batch in self.recv_batches.drain(..) {
+                let success = self.demuxer.demux(batch);
                 if !success {
                     total_drops_in_loop += 1;
                 }

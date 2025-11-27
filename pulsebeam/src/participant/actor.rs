@@ -117,7 +117,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
                 },
-                Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
+                Some(batch) = gateway_rx.recv() => self.core.handle_udp_packet_batch(batch),
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
                 },

@@ -22,6 +22,61 @@ pub struct RecvPacket {
     pub buf: Bytes, // pre-allocated buffer
 }
 
+#[derive(Debug, Clone)]
+pub struct RecvPacketBatch {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+    pub buf: Bytes,
+    pub stride: usize,
+    pub len: usize,
+}
+
+impl RecvPacketBatch {
+    pub fn iter(&self) -> RecvPacketBatchIter<'_> {
+        RecvPacketBatchIter {
+            batch: self,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a RecvPacketBatch {
+    type Item = Bytes;
+    type IntoIter = RecvPacketBatchIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct RecvPacketBatchIter<'a> {
+    batch: &'a RecvPacketBatch,
+    offset: usize,
+}
+
+impl<'a> Iterator for RecvPacketBatchIter<'a> {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.batch.len {
+            return None;
+        }
+
+        let remaining = self.batch.len - self.offset;
+        let seg_len = std::cmp::min(self.batch.stride, remaining);
+
+        if seg_len == 0 {
+            return None;
+        }
+
+        let packet_buf = self.batch.buf.slice(self.offset..self.offset + seg_len);
+
+        self.offset += seg_len;
+
+        Some(packet_buf)
+    }
+}
+
 pub struct RecvBatchStorage {
     backend: Vec<u8>,
     chunk_size: usize,
@@ -47,12 +102,12 @@ impl RecvBatchStorage {
 }
 
 /// Holds IoSliceMut for recv operations and metadata.
-pub struct RecvPacketBatch<'a> {
+pub struct RecvPacketBatcher<'a> {
     slices: Vec<IoSliceMut<'a>>,
     meta: Vec<RecvMeta>,
 }
 
-impl<'a> RecvPacketBatch<'a> {
+impl<'a> RecvPacketBatcher<'a> {
     pub fn new(storage: &'a mut RecvBatchStorage) -> Self {
         let slices = storage.as_io_slices();
         let meta = vec![RecvMeta::default(); quinn_udp::BATCH_SIZE];
@@ -60,8 +115,12 @@ impl<'a> RecvPacketBatch<'a> {
         Self { slices, meta }
     }
 
-    /// Extract received packets into user-facing data
-    pub fn collect_packets(&self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacket>) {
+    pub fn collect_packets(
+        &self,
+        local_addr: SocketAddr,
+        count: usize,
+        out: &mut Vec<RecvPacketBatch>,
+    ) {
         // Record the total size of the received batch as a metric.
         let total_bytes: usize = self.meta.iter().take(count).map(|m| m.len).sum();
         if total_bytes > 0 {
@@ -71,18 +130,16 @@ impl<'a> RecvPacketBatch<'a> {
 
         for (i, m) in self.meta.iter().take(count).enumerate() {
             let buf = &self.slices[i];
-            let mut offset = 0;
-            metrics::histogram!("network_recv_batch_bytes_per_ioslice", "transport" => "udp")
-                .record(m.len as f64);
-            while offset < m.len {
-                let seg_len = std::cmp::min(m.stride, m.len - offset);
-                out.push(RecvPacket {
-                    src: m.addr,
-                    dst: local_addr,
-                    buf: Bytes::copy_from_slice(&buf[offset..offset + seg_len]),
-                });
-                offset += seg_len;
-            }
+            metrics::histogram!("network_recv_batch_io_slices", "transport" => "udp")
+                .record((m.len / m.stride) as f64);
+            let batch = RecvPacketBatch {
+                src: m.addr,
+                dst: local_addr,
+                buf: Bytes::copy_from_slice(buf),
+                stride: m.stride,
+                len: m.len,
+            };
+            out.push(batch);
         }
     }
 }
@@ -166,8 +223,8 @@ impl UnifiedSocket {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        batch: &mut RecvPacketBatch,
-        packets: &mut Vec<RecvPacket>,
+        batch: &mut RecvPacketBatcher,
+        packets: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(batch, packets),
@@ -250,15 +307,15 @@ impl UdpTransport {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        batch: &mut RecvPacketBatch,
-        out: &mut Vec<RecvPacket>,
+        batcher: &mut RecvPacketBatcher,
+        out: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
         match self.sock.try_io(tokio::io::Interest::READABLE, || {
             self.state
-                .recv((&self.sock).into(), &mut batch.slices, &mut batch.meta)
+                .recv((&self.sock).into(), &mut batcher.slices, &mut batcher.meta)
         }) {
             Ok(count) => {
-                batch.collect_packets(self.local_addr, count, out);
+                batcher.collect_packets(self.local_addr, count, out);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -334,8 +391,8 @@ impl SimUdpTransport {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        _batch: &mut RecvPacketBatch,
-        packets: &mut Vec<RecvPacket>,
+        _batch: &mut RecvPacketBatcher,
+        packets: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
         let mut buf = [0u8; Self::MTU];
         let mut total_bytes = 0;
@@ -346,10 +403,12 @@ impl SimUdpTransport {
                 Ok((len, src)) => {
                     read_count += 1;
                     total_bytes += len;
-                    packets.push(RecvPacket {
+                    packets.push(RecvPacketBatch {
                         buf: Bytes::copy_from_slice(&buf[..len]),
                         src,
                         dst: self.local_addr,
+                        len,
+                        stride: len,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -418,7 +477,7 @@ mod test {
 
         sock.readable().await.unwrap();
         let mut storage = RecvBatchStorage::new(1);
-        let mut batch = RecvPacketBatch::new(&mut storage);
+        let mut batch = RecvPacketBatcher::new(&mut storage);
         let mut buf = Vec::with_capacity(1);
         sock.try_recv_batch(&mut batch, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);

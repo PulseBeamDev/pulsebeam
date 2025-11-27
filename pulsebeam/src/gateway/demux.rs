@@ -1,14 +1,13 @@
 use pulsebeam_runtime::mailbox::TrySendError;
-use pulsebeam_runtime::{mailbox, net, rt};
+use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;
 use crate::gateway::ice;
-use crate::participant;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub type ParticipantHandle = mailbox::Sender<net::RecvPacket>;
+pub type ParticipantHandle = mailbox::Sender<net::RecvPacketBatch>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DemuxResult {
@@ -87,35 +86,35 @@ impl Demuxer {
 
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped (queue full or unknown destination).
-    pub fn demux(&mut self, pkt: net::RecvPacket) -> bool {
+    pub fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
         // 1. RESOLVE DESTINATION
-        let participant_handle = if let Some(handle) = self.addr_map.get_mut(&pkt.src) {
+        let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
             handle
-        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&pkt.buf) {
+        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
             // New connection establishment (rare path, logging is okay here)
             if let Some(handle) = self.ufrag_map.get_mut(ufrag) {
-                tracing::debug!("New connection from ufrag: {:?} -> {}", ufrag, pkt.src);
+                tracing::debug!("New connection from ufrag: {:?} -> {}", ufrag, batch.src);
 
-                self.addr_map.insert(pkt.src, handle.clone());
+                self.addr_map.insert(batch.src, handle.clone());
                 let key = ufrag.to_vec().into_boxed_slice();
-                self.ufrag_addrs.entry(key).or_default().push(pkt.src);
+                self.ufrag_addrs.entry(key).or_default().push(batch.src);
 
                 handle
             } else {
                 // Packet from unknown ufrag
-                tracing::trace!("Dropped: unregistered stun binding from {}", pkt.src);
+                tracing::trace!("Dropped: unregistered stun binding from {}", batch.src);
                 return false;
             }
         } else {
             // Packet from unknown source without ufrag
-            tracing::trace!("Dropped: unknown source {}", pkt.src);
+            tracing::trace!("Dropped: unknown source {}", batch.src);
             return false;
         };
 
         // 2. SEND (NON-BLOCKING)
         // We use try_send. If the channel is full, we drop the packet immediately.
         // We do NOT log warnings here as it would thrash I/O during a DDoS or congestion.
-        match participant_handle.try_send(pkt) {
+        match participant_handle.try_send(batch) {
             Ok(_) => true,
             Err(TrySendError::Full(_)) => {
                 // PRODUCTION TIP: Increment a fast counter here (e.g., metrics crate)
