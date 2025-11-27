@@ -2,8 +2,8 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use pulsebeam_runtime::actor::ActorKind;
-use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
+use pulsebeam_runtime::{prelude::*, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
 use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
@@ -83,8 +83,14 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let mut current_deadline = Instant::now() + Duration::from_secs(1);
         let rtc_timer = tokio::time::sleep_until(current_deadline);
         tokio::pin!(rtc_timer);
+        let mut budget = 64;
 
         loop {
+            if budget == 0 {
+                rt::yield_now().await;
+                budget = 64;
+            }
+
             let Some(new_deadline) = self.core.poll_rtc() else {
                 break;
             };
@@ -126,6 +132,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     self.core.handle_timeout();
                 },
             }
+            budget -= 1;
         }
 
         if let Some(reason) = self.core.disconnect_reason() {

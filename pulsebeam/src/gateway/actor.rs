@@ -2,7 +2,7 @@ use crate::{entity::ParticipantId, gateway::demux::Demuxer};
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
-use pulsebeam_runtime::{actor, mailbox, net};
+use pulsebeam_runtime::{actor, mailbox, net, rt};
 use std::{io, sync::Arc};
 
 #[derive(Clone)]
@@ -170,10 +170,14 @@ impl GatewayWorkerActor {
         self.socket
             .try_recv_batch(&mut batch, &mut self.recv_batch)?;
 
-        for packet in self.recv_batch.drain(..) {
+        for (i, packet) in self.recv_batch.drain(..).enumerate() {
+            if i % 32 == 0 {
+                rt::yield_now().await;
+            }
             self.demuxer.demux(packet).await;
         }
         self.recv_batch.clear();
+        rt::yield_now().await;
 
         Ok(())
     }

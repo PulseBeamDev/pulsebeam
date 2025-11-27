@@ -206,7 +206,7 @@ impl ParticipantCore {
                 //     layer.monitor.set_manual_pause(e.paused);
             }
             e => {
-                tracing::warn!("unhandled event: {e:?}");
+                // tracing::warn!("unhandled event: {e:?}");
             }
         }
     }
@@ -227,7 +227,7 @@ impl ParticipantCore {
                     kind: media.kind,
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 });
-                let (tx, rx) = track::new(media.mid, track_meta, 64);
+                let (tx, rx) = track::new(media.mid, track_meta, 128);
                 self.upstream.add_published_track(media.mid, tx);
                 self.events.push(CoreEvent::SpawnTrack(rx));
             }

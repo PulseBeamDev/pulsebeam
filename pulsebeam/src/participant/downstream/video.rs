@@ -374,7 +374,7 @@ impl Slot {
 
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
         // Process a limited number of iterations to ensure fairness
-        let mut budget = 10;
+        let mut budget = 1;
 
         loop {
             if budget == 0 {
