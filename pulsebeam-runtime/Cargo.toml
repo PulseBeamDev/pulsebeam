@@ -10,7 +10,11 @@ authors.workspace = true
 license.workspace = true
 
 [[bench]]
-name = "sync"
+name = "spmc"
+harness = false
+
+[[bench]]
+name = "spsc"
 harness = false
 
 [lib]

@@ -1,4 +1,5 @@
 pub mod spmc;
+pub mod spsc;
 
 #[cfg(not(feature = "loom"))]
 mod primitives {
