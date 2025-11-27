@@ -151,7 +151,9 @@ impl GatewayWorkerActor {
     pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
         // Pre-allocate receive batch with MTU-sized buffers
         let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
-        let storage = net::RecvBatchStorage::new(socket.gro_segments());
+        let gro_segments = socket.gro_segments();
+        tracing::info!("gro_segments={}", gro_segments);
+        let storage = net::RecvBatchStorage::new(gro_segments);
 
         Self {
             id,
@@ -171,9 +173,6 @@ impl GatewayWorkerActor {
             .try_recv_batch(&mut batch, &mut self.recv_batch)?;
 
         for (i, packet) in self.recv_batch.drain(..).enumerate() {
-            if i % 32 == 0 {
-                rt::yield_now().await;
-            }
             self.demuxer.demux(packet).await;
         }
         self.recv_batch.clear();
