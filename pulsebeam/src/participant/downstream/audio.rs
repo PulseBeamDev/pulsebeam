@@ -65,16 +65,7 @@ impl AudioAllocator {
             return Poll::Pending;
         }
 
-        let mut budget = 10;
         loop {
-            if budget == 0 {
-                // Force a wake so we return immediately after the runtime
-                // polls other tasks (like Video).
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            budget -= 1;
-
             let (track_id, packet) = match self.inputs.poll_next_unpin(cx) {
                 Poll::Ready(Some(val)) => val,
                 Poll::Ready(None) => return Poll::Ready(None), // All inputs closed

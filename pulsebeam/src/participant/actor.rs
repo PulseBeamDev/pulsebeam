@@ -67,8 +67,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         &mut self,
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
+        const BATCH_BUDGET: u8 = 64;
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(16);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(32);
 
         let _ = self
             .node_ctx
@@ -83,14 +84,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let mut current_deadline = Instant::now() + Duration::from_secs(1);
         let rtc_timer = tokio::time::sleep_until(current_deadline);
         tokio::pin!(rtc_timer);
-        let mut budget = 32;
+        let mut budget = 0;
 
         loop {
-            if budget == 0 {
-                rt::yield_now().await;
-                budget = 32;
-            }
-
             let Some(new_deadline) = self.core.poll_rtc() else {
                 break;
             };
@@ -132,7 +128,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     self.core.handle_timeout();
                 },
             }
-            budget -= 1;
+            budget += 1;
+            if budget >= BATCH_BUDGET {
+                rt::yield_now().await;
+                budget = 0;
+            }
         }
 
         if let Some(reason) = self.core.disconnect_reason() {
