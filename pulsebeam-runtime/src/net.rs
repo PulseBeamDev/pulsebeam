@@ -8,6 +8,7 @@ use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
 pub const BATCH_SIZE: usize = 32;
+// Fit Mimalloc page size and Linux GRO limit
 pub const CHUNK_SIZE: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +105,8 @@ impl RecvPacketBatcher {
             metrics::histogram!("network_recv_batch_sizes", "transport" => "udp")
                 .record(m.len as f64);
 
+            // This is fairly cheap for mimalloc as the allocation size <= page size
+            // It should be mostly O(1) here
             let new_buf = Box::new_uninit_slice(CHUNK_SIZE);
             let old_buf = std::mem::replace(&mut self.buffers[i], new_buf);
             let old_buf: Box<[u8]> = unsafe { old_buf.assume_init() };
