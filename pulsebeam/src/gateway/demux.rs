@@ -87,11 +87,9 @@ impl Demuxer {
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped (queue full or unknown destination).
     pub async fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
-        // 1. RESOLVE DESTINATION
         let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
             handle
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
-            // New connection establishment (rare path, logging is okay here)
             if let Some(handle) = self.ufrag_map.get_mut(ufrag) {
                 tracing::debug!("New connection from ufrag: {:?} -> {}", ufrag, batch.src);
 
@@ -103,21 +101,20 @@ impl Demuxer {
             } else {
                 // Packet from unknown ufrag
                 tracing::trace!("Dropped: unregistered stun binding from {}", batch.src);
+                metrics::counter!("gateway_demux_dropped", "reason" => "unknown_ufrag")
+                    .increment(1);
                 return false;
             }
         } else {
-            // Packet from unknown source without ufrag
+            // Packet from unknown source without ufrag cache
             tracing::trace!("Dropped: unknown source {}", batch.src);
+            metrics::counter!("gateway_demux_dropped", "reason" => "unknown_source").increment(1);
             return false;
         };
 
         match participant_handle.send(batch).await {
             Ok(_) => true,
-            Err(SendError(_)) => {
-                // The participant actor has died or disconnected.
-                // You might want to trigger a cleanup of self.addr_map here eventually.
-                false
-            }
+            Err(SendError(_)) => false,
         }
     }
 }
