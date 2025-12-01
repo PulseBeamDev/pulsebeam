@@ -68,7 +68,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(16);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(3);
 
         let _ = self
             .node_ctx
@@ -83,7 +83,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let mut current_deadline = Instant::now() + Duration::from_secs(1);
         let rtc_timer = tokio::time::sleep_until(current_deadline);
         tokio::pin!(rtc_timer);
-        let mut budget = 0;
 
         loop {
             let Some(new_deadline) = self.core.poll_rtc() else {
