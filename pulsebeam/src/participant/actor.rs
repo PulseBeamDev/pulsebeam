@@ -67,7 +67,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         &mut self,
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
-        const BATCH_BUDGET: u8 = 128;
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
         let (gateway_tx, mut gateway_rx) = mailbox::new(16);
 
@@ -127,11 +126,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 _ = &mut rtc_timer => {
                     self.core.handle_timeout();
                 },
-            }
-            budget += 1;
-            if budget >= BATCH_BUDGET {
-                rt::yield_now().await;
-                budget = 0;
             }
         }
 

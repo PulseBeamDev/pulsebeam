@@ -35,8 +35,8 @@ tracing = { version = "0.1", features = ["release_max_level_debug"] }
 futures = "0.3.31"
 rand = "0.9"
 bytes = "1.10.1"
-# str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/main", default-features = false, features = ["openssl", "vendored", "sha1"] }
-str0m = { git = "https://github.com/algesten/str0m.git",  rev = "fe599b7847779e9dfd822daea943fa9e272c71b0", default-features = false, features = ["openssl", "vendored", "sha1"] }
+str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/main", default-features = false, features = ["openssl", "vendored", "sha1"] }
+# str0m = { git = "https://github.com/algesten/str0m.git",  rev = "fe599b7847779e9dfd822daea943fa9e272c71b0", default-features = false, features = ["openssl", "vendored"] }
 # str0m = { version = "0.11.1", default-features = false, features = ["openssl", "vendored", "sha1"] }
 
 # [patch.crates-io]
