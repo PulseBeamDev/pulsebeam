@@ -1,10 +1,14 @@
 use std::{
     io::{self, ErrorKind, IoSliceMut},
+    mem::MaybeUninit,
     net::SocketAddr,
 };
 
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
+
+pub const BATCH_SIZE: usize = 32;
+pub const CHUNK_SIZE: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
@@ -77,69 +81,39 @@ impl<'a> Iterator for RecvPacketBatchIter<'a> {
     }
 }
 
-pub struct RecvBatchStorage {
-    backend: Vec<u8>,
-    chunk_size: usize,
+pub struct RecvPacketBatcher {
+    meta: [RecvMeta; BATCH_SIZE],
+    buffers: [Box<[MaybeUninit<u8>]>; BATCH_SIZE],
 }
 
-impl RecvBatchStorage {
-    const MAX_MTU: usize = 1500;
+impl RecvPacketBatcher {
+    pub fn new() -> Self {
+        let buffers: [Box<[MaybeUninit<u8>]>; BATCH_SIZE] =
+            std::array::from_fn(|_| Box::new_uninit_slice(CHUNK_SIZE));
 
-    pub fn new(gro_segments: usize) -> Self {
-        let chunk_size = Self::MAX_MTU * gro_segments;
         Self {
-            backend: vec![0; quinn_udp::BATCH_SIZE * chunk_size],
-            chunk_size,
+            meta: [RecvMeta::default(); BATCH_SIZE],
+            buffers,
         }
     }
 
-    pub fn as_io_slices(&mut self) -> Vec<IoSliceMut<'_>> {
-        self.backend
-            .chunks_mut(self.chunk_size)
-            .map(IoSliceMut::new)
-            .collect()
-    }
-}
+    fn collect(&mut self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacketBatch>) {
+        for i in 0..count {
+            let m = &self.meta[i];
 
-/// Holds IoSliceMut for recv operations and metadata.
-pub struct RecvPacketBatcher<'a> {
-    slices: Vec<IoSliceMut<'a>>,
-    meta: Vec<RecvMeta>,
-}
+            let new_buf = Box::new_uninit_slice(CHUNK_SIZE);
+            let old_buf = std::mem::replace(&mut self.buffers[i], new_buf);
+            let old_buf: Box<[u8]> = unsafe { old_buf.assume_init() };
+            let full_bytes = Bytes::from(old_buf);
+            let buf = full_bytes.slice(0..m.len);
 
-impl<'a> RecvPacketBatcher<'a> {
-    pub fn new(storage: &'a mut RecvBatchStorage) -> Self {
-        let slices = storage.as_io_slices();
-        let meta = vec![RecvMeta::default(); quinn_udp::BATCH_SIZE];
-
-        Self { slices, meta }
-    }
-
-    pub fn collect_packets(
-        &self,
-        local_addr: SocketAddr,
-        count: usize,
-        out: &mut Vec<RecvPacketBatch>,
-    ) {
-        // Record the total size of the received batch as a metric.
-        let total_bytes: usize = self.meta.iter().take(count).map(|m| m.len).sum();
-        if total_bytes > 0 {
-            metrics::histogram!("network_recv_batch_bytes", "transport" => "udp")
-                .record(total_bytes as f64);
-        }
-
-        for (i, m) in self.meta.iter().take(count).enumerate() {
-            let buf = &self.slices[i];
-            metrics::histogram!("network_recv_batch_io_slices", "transport" => "udp")
-                .record((m.len / m.stride) as f64);
-            let batch = RecvPacketBatch {
+            out.push(RecvPacketBatch {
                 src: m.addr,
                 dst: local_addr,
-                buf: Bytes::copy_from_slice(buf),
+                buf,
                 stride: m.stride,
                 len: m.len,
-            };
-            out.push(batch);
+            });
         }
     }
 }
@@ -310,16 +284,26 @@ impl UdpTransport {
         batcher: &mut RecvPacketBatcher,
         out: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
-        match self.sock.try_io(tokio::io::Interest::READABLE, || {
-            self.state
-                .recv((&self.sock).into(), &mut batcher.slices, &mut batcher.meta)
-        }) {
-            Ok(count) => {
-                batcher.collect_packets(self.local_addr, count, out);
-                Ok(())
+        self.sock.try_io(tokio::io::Interest::READABLE, || {
+            let buffers = &mut batcher.buffers;
+            let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|i| {
+                let slice: &mut [u8] =
+                    unsafe { &mut *(buffers[i].as_mut() as *mut [MaybeUninit<u8>] as *mut [u8]) };
+                IoSliceMut::new(slice)
+            });
+            let res = self
+                .state
+                .recv((&self.sock).into(), &mut slices, &mut batcher.meta);
+            let _ = slices; // slices is no longer safe to use
+
+            match res {
+                Ok(count) => {
+                    batcher.collect(self.local_addr, count, out);
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     #[inline]
@@ -462,25 +446,34 @@ mod test {
             .await
             .unwrap();
 
-        let payload = b"hello";
         sock.writable().await.unwrap();
-        let packet = SendPacket {
-            buf: Bytes::from_static(payload),
+        let payload = b"hello";
+        let send_batch = SendPacketBatch {
             dst: sock.local_addr(),
+            buf: payload,
+            segment_size: payload.len(),
         };
-        let batch = SendPacketBatch {
-            dst: packet.dst,
-            buf: &packet.buf,
-            segment_size: packet.buf.len(),
-        };
-        assert!(sock.try_send_batch(&batch).unwrap());
+        assert!(sock.try_send_batch(&send_batch).unwrap());
 
         sock.readable().await.unwrap();
-        let mut storage = RecvBatchStorage::new(1);
-        let mut batch = RecvPacketBatcher::new(&mut storage);
+        let mut batcher = RecvPacketBatcher::new();
         let mut buf = Vec::with_capacity(1);
-        sock.try_recv_batch(&mut batch, &mut buf).unwrap();
+        sock.try_recv_batch(&mut batcher, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);
-        assert_eq!(&buf[0].buf, payload.as_slice());
+        let mut batch = buf[0].iter();
+        assert_eq!(&batch.next().unwrap(), payload.as_slice());
+
+        buf.clear();
+        let payload = b"bla";
+        let send_batch = SendPacketBatch {
+            dst: sock.local_addr(),
+            buf: payload,
+            segment_size: payload.len(),
+        };
+        assert!(sock.try_send_batch(&send_batch).unwrap());
+        sock.try_recv_batch(&mut batcher, &mut buf).unwrap();
+        assert_eq!(buf.len(), 1);
+        let mut batch = buf[0].iter();
+        assert_eq!(&batch.next().unwrap(), payload.as_slice());
     }
 }

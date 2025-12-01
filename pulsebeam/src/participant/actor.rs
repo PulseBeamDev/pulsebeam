@@ -67,9 +67,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         &mut self,
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
-        const BATCH_BUDGET: u8 = 64;
+        const BATCH_BUDGET: u8 = 128;
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(32);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(16);
 
         let _ = self
             .node_ctx

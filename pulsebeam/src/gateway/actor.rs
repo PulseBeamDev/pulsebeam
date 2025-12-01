@@ -96,8 +96,8 @@ pub struct GatewayWorkerActor {
     id: usize,
     socket: Arc<net::UnifiedSocket>,
     demuxer: Demuxer,
+    batcher: net::RecvPacketBatcher,
     recv_batches: Vec<net::RecvPacketBatch>,
-    storage: net::RecvBatchStorage,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
@@ -123,7 +123,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             Ok(_) = self.socket.readable() => {
-                if let Err(err) = self.read_socket().await {
+                if let Err(err) = self.read_socket().await && err.kind() != io::ErrorKind::WouldBlock {
                     tracing::error!("failed to read socket: {err}");
                     break;
                 }
@@ -151,74 +151,29 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
 }
 
 impl GatewayWorkerActor {
-    // Standard batch size for socket syscalls (e.g. RecvMmsg)
-    const BATCH_SIZE: usize = 64;
-
-    // Cooperative Multitasking Budget:
-    // How many batches to process before forcibly yielding to the Tokio runtime.
-    // 16 * 64 = 1024 packets.
-    const BUDGET_BATCHES: usize = 1;
-
-    // Threshold for "Emergency Yielding".
-    // If we drop this many packets in a single loop, downstream is overwhelmed.
-    // We yield immediately to let them catch up.
-    const DROP_THRESHOLD: usize = 100;
-
     pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
-        let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
-        let gro_segments = socket.gro_segments();
-        let storage = net::RecvBatchStorage::new(gro_segments);
+        let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
+        let batcher = net::RecvPacketBatcher::new();
 
         Self {
             id,
             socket,
+            batcher,
             recv_batches: recv_batch,
-            storage,
             demuxer: Demuxer::new(),
         }
     }
 
     async fn read_socket(&mut self) -> io::Result<()> {
-        let mut batches_processed = 0;
-        let mut total_drops_in_loop = 0;
+        self.recv_batches.clear();
+        self.socket
+            .try_recv_batch(&mut self.batcher, &mut self.recv_batches)?;
 
-        loop {
-            if batches_processed >= Self::BUDGET_BATCHES {
+        for (i, batch) in self.recv_batches.drain(..).enumerate() {
+            let success = self.demuxer.demux(batch);
+            if !success || (i + 1) % 3 == 0 {
                 rt::yield_now().await;
-                batches_processed = 0;
-                total_drops_in_loop = 0;
             }
-
-            self.recv_batches.clear();
-
-            let mut batch = net::RecvPacketBatcher::new(&mut self.storage);
-            match self
-                .socket
-                .try_recv_batch(&mut batch, &mut self.recv_batches)
-            {
-                Ok(_) => {
-                    // Data received, continue to process
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-
-            for batch in self.recv_batches.drain(..) {
-                let success = self.demuxer.demux(batch);
-                if !success {
-                    total_drops_in_loop += 1;
-                }
-            }
-
-            if total_drops_in_loop > Self::DROP_THRESHOLD {
-                rt::yield_now().await;
-                batches_processed = 0;
-                total_drops_in_loop = 0;
-            }
-
-            batches_processed += 1;
         }
 
         Ok(())
