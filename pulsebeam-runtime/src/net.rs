@@ -1,10 +1,15 @@
 use std::{
     io::{self, ErrorKind, IoSliceMut},
+    mem::MaybeUninit,
     net::SocketAddr,
 };
 
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
+
+pub const BATCH_SIZE: usize = 32;
+// Fit Mimalloc page size and Linux GRO limit
+pub const CHUNK_SIZE: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
@@ -12,7 +17,6 @@ pub enum Transport {
     Tcp,
     Tls,
     SimUdp,
-    TokioUdp,
 }
 
 /// A received packet (zero-copy buffer + source address).
@@ -23,67 +27,99 @@ pub struct RecvPacket {
     pub buf: Bytes, // pre-allocated buffer
 }
 
-pub struct RecvBatchStorage {
-    backend: Vec<u8>,
-    chunk_size: usize,
+#[derive(Debug, Clone)]
+pub struct RecvPacketBatch {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+    pub buf: Bytes,
+    pub stride: usize,
+    pub len: usize,
 }
 
-impl RecvBatchStorage {
-    const MAX_MTU: usize = 1500;
+impl RecvPacketBatch {
+    pub fn iter(&self) -> RecvPacketBatchIter<'_> {
+        RecvPacketBatchIter {
+            batch: self,
+            offset: 0,
+        }
+    }
+}
 
-    pub fn new(gro_segments: usize) -> Self {
-        let chunk_size = Self::MAX_MTU * gro_segments;
+impl<'a> IntoIterator for &'a RecvPacketBatch {
+    type Item = Bytes;
+    type IntoIter = RecvPacketBatchIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct RecvPacketBatchIter<'a> {
+    batch: &'a RecvPacketBatch,
+    offset: usize,
+}
+
+impl<'a> Iterator for RecvPacketBatchIter<'a> {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.batch.len {
+            return None;
+        }
+
+        let remaining = self.batch.len - self.offset;
+        let seg_len = std::cmp::min(self.batch.stride, remaining);
+
+        if seg_len == 0 {
+            return None;
+        }
+
+        let packet_buf = self.batch.buf.slice(self.offset..self.offset + seg_len);
+
+        self.offset += seg_len;
+
+        Some(packet_buf)
+    }
+}
+
+pub struct RecvPacketBatcher {
+    meta: [RecvMeta; BATCH_SIZE],
+    buffers: [Box<[MaybeUninit<u8>]>; BATCH_SIZE],
+}
+
+impl RecvPacketBatcher {
+    pub fn new() -> Self {
+        let buffers: [Box<[MaybeUninit<u8>]>; BATCH_SIZE] =
+            std::array::from_fn(|_| Box::new_uninit_slice(CHUNK_SIZE));
+
         Self {
-            backend: vec![0; quinn_udp::BATCH_SIZE * chunk_size],
-            chunk_size,
+            meta: [RecvMeta::default(); BATCH_SIZE],
+            buffers,
         }
     }
 
-    pub fn as_io_slices(&mut self) -> Vec<IoSliceMut<'_>> {
-        self.backend
-            .chunks_mut(self.chunk_size)
-            .map(IoSliceMut::new)
-            .collect()
-    }
-}
-
-/// Holds IoSliceMut for recv operations and metadata.
-pub struct RecvPacketBatch<'a> {
-    slices: Vec<IoSliceMut<'a>>,
-    meta: Vec<RecvMeta>,
-}
-
-impl<'a> RecvPacketBatch<'a> {
-    pub fn new(storage: &'a mut RecvBatchStorage) -> Self {
-        let slices = storage.as_io_slices();
-        let meta = vec![RecvMeta::default(); quinn_udp::BATCH_SIZE];
-
-        Self { slices, meta }
-    }
-
-    /// Extract received packets into user-facing data
-    pub fn collect_packets(&self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacket>) {
-        // Record the total size of the received batch as a metric.
-        let total_bytes: usize = self.meta.iter().take(count).map(|m| m.len).sum();
-        if total_bytes > 0 {
-            metrics::histogram!("network_recv_batch_bytes", "transport" => "udp")
-                .record(total_bytes as f64);
-        }
-
-        for (i, m) in self.meta.iter().take(count).enumerate() {
-            let buf = &self.slices[i];
-            let mut offset = 0;
-            metrics::histogram!("network_recv_batch_bytes_per_ioslice", "transport" => "udp")
+    fn collect(&mut self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacketBatch>) {
+        metrics::histogram!("network_recv_batch_counts", "transport" => "udp").record(count as f64);
+        for i in 0..count {
+            let m = &self.meta[i];
+            metrics::histogram!("network_recv_batch_sizes", "transport" => "udp")
                 .record(m.len as f64);
-            while offset < m.len {
-                let seg_len = std::cmp::min(m.stride, m.len - offset);
-                out.push(RecvPacket {
-                    src: m.addr,
-                    dst: local_addr,
-                    buf: Bytes::copy_from_slice(&buf[offset..offset + seg_len]),
-                });
-                offset += seg_len;
-            }
+
+            // This is fairly cheap for mimalloc as the allocation size <= page size
+            // It should be mostly O(1) here
+            let new_buf = Box::new_uninit_slice(CHUNK_SIZE);
+            let old_buf = std::mem::replace(&mut self.buffers[i], new_buf);
+            let old_buf: Box<[u8]> = unsafe { old_buf.assume_init() };
+            let full_bytes = Bytes::from(old_buf);
+            let buf = full_bytes.slice(0..m.len);
+
+            out.push(RecvPacketBatch {
+                src: m.addr,
+                dst: local_addr,
+                buf,
+                stride: m.stride,
+                len: m.len,
+            });
         }
     }
 }
@@ -106,7 +142,6 @@ pub struct SendPacketBatch<'a> {
 pub enum UnifiedSocket {
     Udp(UdpTransport),
     SimUdp(SimUdpTransport),
-    TokioUdp(TokioUdpTransport),
 }
 
 impl UnifiedSocket {
@@ -119,7 +154,6 @@ impl UnifiedSocket {
         let sock = match transport {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
             Transport::SimUdp => Self::SimUdp(SimUdpTransport::bind(addr, external_addr).await?),
-            Transport::TokioUdp => Self::TokioUdp(TokioUdpTransport::bind(addr, external_addr)?),
             _ => todo!(),
         };
         tracing::debug!("bound to {addr} ({transport:?})");
@@ -130,7 +164,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::SimUdp(inner) => inner.local_addr(),
-            Self::TokioUdp(inner) => inner.local_addr(),
         }
     }
 
@@ -138,7 +171,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
             Self::SimUdp(inner) => inner.max_gso_segments(),
-            Self::TokioUdp(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -146,7 +178,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.gro_segments(),
             Self::SimUdp(inner) => inner.gro_segments(),
-            Self::TokioUdp(inner) => inner.gro_segments(),
         }
     }
 
@@ -156,7 +187,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.readable().await,
             Self::SimUdp(inner) => inner.readable().await,
-            Self::TokioUdp(inner) => inner.readable().await,
         }
     }
 
@@ -166,7 +196,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::SimUdp(inner) => inner.writable().await,
-            Self::TokioUdp(inner) => inner.writable().await,
         }
     }
 
@@ -174,13 +203,12 @@ impl UnifiedSocket {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        batch: &mut RecvPacketBatch,
-        packets: &mut Vec<RecvPacket>,
+        batch: &mut RecvPacketBatcher,
+        packets: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(batch, packets),
             Self::SimUdp(inner) => inner.try_recv_batch(batch, packets),
-            Self::TokioUdp(inner) => inner.try_recv_batch(batch, packets),
         }
     }
 
@@ -190,7 +218,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::SimUdp(inner) => inner.try_send_batch(batch),
-            Self::TokioUdp(inner) => inner.try_send_batch(batch),
         }
     }
 }
@@ -260,20 +287,29 @@ impl UdpTransport {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        batch: &mut RecvPacketBatch,
-        out: &mut Vec<RecvPacket>,
+        batcher: &mut RecvPacketBatcher,
+        out: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
-        match self.sock.try_io(tokio::io::Interest::READABLE, || {
-            self.state
-                .recv((&self.sock).into(), &mut batch.slices, &mut batch.meta)
-        }) {
-            Ok(count) => {
-                batch.collect_packets(self.local_addr, count, out);
-                Ok(())
+        self.sock.try_io(tokio::io::Interest::READABLE, || {
+            let buffers = &mut batcher.buffers;
+            let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|i| {
+                let slice: &mut [u8] =
+                    unsafe { &mut *(buffers[i].as_mut() as *mut [MaybeUninit<u8>] as *mut [u8]) };
+                IoSliceMut::new(slice)
+            });
+            let res = self
+                .state
+                .recv((&self.sock).into(), &mut slices, &mut batcher.meta);
+            let _ = slices; // slices is no longer safe to use
+
+            match res {
+                Ok(count) => {
+                    batcher.collect(self.local_addr, count, out);
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(()),
-            Err(e) => Err(e),
-        }
+        })
     }
 
     #[inline]
@@ -293,107 +329,6 @@ impl UdpTransport {
         match res {
             Ok(_) => {
                 metrics::histogram!("network_send_batch_bytes", "transport" => "udp")
-                    .record(batch.buf.len() as f64);
-                Ok(true)
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
-            Err(err) => {
-                tracing::warn!("try_send_batch failed with {err}");
-                Err(err)
-            }
-        }
-    }
-}
-
-pub struct TokioUdpTransport {
-    sock: tokio::net::UdpSocket,
-    local_addr: SocketAddr,
-}
-
-impl TokioUdpTransport {
-    pub const MAX_MTU: usize = 1500;
-    pub const BUF_SIZE: usize = 16 * 1024 * 1024; // 16MB
-
-    pub fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
-        let socket2_sock = socket2::Socket::new(
-            socket2::Domain::for_address(addr),
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        socket2_sock.set_nonblocking(true)?;
-        socket2_sock.set_reuse_address(true)?;
-
-        #[cfg(unix)]
-        socket2_sock.set_reuse_port(true)?;
-
-        socket2_sock.set_recv_buffer_size(Self::BUF_SIZE)?;
-        socket2_sock.set_send_buffer_size(Self::BUF_SIZE)?;
-        socket2_sock.bind(&addr.into())?;
-
-        let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
-
-        let local_addr = external_addr.unwrap_or(sock.local_addr()?);
-
-        Ok(Self { sock, local_addr })
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    pub fn max_gso_segments(&self) -> usize {
-        1
-    }
-
-    pub fn gro_segments(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    pub async fn readable(&self) -> io::Result<()> {
-        self.sock.ready(tokio::io::Interest::READABLE).await?;
-        Ok(())
-    }
-
-    #[inline]
-    pub async fn writable(&self) -> io::Result<()> {
-        self.sock.ready(tokio::io::Interest::WRITABLE).await?;
-        Ok(())
-    }
-
-    #[inline]
-    pub fn try_recv_batch(
-        &self,
-        batch: &mut RecvPacketBatch,
-        out: &mut Vec<RecvPacket>,
-    ) -> std::io::Result<()> {
-        let mut buf = vec![0; 1500];
-        match self.sock.try_io(tokio::io::Interest::READABLE, || {
-            self.sock.try_recv_from(&mut buf)
-        }) {
-            Ok((n, src)) => {
-                out.push(RecvPacket {
-                    src,
-                    dst: self.local_addr,
-                    buf: Bytes::copy_from_slice(&buf[..n]),
-                });
-                Ok(())
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
-        debug_assert!(batch.segment_size != 0);
-        let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
-            self.sock.try_send_to(batch.buf, batch.dst)
-        });
-
-        match res {
-            Ok(_) => {
-                metrics::histogram!("network_send_batch_bytes", "transport" => "tokio_udp")
                     .record(batch.buf.len() as f64);
                 Ok(true)
             }
@@ -446,20 +381,24 @@ impl SimUdpTransport {
     #[inline]
     pub fn try_recv_batch(
         &self,
-        _batch: &mut RecvPacketBatch,
-        packets: &mut Vec<RecvPacket>,
+        _batch: &mut RecvPacketBatcher,
+        packets: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
         let mut buf = [0u8; Self::MTU];
         let mut total_bytes = 0;
+        let mut read_count = 0; // Track count to ensure we signal WouldBlock if empty
 
         loop {
             match self.sock.try_recv_from(&mut buf) {
                 Ok((len, src)) => {
+                    read_count += 1;
                     total_bytes += len;
-                    packets.push(RecvPacket {
+                    packets.push(RecvPacketBatch {
                         buf: Bytes::copy_from_slice(&buf[..len]),
                         src,
                         dst: self.local_addr,
+                        len,
+                        stride: len,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -470,12 +409,15 @@ impl SimUdpTransport {
             }
         }
 
-        if total_bytes > 0 {
-            metrics::histogram!("network_recv_batch_bytes", "transport" => "sim_udp")
-                .record(total_bytes as f64);
+        if read_count > 0 {
+            if total_bytes > 0 {
+                metrics::histogram!("network_recv_batch_bytes", "transport" => "sim_udp")
+                    .record(total_bytes as f64);
+            }
+            Ok(())
+        } else {
+            Err(io::Error::from(ErrorKind::WouldBlock))
         }
-
-        Ok(())
     }
 
     #[inline]
@@ -510,25 +452,34 @@ mod test {
             .await
             .unwrap();
 
-        let payload = b"hello";
         sock.writable().await.unwrap();
-        let packet = SendPacket {
-            buf: Bytes::from_static(payload),
+        let payload = b"hello";
+        let send_batch = SendPacketBatch {
             dst: sock.local_addr(),
+            buf: payload,
+            segment_size: payload.len(),
         };
-        let batch = SendPacketBatch {
-            dst: packet.dst,
-            buf: &packet.buf,
-            segment_size: packet.buf.len(),
-        };
-        assert!(sock.try_send_batch(&batch).unwrap());
+        assert!(sock.try_send_batch(&send_batch).unwrap());
 
         sock.readable().await.unwrap();
-        let mut storage = RecvBatchStorage::new(1);
-        let mut batch = RecvPacketBatch::new(&mut storage);
+        let mut batcher = RecvPacketBatcher::new();
         let mut buf = Vec::with_capacity(1);
-        sock.try_recv_batch(&mut batch, &mut buf).unwrap();
+        sock.try_recv_batch(&mut batcher, &mut buf).unwrap();
         assert_eq!(buf.len(), 1);
-        assert_eq!(&buf[0].buf, payload.as_slice());
+        let mut batch = buf[0].iter();
+        assert_eq!(&batch.next().unwrap(), payload.as_slice());
+
+        buf.clear();
+        let payload = b"bla";
+        let send_batch = SendPacketBatch {
+            dst: sock.local_addr(),
+            buf: payload,
+            segment_size: payload.len(),
+        };
+        assert!(sock.try_send_batch(&send_batch).unwrap());
+        sock.try_recv_batch(&mut batcher, &mut buf).unwrap();
+        assert_eq!(buf.len(), 1);
+        let mut batch = buf[0].iter();
+        assert_eq!(&batch.next().unwrap(), payload.as_slice());
     }
 }

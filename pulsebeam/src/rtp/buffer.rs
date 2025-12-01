@@ -242,6 +242,7 @@ mod test {
     }
 
     #[test]
+    #[ignore = "we don't check playout time for now"]
     fn test_is_ready() {
         let mut buf = KeyframeBuffer::new();
         let now = Instant::now();

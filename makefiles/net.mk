@@ -31,7 +31,7 @@ net-apply: net-clear net-verify
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 	@echo "→ Applying network rules to $(IFACE)..."
-	@if [ -n "$(JITTER_DIST)" ]; then \
+	if [ -n "$(JITTER_DIST)" ]; then \
 		sudo tc qdisc add dev $(IFACE) root netem \
 			rate $(UPLOAD_RATE) \
 			delay $(HALF_LATENCY)ms $(HALF_UPLOAD_JITTER)ms $(JITTER_DIST) \

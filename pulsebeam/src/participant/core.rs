@@ -67,19 +67,22 @@ impl ParticipantCore {
         self.events.drain(..)
     }
 
-    pub fn handle_udp_packet(&mut self, packet: net::RecvPacket) {
-        if let Ok(contents) = (*packet.buf).try_into() {
-            let recv = str0m::net::Receive {
-                proto: str0m::net::Protocol::Udp,
-                source: packet.src,
-                destination: packet.dst,
-                contents,
-            };
-            let _ = self
-                .rtc
-                .handle_input(Input::Receive(Instant::now().into(), recv));
-        } else {
-            tracing::warn!(src = %packet.src, "Dropping malformed UDP packet");
+    pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) {
+        for pkt in batch.into_iter() {
+            if let Ok(contents) = (*pkt).try_into() {
+                let recv = str0m::net::Receive {
+                    proto: str0m::net::Protocol::Udp,
+                    source: batch.src,
+                    destination: batch.dst,
+                    contents,
+                };
+                let _ = self
+                    .rtc
+                    .handle_input(Input::Receive(Instant::now().into(), recv));
+                self.poll_rtc();
+            } else {
+                tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
+            }
         }
     }
 
@@ -206,7 +209,7 @@ impl ParticipantCore {
                 //     layer.monitor.set_manual_pause(e.paused);
             }
             e => {
-                tracing::warn!("unhandled event: {e:?}");
+                // tracing::warn!("unhandled event: {e:?}");
             }
         }
     }
@@ -227,7 +230,7 @@ impl ParticipantCore {
                     kind: media.kind,
                     simulcast_rids: media.simulcast.map(|s| s.recv),
                 });
-                let (tx, rx) = track::new(media.mid, track_meta, 64);
+                let (tx, rx) = track::new(media.mid, track_meta, 128);
                 self.upstream.add_published_track(media.mid, tx);
                 self.events.push(CoreEvent::SpawnTrack(rx));
             }

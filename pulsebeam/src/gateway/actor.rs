@@ -2,12 +2,16 @@ use crate::{entity::ParticipantId, gateway::demux::Demuxer};
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
-use pulsebeam_runtime::{actor, mailbox, net};
+use pulsebeam_runtime::{actor, mailbox, net, rt};
 use std::{io, sync::Arc};
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(Arc<ParticipantId>, String, mailbox::Sender<net::RecvPacket>),
+    AddParticipant(
+        Arc<ParticipantId>,
+        String,
+        mailbox::Sender<net::RecvPacketBatch>,
+    ),
     RemoveParticipant(Arc<ParticipantId>),
 }
 
@@ -92,8 +96,8 @@ pub struct GatewayWorkerActor {
     id: usize,
     socket: Arc<net::UnifiedSocket>,
     demuxer: Demuxer,
-    recv_batch: Vec<net::RecvPacket>,
-    storage: net::RecvBatchStorage,
+    batcher: net::RecvPacketBatcher,
+    recv_batches: Vec<net::RecvPacketBatch>,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
@@ -119,7 +123,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             Ok(_) = self.socket.readable() => {
-                if let Err(err) = self.read_socket().await {
+                if let Err(err) = self.read_socket().await && err.kind() != io::ErrorKind::WouldBlock {
                     tracing::error!("failed to read socket: {err}");
                     break;
                 }
@@ -147,33 +151,27 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
 }
 
 impl GatewayWorkerActor {
-    const BATCH_SIZE: usize = 64;
     pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
-        // Pre-allocate receive batch with MTU-sized buffers
-        let recv_batch = Vec::with_capacity(Self::BATCH_SIZE);
-        let storage = net::RecvBatchStorage::new(socket.gro_segments());
+        let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
+        let batcher = net::RecvPacketBatcher::new();
 
         Self {
             id,
             socket,
-            recv_batch,
-            storage,
+            batcher,
+            recv_batches: recv_batch,
             demuxer: Demuxer::new(),
         }
     }
 
     async fn read_socket(&mut self) -> io::Result<()> {
-        // the loop after reading should always clear the buffer
-        assert!(self.recv_batch.is_empty());
-
-        let mut batch = net::RecvPacketBatch::new(&mut self.storage);
+        self.recv_batches.clear();
         self.socket
-            .try_recv_batch(&mut batch, &mut self.recv_batch)?;
+            .try_recv_batch(&mut self.batcher, &mut self.recv_batches)?;
 
-        for packet in self.recv_batch.drain(..) {
-            self.demuxer.demux(packet).await;
+        for batch in self.recv_batches.drain(..) {
+            self.demuxer.demux(batch).await;
         }
-        self.recv_batch.clear();
 
         Ok(())
     }

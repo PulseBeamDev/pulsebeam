@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::{
     entity::{ParticipantId, RoomId},
@@ -122,6 +122,7 @@ impl ControllerActor {
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
             .set_rtp_mode(true)
+            .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300)))
             // Uncomment this to see statistics

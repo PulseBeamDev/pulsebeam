@@ -1,14 +1,13 @@
-use pulsebeam_runtime::mailbox::TrySendError;
-use pulsebeam_runtime::{mailbox, net, rt};
+use pulsebeam_runtime::mailbox::{SendError, TrySendError};
+use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;
 use crate::gateway::ice;
-use crate::participant;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub type ParticipantHandle = mailbox::Sender<net::RecvPacket>;
+pub type ParticipantHandle = mailbox::Sender<net::RecvPacketBatch>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DemuxResult {
@@ -85,38 +84,37 @@ impl Demuxer {
         }
     }
 
-    /// Determines the owner of an incoming UDP packet.
-    pub async fn demux(&mut self, pkt: net::RecvPacket) {
-        let participant_handle = if let Some(participant_handle) = self.addr_map.get_mut(&pkt.src) {
-            participant_handle
-        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&pkt.buf) {
-            if let Some(participant_handle) = self.ufrag_map.get_mut(ufrag) {
-                tracing::debug!("found connection from ufrag: {:?} -> {}", ufrag, pkt.src,);
-                self.addr_map.insert(pkt.src, participant_handle.clone());
+    /// Routes a packet to the correct participant.
+    /// Returns `true` if sent, `false` if dropped (queue full or unknown destination).
+    pub async fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
+        let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
+            handle
+        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
+            if let Some(handle) = self.ufrag_map.get_mut(ufrag) {
+                tracing::debug!("New connection from ufrag: {:?} -> {}", ufrag, batch.src);
+
+                self.addr_map.insert(batch.src, handle.clone());
                 let key = ufrag.to_vec().into_boxed_slice();
-                self.ufrag_addrs.entry(key).or_default().push(pkt.src);
-                participant_handle
+                self.ufrag_addrs.entry(key).or_default().push(batch.src);
+
+                handle
             } else {
-                tracing::trace!(
-                    "dropped a packet from {} due to unregistered stun binding: {:?}",
-                    pkt.src,
-                    ufrag
-                );
-                return;
+                // Packet from unknown ufrag
+                tracing::trace!("Dropped: unregistered stun binding from {}", batch.src);
+                metrics::counter!("gateway_demux_dropped", "reason" => "unknown_ufrag")
+                    .increment(1);
+                return false;
             }
         } else {
-            tracing::trace!(
-                "dropped a packet from {} due to unexpected message flow from an unknown source",
-                pkt.src
-            );
-            return;
+            // Packet from unknown source without ufrag cache
+            tracing::trace!("Dropped: unknown source {}", batch.src);
+            metrics::counter!("gateway_demux_dropped", "reason" => "unknown_source").increment(1);
+            return false;
         };
 
-        // participant_handle.send(pkt).await;
-        if let Err(TrySendError::Full(_)) = participant_handle.try_send(pkt) {
-            tracing::warn!("gateway -> participant: full queue, dropping");
-            // downstream has later stages of work.. let them have a chance.
-            rt::yield_now().await;
+        match participant_handle.send(batch).await {
+            Ok(_) => true,
+            Err(SendError(_)) => false,
         }
     }
 }

@@ -2,8 +2,8 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use pulsebeam_runtime::actor::ActorKind;
-use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
+use pulsebeam_runtime::{prelude::*, rt};
 use str0m::{Rtc, RtcError, error::SdpError};
 use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
@@ -68,7 +68,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(64);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(3);
 
         let _ = self
             .node_ctx
@@ -115,7 +115,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
                 },
-                Some(pkt) = gateway_rx.recv() => self.core.handle_udp_packet(pkt),
+                Some(batch) = gateway_rx.recv() => self.core.handle_udp_packet_batch(batch),
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
                 },
