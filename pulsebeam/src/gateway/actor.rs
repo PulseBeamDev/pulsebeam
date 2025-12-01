@@ -169,11 +169,8 @@ impl GatewayWorkerActor {
         self.socket
             .try_recv_batch(&mut self.batcher, &mut self.recv_batches)?;
 
-        for (i, batch) in self.recv_batches.drain(..).enumerate() {
-            let success = self.demuxer.demux(batch);
-            if !success || (i + 1) % 3 == 0 {
-                rt::yield_now().await;
-            }
+        for batch in self.recv_batches.drain(..) {
+            self.demuxer.demux(batch).await;
         }
 
         Ok(())

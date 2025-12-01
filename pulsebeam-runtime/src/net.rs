@@ -98,8 +98,11 @@ impl RecvPacketBatcher {
     }
 
     fn collect(&mut self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacketBatch>) {
+        metrics::histogram!("network_recv_batch_counts", "transport" => "udp").record(count as f64);
         for i in 0..count {
             let m = &self.meta[i];
+            metrics::histogram!("network_recv_batch_sizes", "transport" => "udp")
+                .record(m.len as f64);
 
             let new_buf = Box::new_uninit_slice(CHUNK_SIZE);
             let old_buf = std::mem::replace(&mut self.buffers[i], new_buf);

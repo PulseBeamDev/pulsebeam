@@ -1,4 +1,4 @@
-use pulsebeam_runtime::mailbox::TrySendError;
+use pulsebeam_runtime::mailbox::{SendError, TrySendError};
 use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;
@@ -86,7 +86,7 @@ impl Demuxer {
 
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped (queue full or unknown destination).
-    pub fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
+    pub async fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
         // 1. RESOLVE DESTINATION
         let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
             handle
@@ -111,17 +111,9 @@ impl Demuxer {
             return false;
         };
 
-        // 2. SEND (NON-BLOCKING)
-        // We use try_send. If the channel is full, we drop the packet immediately.
-        // We do NOT log warnings here as it would thrash I/O during a DDoS or congestion.
-        match participant_handle.try_send(batch) {
+        match participant_handle.send(batch).await {
             Ok(_) => true,
-            Err(TrySendError::Full(_)) => {
-                // PRODUCTION TIP: Increment a fast counter here (e.g., metrics crate)
-                // metrics::increment_counter!("gateway_drops_full");
-                false
-            }
-            Err(TrySendError::Closed(_)) => {
+            Err(SendError(_)) => {
                 // The participant actor has died or disconnected.
                 // You might want to trigger a cleanup of self.addr_map here eventually.
                 false
