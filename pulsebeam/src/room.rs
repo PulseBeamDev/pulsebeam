@@ -151,7 +151,7 @@ impl RoomActor {
         );
 
         // TODO: capacity
-        let participant_cfg = actor::RunnerConfig::default().with_lo(128);
+        let participant_cfg = actor::RunnerConfig::default().with_mailbox_cap(128);
         let (mut participant_handle, participant_join) =
             actor::spawn(participant_actor, participant_cfg);
         self.participant_tasks.push(participant_join);

@@ -190,16 +190,12 @@ impl<M: MessageSet> ActorHandle<M> {
 }
 
 pub struct RunnerConfig {
-    pub lo_cap: usize,
-    pub hi_cap: usize,
+    pub mailbox_cap: usize,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
-        Self {
-            lo_cap: 1,
-            hi_cap: 128,
-        }
+        Self { mailbox_cap: 128 }
     }
 }
 
@@ -207,22 +203,21 @@ impl RunnerConfig {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn with_lo(mut self, cap: usize) -> Self {
-        self.lo_cap = cap;
-        self
-    }
-    pub fn with_hi(mut self, cap: usize) -> Self {
-        self.hi_cap = cap;
+    pub fn with_mailbox_cap(mut self, cap: usize) -> Self {
+        self.mailbox_cap = cap;
         self
     }
 }
 
-pub fn spawn<A, M>(a: A, config: RunnerConfig) -> (ActorHandle<M>, JoinHandle<M>)
+pub fn prepare<A, M>(
+    a: A,
+    config: RunnerConfig,
+) -> (ActorHandle<M>, impl Future<Output = (M::Meta, ActorStatus)>)
 where
     M: MessageSet,
     A: Actor<M>,
 {
-    let (tx, rx) = mailbox::new(config.lo_cap);
+    let (tx, rx) = mailbox::new(config.mailbox_cap);
     let (sys_tx, sys_rx) = mailbox::new(1);
 
     let handle = ActorHandle::<M> {
@@ -232,18 +227,16 @@ where
     };
 
     let ctx = ActorContext {
-        sys_rx,
         rx,
+        sys_rx,
         handle: handle.clone(),
     };
 
-    let monitor = A::monitor();
-    let actor_id = a.meta().clone();
-
+    // Capture current scope for nesting
     let mut active_scope = CURRENT_SCOPE
         .try_with(|s| s.borrow().clone())
         .unwrap_or_default();
-    active_scope.tags.insert(A::kind(), actor_id.to_string());
+    active_scope.tags.insert(A::kind(), a.meta().to_string());
 
     let parent_span = tracing::Span::current();
     let span = tracing::info_span!(
@@ -255,18 +248,29 @@ where
 
     let scope_for_child = active_scope.clone();
 
+    // Wrap the actor's run in instrumentation and unwind safety
     let runnable = CURRENT_SCOPE.scope(RefCell::new(scope_for_child), run(a, ctx));
-    let runnable = monitor.instrument(runnable);
+    let runnable = A::monitor().instrument(runnable);
     let runnable = tracing::Instrument::instrument(runnable, span);
-    // let runnable = tokio::task::unconstrained(runnable);
+
+    let actor_id = handle.meta.clone();
+    let fut = runnable.map(move |status| (actor_id, status));
+
+    (handle, fut)
+}
+
+pub fn spawn<A, M>(a: A, config: RunnerConfig) -> (ActorHandle<M>, JoinHandle<M>)
+where
+    M: MessageSet,
+    A: Actor<M>,
+{
+    let (handle, runnable) = prepare(a, config);
     let join = tokio::spawn(runnable);
     let abort_handle = join.abort_handle();
 
+    let actor_id = handle.meta.clone();
     let join = join
-        .map(|res| match res {
-            Ok(ret) => (actor_id, ret),
-            Err(_) => (actor_id, ActorStatus::ShutDown),
-        })
+        .map(|res| res.unwrap_or((actor_id, ActorStatus::ShutDown)))
         .boxed();
 
     (
