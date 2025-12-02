@@ -2,7 +2,7 @@ use crate::{entity::ParticipantId, gateway::demux::Demuxer};
 use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
-use pulsebeam_runtime::{actor, mailbox, net, rt};
+use pulsebeam_runtime::{actor, mailbox, net};
 use std::{io, sync::Arc};
 
 #[derive(Clone)]

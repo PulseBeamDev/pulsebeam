@@ -303,6 +303,12 @@ pub struct TrackId {
     pub internal: Arc<EntityId>,
 }
 
+impl Default for TrackId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrackId {
     pub fn new() -> Self {
         let internal = new_entity_id(prefix::TRACK_ID);

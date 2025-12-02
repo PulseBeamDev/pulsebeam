@@ -910,7 +910,7 @@ mod test {
             RtpPacket {
                 seq_no: seq.into(),
                 rtp_ts: MediaTime::new(rtp_ts, TEST_FREQ),
-                arrival_ts: arrival_time.into(),
+                arrival_ts: arrival_time,
                 ..Default::default()
             }
         }

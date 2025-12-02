@@ -141,7 +141,7 @@ impl RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
         participant_id: Arc<ParticipantId>,
-        mut rtc: str0m::Rtc,
+        rtc: str0m::Rtc,
     ) {
         let participant_actor = participant::ParticipantActor::new(
             self.node_ctx.clone(),
@@ -179,7 +179,7 @@ impl RoomActor {
             return;
         };
 
-        for (track_id, track_handle) in participant.tracks.iter_mut() {
+        for (track_id, _) in participant.tracks.iter_mut() {
             // Remove the track from the central registry.
             self.state.tracks.remove(track_id);
         }

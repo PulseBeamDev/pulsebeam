@@ -208,7 +208,7 @@ impl ParticipantCore {
                 //
                 //     layer.monitor.set_manual_pause(e.paused);
             }
-            e => {
+            _ => {
                 // tracing::warn!("unhandled event: {e:?}");
             }
         }

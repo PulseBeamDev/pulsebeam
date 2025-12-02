@@ -170,7 +170,7 @@ mod test {
         assert!(!seq.ready_to_stream(), "Switcher must end in drained state");
 
         // === PROPERTY 2: Output seqno must be *strictly increasing* and *gap-free* ===
-        let seq_nos: Vec<u64> = rewritten_headers.iter().map(|h| (*h.seq_no)).collect();
+        let seq_nos: Vec<u64> = rewritten_headers.iter().map(|h| *h.seq_no).collect();
         if !seq_nos.is_empty() {
             let is_continuous = seq_nos
                 .iter()

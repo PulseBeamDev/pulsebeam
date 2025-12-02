@@ -31,10 +31,6 @@ impl UpstreamAllocator {
         self.published_tracks.insert(mid, track);
     }
 
-    pub fn get_track_mut(&mut self, mid: &Mid) -> Option<&mut TrackSender> {
-        self.published_tracks.get_mut(mid)
-    }
-
     /// Handles an incoming RTP packet from the RTC engine.
     ///
     /// This method finds the correct simulcast layer and pushes the packet
@@ -53,13 +49,9 @@ impl UpstreamAllocator {
         }
     }
 
-    /// Polls all jitter buffers for all tracks to release ready packets.
-    pub fn poll(&mut self, rtc: &mut str0m::Rtc, now: Instant) -> Option<Instant> {
+    pub fn poll(&mut self, rtc: &mut str0m::Rtc, _: Instant) -> Option<Instant> {
         self.drain_keyframe_requests(rtc);
-        self.published_tracks
-            .values_mut()
-            .filter_map(|track| track.poll(now))
-            .min()
+        None
     }
 
     pub fn poll_stats(&mut self, now: Instant) {

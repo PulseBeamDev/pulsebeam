@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastQuality, SimulcastReceiver, TrackReceiver};
+use crate::track::{SimulcastReceiver, TrackReceiver};
 
 #[derive(Default)]
 pub struct VideoAllocator {
@@ -272,20 +272,6 @@ impl Slot {
             SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
             SlotState::Idle => None,
         }
-    }
-
-    pub fn track_id(&self) -> Option<&Arc<TrackId>> {
-        self.target_receiver().map(|r| &r.meta.id)
-    }
-
-    pub fn rid(&self) -> Option<Rid> {
-        self.target_receiver().and_then(|r| r.rid)
-    }
-
-    pub fn quality(&self) -> SimulcastQuality {
-        self.target_receiver()
-            .map(|r| r.quality)
-            .unwrap_or(SimulcastQuality::Undefined)
     }
 
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {

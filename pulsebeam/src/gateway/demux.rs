@@ -1,4 +1,4 @@
-use pulsebeam_runtime::mailbox::{SendError, TrySendError};
+use pulsebeam_runtime::mailbox::TrySendError;
 use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;
@@ -8,24 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub type ParticipantHandle = mailbox::Sender<net::RecvPacketBatch>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DemuxResult {
-    Participant(Arc<ParticipantId>),
-    Rejected(RejectionReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RejectionReason {
-    /// Packet received from an unknown source address that was not a STUN binding request.
-    UnknownSource,
-    /// STUN packet could not be parsed or was missing a USERNAME attribute.
-    MalformedStun,
-    /// STUN packet had a valid format but an unknown USERNAME attribute.
-    UnauthorizedIceUfrag,
-    /// Packet was too small to be processed.
-    PacketTooSmall,
-}
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///

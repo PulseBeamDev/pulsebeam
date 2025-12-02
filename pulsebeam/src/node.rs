@@ -140,14 +140,13 @@ mod internal {
         response::{Html, IntoResponse},
         routing::get,
     };
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use pprof::{ProfilerGuard, protos::Message};
-    use pulsebeam_runtime::{actor::Actor, rt};
+    use pulsebeam_runtime::actor::Actor;
     use serde::Deserialize;
-    use tokio_metrics::TaskMonitor;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{controller, gateway, participant, room, track};
+    use crate::{controller, gateway, participant, room};
 
     #[derive(Deserialize)]
     struct ProfileParams {

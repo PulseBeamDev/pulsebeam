@@ -126,10 +126,6 @@ impl SimulcastSender {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    pub fn poll(&mut self, now: Instant) -> Option<Instant> {
-        None
-    }
-
     fn forward(&mut self, pkt: RtpPacket) {
         if let KeyframeRequestState::Debouncing { .. } = self.keyframe_request_state
             && pkt.is_keyframe_start
@@ -165,13 +161,6 @@ impl TrackSender {
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut SimulcastSender> {
         self.simulcast.iter_mut().find(|s| s.rid == *rid)
-    }
-
-    pub fn poll(&mut self, now: Instant) -> Option<Instant> {
-        self.simulcast
-            .iter_mut()
-            .filter_map(|layer| layer.poll(now))
-            .min()
     }
 
     pub fn poll_stats(&mut self, now: Instant) {

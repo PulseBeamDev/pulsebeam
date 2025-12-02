@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::rtp::RtpPacket;
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
@@ -32,7 +30,7 @@ impl KeyframeBuffer {
         }
     }
 
-    pub fn is_ready(&self, target_playout: Instant) -> bool {
+    pub fn is_ready(&self, _target_playout: Instant) -> bool {
         // TODO: use target_playout to decide
         self.segment.is_some()
         // let Some(segment) = self.segment.as_ref() else {
