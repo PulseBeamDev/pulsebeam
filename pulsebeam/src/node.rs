@@ -1,4 +1,5 @@
-use crate::{api, controller, gateway};
+use crate::shard::ShardMessageSet;
+use crate::{api, controller, gateway, shard};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
@@ -12,6 +13,7 @@ pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
     pub gateway: gateway::GatewayHandle,
     pub sockets: Vec<Arc<net::UnifiedSocket>>,
+    pub shards: Vec<ActorHandle<ShardMessageSet>>,
     egress_counter: Arc<AtomicUsize>,
 }
 
@@ -24,6 +26,7 @@ impl NodeContext {
         Self {
             rng: rand::Rng::from_os_rng(),
             gateway: gw,
+            shards: vec![],
             sockets: vec![socket.clone()],
             egress_counter: Arc::new(AtomicUsize::new(0)),
         }
@@ -64,6 +67,7 @@ pub async fn run(
         let socket = Arc::new(socket);
         sockets.push(socket);
     }
+
     let cors = CorsLayer::very_permissive()
         .allow_origin(AllowOrigin::mirror_request())
         .expose_headers([hyper::header::LOCATION])
@@ -72,11 +76,22 @@ pub async fn run(
     let mut join_set = FuturesUnordered::new();
     let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
     join_set.push(gateway_join.map(|_| ()).boxed());
+
+    let shard_count = 2 * workers;
+    let mut shard_handles = Vec::with_capacity(shard_count);
+
+    for i in 0..shard_count {
+        let (shard, shard_join) = actor::spawn_default(shard::ShardActor::new(i));
+        join_set.push(shard_join.map(|_| ()).boxed());
+        shard_handles.push(shard);
+    }
+
     let rng = rand::Rng::from_os_rng();
     let node_ctx = NodeContext {
         rng,
         gateway,
         sockets,
+        shards: shard_handles,
         egress_counter: Arc::new(AtomicUsize::new(0)),
     };
 
