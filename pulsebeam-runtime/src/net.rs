@@ -7,9 +7,15 @@ use std::{
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
-pub const BATCH_SIZE: usize = 32;
+// L2 cache friendly, keep it <= 1MB
+pub const BATCH_SIZE: usize = 16;
 // Fit Mimalloc page size and Linux GRO limit
 pub const CHUNK_SIZE: usize = u16::MAX as usize;
+// Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
+// With 1ms scheduling delay, this is capped to 8ms latency.
+pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
+// per-client-pacer handles the latency bloat. But, big enough for keyframe bursts to many subscribers
+pub const SOCKET_SEND_SIZE: usize = 32 * BATCH_SIZE * CHUNK_SIZE;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Transport {
@@ -230,7 +236,6 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub const MAX_MTU: usize = 1500;
-    pub const BUF_SIZE: usize = 1024 * 1024 * 1024;
 
     pub fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
         let socket2_sock = socket2::Socket::new(
@@ -244,8 +249,8 @@ impl UdpTransport {
         #[cfg(unix)]
         socket2_sock.set_reuse_port(true)?;
 
-        socket2_sock.set_recv_buffer_size(Self::BUF_SIZE)?;
-        socket2_sock.set_send_buffer_size(Self::BUF_SIZE)?;
+        socket2_sock.set_recv_buffer_size(SOCKET_RECV_SIZE)?;
+        socket2_sock.set_send_buffer_size(SOCKET_SEND_SIZE)?;
         socket2_sock.bind(&addr.into())?;
 
         let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
