@@ -86,7 +86,7 @@ impl Demuxer {
 
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped (queue full or unknown destination).
-    pub async fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
+    pub fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
         let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
             handle
         } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
@@ -112,9 +112,13 @@ impl Demuxer {
             return false;
         };
 
-        match participant_handle.send(batch).await {
+        match participant_handle.try_send(batch) {
             Ok(_) => true,
-            Err(SendError(_)) => false,
+            Err(TrySendError::Full(_)) => {
+                metrics::counter!("gateway_demux_dropped", "reason" => "full").increment(1);
+                false
+            }
+            Err(TrySendError::Closed(_)) => false,
         }
     }
 }

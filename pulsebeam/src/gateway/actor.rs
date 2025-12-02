@@ -123,9 +123,19 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             Ok(_) = self.socket.readable() => {
-                if let Err(err) = self.read_socket().await && err.kind() != io::ErrorKind::WouldBlock {
-                    tracing::error!("failed to read socket: {err}");
-                    break;
+                self.recv_batches.clear();
+                match self.socket.try_recv_batch(&mut self.batcher, &mut self.recv_batches) {
+                    Ok(_) => {
+                        for batch in self.recv_batches.drain(..) {
+                            self.demuxer.demux(batch);
+                        }
+
+                        tokio::task::yield_now().await;
+                    },
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Socket empty. Do NOT yield. fast-path back to select!
+                    },
+                    Err(_) => break, // Error handling
                 }
             }
         });
@@ -171,18 +181,6 @@ impl GatewayWorkerActor {
             recv_batches: recv_batch,
             demuxer: Demuxer::new(),
         }
-    }
-
-    async fn read_socket(&mut self) -> io::Result<()> {
-        self.recv_batches.clear();
-        self.socket
-            .try_recv_batch(&mut self.batcher, &mut self.recv_batches)?;
-
-        for batch in self.recv_batches.drain(..) {
-            self.demuxer.demux(batch).await;
-        }
-
-        Ok(())
     }
 }
 

@@ -101,6 +101,8 @@ impl<T: Clone> Receiver<T> {
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
         loop {
+            let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+
             // Snapshot producer head
             let head = self.ring.head.load(Ordering::Acquire);
             let capacity = self.ring.mask as u64 + 1;
@@ -108,6 +110,7 @@ impl<T: Clone> Receiver<T> {
 
             // Closed and nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= head {
+                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
@@ -137,6 +140,7 @@ impl<T: Clone> Receiver<T> {
             if slot_seq < earliest {
                 drop(slot);
                 self.next_seq = head;
+                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
@@ -144,6 +148,7 @@ impl<T: Clone> Receiver<T> {
             if slot_seq != self.next_seq {
                 drop(slot);
                 self.next_seq = head;
+                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
@@ -152,6 +157,7 @@ impl<T: Clone> Receiver<T> {
                 let out = v.clone();
                 drop(slot);
                 self.next_seq += 1;
+                coop.made_progress();
                 return Poll::Ready(Ok(out));
             }
 
@@ -159,6 +165,7 @@ impl<T: Clone> Receiver<T> {
             // Seq was correct but value missing — treat as lag
             drop(slot);
             self.next_seq = head;
+            coop.made_progress();
             return Poll::Ready(Err(RecvError::Lagged(head)));
         }
     }
