@@ -155,6 +155,15 @@ impl GatewayWorkerActor {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let batcher = net::RecvPacketBatcher::new();
 
+        let gro_segments = socket.gro_segments();
+        let gso_segments = socket.max_gso_segments();
+        tracing::info!(
+            gateway_worker = id,
+            "gro_segments={},gso_segments={}",
+            gro_segments,
+            gso_segments
+        );
+
         Self {
             id,
             socket,
