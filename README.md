@@ -125,10 +125,12 @@ await pc.setRemoteDescription({ type: "answer", sdp: answer });
 ## Roadmap
 
 * ✅ Prototype: working basic audio/video Rust SFU + demo
-* 🚧 Bandwidth estimator, data handling, video simulcast (current focus)
+* 🚧 Bandwidth estimator, video simulcast (current focus)
+* 📅 Web Client SDK, data channel
+* 📅 HTTP API & Webhooks (Events)
 * 📅 Core stability: simulation testing, end-to-end tests
-* 📅 First-party services (recording, etc.) + JS SDK
 * 📅 Built-in multi node or cascading SFU.
+* 📅 First-party services (recording, SIP, etc.)
 
 ---
 
