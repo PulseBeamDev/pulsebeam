@@ -174,12 +174,12 @@ impl RoomActor {
         let (mut participant_handle, participant_task) =
             actor::prepare(participant_actor, RunnerConfig::default());
         let mut room_handle = ctx.handle.clone();
-        let participant_task = tokio::task::unconstrained(async move {
+        let participant_task = async move {
             let (participant_id, _) = participant_task.await;
             room_handle
                 .send(RoomMessage::RemoveParticipant(participant_id))
                 .await;
-        });
+        };
 
         self.schedule(participant_task.boxed()).await;
         self.state.participants.insert(
