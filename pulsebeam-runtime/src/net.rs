@@ -10,7 +10,7 @@ use quinn_udp::RecvMeta;
 // L2 cache friendly, keep it <= 1MB
 pub const BATCH_SIZE: usize = 16;
 // Fit Mimalloc page size and Linux GRO limit
-pub const CHUNK_SIZE: usize = u16::MAX as usize;
+pub const CHUNK_SIZE: usize = 32 * 1024;
 // Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
 // With 1ms scheduling delay, this is capped to 8ms latency.
 pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
@@ -228,6 +228,19 @@ impl UnifiedSocket {
     }
 }
 
+fn fmt_bytes(b: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+
+    if b >= MB {
+        format!("{}MB", b / MB)
+    } else if b >= KB {
+        format!("{}KB", b / KB)
+    } else {
+        format!("{}B", b)
+    }
+}
+
 pub struct UdpTransport {
     sock: tokio::net::UdpSocket,
     state: quinn_udp::UdpSocketState,
@@ -253,10 +266,25 @@ impl UdpTransport {
         socket2_sock.set_send_buffer_size(SOCKET_SEND_SIZE)?;
         socket2_sock.bind(&addr.into())?;
 
-        let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
-        let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
+        let send_buf_size = socket2_sock.send_buffer_size()?;
+        let recv_buf_size = socket2_sock.recv_buffer_size()?;
 
+        let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
+        let gro_segments = state.gro_segments();
+        let gso_segments = state.max_gso_segments();
+
+        let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
         let local_addr = external_addr.unwrap_or(sock.local_addr()?);
+
+        tracing::info!(
+            %addr,
+            %local_addr,
+            recv_buf = fmt_bytes(recv_buf_size),
+            send_buf = fmt_bytes(send_buf_size),
+            gro_segments = ?gro_segments,
+            gso_segments = ?gso_segments,
+            "UDP socket bound"
+        );
 
         Ok(Self {
             sock,

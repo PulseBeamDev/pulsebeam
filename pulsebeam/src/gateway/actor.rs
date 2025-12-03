@@ -130,7 +130,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
                             self.demuxer.demux(batch).await;
                         }
 
-                        tokio::task::yield_now().await;
+                        // tokio::task::yield_now().await;
                     },
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         // Socket empty. Do NOT yield. fast-path back to select!
@@ -164,15 +164,6 @@ impl GatewayWorkerActor {
     pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let batcher = net::RecvPacketBatcher::new();
-
-        let gro_segments = socket.gro_segments();
-        let gso_segments = socket.max_gso_segments();
-        tracing::info!(
-            gateway_worker = id,
-            "gro_segments={},gso_segments={}",
-            gro_segments,
-            gso_segments
-        );
 
         Self {
             id,

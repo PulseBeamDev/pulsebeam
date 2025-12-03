@@ -141,13 +141,16 @@ impl RoomActor {
     }
 
     pub async fn schedule(&mut self, task: ShardTask) {
-        const GROUP_LIMIT: usize = 50;
+        use ahash::AHasher;
+        use std::hash::{Hash, Hasher};
+
+        const GROUP_LIMIT: usize = 16;
         let room_size = self.state.participants.len();
         let shard_idx = {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.room_id.internal.hash(&mut hasher);
+            let mut hasher = AHasher::default();
             let group = room_size / GROUP_LIMIT;
-            group.hash(&mut hasher);
+
+            (&self.room_id.internal, group).hash(&mut hasher);
             (hasher.finish() as usize) % self.node_ctx.shards.len()
         };
         self.node_ctx.shards[shard_idx]

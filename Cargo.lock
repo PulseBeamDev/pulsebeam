@@ -2235,12 +2235,14 @@ dependencies = [
 name = "pulsebeam"
 version = "0.2.22"
 dependencies = [
+ "ahash",
  "anyhow",
  "axum",
  "axum-extra",
  "bs58",
  "bytes",
  "futures",
+ "futures-buffered",
  "hex",
  "hyper",
  "metrics",
