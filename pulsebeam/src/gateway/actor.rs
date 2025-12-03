@@ -127,7 +127,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
                 match self.socket.try_recv_batch(&mut self.batcher, &mut self.recv_batches) {
                     Ok(_) => {
                         for batch in self.recv_batches.drain(..) {
-                            self.demuxer.demux(batch);
+                            self.demuxer.demux(batch).await;
                         }
 
                         tokio::task::yield_now().await;

@@ -77,7 +77,7 @@ pub async fn run(
     let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
     join_set.push(gateway_join.map(|_| ()).boxed());
 
-    let shard_count = 8 * workers;
+    let shard_count = 32 * workers;
     let mut shard_handles = Vec::with_capacity(shard_count);
 
     for i in 0..shard_count {
