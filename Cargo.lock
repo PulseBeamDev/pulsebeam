@@ -2242,7 +2242,6 @@ dependencies = [
  "bs58",
  "bytes",
  "futures",
- "futures-buffered",
  "hex",
  "hyper",
  "metrics",

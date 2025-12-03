@@ -1,7 +1,6 @@
 use std::pin::Pin;
 
-use futures::StreamExt;
-use futures_buffered::FuturesUnorderedBounded;
+use futures::{StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::{actor, sync::Arc};
 
 pub type ShardTask = Pin<Box<dyn futures::Future<Output = ()> + Send>>;
@@ -12,7 +11,7 @@ pub enum ShardMessage {
 
 pub struct ShardActor {
     shard_id: usize,
-    tasks: FuturesUnorderedBounded<ShardTask>,
+    tasks: FuturesUnordered<ShardTask>,
 }
 
 pub struct ShardMessageSet;
@@ -70,7 +69,7 @@ impl ShardActor {
     pub fn new(shard_id: usize) -> Self {
         Self {
             shard_id,
-            tasks: FuturesUnorderedBounded::new(512),
+            tasks: FuturesUnordered::new(),
         }
     }
 }
