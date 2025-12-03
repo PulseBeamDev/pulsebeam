@@ -1,16 +1,25 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{
     future::Either,
     stream::{FuturesUnordered, StreamExt},
 };
-use pulsebeam_runtime::{actor::ActorKind, prelude::*};
+use pulsebeam_runtime::{
+    actor::{ActorKind, RunnerConfig},
+    prelude::*,
+};
 use str0m::Rtc;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
-    gateway, node, participant, track,
-    track::TrackMeta,
+    gateway, node, participant,
+    shard::{ShardMessage, ShardTask},
+    track::{self, TrackMeta},
 };
 use pulsebeam_runtime::actor;
 
@@ -48,7 +57,6 @@ pub struct RoomActor {
     node_ctx: node::NodeContext,
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
-    participant_tasks: FuturesUnordered<actor::JoinHandle<participant::ParticipantMessageSet>>,
     state: RoomState,
 }
 
@@ -90,10 +98,6 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                     };
             },
             select: {
-                Some((participant_id, _)) = self.participant_tasks.next() => {
-                    self.handle_participant_left(participant_id).await;
-                },
-
                 _ = empty_room_timer => {
                     tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
                     break;
@@ -133,8 +137,22 @@ impl RoomActor {
             node_ctx,
             room_id,
             state: RoomState::default(),
-            participant_tasks: FuturesUnordered::new(),
         }
+    }
+
+    pub async fn schedule(&mut self, task: ShardTask) {
+        const GROUP_LIMIT: usize = 50;
+        let room_size = self.state.participants.len();
+        let shard_idx = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.room_id.internal.hash(&mut hasher);
+            let group = room_size / GROUP_LIMIT;
+            group.hash(&mut hasher);
+            (hasher.finish() as usize) % self.node_ctx.shards.len()
+        };
+        self.node_ctx.shards[shard_idx]
+            .send(ShardMessage::AddTask(task))
+            .await;
     }
 
     async fn handle_participant_joined(
@@ -150,12 +168,17 @@ impl RoomActor {
             rtc,
         );
 
-        // TODO: capacity
-        let participant_cfg = actor::RunnerConfig::default().with_mailbox_cap(128);
-        let (mut participant_handle, participant_join) =
-            actor::spawn(participant_actor, participant_cfg);
-        self.participant_tasks.push(participant_join);
+        let (mut participant_handle, participant_task) =
+            actor::prepare(participant_actor, RunnerConfig::default());
+        let mut room_handle = ctx.handle.clone();
+        let participant_task = async move {
+            let (participant_id, _) = participant_task.await;
+            room_handle
+                .send(RoomMessage::RemoveParticipant(participant_id))
+                .await;
+        };
 
+        self.schedule(participant_task.boxed()).await;
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {

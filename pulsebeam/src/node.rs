@@ -1,4 +1,4 @@
-use crate::shard::ShardMessageSet;
+use crate::shard::{ShardMessageSet, ShardTask};
 use crate::{api, controller, gateway, shard};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use pulsebeam_runtime::prelude::*;
@@ -77,7 +77,7 @@ pub async fn run(
     let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
     join_set.push(gateway_join.map(|_| ()).boxed());
 
-    let shard_count = 2 * workers;
+    let shard_count = 8 * workers;
     let mut shard_handles = Vec::with_capacity(shard_count);
 
     for i in 0..shard_count {
@@ -161,7 +161,7 @@ mod internal {
     use serde::Deserialize;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{controller, gateway, participant, room};
+    use crate::{controller, gateway, participant, room, shard};
 
     #[derive(Deserialize)]
     struct ProfileParams {
@@ -243,6 +243,7 @@ mod internal {
                 "participant",
                 participant::ParticipantActor::monitor().intervals(),
             ),
+            ("shard", shard::ShardActor::monitor().intervals()),
         ];
 
         let mut interval = tokio::time::interval(Duration::from_secs(5));
