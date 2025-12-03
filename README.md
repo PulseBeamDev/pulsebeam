@@ -126,6 +126,7 @@ await pc.setRemoteDescription({ type: "answer", sdp: answer });
 
 * ✅ Prototype: working basic audio/video Rust SFU + demo
 * 🚧 Bandwidth estimator, video simulcast (current focus)
+* 📅 Top-N audio selection
 * 📅 Web Client SDK, data channel
 * 📅 HTTP API & Webhooks (Events)
 * 📅 Core stability: simulation testing, end-to-end tests
