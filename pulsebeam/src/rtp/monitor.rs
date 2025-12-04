@@ -249,8 +249,10 @@ impl StreamMonitor {
         }
 
         let jitter_score = metrics.calculate_jitter_score();
-        let loss_score = metrics.calculate_loss_score();
-        let quality_score = jitter_score.min(loss_score);
+        // TODO: loss_score is too noisy to be usable, needs to stabilize this first.
+        // let loss_score = metrics.calculate_loss_score();
+        // let quality_score = jitter_score.min(loss_score);
+        let quality_score = jitter_score;
 
         let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
         if new_quality == self.current_quality {
@@ -289,13 +291,11 @@ impl StreamMonitor {
         // Finally, commit the state change.
         tracing::info!(
             stream_id = %self.stream_id,
-            "Stream quality transition: {:?} -> {:?} (score: {:.1}, jitter_score: {:.1}, loss_score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
+            "Stream quality transition: {:?} -> {:?} (score: {:.1}, jitter_score: {:.1}, m_hat: {:.3}, bitrate: {})",
             self.current_quality,
             new_quality,
             quality_score,
             jitter_score,
-            loss_score,
-            metrics.packet_loss() * 100.0,
             metrics.m_hat,
             Bitrate::from(self.bwe.bwe_bps_ewma),
         );
