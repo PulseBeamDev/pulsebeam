@@ -49,11 +49,21 @@ impl VideoAllocator {
     }
 
     pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
-        if self.tracks.remove(track_id).is_some() {
+        if let Some(track) = self.tracks.remove(track_id) {
             tracing::info!(
                 track = %track_id,
                 "video track removed"
             );
+
+            let Some(assigned_mid) = track.assigned_mid else {
+                return;
+            };
+
+            let Some(slot) = self.slots.iter_mut().find(|s| s.mid == assigned_mid) else {
+                return;
+            };
+
+            slot.stop();
             self.rebalance();
         }
     }

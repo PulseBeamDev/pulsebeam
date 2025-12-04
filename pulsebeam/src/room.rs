@@ -122,6 +122,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                 if let Some(participant_handle) = self.state.participants.get_mut(&participant_id) {
                     // if it's closed, then the participant has exited
                     let _ = participant_handle.handle.terminate().await;
+                    self.handle_participant_left(participant_id).await;
                 }
             }
             RoomMessage::PublishTrack(track_handle) => {
