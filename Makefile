@@ -33,8 +33,11 @@ brew-deps:
 
 cargo-deps:
 	$(CARGO_CMD) install cargo-smart-release --features allow-emoji
-	$(CARGO_CMD) install flamegraph
+	$(CARGO_CMD) install flamegraph cargo-machete
 
 clean:
 	$(CARGO_CMD) clean
 	rm -f perf.data flamegraph.svg
+
+unused:
+	cargo machete
