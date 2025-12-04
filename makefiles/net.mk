@@ -11,7 +11,7 @@ all: help
 # Presets should specify TARGET_RTT and jitter as if measuring end-to-end
 # This function divides by 2 automatically for localhost since packets traverse rules twice
 net-apply: net-clear net-verify
-	$(eval HALF_LATENCY=$(shell echo "$(TARGET_LATENCY)" | sed 's/ms//' | awk '{print $$1/2}'))
+	$(eval HALF_LATENCY=$(shell echo "$(TARGET_RTT)" | sed 's/ms//' | awk '{print $$1/2}'))
 	$(eval HALF_UPLOAD_JITTER=$(shell echo "$(UPLOAD_JITTER)" | sed 's/ms.*//' | awk '{print $$1/2}'))
 	$(eval HALF_DOWNLOAD_JITTER=$(shell echo "$(DOWNLOAD_JITTER)" | sed 's/ms.*//' | awk '{print $$1/2}'))
 	$(eval JITTER_DIST=$(shell echo "$(UPLOAD_JITTER)" | grep -o 'distribution.*' || echo ""))
@@ -55,7 +55,6 @@ net-apply: net-clear net-verify
 net-good-home-wifi:
 	@$(MAKE) net-apply \
 		TARGET_RTT="40ms" \
-		TARGET_LATENCY="40" \
 		UPLOAD_RATE="25mbit" \
 		DOWNLOAD_RATE="100mbit" \
 		UPLOAD_JITTER="10ms" \
@@ -68,7 +67,6 @@ net-good-home-wifi:
 net-congested-wifi:
 	@$(MAKE) net-apply \
 		TARGET_RTT="50ms" \
-		TARGET_LATENCY="50" \
 		UPLOAD_RATE="5mbit" \
 		DOWNLOAD_RATE="20mbit" \
 		UPLOAD_JITTER="40ms" \
@@ -78,12 +76,21 @@ net-congested-wifi:
 
 # Simulates a stable 4G/5G connection.
 # Target RTT: ~80ms
-net-stable-mobile:
+net-mobile-stable:
 	@$(MAKE) net-apply \
 		TARGET_RTT="80ms" \
-		TARGET_LATENCY="80" \
 		UPLOAD_RATE="8mbit" \
 		DOWNLOAD_RATE="40mbit" \
+		UPLOAD_JITTER="30ms" \
+		DOWNLOAD_JITTER="30ms" \
+		UPLOAD_PACKET_LOSS="0%" \
+		DOWNLOAD_PACKET_LOSS="0.2%"
+
+net-mobile-low-bandwidth:
+	@$(MAKE) net-apply \
+		TARGET_RTT="160ms" \
+		UPLOAD_RATE="1mbit" \
+		DOWNLOAD_RATE="10mbit" \
 		UPLOAD_JITTER="30ms" \
 		DOWNLOAD_JITTER="30ms" \
 		UPLOAD_PACKET_LOSS="0%" \
@@ -94,10 +101,9 @@ net-stable-mobile:
 # Calibration: TARGET 90ms sets the correct mode/baseline. 
 # Jitter 70ms with paretonormal provides the heavy tail without dragging the Min/Avg too far.
 # 25% correlation simulates the "clumping" of latency spikes seen in the log.
-net-lte-1bar:
+net-mobile-1bar:
 	@$(MAKE) net-apply \
 		TARGET_RTT="90ms" \
-		TARGET_LATENCY="90" \
 		UPLOAD_RATE="3mbit" \
 		DOWNLOAD_RATE="15mbit" \
 		UPLOAD_JITTER="70ms 25% distribution pareto" \
@@ -110,7 +116,6 @@ net-lte-1bar:
 net-cross-continent:
 	@$(MAKE) net-apply \
 		TARGET_RTT="140ms" \
-		TARGET_LATENCY="140" \
 		UPLOAD_RATE="10mbit" \
 		DOWNLOAD_RATE="50mbit" \
 		UPLOAD_JITTER="20ms" \
@@ -123,7 +128,6 @@ net-cross-continent:
 net-unusable:
 	@$(MAKE) net-apply \
 		TARGET_RTT="300ms" \
-		TARGET_LATENCY="300" \
 		UPLOAD_RATE="500kbit" \
 		DOWNLOAD_RATE="1mbit" \
 		UPLOAD_JITTER="200ms" \

@@ -178,7 +178,11 @@ impl StreamMonitor {
             );
         }
 
-        let metrics: RawMetrics = (&self.delta_delta).into();
+        let mut metrics: RawMetrics = (&self.delta_delta).into();
+        // Reset the counters so we measure the interval (windowed) metrics next time.
+        // This makes the loss score reactive to RECENT conditions rather than lifetime average.
+        self.delta_delta.snapshot_and_reset();
+
         let was_inactive = self.shared_state.is_inactive();
         let is_inactive = self
             .determine_inactive_state(now, metrics.frame_duration * INACTIVE_TIMEOUT_MULTIPLIER);
@@ -244,9 +248,11 @@ impl StreamMonitor {
             }
         }
 
-        let quality_score = metrics.calculate_jitter_score();
-        let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
+        let jitter_score = metrics.calculate_jitter_score();
+        let loss_score = metrics.calculate_loss_score();
+        let quality_score = jitter_score.min(loss_score);
 
+        let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
         if new_quality == self.current_quality {
             return;
         }
@@ -283,10 +289,12 @@ impl StreamMonitor {
         // Finally, commit the state change.
         tracing::info!(
             stream_id = %self.stream_id,
-            "Stream quality transition: {:?} -> {:?} (score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
+            "Stream quality transition: {:?} -> {:?} (score: {:.1}, jitter_score: {:.1}, loss_score: {:.1}, loss: {:.2}%, m_hat: {:.3}, bitrate: {})",
             self.current_quality,
             new_quality,
             quality_score,
+            jitter_score,
+            loss_score,
             metrics.packet_loss() * 100.0,
             metrics.m_hat,
             Bitrate::from(self.bwe.bwe_bps_ewma),
@@ -423,9 +431,7 @@ impl RawMetrics {
         // and underuse (negative, which can also indicate instability).
         // The midpoint will need to be re-tuned. The paper RECOMMENDS
         // a threshold of 12.5ms to detect overuse.
-        //
-        // midpoint=10.0ms to make it a bit more sensitive to measurement.
-        sigmoid(self.m_hat.abs(), 100.0, -0.2, 10.0)
+        sigmoid(self.m_hat.abs(), 100.0, -0.2, 12.5)
     }
 
     pub fn calculate_loss_score(&self) -> f64 {
@@ -483,6 +489,13 @@ fn sigmoid(value: f64, range_max: f64, k: f64, midpoint: f64) -> f64 {
     range_max / (1.0 + (-k * (value - midpoint)).exp())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PacketGroup {
+    first_arrival: Instant,
+    last_arrival: Instant,
+    rtp_ts: MediaTime,
+}
+
 #[derive(Debug)]
 struct DeltaDeltaState {
     head: SeqNo,          // Next expected seq
@@ -491,7 +504,7 @@ struct DeltaDeltaState {
     last_rtp_ts: MediaTime,
     last_arrival: Instant,
 
-    m_hat: f64,     // The estimate of the queue delay trend, m_hat(i-1)
+    m_hat: f64,     // The Kalman-filtered queue delay trend, m_hat(i-1)
     e: f64,         // The variance of the estimate, e(i-1)
     var_v_hat: f64, // The variance of the measurement noise, var_v_hat(i-1)
 
@@ -500,6 +513,7 @@ struct DeltaDeltaState {
     frame_duration_ms_ewma: f64,
 
     buffer: Vec<Option<PacketStatus>>,
+    pending_group: Option<PacketGroup>,
     initialized: bool,
 }
 
@@ -518,8 +532,14 @@ impl DeltaDeltaState {
             packets_expected: 0,
             frame_duration_ms_ewma: 1000.0,
             buffer: vec![None; cap],
+            pending_group: None,
             initialized: false,
         }
+    }
+
+    pub fn snapshot_and_reset(&mut self) {
+        self.packets_actual = 0;
+        self.packets_expected = 0;
     }
 
     pub fn update(&mut self, packet: &RtpPacket) {
@@ -583,9 +603,21 @@ impl DeltaDeltaState {
     }
 
     /// Implements https://www.ietf.org/archive/id/draft-ietf-rmcat-gcc-02.txt.
-    fn advance(&mut self, pkt: &PacketStatus) {
-        let actual_ms = pkt.arrival.duration_since(self.last_arrival).as_secs_f64() * 1000.0;
-        let expected_ms = (pkt.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
+    fn advance_group(&mut self, group: &PacketGroup) {
+        let actual_ms = if group.last_arrival >= self.last_arrival {
+            group
+                .last_arrival
+                .duration_since(self.last_arrival)
+                .as_secs_f64()
+                * 1000.0
+        } else {
+            -(self
+                .last_arrival
+                .duration_since(group.last_arrival)
+                .as_secs_f64()
+                * 1000.0)
+        };
+        let expected_ms = (group.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
             * 1000.0
             / self.frequency.get() as f64;
 
@@ -623,8 +655,8 @@ impl DeltaDeltaState {
         let z_clamped = z.abs().min(3.0 * self.var_v_hat.sqrt());
         self.var_v_hat = (alpha * self.var_v_hat + (1.0 - alpha) * z_clamped.powi(2)).max(1.0);
 
-        self.last_arrival = pkt.arrival;
-        self.last_rtp_ts = pkt.rtp_ts;
+        self.last_arrival = group.last_arrival;
+        self.last_rtp_ts = group.rtp_ts;
         self.packets_actual += 1;
         self.packets_expected += 1;
 
@@ -666,7 +698,7 @@ impl DeltaDeltaState {
                 break;
             };
 
-            self.advance(&pkt);
+            self.step_group(&pkt);
             self.tail = self.tail.wrapping_add(1).into();
         }
     }
@@ -722,9 +754,39 @@ impl DeltaDeltaState {
                 continue;
             };
 
-            self.advance(&pkt);
+            self.step_group(&pkt);
         }
         self.tail = end;
+    }
+
+    fn step_group(&mut self, pkt: &PacketStatus) {
+        let group = if let Some(mut group) = self.pending_group.take() {
+            if group.rtp_ts == pkt.rtp_ts {
+                // Same group (frame), update arrival time
+                if pkt.arrival > group.last_arrival {
+                    group.last_arrival = pkt.arrival;
+                }
+                group
+            } else {
+                // New group detected. Process the pending one.
+                self.advance_group(&group);
+
+                // Start new group
+                PacketGroup {
+                    first_arrival: pkt.arrival,
+                    last_arrival: pkt.arrival,
+                    rtp_ts: pkt.rtp_ts,
+                }
+            }
+        } else {
+            // No pending group, start one
+            PacketGroup {
+                first_arrival: pkt.arrival,
+                last_arrival: pkt.arrival,
+                rtp_ts: pkt.rtp_ts,
+            }
+        };
+        self.pending_group = Some(group);
     }
 
     fn as_index(&self, seq: SeqNo) -> usize {
