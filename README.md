@@ -7,7 +7,7 @@
 
 # PulseBeam
 
-**WebRTC SFU for browsers, mobile, and IoT.**  
+**Open Source WebRTC SFU for browsers, mobile, and IoT.**  
 Rust-based SFU core. HTTP signaling (no WebSockets). Modular, extensible architecture.  
 
 [🐛 Report a Bug](https://github.com/pulsebeamdev/pulsebeam/issues) · [✨ Request a Feature](https://github.com/pulsebeamdev/pulsebeam/issues) · [💬 Discord](https://discord.gg/Bhd3t9afuB)
