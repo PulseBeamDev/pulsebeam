@@ -19,7 +19,7 @@ impl Default for BitrateControllerConfig {
     fn default() -> Self {
         Self {
             min_bitrate: Bitrate::kbps(300),
-            max_bitrate: Bitrate::mbps(20),
+            max_bitrate: Bitrate::mbps(5),
 
             // Headroom: 15% is a safe and standard value.
             headroom: 0.85,
@@ -29,7 +29,7 @@ impl Default for BitrateControllerConfig {
 
             // Ramp limits (per second): Be aggressive in our reactions.
             // Allow ramping up reasonably fast to achieve good quality in a few seconds.
-            max_ramp_up: Bitrate::kbps(800),
+            max_ramp_up: Bitrate::kbps(1500),
 
             // React to congestion IMMEDIATELY. Allow dropping several megabits per second.
             max_ramp_down: Bitrate::mbps(3),
