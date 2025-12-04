@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
@@ -5,7 +6,7 @@ use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use str0m::{Rtc, RtcError, error::SdpError};
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 use tokio_metrics::TaskMonitor;
 
 use crate::participant::core::{CoreEvent, ParticipantCore};
@@ -81,16 +82,19 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             .await;
         let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
         let mut current_deadline = Instant::now() + Duration::from_secs(1);
+        let mut new_deadline = Some(current_deadline);
+
         let rtc_timer = tokio::time::sleep_until(current_deadline);
         tokio::pin!(rtc_timer);
 
         loop {
-            let Some(new_deadline) = self.core.poll_rtc() else {
-                break;
-            };
-            if new_deadline != current_deadline {
-                rtc_timer.as_mut().reset(new_deadline);
-                current_deadline = new_deadline;
+            match new_deadline {
+                Some(new_deadline) if new_deadline != current_deadline => {
+                    rtc_timer.as_mut().reset(new_deadline);
+                    current_deadline = new_deadline;
+                }
+                None => break,
+                _ => {}
             }
 
             let events: Vec<_> = self.core.drain_events().collect();
@@ -99,7 +103,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             }
 
             tokio::select! {
-                biased;
                 res = ctx.sys_rx.recv() => {
                     match res {
                         Some(msg) => match msg {
@@ -115,15 +118,22 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
                 },
-                Some(batch) = gateway_rx.recv() => self.core.handle_udp_packet_batch(batch),
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
+                    while let Some((mid, pkt)) = self.core.downstream.next().now_or_never().flatten() {
+                        self.core.handle_forward_rtp(mid, pkt);
+                    }
+
+                    new_deadline = self.core.poll_rtc();
+                },
+                Some(batch) = gateway_rx.recv() => {
+                    new_deadline = self.core.handle_udp_packet_batch(batch);
                 },
                 now = stats_interval.tick() => {
                     self.core.poll_stats(now);
                 }
                 _ = &mut rtc_timer => {
-                    self.core.handle_timeout();
+                    new_deadline = self.core.handle_timeout();
                 },
             }
         }

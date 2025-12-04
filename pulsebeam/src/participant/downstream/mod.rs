@@ -65,18 +65,20 @@ impl DownstreamAllocator {
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
         self.video.handle_keyframe_request(req);
     }
+
+    pub fn poll_next_unpin(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+        if let Poll::Ready(item) = self.audio.poll_next(cx) {
+            return Poll::Ready(item);
+        }
+
+        self.video.poll_next(cx)
+    }
 }
 
 impl Stream for DownstreamAllocator {
     type Item = (Mid, RtpPacket);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        if let Poll::Ready(item) = this.audio.poll_next(cx) {
-            return Poll::Ready(item);
-        }
-
-        this.video.poll_next(cx)
+        self.get_mut().poll_next_unpin(cx)
     }
 }
