@@ -258,48 +258,6 @@ mod internal {
 
                 let labels = [("actor", *actor_name)];
 
-                // ---- Counters ----
-                metrics::counter!("actor_instrumented_count", &labels)
-                    .absolute(snapshot.instrumented_count);
-                metrics::counter!("actor_dropped_count", &labels).absolute(snapshot.dropped_count);
-                metrics::counter!("actor_first_poll_count", &labels)
-                    .absolute(snapshot.first_poll_count);
-                metrics::counter!("actor_total_idled_count", &labels)
-                    .absolute(snapshot.total_idled_count);
-                metrics::counter!("actor_total_scheduled_count", &labels)
-                    .absolute(snapshot.total_scheduled_count);
-                metrics::counter!("actor_total_poll_count", &labels)
-                    .absolute(snapshot.total_poll_count);
-                metrics::counter!("actor_total_fast_poll_count", &labels)
-                    .absolute(snapshot.total_fast_poll_count);
-                metrics::counter!("actor_total_slow_poll_count", &labels)
-                    .absolute(snapshot.total_slow_poll_count);
-                metrics::counter!("actor_total_short_delay_count", &labels)
-                    .absolute(snapshot.total_short_delay_count);
-                metrics::counter!("actor_total_long_delay_count", &labels)
-                    .absolute(snapshot.total_long_delay_count);
-
-                // ---- Histograms ----
-                metrics::histogram!("actor_total_first_poll_delay_us", &labels)
-                    .record(snapshot.total_first_poll_delay.as_micros() as f64);
-                metrics::histogram!("actor_total_idle_duration_us", &labels)
-                    .record(snapshot.total_idle_duration.as_micros() as f64);
-                metrics::histogram!("actor_max_idle_duration_us", &labels)
-                    .record(snapshot.max_idle_duration.as_micros() as f64);
-                metrics::histogram!("actor_total_scheduled_duration_us", &labels)
-                    .record(snapshot.total_scheduled_duration.as_micros() as f64);
-                metrics::histogram!("actor_total_poll_duration_us", &labels)
-                    .record(snapshot.total_poll_duration.as_micros() as f64);
-                metrics::histogram!("actor_total_fast_poll_duration_us", &labels)
-                    .record(snapshot.total_fast_poll_duration.as_micros() as f64);
-                metrics::histogram!("actor_total_slow_poll_duration_us", &labels)
-                    .record(snapshot.total_slow_poll_duration.as_micros() as f64);
-                metrics::histogram!("actor_total_short_delay_duration_us", &labels)
-                    .record(snapshot.total_short_delay_duration.as_micros() as f64);
-                metrics::histogram!("actor_total_long_delay_duration_us", &labels)
-                    .record(snapshot.total_long_delay_duration.as_micros() as f64);
-
-                // ---- Derived metrics ----
                 metrics::gauge!("actor_long_delay_ratio", &labels).set(snapshot.long_delay_ratio());
                 metrics::gauge!("actor_slow_poll_ratio", &labels).set(snapshot.slow_poll_ratio());
                 metrics::gauge!("actor_mean_first_poll_delay_us", &labels)
