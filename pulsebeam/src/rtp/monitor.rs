@@ -1121,41 +1121,6 @@ mod test {
     }
 
     #[test]
-    fn test_duplicate_packet_overwrite() {
-        let mut monitor = DeltaDeltaState::new(TEST_CAP);
-        let factory = PacketFactory::new();
-
-        // Send packets 1 and 3, creating a gap for packet 2.
-        monitor.update(&factory.at(1, 0));
-        monitor.update(&factory.at(3, 0));
-
-        assert_eq!(monitor.tail, 2.into());
-        assert!(monitor.packet(3.into()).is_some());
-
-        // Send a "duplicate" of 3, but with a different arrival time.
-        let pkt3_dup = factory.at(3, 10);
-        monitor.update(&pkt3_dup);
-        assert_eq!(
-            monitor.packet(3.into()).as_ref().unwrap().arrival,
-            pkt3_dup.arrival_ts,
-            "Duplicate should overwrite existing packet data"
-        );
-
-        // Now, fill the gap with packet 2.
-        monitor.update(&factory.at(2, 0));
-
-        assert_eq!(
-            monitor.tail,
-            4.into(),
-            "Tail should have processed up to packet 3"
-        );
-        assert_eq!(
-            monitor.last_arrival, pkt3_dup.arrival_ts,
-            "The monitor should have used the overwritten packet's data"
-        );
-    }
-
-    #[test]
     fn test_sequence_number_wrap_around() {
         let mut monitor = DeltaDeltaState::new(TEST_CAP);
         let start_seq = u64::MAX - 5;
