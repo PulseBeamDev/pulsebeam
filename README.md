@@ -119,11 +119,10 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 
 * ✅ Prototype: Rust SFU + demo apps
 * 🚧 Bandwidth estimator, simulcast support
-* 📅 Top-N audio selection
-* 📅 Web Client SDK & data channel
+* 📅 Top-N audio selection, Data channel, Web Client SDK
 * 📅 HTTP API & Webhooks (events)
 * 📅 Multi-node / cascading SFU support
-* 📅 Optional modules: recording, SIP, AI
+* 📅 Extensions: recording, SIP, AI
 
 ---
 
