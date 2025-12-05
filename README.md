@@ -1,41 +1,19 @@
-<h1 align="center">
-  <a href="https://pulsebeam.dev"><img src="https://pulsebeam.dev/favicon.svg" alt="PulseBeam" height="250px"></a>
-  <br>
-  PulseBeam
-  <br>
-</h1>
-
 # PulseBeam
 
-**Open Source WebRTC SFU for browsers, mobile, and IoT.**  
-Rust-based SFU core. HTTP signaling (no WebSockets). Modular, extensible architecture.  
+<img align="right" src="https://pulsebeam.dev/favicon.svg" height="48px" alt="PulseBeam Logo: Open Source WebRTC SFU for browsers, mobile, and IoT">
 
-[🐛 Report a Bug](https://github.com/pulsebeamdev/pulsebeam/issues) · [✨ Request a Feature](https://github.com/pulsebeamdev/pulsebeam/issues) · [💬 Discord](https://discord.gg/Bhd3t9afuB)
+PulseBeam is a WebRTC SFU server for connecting browsers, mobile, and IoT clients. We believe WebRTC/realtime application development shouldn't be complicated, nor it should 
+involve complicated and many moving components. 
 
----
+**Design Goals**:
 
-## Overview
-
-PulseBeam is a **developer-first real-time media server** designed to be fast, reliable, and easy to extend:
-
-- **Rust SFU core** — memory-safe, low-latency, and performant.  
-- **HTTP signaling** — WHIP/WHEP-compatible, no WebSockets required.  
-- **Client-agnostic** — any WebRTC-capable client can connect (browsers, mobile, embedded devices, bots).  
-- **Modular architecture** — features like recording, analytics, or AI run as separate processes.  
+* Support all WebRTC clients
+* Keep it simple, but not simpler
+* Vertical and horizontal scaling are natively supported
+* Client SDKs provided just for convenience
+* Minimal to zero configuration
 
 > If your client speaks WebRTC, it can communicate with PulseBeam.
-
-```
-
-Clients (browsers, mobile, embedded, bots)
-↕
-PulseBeam SFU
-↕
-External modules (recorders, transcoding, AI)
-
-````
-
----
 
 ## Compatibility
 
@@ -45,7 +23,8 @@ PulseBeam is opinionated about media handling to ensure **wide hardware support 
 - **Audio:** Opus  
 - **Data Channel:** Planned  
 
----
+## Architecture
+
 
 ## Quickstart
 
@@ -130,8 +109,6 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 
 * Server → AGPL-3.0
 * Client libraries/tooling → Apache-2.0
-
-For custom licensing, contact [lukas@pulsebeam.dev](mailto:lukas@pulsebeam.dev).
 
 ---
 
