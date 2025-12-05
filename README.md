@@ -2,16 +2,13 @@
 
 <img align="right" src="https://pulsebeam.dev/favicon.svg" height="48px" alt="PulseBeam Logo: Open Source WebRTC SFU for browsers, mobile, and IoT">
 
-PulseBeam is a WebRTC SFU server for connecting browsers, mobile, and IoT clients. We believe WebRTC/realtime application development shouldn't be complicated, nor it should 
-involve complicated and many moving components. 
+PulseBeam is an open source, general-purpose WebRTC SFU server for connecting browsers, mobile, and IoT clients. We believe real-time application development shouldn't be complicated, nor should it rely on heavy architectures with many moving parts. PulseBeam reduces this friction by adhering to these core design goals:
 
-**Design Goals**:
-
-* Support all WebRTC clients
-* Keep it simple, but not simpler
-* Vertical and horizontal scaling are natively supported
-* Client SDKs provided just for convenience
-* Minimal to zero configuration
+* Support all WebRTC clients.
+* Keep the architecture simple, but not simpler.
+* Natively support vertical and horizontal scaling.
+* Provide client SDKs strictly for convenience, not necessity.
+* Require minimal to zero configuration.
 
 If your client device speaks WebRTC, it can communicate with PulseBeam.
 
