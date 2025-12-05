@@ -13,7 +13,7 @@ involve complicated and many moving components.
 * Client SDKs provided just for convenience
 * Minimal to zero configuration
 
-> If your client speaks WebRTC, it can communicate with PulseBeam.
+If your client device speaks WebRTC, it can communicate with PulseBeam.
 
 ## Compatibility
 
@@ -25,6 +25,9 @@ PulseBeam is opinionated about media handling to ensure **wide hardware support 
 
 ## Architecture
 
+The architecture is highly inspired by [SDN](https://en.wikipedia.org/wiki/Software-defined_networking) architecture.
+
+![architecture](./docs/architecture.svg)
 
 ## Quickstart
 
@@ -97,8 +100,8 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 ## Roadmap
 
 * ✅ Prototype: Rust SFU + demo apps
-* 🚧 Bandwidth estimator, simulcast support
-* 📅 Top-N audio selection, Data channel, Web Client SDK
+* ✅ Bandwidth estimator, simulcast support
+* 🚧 Top-N audio selection, Data channel, Web Client SDK
 * 📅 HTTP API & Webhooks (events)
 * 📅 Multi-node / cascading SFU support
 * 📅 Extensions: recording, SIP, AI
