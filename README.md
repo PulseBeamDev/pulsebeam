@@ -14,7 +14,7 @@ If your client device speaks WebRTC, it can communicate with PulseBeam.
 
 ## Compatibility
 
-PulseBeam is opinionated about media handling to ensure **wide hardware support and predictable performance**:
+PulseBeam is opinionated about media handling to prioritize battery efficiency, hardware support, and predictable performance:
 
 - **Video:** H.264 Baseline profile up to Level 4.1  
 - **Audio:** Opus  
