@@ -123,20 +123,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             Ok(_) = self.socket.readable() => {
-                self.recv_batches.clear();
-                match self.socket.try_recv_batch(&mut self.batcher, &mut self.recv_batches) {
-                    Ok(_) => {
-                        for batch in self.recv_batches.drain(..) {
-                            self.demuxer.demux(batch).await;
-                        }
-
-                        // tokio::task::yield_now().await;
-                    },
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Socket empty. Do NOT yield. fast-path back to select!
-                    },
-                    Err(_) => break, // Error handling
-                }
+                self.read_socket().await;
             }
         });
 
@@ -172,6 +159,37 @@ impl GatewayWorkerActor {
             recv_batches: recv_batch,
             demuxer: Demuxer::new(),
         }
+    }
+
+    async fn read_socket(&mut self) -> io::Result<()> {
+        let mut budget: usize = 256;
+        while budget > 0 {
+            self.recv_batches.clear();
+            match self
+                .socket
+                .try_recv_batch(&mut self.batcher, &mut self.recv_batches)
+            {
+                Ok(_) => {
+                    for batch in self.recv_batches.drain(..) {
+                        let count = if batch.stride > 0 {
+                            std::cmp::max(1, batch.len / batch.stride)
+                        } else {
+                            1
+                        };
+                        budget = budget.saturating_sub(count);
+                        self.demuxer.demux(batch).await;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Socket empty, wait until ready again.
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        tokio::task::yield_now().await;
+        Ok(())
     }
 }
 

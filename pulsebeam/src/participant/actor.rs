@@ -1,4 +1,3 @@
-use std::pin::Pin;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
@@ -6,7 +5,7 @@ use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use str0m::{Rtc, RtcError, error::SdpError};
-use tokio::time::{Instant, Sleep};
+use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
 
 use crate::participant::core::{CoreEvent, ParticipantCore};
@@ -69,7 +68,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = mailbox::new(32);
+        let (gateway_tx, mut gateway_rx) = mailbox::new(64);
 
         let _ = self
             .node_ctx
