@@ -118,6 +118,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
                     self.core.batcher.flush(&self.egress);
                 },
+                // TODO: consolidate pollings in core
+                Some(req) = self.core.upstream.keyframe_request_streams.next() => {
+                    self.core.handle_keyframe_request(req);
+                }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
                     while let Some((mid, pkt)) = self.core.downstream.next().now_or_never().flatten() {

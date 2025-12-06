@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use str0m::media::{MediaKind, Mid};
+use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 
 use pulsebeam_runtime::net;
@@ -67,6 +67,16 @@ impl ParticipantCore {
         self.events.drain(..)
     }
 
+    pub fn handle_keyframe_request(&mut self, key: KeyframeRequest) {
+        let mut api = self.rtc.direct_api();
+        if let Some(stream) = api.stream_rx_by_mid(key.mid, key.rid) {
+            stream.request_keyframe(key.kind);
+            tracing::debug!(?key, "requested keyframe for upstream");
+        } else {
+            tracing::warn!(?key, "stream not found for keyframe request");
+        }
+    }
+
     pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) -> Option<Instant> {
         let mut last_deadline = None;
         for pkt in batch.into_iter() {
@@ -125,8 +135,6 @@ impl ParticipantCore {
         if self.disconnect_reason.is_some() {
             return None;
         }
-
-        self.upstream.poll(&mut self.rtc, Instant::now());
 
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {

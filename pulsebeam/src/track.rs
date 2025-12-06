@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::pin::Pin;
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
@@ -10,6 +16,8 @@ use crate::rtp::{
     monitor::{StreamMonitor, StreamState},
     sync::Synchronizer,
 };
+
+pub type KeyframeRequestStream = Pin<Box<dyn Stream<Item = KeyframeRequest> + Send>>;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -77,48 +85,11 @@ pub struct SimulcastSender {
     synchronizer: Synchronizer,
     channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
-
-    keyframe_request_state: KeyframeRequestState,
-    keyframe_debounce_duration: Duration,
     keyframe_requests: watch::Receiver<Option<KeyframeRequestKind>>,
 }
 
 impl SimulcastSender {
-    /// Checks for and returns a keyframe request if the debounce conditions are met.
-    pub fn get_keyframe_request(&mut self) -> Option<KeyframeRequest> {
-        // Check if a new request signal has arrived.
-        if self.keyframe_requests.has_changed().unwrap_or(false) {
-            // Borrow and update to mark this change as seen.
-            let binding = self.keyframe_requests.borrow_and_update();
-            if binding.is_some() {
-                // A new request came in. Start or reset the debounce timer.
-                self.keyframe_request_state = KeyframeRequestState::Debouncing {
-                    requested_at: Instant::now(),
-                };
-            }
-        }
-
-        // Check if we are in the debouncing state and if the timer has elapsed.
-        if let KeyframeRequestState::Debouncing { requested_at } = self.keyframe_request_state
-            && Instant::now().duration_since(requested_at) >= self.keyframe_debounce_duration
-        {
-            // Debounce duration has passed. Transition to Idle and issue the request.
-            self.keyframe_request_state = KeyframeRequestState::Idle;
-
-            // Return the latest request from the channel.
-            let kind = self.keyframe_requests.borrow();
-            return kind.map(|k| KeyframeRequest {
-                kind: k,
-                rid: self.rid,
-                mid: self.mid,
-            });
-        }
-
-        None
-    }
-
     pub fn push(&mut self, pkt: RtpPacket) {
-        // self.jb.push(pkt)
         self.forward(pkt);
     }
 
@@ -127,13 +98,6 @@ impl SimulcastSender {
     }
 
     fn forward(&mut self, pkt: RtpPacket) {
-        if let KeyframeRequestState::Debouncing { .. } = self.keyframe_request_state
-            && pkt.is_keyframe_start
-        {
-            tracing::debug!("Keyframe received, cancelling pending request.");
-            self.keyframe_request_state = KeyframeRequestState::Idle;
-        }
-
         // RTP Pipeline
         let pkt = self.synchronizer.process(pkt);
         self.monitor
@@ -141,6 +105,16 @@ impl SimulcastSender {
         if (self.filter)(&pkt) {
             self.channel.send(pkt);
         }
+    }
+
+    pub fn keyframe_request_stream(&self, debounce: Duration) -> KeyframeRequestStream {
+        let rid = self.rid;
+        let mid = self.mid;
+        let watch_stream = WatchStream::new(self.keyframe_requests.clone()).filter_map(|opt| opt);
+        let debounced = LeadingEdgeDebounce::new(watch_stream, debounce)
+            .map(move |kind| KeyframeRequest { kind, rid, mid });
+
+        Box::pin(debounced)
     }
 }
 
@@ -277,8 +251,6 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
             synchronizer: Synchronizer::new(clock_rate),
             channel: tx,
             keyframe_requests: keyframe_rx,
-            keyframe_request_state: KeyframeRequestState::default(),
-            keyframe_debounce_duration: Duration::from_millis(300),
             monitor,
         });
         receivers.push(SimulcastReceiver {
@@ -340,4 +312,50 @@ pub fn should_forward_audio(packet: &RtpPacket) -> bool {
 #[inline]
 fn should_forward_noop(_: &RtpPacket) -> bool {
     true
+}
+
+/// A stream wrapper for leading-edge debounce
+pub struct LeadingEdgeDebounce<S> {
+    inner: S,
+    debounce_duration: Duration,
+    last_emitted: Option<Instant>,
+}
+
+impl<S> LeadingEdgeDebounce<S> {
+    pub fn new(inner: S, debounce_duration: Duration) -> Self {
+        Self {
+            inner,
+            debounce_duration,
+            last_emitted: None,
+        }
+    }
+}
+
+impl<S, T> Stream for LeadingEdgeDebounce<S>
+where
+    S: Stream<Item = T> + Unpin,
+{
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    let now = Instant::now();
+                    match self.last_emitted {
+                        Some(last) if now.duration_since(last) < self.debounce_duration => {
+                            // Ignore item, still in debounce period
+                            continue;
+                        }
+                        _ => {
+                            // Leading edge: emit immediately
+                            self.last_emitted = Some(now);
+                            return Poll::Ready(Some(item));
+                        }
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
 }

@@ -1,40 +1,38 @@
-use std::collections::HashMap;
+use futures::{StreamExt, stream::SelectAll};
+use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 
-use crate::rtp::RtpPacket;
+use crate::{rtp::RtpPacket, track::KeyframeRequestStream};
 use str0m::media::Mid;
 
 use crate::track::TrackSender;
 
-/// Manages all upstream tracks published by this participant.
-///
-/// This allocator's primary responsibilities are:
-/// 1.  Owning the `TrackSender` for each track published by the client.
-/// 2.  Receiving raw incoming RTP packets from the `ParticipantCore`.
-/// 3.  Pushing each packet into the appropriate per-simulcast-layer `JitterBuffer`.
-/// 4.  Being polled regularly to drain ready packets from the jitter buffers and
-///     forward them into the track's SPMC channel for consumption by downstream allocators.
-/// 5.  Aggregating keyframe requests from subscribers to be sent back to the publisher.
+const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(300);
+
 pub struct UpstreamAllocator {
     published_tracks: HashMap<Mid, TrackSender>,
+    pub keyframe_request_streams: SelectAll<KeyframeRequestStream>,
 }
 
 impl UpstreamAllocator {
     pub fn new() -> Self {
         Self {
             published_tracks: HashMap::new(),
+            keyframe_request_streams: SelectAll::new(),
         }
     }
 
     /// Adds a new locally published track that will receive RTP packets.
     pub fn add_published_track(&mut self, mid: Mid, track: TrackSender) {
+        if track.meta.kind.is_video() {
+            for sender in &track.simulcast {
+                self.keyframe_request_streams
+                    .push(sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
+            }
+        }
         self.published_tracks.insert(mid, track);
     }
 
-    /// Handles an incoming RTP packet from the RTC engine.
-    ///
-    /// This method finds the correct simulcast layer and pushes the packet
-    /// into its jitter buffer.
     pub fn handle_incoming_rtp(
         &mut self,
         mid: Mid,
@@ -49,33 +47,9 @@ impl UpstreamAllocator {
         }
     }
 
-    pub fn poll(&mut self, rtc: &mut str0m::Rtc, _: Instant) -> Option<Instant> {
-        self.drain_keyframe_requests(rtc);
-        None
-    }
-
     pub fn poll_stats(&mut self, now: Instant) {
         self.published_tracks
             .values_mut()
             .for_each(|track| track.poll_stats(now));
-    }
-
-    /// Drains pending keyframe requests from all managed tracks.
-    fn drain_keyframe_requests(&mut self, rtc: &mut str0m::Rtc) {
-        for track in self.published_tracks.values_mut() {
-            for sender in &mut track.simulcast {
-                let Some(key) = sender.get_keyframe_request() else {
-                    continue;
-                };
-
-                let mut api = rtc.direct_api();
-                if let Some(stream) = api.stream_rx_by_mid(key.mid, key.rid) {
-                    stream.request_keyframe(key.kind);
-                    tracing::debug!(?key, "requested keyframe for upstream");
-                } else {
-                    tracing::warn!(?key, "stream not found for keyframe request");
-                }
-            }
-        }
     }
 }
