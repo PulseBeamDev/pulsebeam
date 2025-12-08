@@ -1,3 +1,5 @@
+[Documentation](https://docs.pulsebeam.dev) | [Issues](https://github.com/PulseBeamDev/pulsebeam/issues) | [Discord](https://discord.com/invite/Bhd3t9afuB)
+
 # PulseBeam
 
 <img align="right" src="https://pulsebeam.dev/favicon.svg" height="64px" alt="PulseBeam Logo: Open Source WebRTC SFU for browsers, mobile, and IoT">
