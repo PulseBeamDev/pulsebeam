@@ -35,6 +35,12 @@ cargo-deps:
 	$(CARGO_CMD) install cargo-smart-release --features allow-emoji
 	$(CARGO_CMD) install flamegraph cargo-machete
 
+gh-deps:
+	gh extension install yusukebe/gh-markdown-preview
+
+preview-markdown:
+	gh markdown-preview
+
 clean:
 	$(CARGO_CMD) clean
 	rm -f perf.data flamegraph.svg

@@ -1,153 +1,91 @@
 # PulseBeam
 
-**Lightweight end-to-end stack for real-time video/audio/data.**  
-Rust WebRTC SFU core. HTTP signaling (no WebSockets). Modular services.  
+<img align="right" src="https://pulsebeam.dev/favicon.svg" height="64px" alt="PulseBeam Logo: Open Source WebRTC SFU for browsers, mobile, and IoT">
 
-[Report a Bug](https://github.com/pulsebeamdev/pulsebeam/issues) · [Request a Feature](https://github.com/pulsebeamdev/pulsebeam/issues) · [Discord](https://discord.gg/Bhd3t9afuB)
+PulseBeam is an open source, general-purpose WebRTC SFU server for connecting browsers, mobile, and IoT clients. We believe real-time application development shouldn't be complicated, nor should it rely on heavy architectures with many moving parts. PulseBeam reduces this friction by adhering to these core design goals:
 
----
+* Support all WebRTC clients.
+* Keep the architecture simple, but not simpler.
+* Natively support vertical and horizontal scaling.
+* Provide client SDKs strictly for convenience, not necessity.
+* Require minimal configuration.
 
-PulseBeam is an opinionated **real-time media stack** designed to be simple, reliable, and easy to extend.  
-
-- **Rust SFU core** – fast, memory-safe, no garbage collector pauses.  
-- **HTTP signaling** – WHIP/WHEP-compatible, extended for multi-party and server-side use cases. No WebSockets required.  
-- **SDK optional** – any client that speaks WebRTC (browsers, mobile, embedded, bots) can connect directly; thin SDKs will exist for convenience. 
-- **Modular by design** – features like recording, analytics, or AI live outside the core as separate processes.  
-
-If your client can do WebRTC, it can talk to PulseBeam.
-
-```
-Clients (browsers, mobile, embedded, bots)
-          ↕
-      PulseBeam
-          ↕
- External agents (recorders, transcoding, AI)
-```
+If your client device speaks WebRTC, it can communicate with PulseBeam.
 
 ## Compatibility
 
-To ensure wide hardware acceleration support, compatibility with embedded devices, and a minimal feature set, PulseBeam is opinionated about its media handling:
+PulseBeam is opinionated about media handling to prioritize battery efficiency, hardware support, and predictable performance:
 
-* **Video**: H.264 Baseline profile up to Level 4.1.
-* **Audio**: Opus.
-* **Data Channel**: Not yet supported.
+- **Video:** H.264 Baseline profile up to Level 4.1
+- **Audio:** Opus
+- **Data Channel:** Planned
+
+## Architecture
+
+The architecture is highly inspired by [SDN](https://en.wikipedia.org/wiki/Software-defined_networking) architecture.
+
+![architecture](./docs/architecture.svg)
 
 ## Quickstart
 
-Getting started is a simple, step-by-step process. First, you'll run the server on your machine, and then you'll connect to it using the browser-based demos.
+The following quickstart assumes that you have a Linux machine. As a fallback, you can go to https://pulsebeam.dev/#quickstart and check the "fallback" toggle.
 
-### Step 1: Run the PulseBeam Server
+### Step 1. Run the PulseBeam Server
 
-You must have the server running before the demo clients can connect. The easiest way to start it is with Docker.
-
-Open your terminal and run the following command:
+**Docker/Podman (recommended):**
 
 ```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.1.13
+docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.2.23
 ```
 
-This command starts the PulseBeam server, which is now listening for connections on your machine. Keep this terminal window running.
+**Open Port Requirements:**
+* **TCP/3000:** HTTP signaling
+* **UDP/3478:** WebRTC traffic (Multiplexed)
+* **TCP/3478:** WebRTC over TCP fallback (Multiplexed) — *Planned*
 
-> **Other ways to run:**
->
-> *   **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
-> *   **Source:** `cargo run --release -p pulsebeam`
+**Other options:**
+* **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
+* **Source:** `cargo run --release -p pulsebeam`
 
-### Step 2: Run the Browser Demo
+### Step 2. Publish a video
 
-With the server running, you can use the demo clients. The snippets below show the core JavaScript logic.
-
-**Note:** The linked JSFiddles are configured to connect to `http://localhost:3000` and are intended to be run on the **same machine** as the server. See the section below for instructions on testing with other devices.
-
-#### A. Start the Publisher
-
-The publisher page accesses your webcam and sends the video stream to your local PulseBeam server.
-
-*   **[Open Publisher Demo in JSFiddle](https://jsfiddle.net/lherman/0bqe6xnv/)**
-
-Once the page loads, click **"Start Publishing"** to begin the stream.
+Run the following snippet in the browser console:
 
 ```javascript
-// Core publisher logic
 const pc = new RTCPeerConnection();
-
-// 1. Get user's video and add it to the connection
 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-const trans = pc.addTransceiver("video", { direction: "sendonly" });
-trans.sender.replaceTrack(stream.getVideoTracks()[0]);
+const transceiver = pc.addTransceiver("video", {
+  direction: "sendonly",
+  // Define scalability layers (low, medium, high)
+  sendEncodings: [
+    { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 },
+    { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 400_000 },
+    { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_250_000 },
+  ],
+});
+transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
 
-// 2. Create an SDP offer and send it to your local PulseBeam server
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
+
 const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
   method: "POST",
   headers: { "Content-Type": "application/sdp" },
   body: offer.sdp
 });
 
-// 3. Set the remote description with PulseBeam's answer
-const answer = await res.text();
-await pc.setRemoteDescription({ type: "answer", sdp: answer });
+await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 ```
 
----
+### Step 3. View the video stream
 
-#### B. Start the Viewer
-
-The viewer page subscribes to the video stream. Open the link in a **new browser tab on the same machine** to test.
-
-*   **[Open Viewer Demo in JSFiddle](https://jsfiddle.net/lherman/xotv9h6m)**
-
-Click **"Start Viewing,"** and you should see the video from the publisher tab.
-
-```javascript
-// Core viewer logic
-const pc = new RTCPeerConnection();
-
-// 1. Set up the connection to receive video
-pc.addTransceiver("video", { direction: "recvonly" });
-pc.ontrack = e => remoteVideo.srcObject = e.streams[0]; // 'remoteVideo' is a <video> element
-
-// 2. Create an SDP offer to signal intent to receive
-const offer = await pc.createOffer();
-await pc.setLocalDescription(offer);
-const res = await fetch("http://localhost:3000/api/v1/rooms/demo", {
-  method: "POST",
-  headers: { "Content-Type": "application/sdp" },
-  body: offer.sdp
-});
-
-// 3. Set the remote description with PulseBeam's answer
-const answer = await res.text();
-await pc.setRemoteDescription({ type: "answer", sdp: answer });
-```
+Go to https://codepen.io/lherman-cs/pen/pvgVZar, then put "demo" as the room to connect to.
 
 ## Roadmap
 
-* ✅ Prototype: working basic audio/video Rust SFU + demo
-* 🚧 Bandwidth estimator, video simulcast (current focus)
-* 📅 Top-N audio selection
-* 📅 Web Client SDK, data channel
-* 📅 HTTP API & Webhooks (Events)
-* 📅 Core stability: simulation testing, end-to-end tests
-* 📅 Built-in multi node or cascading SFU.
-* 📅 First-party services (recording, SIP, etc.)
-
----
-
-## License
-
-* **Server** → AGPL-3.0
-* **Client libraries/tooling** → Apache-2.0
-
-Internal/company use is fine.
-Need a different license? → [lukas@pulsebeam.dev](mailto:lukas@pulsebeam.dev)
-
----
-
-## Community
-
-* 💬 [Discord](https://discord.gg/Bhd3t9afuB)
-* 🐛 [Issues](https://github.com/pulsebeamdev/pulsebeam/issues)
-
-PRs welcome.
+* ✅ Prototype: Rust SFU + demo apps
+* ✅ Bandwidth estimator, simulcast support
+* 🚧 Top-N audio selection, Data channel, Web Client SDK
+* 📅 HTTP API & Webhooks (events)
+* 📅 Multi-node / cascading SFU support
+* 📅 Extensions: recording, SIP, AI agents
