@@ -19,7 +19,7 @@ ffmpeg-static = ["ffmpeg-next/build"]
 ffmpeg-dynamic = []
 
 [dependencies]
-futures = { workspace = true }
+futures-lite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 str0m = { workspace = true }

@@ -1,6 +1,5 @@
-use futures::StreamExt;
-use futures::stream::SelectAll;
-use futures::stream::Stream;
+use futures_lite::StreamExt;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Waker;
@@ -9,6 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::media::Mid;
 use tokio::time::Instant;
+use tokio_stream::{Stream, StreamMap};
 
 use crate::entity::TrackId;
 use crate::rtp;
@@ -19,25 +19,25 @@ use crate::track::TrackReceiver;
 use pulsebeam_runtime::sync::spmc::RecvError;
 
 pub struct AudioAllocator {
-    inputs: SelectAll<IdentifyStream>,
+    inputs: StreamMap<Arc<TrackId>, SimulcastReceiver>,
     slots: Vec<AudioSlot>,
     waker: Option<Waker>,
+    buffer: Vec<RtpPacket>,
 }
 
 impl AudioAllocator {
     pub fn new() -> Self {
         Self {
-            inputs: SelectAll::new(),
+            inputs: StreamMap::new(),
             slots: Vec::new(),
             waker: None,
+            buffer: Vec::with_capacity(16),
         }
     }
 
     pub fn add_track(&mut self, track: TrackReceiver) {
-        self.inputs.push(IdentifyStream {
-            id: track.meta.id.clone(),
-            inner: track.lowest_quality().clone(),
-        });
+        self.inputs
+            .insert(track.meta.id.clone(), track.lowest_quality().clone());
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
@@ -65,8 +65,10 @@ impl AudioAllocator {
             return Poll::Pending;
         }
 
+        // TODO: use assignment then poll just the assignment
+
         loop {
-            let (track_id, packet) = match self.inputs.poll_next_unpin(cx) {
+            let (track_id, packet) = match self.inputs.poll_next_many(cx) {
                 Poll::Ready(Some(val)) => val,
                 Poll::Ready(None) => return Poll::Ready(None), // All inputs closed
                 Poll::Pending => return Poll::Pending,         // No audio data

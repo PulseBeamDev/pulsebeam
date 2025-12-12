@@ -4,11 +4,10 @@ use crate::{
     entity::{ParticipantId, RoomId},
     node, room,
 };
-use futures::stream::FuturesUnordered;
-use pulsebeam_runtime::actor::{self, ActorKind};
+use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
 use pulsebeam_runtime::prelude::*;
 use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, task::JoinSet};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -54,7 +53,7 @@ pub struct ControllerActor {
     local_addrs: Vec<SocketAddr>,
 
     rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
-    room_tasks: FuturesUnordered<actor::JoinHandle<room::RoomMessageSet>>,
+    room_tasks: JoinSet<(RoomId, ActorStatus)>,
 }
 
 impl actor::Actor<ControllerMessageSet> for ControllerActor {
@@ -79,7 +78,7 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
             select: {
-                Some((room_id, _)) = self.room_tasks.next() => {
+                Some(Ok((room_id, _))) = self.room_tasks.join_next() => {
                     self.rooms.remove(&room_id);
                 }
             }
@@ -203,11 +202,11 @@ impl ControllerActor {
         } else {
             tracing::info!("create_room: {}", room_id);
             let room_actor = room::RoomActor::new(self.node_ctx.clone(), room_id.clone());
-            let (room_handle, room_join) = actor::spawn(
+            let (room_handle, room_task) = actor::prepare(
                 room_actor,
                 actor::RunnerConfig::default().with_mailbox_cap(1024),
             );
-            self.room_tasks.push(room_join);
+            self.room_tasks.push(room_task);
 
             self.rooms.insert(room_id.clone(), room_handle.clone());
 
@@ -227,7 +226,7 @@ impl ControllerActor {
             node_ctx: system_ctx,
             local_addrs,
             rooms: HashMap::new(),
-            room_tasks: FuturesUnordered::new(),
+            room_tasks: JoinSet::new(),
         }
     }
 }

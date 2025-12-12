@@ -1,10 +1,12 @@
-use crate::shard::{ShardMessageSet, ShardTask};
+use crate::shard::ShardMessageSet;
 use crate::{api, controller, gateway, shard};
-use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use futures_lite::{FutureExt, StreamExt};
+use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
 use std::sync::atomic::AtomicUsize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -18,20 +20,23 @@ pub struct NodeContext {
 }
 
 impl NodeContext {
-    pub fn single(socket: net::UnifiedSocket) -> Self {
-        let socket = Arc::new(socket);
-
-        let (gw, _) = actor::spawn_default(gateway::GatewayActor::new(vec![socket.clone()]));
-
-        Self {
-            rng: rand::Rng::from_os_rng(),
-            gateway: gw,
-            shards: vec![],
-            sockets: vec![socket.clone()],
-            egress_counter: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
+    // pub fn single(socket: net::UnifiedSocket) -> Self {
+    //     let socket = Arc::new(socket);
+    //
+    //     let (gw, _) = actor::prepare(
+    //         gateway::GatewayActor::new(vec![socket.clone()]),
+    //         RunnerConfig::default(),
+    //     );
+    //
+    //     Self {
+    //         rng: rand::Rng::from_os_rng(),
+    //         gateway: gw,
+    //         shards: vec![],
+    //         sockets: vec![socket.clone()],
+    //         egress_counter: Arc::new(AtomicUsize::new(0)),
+    //     }
+    // }
+    //
     pub fn allocate_egress(&self) -> Arc<net::UnifiedSocket> {
         let seq = self
             .egress_counter
@@ -73,16 +78,20 @@ pub async fn run(
         .expose_headers([hyper::header::LOCATION])
         .max_age(Duration::from_secs(86400));
 
-    let mut join_set = FuturesUnordered::new();
-    let (gateway, gateway_join) = actor::spawn_default(gateway::GatewayActor::new(sockets.clone()));
-    join_set.push(gateway_join.map(|_| ()).boxed());
+    let mut join_set = JoinSet::new();
+    let (gateway, gateway_task) = actor::prepare(
+        gateway::GatewayActor::new(sockets.clone()),
+        RunnerConfig::default(),
+    );
+    join_set.push(gateway_task);
 
     let shard_count = 2 * workers;
     let mut shard_handles = Vec::with_capacity(shard_count);
 
     for i in 0..shard_count {
-        let (shard, shard_join) = actor::spawn_default(shard::ShardActor::new(i));
-        join_set.push(shard_join.map(|_| ()).boxed());
+        let (shard, shard_task) =
+            actor::prepare(shard::ShardActor::new(i), RunnerConfig::default());
+        join_set.push(shard_task);
         shard_handles.push(shard);
     }
 
@@ -100,8 +109,9 @@ pub async fn run(
         vec![external_addr],
         Arc::new("root".to_string()),
     );
-    let (controller_handle, controller_join) = actor::spawn_default(controller_actor);
-    join_set.push(controller_join.map(|_| ()).boxed());
+    let (controller_handle, controller_task) =
+        actor::prepare(controller_actor, RunnerConfig::default());
+    join_set.push(controller_task);
 
     // HTTP API
     let api_cfg = api::ApiConfig {

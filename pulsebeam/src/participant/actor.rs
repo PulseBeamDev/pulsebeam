@@ -123,10 +123,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
-                    while let Some((mid, pkt)) = self.core.downstream.next().now_or_never().flatten() {
+                    while let Some(Some((mid, pkt))) = std::future::poll_fn(|cx| {
+                        Pin::new(&mut self.core.downstream).poll_next(cx)
+                    }).now_or_never() {
                         self.core.handle_forward_rtp(mid, pkt);
                     }
-
                     new_deadline = self.core.poll_rtc();
                 },
                 Some(batch) = gateway_rx.recv() => {

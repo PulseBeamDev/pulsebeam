@@ -1,9 +1,10 @@
 use crate::actor_loop;
-use futures::FutureExt;
+use futures_lite::FutureExt;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::future::Future;
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -25,7 +26,7 @@ tokio::task_local! {
 }
 
 pub struct JoinHandle<M: MessageSet> {
-    inner: Pin<Box<dyn futures::Future<Output = (M::Meta, ActorStatus)> + Send>>,
+    inner: Pin<Box<dyn Future<Output = (M::Meta, ActorStatus)> + Send>>,
     abort_handle: tokio::task::AbortHandle,
 }
 
@@ -41,7 +42,7 @@ impl<M: MessageSet> Drop for JoinHandle<M> {
     }
 }
 
-impl<M: MessageSet> futures::Future for JoinHandle<M> {
+impl<M: MessageSet> Future for JoinHandle<M> {
     type Output = (M::Meta, ActorStatus);
 
     fn poll(
@@ -117,7 +118,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
     fn run(
         &mut self,
         ctx: &mut ActorContext<M>,
-    ) -> impl futures::Future<Output = Result<(), ActorError>> + Send {
+    ) -> impl Future<Output = Result<(), ActorError>> + Send {
         async {
             actor_loop!(self, ctx);
             Ok(())
@@ -128,7 +129,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
         &mut self,
         _ctx: &mut ActorContext<M>,
         _msg: SystemMsg<M::ObservableState>,
-    ) -> impl futures::Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> + Send {
         async move {}
     }
 
@@ -136,7 +137,7 @@ pub trait Actor<M: MessageSet>: Sized + Send + 'static {
         &mut self,
         _ctx: &mut ActorContext<M>,
         _msg: M::Msg,
-    ) -> impl futures::Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> + Send {
         async move {}
     }
 }
@@ -254,40 +255,12 @@ where
     let runnable = tracing::Instrument::instrument(runnable, span);
 
     let actor_id = handle.meta.clone();
-    let fut = runnable.map(move |status| (actor_id, status));
+    let runnable = async move {
+        let status = runnable.await;
+        (actor_id, status)
+    };
 
-    (handle, fut)
-}
-
-pub fn spawn<A, M>(a: A, config: RunnerConfig) -> (ActorHandle<M>, JoinHandle<M>)
-where
-    M: MessageSet,
-    A: Actor<M>,
-{
-    let (handle, runnable) = prepare(a, config);
-    let join = tokio::spawn(runnable);
-    let abort_handle = join.abort_handle();
-
-    let actor_id = handle.meta.clone();
-    let join = join
-        .map(|res| res.unwrap_or((actor_id, ActorStatus::ShutDown)))
-        .boxed();
-
-    (
-        handle,
-        JoinHandle {
-            inner: join,
-            abort_handle,
-        },
-    )
-}
-
-pub fn spawn_default<A, M>(a: A) -> (ActorHandle<M>, JoinHandle<M>)
-where
-    M: MessageSet,
-    A: Actor<M>,
-{
-    spawn(a, RunnerConfig::default())
+    (handle, runnable)
 }
 
 async fn run<A, M>(mut a: A, mut ctx: ActorContext<M>) -> ActorStatus

@@ -27,17 +27,17 @@ pub fn create_sim<'a>() -> turmoil::Sim<'a> {
         .build()
 }
 
-pub async fn create_node_ctx() -> node::NodeContext {
-    let external_addr = "192.168.1.1:3478".parse().unwrap();
-    let socket = net::UnifiedSocket::bind(
-        (Ipv4Addr::LOCALHOST, 0).into(),
-        net::Transport::SimUdp,
-        Some(external_addr),
-    )
-    .await
-    .unwrap();
-    node::NodeContext::single(socket)
-}
+// pub async fn create_node_ctx() -> node::NodeContext {
+//     let external_addr = "192.168.1.1:3478".parse().unwrap();
+//     let socket = net::UnifiedSocket::bind(
+//         (Ipv4Addr::LOCALHOST, 0).into(),
+//         net::Transport::SimUdp,
+//         Some(external_addr),
+//     )
+//     .await
+//     .unwrap();
+//     node::NodeContext::single(socket)
+// }
 
 pub fn create_track_id() -> Arc<entity::TrackId> {
     Arc::new(entity::TrackId::new())
