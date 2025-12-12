@@ -164,7 +164,7 @@ mod internal {
         routing::get,
     };
     use hyper::StatusCode;
-    use metrics_exporter_prometheus::PrometheusBuilder;
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::{ProfilerGuard, protos::Message};
     use pulsebeam_runtime::actor::Actor;
     use serde::Deserialize;
@@ -225,7 +225,7 @@ mod internal {
                 .with_interval(std::time::Duration::from_secs(5))
                 .describe_and_run(),
         );
-        let actor_monitor_join = tokio::spawn(monitor_actors());
+        let actor_monitor_join = tokio::spawn(background_monitor(prometheus_handle));
 
         tokio::select! {
             res = axum::serve(listener, router) => {
@@ -243,7 +243,7 @@ mod internal {
         Ok(())
     }
 
-    async fn monitor_actors() {
+    async fn background_monitor(prometheus_handle: PrometheusHandle) {
         let mut monitors = [
             ("gateway", gateway::GatewayActor::monitor().intervals()),
             (
@@ -266,6 +266,11 @@ mod internal {
 
         loop {
             interval.tick().await;
+
+            // https://docs.rs/metrics-exporter-prometheus/latest/metrics_exporter_prometheus/#upkeep-and-maintenance
+            // Keep memory usage and CPU usage bounded per prometheus interval.
+            // 5 seconds matches the default from the crate.
+            prometheus_handle.run_upkeep();
 
             for (actor_name, monitor) in &mut monitors {
                 let Some(snapshot) = monitor.next() else {
