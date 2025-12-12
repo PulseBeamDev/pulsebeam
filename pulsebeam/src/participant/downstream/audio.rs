@@ -1,6 +1,6 @@
-use futures::StreamExt;
-use futures::stream::SelectAll;
-use futures::stream::Stream;
+use futures_lite::StreamExt;
+use pulsebeam_runtime::sync::spmc;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Waker;
@@ -9,6 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::media::Mid;
 use tokio::time::Instant;
+use tokio_stream::{Stream, StreamMap};
 
 use crate::entity::TrackId;
 use crate::rtp;
@@ -19,7 +20,7 @@ use crate::track::TrackReceiver;
 use pulsebeam_runtime::sync::spmc::RecvError;
 
 pub struct AudioAllocator {
-    inputs: SelectAll<IdentifyStream>,
+    inputs: StreamMap<Arc<TrackId>, spmc::Receiver<RtpPacket>>,
     slots: Vec<AudioSlot>,
     waker: Option<Waker>,
 }
@@ -27,17 +28,17 @@ pub struct AudioAllocator {
 impl AudioAllocator {
     pub fn new() -> Self {
         Self {
-            inputs: SelectAll::new(),
+            inputs: StreamMap::new(),
             slots: Vec::new(),
             waker: None,
         }
     }
 
     pub fn add_track(&mut self, track: TrackReceiver) {
-        self.inputs.push(IdentifyStream {
-            id: track.meta.id.clone(),
-            inner: track.lowest_quality().clone(),
-        });
+        self.inputs.insert(
+            track.meta.id.clone(),
+            track.lowest_quality().channel.clone(),
+        );
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
@@ -59,17 +60,22 @@ impl AudioAllocator {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        // SelectAll will return Ready(None) with an empty list
-        if self.inputs.is_empty() || self.slots.is_empty() {
-            self.waker = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
+        // TODO: use assignment then poll just the assignment
 
         loop {
-            let (track_id, packet) = match self.inputs.poll_next_unpin(cx) {
-                Poll::Ready(Some(val)) => val,
-                Poll::Ready(None) => return Poll::Ready(None), // All inputs closed
-                Poll::Pending => return Poll::Pending,         // No audio data
+            // SelectAll will return Ready(None) with an empty list
+            if self.inputs.is_empty() || self.slots.is_empty() {
+                self.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+
+            let (track_id, packet) = match ready!(self.inputs.poll_next(cx)) {
+                Some((track_id, Ok(packet))) => (track_id, packet),
+                Some((track_id, Err(err))) => {
+                    tracing::warn!("{} stream is lagging: {:?}", track_id, err);
+                    continue;
+                }
+                None => return Poll::Ready(None), // All inputs closed
             };
 
             let now = Instant::now();
@@ -131,29 +137,6 @@ impl AudioSlot {
         match self.current_track_id {
             Some(_) => now.duration_since(self.last_active_at) > HANGOVER,
             None => true,
-        }
-    }
-}
-
-struct IdentifyStream {
-    id: Arc<TrackId>,
-    inner: SimulcastReceiver,
-}
-
-impl Stream for IdentifyStream {
-    type Item = (Arc<TrackId>, RtpPacket);
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            match ready!(this.inner.channel.poll_recv(cx)) {
-                Ok(pkt) => return Poll::Ready(Some((this.id.clone(), pkt))),
-                Err(RecvError::Lagged(n)) => {
-                    tracing::warn!(track_id = %this.id, "audio stream is lagging by {}", n);
-                    // will continue to read from the latest
-                }
-                Err(RecvError::Closed) => return Poll::Ready(None),
-            };
         }
     }
 }

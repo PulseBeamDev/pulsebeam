@@ -1,9 +1,10 @@
 use crate::{entity::ParticipantId, gateway::demux::Demuxer};
-use futures::{StreamExt, stream::FuturesUnordered};
-use pulsebeam_runtime::actor::ActorKind;
+use futures_lite::StreamExt;
+use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use std::{io, sync::Arc};
+use tokio::task::JoinSet;
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
@@ -27,7 +28,7 @@ pub struct GatewayActor {
     sockets: Vec<Arc<net::UnifiedSocket>>,
     workers: Vec<GatewayWorkerHandle>,
 
-    worker_tasks: FuturesUnordered<actor::JoinHandle<GatewayMessageSet>>,
+    worker_tasks: JoinSet<(String, ActorStatus)>,
 }
 
 impl actor::Actor<GatewayMessageSet> for GatewayActor {
@@ -51,15 +52,17 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         ctx: &mut actor::ActorContext<GatewayMessageSet>,
     ) -> Result<(), actor::ActorError> {
         for (id, socket) in self.sockets.iter().enumerate() {
-            let (worker_handle, worker_join) =
-                actor::spawn_default(GatewayWorkerActor::new(id, socket.clone()));
-            self.worker_tasks.push(worker_join);
+            let (worker_handle, worker_task) = actor::prepare(
+                GatewayWorkerActor::new(id, socket.clone()),
+                RunnerConfig::default(),
+            );
+            self.worker_tasks.spawn(worker_task);
             self.workers.push(worker_handle);
         }
 
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
-            Some((id, _)) = self.worker_tasks.next() => {
+            Some(Ok((id, _))) = self.worker_tasks.join_next() => {
                 tracing::info!("gateway worker-{id} has exited");
                 break;
             }
@@ -85,7 +88,7 @@ impl GatewayActor {
         Self {
             sockets,
             workers,
-            worker_tasks: FuturesUnordered::new(),
+            worker_tasks: JoinSet::new(),
         }
     }
 }

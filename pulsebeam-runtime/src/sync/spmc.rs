@@ -1,16 +1,22 @@
 use crossbeam_utils::CachePadded;
 use event_listener::{Event, EventListener};
+use futures_lite::Stream;
 use parking_lot::RwLock;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
     Lagged(u64),
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamRecvError {
+    Lagged(u64),
 }
 
 #[derive(Debug)]
@@ -168,6 +174,21 @@ impl<T: Clone> Receiver<T> {
             coop.made_progress();
             return Poll::Ready(Err(RecvError::Lagged(head)));
         }
+    }
+}
+
+impl<T: Clone> Stream for Receiver<T> {
+    type Item = Result<T, StreamRecvError>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        let res = match ready!(this.poll_recv(cx)) {
+            Ok(item) => Some(Ok(item)),
+            Err(RecvError::Lagged(n)) => Some(Err(StreamRecvError::Lagged(n))),
+            Err(RecvError::Closed) => None,
+        };
+
+        Poll::Ready(res)
     }
 }
 

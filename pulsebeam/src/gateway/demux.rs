@@ -1,4 +1,4 @@
-use pulsebeam_runtime::mailbox::{SendError, TrySendError};
+use pulsebeam_runtime::mailbox::SendError;
 use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;

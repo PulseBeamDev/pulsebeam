@@ -118,15 +118,12 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     self.core.batcher.flush(&self.egress);
                 },
                 // TODO: consolidate pollings in core
-                Some(req) = self.core.upstream.keyframe_request_streams.next() => {
+                Some((_, req)) = self.core.upstream.keyframe_request_streams.next() => {
                     self.core.handle_keyframe_request(req);
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
-                    while let Some((mid, pkt)) = self.core.downstream.next().now_or_never().flatten() {
-                        self.core.handle_forward_rtp(mid, pkt);
-                    }
-
+                    // TODO: add batching back
                     new_deadline = self.core.poll_rtc();
                 },
                 Some(batch) = gateway_rx.recv() => {

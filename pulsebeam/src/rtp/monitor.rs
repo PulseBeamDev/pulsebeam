@@ -178,7 +178,7 @@ impl StreamMonitor {
             );
         }
 
-        let mut metrics: RawMetrics = (&self.delta_delta).into();
+        let metrics: RawMetrics = (&self.delta_delta).into();
         // Reset the counters so we measure the interval (windowed) metrics next time.
         // This makes the loss score reactive to RECENT conditions rather than lifetime average.
         self.delta_delta.snapshot_and_reset();

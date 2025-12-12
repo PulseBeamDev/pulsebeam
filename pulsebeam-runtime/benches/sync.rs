@@ -1,11 +1,11 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use futures::{StreamExt, future::join_all};
 use futures_concurrency::stream::Merge;
+use futures_lite::StreamExt;
 use rand::seq::index;
 use std::time::{Duration, Instant};
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::task;
+use tokio::{runtime::Runtime, task::JoinSet};
 
 // Use the specified import path for the SPMC channel implementation.
 use pulsebeam_runtime::sync::spmc::{RecvError, Sender, channel};
@@ -111,7 +111,7 @@ async fn run_interactive_room_mesh_mpsc_fanout_test() {
     }
 
     let simulation_start = Instant::now();
-    join_all(publisher_tasks).await;
+    JoinSet::from_iter(publisher_tasks).join_all().await;
     let total_send_duration = simulation_start.elapsed();
 
     let all_latencies = aggregate_latencies(subscriber_tasks).await;
@@ -210,7 +210,7 @@ async fn run_interactive_room_mesh_spawn_test() {
     }
 
     let simulation_start = Instant::now();
-    join_all(publisher_tasks).await;
+    JoinSet::from_iter(publisher_tasks).join_all().await;
     let total_send_duration = simulation_start.elapsed();
 
     let all_latencies = aggregate_latencies(subscriber_tasks).await;
@@ -298,7 +298,7 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
     }
 
     let simulation_start = Instant::now();
-    join_all(publisher_tasks).await;
+    JoinSet::from_iter(publisher_tasks).join_all().await;
     let total_send_duration = simulation_start.elapsed();
 
     let all_latencies = aggregate_latencies(subscriber_tasks).await;
@@ -416,12 +416,11 @@ async fn create_publisher_load_mpsc(tx: mpsc::Sender<(usize, Instant)>, num_pack
 }
 
 async fn aggregate_latencies(handles: Vec<task::JoinHandle<Vec<Duration>>>) -> Vec<Duration> {
-    let results = join_all(handles).await;
+    let results = JoinSet::from_iter(handles).join_all().await;
+    let results = results.iter().flatten();
     let mut all_latencies = Vec::new();
     for result in results {
-        if let Ok(subscriber_latencies) = result {
-            all_latencies.extend(subscriber_latencies);
-        }
+        all_latencies.extend(result);
     }
     all_latencies
 }

@@ -1,9 +1,10 @@
 use std::pin::Pin;
 
 use pulsebeam_runtime::{actor, sync::Arc};
+use std::future::Future;
 use tokio::task::JoinSet;
 
-pub type ShardTask = Pin<Box<dyn futures::Future<Output = ()> + Send>>;
+pub type ShardTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub enum ShardMessage {
     AddTask(ShardTask),

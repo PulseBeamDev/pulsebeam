@@ -1,6 +1,6 @@
-use futures::{StreamExt, stream::SelectAll};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
+use tokio_stream::StreamMap;
 
 use crate::{rtp::RtpPacket, track::KeyframeRequestStream};
 use str0m::media::Mid;
@@ -11,14 +11,14 @@ const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct UpstreamAllocator {
     published_tracks: HashMap<Mid, TrackSender>,
-    pub keyframe_request_streams: SelectAll<KeyframeRequestStream>,
+    pub keyframe_request_streams: StreamMap<Mid, KeyframeRequestStream>,
 }
 
 impl UpstreamAllocator {
     pub fn new() -> Self {
         Self {
             published_tracks: HashMap::new(),
-            keyframe_request_streams: SelectAll::new(),
+            keyframe_request_streams: StreamMap::new(),
         }
     }
 
@@ -27,7 +27,7 @@ impl UpstreamAllocator {
         if track.meta.kind.is_video() {
             for sender in &track.simulcast {
                 self.keyframe_request_streams
-                    .push(sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
+                    .insert(mid, sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
             }
         }
         self.published_tracks.insert(mid, track);

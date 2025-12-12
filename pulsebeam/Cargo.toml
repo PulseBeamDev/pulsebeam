@@ -11,7 +11,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-futures = { workspace = true }
+futures-lite = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

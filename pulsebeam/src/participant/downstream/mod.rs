@@ -6,7 +6,7 @@ use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
 use crate::track::TrackReceiver;
-use futures::stream::Stream;
+use futures_lite::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
