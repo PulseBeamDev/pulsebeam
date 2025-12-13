@@ -89,34 +89,34 @@ impl<'a> Iterator for RecvPacketBatchIter<'a> {
 
 pub struct RecvPacketBatcher {
     meta: [RecvMeta; BATCH_SIZE],
-    buffers: [Box<[MaybeUninit<u8>]>; BATCH_SIZE],
+    batch_buffer: Vec<u8>,
 }
 
 impl RecvPacketBatcher {
     pub fn new() -> Self {
-        let buffers: [Box<[MaybeUninit<u8>]>; BATCH_SIZE] =
-            std::array::from_fn(|_| Box::new_uninit_slice(CHUNK_SIZE));
-
         Self {
             meta: [RecvMeta::default(); BATCH_SIZE],
-            buffers,
+            batch_buffer: Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE),
         }
     }
 
     fn collect(&mut self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacketBatch>) {
-        metrics::histogram!("network_recv_batch_counts", "transport" => "udp").record(count as f64);
+        let new_buffer = Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE);
+        let filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
+        let master_bytes = Bytes::from(filled_buffer);
+
         for i in 0..count {
             let m = &self.meta[i];
-            metrics::histogram!("network_recv_batch_sizes", "transport" => "udp")
-                .record(m.len as f64);
 
-            // This is fairly cheap for mimalloc as the allocation size <= page size
-            // It should be mostly O(1) here
-            let new_buf = Box::new_uninit_slice(CHUNK_SIZE);
-            let old_buf = std::mem::replace(&mut self.buffers[i], new_buf);
-            let old_buf: Box<[u8]> = unsafe { old_buf.assume_init() };
-            let full_bytes = Bytes::from(old_buf);
-            let buf = full_bytes.slice(0..m.len);
+            let start = i * CHUNK_SIZE;
+            let end = start + m.len;
+
+            // Safety: Ensure we don't slice past the buffer (e.g., if kernel lied about len)
+            if end > master_bytes.len() {
+                continue;
+            }
+
+            let buf = master_bytes.slice(start..end);
 
             out.push(RecvPacketBatch {
                 src: m.addr,
@@ -323,12 +323,23 @@ impl UdpTransport {
         out: &mut Vec<RecvPacketBatch>,
     ) -> std::io::Result<()> {
         self.sock.try_io(tokio::io::Interest::READABLE, || {
-            let buffers = &mut batcher.buffers;
+            // Prepare the pointers for the kernel
+            // We set len=capacity so we can take mutable slices of the uninitialized memory
+            unsafe {
+                batcher
+                    .batch_buffer
+                    .set_len(batcher.batch_buffer.capacity())
+            };
+            let ptr = batcher.batch_buffer.as_mut_ptr();
+
             let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|i| {
-                let slice: &mut [u8] =
-                    unsafe { &mut *(buffers[i].as_mut() as *mut [MaybeUninit<u8>] as *mut [u8]) };
-                IoSliceMut::new(slice)
+                let offset = i * CHUNK_SIZE;
+                // SAFETY: We know the buffer is BATCH_SIZE * CHUNK_SIZE large
+                unsafe {
+                    IoSliceMut::new(std::slice::from_raw_parts_mut(ptr.add(offset), CHUNK_SIZE))
+                }
             });
+
             let res = self
                 .state
                 .recv((&self.sock).into(), &mut slices, &mut batcher.meta);
@@ -359,11 +370,7 @@ impl UdpTransport {
         });
 
         match res {
-            Ok(_) => {
-                metrics::histogram!("network_send_batch_bytes", "transport" => "udp")
-                    .record(batch.buf.len() as f64);
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(err) => {
                 tracing::warn!("try_send_batch failed with {err}");

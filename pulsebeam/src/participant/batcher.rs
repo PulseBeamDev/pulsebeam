@@ -70,7 +70,6 @@ impl Batcher {
     }
 
     pub fn flush(&mut self, socket: &net::UnifiedSocket) {
-        let start = tokio::time::Instant::now();
         while let Some(state) = self.front() {
             let res = socket.try_send_batch(&net::SendPacketBatch {
                 dst: state.dst,
@@ -85,9 +84,6 @@ impl Batcher {
                 Ok(false) => break,
             }
         }
-        let elapsed = start.elapsed().as_micros();
-        let labels = [("type", "flush")];
-        metrics::histogram!("participant_poll_delay_us", &labels).record(elapsed as f64);
     }
 }
 
