@@ -41,7 +41,7 @@ ahash = "0.8.12"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms", "disable_initial_exec_tls"] }
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 
 [dev-dependencies]

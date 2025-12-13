@@ -35,7 +35,8 @@ jobs:
       matrix:
         platform:
           - linux/amd64
-          - linux/arm64
+          # Jemallocator has not recommended arm64
+          # - linux/arm64
       # The matrix includes two platforms: linux/amd64 and linux/arm64.
       # The build job will run for each platform in the matrix.
 

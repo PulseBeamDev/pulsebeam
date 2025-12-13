@@ -5,3 +5,9 @@ dist
 *.data
 *.data.old
 Dockerfile
+docs
+venv
+demo
+.github
+.git
+**/*.data
