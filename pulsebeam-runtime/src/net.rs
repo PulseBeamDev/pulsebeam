@@ -7,10 +7,9 @@ use std::{
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
-// L2 cache friendly, keep it <= 1MB
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
-// Fit Mimalloc page size and Linux GRO limit
-pub const CHUNK_SIZE: usize = 32 * 1024;
+// Fit allocator page size and Linux GRO limit
+pub const CHUNK_SIZE: usize = 64 * 1024;
 // Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
 // With 1ms scheduling delay, this is capped to 8ms latency.
 pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
