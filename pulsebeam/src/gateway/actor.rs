@@ -165,7 +165,7 @@ impl GatewayWorkerActor {
     }
 
     async fn read_socket(&mut self) -> io::Result<()> {
-        let mut budget: usize = 256;
+        let mut budget: usize = 128;
         while budget > 0 {
             self.recv_batches.clear();
             match self

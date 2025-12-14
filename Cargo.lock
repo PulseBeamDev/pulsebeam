@@ -2447,6 +2447,7 @@ dependencies = [
  "axum-extra",
  "bs58",
  "bytes",
+ "futures-buffered",
  "futures-lite",
  "hex",
  "hyper",

@@ -1,8 +1,9 @@
 use std::pin::Pin;
 
+use futures_buffered::FuturesUnorderedBounded;
+use futures_lite::StreamExt;
 use pulsebeam_runtime::{actor, sync::Arc};
 use std::future::Future;
-use tokio::task::JoinSet;
 
 pub type ShardTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -12,7 +13,7 @@ pub enum ShardMessage {
 
 pub struct ShardActor {
     shard_id: usize,
-    tasks: JoinSet<()>,
+    tasks: FuturesUnorderedBounded<ShardTask>,
 }
 
 pub struct ShardMessageSet;
@@ -49,7 +50,7 @@ impl actor::Actor<ShardMessageSet> for ShardActor {
         pulsebeam_runtime::actor_loop!(self, _ctx,
             pre_select: {},
             select: {
-                Some(_) = self.tasks.join_next() => {
+                Some(_) = self.tasks.next() => {
                     // task completed, shard does nothing else
                 }
             }
@@ -60,7 +61,7 @@ impl actor::Actor<ShardMessageSet> for ShardActor {
 
     async fn on_msg(&mut self, _ctx: &mut actor::ActorContext<ShardMessageSet>, msg: ShardMessage) {
         let ShardMessage::AddTask(task) = msg;
-        self.tasks.spawn(task);
+        self.tasks.push(task);
         metrics::counter!("shard_task_count", "shard_id" => self.shard_id.to_string())
             .absolute(self.tasks.len() as u64);
     }
@@ -70,7 +71,7 @@ impl ShardActor {
     pub fn new(shard_id: usize) -> Self {
         Self {
             shard_id,
-            tasks: JoinSet::new(),
+            tasks: FuturesUnorderedBounded::new(16),
         }
     }
 }
