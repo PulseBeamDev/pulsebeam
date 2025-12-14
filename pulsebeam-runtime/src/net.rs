@@ -1,6 +1,5 @@
 use std::{
     io::{self, ErrorKind, IoSliceMut},
-    mem::MaybeUninit,
     net::SocketAddr,
 };
 

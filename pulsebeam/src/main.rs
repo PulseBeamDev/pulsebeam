@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// sampling every 32MB allocations
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+pub static malloc_conf: &[u8] = b"background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decay_ms:30000,lg_tcache_max:21,prof:true,prof_active:true,lg_prof_sample:25\0";
 
 use std::{
     net::{IpAddr, SocketAddr},
