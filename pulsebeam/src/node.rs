@@ -84,7 +84,7 @@ pub async fn run(
     );
     join_set.spawn(ignore(gateway_task));
 
-    let shard_count = 4 * workers;
+    let shard_count = 2 * workers;
     let mut shard_handles = Vec::with_capacity(shard_count);
 
     for i in 0..shard_count {
