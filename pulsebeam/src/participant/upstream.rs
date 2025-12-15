@@ -3,15 +3,16 @@ use tokio::time::Instant;
 use tokio_stream::StreamMap;
 
 use crate::{rtp::RtpPacket, track::KeyframeRequestStream};
-use str0m::media::Mid;
+use str0m::media::{Mid, Rid};
 
 use crate::track::TrackSender;
 
 const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(300);
+type StreamKey = (Mid, Option<Rid>);
 
 pub struct UpstreamAllocator {
     published_tracks: HashMap<Mid, TrackSender>,
-    pub keyframe_request_streams: StreamMap<Mid, KeyframeRequestStream>,
+    pub keyframe_request_streams: StreamMap<StreamKey, KeyframeRequestStream>,
 }
 
 impl UpstreamAllocator {
@@ -23,11 +24,12 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, mid: Mid, track: TrackSender) {
+    pub fn add_published_track(&mut self, mid: Mid, mut track: TrackSender) {
         if track.meta.kind.is_video() {
-            for sender in &track.simulcast {
+            for sender in track.simulcast.iter_mut() {
+                let key = (mid, sender.rid);
                 self.keyframe_request_streams
-                    .insert(mid, sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
+                    .insert(key, sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
             }
         }
         self.published_tracks.insert(mid, track);

@@ -30,23 +30,23 @@ impl KeyframeBuffer {
         }
     }
 
-    pub fn is_ready(&self, _target_playout: Instant) -> bool {
+    pub fn is_ready(&self, target_playout: Instant) -> bool {
         // TODO: use target_playout to decide
-        self.segment.is_some()
-        // let Some(segment) = self.segment.as_ref() else {
-        //     return false;
-        // };
-        //
-        // if segment.1 < target_playout {
-        //     tracing::debug!(
-        //         "segment is behind the target_playout: {:?} < {:?}",
-        //         segment.1,
-        //         target_playout
-        //     );
-        //     return false;
-        // }
-        //
-        // true
+        // self.segment.is_some()
+        let Some(segment) = self.segment.as_ref() else {
+            return false;
+        };
+
+        if segment.1 < target_playout {
+            tracing::debug!(
+                "segment is behind the target_playout: {:?} < {:?}",
+                segment.1,
+                target_playout
+            );
+            return false;
+        }
+
+        true
     }
 
     pub fn reset_to(&mut self, seq_no: SeqNo) {
