@@ -59,7 +59,7 @@ impl<T> Ring<T> {
 #[derive(Debug)]
 pub struct Sender<T> {
     ring: Arc<Ring<T>>,
-    head: u64,
+    local_head: u64,
 }
 
 impl<T> Sender<T> {
@@ -68,16 +68,16 @@ impl<T> Sender<T> {
             return;
         }
 
-        let idx = (self.head as usize) & self.ring.mask;
+        let idx = (self.local_head as usize) & self.ring.mask;
 
         {
             let mut slot = self.ring.slots[idx].write();
             slot.val = Some(val);
-            slot.seq = self.head;
+            slot.seq = self.local_head;
         }
 
-        self.ring.head.store(self.head + 1, Ordering::Release);
-        self.head += 1;
+        self.ring.head.store(self.local_head + 1, Ordering::Release);
+        self.local_head += 1;
         self.ring.event.notify(usize::MAX);
     }
 }
@@ -93,6 +93,7 @@ impl<T> Drop for Sender<T> {
 pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
+    local_head: u64,
     listener: Option<EventListener>,
 }
 
@@ -109,18 +110,24 @@ impl<T: Clone> Receiver<T> {
         loop {
             let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
 
-            // Snapshot producer head
-            let head = self.ring.head.load(Ordering::Acquire);
+            // Snapshot producer head. This allows batching efficiency without a batching API.
+            // It creates a fast-path for a slightly behind receiver to catchup the producer
+            // without spending atomic load on every iteration.
+            //
+            // Safety: head is strictly monotonically increasing
+            if self.next_seq == self.local_head {
+                self.local_head = self.ring.head.load(Ordering::Acquire);
+            }
             let capacity = self.ring.mask as u64 + 1;
-            let earliest = head.saturating_sub(capacity);
+            let earliest = self.local_head.saturating_sub(capacity);
 
             // Closed and nothing left
-            if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= head {
+            if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= self.local_head {
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
             // No new items — wait
-            if self.next_seq >= head {
+            if self.next_seq >= self.local_head {
                 match &mut self.listener {
                     Some(l) => {
                         if Pin::new(l).poll(cx).is_pending() {
@@ -144,15 +151,15 @@ impl<T: Clone> Receiver<T> {
             // Slot overwritten before we got here
             if slot_seq < earliest {
                 drop(slot);
-                self.next_seq = head;
-                return Poll::Ready(Err(RecvError::Lagged(head)));
+                self.next_seq = self.local_head;
+                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
             }
 
             // Seq mismatch — producer overwrote after head snapshot
             if slot_seq != self.next_seq {
                 drop(slot);
-                self.next_seq = head;
-                return Poll::Ready(Err(RecvError::Lagged(head)));
+                self.next_seq = self.local_head;
+                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
             }
 
             // Valid message
@@ -167,8 +174,8 @@ impl<T: Clone> Receiver<T> {
             // This shouldn't never happen, but just in case..
             // Seq was correct but value missing — treat as lag
             drop(slot);
-            self.next_seq = head;
-            return Poll::Ready(Err(RecvError::Lagged(head)));
+            self.next_seq = self.local_head;
+            return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
         }
     }
 }
@@ -190,9 +197,11 @@ impl<T: Clone> Stream for Receiver<T> {
 
 impl<T: Clone> Clone for Receiver<T> {
     fn clone(&self) -> Self {
+        let head = self.ring.head.load(Ordering::Acquire);
         Self {
             ring: self.ring.clone(),
-            next_seq: self.ring.head.load(Ordering::Acquire),
+            next_seq: head,
+            local_head: head,
             listener: None,
         }
     }
@@ -203,11 +212,12 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
     (
         Sender {
             ring: ring.clone(),
-            head: 0,
+            local_head: 0,
         },
         Receiver {
             ring: ring.clone(),
             next_seq: 0,
+            local_head: 0,
             listener: None,
         },
     )
