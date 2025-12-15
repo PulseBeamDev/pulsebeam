@@ -71,7 +71,7 @@ impl ShardActor {
     pub fn new(shard_id: usize) -> Self {
         Self {
             shard_id,
-            tasks: FutureGroup::with_capacity(128),
+            tasks: FutureGroup::with_capacity(64),
         }
     }
 }

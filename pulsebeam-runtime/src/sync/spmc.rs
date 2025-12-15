@@ -94,7 +94,6 @@ pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
     listener: Option<EventListener>,
-    tick: u8,
 }
 
 impl<T: Clone> Receiver<T> {
@@ -160,10 +159,7 @@ impl<T: Clone> Receiver<T> {
             if let Some(v) = &slot.val {
                 let out = v.clone();
                 drop(slot);
-                if self.tick.is_multiple_of(16) {
-                    coop.made_progress();
-                }
-                self.tick += 1;
+                coop.made_progress();
                 self.next_seq += 1;
                 return Poll::Ready(Ok(out));
             }
@@ -198,7 +194,6 @@ impl<T: Clone> Clone for Receiver<T> {
             ring: self.ring.clone(),
             next_seq: self.ring.head.load(Ordering::Acquire),
             listener: None,
-            tick: 0,
         }
     }
 }
@@ -214,7 +209,6 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
             ring: ring.clone(),
             next_seq: 0,
             listener: None,
-            tick: 0,
         },
     )
 }

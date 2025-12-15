@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use pulsebeam_runtime::{
-    actor::{ActorKind, RunnerConfig},
+    actor::{ActorKind, ActorStatus, RunnerConfig},
     prelude::*,
 };
 use str0m::Rtc;
+use tokio::task::JoinSet;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
@@ -48,6 +49,8 @@ pub struct RoomActor {
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
     room_id: Arc<RoomId>,
     state: RoomState,
+
+    participant_tasks: JoinSet<(Arc<ParticipantId>, ActorStatus)>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -80,6 +83,9 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
             select: {
+                Some(Ok((participant_id, _))) = self.participant_tasks.join_next() => {
+                    self.handle_participant_left(participant_id).await;
+                }
                 _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
                     tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
                     break;
@@ -120,6 +126,7 @@ impl RoomActor {
             node_ctx,
             room_id,
             state: RoomState::default(),
+            participant_tasks: JoinSet::new(),
         }
     }
 
@@ -156,15 +163,16 @@ impl RoomActor {
 
         let (mut participant_handle, participant_task) =
             actor::prepare(participant_actor, RunnerConfig::default());
-        let mut room_handle = ctx.handle.clone();
-        let participant_task = async move {
-            let (participant_id, _) = participant_task.await;
-            room_handle
-                .send(RoomMessage::RemoveParticipant(participant_id))
-                .await;
-        };
 
-        self.schedule(participant_task.boxed()).await;
+        self.participant_tasks.spawn(participant_task);
+
+        // let participant_task = async move {
+        //     let (participant_id, _) = participant_task.await;
+        //     room_handle
+        //         .send(RoomMessage::RemoveParticipant(participant_id))
+        //         .await;
+        // };
+        // self.schedule(participant_task.boxed()).await;
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {
