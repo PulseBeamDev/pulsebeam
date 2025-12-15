@@ -102,6 +102,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             }
 
             tokio::select! {
+                biased;
+                // Priority 1: Control Messages
                 res = ctx.sys_rx.recv() => {
                     match res {
                         Some(msg) => match msg {
@@ -114,21 +116,31 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     }
                 }
                 Some(msg) = ctx.rx.recv() => self.handle_control_message(msg).await,
-                Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
-                    self.core.batcher.flush(&self.egress);
-                },
+
+                // Priority 2: CPU Work
                 // TODO: consolidate pollings in core
                 Some((_, req)) = self.core.upstream.keyframe_request_streams.next() => {
                     self.core.handle_keyframe_request(req);
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
-                    // TODO: add batching back
+                    // this indicates the first batch is filled.
+                    if self.core.batcher.len() >= 2 {
+                        self.core.batcher.flush(&self.egress);
+                    }
+
                     new_deadline = self.core.poll_rtc();
                 },
                 Some(batch) = gateway_rx.recv() => {
                     new_deadline = self.core.handle_udp_packet_batch(batch);
                 },
+
+                // Priority 3: Flush to network
+                Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
+                    self.core.batcher.flush(&self.egress);
+                },
+
+                // Priority 4: Background tasks
                 now = stats_interval.tick() => {
                     self.core.poll_stats(now);
                 }

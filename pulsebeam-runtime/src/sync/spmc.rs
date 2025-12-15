@@ -94,6 +94,7 @@ pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
     listener: Option<EventListener>,
+    tick: u8,
 }
 
 impl<T: Clone> Receiver<T> {
@@ -116,7 +117,6 @@ impl<T: Clone> Receiver<T> {
 
             // Closed and nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= head {
-                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
@@ -146,7 +146,6 @@ impl<T: Clone> Receiver<T> {
             if slot_seq < earliest {
                 drop(slot);
                 self.next_seq = head;
-                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
@@ -154,7 +153,6 @@ impl<T: Clone> Receiver<T> {
             if slot_seq != self.next_seq {
                 drop(slot);
                 self.next_seq = head;
-                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
@@ -162,8 +160,11 @@ impl<T: Clone> Receiver<T> {
             if let Some(v) = &slot.val {
                 let out = v.clone();
                 drop(slot);
+                if self.tick.is_multiple_of(16) {
+                    coop.made_progress();
+                }
+                self.tick += 1;
                 self.next_seq += 1;
-                coop.made_progress();
                 return Poll::Ready(Ok(out));
             }
 
@@ -171,7 +172,6 @@ impl<T: Clone> Receiver<T> {
             // Seq was correct but value missing — treat as lag
             drop(slot);
             self.next_seq = head;
-            coop.made_progress();
             return Poll::Ready(Err(RecvError::Lagged(head)));
         }
     }
@@ -198,6 +198,7 @@ impl<T: Clone> Clone for Receiver<T> {
             ring: self.ring.clone(),
             next_seq: self.ring.head.load(Ordering::Acquire),
             listener: None,
+            tick: 0,
         }
     }
 }
@@ -213,6 +214,7 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
             ring: ring.clone(),
             next_seq: 0,
             listener: None,
+            tick: 0,
         },
     )
 }
