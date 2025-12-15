@@ -33,6 +33,7 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // .disable_lifo_slot()
         .worker_threads(workers)
         .build()
         .unwrap();

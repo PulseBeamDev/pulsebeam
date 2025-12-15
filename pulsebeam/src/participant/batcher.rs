@@ -69,6 +69,10 @@ impl Batcher {
         self.free_states.push(state);
     }
 
+    pub fn len(&self) -> usize {
+        self.active_states.len()
+    }
+
     pub fn flush(&mut self, socket: &net::UnifiedSocket) {
         while let Some(state) = self.front() {
             let res = socket.try_send_batch(&net::SendPacketBatch {

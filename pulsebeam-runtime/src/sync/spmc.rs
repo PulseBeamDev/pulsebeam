@@ -116,7 +116,6 @@ impl<T: Clone> Receiver<T> {
 
             // Closed and nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= head {
-                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
@@ -146,7 +145,6 @@ impl<T: Clone> Receiver<T> {
             if slot_seq < earliest {
                 drop(slot);
                 self.next_seq = head;
-                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
@@ -154,7 +152,6 @@ impl<T: Clone> Receiver<T> {
             if slot_seq != self.next_seq {
                 drop(slot);
                 self.next_seq = head;
-                coop.made_progress();
                 return Poll::Ready(Err(RecvError::Lagged(head)));
             }
 
@@ -162,8 +159,8 @@ impl<T: Clone> Receiver<T> {
             if let Some(v) = &slot.val {
                 let out = v.clone();
                 drop(slot);
-                self.next_seq += 1;
                 coop.made_progress();
+                self.next_seq += 1;
                 return Poll::Ready(Ok(out));
             }
 
@@ -171,7 +168,6 @@ impl<T: Clone> Receiver<T> {
             // Seq was correct but value missing — treat as lag
             drop(slot);
             self.next_seq = head;
-            coop.made_progress();
             return Poll::Ready(Err(RecvError::Lagged(head)));
         }
     }

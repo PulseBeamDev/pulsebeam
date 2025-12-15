@@ -84,22 +84,22 @@ pub async fn run(
     );
     join_set.spawn(ignore(gateway_task));
 
-    let shard_count = 2 * workers;
-    let mut shard_handles = Vec::with_capacity(shard_count);
-
-    for i in 0..shard_count {
-        let (shard, shard_task) =
-            actor::prepare(shard::ShardActor::new(i), RunnerConfig::default());
-        join_set.spawn(ignore(shard_task));
-        shard_handles.push(shard);
-    }
+    // let shard_count = 2 * workers;
+    // let mut shard_handles = Vec::with_capacity(shard_count);
+    //
+    // for i in 0..shard_count {
+    //     let (shard, shard_task) =
+    //         actor::prepare(shard::ShardActor::new(i), RunnerConfig::default());
+    //     join_set.spawn(ignore(shard_task));
+    //     shard_handles.push(shard);
+    // }
 
     let rng = rand::Rng::from_os_rng();
     let node_ctx = NodeContext {
         rng,
         gateway,
         sockets,
-        shards: shard_handles,
+        shards: vec![],
         egress_counter: Arc::new(AtomicUsize::new(0)),
     };
 
