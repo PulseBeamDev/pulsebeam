@@ -1,11 +1,30 @@
 IFACE ?= lo
 
 .PHONY: all help \
+	net-tune \
 	net-apply net-clear net-status net-verify \
 	net-good-home-wifi net-congested-wifi net-stable-mobile net-lte-1bar \
 	net-cross-continent net-unusable
 
 all: help
+
+net-tune:
+	@echo "Applying socket tuning for interface $(NIC)..."
+	@sudo sysctl -w net.core.wmem_max=134217728
+	@sudo sysctl -w net.core.rmem_max=134217728
+	# Enable hardware GRO (or hypervisor-assisted)
+	@sudo ethtool -K $(NIC) rx-gro-hw on || true
+	# Enable software GRO as fallback
+	@sudo ethtool -K $(NIC) gro on || true
+	# Use fragment-based skbs (lower latency, safer in virtio/cloud)
+	@sudo ethtool -K $(NIC) rx-gro-list off || true
+	@sudo ethtool -K $(NIC) rx-udp-gro-forwarding on || true
+	# Enable generic segmentation offload for TCP/UDP GSO
+	@sudo ethtool -K $(NIC) gso on || true
+	@sudo ethtool -K $(NIC) tx-gso-partial on || true
+	@echo "Current GRO/GSO settings for $(NIC):"
+	@ethtool -k $(NIC) | grep -E "gro|gso|segmentation|scatter"
+	@echo "✅ Socket tuning applied successfully."
 
 # net-apply: Applies network simulation with AUTOMATIC handling of localhost double-counting
 # Presets should specify TARGET_RTT and jitter as if measuring end-to-end
