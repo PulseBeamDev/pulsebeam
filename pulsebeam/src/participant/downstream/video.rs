@@ -358,8 +358,12 @@ impl Slot {
 
     fn request_keyframe(&self, kind: KeyframeRequestKind) {
         match self.state() {
-            SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => {
+            SlotState::Resuming { staging } => {
                 staging.request_keyframe(kind);
+            }
+            // We're not requesting staging stream since we're currently streaming active.
+            SlotState::Switching { active, .. } => {
+                active.request_keyframe(kind);
             }
             SlotState::Streaming { active } => {
                 active.request_keyframe(kind);
