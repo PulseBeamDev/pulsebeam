@@ -11,7 +11,7 @@ use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::rtp::depacketizer::H264Depacketizer;
+use crate::rtp::keyframe_detector::H264KeyframeDetector;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
@@ -77,7 +77,7 @@ pub struct SimulcastSender {
     channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
     keyframe_requests: Option<mpsc::Receiver<KeyframeRequestKind>>,
-    depacketizer: H264Depacketizer,
+    keyframe_detector: H264KeyframeDetector,
 }
 
 impl SimulcastSender {
@@ -91,8 +91,8 @@ impl SimulcastSender {
 
     fn forward(&mut self, pkt: RtpPacket) {
         // RTP Pipeline
-        let pkt = self.synchronizer.process(pkt);
-        self.depacketizer.depacketize(&pkt.payload, out, extra)
+        let mut pkt = self.synchronizer.process(pkt);
+        // pkt.is_keyframe_start = self.keyframe_detector.process_packet(&pkt);
         self.monitor
             .process_packet(&pkt, pkt.payload.len() + pkt.raw_header.header_len);
         if (self.filter)(&pkt) {
@@ -246,6 +246,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
             channel: tx,
             keyframe_requests: Some(keyframe_rx),
             monitor,
+            keyframe_detector: H264KeyframeDetector::new(),
         });
         receivers.push(SimulcastReceiver {
             meta: meta.clone(),

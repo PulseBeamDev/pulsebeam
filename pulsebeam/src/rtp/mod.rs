@@ -1,5 +1,5 @@
 pub mod buffer;
-pub mod depacketizer;
+pub mod keyframe_detector;
 pub mod monitor;
 pub mod switcher;
 pub mod sync;
@@ -67,7 +67,7 @@ impl Default for RtpPacket {
 impl RtpPacket {
     pub fn from_str0m(rtp: str0m::rtp::RtpPacket, codec: Codec) -> Self {
         let is_keyframe_start = match codec {
-            Codec::H264 => false,
+            Codec::H264 => is_h264_keyframe_start(&rtp.payload),
             Codec::VP8 => is_vp8_keyframe_start(&rtp.payload),
             Codec::VP9 => is_vp9_keyframe_start(&rtp.payload),
             Codec::Opus => true, // audio frame has not dependencies,
@@ -91,121 +91,82 @@ impl RtpPacket {
     }
 }
 
-// adapted from Galene, https://github.com/jech/galene/blob/e09b135cd2ff240626b8619913bb9b2b3bba242b/codecs/codecs.go
-fn is_h264_keyframe_start(payload: &[u8]) -> bool {
+/// Checks if an H.264 RTP packet contains the start of a keyframe sequence.
+///
+/// This function is stateless and looks for "Anchor" NAL units:
+/// - IDR (5): The keyframe image data.
+/// - SPS (7) / PPS (8): Configuration data (Self-synchronizing).
+/// - AUD (9) / SEI (6): Preamble data that strictly precedes a keyframe.
+///
+/// It handles:
+/// 1. Single NAL Units.
+/// 2. STAP-A (Type 24): Checks the first NAL in the bundle (common in WebRTC).
+/// 3. FU-A (Type 28): Checks if it is the 'Start' fragment of a keyframe NAL.
+pub fn is_h264_keyframe_start(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
     }
 
-    let nal_unit_type = payload[0] & 0x1F;
+    // --- Constants Definitions ---
+    const NAL_IDR: u8 = 5;
+    const NAL_SEI: u8 = 6;
+    const NAL_SPS: u8 = 7;
+    const NAL_PPS: u8 = 8;
+    const NAL_AUD: u8 = 9;
 
-    match nal_unit_type {
-        1..=23 => {
-            // Single NAL unit packet
-            nal_unit_type == 5 // IDR slice
-        }
-        28 => {
-            // FU-A (fragmented NAL unit)
-            if payload.len() < 2 {
-                return false;
-            }
-            let fu_header = payload[1];
-            let start_bit = fu_header & 0x80 != 0;
-            let original_nal_type = fu_header & 0x1F;
-            start_bit && original_nal_type == 5
-        }
-        _ => false, // Other types (STAP-A, etc.)
-    }
-}
+    const NAL_STAPA: u8 = 24;
+    const NAL_FUA: u8 = 28;
 
-fn is_h264_keyframe_start_old(payload: &[u8]) -> bool {
-    if payload.is_empty() {
-        return false;
-    }
+    const NAL_TYPE_MASK: u8 = 0x1F;
+    const FU_START_BITMASK: u8 = 0x80;
 
-    let header = payload[0];
-    let nalu_type = header & 0x1F;
+    // Helper to check if a raw NAL type is an anchor candidate
+    let is_anchor =
+        |t: u8| -> bool { matches!(t, NAL_IDR | NAL_SEI | NAL_SPS | NAL_PPS | NAL_AUD) };
 
-    // NAL unit type constants
-    const IDR: u8 = 5;
-    const SPS: u8 = 7;
-    const PPS: u8 = 8;
-    const STAP_A: u8 = 24;
-    const FU_A: u8 = 28;
+    // --- Logic ---
 
-    match nalu_type {
-        // Single NAL Units - IDR is a keyframe, SPS/PPS typically precede keyframes
-        IDR => true,
-        SPS | PPS => true,
+    let b0 = payload[0];
+    let nal_type = b0 & NAL_TYPE_MASK;
 
-        // STAP-A (Single-Time Aggregation Packet Type A)
-        STAP_A => check_stap_a_for_keyframe(payload),
-
-        // FU-A (Fragmentation Unit Type A)
-        FU_A => check_fu_a_for_keyframe(payload),
-
-        _ => false,
-    }
-}
-
-fn check_stap_a_for_keyframe(payload: &[u8]) -> bool {
-    const IDR: u8 = 5;
-    const SPS: u8 = 7;
-    const PPS: u8 = 8;
-
-    if payload.len() < 3 {
-        return false;
+    // 1. Single NAL Unit Case
+    if is_anchor(nal_type) {
+        return true;
     }
 
-    let mut offset = 1; // Skip STAP-A header
-
-    // Iterate through all aggregated NAL units
-    while offset + 2 <= payload.len() {
-        // Read NAL size (16-bit big-endian)
-        let nal_size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
-        offset += 2;
-
-        // Validate bounds
-        if offset >= payload.len() || offset + nal_size > payload.len() {
+    // 2. STAP-A Case (Aggregation Packet)
+    // Format: [STAP Header (1)] [Size (2)] [NAL Header (1)] ...
+    // WebRTC often bundles [SPS, PPS, IDR] here. We only need to check the first one.
+    if nal_type == NAL_STAPA {
+        if payload.len() < 4 {
             return false;
         }
+        let first_nal_header = payload[3];
+        let first_nal_type = first_nal_header & NAL_TYPE_MASK;
 
-        // Check NAL unit type
-        let nal_header = payload[offset];
-        let nal_type = nal_header & 0x1F;
-
-        if nal_type == IDR || nal_type == SPS || nal_type == PPS {
+        if is_anchor(first_nal_type) {
             return true;
         }
+    }
 
-        offset += nal_size;
+    // 3. FU-A Case (Fragmentation Unit)
+    // Format: [FU Indicator (1)] [FU Header (1)] ...
+    // We only care if this is the *Start* of a fragmented anchor NAL.
+    if nal_type == NAL_FUA {
+        if payload.len() < 2 {
+            return false;
+        }
+        let fu_header = payload[1];
+
+        let is_start = (fu_header & FU_START_BITMASK) != 0;
+        let original_type = fu_header & NAL_TYPE_MASK;
+
+        if is_start && is_anchor(original_type) {
+            return true;
+        }
     }
 
     false
-}
-
-fn check_fu_a_for_keyframe(payload: &[u8]) -> bool {
-    const IDR: u8 = 5;
-    const SPS: u8 = 7;
-    const PPS: u8 = 8;
-
-    if payload.len() < 2 {
-        return false;
-    }
-
-    // FU-A structure:
-    // Byte 0: FU indicator (NAL header with type = 28)
-    // Byte 1: FU header
-    //   Bit 7: Start bit (S)
-    //   Bit 6: End bit (E)
-    //   Bit 5: Reserved
-    //   Bits 4-0: NAL unit type
-    let fu_header = payload[1];
-    let start_bit = (fu_header & 0x80) != 0;
-    let original_type = fu_header & 0x1F;
-
-    // Only the FIRST fragment (start_bit = true) of an IDR/SPS/PPS is a keyframe start
-    start_bit && (original_type == IDR || original_type == SPS || original_type == PPS)
 }
 
 fn is_vp8_keyframe_start(payload: &[u8]) -> bool {
