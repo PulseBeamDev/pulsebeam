@@ -108,10 +108,10 @@ impl VideoAllocator {
         const MIN_BANDWIDTH: f64 = 300_000.0;
 
         struct SlotPlan<'a> {
-            slot_idx: usize,
             current_receiver: &'a SimulcastReceiver,
             target_receiver: &'a SimulcastReceiver,
-            total_cost: f64,
+            current_bitrate: f64,
+            desired_bitrate: f64,
             paused: bool,
             commited: bool,
         }
@@ -122,10 +122,11 @@ impl VideoAllocator {
 
         // Sort by priority (max_height) - higher priority slots first
         self.slots.sort_by_key(|s| std::cmp::Reverse(s.max_height));
+        let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
 
         // Step 1: Start everyone at lowest quality
         let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.slots.len());
-        for (slot_idx, slot) in self.slots.iter_mut().enumerate() {
+        for slot in &self.slots {
             let Some(current_receiver) = slot.target_receiver() else {
                 continue;
             };
@@ -135,23 +136,22 @@ impl VideoAllocator {
             };
 
             let lowest = state.track.lowest_quality();
+            let current_bitrate = current_receiver.state.bitrate_bps();
+            let paused = current_bitrate > budget;
 
             slot_plans.push(SlotPlan {
-                slot_idx,
                 current_receiver,
                 target_receiver: lowest,
-                paused: slot.is_paused(),
-                commited: false,
+                current_bitrate,
+                desired_bitrate: current_bitrate,
+                paused,
+                commited: paused, // if we're pausing, we're commited
             });
         }
 
         // Step 2: Upgrade slots one step at a time in priority order
         // Keep looping until no more upgrades can be made
         let mut made_progress = true;
-        let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
-        let mut total_allocated = 0.0;
-        let mut total_desired = 0.0;
-
         while made_progress {
             made_progress = false;
 
@@ -189,45 +189,34 @@ impl VideoAllocator {
                     }
                 };
 
-                let desired_bitrate = desired_receiver.state.bitrate_bps();
-                if desired_bitrate > budget {
+                let desired_bitrate =
+                    desired_receiver.state.bitrate_bps() * UPGRADE_HYSTERESIS_FACTOR;
+
+                let upgrade_cost = if desired_bitrate > plan.current_bitrate {
+                    desired_bitrate - plan.current_bitrate
+                } else {
+                    0.0
+                };
+
+                if upgrade_cost > budget {
                     continue;
                 }
 
-                // Get current allocated bitrate
-                let current_cost = state
-                    .track
-                    .by_quality(plan.allocated_quality)
-                    .map(|r| r.state.bitrate_bps())
-                    .unwrap_or(0.0);
-
-                let next_cost = next_quality.state.bitrate_bps();
-                let upgrade_cost = next_cost - current_cost;
-
-                if total_allocated + upgrade_cost <= budget
-                    && (plan.paused || next_quality.rid != plan.current_receiver.rid)
-                {
-                    // Upgrade this slot
-                    total_allocated += upgrade_cost;
-                    plan.allocated_quality = next_quality.quality;
-                    made_progress = true;
-                }
+                // we might upgrade again
+                plan.commited = false;
+                plan.current_bitrate += upgrade_cost;
+                budget -= upgrade_cost;
             }
         }
 
         // Step 3: Apply the allocations
-        for plan in slot_plans.drain(..) {
-            if plan.allocated_quality != plan.current_receiver.quality {
-                // Need to get the actual receiver to switch to
-                let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
-                    continue;
-                };
-
-                if let Some(allocated_receiver) = state.track.by_quality(plan.allocated_quality) {
-                    let slot = &mut self.slots[plan.slot_idx];
-                    slot.switch_to(allocated_receiver.clone());
-                }
-            }
+        let mut total_allocated = 0.0;
+        let mut total_desired = 0.0;
+        for (idx, plan) in slot_plans.drain(..).enumerate() {
+            let slot = &mut self.slots[idx];
+            slot.switch_to(plan.target_receiver.clone());
+            total_allocated += plan.current_bitrate;
+            total_desired += plan.desired_bitrate;
         }
 
         let total_allocated = Bitrate::from(total_allocated);
