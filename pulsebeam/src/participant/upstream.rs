@@ -43,7 +43,7 @@ impl UpstreamAllocator {
     ) {
         if let Some(track) = self.published_tracks.get_mut(&mid) {
             rtp.raw_header.ext_vals.rid = rid.cloned();
-            track.push(rid, rtp);
+            track.forward(rid, rtp);
         } else {
             tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }

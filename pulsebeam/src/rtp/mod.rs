@@ -101,11 +101,6 @@ impl RtpPacket {
 /// - PPS (8): Picture Parameter Set (Critical configuration)
 /// - AUD (9): Access Unit Delimiter (Marks the start of a frame)
 /// - SEI (6): Supplemental Enhancement Information (Often precedes keyframes)
-///
-/// It correctly handles:
-/// 1. Single NAL Units.
-/// 2. FU-A (Fragmentation): Only checks the 'Start' packet of a fragmented keyframe NAL.
-/// 3. STAP-A (Aggregation): Iterates through *every* NAL unit inside the bundle.
 pub fn is_h264_keyframe_start(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
