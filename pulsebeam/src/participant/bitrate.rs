@@ -6,6 +6,7 @@ use tokio::time::Instant;
 pub struct BitrateControllerConfig {
     pub min_bitrate: Bitrate,
     pub max_bitrate: Bitrate,
+    pub default_bitrate: Bitrate,
     pub headroom: f64,           // fraction of available bandwidth to target
     pub tau: f64,                // EMA smoothing constant (s)
     pub max_ramp_up: Bitrate,    // max increase per second
@@ -20,12 +21,13 @@ impl Default for BitrateControllerConfig {
         Self {
             min_bitrate: Bitrate::kbps(300),
             max_bitrate: Bitrate::mbps(5),
+            default_bitrate: Bitrate::mbps(1),
 
             // Headroom: 15% is a safe and standard value.
             headroom: 0.85,
 
             // EMA smoothing
-            tau: 1.0,
+            tau: 1.5,
 
             // Ramp limits (per second): Be aggressive in our reactions.
             // Allow ramping up reasonably fast to achieve good quality in a few seconds.
@@ -36,21 +38,21 @@ impl Default for BitrateControllerConfig {
 
             // Hysteresis: Require a SIGNIFICANT and sustained improvement before upgrading.
             // A 15% increase in the smoothed, headroom-adjusted target is a strong signal.
-            hysteresis_up: 1.0,
+            hysteresis_up: 1.15,
 
             // Be slightly more sensitive to decreases. A 15% drop is also a clear signal.
             hysteresis_down: 0.85,
 
             // Hold time: After a change, wait a bit longer to observe its effect on the network.
             // This prevents the controller from chasing noisy BWE feedback too quickly.
-            min_hold_time: Duration::ZERO,
+            min_hold_time: Duration::from_millis(500),
         }
     }
 }
 
 impl BitrateControllerConfig {
     pub fn build(self) -> BitrateController {
-        let init = self.min_bitrate;
+        let init = self.default_bitrate;
         BitrateController::new(self, init, Instant::now())
     }
 }
@@ -139,6 +141,7 @@ mod tests {
         let config = BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(100),
             max_bitrate: Bitrate::mbps(2),
+            default_bitrate: Bitrate::kbps(100),
             headroom: 0.85,
             tau: 1.0,
             max_ramp_up: Bitrate::kbps(50),

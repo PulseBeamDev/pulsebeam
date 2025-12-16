@@ -1,6 +1,7 @@
 mod audio;
 mod video;
 
+use crate::participant::bitrate::BitrateController;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
@@ -13,7 +14,7 @@ use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 
 pub struct DownstreamAllocator {
-    available_bandwidth: Bitrate,
+    available_bandwidth: BitrateController,
 
     audio: AudioAllocator,
     video: VideoAllocator,
@@ -22,7 +23,7 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new() -> Self {
         Self {
-            available_bandwidth: Bitrate::mbps(1),
+            available_bandwidth: BitrateController::default(),
             audio: AudioAllocator::new(),
             video: VideoAllocator::default(),
         }
@@ -51,12 +52,14 @@ impl DownstreamAllocator {
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
-        self.available_bandwidth = available_bandwidth;
+        self.available_bandwidth
+            .update(available_bandwidth, Instant::now());
         self.update_allocations()
     }
 
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        self.video.update_allocations(self.available_bandwidth)
+        self.video
+            .update_allocations(self.available_bandwidth.current())
     }
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {

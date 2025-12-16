@@ -113,10 +113,10 @@ impl VideoAllocator {
             current_bitrate: f64,
             desired_bitrate: f64,
             paused: bool,
-            commited: bool,
+            committed: bool,
         }
 
-        struct CommitedSlotPlan {
+        struct CommittedSlotPlan {
             receiver: SimulcastReceiver,
             paused: bool,
         }
@@ -141,16 +141,25 @@ impl VideoAllocator {
             };
 
             let lowest = state.track.lowest_quality();
-            let current_bitrate = current_receiver.state.bitrate_bps();
-            let paused = current_bitrate > budget;
+            let lowest_bitrate = lowest.state.bitrate_bps();
+
+            // Apply downgrade hysteresis if we need to downgrade
+            let needs_downgrade = lowest.quality < current_receiver.quality;
+            let effective_bitrate = if needs_downgrade {
+                lowest_bitrate * DOWNGRADE_HYSTERESIS_FACTOR
+            } else {
+                lowest_bitrate
+            };
+
+            let paused = effective_bitrate > budget;
 
             slot_plans.push(SlotPlan {
                 current_receiver,
                 target_receiver: lowest,
-                current_bitrate,
-                desired_bitrate: current_bitrate,
+                current_bitrate: effective_bitrate,
+                desired_bitrate: effective_bitrate,
                 paused,
-                commited: paused, // if we're pausing, we're committed
+                committed: paused, // if we're pausing, we're committed
             });
         }
 
@@ -161,12 +170,12 @@ impl VideoAllocator {
             made_progress = false;
 
             for plan in &mut slot_plans {
-                if plan.commited {
+                if plan.committed {
                     continue;
                 }
 
-                // if any executes continue, we assume that the plan is commited
-                plan.commited = true;
+                // if any executes continue, we assume that the plan is committed
+                plan.committed = true;
 
                 if plan.current_receiver.state.is_inactive() {
                     continue;
@@ -194,11 +203,12 @@ impl VideoAllocator {
                     }
                 };
 
-                let desired_bitrate =
-                    desired_receiver.state.bitrate_bps() * UPGRADE_HYSTERESIS_FACTOR;
+                // Apply upgrade hysteresis
+                let desired_bitrate = desired_receiver.state.bitrate_bps();
+                let threshold_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
 
-                let upgrade_cost = if desired_bitrate > plan.current_bitrate {
-                    desired_bitrate - plan.current_bitrate
+                let upgrade_cost = if threshold_bitrate > plan.current_bitrate {
+                    threshold_bitrate - plan.current_bitrate
                 } else {
                     0.0
                 };
@@ -208,9 +218,16 @@ impl VideoAllocator {
                     continue;
                 }
 
-                // we might upgrade again
-                plan.commited = false;
-                plan.current_bitrate += upgrade_cost;
+                let bitrate_cost = if desired_bitrate > plan.current_bitrate {
+                    desired_bitrate - plan.current_bitrate
+                } else {
+                    0.0
+                };
+
+                // Grant the upgrade
+                made_progress = true;
+                plan.committed = false; // we might upgrade again
+                plan.current_bitrate += bitrate_cost;
                 plan.target_receiver = desired_receiver;
                 budget -= upgrade_cost;
             }
@@ -223,7 +240,7 @@ impl VideoAllocator {
         for plan in slot_plans.drain(..) {
             total_allocated += plan.current_bitrate;
             total_desired += plan.desired_bitrate;
-            committed.push(CommitedSlotPlan {
+            committed.push(CommittedSlotPlan {
                 receiver: plan.target_receiver.clone(),
                 paused: plan.paused,
             });
