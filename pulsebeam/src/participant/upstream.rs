@@ -7,7 +7,7 @@ use str0m::media::{Mid, Rid};
 
 use crate::track::TrackSender;
 
-const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(300);
+const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 type StreamKey = (Mid, Option<Rid>);
 
 pub struct UpstreamAllocator {
