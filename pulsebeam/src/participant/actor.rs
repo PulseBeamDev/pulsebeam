@@ -142,7 +142,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
                 // Priority 4: Background tasks
                 now = stats_interval.tick() => {
-                    self.core.poll_stats(now);
+                    self.core.poll_slow(now);
                 }
                 _ = &mut rtc_timer => {
                     new_deadline = self.core.handle_timeout();

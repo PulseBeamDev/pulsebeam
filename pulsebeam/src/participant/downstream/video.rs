@@ -200,7 +200,13 @@ impl VideoAllocator {
         slot.request_keyframe(req.kind);
     }
 
-    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+    pub fn poll_slow(&mut self, now: Instant) {
+        for slot in &mut self.slots {
+            slot.poll_slow(now);
+        }
+    }
+
+    pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
         if self.slots.is_empty() {
             self.waker.replace(cx.waker().clone());
             return Poll::Pending;
@@ -213,7 +219,7 @@ impl VideoAllocator {
             }
 
             let slot = &mut self.slots[self.rr_cursor];
-            match slot.poll_next(cx) {
+            match slot.poll_fast(cx) {
                 Poll::Ready(Some(pkt)) => {
                     // ensure each frame to be flushed before moving to another stream,
                     // allows related contexts to stay in L1/L2 caches longer.
@@ -333,7 +339,6 @@ impl Slot {
             track = %receiver.meta.id,
             "switch_to: initiating switch"
         );
-        let old_state_str = old_state.to_string();
         let new_state = match old_state {
             SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
 
@@ -396,7 +401,7 @@ impl Slot {
         }
     }
 
-    fn poll_slow(&mut self) {
+    fn poll_slow(&mut self, now: Instant) {
         let Some(started_at) = self.switching_started_at else {
             return;
         };
@@ -406,7 +411,6 @@ impl Slot {
         }
 
         let deadline = started_at + Duration::from_secs(1) * self.keyframe_req_count;
-        let now = Instant::now();
         if deadline > now {
             return;
         }
@@ -430,8 +434,7 @@ impl Slot {
         self.state = Some(new_state);
     }
 
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
-        self.poll_slow();
+    fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
         loop {
             if let Some(pkt) = self.switcher.pop() {
                 return Poll::Ready(Some(pkt));

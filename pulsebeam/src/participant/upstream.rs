@@ -49,7 +49,7 @@ impl UpstreamAllocator {
         }
     }
 
-    pub fn poll_stats(&mut self, now: Instant) {
+    pub fn poll_slow(&mut self, now: Instant) {
         self.published_tracks
             .values_mut()
             .for_each(|track| track.poll_stats(now));

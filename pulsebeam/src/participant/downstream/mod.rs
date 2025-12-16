@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
+use tokio::time::Instant;
 
 pub struct DownstreamAllocator {
     available_bandwidth: Bitrate,
@@ -62,12 +63,16 @@ impl DownstreamAllocator {
         self.video.handle_keyframe_request(req);
     }
 
-    pub fn poll_next_unpin(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+    pub fn poll_slow(&mut self, now: Instant) {
+        self.video.poll_slow(now);
+    }
+
+    pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
         if let Poll::Ready(item) = self.audio.poll_next(cx) {
             return Poll::Ready(item);
         }
 
-        self.video.poll_next(cx)
+        self.video.poll_fast(cx)
     }
 }
 
@@ -75,6 +80,6 @@ impl Stream for DownstreamAllocator {
     type Item = (Mid, RtpPacket);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().poll_next_unpin(cx)
+        self.get_mut().poll_fast(cx)
     }
 }
