@@ -1,5 +1,4 @@
 pub mod buffer;
-pub mod keyframe_detector;
 pub mod monitor;
 pub mod switcher;
 pub mod sync;

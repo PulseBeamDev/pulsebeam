@@ -198,6 +198,13 @@ impl TrackReceiver {
             .min_by_key(|s| s.quality)
             .expect("no lowest quality, there must be at least 1 layer for TrackReceiver to exist")
     }
+
+    pub fn highest_quality(&self) -> &SimulcastReceiver {
+        self.simulcast
+            .iter()
+            .max_by_key(|s| s.quality)
+            .expect("no highest quality, there must be at least 1 layer for TrackReceiver to exist")
+    }
 }
 
 pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
