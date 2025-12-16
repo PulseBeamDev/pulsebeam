@@ -3,6 +3,7 @@ use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::task::Waker;
 use std::task::{Context, Poll};
@@ -253,6 +254,20 @@ enum SlotState {
     },
 }
 
+impl Display for SlotState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self {
+            Self::Idle => "idle",
+            Self::Paused { .. } => "paused",
+            Self::Resuming { .. } => "resuming",
+            Self::Streaming { .. } => "streaming",
+            Self::Switching { .. } => "switching",
+        };
+
+        f.write_str(state)
+    }
+}
+
 struct Slot {
     mid: Mid,
     max_height: u32,
@@ -301,15 +316,16 @@ impl Slot {
         // Take ownership of state to move internals
         let old_state = self.state.take().unwrap_or(SlotState::Idle);
 
+        receiver.channel.reset();
+        receiver.request_keyframe(KeyframeRequestKind::Fir);
+
         tracing::info!(
             mid = %self.mid,
             to_rid = ?receiver.rid,
             track = %receiver.meta.id,
             "switch_to: initiating switch"
         );
-        receiver.channel.reset();
-        receiver.request_keyframe(KeyframeRequestKind::Fir);
-
+        let old_state_str = old_state.to_string();
         let new_state = match old_state {
             SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
 
@@ -336,6 +352,7 @@ impl Slot {
             }
         };
 
+        tracing::info!("new_state: {} -> {}", old_state_str, new_state);
         self.state = Some(new_state);
         self.switcher.clear();
 

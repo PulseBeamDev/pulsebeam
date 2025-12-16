@@ -673,7 +673,7 @@ impl DeltaDeltaState {
             if (new_duration - self.frame_duration_ms_ewma).abs() > 0.1 {
                 let from = self.frame_duration_ms_ewma * INACTIVE_TIMEOUT_MULTIPLIER as f64;
                 let to = new_duration * INACTIVE_TIMEOUT_MULTIPLIER as f64;
-                tracing::debug!("new inactivity timeout: {:.3}ms -> {:.3}ms", from, to);
+                tracing::trace!("new inactivity timeout: {:.3}ms -> {:.3}ms", from, to);
             }
             self.frame_duration_ms_ewma = new_duration;
         }

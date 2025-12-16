@@ -8,9 +8,10 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::rtp::depacketizer::H264Depacketizer;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
@@ -60,7 +61,9 @@ pub struct SimulcastReceiver {
 
 impl SimulcastReceiver {
     pub fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        self.keyframe_requester.try_send(kind);
+        if let Err(err) = self.keyframe_requester.try_send(kind) {
+            tracing::warn!("failed to request keyframe: {err:?}");
+        }
     }
 }
 
@@ -74,6 +77,7 @@ pub struct SimulcastSender {
     channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
     keyframe_requests: Option<mpsc::Receiver<KeyframeRequestKind>>,
+    depacketizer: H264Depacketizer,
 }
 
 impl SimulcastSender {
@@ -88,6 +92,7 @@ impl SimulcastSender {
     fn forward(&mut self, pkt: RtpPacket) {
         // RTP Pipeline
         let pkt = self.synchronizer.process(pkt);
+        self.depacketizer.depacketize(&pkt.payload, out, extra)
         self.monitor
             .process_packet(&pkt, pkt.payload.len() + pkt.raw_header.header_len);
         if (self.filter)(&pkt) {

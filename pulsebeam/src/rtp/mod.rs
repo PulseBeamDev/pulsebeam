@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod depacketizer;
 pub mod monitor;
 pub mod switcher;
 pub mod sync;
@@ -66,7 +67,7 @@ impl Default for RtpPacket {
 impl RtpPacket {
     pub fn from_str0m(rtp: str0m::rtp::RtpPacket, codec: Codec) -> Self {
         let is_keyframe_start = match codec {
-            Codec::H264 => is_h264_keyframe_start(&rtp.payload),
+            Codec::H264 => false,
             Codec::VP8 => is_vp8_keyframe_start(&rtp.payload),
             Codec::VP9 => is_vp9_keyframe_start(&rtp.payload),
             Codec::Opus => true, // audio frame has not dependencies,
@@ -92,80 +93,119 @@ impl RtpPacket {
 
 // adapted from Galene, https://github.com/jech/galene/blob/e09b135cd2ff240626b8619913bb9b2b3bba242b/codecs/codecs.go
 fn is_h264_keyframe_start(payload: &[u8]) -> bool {
-    let nalu = payload[0] & 0x1F;
-
-    if nalu == 0 {
-        // Reserved
+    if payload.is_empty() {
         return false;
-    } else if nalu <= 23 {
-        // Simple NALU.
-        return nalu == 7;
-    } else if nalu >= 24 && nalu <= 27 {
-        // STAP-A (24), STAP-B (25), MTAP16 (26), MTAP24 (27)
-        let mut i = 1;
+    }
 
-        // Skip DON (Decoding Order Number) for STAP-B, MTAP16, MTAP24
-        if nalu == 25 || nalu == 26 || nalu == 27 {
-            i += 2;
+    let nal_unit_type = payload[0] & 0x1F;
+
+    match nal_unit_type {
+        1..=23 => {
+            // Single NAL unit packet
+            nal_unit_type == 5 // IDR slice
         }
-
-        while i < payload.len() {
-            // Need at least 2 bytes for length
-            if i + 2 > payload.len() {
+        28 => {
+            // FU-A (fragmented NAL unit)
+            if payload.len() < 2 {
                 return false;
             }
-
-            // Read big-endian u16 length
-            let length = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-            i += 2;
-
-            if i + length > payload.len() {
-                return false;
-            }
-
-            let mut offset = 0;
-            if nalu == 26 {
-                offset = 3; // MTAP16 TS offset
-            } else if nalu == 27 {
-                offset = 4; // MTAP24 TS offset
-            }
-
-            if offset >= length {
-                // Malformed or empty NALU inside
-                return false;
-            }
-
-            let inner_nalu_header = payload[i + offset];
-            let n = inner_nalu_header & 0x1F;
-
-            // STRICT PORT: Only checking for SPS (7)
-            if n == 7 {
-                return true;
-            } else if n >= 24 {
-                // Illegal nested aggregation
-                return false;
-            }
-
-            i += length;
+            let fu_header = payload[1];
+            let start_bit = fu_header & 0x80 != 0;
+            let original_nal_type = fu_header & 0x1F;
+            start_bit && original_nal_type == 5
         }
+        _ => false, // Other types (STAP-A, etc.)
+    }
+}
+
+fn is_h264_keyframe_start_old(payload: &[u8]) -> bool {
+    if payload.is_empty() {
         return false;
-    } else if nalu == 28 || nalu == 29 {
-        // FU-A (28) or FU-B (29)
-        if payload.len() < 2 {
+    }
+
+    let header = payload[0];
+    let nalu_type = header & 0x1F;
+
+    // NAL unit type constants
+    const IDR: u8 = 5;
+    const SPS: u8 = 7;
+    const PPS: u8 = 8;
+    const STAP_A: u8 = 24;
+    const FU_A: u8 = 28;
+
+    match nalu_type {
+        // Single NAL Units - IDR is a keyframe, SPS/PPS typically precede keyframes
+        IDR => true,
+        SPS | PPS => true,
+
+        // STAP-A (Single-Time Aggregation Packet Type A)
+        STAP_A => check_stap_a_for_keyframe(payload),
+
+        // FU-A (Fragmentation Unit Type A)
+        FU_A => check_fu_a_for_keyframe(payload),
+
+        _ => false,
+    }
+}
+
+fn check_stap_a_for_keyframe(payload: &[u8]) -> bool {
+    const IDR: u8 = 5;
+    const SPS: u8 = 7;
+    const PPS: u8 = 8;
+
+    if payload.len() < 3 {
+        return false;
+    }
+
+    let mut offset = 1; // Skip STAP-A header
+
+    // Iterate through all aggregated NAL units
+    while offset + 2 <= payload.len() {
+        // Read NAL size (16-bit big-endian)
+        let nal_size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+
+        // Validate bounds
+        if offset >= payload.len() || offset + nal_size > payload.len() {
             return false;
         }
-        let fu_header = payload[1];
 
-        // Check Start Bit (0x80)
-        if (fu_header & 0x80) == 0 {
-            return false;
+        // Check NAL unit type
+        let nal_header = payload[offset];
+        let nal_type = nal_header & 0x1F;
+
+        if nal_type == IDR || nal_type == SPS || nal_type == PPS {
+            return true;
         }
 
-        // STRICT PORT: Check if the original NALU type was 7 (SPS)
-        return (fu_header & 0x1F) == 7;
+        offset += nal_size;
     }
 
     false
+}
+
+fn check_fu_a_for_keyframe(payload: &[u8]) -> bool {
+    const IDR: u8 = 5;
+    const SPS: u8 = 7;
+    const PPS: u8 = 8;
+
+    if payload.len() < 2 {
+        return false;
+    }
+
+    // FU-A structure:
+    // Byte 0: FU indicator (NAL header with type = 28)
+    // Byte 1: FU header
+    //   Bit 7: Start bit (S)
+    //   Bit 6: End bit (E)
+    //   Bit 5: Reserved
+    //   Bits 4-0: NAL unit type
+    let fu_header = payload[1];
+    let start_bit = (fu_header & 0x80) != 0;
+    let original_type = fu_header & 0x1F;
+
+    // Only the FIRST fragment (start_bit = true) of an IDR/SPS/PPS is a keyframe start
+    start_bit && (original_type == IDR || original_type == SPS || original_type == PPS)
 }
 
 fn is_vp8_keyframe_start(payload: &[u8]) -> bool {
