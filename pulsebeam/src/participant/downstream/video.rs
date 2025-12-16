@@ -316,7 +316,7 @@ impl Slot {
         // Take ownership of state to move internals
         let old_state = self.state.take().unwrap_or(SlotState::Idle);
 
-        // receiver.channel.reset();
+        receiver.channel.reset();
         receiver.request_keyframe(KeyframeRequestKind::Fir);
 
         tracing::info!(

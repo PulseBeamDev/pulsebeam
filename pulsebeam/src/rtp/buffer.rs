@@ -50,12 +50,15 @@ impl KeyframeBuffer {
         // true
     }
 
-    fn reset_to(&mut self, seq_no: SeqNo) {
-        tracing::debug!("reset to {}", seq_no);
+    pub fn reset_to(&mut self, seq_no: SeqNo) {
         self.head = seq_no.wrapping_add(1).into();
         self.tail = seq_no;
         self.ring.fill(None);
         self.segment.take();
+    }
+
+    pub fn clear(&mut self) {
+        self.reset_to(0.into());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -63,6 +66,8 @@ impl KeyframeBuffer {
     }
 
     pub fn push(&mut self, pkt: RtpPacket) {
+        let hex: String = pkt.payload.encode_hex();
+        // tracing::debug!(">>>{}:{}={}", pkt.raw_header.ssrc, pkt.seq_no, hex);
         if !self.initialized {
             self.reset_to(pkt.seq_no);
             self.initialized = true;

@@ -104,11 +104,13 @@ impl SimulcastSender {
         let stream = self.keyframe_requests.take().unwrap();
         let rid = self.rid;
         let mid = self.mid;
-        let watch_stream = ReceiverStream::new(stream);
-        let debounced = LeadingEdgeDebounce::new(watch_stream, debounce)
-            .map(move |kind| KeyframeRequest { kind, rid, mid });
+        let watch_stream =
+            ReceiverStream::new(stream).map(move |kind| KeyframeRequest { kind, rid, mid });
 
-        Box::pin(debounced)
+        // let debounced = LeadingEdgeDebounce::new(watch_stream, debounce)
+        //     .map(move |kind| KeyframeRequest { kind, rid, mid });
+
+        Box::pin(watch_stream)
     }
 }
 
