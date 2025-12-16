@@ -156,6 +156,10 @@ impl TrackReceiver {
         self.simulcast.iter().find(|s| s.rid == *rid)
     }
 
+    pub fn by_quality(&self, quality: SimulcastQuality) -> Option<&SimulcastReceiver> {
+        self.simulcast.iter().find(|s| s.quality == quality)
+    }
+
     pub fn higher_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
         let next_quality = match current {
             SimulcastQuality::Undefined => Some(SimulcastQuality::Low),
