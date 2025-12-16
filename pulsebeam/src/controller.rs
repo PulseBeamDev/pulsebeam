@@ -123,7 +123,7 @@ impl ControllerActor {
             .set_rtp_mode(true)
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
-            .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300)))
+            .enable_bwe(Some(str0m::bwe::Bitrate::mbps(1)))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
             // enable for compatibility, some clients don't support remote ice-lite

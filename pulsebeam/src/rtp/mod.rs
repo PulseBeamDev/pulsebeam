@@ -90,79 +90,104 @@ impl RtpPacket {
     }
 }
 
-// adapted from Galene, https://github.com/jech/galene/blob/e09b135cd2ff240626b8619913bb9b2b3bba242b/codecs/codecs.go
-fn is_h264_keyframe_start(payload: &[u8]) -> bool {
-    let nalu = payload[0] & 0x1F;
-
-    if nalu == 0 {
-        // Reserved
+/// Checks if an H.264 RTP payload contains the start of a keyframe sequence.
+///
+/// Input: `payload` is the raw RTP payload (excluding the RTP header).
+///
+/// This function returns `true` if the payload contains any of the following NAL types,
+/// ensuring we detect the start of a keyframe regardless of packet bundling:
+/// - IDR (5): Instantaneous Decoding Refresh (Keyframe pixel data)
+/// - SPS (7): Sequence Parameter Set (Critical configuration)
+/// - PPS (8): Picture Parameter Set (Critical configuration)
+/// - AUD (9): Access Unit Delimiter (Marks the start of a frame)
+/// - SEI (6): Supplemental Enhancement Information (Often precedes keyframes)
+pub fn is_h264_keyframe_start(payload: &[u8]) -> bool {
+    if payload.is_empty() {
         return false;
-    } else if nalu <= 23 {
-        // Simple NALU.
-        return nalu == 7;
-    } else if nalu >= 24 && nalu <= 27 {
-        // STAP-A (24), STAP-B (25), MTAP16 (26), MTAP24 (27)
-        let mut i = 1;
+    }
 
-        // Skip DON (Decoding Order Number) for STAP-B, MTAP16, MTAP24
-        if nalu == 25 || nalu == 26 || nalu == 27 {
-            i += 2;
+    // --- Constants (RFC 6184) ---
+    const NAL_IDR: u8 = 5;
+    const NAL_SEI: u8 = 6;
+    const NAL_SPS: u8 = 7;
+    const NAL_PPS: u8 = 8;
+    const NAL_AUD: u8 = 9;
+
+    const NAL_STAPA: u8 = 24;
+    const NAL_FUA: u8 = 28;
+
+    const NAL_TYPE_MASK: u8 = 0x1F;
+    const FU_START_BITMASK: u8 = 0x80;
+
+    // Helper to identify anchor NALs
+    let is_anchor =
+        |t: u8| -> bool { matches!(t, NAL_IDR | NAL_SEI | NAL_SPS | NAL_PPS | NAL_AUD) };
+
+    let b0 = payload[0];
+    let nal_type = b0 & NAL_TYPE_MASK;
+
+    // 1. Single NAL Unit Case
+    // If the packet contains just a raw SPS, PPS, or IDR.
+    if is_anchor(nal_type) {
+        return true;
+    }
+
+    // 2. STAP-A Case (Aggregation) - The Chrome WebRTC Fix
+    // Format: [STAP Header (1)] [Size (2)] [NAL Header (1)] [Data...] [Size (2)] ...
+    // We must iterate the entire packet. Chrome sometimes places filler NALs or
+    // timing SEIs *before* the SPS/IDR in the same packet.
+    if nal_type == NAL_STAPA {
+        // Start after the STAP-A header (1 byte)
+        let mut offset = 1;
+        let len = payload.len();
+
+        // Loop as long as we have at least 2 bytes for the NAL size
+        while offset + 2 <= len {
+            // Read 16-bit NAL unit size (Big Endian)
+            let nalu_size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+            offset += 2; // Advance past size field
+
+            // Safety check: Ensure the NAL unit data exists in the buffer
+            if offset + nalu_size > len {
+                // Malformed packet: claimed size exceeds remaining buffer.
+                // Stop processing to prevent panic.
+                break;
+            }
+
+            // If the NAL has content, check its header
+            if nalu_size > 0 {
+                let nalu_header = payload[offset];
+                let nalu_type = nalu_header & NAL_TYPE_MASK;
+
+                if is_anchor(nalu_type) {
+                    return true;
+                }
+            }
+
+            // Advance to the next NAL unit
+            offset += nalu_size;
         }
 
-        while i < payload.len() {
-            // Need at least 2 bytes for length
-            if i + 2 > payload.len() {
-                return false;
-            }
-
-            // Read big-endian u16 length
-            let length = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-            i += 2;
-
-            if i + length > payload.len() {
-                return false;
-            }
-
-            let mut offset = 0;
-            if nalu == 26 {
-                offset = 3; // MTAP16 TS offset
-            } else if nalu == 27 {
-                offset = 4; // MTAP24 TS offset
-            }
-
-            if offset >= length {
-                // Malformed or empty NALU inside
-                return false;
-            }
-
-            let inner_nalu_header = payload[i + offset];
-            let n = inner_nalu_header & 0x1F;
-
-            // STRICT PORT: Only checking for SPS (7)
-            if n == 7 {
-                return true;
-            } else if n >= 24 {
-                // Illegal nested aggregation
-                return false;
-            }
-
-            i += length;
-        }
         return false;
-    } else if nalu == 28 || nalu == 29 {
-        // FU-A (28) or FU-B (29)
+    }
+
+    // 3. FU-A Case (Fragmentation)
+    // Format: [FU Indicator (1)] [FU Header (1)] [Data...]
+    if nal_type == NAL_FUA {
         if payload.len() < 2 {
             return false;
         }
+
         let fu_header = payload[1];
+        let is_start = (fu_header & FU_START_BITMASK) != 0;
 
-        // Check Start Bit (0x80)
-        if (fu_header & 0x80) == 0 {
-            return false;
+        // We only consider it a "start" if this is the FIRST fragment
+        if is_start {
+            let original_nal_type = fu_header & NAL_TYPE_MASK;
+            if is_anchor(original_nal_type) {
+                return true;
+            }
         }
-
-        // STRICT PORT: Check if the original NALU type was 7 (SPS)
-        return (fu_header & 0x1F) == 7;
     }
 
     false

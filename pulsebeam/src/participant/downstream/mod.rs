@@ -1,7 +1,6 @@
 mod audio;
 mod video;
 
-use crate::participant::bitrate::BitrateController;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
@@ -14,7 +13,7 @@ use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 
 pub struct DownstreamAllocator {
-    available_bandwidth: BitrateController,
+    available_bandwidth: Bitrate,
 
     audio: AudioAllocator,
     video: VideoAllocator,
@@ -23,7 +22,7 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new() -> Self {
         Self {
-            available_bandwidth: BitrateController::default(),
+            available_bandwidth: Bitrate::mbps(1),
             audio: AudioAllocator::new(),
             video: VideoAllocator::default(),
         }
@@ -52,26 +51,28 @@ impl DownstreamAllocator {
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
-        self.available_bandwidth
-            .update(available_bandwidth, Instant::now());
+        self.available_bandwidth = available_bandwidth;
         self.update_allocations()
     }
 
     pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
-        self.video
-            .update_allocations(self.available_bandwidth.current())
+        self.video.update_allocations(self.available_bandwidth)
     }
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
         self.video.handle_keyframe_request(req);
     }
 
-    pub fn poll_next_unpin(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+    pub fn poll_slow(&mut self, now: Instant) {
+        self.video.poll_slow(now);
+    }
+
+    pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
         if let Poll::Ready(item) = self.audio.poll_next(cx) {
             return Poll::Ready(item);
         }
 
-        self.video.poll_next(cx)
+        self.video.poll_fast(cx)
     }
 }
 
@@ -79,6 +80,6 @@ impl Stream for DownstreamAllocator {
     type Item = (Mid, RtpPacket);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().poll_next_unpin(cx)
+        self.get_mut().poll_fast(cx)
     }
 }

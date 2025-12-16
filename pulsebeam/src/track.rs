@@ -4,11 +4,11 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::rtp::{
@@ -54,26 +54,16 @@ pub struct SimulcastReceiver {
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
     pub channel: spmc::Receiver<RtpPacket>,
-    pub keyframe_requester: watch::Sender<Option<KeyframeRequestKind>>,
+    pub keyframe_requester: mpsc::Sender<KeyframeRequestKind>,
     pub state: StreamState,
 }
 
 impl SimulcastReceiver {
     pub fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        if self.keyframe_requester.send(Some(kind)).is_err() {
-            tracing::warn!(?kind, "feedback channel is unavailable");
+        if let Err(err) = self.keyframe_requester.try_send(kind) {
+            tracing::warn!("failed to request keyframe: {err:?}");
         }
     }
-}
-
-/// Represents the state of a keyframe request.
-#[derive(Debug, Default)]
-enum KeyframeRequestState {
-    /// No keyframe has been requested.
-    #[default]
-    Idle,
-    /// A keyframe has been requested, and we are waiting for the debounce duration to pass.
-    Debouncing { requested_at: Instant },
 }
 
 #[derive(Debug)]
@@ -85,19 +75,15 @@ pub struct SimulcastSender {
     synchronizer: Synchronizer,
     channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
-    keyframe_requests: watch::Receiver<Option<KeyframeRequestKind>>,
+    keyframe_requests: Option<mpsc::Receiver<KeyframeRequestKind>>,
 }
 
 impl SimulcastSender {
-    pub fn push(&mut self, pkt: RtpPacket) {
-        self.forward(pkt);
-    }
-
     pub fn poll_stats(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    fn forward(&mut self, pkt: RtpPacket) {
+    pub fn forward(&mut self, pkt: RtpPacket) {
         // RTP Pipeline
         let pkt = self.synchronizer.process(pkt);
         self.monitor
@@ -107,10 +93,12 @@ impl SimulcastSender {
         }
     }
 
-    pub fn keyframe_request_stream(&self, debounce: Duration) -> KeyframeRequestStream {
+    pub fn keyframe_request_stream(&mut self, debounce: Duration) -> KeyframeRequestStream {
+        let stream = self.keyframe_requests.take().unwrap();
         let rid = self.rid;
         let mid = self.mid;
-        let watch_stream = WatchStream::new(self.keyframe_requests.clone()).filter_map(|opt| opt);
+        let watch_stream = ReceiverStream::new(stream);
+
         let debounced = LeadingEdgeDebounce::new(watch_stream, debounce)
             .map(move |kind| KeyframeRequest { kind, rid, mid });
 
@@ -124,13 +112,13 @@ pub struct TrackSender {
 }
 
 impl TrackSender {
-    pub fn push(&mut self, rid: Option<&Rid>, packet: RtpPacket) {
+    pub fn forward(&mut self, rid: Option<&Rid>, packet: RtpPacket) {
         let sender = self
             .simulcast
             .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available");
-        sender.push(packet);
+        sender.forward(packet);
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut SimulcastSender> {
@@ -203,6 +191,13 @@ impl TrackReceiver {
             .min_by_key(|s| s.quality)
             .expect("no lowest quality, there must be at least 1 layer for TrackReceiver to exist")
     }
+
+    pub fn highest_quality(&self) -> &SimulcastReceiver {
+        self.simulcast
+            .iter()
+            .max_by_key(|s| s.quality)
+            .expect("no highest quality, there must be at least 1 layer for TrackReceiver to exist")
+    }
 }
 
 pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
@@ -219,7 +214,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
 
     for rid in simulcast_rids {
         let (tx, rx) = spmc::channel(capacity);
-        let (keyframe_tx, keyframe_rx) = watch::channel(None);
+        let (keyframe_tx, keyframe_rx) = mpsc::channel(1);
 
         // TODO: get this from SDP instead
         let (clock_rate, filter) = match meta.kind {
@@ -250,7 +245,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
             filter,
             synchronizer: Synchronizer::new(clock_rate),
             channel: tx,
-            keyframe_requests: keyframe_rx,
+            keyframe_requests: Some(keyframe_rx),
             monitor,
         });
         receivers.push(SimulcastReceiver {
@@ -357,5 +352,69 @@ where
                 other => return other,
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_leading_edge_debounce() {
+        // 1. Setup: Debounce for 100ms
+        let (tx, rx) = mpsc::channel(10);
+        let stream = ReceiverStream::new(rx);
+        let mut debounced_stream = LeadingEdgeDebounce::new(stream, Duration::from_millis(100));
+
+        // 2. Event A (Time 0ms): Should pass through immediately (Leading Edge)
+        tx.send("A").await.unwrap();
+
+        let item = debounced_stream.next().await;
+        assert_eq!(item, Some("A"), "First item should be emitted immediately");
+
+        // 3. Event B (Time 1ms): Should be dropped (inside 100ms window)
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tx.send("B").await.unwrap();
+
+        // We poll the stream to ensure it processes "B" and returns Pending
+        // We use tokio::time::timeout to ensure we don't hang if logic is wrong
+        let result = tokio::time::timeout(Duration::from_millis(1), debounced_stream.next()).await;
+        assert!(
+            result.is_err(),
+            "Item B should be swallowed/debounced, so stream should be Pending"
+        );
+
+        // 4. Event C (Time 50ms): Still inside window (total 51ms), should be dropped
+        tokio::time::advance(Duration::from_millis(49)).await;
+        tx.send("C").await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(1), debounced_stream.next()).await;
+        assert!(
+            result.is_err(),
+            "Item C should be swallowed (only 50ms passed)"
+        );
+
+        // 5. Event D (Time 101ms): Window passed, should emit
+        // Advance enough to pass the 100ms threshold from the LAST EMISSION (Time 0)
+        tokio::time::advance(Duration::from_millis(51)).await; // Total time since A = 102ms
+        tx.send("D").await.unwrap();
+
+        let item = debounced_stream.next().await;
+        assert_eq!(
+            item,
+            Some("D"),
+            "Item D should be emitted as 100ms has passed since A"
+        );
+
+        // 6. Event E (Time 103ms): Should be dropped (new window started at D)
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tx.send("E").await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(1), debounced_stream.next()).await;
+        assert!(
+            result.is_err(),
+            "Item E should be swallowed (too close to D)"
+        );
     }
 }

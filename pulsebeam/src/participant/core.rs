@@ -126,9 +126,10 @@ impl ParticipantCore {
         self.update_desired_bitrate();
     }
 
-    pub fn poll_stats(&mut self, now: Instant) {
+    pub fn poll_slow(&mut self, now: Instant) {
         self.update_desired_bitrate();
-        self.upstream.poll_stats(now);
+        self.downstream.poll_slow(now);
+        self.upstream.poll_slow(now);
     }
 
     pub fn poll_rtc(&mut self) -> Option<Instant> {

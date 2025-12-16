@@ -1,5 +1,5 @@
 use crate::shard::ShardMessageSet;
-use crate::{api, controller, gateway, shard};
+use crate::{api, controller, gateway};
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
