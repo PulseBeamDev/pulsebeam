@@ -116,6 +116,11 @@ impl VideoAllocator {
             commited: bool,
         }
 
+        struct CommitedSlotPlan {
+            receiver: SimulcastReceiver,
+            paused: bool,
+        }
+
         if self.slots.is_empty() {
             return (Bitrate::from(0), Bitrate::from(0));
         }
@@ -145,7 +150,7 @@ impl VideoAllocator {
                 current_bitrate,
                 desired_bitrate: current_bitrate,
                 paused,
-                commited: paused, // if we're pausing, we're commited
+                commited: paused, // if we're pausing, we're committed
             });
         }
 
@@ -199,24 +204,38 @@ impl VideoAllocator {
                 };
 
                 if upgrade_cost > budget {
+                    plan.desired_bitrate += upgrade_cost;
                     continue;
                 }
 
                 // we might upgrade again
                 plan.commited = false;
                 plan.current_bitrate += upgrade_cost;
+                plan.target_receiver = desired_receiver;
                 budget -= upgrade_cost;
             }
         }
 
         // Step 3: Apply the allocations
+        let mut committed = Vec::with_capacity(self.slots.len());
         let mut total_allocated = 0.0;
         let mut total_desired = 0.0;
-        for (idx, plan) in slot_plans.drain(..).enumerate() {
-            let slot = &mut self.slots[idx];
-            slot.switch_to(plan.target_receiver.clone());
+        for plan in slot_plans.drain(..) {
             total_allocated += plan.current_bitrate;
             total_desired += plan.desired_bitrate;
+            committed.push(CommitedSlotPlan {
+                receiver: plan.target_receiver.clone(),
+                paused: plan.paused,
+            });
+        }
+
+        for (idx, plan) in committed.drain(..).enumerate() {
+            let slot = &mut self.slots[idx];
+            if plan.paused {
+                slot.pause(plan.receiver);
+            } else {
+                slot.switch_to(plan.receiver);
+            }
         }
 
         let total_allocated = Bitrate::from(total_allocated);
@@ -428,6 +447,12 @@ impl Slot {
 
     pub fn stop(&mut self) {
         self.transition_to(SlotState::Idle);
+    }
+
+    pub fn pause(&mut self, current_receiver: SimulcastReceiver) {
+        self.transition_to(SlotState::Paused {
+            active: current_receiver,
+        });
     }
 
     fn request_keyframe(&self, kind: KeyframeRequestKind) {
