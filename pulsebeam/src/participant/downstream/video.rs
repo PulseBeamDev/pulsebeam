@@ -13,7 +13,7 @@ use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastQuality, SimulcastReceiver, TrackReceiver};
+use crate::track::{SimulcastReceiver, TrackReceiver};
 
 #[derive(Default)]
 pub struct VideoAllocator {
