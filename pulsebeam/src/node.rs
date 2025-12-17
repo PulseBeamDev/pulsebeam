@@ -160,10 +160,13 @@ mod internal {
     use axum::{
         Router,
         extract::Query,
-        response::{Html, IntoResponse},
+        response::{Html, IntoResponse, Response},
         routing::get,
     };
-    use hyper::StatusCode;
+    use hyper::{
+        StatusCode,
+        header::{CONTENT_DISPOSITION, CONTENT_TYPE},
+    };
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::{ProfilerGuard, protos::Message};
     use pulsebeam_runtime::actor::Actor;
@@ -173,7 +176,7 @@ mod internal {
     use crate::{controller, gateway, participant, room, shard};
 
     #[derive(Deserialize)]
-    struct ProfileParams {
+    pub struct ProfileParams {
         #[serde(default = "default_seconds")]
         seconds: u64,
         #[serde(default)]
@@ -195,7 +198,7 @@ mod internal {
   <li><a href="/debug/pprof/profile?seconds=30">CPU Profile (pprof)</a></li>
   <li><a href="/debug/pprof/profile?seconds=30&flamegraph=true">CPU Flamegraph</a></li>
   <li><a href="/debug/pprof/allocs?seconds=30">Memory Profile (pprof)</a></li>
-  <li><a href="/debug/pprof/allocs/flamegraph?seconds=30">Memory Flamegraph</a></li>
+  <li><a href="/debug/pprof/allocs?seconds=30&flamegraph=true">Memory Flamegraph</a></li>
 </ul>
 "#;
 
@@ -209,11 +212,7 @@ mod internal {
                 }),
             )
             .route("/debug/pprof/profile", get(pprof_profile))
-            .route("/debug/pprof/allocs", axum::routing::get(handle_get_heap))
-            .route(
-                "/debug/pprof/allocs/flamegraph",
-                axum::routing::get(handle_get_heap_flamegraph),
-            )
+            .route("/debug/pprof/allocs", axum::routing::get(heap_profile))
             .route("/", get(|| async { Html(INDEX_HTML) }))
             .with_state(());
 
@@ -301,29 +300,44 @@ mod internal {
         }
     }
 
-    pub async fn handle_get_heap() -> Result<impl IntoResponse, (StatusCode, String)> {
+    pub async fn heap_profile(
+        Query(params): Query<ProfileParams>,
+    ) -> Result<Response, (StatusCode, String)> {
         let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
         require_profiling_activated(&prof_ctl)?;
-        let pprof = prof_ctl
-            .dump_pprof()
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        Ok(pprof)
-    }
 
-    pub async fn handle_get_heap_flamegraph() -> Result<impl IntoResponse, (StatusCode, String)> {
-        use axum::body::Body;
-        use axum::http::header::CONTENT_TYPE;
-        use axum::response::Response;
+        let resp = if params.flamegraph {
+            use axum::http::header::CONTENT_TYPE;
 
-        let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
-        require_profiling_activated(&prof_ctl)?;
-        let svg = prof_ctl
-            .dump_flamegraph()
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        Response::builder()
-            .header(CONTENT_TYPE, "image/svg+xml")
-            .body(Body::from(svg))
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+            let svg = prof_ctl
+                .dump_flamegraph()
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+            (
+                axum::http::StatusCode::OK,
+                [
+                    (CONTENT_TYPE, "image/svg+xml"),
+                    (CONTENT_DISPOSITION, "attachment; filename=allocs.svg"),
+                ],
+                svg,
+            )
+                .into_response()
+        } else {
+            let pprof = prof_ctl
+                .dump_pprof()
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+            (
+                axum::http::StatusCode::OK,
+                [
+                    (CONTENT_TYPE, "application/octet-stream"),
+                    (CONTENT_DISPOSITION, "attachment; filename=allocs.pprof"),
+                ],
+                pprof,
+            )
+                .into_response()
+        };
+        Ok(resp)
     }
 
     /// Checks whether jemalloc profiling is activated an returns an error response if not.
@@ -341,32 +355,40 @@ mod internal {
     }
 
     /// Handler: /debug/pprof/profile?seconds=30&flamegraph=true
-    async fn pprof_profile(Query(params): Query<ProfileParams>) -> impl IntoResponse {
+    async fn pprof_profile(
+        Query(params): Query<ProfileParams>,
+    ) -> Result<impl IntoResponse, (StatusCode, String)> {
         let guard = ProfilerGuard::new(100).unwrap(); // 100 Hz sampling
         tokio::time::sleep(Duration::from_secs(params.seconds)).await;
 
-        match guard.report().build() {
+        let resp = match guard.report().build() {
             Ok(report) => {
                 if params.flamegraph {
                     let mut body = Vec::new();
-                    if let Err(e) = report.flamegraph(&mut body) {
-                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                            .into_response();
-                    }
+                    report
+                        .flamegraph(&mut body)
+                        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
                     (
                         axum::http::StatusCode::OK,
-                        [("Content-Type", "image/svg+xml")],
+                        [
+                            (CONTENT_TYPE, "image/svg+xml"),
+                            (CONTENT_DISPOSITION, "attachment; filename=cpu.svg"),
+                        ],
                         body,
                     )
                         .into_response()
                 } else {
-                    let profile = report.pprof().unwrap();
+                    let profile = report
+                        .pprof()
+                        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
                     let body = profile.encode_to_vec();
                     (
                         axum::http::StatusCode::OK,
                         [
-                            ("Content-Type", "application/octet-stream"),
-                            ("Content-Disposition", "attachment; filename=cpu.pprof"),
+                            (CONTENT_TYPE, "application/octet-stream"),
+                            (CONTENT_DISPOSITION, "attachment; filename=cpu.pprof"),
                         ],
                         body,
                     )
@@ -378,7 +400,9 @@ mod internal {
                 format!("Failed to build pprof report: {e}"),
             )
                 .into_response(),
-        }
+        };
+
+        Ok(resp)
     }
 }
 
