@@ -457,7 +457,6 @@ impl Slot {
         if let Some(current) = self.target_receiver()
             && current.rid == receiver.rid
             && current.meta.id == receiver.meta.id
-            && !matches!(self.state(), SlotState::Paused { .. })
         {
             return;
         }
