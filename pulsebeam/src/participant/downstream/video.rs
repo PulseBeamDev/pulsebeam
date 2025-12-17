@@ -132,7 +132,7 @@ impl VideoAllocator {
         // Step 1: Start everyone at lowest quality
         let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
-            let Some(current_receiver) = slot.target_receiver() else {
+            let Some(current_receiver) = slot.current_receiver() else {
                 continue;
             };
 
@@ -143,21 +143,24 @@ impl VideoAllocator {
             let lowest = state.track.lowest_quality();
             let lowest_bitrate = lowest.state.bitrate_bps();
 
-            // Apply downgrade hysteresis if we need to downgrade
-            let needs_downgrade = lowest.quality < current_receiver.quality;
-            let effective_bitrate = if needs_downgrade {
+            let needs_downgrade = current_receiver.quality >= lowest.quality;
+            let threshold_bitrate = if needs_downgrade {
                 lowest_bitrate * DOWNGRADE_HYSTERESIS_FACTOR
             } else {
                 lowest_bitrate
             };
 
-            let paused = effective_bitrate > budget;
+            let paused = threshold_bitrate > budget;
+
+            if !paused {
+                budget -= lowest_bitrate;
+            }
 
             slot_plans.push(SlotPlan {
                 current_receiver,
                 target_receiver: lowest,
-                current_bitrate: effective_bitrate,
-                desired_bitrate: effective_bitrate,
+                current_bitrate: lowest_bitrate,
+                desired_bitrate: lowest_bitrate,
                 paused,
                 committed: paused, // if we're pausing, we're committed
             });
@@ -203,33 +206,31 @@ impl VideoAllocator {
                     }
                 };
 
-                // Apply upgrade hysteresis
                 let desired_bitrate = desired_receiver.state.bitrate_bps();
-                let threshold_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
-
-                let upgrade_cost = if threshold_bitrate > plan.current_bitrate {
-                    threshold_bitrate - plan.current_bitrate
-                } else {
-                    0.0
-                };
-
-                if upgrade_cost > budget {
-                    plan.desired_bitrate += upgrade_cost;
-                    continue;
-                }
-
-                let bitrate_cost = if desired_bitrate > plan.current_bitrate {
+                let actual_cost = if desired_bitrate > plan.current_bitrate {
                     desired_bitrate - plan.current_bitrate
                 } else {
                     0.0
                 };
 
-                // Grant the upgrade
+                let threshold_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
+                let threshold_cost = if threshold_bitrate > plan.current_bitrate {
+                    threshold_bitrate - plan.current_bitrate
+                } else {
+                    0.0
+                };
+
+                if threshold_cost > budget {
+                    plan.desired_bitrate += threshold_cost;
+                    continue;
+                }
+
                 made_progress = true;
                 plan.committed = false; // we might upgrade again
-                plan.current_bitrate += bitrate_cost;
+                plan.current_bitrate += actual_cost;
+                plan.desired_bitrate += actual_cost;
                 plan.target_receiver = desired_receiver;
-                budget -= upgrade_cost;
+                budget -= actual_cost;
             }
         }
 
@@ -382,6 +383,15 @@ impl Slot {
 
     fn state(&self) -> &SlotState {
         self.state.as_ref().expect("State invalid outside poll")
+    }
+
+    fn current_receiver(&self) -> Option<&SimulcastReceiver> {
+        match self.state() {
+            SlotState::Resuming { staging } => Some(staging),
+            SlotState::Switching { active, .. } => Some(active),
+            SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
+            SlotState::Idle => None,
+        }
     }
 
     fn target_receiver(&self) -> Option<&SimulcastReceiver> {

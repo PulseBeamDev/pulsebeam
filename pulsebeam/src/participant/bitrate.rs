@@ -21,7 +21,7 @@ impl Default for BitrateControllerConfig {
         Self {
             min_bitrate: Bitrate::kbps(300),
             max_bitrate: Bitrate::mbps(5),
-            default_bitrate: Bitrate::mbps(1),
+            default_bitrate: Bitrate::kbps(300),
 
             // Headroom: 15% is a safe and standard value.
             headroom: 0.85,
