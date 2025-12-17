@@ -1,18 +1,23 @@
-use std::time::Duration;
 use str0m::bwe::Bitrate;
-use tokio::time::Instant;
 
-/// Controller config for stabilizing desired bitrate
+#[derive(Clone, Copy)]
 pub struct BitrateControllerConfig {
     pub min_bitrate: Bitrate,
     pub max_bitrate: Bitrate,
-    pub headroom: f64,           // fraction of available bandwidth to target
-    pub tau: f64,                // EMA smoothing constant (s)
-    pub max_ramp_up: Bitrate,    // max increase per second
-    pub max_ramp_down: Bitrate,  // max decrease per second
-    pub hysteresis_up: f64,      // fraction above current to trigger increase
-    pub hysteresis_down: f64,    // fraction below current to trigger decrease
-    pub min_hold_time: Duration, // min time between updates
+    pub default_bitrate: Bitrate,
+
+    // Safety headroom (e.g. 0.85 of estimate)
+    pub headroom_factor: f64,
+
+    // Immediate downgrade if target drops below this % of current (e.g. 0.90)
+    pub downgrade_threshold: f64,
+
+    // Number of ticks to hold a higher target before committing
+    // Since input is already smoothed, 5-8 ticks is usually enough stability.
+    pub required_up_samples: usize,
+
+    // Step size to prevent micro-fluctuations (e.g. 50kbps)
+    pub quantization_step: Bitrate,
 }
 
 impl Default for BitrateControllerConfig {
@@ -20,150 +25,110 @@ impl Default for BitrateControllerConfig {
         Self {
             min_bitrate: Bitrate::kbps(300),
             max_bitrate: Bitrate::mbps(5),
-
-            // Headroom: 15% is a safe and standard value.
-            headroom: 0.85,
-
-            // EMA smoothing
-            tau: 1.0,
-
-            // Ramp limits (per second): Be aggressive in our reactions.
-            // Allow ramping up reasonably fast to achieve good quality in a few seconds.
-            max_ramp_up: Bitrate::kbps(1500),
-
-            // React to congestion IMMEDIATELY. Allow dropping several megabits per second.
-            max_ramp_down: Bitrate::mbps(3),
-
-            // Hysteresis: Require a SIGNIFICANT and sustained improvement before upgrading.
-            // A 15% increase in the smoothed, headroom-adjusted target is a strong signal.
-            hysteresis_up: 1.0,
-
-            // Be slightly more sensitive to decreases. A 15% drop is also a clear signal.
-            hysteresis_down: 0.85,
-
-            // Hold time: After a change, wait a bit longer to observe its effect on the network.
-            // This prevents the controller from chasing noisy BWE feedback too quickly.
-            min_hold_time: Duration::ZERO,
+            default_bitrate: Bitrate::kbps(300),
+            headroom_factor: 0.85,
+            downgrade_threshold: 0.90,
+            required_up_samples: 1,
+            quantization_step: Bitrate::kbps(10),
         }
-    }
-}
-
-impl BitrateControllerConfig {
-    pub fn build(self) -> BitrateController {
-        let init = self.min_bitrate;
-        BitrateController::new(self, init, Instant::now())
     }
 }
 
 pub struct BitrateController {
     config: BitrateControllerConfig,
-    smoothed_bw: f64,
-    bitrate: f64,
-    last_change: Instant,
-    last_update: Instant,
+    current_bitrate: f64,
+    pending_target: Option<f64>,
+    stability_counter: usize,
 }
 
 impl Default for BitrateController {
     fn default() -> Self {
-        BitrateControllerConfig::default().build()
+        let config = BitrateControllerConfig::default();
+        Self::new(config, config.default_bitrate)
     }
 }
 
 impl BitrateController {
-    pub fn new(config: BitrateControllerConfig, initial_bitrate: Bitrate, now: Instant) -> Self {
+    pub fn new(config: BitrateControllerConfig, initial_bitrate: Bitrate) -> Self {
         Self {
-            smoothed_bw: initial_bitrate.as_f64(),
-            bitrate: initial_bitrate.as_f64(),
-            last_change: now,
-            last_update: now,
             config,
+            current_bitrate: initial_bitrate.as_f64(),
+            pending_target: None,
+            stability_counter: 0,
         }
     }
 
-    /// Update the desired bitrate given an available bandwidth measurement
-    pub fn update(&mut self, available_bw: Bitrate, now: Instant) -> Bitrate {
-        let dt = now.duration_since(self.last_update).as_secs_f64();
-        self.last_update = now;
+    pub fn update(&mut self, available_bandwidth: Bitrate) -> Bitrate {
+        // 1. Give headroom
+        let raw_bw = available_bandwidth.as_f64();
+        let safe_bw = raw_bw * self.config.headroom_factor;
 
-        // 1️⃣ EMA smoothing of available bandwidth
-        let alpha = dt / (self.config.tau + dt);
-        self.smoothed_bw = alpha * available_bw.as_f64() + (1.0 - alpha) * self.smoothed_bw;
+        // 2. Quantize (Floor)
+        // This stabilizes the input "jitter" into steps
+        let step = self.config.quantization_step.as_f64();
+        let quantized_target = (safe_bw / step).floor() * step;
 
-        // 2️⃣ Compute conservative target with headroom
-        let mut target = self.smoothed_bw * self.config.headroom;
-        target = target.clamp(
+        let target = quantized_target.clamp(
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
 
-        // 3️⃣ Rate-limit changes
-        let diff = target - self.bitrate;
-        let delta = if diff > 0.0 {
-            diff.min(self.config.max_ramp_up.as_f64() * dt)
-        } else {
-            diff.max(-self.config.max_ramp_down.as_f64() * dt)
-        };
-        let candidate_bitrate = self.bitrate + delta;
+        // 3. Logic
 
-        // 4️⃣ Apply hysteresis and hold time
-        let time_since_last = now.duration_since(self.last_change);
-        let mut new_bitrate = self.bitrate;
-
-        if candidate_bitrate >= self.bitrate * self.config.hysteresis_up {
-            if time_since_last >= self.config.min_hold_time {
-                new_bitrate = candidate_bitrate;
-                self.last_change = now;
-            }
-        } else if candidate_bitrate <= self.bitrate * self.config.hysteresis_down {
-            if time_since_last >= self.config.min_hold_time {
-                new_bitrate = candidate_bitrate;
-                self.last_change = now;
-            }
+        // A: Immediate Downgrade
+        // If external BWE says we dropped significant bandwidth, believe it immediately.
+        if target < self.current_bitrate * self.config.downgrade_threshold {
+            self.current_bitrate = target;
+            self.reset_stability();
+            return self.current();
         }
 
-        self.bitrate = new_bitrate;
-        self.bitrate.into()
+        // B: Debounced Upgrade
+        // If target is higher, wait for N samples to confirm it's not a temporary spike.
+        if target > self.current_bitrate {
+            match self.pending_target {
+                Some(mut pending) => {
+                    // Track the "Floor" of the new bandwidth during the window.
+                    // If bandwidth dips during the wait, lower our expectations
+                    // to that dip, but keep the counter running.
+                    if target < pending {
+                        pending = target;
+                        self.pending_target = Some(pending);
+                    }
+
+                    // If the dip made it drop below current, the upgrade is invalid.
+                    if pending <= self.current_bitrate {
+                        self.reset_stability();
+                    } else {
+                        self.stability_counter += 1;
+                    }
+                }
+                None => {
+                    self.pending_target = Some(target);
+                    self.stability_counter = 1;
+                }
+            }
+
+            if self.stability_counter >= self.config.required_up_samples {
+                if let Some(final_target) = self.pending_target {
+                    self.current_bitrate = final_target;
+                }
+                self.reset_stability();
+            }
+        } else {
+            // Target is roughly equal or slightly below (within threshold). Stable.
+            self.reset_stability();
+        }
+
+        self.current()
+    }
+
+    fn reset_stability(&mut self) {
+        self.stability_counter = 0;
+        self.pending_target = None;
     }
 
     pub fn current(&self) -> Bitrate {
-        self.bitrate.into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_stable_desired_bitrate() {
-        let config = BitrateControllerConfig {
-            min_bitrate: Bitrate::kbps(100),
-            max_bitrate: Bitrate::mbps(2),
-            headroom: 0.85,
-            tau: 1.0,
-            max_ramp_up: Bitrate::kbps(50),
-            max_ramp_down: Bitrate::kbps(200),
-            hysteresis_up: 1.1,
-            hysteresis_down: 0.9,
-            min_hold_time: Duration::from_secs(3),
-        };
-
-        let mut controller = BitrateController::new(config, Bitrate::kbps(500), Instant::now());
-
-        let mut now = Instant::now();
-        let dt = 0.25; // 250 ms
-        let samples = vec![
-            Bitrate::kbps(600),
-            Bitrate::kbps(1200),
-            Bitrate::kbps(800),
-            Bitrate::kbps(1500),
-            Bitrate::kbps(1000),
-        ];
-
-        for bw in samples {
-            let desired = controller.update(bw, now);
-            println!("Available BW: {}, Desired: {}", bw, desired);
-            now += Duration::from_secs_f64(dt);
-        }
+        Bitrate::from(self.current_bitrate)
     }
 }
