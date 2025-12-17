@@ -26,7 +26,7 @@ impl Default for BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(300),
             max_bitrate: Bitrate::mbps(5),
             default_bitrate: Bitrate::kbps(300),
-            headroom_factor: 0.85,
+            headroom_factor: 1.0,
             downgrade_threshold: 0.90,
             required_up_samples: 1,
             quantization_step: Bitrate::kbps(10),

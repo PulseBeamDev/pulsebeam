@@ -70,6 +70,10 @@ impl StreamStateInner {
         }
     }
 
+    pub fn is_healthy(&self) -> bool {
+        !self.is_inactive() && self.quality() != StreamQuality::Bad
+    }
+
     pub fn is_inactive(&self) -> bool {
         self.inactive.load(Ordering::Relaxed)
     }

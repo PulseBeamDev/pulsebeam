@@ -147,10 +147,11 @@ impl VideoAllocator {
             // we do NOT give up. Instead, we reset our target to the "Lowest" layer (`q`).
             // This forces the allocator to try and maintain at least the base layer.
             let (target_receiver, cost) =
-                if slot.is_paused() || current_receiver.state.is_inactive() {
+                if slot.is_paused() || !current_receiver.state.is_healthy() {
                     let lowest = state.track.lowest_quality();
 
                     // If even the lowest layer is dead, THEN we truly pause.
+                    // It's okay if the quality is not great. At least, we're trying to stream.
                     if lowest.state.is_inactive() {
                         slot_plans.push(SlotPlan {
                             current_receiver,
@@ -237,21 +238,24 @@ impl VideoAllocator {
             made_progress = false;
 
             for plan in &mut slot_plans {
-                if plan.paused {
+                if plan.committed {
                     continue;
                 }
+                plan.committed = true;
 
                 let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
                     continue;
                 };
 
-                // Strict Check: We only UPGRADE if the destination is ACTIVE.
+                // Step 1 has created a baseline for healthy layers.
                 let Some(desired_receiver) = state
                     .track
                     .higher_quality(plan.target_receiver.quality)
-                    .filter(|next| !next.state.is_inactive())
+                    .filter(|next| {
+                        !next.state.is_inactive()
+                            && next.state.quality() == StreamQuality::Excellent
+                    })
                 else {
-                    plan.committed = true;
                     continue;
                 };
 
@@ -266,16 +270,17 @@ impl VideoAllocator {
 
                 let effective_cost = upgrade_cost * hysteresis;
 
-                if effective_cost <= budget {
-                    budget -= upgrade_cost;
-                    plan.target_receiver = desired_receiver;
-                    plan.current_bitrate = desired_bitrate;
-                    plan.desired_bitrate = desired_bitrate;
-                    made_progress = true;
-                } else {
-                    plan.desired_bitrate = desired_bitrate;
-                    plan.committed = true;
+                if effective_cost > budget {
+                    plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
+                    continue;
                 }
+
+                budget -= upgrade_cost;
+                plan.committed = false;
+                plan.target_receiver = desired_receiver;
+                plan.current_bitrate = desired_bitrate;
+                plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
+                made_progress = true;
             }
         }
 
