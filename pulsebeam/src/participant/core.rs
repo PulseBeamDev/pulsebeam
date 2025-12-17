@@ -202,9 +202,10 @@ impl ParticipantCore {
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
             Event::KeyframeRequest(req) => self.downstream.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                let (current, desired) = self.downstream.update_bitrate(available);
-                self.rtc.bwe().set_current_bitrate(current);
-                self.rtc.bwe().set_desired_bitrate(desired);
+                if let Some((current, desired)) = self.downstream.update_bitrate(available) {
+                    self.rtc.bwe().set_current_bitrate(current);
+                    self.rtc.bwe().set_desired_bitrate(desired);
+                }
             }
             // rtp monitor handles this
             Event::StreamPaused(_) => {
@@ -228,9 +229,10 @@ impl ParticipantCore {
     }
 
     fn update_desired_bitrate(&mut self) {
-        let (current, desired) = self.downstream.update_allocations();
-        self.rtc.bwe().set_current_bitrate(current);
-        self.rtc.bwe().set_desired_bitrate(desired);
+        if let Some((current, desired)) = self.downstream.update_allocations() {
+            self.rtc.bwe().set_current_bitrate(current);
+            self.rtc.bwe().set_desired_bitrate(desired);
+        }
     }
 
     fn handle_media_added(&mut self, media: MediaAdded) {

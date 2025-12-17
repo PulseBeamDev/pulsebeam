@@ -51,13 +51,12 @@ impl DownstreamAllocator {
     }
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
-    pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> (Bitrate, Bitrate) {
-        self.available_bandwidth
-            .update(available_bandwidth, Instant::now());
+    pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> Option<(Bitrate, Bitrate)> {
+        self.available_bandwidth.update(available_bandwidth);
         self.update_allocations()
     }
 
-    pub fn update_allocations(&mut self) -> (Bitrate, Bitrate) {
+    pub fn update_allocations(&mut self) -> Option<(Bitrate, Bitrate)> {
         self.video
             .update_allocations(self.available_bandwidth.current())
     }
