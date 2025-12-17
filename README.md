@@ -83,6 +83,25 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 
 Go to https://codepen.io/lherman-cs/pen/pvgVZar, then put "demo" as the room to connect to.
 
+## Profiling & Metrics
+
+PulseBeam exposes an internal debug HTTP server on **`http://localhost:6060`**.
+
+* **Metrics (Prometheus):** `http://localhost:6060/metrics`
+* **CPU profile (pprof):** `http://localhost:6060/debug/pprof/profile?seconds=30`
+* **CPU flamegraph:** `http://localhost:6060/debug/pprof/profile?seconds=30&flamegraph=true`
+* **Memory profile:** `http://localhost:6060/debug/pprof/allocs`
+
+> CPU profiling measures **CPU usage**, not wall time. For meaningful results, profile while the server is under load.
+
+View CPU profiles with:
+
+```bash
+go tool pprof -http=:8080 cpu.pprof
+```
+
+Or view as a flamegraph on a browser by specifying `flamegraph=true` to the URL query.
+
 ## Roadmap
 
 * ✅ Prototype: Rust SFU + demo apps
