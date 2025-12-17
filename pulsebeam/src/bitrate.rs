@@ -1,6 +1,6 @@
 use str0m::bwe::Bitrate;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct BitrateControllerConfig {
     pub min_bitrate: Bitrate,
     pub max_bitrate: Bitrate,
@@ -34,6 +34,7 @@ impl Default for BitrateControllerConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct BitrateController {
     config: BitrateControllerConfig,
     current_bitrate: f64,
@@ -44,15 +45,15 @@ pub struct BitrateController {
 impl Default for BitrateController {
     fn default() -> Self {
         let config = BitrateControllerConfig::default();
-        Self::new(config, config.default_bitrate)
+        Self::new(config)
     }
 }
 
 impl BitrateController {
-    pub fn new(config: BitrateControllerConfig, initial_bitrate: Bitrate) -> Self {
+    pub fn new(config: BitrateControllerConfig) -> Self {
         Self {
             config,
-            current_bitrate: initial_bitrate.as_f64(),
+            current_bitrate: config.default_bitrate.as_f64(),
             pending_target: None,
             stability_counter: 0,
         }

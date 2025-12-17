@@ -1,4 +1,5 @@
 pub mod api;
+mod bitrate;
 pub mod controller;
 pub mod entity;
 pub mod gateway;

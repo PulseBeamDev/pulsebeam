@@ -1,7 +1,7 @@
 mod audio;
 mod video;
 
-use crate::participant::bitrate::BitrateController;
+use crate::bitrate::BitrateController;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;

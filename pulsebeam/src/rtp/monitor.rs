@@ -7,6 +7,7 @@ use str0m::rtp::SeqNo;
 use str0m::{bwe::Bitrate, media::MediaKind};
 use tokio::time::Instant;
 
+use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::rtp::RtpPacket;
 
 const MAX_BAD_QUALITY_LOCKOUT_DURATION: Duration = Duration::from_secs(20);
@@ -301,7 +302,7 @@ impl StreamMonitor {
             quality_score,
             jitter_score,
             metrics.m_hat,
-            Bitrate::from(self.bwe.bwe_bps_ewma),
+            Bitrate::from(self.bwe.estimate_bps()),
         );
         self.current_quality = new_quality;
         self.shared_state
@@ -333,73 +334,65 @@ impl StreamMonitor {
 
 #[derive(Debug)]
 pub struct BitrateEstimate {
-    bwe_last_update: Instant,
-    bwe_interval_bytes: usize,
-    bwe_bps_ewma: f64,
-    bwe_bps_peak: f64,
-    peak_decay_time: Instant,
+    controller: BitrateController,
+    last_update: Instant,
+    smoothed_bps: f64,
+    accumulated_bytes: usize,
 }
 
 impl BitrateEstimate {
     pub fn new(now: Instant) -> Self {
+        let config = BitrateControllerConfig {
+            min_bitrate: Bitrate::kbps(10), // Allow very low costs (silence)
+            max_bitrate: Bitrate::mbps(5),
+            default_bitrate: Bitrate::kbps(100),
+            headroom_factor: 1.0,
+            downgrade_threshold: 0.95,
+            // smooth out keyframe spikes
+            required_up_samples: 5,
+            quantization_step: Bitrate::kbps(10),
+        };
+        let controller = BitrateController::new(config);
         Self {
-            bwe_last_update: now,
-            bwe_interval_bytes: 0,
-            bwe_bps_ewma: 0.0,
-            bwe_bps_peak: 0.0,
-            peak_decay_time: now,
+            last_update: now,
+            accumulated_bytes: 0,
+            smoothed_bps: 0.0,
+            controller,
         }
     }
 
     pub fn record(&mut self, packet_len: usize) {
-        self.bwe_interval_bytes = self.bwe_interval_bytes.saturating_add(packet_len);
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(packet_len);
     }
 
     pub fn poll(&mut self, now: Instant) {
-        const ALPHA_UP: f64 = 0.9;
-        const ALPHA_DOWN: f64 = 0.1;
-        const PEAK_DECAY_INTERVAL: Duration = Duration::from_secs(5);
-        const PEAK_DECAY_FACTOR: f64 = 0.95;
+        let elapsed = now.saturating_duration_since(self.last_update);
+        if elapsed < Duration::from_millis(100) {
+            return;
+        }
 
-        let elapsed = now.saturating_duration_since(self.bwe_last_update);
         let elapsed_secs = elapsed.as_secs_f64();
-
-        if elapsed_secs > 0.0 && self.bwe_interval_bytes > 0 {
-            let bps = (self.bwe_interval_bytes as f64 * 8.0) / elapsed_secs;
-
-            // Update EWMA
-            if self.bwe_bps_ewma == 0.0 {
-                self.bwe_bps_ewma = bps;
-            } else {
-                let alpha = if bps > self.bwe_bps_ewma {
-                    ALPHA_UP
-                } else {
-                    ALPHA_DOWN
-                };
-                self.bwe_bps_ewma = (1.0 - alpha) * self.bwe_bps_ewma + alpha * bps;
-            }
-
-            // Update peak
-            if bps > self.bwe_bps_peak {
-                self.bwe_bps_peak = bps;
-                self.peak_decay_time = now;
-            }
-
-            self.bwe_interval_bytes = 0;
-            self.bwe_last_update = now;
+        if elapsed_secs == 0.0 {
+            return;
         }
 
-        // Decay peak slowly over time
-        let peak_age = now.saturating_duration_since(self.peak_decay_time);
-        if peak_age > PEAK_DECAY_INTERVAL {
-            self.bwe_bps_peak *= PEAK_DECAY_FACTOR;
-            self.peak_decay_time = now;
+        let raw_bps = (self.accumulated_bytes as f64 * 8.0) / elapsed_secs;
+        const PRE_SMOOTH_ALPHA: f64 = 0.3;
+
+        if self.smoothed_bps == 0.0 {
+            self.smoothed_bps = raw_bps;
+        } else {
+            self.smoothed_bps =
+                (1.0 - PRE_SMOOTH_ALPHA) * self.smoothed_bps + PRE_SMOOTH_ALPHA * raw_bps;
         }
+        let raw_bitrate = Bitrate::from(self.smoothed_bps);
+        self.controller.update(raw_bitrate);
+        self.last_update = now;
+        self.accumulated_bytes = 0;
     }
 
     pub fn estimate_bps(&self) -> f64 {
-        // Use max of EWMA and decayed peak for pacing
-        self.bwe_bps_ewma.max(self.bwe_bps_peak)
+        self.controller.current().as_f64()
     }
 }
 
