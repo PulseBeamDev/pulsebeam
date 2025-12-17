@@ -106,8 +106,8 @@ impl VideoAllocator {
         &mut self,
         available_bandwidth: Bitrate,
     ) -> Option<(Bitrate, Bitrate)> {
-        const DOWNGRADE_TOLERANCE: f64 = 0.15; // Allow 5% overuse before forcing a drop
-        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.25; // Require 15% clear headroom to upgrade
+        const DOWNGRADE_TOLERANCE: f64 = 0.15;
+        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.25;
         const MIN_BANDWIDTH: f64 = 300_000.0;
 
         struct SlotPlan<'a> {
@@ -131,8 +131,9 @@ impl VideoAllocator {
         self.slots.sort_by_key(|s| std::cmp::Reverse(s.max_height));
         let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
 
-        // Step 1: Optimistic Initialization
-        // Start everyone at their CURRENT quality.
+        // Step 1: Optimistic Initialization (Resume Everyone)
+        // We assume every slot is ACTIVE at its current (or lowest) quality.
+        // Step 2 will handle pausing them if we are actually broke.
         let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.slots.len());
 
         for slot in &self.slots {
@@ -140,6 +141,7 @@ impl VideoAllocator {
                 continue;
             };
 
+            // If the source track is gone/inactive, we must stay paused.
             if current_receiver.state.is_inactive() {
                 slot_plans.push(SlotPlan {
                     current_receiver,
@@ -152,29 +154,37 @@ impl VideoAllocator {
                 continue;
             }
 
-            let current_bitrate = current_receiver.state.bitrate_bps();
-            budget -= current_bitrate; // Budget may become negative here
+            let Some(state) = self.tracks.get(&current_receiver.meta.id) else {
+                continue;
+            };
+
+            // LOGIC: If paused, try to wake up at Lowest. If active, stay as is.
+            // This sets the "Desired" bitrate to at least the minimum required to view the stream.
+            let (target_receiver, cost) = if slot.is_paused() {
+                let lowest = state.track.lowest_quality();
+                (lowest, lowest.state.bitrate_bps())
+            } else {
+                (current_receiver, current_receiver.state.bitrate_bps())
+            };
+
+            budget -= cost;
 
             slot_plans.push(SlotPlan {
                 current_receiver,
-                target_receiver: current_receiver,
-                current_bitrate,
-                desired_bitrate: current_bitrate,
-                paused: false,
+                target_receiver,
+                current_bitrate: cost,
+                desired_bitrate: cost,
+                paused: false, // We tentatively unpause everyone
                 committed: false,
             });
         }
 
-        // Step 2: Resolve Congestion (Downgrade Phase)
-        // Only downgrade if we exceed the "Tolerance Zone" (Hysteresis).
-        // If we are just slightly over budget (within 5%), we hold the current layers
-        // to prevent flapping due to minor BWE noise.
+        // Step 2: Resolve Congestion (Downgrade/Pause Phase)
         let tolerance = available_bandwidth.as_f64() * DOWNGRADE_TOLERANCE;
 
         while budget < -tolerance {
             let mut resolved_some_debt = false;
 
-            // Iterate Lowest Priority -> Highest Priority
             for plan in slot_plans.iter_mut().rev() {
                 if plan.paused || plan.committed {
                     continue;
@@ -184,8 +194,8 @@ impl VideoAllocator {
                     continue;
                 };
 
-                // Try to find a lower quality
                 if let Some(lower) = state.track.lower_quality(plan.target_receiver.quality) {
+                    // Option A: Downgrade to save budget
                     let savings =
                         plan.target_receiver.state.bitrate_bps() - lower.state.bitrate_bps();
 
@@ -196,17 +206,19 @@ impl VideoAllocator {
                         budget += savings;
                         resolved_some_debt = true;
 
-                        // If we are now within tolerance, stop downgrading immediately
                         if budget >= -tolerance {
                             break;
                         }
                     }
                 } else {
-                    // Must pause this stream (lowest quality didn't fit)
+                    // Option B: Must pause (lowest didn't fit)
                     let cost = plan.target_receiver.state.bitrate_bps();
+
                     plan.paused = true;
                     plan.committed = true;
                     plan.current_bitrate = 0.0;
+                    // KEY: We do NOT zero out desired_bitrate.
+                    // We still desire the layer we tried to resume in Step 1.
                     budget += cost;
                     resolved_some_debt = true;
 
@@ -217,14 +229,11 @@ impl VideoAllocator {
             }
 
             if !resolved_some_debt {
-                break; // Prevent infinite loop if no further reductions are possible
+                break;
             }
         }
 
         // Step 3: Upgrade Phase
-        // Note: If we exited Step 2 inside the "Tolerance Zone" (e.g., budget is -100),
-        // `budget` is still negative. The check `effective_cost <= budget` will fail
-        // for all upgrades, ensuring we don't upgrade while slightly over-saturated.
         let mut made_progress = true;
         while made_progress {
             made_progress = false;
@@ -250,9 +259,6 @@ impl VideoAllocator {
                 let desired_bitrate = desired_receiver.state.bitrate_bps();
                 let upgrade_cost = desired_bitrate - plan.current_bitrate;
 
-                // Upgrade Hysteresis:
-                // If upgrading to a new higher layer, apply cost penalty.
-                // If recovering a layer we just dropped (unlikely in this loop but good for safety), cost is 1.0.
                 let hysteresis = if desired_receiver.quality > plan.current_receiver.quality {
                     UPGRADE_HYSTERESIS_FACTOR
                 } else {
@@ -278,9 +284,11 @@ impl VideoAllocator {
         let mut committed = Vec::with_capacity(self.slots.len());
         let mut total_allocated = 0.0;
         let mut total_desired = 0.0;
+
         for plan in slot_plans.drain(..) {
             total_allocated += plan.current_bitrate;
             total_desired += plan.desired_bitrate;
+
             committed.push(CommittedSlotPlan {
                 receiver: plan.target_receiver.clone(),
                 paused: plan.paused,
@@ -296,8 +304,8 @@ impl VideoAllocator {
             }
         }
 
-        let total_allocated = Bitrate::from(total_allocated);
-        let total_desired = Bitrate::from(total_desired);
+        let total_allocated = Bitrate::from(total_allocated.max(MIN_BANDWIDTH));
+        let total_desired = Bitrate::from(total_desired.max(MIN_BANDWIDTH));
 
         if self.ticks >= 30 {
             tracing::debug!(
