@@ -243,7 +243,9 @@ impl ParticipantCore {
                     id: track_id,
                     origin_participant: self.participant_id.clone(),
                     kind: media.kind,
-                    simulcast_rids: media.simulcast.map(|s| s.recv),
+                    simulcast_rids: media
+                        .simulcast
+                        .map(|s| s.recv.iter().map(|l| l.rid).collect()),
                 });
                 let (tx, rx) = track::new(media.mid, track_meta, 128);
                 self.upstream.add_published_track(media.mid, tx);
