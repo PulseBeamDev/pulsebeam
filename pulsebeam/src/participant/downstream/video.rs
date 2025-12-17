@@ -213,7 +213,13 @@ impl VideoAllocator {
                     0.0
                 };
 
-                let threshold_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
+                let hysteresis = if desired_receiver.quality > plan.current_receiver.quality {
+                    UPGRADE_HYSTERESIS_FACTOR
+                } else {
+                    1.0
+                };
+
+                let threshold_bitrate = desired_bitrate * hysteresis;
                 let threshold_cost = if threshold_bitrate > plan.current_bitrate {
                     threshold_bitrate - plan.current_bitrate
                 } else {
@@ -226,7 +232,7 @@ impl VideoAllocator {
                 }
 
                 made_progress = true;
-                plan.committed = false; // we might upgrade again
+                plan.committed = false;
                 plan.current_bitrate += actual_cost;
                 plan.desired_bitrate += actual_cost;
                 plan.target_receiver = desired_receiver;
