@@ -106,8 +106,8 @@ impl VideoAllocator {
         &mut self,
         available_bandwidth: Bitrate,
     ) -> Option<(Bitrate, Bitrate)> {
-        const DOWNGRADE_TOLERANCE: f64 = 0.15;
-        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.25;
+        const DOWNGRADE_TOLERANCE: f64 = 0.25;
+        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.3;
         const MIN_BANDWIDTH: f64 = 300_000.0;
 
         struct SlotPlan<'a> {
@@ -131,9 +131,7 @@ impl VideoAllocator {
         self.slots.sort_by_key(|s| std::cmp::Reverse(s.max_height));
         let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
 
-        // Step 1: Optimistic Initialization (Resume Everyone)
-        // We assume every slot is ACTIVE at its current (or lowest) quality.
-        // Step 2 will handle pausing them if we are actually broke.
+        // Step 1: Optimistic Initialization
         let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.slots.len());
 
         for slot in &self.slots {
@@ -141,31 +139,35 @@ impl VideoAllocator {
                 continue;
             };
 
-            // If the source track is gone/inactive, we must stay paused.
-            if current_receiver.state.is_inactive() {
-                slot_plans.push(SlotPlan {
-                    current_receiver,
-                    target_receiver: current_receiver,
-                    current_bitrate: 0.0,
-                    desired_bitrate: 0.0,
-                    paused: true,
-                    committed: true,
-                });
-                continue;
-            }
-
             let Some(state) = self.tracks.get(&current_receiver.meta.id) else {
                 continue;
             };
 
-            // LOGIC: If paused, try to wake up at Lowest. If active, stay as is.
-            // This sets the "Desired" bitrate to at least the minimum required to view the stream.
-            let (target_receiver, cost) = if slot.is_paused() {
-                let lowest = state.track.lowest_quality();
-                (lowest, lowest.state.bitrate_bps())
-            } else {
-                (current_receiver, current_receiver.state.bitrate_bps())
-            };
+            // If the slot is paused OR the layer we are currently watching has died (is_inactive),
+            // we do NOT give up. Instead, we reset our target to the "Lowest" layer (`q`).
+            // This forces the allocator to try and maintain at least the base layer.
+            let (target_receiver, cost) =
+                if slot.is_paused() || current_receiver.state.is_inactive() {
+                    let lowest = state.track.lowest_quality();
+
+                    // If even the lowest layer is dead, THEN we truly pause.
+                    if lowest.state.is_inactive() {
+                        slot_plans.push(SlotPlan {
+                            current_receiver,
+                            target_receiver: current_receiver,
+                            current_bitrate: 0.0,
+                            desired_bitrate: 0.0,
+                            paused: true,
+                            committed: true,
+                        });
+                        continue;
+                    }
+
+                    (lowest, lowest.state.bitrate_bps())
+                } else {
+                    // Current layer is healthy, try to keep it.
+                    (current_receiver, current_receiver.state.bitrate_bps())
+                };
 
             budget -= cost;
 
@@ -174,12 +176,12 @@ impl VideoAllocator {
                 target_receiver,
                 current_bitrate: cost,
                 desired_bitrate: cost,
-                paused: false, // We tentatively unpause everyone
+                paused: false, // Optimistically active
                 committed: false,
             });
         }
 
-        // Step 2: Resolve Congestion (Downgrade/Pause Phase)
+        // Step 2: Resolve Congestion (Downgrade Phase)
         let tolerance = available_bandwidth.as_f64() * DOWNGRADE_TOLERANCE;
 
         while budget < -tolerance {
@@ -195,7 +197,6 @@ impl VideoAllocator {
                 };
 
                 if let Some(lower) = state.track.lower_quality(plan.target_receiver.quality) {
-                    // Option A: Downgrade to save budget
                     let savings =
                         plan.target_receiver.state.bitrate_bps() - lower.state.bitrate_bps();
 
@@ -211,14 +212,11 @@ impl VideoAllocator {
                         }
                     }
                 } else {
-                    // Option B: Must pause (lowest didn't fit)
+                    // Must pause
                     let cost = plan.target_receiver.state.bitrate_bps();
-
                     plan.paused = true;
                     plan.committed = true;
                     plan.current_bitrate = 0.0;
-                    // KEY: We do NOT zero out desired_bitrate.
-                    // We still desire the layer we tried to resume in Step 1.
                     budget += cost;
                     resolved_some_debt = true;
 
@@ -247,6 +245,7 @@ impl VideoAllocator {
                     continue;
                 };
 
+                // Strict Check: We only UPGRADE if the destination is ACTIVE.
                 let Some(desired_receiver) = state
                     .track
                     .higher_quality(plan.target_receiver.quality)
@@ -288,7 +287,6 @@ impl VideoAllocator {
         for plan in slot_plans.drain(..) {
             total_allocated += plan.current_bitrate;
             total_desired += plan.desired_bitrate;
-
             committed.push(CommittedSlotPlan {
                 receiver: plan.target_receiver.clone(),
                 paused: plan.paused,
