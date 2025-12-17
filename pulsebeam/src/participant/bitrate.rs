@@ -59,7 +59,7 @@ impl BitrateController {
     }
 
     pub fn update(&mut self, available_bandwidth: Bitrate) -> Bitrate {
-        // 1. Raw Input Processing (No internal smoothing)
+        // 1. Give headroom
         let raw_bw = available_bandwidth.as_f64();
         let safe_bw = raw_bw * self.config.headroom_factor;
 
