@@ -3,17 +3,17 @@ use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::{io, net::SocketAddr};
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 
 pub struct TcpTransport {
     local_addr: SocketAddr,
     // Channel where background TCP tasks send framed packets to the main loop
-    packet_rx: mpsc::Receiver<RecvPacketBatch>,
+    packet_rx: async_channel::Receiver<RecvPacketBatch>,
     // Map to find the outbound channel for a specific remote peer
     // Using Arc<DashMap> for O(1) lookups during send without blocking the main loop
-    conns: Arc<DashMap<SocketAddr, mpsc::Sender<Bytes>>>,
+    conns: Arc<DashMap<SocketAddr, async_channel::Sender<Bytes>>>,
     // A notifier to wake up the `readable()` future
     readable_notifier: Arc<tokio::sync::Notify>,
 }
@@ -23,7 +23,7 @@ impl TcpTransport {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = external_addr.unwrap_or(listener.local_addr()?);
 
-        let (packet_tx, packet_rx) = mpsc::channel(BATCH_SIZE * 8);
+        let (packet_tx, packet_rx) = async_channel::bounded(BATCH_SIZE * 8);
         let conns = Arc::new(DashMap::new());
         let readable_notifier = Arc::new(tokio::sync::Notify::new());
 
@@ -56,11 +56,11 @@ impl TcpTransport {
         stream: TcpStream,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
-        packet_tx: mpsc::Sender<RecvPacketBatch>,
-        conns: Arc<DashMap<SocketAddr, mpsc::Sender<Bytes>>>,
+        packet_tx: async_channel::Sender<RecvPacketBatch>,
+        conns: Arc<DashMap<SocketAddr, async_channel::Sender<Bytes>>>,
         notifier: Arc<tokio::sync::Notify>,
     ) {
-        let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(256); // Per-peer egress buffer
+        let (send_tx, send_rx) = async_channel::bounded::<Bytes>(256); // Per-peer egress buffer
         conns.insert(peer_addr, send_tx);
 
         tokio::spawn(async move {
@@ -70,7 +70,7 @@ impl TcpTransport {
             loop {
                 tokio::select! {
                     // Outbound: SFU -> TCP Socket
-                    Some(pkt) = send_rx.recv() => {
+                    Ok(pkt) = send_rx.recv() => {
                         let len_header = (pkt.len() as u16).to_be_bytes();
                         let bufs = [std::io::IoSlice::new(&len_header), std::io::IoSlice::new(&pkt)];
                         if writer.write_vectored(&bufs).await.is_err() { break; }
@@ -122,7 +122,13 @@ impl TcpTransport {
         Ok(())
     }
 
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<()> {
+    /// TCP does not use application-level GSO. The kernel handles
+    /// segmentation (TSO) automatically for the byte stream.
+    pub fn max_gso_segments(&self) -> usize {
+        1
+    }
+
+    pub fn try_recv_batch(&self, out: &mut Vec<RecvPacketBatch>) -> io::Result<()> {
         let mut count = 0;
         while let Ok(pkt) = self.packet_rx.try_recv() {
             out.push(pkt);
@@ -144,7 +150,7 @@ impl TcpTransport {
             // to prevent a slow TCP client from blocking the whole SFU.
             match peer_tx.try_send(Bytes::copy_from_slice(batch.buf)) {
                 Ok(_) => Ok(true),
-                Err(mpsc::error::TrySendError::Full(_)) => Ok(false), // Backpressure: drop
+                Err(async_channel::TrySendError::Full(_)) => Ok(false), // Backpressure: drop
                 Err(_) => Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     "TCP Peer gone",

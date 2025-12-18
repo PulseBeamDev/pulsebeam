@@ -7,7 +7,7 @@ use std::{io, net::SocketAddr};
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
-use crate::net::{sim::SimUdpTransport, udp::UdpTransport};
+use crate::net::{sim::SimUdpTransport, tcp::TcpTransport, udp::UdpTransport};
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 // Fit allocator page size and Linux GRO limit
@@ -143,6 +143,7 @@ pub struct SendPacketBatch<'a> {
 /// UnifiedSocket enum for different transport types
 pub enum UnifiedSocket {
     Udp(UdpTransport),
+    Tcp(TcpTransport),
     SimUdp(SimUdpTransport),
 }
 
@@ -155,6 +156,7 @@ impl UnifiedSocket {
     ) -> io::Result<Self> {
         let sock = match transport {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
+            Transport::Tcp => Self::Tcp(TcpTransport::bind(addr, external_addr).await?),
             Transport::SimUdp => Self::SimUdp(SimUdpTransport::bind(addr, external_addr).await?),
             _ => todo!(),
         };
@@ -165,6 +167,7 @@ impl UnifiedSocket {
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
+            Self::Tcp(inner) => inner.local_addr(),
             Self::SimUdp(inner) => inner.local_addr(),
         }
     }
@@ -172,14 +175,8 @@ impl UnifiedSocket {
     pub fn max_gso_segments(&self) -> usize {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
+            Self::Tcp(inner) => inner.max_gso_segments(),
             Self::SimUdp(inner) => inner.max_gso_segments(),
-        }
-    }
-
-    pub fn gro_segments(&self) -> usize {
-        match self {
-            Self::Udp(inner) => inner.gro_segments(),
-            Self::SimUdp(inner) => inner.gro_segments(),
         }
     }
 
@@ -188,6 +185,7 @@ impl UnifiedSocket {
     pub async fn readable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.readable().await,
+            Self::Tcp(inner) => inner.readable().await,
             Self::SimUdp(inner) => inner.readable().await,
         }
     }
@@ -197,6 +195,7 @@ impl UnifiedSocket {
     pub async fn writable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.writable().await,
+            Self::Tcp(inner) => inner.writable().await,
             Self::SimUdp(inner) => inner.writable().await,
         }
     }
@@ -210,6 +209,7 @@ impl UnifiedSocket {
     ) -> std::io::Result<()> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(batch, packets),
+            Self::Tcp(inner) => inner.try_recv_batch(packets),
             Self::SimUdp(inner) => inner.try_recv_batch(batch, packets),
         }
     }
@@ -219,6 +219,7 @@ impl UnifiedSocket {
     pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
+            Self::Tcp(inner) => inner.try_send_batch(batch),
             Self::SimUdp(inner) => inner.try_send_batch(batch),
         }
     }
@@ -243,7 +244,7 @@ mod test {
 
     #[tokio::test]
     async fn test_loopback() {
-        let sock = UnifiedSocket::bind("127.0.0.1:3000".parse().unwrap(), Transport::Udp, None)
+        let mut sock = UnifiedSocket::bind("127.0.0.1:3000".parse().unwrap(), Transport::Udp, None)
             .await
             .unwrap();
 
