@@ -591,11 +591,8 @@ impl DeltaDeltaState {
         }
 
         // Check if there's space in the buffer for this packet
-        // Using wrapping arithmetic: offset < capacity means it's in range
         let offset_from_tail = seq_val.wrapping_sub(tail_val);
         if offset_from_tail >= buffer_capacity {
-            // No space - need to slide the window
-            // process_until is now optimized to only check each buffer slot once
             let new_tail = self.head.wrapping_sub(buffer_capacity);
             self.process_until(new_tail.into());
         }

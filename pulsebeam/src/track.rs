@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::pin::Pin;
 use std::{
     sync::Arc,
@@ -56,6 +57,16 @@ pub struct SimulcastReceiver {
     pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: mpsc::Sender<KeyframeRequestKind>,
     pub state: StreamState,
+}
+
+impl Display for SimulcastReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "{}:{}",
+            self.meta.id,
+            self.rid.as_deref().unwrap_or("_")
+        ))
+    }
 }
 
 impl SimulcastReceiver {

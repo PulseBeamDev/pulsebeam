@@ -415,7 +415,7 @@ struct Slot {
     switcher: Switcher,
     state: Option<SlotState>,
     switching_started_at: Option<Instant>,
-    keyframe_req_count: u32,
+    keyframe_retries: usize,
     waker: Option<Waker>,
 }
 
@@ -427,7 +427,7 @@ impl Slot {
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             state: Some(SlotState::Idle),
             switching_started_at: None,
-            keyframe_req_count: 0,
+            keyframe_retries: 0,
             waker: None,
         }
     }
@@ -472,7 +472,7 @@ impl Slot {
         receiver.channel.reset();
         receiver.request_keyframe(KeyframeRequestKind::Fir);
         self.switching_started_at = Some(Instant::now());
-        self.keyframe_req_count = 1;
+        self.keyframe_retries = 0;
 
         tracing::info!(
             mid = %self.mid,
@@ -549,24 +549,37 @@ impl Slot {
     }
 
     fn poll_slow(&mut self, now: Instant) {
+        const KEYFRAME_RETRY_DELAYS_MS: [u64; 4] = [500, 1000, 2000, 4000];
+
+        // Chrome shares keyframe request throttling for all simulcast streams &
+        // Our keyframe request might get lost in the middle. Retry some to at least
+        // reduce the probability to miss the keyframe.
         let Some(started_at) = self.switching_started_at else {
             return;
         };
 
-        if self.keyframe_req_count >= 5 {
+        if self.keyframe_retries >= KEYFRAME_RETRY_DELAYS_MS.len() {
             return;
         }
 
-        let deadline = started_at + Duration::from_secs(1) * self.keyframe_req_count;
+        let current_delay_ms = KEYFRAME_RETRY_DELAYS_MS[self.keyframe_retries];
+        let deadline = started_at + Duration::from_millis(current_delay_ms);
         if deadline > now {
             return;
         }
 
-        self.keyframe_req_count += 1;
-        let Some(receiver) = self.target_receiver() else {
-            return;
-        };
-        receiver.request_keyframe(KeyframeRequestKind::Fir);
+        self.keyframe_retries += 1;
+        if let Some(receiver) = self.target_receiver() {
+            tracing::warn!(
+                receiver = %receiver,
+                "Switch slow. Retrying keyframe request (attempt {}/{}). Elapsed: {:?}",
+                self.keyframe_retries,
+                KEYFRAME_RETRY_DELAYS_MS.len(),
+                now.duration_since(started_at)
+            );
+
+            receiver.request_keyframe(KeyframeRequestKind::Fir);
+        }
     }
 
     #[inline]
@@ -574,7 +587,7 @@ impl Slot {
         match &new_state {
             SlotState::Streaming { .. } => {
                 self.switching_started_at = None;
-                self.keyframe_req_count = 0;
+                self.keyframe_retries = 0;
             }
             _ => {}
         }
