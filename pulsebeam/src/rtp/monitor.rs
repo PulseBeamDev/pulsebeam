@@ -1,5 +1,6 @@
 use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::time::Duration;
 use str0m::media::{Frequency, MediaTime};
@@ -336,27 +337,29 @@ impl StreamMonitor {
 pub struct BitrateEstimate {
     controller: BitrateController,
     last_update: Instant,
-    smoothed_bps: f64,
     accumulated_bytes: usize,
+    history: VecDeque<f64>,
 }
 
 impl BitrateEstimate {
     pub fn new(now: Instant) -> Self {
         let config = BitrateControllerConfig {
-            min_bitrate: Bitrate::kbps(10), // Allow very low costs (silence)
+            min_bitrate: Bitrate::kbps(10),
             max_bitrate: Bitrate::mbps(5),
             default_bitrate: Bitrate::kbps(100),
             headroom_factor: 1.0,
             downgrade_threshold: 0.95,
-            // smooth out keyframe spikes
-            required_up_samples: 5,
+            required_up_samples: 2,
             quantization_step: Bitrate::kbps(10),
         };
+
         let controller = BitrateController::new(config);
+
         Self {
             last_update: now,
             accumulated_bytes: 0,
-            smoothed_bps: 0.0,
+            // Keep 1 second of history (10 samples @ 100ms)
+            history: VecDeque::with_capacity(10),
             controller,
         }
     }
@@ -367,6 +370,7 @@ impl BitrateEstimate {
 
     pub fn poll(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_update);
+
         if elapsed < Duration::from_millis(100) {
             return;
         }
@@ -377,16 +381,26 @@ impl BitrateEstimate {
         }
 
         let raw_bps = (self.accumulated_bytes as f64 * 8.0) / elapsed_secs;
-        const PRE_SMOOTH_ALPHA: f64 = 0.3;
 
-        if self.smoothed_bps == 0.0 {
-            self.smoothed_bps = raw_bps;
-        } else {
-            self.smoothed_bps =
-                (1.0 - PRE_SMOOTH_ALPHA) * self.smoothed_bps + PRE_SMOOTH_ALPHA * raw_bps;
+        if self.history.len() >= 10 {
+            self.history.pop_front();
         }
-        let raw_bitrate = Bitrate::from(self.smoothed_bps);
-        self.controller.update(raw_bitrate);
+        self.history.push_back(raw_bps);
+
+        let robust_bps = if self.history.is_empty() {
+            raw_bps
+        } else {
+            let mut sorted: Vec<f64> = self.history.iter().copied().collect();
+            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // P80
+            let idx = (sorted.len() as f64 * 0.8) as usize;
+            let idx = idx.min(sorted.len().saturating_sub(1));
+
+            sorted[idx]
+        };
+
+        self.controller.update(Bitrate::from(robust_bps));
+
         self.last_update = now;
         self.accumulated_bytes = 0;
     }
@@ -1137,5 +1151,70 @@ mod test {
         let expected_head = start_seq.wrapping_add(16);
         assert_eq!(monitor.tail, expected_tail.into());
         assert_eq!(monitor.head, expected_head.into());
+    }
+
+    struct StreamSimulator {
+        estimator: BitrateEstimate,
+        now: Instant,
+    }
+
+    impl StreamSimulator {
+        fn new() -> Self {
+            Self {
+                estimator: BitrateEstimate::new(Instant::now()),
+                now: Instant::now(),
+            }
+        }
+
+        fn run_steady(&mut self, duration: Duration, target_bps: f64) {
+            let tick_size = Duration::from_millis(100);
+            let bytes_per_tick = (target_bps * 0.1 / 8.0) as usize;
+            let end = self.now + duration;
+            while self.now < end {
+                self.now += tick_size;
+                self.estimator.record(bytes_per_tick);
+                self.estimator.poll(self.now);
+            }
+        }
+
+        fn inject_keyframe(&mut self, size_bytes: usize) {
+            self.estimator.record(size_bytes);
+            self.now += Duration::from_millis(100);
+            self.estimator.poll(self.now);
+        }
+
+        fn current(&self) -> f64 {
+            self.estimator.estimate_bps()
+        }
+    }
+
+    #[test]
+    fn test_perfect_keyframe_rejection() {
+        let mut sim = StreamSimulator::new();
+
+        // 1. Warm up at 1Mbps
+        sim.run_steady(Duration::from_secs(2), 1_000_000.0);
+        let baseline = sim.current();
+
+        println!("Baseline: {:.0} bps", baseline);
+        assert!(baseline > 900_000.0 && baseline < 1_100_000.0);
+
+        // 2. Inject Massive Keyframe
+        // Normal 100ms = 12,500 bytes. Keyframe = 62,500 bytes (5x spike).
+        sim.inject_keyframe(62_500);
+
+        // 3. Run steady again
+        sim.run_steady(Duration::from_millis(500), 1_000_000.0);
+
+        let after_spike = sim.current();
+        println!("After Spike: {:.0} bps", after_spike);
+
+        // STABILITY CHECK:
+        // The BitrateController should have completely ignored the bump.
+        // It might have risen by 1 quantization step (10kbps), but not more.
+        assert!(
+            (after_spike - baseline).abs() < 50_000.0,
+            "Estimator flapped due to keyframe!"
+        );
     }
 }
