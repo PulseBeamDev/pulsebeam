@@ -6,7 +6,7 @@ use crate::{
 };
 use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
 use pulsebeam_runtime::prelude::*;
-use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError};
+use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError, net::Protocol};
 use tokio::{sync::oneshot, task::JoinSet};
 
 #[derive(thiserror::Error, Debug)]
@@ -174,8 +174,13 @@ impl ControllerActor {
 
         for addr in self.local_addrs.iter() {
             // TODO: add tcp and ssltcp later
-            let candidate = Candidate::host(*addr, "udp").expect("a host candidate");
-            rtc.add_local_candidate(candidate);
+            // let candidate = Candidate::host(*addr, "udp").expect("a host candidate");
+
+            // Add the TCP Passive candidate (RFC 6544)
+            // This tells the remote peer that the SFU is listening for TCP connections on this address.
+            let tcp_candidate =
+                Candidate::host(*addr, Protocol::Tcp).expect("a TCP passive host candidate");
+            rtc.add_local_candidate(tcp_candidate);
         }
 
         let answer = rtc

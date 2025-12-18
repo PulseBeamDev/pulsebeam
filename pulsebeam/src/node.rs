@@ -55,7 +55,7 @@ pub async fn run(
     let mut sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
     for _ in 0..workers {
         let socket =
-            match net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
+            match net::UnifiedSocket::bind(local_addr, net::Transport::Tcp, Some(external_addr))
                 .await
             {
                 Ok(socket) => socket,

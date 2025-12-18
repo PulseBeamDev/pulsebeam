@@ -3,7 +3,7 @@ use std::sync::Arc;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 
-use pulsebeam_runtime::net;
+use pulsebeam_runtime::net::{self, Transport};
 use str0m::bwe::BweKind;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
@@ -79,10 +79,15 @@ impl ParticipantCore {
 
     pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) -> Option<Instant> {
         let mut last_deadline = None;
+        let transport = match batch.transport {
+            Transport::Udp => str0m::net::Protocol::Udp,
+            Transport::Tcp => str0m::net::Protocol::Tcp,
+            _ => str0m::net::Protocol::Udp,
+        };
         for pkt in batch.into_iter() {
             if let Ok(contents) = (*pkt).try_into() {
                 let recv = str0m::net::Receive {
-                    proto: str0m::net::Protocol::Udp,
+                    proto: transport,
                     source: batch.src,
                     destination: batch.dst,
                     contents,

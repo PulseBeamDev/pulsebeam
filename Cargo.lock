@@ -3324,7 +3324,6 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "str0m"
 version = "0.14.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
 dependencies = [
  "combine",
  "crc",
@@ -3342,7 +3341,6 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -3352,7 +3350,6 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
 dependencies = [
  "base64ct",
  "dimpl",
@@ -3362,7 +3359,6 @@ dependencies = [
 [[package]]
 name = "str0m-wincrypto"
 version = "0.3.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
 dependencies = [
  "str0m-proto",
  "tracing",

@@ -45,8 +45,8 @@ more-asserts = "0.3.1"
 # str0m = { path = "../str0m" }
 # [patch."https://github.com/algesten/str0m.git"]
 # str0m = { path = "../str0m" }
-# [patch."https://github.com/PulseBeamDev/str0m.git"]
-# str0m = { path = "../str0m" }
+[patch."https://github.com/PulseBeamDev/str0m.git"]
+str0m = { path = "../str0m" }
 
 [workspace]
 resolver = "2"

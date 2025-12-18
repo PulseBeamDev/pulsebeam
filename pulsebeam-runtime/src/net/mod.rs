@@ -36,6 +36,7 @@ pub struct RecvPacketBatch {
     pub buf: Bytes,
     pub stride: usize,
     pub len: usize,
+    pub transport: Transport,
 }
 
 impl RecvPacketBatch {
@@ -121,6 +122,7 @@ impl RecvPacketBatcher {
                 buf,
                 stride: m.stride,
                 len: m.len,
+                transport: Transport::Udp,
             });
         }
     }

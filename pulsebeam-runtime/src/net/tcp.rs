@@ -1,3 +1,5 @@
+use crate::net::Transport;
+
 use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch};
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -93,6 +95,7 @@ impl TcpTransport {
                                         buf: data,
                                         stride: len,
                                         len,
+                                        transport: Transport::Tcp,
                                     };
 
                                     if packet_tx.send(pkt).await.is_err() { return; }
