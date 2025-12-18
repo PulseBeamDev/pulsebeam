@@ -2619,6 +2619,7 @@ dependencies = [
  "bytes",
  "criterion",
  "crossbeam-utils",
+ "dashmap",
  "event-listener",
  "futures-concurrency",
  "futures-lite",
