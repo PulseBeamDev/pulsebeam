@@ -357,7 +357,7 @@ impl BitrateEstimate {
         };
 
         let controller = BitrateController::new(config);
-        let window_size = 30;
+        let window_size = 35;
 
         Self {
             last_update: now,
@@ -376,7 +376,7 @@ impl BitrateEstimate {
     pub fn poll(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_update);
 
-        if elapsed < Duration::from_millis(100) {
+        if elapsed < Duration::from_millis(200) {
             return;
         }
 
@@ -398,8 +398,7 @@ impl BitrateEstimate {
         let robust_bps = if self.scratch.is_empty() {
             raw_bps
         } else {
-            // P80
-            let target_idx = (self.scratch.len() as f64 * 0.8) as usize;
+            let target_idx = (self.scratch.len() as f64 * 0.5) as usize;
             let target_idx = target_idx.min(self.scratch.len().saturating_sub(1));
             let (_, &mut val, _) = self
                 .scratch
