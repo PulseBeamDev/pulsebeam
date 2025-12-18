@@ -338,7 +338,10 @@ pub struct BitrateEstimate {
     controller: BitrateController,
     last_update: Instant,
     accumulated_bytes: usize,
+
     history: VecDeque<f64>,
+    scratch: Vec<f64>,
+    window_size: usize,
 }
 
 impl BitrateEstimate {
@@ -349,17 +352,19 @@ impl BitrateEstimate {
             default_bitrate: Bitrate::kbps(100),
             headroom_factor: 1.0,
             downgrade_threshold: 0.95,
-            required_up_samples: 2,
+            required_up_samples: 1,
             quantization_step: Bitrate::kbps(10),
         };
 
         let controller = BitrateController::new(config);
+        let window_size = 30;
 
         Self {
             last_update: now,
             accumulated_bytes: 0,
-            // Keep 1 second of history (10 samples @ 100ms)
-            history: VecDeque::with_capacity(10),
+            history: VecDeque::with_capacity(window_size),
+            scratch: Vec::with_capacity(window_size),
+            window_size,
             controller,
         }
     }
@@ -382,25 +387,27 @@ impl BitrateEstimate {
 
         let raw_bps = (self.accumulated_bytes as f64 * 8.0) / elapsed_secs;
 
-        if self.history.len() >= 10 {
+        if self.history.len() >= self.window_size {
             self.history.pop_front();
         }
         self.history.push_back(raw_bps);
 
-        let robust_bps = if self.history.is_empty() {
+        self.scratch.clear();
+        self.scratch.extend(self.history.iter());
+
+        let robust_bps = if self.scratch.is_empty() {
             raw_bps
         } else {
-            let mut sorted: Vec<f64> = self.history.iter().copied().collect();
-            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             // P80
-            let idx = (sorted.len() as f64 * 0.8) as usize;
-            let idx = idx.min(sorted.len().saturating_sub(1));
-
-            sorted[idx]
+            let target_idx = (self.scratch.len() as f64 * 0.8) as usize;
+            let target_idx = target_idx.min(self.scratch.len().saturating_sub(1));
+            let (_, &mut val, _) = self
+                .scratch
+                .select_nth_unstable_by(target_idx, |a, b| a.total_cmp(b));
+            val
         };
 
         self.controller.update(Bitrate::from(robust_bps));
-
         self.last_update = now;
         self.accumulated_bytes = 0;
     }
@@ -1189,7 +1196,7 @@ mod test {
     }
 
     #[test]
-    fn test_perfect_keyframe_rejection() {
+    fn test_keyframe_rejection() {
         let mut sim = StreamSimulator::new();
 
         // 1. Warm up at 1Mbps
