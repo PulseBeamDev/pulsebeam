@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, net::SocketAddr};
+use std::{collections::VecDeque, io, net::SocketAddr};
 
 use pulsebeam_runtime::net;
 
@@ -81,11 +81,16 @@ impl Batcher {
                 segment_size: state.segment_size,
             });
             match res {
-                Ok(true) | Err(_) => {
+                Ok(true) => {
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }
-                Ok(false) => break,
+                Err(err) if err.kind() != io::ErrorKind::WouldBlock => {
+                    tracing::warn!("error on writing to egress socket: {:?}", err);
+                    let state = self.pop_front().unwrap();
+                    self.reclaim(state);
+                }
+                _ => break,
             }
         }
     }
