@@ -255,10 +255,8 @@ impl StreamMonitor {
         }
 
         let jitter_score = metrics.calculate_jitter_score();
-        // TODO: loss_score is too noisy to be usable, needs to stabilize this first.
-        // let loss_score = metrics.calculate_loss_score();
-        // let quality_score = jitter_score.min(loss_score);
-        let quality_score = jitter_score;
+        let loss_score = metrics.calculate_loss_score();
+        let quality_score = jitter_score.min(loss_score);
 
         let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
         if new_quality == self.current_quality {
@@ -297,11 +295,12 @@ impl StreamMonitor {
         // Finally, commit the state change.
         tracing::info!(
             stream_id = %self.stream_id,
-            "Stream quality transition: {:?} -> {:?} (score: {:.1}, jitter_score: {:.1}, m_hat: {:.3}, bitrate: {})",
+            "Stream quality transition: {:?} -> {:?} (score: {:.1}, jitter: {:.1}, loss: {:.1}, m_hat: {:.3}, bitrate: {})",
             self.current_quality,
             new_quality,
             quality_score,
             jitter_score,
+            loss_score,
             metrics.m_hat,
             Bitrate::from(self.bwe.estimate_bps()),
         );
@@ -452,16 +451,31 @@ impl RawMetrics {
     }
 
     pub fn calculate_loss_score(&self) -> f64 {
+        // min sample count
+        if self.packets_expected < 10 {
+            return 100.0;
+        }
+
         let loss_ratio = self.packet_loss();
 
-        // Linear penalty:
-        // 1% loss = 25 point deduction.
-        // 2% loss = 50 point deduction.
-        // 4% loss or more = score of 0.
-        let loss_penalty_per_percent = 25.0;
-        let score = 100.0 - (loss_ratio * 100.0 * loss_penalty_per_percent);
+        // small packet loss is easy to recover
+        const GRACE_THRESHOLD: f64 = 0.02;
+        if loss_ratio <= GRACE_THRESHOLD {
+            return 100.0;
+        }
 
-        score.max(0.0)
+        const PANIC_THRESHOLD: f64 = 0.12;
+        if loss_ratio >= PANIC_THRESHOLD {
+            return 0.0;
+        }
+
+        // We map the range [0.02 ... 0.12] to score [100 ... 0]
+        // Range size = 0.10
+        let range = PANIC_THRESHOLD - GRACE_THRESHOLD;
+        let excess_loss = loss_ratio - GRACE_THRESHOLD;
+        let penalty_fraction = excess_loss / range;
+
+        (100.0 * (1.0 - penalty_fraction)).max(0.0)
     }
 
     pub fn quality_hysteresis(&self, score: f64, current: StreamQuality) -> StreamQuality {
