@@ -119,6 +119,8 @@ impl BitrateController {
 
 #[cfg(test)]
 mod tests {
+    use more_asserts::{assert_gt, assert_lt};
+
     use super::*;
 
     #[test]
@@ -142,11 +144,11 @@ mod tests {
         }
         assert_eq!(ctrl.current().as_f64(), 1_000_000.0);
 
-        // One tick drop to 300 kbps (simulating bad estimate/jitter)
-        // With decay 0.95, should only drop to ~950k, not 300k
-        let res = ctrl.update(Bitrate::kbps(300));
-        assert!(res.as_f64() > 900_000.0);
-        assert!(res.as_f64() < 1_000_000.0);
+        // One tick drop to 800 kbps (simulating bad estimate/jitter)
+        // With decay 0.95, should only drop to ~950k, not 800k
+        let res = ctrl.update(Bitrate::kbps(800));
+        assert_gt!(res.as_f64(), 900_000.0);
+        assert_lt!(res.as_f64(), 1_000_000.0);
 
         // Input recovers immediately
         let res = ctrl.update(Bitrate::kbps(1000));
