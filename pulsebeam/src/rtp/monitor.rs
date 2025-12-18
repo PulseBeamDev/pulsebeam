@@ -467,25 +467,23 @@ impl RawMetrics {
     pub fn quality_hysteresis(&self, score: f64, current: StreamQuality) -> StreamQuality {
         match current {
             StreamQuality::Excellent => {
-                // Must drop below 75 to go down to Good
-                if score < 75.0 {
+                if score < 80.0 {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Excellent
                 }
             }
             StreamQuality::Good => {
-                if score >= 85.0 {
+                if score >= 90.0 {
                     StreamQuality::Excellent
-                } else if score < 55.0 {
+                } else if score < 60.0 {
                     StreamQuality::Bad
                 } else {
                     StreamQuality::Good
                 }
             }
             StreamQuality::Bad => {
-                // Must rise above 65 to go up to Good
-                if score >= 65.0 {
+                if score >= 75.0 {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Bad
