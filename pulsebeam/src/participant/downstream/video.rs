@@ -562,8 +562,11 @@ impl Slot {
             return;
         }
 
-        let current_delay_ms = KEYFRAME_RETRY_DELAYS_MS[self.keyframe_retries];
-        let deadline = started_at + Duration::from_millis(current_delay_ms);
+        let current_cumulative_delay: u64 = KEYFRAME_RETRY_DELAYS_MS
+            .iter()
+            .take(self.keyframe_retries + 1)
+            .sum();
+        let deadline = started_at + Duration::from_millis(current_cumulative_delay);
         if deadline > now {
             return;
         }
