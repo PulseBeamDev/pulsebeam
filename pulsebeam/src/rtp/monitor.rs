@@ -351,9 +351,9 @@ impl BitrateEstimate {
             max_bitrate: Bitrate::mbps(5),
             default_bitrate: Bitrate::kbps(100),
             headroom_factor: 1.0,
-            downgrade_threshold: 0.95,
             required_up_samples: 1,
             quantization_step: Bitrate::kbps(10),
+            ..Default::default()
         };
 
         let controller = BitrateController::new(config);
@@ -1219,7 +1219,7 @@ mod test {
         // The BitrateController should have completely ignored the bump.
         // It might have risen by 1 quantization step (10kbps), but not more.
         assert!(
-            (after_spike - baseline).abs() < 50_000.0,
+            (after_spike - baseline).abs() < 5.0,
             "Estimator flapped due to keyframe!"
         );
     }
