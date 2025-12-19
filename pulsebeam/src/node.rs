@@ -89,10 +89,10 @@ pub async fn run(
         .max_age(Duration::from_secs(86400));
 
     let mut join_set = JoinSet::new();
-    let (gateway, gateway_task) = actor::prepare(
-        gateway::GatewayActor::new(udp_sockets.clone()),
-        RunnerConfig::default(),
-    );
+    let mut sockets = udp_sockets.clone();
+    sockets.push(tcp_socket.clone());
+    let (gateway, gateway_task) =
+        actor::prepare(gateway::GatewayActor::new(sockets), RunnerConfig::default());
     join_set.spawn(ignore(gateway_task));
 
     // let shard_count = 2 * workers;

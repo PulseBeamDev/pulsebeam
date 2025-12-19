@@ -1,10 +1,5 @@
 IFACE ?= lo
-
-.PHONY: all help \
-	net-tune \
-	net-apply net-clear net-status net-verify \
-	net-good-home-wifi net-congested-wifi net-stable-mobile net-lte-1bar \
-	net-cross-continent net-unusable
+IP ?= 192.168.1.63
 
 all: help
 
@@ -25,6 +20,14 @@ net-tune:
 	@echo "Current GRO/GSO settings for $(NIC):"
 	@ethtool -k $(NIC) | grep -E "gro|gso|segmentation|scatter"
 	@echo "✅ Socket tuning applied successfully."
+
+net-udp-block:
+	sudo iptables -A OUTPUT -p udp -d $(IP) --dport 3478 -j DROP
+	sudo iptables -L -n -v
+
+net-udp-unblock:
+	sudo iptables -D OUTPUT -p udp -d $(IP) --dport 3478 -j DROP || true
+	sudo iptables -D INPUT -p udp -s $(IP) --sport 3478 -j DROP || true
 
 # net-apply: Applies network simulation with AUTOMATIC handling of localhost double-counting
 # Presets should specify TARGET_RTT and jitter as if measuring end-to-end
