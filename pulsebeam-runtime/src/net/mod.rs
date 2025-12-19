@@ -7,7 +7,7 @@ use std::{io, net::SocketAddr};
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
-use crate::net::{sim::SimUdpTransport, tcp::TcpTransport, udp::UdpTransport};
+use crate::net::{tcp::TcpTransport, udp::UdpTransport};
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 // Fit allocator page size and Linux GRO limit
@@ -17,7 +17,7 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 pub enum Transport {
     Udp,
     Tcp,
-    Tls,
+    // Tls,
 }
 
 /// A received packet (zero-copy buffer + source address).

@@ -2,10 +2,15 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use crate::{
     entity::{ParticipantId, RoomId},
-    node, room,
+    node,
+    participant::ParticipantActor,
+    room,
 };
-use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
-use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::{
+    actor::{self, ActorKind, ActorStatus},
+    net::UnifiedSocket,
+};
+use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{
     Candidate, RtcConfig, RtcError,
     change::SdpOffer,
@@ -55,8 +60,6 @@ pub struct ControllerActor {
     node_ctx: node::NodeContext,
 
     id: Arc<String>,
-    local_addrs: Vec<SocketAddr>,
-
     rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
     room_tasks: JoinSet<(Arc<RoomId>, ActorStatus)>,
 }
@@ -176,30 +179,43 @@ impl ControllerActor {
         // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
 
         let mut rtc = rtc_config.build();
+        let udp_egress = self.node_ctx.allocate_udp_egress();
+        let tcp_egress = self.node_ctx.allocate_tcp_egress();
+        let sockets = [&udp_egress, &tcp_egress];
+        for s in &sockets {
+            let candidate = match s.transport() {
+                Transport::Udp => {
+                    Candidate::host(s.local_addr(), Protocol::Udp).expect("a UDP host candidate")
+                }
+                Transport::Tcp => {
+                    Candidate::host_tcp(s.local_addr(), Protocol::Tcp, Some(TcpType::Passive))
+                        .expect("a TCP passive host candidate")
+                }
+            };
 
-        for addr in self.local_addrs.iter() {
-            // TODO: add tcp and ssltcp later
-            // let candidate = Candidate::host(*addr, "udp").expect("a host candidate");
-
-            // Add the TCP Passive candidate (RFC 6544)
-            // This tells the remote peer that the SFU is listening for TCP connections on this address.
-            let tcp_candidate = Candidate::host_tcp(*addr, Protocol::Tcp, TcpType::Passive)
-                .expect("a TCP passive host candidate");
-            rtc.add_local_candidate(tcp_candidate);
+            rtc.add_local_candidate(candidate);
         }
 
         let answer = rtc
             .sdp_api()
             .accept_offer(offer)
             .map_err(ControllerError::OfferRejected)?;
-
         let mut room_handle = self.get_or_create_room(room_id);
+        let gateway = self.node_ctx.gateway.clone();
+        let participant = ParticipantActor::new(
+            gateway,
+            room_handle.clone(),
+            udp_egress,
+            tcp_egress,
+            participant_id,
+            rtc,
+        );
 
         // TODO: probably retry? Or, let the client to retry instead?
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .send(room::RoomMessage::AddParticipant(participant_id, rtc))
+            .send(room::RoomMessage::AddParticipant(participant))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
@@ -228,15 +244,10 @@ impl ControllerActor {
 }
 
 impl ControllerActor {
-    pub fn new(
-        system_ctx: node::NodeContext,
-        local_addrs: Vec<SocketAddr>,
-        id: Arc<String>,
-    ) -> Self {
+    pub fn new(system_ctx: node::NodeContext, id: Arc<String>) -> Self {
         Self {
             id,
             node_ctx: system_ctx,
-            local_addrs,
             rooms: HashMap::new(),
             room_tasks: JoinSet::new(),
         }
