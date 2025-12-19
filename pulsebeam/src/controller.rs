@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 use crate::{
     entity::{ParticipantId, RoomId},
@@ -6,10 +6,7 @@ use crate::{
     participant::ParticipantActor,
     room,
 };
-use pulsebeam_runtime::{
-    actor::{self, ActorKind, ActorStatus},
-    net::UnifiedSocket,
-};
+use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
 use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{
     Candidate, RtcConfig, RtcError,
@@ -184,13 +181,17 @@ impl ControllerActor {
         let sockets = [&udp_egress, &tcp_egress];
         for s in &sockets {
             let candidate = match s.transport() {
-                Transport::Udp => {
-                    Candidate::host(s.local_addr(), Protocol::Udp).expect("a UDP host candidate")
-                }
-                Transport::Tcp => {
-                    Candidate::host_tcp(s.local_addr(), Protocol::Tcp, Some(TcpType::Passive))
-                        .expect("a TCP passive host candidate")
-                }
+                Transport::Udp => Candidate::builder()
+                    .udp()
+                    .host(s.local_addr())
+                    .build()
+                    .expect("a UDP host candidate"),
+                Transport::Tcp => Candidate::builder()
+                    .tcp()
+                    .host(s.local_addr())
+                    .tcptype(TcpType::Passive)
+                    .build()
+                    .expect("a TCP passive host candidate"),
             };
 
             rtc.add_local_candidate(candidate);
