@@ -18,7 +18,6 @@ pub enum Transport {
     Udp,
     Tcp,
     Tls,
-    SimUdp,
 }
 
 /// A received packet (zero-copy buffer + source address).
@@ -146,7 +145,6 @@ pub struct SendPacketBatch<'a> {
 pub enum UnifiedSocket {
     Udp(UdpTransport),
     Tcp(TcpTransport),
-    SimUdp(SimUdpTransport),
 }
 
 impl UnifiedSocket {
@@ -159,7 +157,6 @@ impl UnifiedSocket {
         let sock = match transport {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
             Transport::Tcp => Self::Tcp(TcpTransport::bind(addr, external_addr).await?),
-            Transport::SimUdp => Self::SimUdp(SimUdpTransport::bind(addr, external_addr).await?),
             _ => todo!(),
         };
         tracing::debug!("bound to {addr} ({transport:?})");
@@ -170,7 +167,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::Tcp(inner) => inner.local_addr(),
-            Self::SimUdp(inner) => inner.local_addr(),
         }
     }
 
@@ -178,7 +174,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
             Self::Tcp(inner) => inner.max_gso_segments(),
-            Self::SimUdp(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -188,7 +183,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.readable().await,
             Self::Tcp(inner) => inner.readable().await,
-            Self::SimUdp(inner) => inner.readable().await,
         }
     }
 
@@ -198,7 +192,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::Tcp(inner) => inner.writable().await,
-            Self::SimUdp(inner) => inner.writable().await,
         }
     }
 
@@ -212,7 +205,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(batch, packets),
             Self::Tcp(inner) => inner.try_recv_batch(packets),
-            Self::SimUdp(inner) => inner.try_recv_batch(batch, packets),
         }
     }
 
@@ -222,7 +214,13 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::Tcp(inner) => inner.try_send_batch(batch),
-            Self::SimUdp(inner) => inner.try_send_batch(batch),
+        }
+    }
+
+    pub fn transport(&self) -> Transport {
+        match self {
+            Self::Udp(_) => Transport::Udp,
+            Self::Tcp(_) => Transport::Tcp,
         }
     }
 }
