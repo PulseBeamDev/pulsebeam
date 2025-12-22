@@ -1,5 +1,8 @@
+use std::panic::AssertUnwindSafe;
+
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
+use futures_lite::FutureExt;
 use reqwest::Client as HttpClient;
 use str0m::{
     Event, Input, Rtc,
@@ -12,8 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    VideoFrame(Bytes),
-    AudioFrame(Bytes),
+    MediaAdded,
     StateChanged(str0m::IceConnectionState),
     Connected,
 }
@@ -25,14 +27,10 @@ pub struct AgentBuilder {
 
 #[derive(Clone)]
 pub struct Agent {
-    frame_tx: mpsc::Sender<Bytes>,
     events: broadcast::Sender<AgentEvent>,
-    pub video_mid: Option<Mid>,
 }
 
 impl Agent {
-    /// Mirrored from your JS `start()` logic.
-    /// Performs HTTP POST, sets up transceivers, and spawns the worker.
     pub async fn join(
         http_client: HttpClient,
         socket: UdpSocket,
@@ -40,10 +38,7 @@ impl Agent {
         room_id: &str,
     ) -> Result<Self> {
         let (event_tx, _event_rx) = broadcast::channel(128);
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(100);
-
         let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).build();
-        let mut video_mid = None;
 
         // TODO: allow configurable transceivers
         let mut sdp = rtc.sdp_api();
@@ -55,15 +50,13 @@ impl Agent {
             ],
             recv: vec![],
         };
-        let mid = sdp.add_media(
+        sdp.add_media(
             str0m::media::MediaKind::Video,
             Direction::SendOnly,
             None,
             None,
             Some(simulcast),
         );
-
-        video_mid = Some(mid);
 
         sdp.add_media(
             str0m::media::MediaKind::Video,
@@ -98,85 +91,18 @@ impl Agent {
 
         let answer = res.text().await?;
         let answer = SdpAnswer::from_sdp_string(&answer)?;
+        let sdp = rtc.sdp_api();
         sdp.accept_answer(pending_offer, answer)?;
 
-        let agent_socket = socket;
-        let agent_events = event_tx.clone();
-        let agent_video_mid = video_mid;
+        let driver = AgentDriver {
+            socket,
+            event_tx: event_tx.clone(),
+        };
 
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 2000];
-            let mut agent_rtc = rtc;
+        let driver_task = AssertUnwindSafe(driver.run()).catch_unwind();
+        tokio::spawn(driver_task);
 
-            loop {
-                let now = std::time::Instant::now();
-                let timeout = agent_rtc
-                    .poll_timeout()
-                    .map(|d| now + d)
-                    .unwrap_or(now + std::time::Duration::from_secs(1));
-
-                tokio::select! {
-                    // Receive from SFU
-                    res = agent_socket.recv_from(&mut buf) => {
-                        if let Ok((len, _)) = res {
-                            let input = Input::Receive(
-                                now,
-                                Receive {
-                                    source: remote_addr,
-                                    destination: agent_socket.local_addr().unwrap(),
-                                    contents: (&buf[..len]).into(),
-                                },
-                            );
-                            agent_rtc.handle_input(input).ok();
-                        }
-                    }
-
-                    // Send Frame to SFU
-                    Some(frame) = frame_rx.recv() => {
-                        if let Some(mid) = agent_video_mid {
-                            if let Some(mut writer) = agent_rtc.writer(mid) {
-                                writer.write(now, frame).ok();
-                            }
-                        }
-                    }
-
-                    // Handle str0m internal timers
-                    _ = tokio::time::sleep_until(timeout.into()) => {
-                        agent_rtc.handle_input(Input::Timeout(now)).ok();
-                    }
-                }
-
-                // Drive Outgoing UDP
-                while let Some(transmit) = agent_rtc.poll_transmit() {
-                    agent_socket
-                        .send_to(&transmit.contents, transmit.destination)
-                        .await
-                        .ok();
-                }
-
-                // Handle str0m Events
-                while let Some(event) = agent_rtc.poll_event() {
-                    match event {
-                        Event::Connected => {
-                            agent_events.send(AgentEvent::Connected).ok();
-                        }
-                        Event::IceConnectionStateChange(s) => {
-                            agent_events.send(AgentEvent::StateChanged(s)).ok();
-                        }
-                        Event::MediaData(data) => {
-                            agent_events.send(AgentEvent::VideoFrame(data.data)).ok();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // DELETE session on exit (Cleanup)
-            #[allow(unreachable_code)]
-            {
-                let _ = HttpClient::new().delete(&location).send().await;
-            }
-        });
+        let _ = HttpClient::new().delete(&location).send().await;
 
         Ok(Self {
             frame_tx,
@@ -197,5 +123,86 @@ impl Agent {
             .send(nalu.into())
             .await
             .map_err(|_| anyhow!("Agent closed"))
+    }
+}
+
+struct AgentDriver {
+    socket: UdpSocket,
+    event_tx: broadcast::Sender<AgentEvent>,
+}
+
+impl AgentDriver {
+    async fn run(mut self) {
+        let mut buf = vec![0u8; 2000];
+        let mut agent_rtc = rtc;
+
+        loop {
+            let now = std::time::Instant::now();
+            let timeout = agent_rtc
+                .poll_timeout()
+                .map(|d| now + d)
+                .unwrap_or(now + std::time::Duration::from_secs(1));
+
+            tokio::select! {
+                // Receive from SFU
+                res = agent_socket.recv_from(&mut buf) => {
+                    if let Ok((len, _)) = res {
+                        let input = Input::Receive(
+                            now,
+                            Receive {
+                                source: remote_addr,
+                                destination: agent_socket.local_addr().unwrap(),
+                                contents: (&buf[..len]).into(),
+                            },
+                        );
+                        agent_rtc.handle_input(input).ok();
+                    }
+                }
+
+                // Send Frame to SFU
+                Some(frame) = frame_rx.recv() => {
+                    if let Some(mid) = agent_video_mid {
+                        if let Some(mut writer) = agent_rtc.writer(mid) {
+                            writer.write(now, frame).ok();
+                        }
+                    }
+                }
+
+                // Handle str0m internal timers
+                _ = tokio::time::sleep_until(timeout.into()) => {
+                    agent_rtc.handle_input(Input::Timeout(now)).ok();
+                }
+            }
+
+            // Drive Outgoing UDP
+            while let Some(transmit) = agent_rtc.poll_transmit() {
+                agent_socket
+                    .send_to(&transmit.contents, transmit.destination)
+                    .await
+                    .ok();
+            }
+
+            // Handle str0m Events
+            while let Some(event) = agent_rtc.poll_event() {
+                match event {
+                    Event::Connected => {
+                        agent_events.send(AgentEvent::Connected).ok();
+                    }
+                    Event::IceConnectionStateChange(s) => {
+                        agent_events.send(AgentEvent::StateChanged(s)).ok();
+                    }
+                    Event::MediaData(data) => {
+                        agent_events.send(AgentEvent::VideoFrame(data.data)).ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // DELETE session on exit (Cleanup)
+        #[allow(unreachable_code)]
+        {
+            let _ = HttpClient::new().delete(&location).send().await;
+        }
     }
 }
