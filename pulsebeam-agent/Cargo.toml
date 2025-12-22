@@ -9,15 +9,15 @@ documentation.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[features]
-default = ["ffmpeg-static"]
-
-# Force static linking (default)
-ffmpeg-static = ["ffmpeg-next/build"]
-
-# Use dynamic linking instead
-ffmpeg-dynamic = []
-
+# [features]
+# default = ["ffmpeg-static"]
+#
+# # Force static linking (default)
+# ffmpeg-static = ["ffmpeg-next/build"]
+#
+# # Use dynamic linking instead
+# ffmpeg-dynamic = []
+#
 [dependencies]
 futures-lite = { workspace = true }
 thiserror = { workspace = true }
@@ -31,4 +31,4 @@ maybe-async = "0.2.10"
 http = "1.4.0"
 
 # FFmpeg integration
-ffmpeg-next = { version = "8.0.0", default-features = false, features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
+# ffmpeg-next = { version = "8.0.0", default-features = false, features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
