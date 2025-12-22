@@ -165,6 +165,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-channel"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
+dependencies = [
+ "concurrent-queue",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -949,6 +961,16 @@ checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
 dependencies = [
  "concurrent-queue",
  "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener-strategy"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
+dependencies = [
+ "event-listener",
  "pin-project-lite",
 ]
 
@@ -2615,10 +2637,12 @@ version = "0.1.0"
 name = "pulsebeam-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "async-stream",
  "bytes",
  "criterion",
  "crossbeam-utils",
+ "dashmap",
  "event-listener",
  "futures-concurrency",
  "futures-lite",
@@ -3300,7 +3324,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "str0m"
 version = "0.14.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
 dependencies = [
  "combine",
  "crc",
@@ -3318,7 +3342,7 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -3328,7 +3352,7 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
 dependencies = [
  "base64ct",
  "dimpl",
@@ -3338,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "str0m-wincrypto"
 version = "0.3.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2Fmain#5201a30c11b402ae6ff83bf314dfe8b20b517b12"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
 dependencies = [
  "str0m-proto",
  "tracing",

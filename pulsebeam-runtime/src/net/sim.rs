@@ -3,6 +3,8 @@ use std::{
     net::SocketAddr,
 };
 
+use crate::net::Transport;
+
 use super::{RecvPacketBatch, RecvPacketBatcher, SendPacketBatch};
 use bytes::Bytes;
 
@@ -64,6 +66,7 @@ impl SimUdpTransport {
                         dst: self.local_addr,
                         len,
                         stride: len,
+                        transport: Transport::Udp,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,

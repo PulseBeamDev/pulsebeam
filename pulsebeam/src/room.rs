@@ -4,12 +4,12 @@ use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},
     prelude::*,
 };
-use str0m::Rtc;
 use tokio::task::JoinSet;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId},
-    gateway, node, participant,
+    gateway, node,
+    participant::{self, ParticipantActor},
     shard::{ShardMessage, ShardTask},
     track::{self, TrackMeta},
 };
@@ -17,10 +17,9 @@ use pulsebeam_runtime::actor;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
 pub enum RoomMessage {
     PublishTrack(track::TrackReceiver),
-    AddParticipant(Arc<ParticipantId>, Rtc),
+    AddParticipant(ParticipantActor),
     RemoveParticipant(Arc<ParticipantId>),
 }
 
@@ -102,9 +101,8 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         msg: RoomMessage,
     ) -> () {
         match msg {
-            RoomMessage::AddParticipant(participant_id, rtc) => {
-                self.handle_participant_joined(ctx, participant_id, rtc)
-                    .await
+            RoomMessage::AddParticipant(participant) => {
+                self.handle_participant_joined(ctx, participant).await
             }
             RoomMessage::RemoveParticipant(participant_id) => {
                 if let Some(participant_handle) = self.state.participants.get_mut(&participant_id) {
@@ -150,19 +148,12 @@ impl RoomActor {
 
     async fn handle_participant_joined(
         &mut self,
-        ctx: &mut actor::ActorContext<RoomMessageSet>,
-        participant_id: Arc<ParticipantId>,
-        rtc: str0m::Rtc,
+        _ctx: &mut actor::ActorContext<RoomMessageSet>,
+        participant_actor: ParticipantActor,
     ) {
-        let participant_actor = participant::ParticipantActor::new(
-            self.node_ctx.clone(),
-            ctx.handle.clone(),
-            participant_id.clone(),
-            rtc,
-        );
-
         let (mut participant_handle, participant_task) =
             actor::prepare(participant_actor, RunnerConfig::default());
+        let participant_id = participant_handle.meta.clone();
 
         self.participant_tasks.spawn(participant_task);
 

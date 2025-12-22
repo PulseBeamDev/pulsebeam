@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
+use str0m::net::Protocol;
 use tokio::time::Instant;
 
-use pulsebeam_runtime::net;
+use pulsebeam_runtime::net::{self, Transport};
 use str0m::bwe::BweKind;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
@@ -35,7 +36,8 @@ pub enum CoreEvent {
 pub struct ParticipantCore {
     pub participant_id: Arc<entity::ParticipantId>,
     pub rtc: Rtc,
-    pub batcher: Batcher,
+    pub udp_batcher: Batcher,
+    pub tcp_batcher: Batcher,
     pub upstream: UpstreamAllocator,
     pub downstream: DownstreamAllocator,
     disconnect_reason: Option<DisconnectReason>,
@@ -46,12 +48,14 @@ impl ParticipantCore {
     pub fn new(
         participant_id: Arc<entity::ParticipantId>,
         rtc: Rtc,
-        batcher_capacity: usize,
+        udp_batcher: Batcher,
+        tcp_batcher: Batcher,
     ) -> Self {
         Self {
             participant_id,
             rtc,
-            batcher: Batcher::with_capacity(batcher_capacity),
+            udp_batcher,
+            tcp_batcher,
             upstream: UpstreamAllocator::new(),
             downstream: DownstreamAllocator::new(),
             disconnect_reason: None,
@@ -79,10 +83,15 @@ impl ParticipantCore {
 
     pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) -> Option<Instant> {
         let mut last_deadline = None;
+        let transport = match batch.transport {
+            Transport::Udp => str0m::net::Protocol::Udp,
+            Transport::Tcp => str0m::net::Protocol::Tcp,
+            _ => str0m::net::Protocol::Udp,
+        };
         for pkt in batch.into_iter() {
             if let Ok(contents) = (*pkt).try_into() {
                 let recv = str0m::net::Receive {
-                    proto: str0m::net::Protocol::Udp,
+                    proto: transport,
                     source: batch.src,
                     destination: batch.dst,
                     contents,
@@ -142,9 +151,11 @@ impl ParticipantCore {
                 Ok(Output::Timeout(deadline)) => {
                     return Some(deadline.into());
                 }
-                Ok(Output::Transmit(tx)) => {
-                    self.batcher.push_back(tx.destination, &tx.contents);
-                }
+                Ok(Output::Transmit(tx)) => match tx.proto {
+                    Protocol::Udp => self.udp_batcher.push_back(tx.destination, &tx.contents),
+                    Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
+                    _ => {}
+                },
                 Ok(Output::Event(event)) => self.handle_event(event),
                 Err(e) => {
                     self.disconnect(e.into());

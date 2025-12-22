@@ -2,12 +2,15 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use pulsebeam_runtime::actor::ActorKind;
+use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
 use str0m::{Rtc, RtcError, error::SdpError};
 use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
 
+use crate::gateway::GatewayWorkerHandle;
+use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, node, room, track};
 
@@ -42,9 +45,10 @@ impl actor::MessageSet for ParticipantMessageSet {
 
 pub struct ParticipantActor {
     core: ParticipantCore,
-    node_ctx: node::NodeContext,
+    gateway: GatewayWorkerHandle,
+    udp_egress: Arc<UnifiedSocket>,
+    tcp_egress: Arc<UnifiedSocket>,
     room_handle: room::RoomHandle,
-    egress: Arc<net::UnifiedSocket>,
 }
 
 impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
@@ -71,7 +75,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let (gateway_tx, mut gateway_rx) = mailbox::new(64);
 
         let _ = self
-            .node_ctx
             .gateway
             .send(gateway::GatewayControlMessage::AddParticipant(
                 self.meta(),
@@ -125,8 +128,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
                     // this indicates the first batch is filled.
-                    if self.core.batcher.len() >= 2 {
-                        self.core.batcher.flush(&self.egress);
+                    if self.core.udp_batcher.len() >= 2 {
+                        self.core.udp_batcher.flush(&self.udp_egress);
+                    }
+                    if self.core.tcp_batcher.len() >= 2 {
+                        self.core.tcp_batcher.flush(&self.tcp_egress);
                     }
 
                     new_deadline = self.core.poll_rtc();
@@ -136,8 +142,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 },
 
                 // Priority 3: Flush to network
-                Ok(_) = self.egress.writable(), if !self.core.batcher.is_empty() => {
-                    self.core.batcher.flush(&self.egress);
+                Ok(_) = self.udp_egress.writable(), if !self.core.udp_batcher.is_empty() => {
+                    self.core.udp_batcher.flush(&self.udp_egress);
+                },
+                Ok(_) = self.tcp_egress.writable(), if !self.core.tcp_batcher.is_empty() => {
+                    self.core.tcp_batcher.flush(&self.tcp_egress);
                 },
 
                 // Priority 4: Background tasks
@@ -161,20 +170,30 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
 impl ParticipantActor {
     pub fn new(
-        node_ctx: node::NodeContext,
+        gateway_handle: GatewayWorkerHandle,
         room_handle: room::RoomHandle,
+        udp_egress: Arc<UnifiedSocket>,
+        tcp_egress: Arc<UnifiedSocket>,
         participant_id: Arc<entity::ParticipantId>,
         rtc: Rtc,
     ) -> Self {
-        let egress = node_ctx.allocate_egress();
-        let gso_segments = egress.max_gso_segments();
-        let batch_size_limit = std::cmp::min(gso_segments * MAX_MTU, MAX_GSO_SIZE);
-        let core = ParticipantCore::new(participant_id, rtc, batch_size_limit);
+        let udp_batcher = {
+            let gso_segments = udp_egress.max_gso_segments();
+            let batch_size_limit = std::cmp::min(gso_segments * MAX_MTU, MAX_GSO_SIZE);
+            Batcher::with_capacity(batch_size_limit)
+        };
+        let tcp_batcher = {
+            let gso_segments = tcp_egress.max_gso_segments();
+            let batch_size_limit = std::cmp::min(gso_segments * MAX_MTU, MAX_GSO_SIZE);
+            Batcher::with_capacity(batch_size_limit)
+        };
+        let core = ParticipantCore::new(participant_id, rtc, udp_batcher, tcp_batcher);
         Self {
+            gateway: gateway_handle,
             core,
-            node_ctx,
             room_handle,
-            egress,
+            udp_egress,
+            tcp_egress,
         }
     }
 

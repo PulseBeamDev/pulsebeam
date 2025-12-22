@@ -7,7 +7,7 @@ use std::{io, net::SocketAddr};
 use bytes::Bytes;
 use quinn_udp::RecvMeta;
 
-use crate::net::{sim::SimUdpTransport, udp::UdpTransport};
+use crate::net::{tcp::TcpTransport, udp::UdpTransport};
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 // Fit allocator page size and Linux GRO limit
@@ -17,8 +17,7 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 pub enum Transport {
     Udp,
     Tcp,
-    Tls,
-    SimUdp,
+    // Tls,
 }
 
 /// A received packet (zero-copy buffer + source address).
@@ -36,6 +35,7 @@ pub struct RecvPacketBatch {
     pub buf: Bytes,
     pub stride: usize,
     pub len: usize,
+    pub transport: Transport,
 }
 
 impl RecvPacketBatch {
@@ -121,6 +121,7 @@ impl RecvPacketBatcher {
                 buf,
                 stride: m.stride,
                 len: m.len,
+                transport: Transport::Udp,
             });
         }
     }
@@ -143,7 +144,7 @@ pub struct SendPacketBatch<'a> {
 /// UnifiedSocket enum for different transport types
 pub enum UnifiedSocket {
     Udp(UdpTransport),
-    SimUdp(SimUdpTransport),
+    Tcp(TcpTransport),
 }
 
 impl UnifiedSocket {
@@ -155,7 +156,7 @@ impl UnifiedSocket {
     ) -> io::Result<Self> {
         let sock = match transport {
             Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
-            Transport::SimUdp => Self::SimUdp(SimUdpTransport::bind(addr, external_addr).await?),
+            Transport::Tcp => Self::Tcp(TcpTransport::bind(addr, external_addr).await?),
             _ => todo!(),
         };
         tracing::debug!("bound to {addr} ({transport:?})");
@@ -165,21 +166,14 @@ impl UnifiedSocket {
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
-            Self::SimUdp(inner) => inner.local_addr(),
+            Self::Tcp(inner) => inner.local_addr(),
         }
     }
 
     pub fn max_gso_segments(&self) -> usize {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
-            Self::SimUdp(inner) => inner.max_gso_segments(),
-        }
-    }
-
-    pub fn gro_segments(&self) -> usize {
-        match self {
-            Self::Udp(inner) => inner.gro_segments(),
-            Self::SimUdp(inner) => inner.gro_segments(),
+            Self::Tcp(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -188,7 +182,7 @@ impl UnifiedSocket {
     pub async fn readable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.readable().await,
-            Self::SimUdp(inner) => inner.readable().await,
+            Self::Tcp(inner) => inner.readable().await,
         }
     }
 
@@ -197,7 +191,7 @@ impl UnifiedSocket {
     pub async fn writable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.writable().await,
-            Self::SimUdp(inner) => inner.writable().await,
+            Self::Tcp(inner) => inner.writable().await,
         }
     }
 
@@ -210,7 +204,7 @@ impl UnifiedSocket {
     ) -> std::io::Result<()> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(batch, packets),
-            Self::SimUdp(inner) => inner.try_recv_batch(batch, packets),
+            Self::Tcp(inner) => inner.try_recv_batch(packets),
         }
     }
 
@@ -219,7 +213,14 @@ impl UnifiedSocket {
     pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
-            Self::SimUdp(inner) => inner.try_send_batch(batch),
+            Self::Tcp(inner) => inner.try_send_batch(batch),
+        }
+    }
+
+    pub fn transport(&self) -> Transport {
+        match self {
+            Self::Udp(_) => Transport::Udp,
+            Self::Tcp(_) => Transport::Tcp,
         }
     }
 }
@@ -238,43 +239,134 @@ fn fmt_bytes(b: usize) -> String {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
+    use bytes::BufMut;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UdpSocket},
+    };
 
-    #[tokio::test]
-    async fn test_loopback() {
-        let sock = UnifiedSocket::bind("127.0.0.1:3000".parse().unwrap(), Transport::Udp, None)
+    async fn test_transport(transport_type: Transport) {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server = UnifiedSocket::bind(bind_addr, transport_type, None)
             .await
             .unwrap();
+        let actual_server_addr = server.local_addr();
 
-        sock.writable().await.unwrap();
-        let payload = b"hello";
-        let send_batch = SendPacketBatch {
-            dst: sock.local_addr(),
-            buf: payload,
-            segment_size: payload.len(),
-        };
-        assert!(sock.try_send_batch(&send_batch).unwrap());
+        // --- 1. External Client Setup ---
+        // (We use raw sockets here to simulate an external browser/client)
+        let mut tcp_client: Option<TcpStream> = None;
+        let mut udp_client: Option<UdpSocket> = None;
 
-        sock.readable().await.unwrap();
+        if matches!(transport_type, Transport::Tcp) {
+            tcp_client = Some(TcpStream::connect(actual_server_addr).await.unwrap());
+            tcp_client.as_ref().unwrap().set_nodelay(true).unwrap();
+        } else {
+            udp_client = Some(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+
+        // --- 2. Handshake: Client -> Server ---
+        // This allows the Server to discover the client's ephemeral port
+        let handshake_payload = b"hello-sfu";
+        if let Some(ref mut tcp) = tcp_client {
+            let mut buf = Vec::new();
+            buf.put_u16(handshake_payload.len() as u16);
+            buf.put_slice(handshake_payload);
+            tcp.write_all(&buf).await.unwrap();
+        } else {
+            udp_client
+                .as_ref()
+                .unwrap()
+                .send_to(handshake_payload, actual_server_addr)
+                .await
+                .unwrap();
+        }
+
+        // Server: Wait for handshake
+        server.readable().await.unwrap();
         let mut batcher = RecvPacketBatcher::new();
-        let mut buf = Vec::with_capacity(1);
-        sock.try_recv_batch(&mut batcher, &mut buf).unwrap();
-        assert_eq!(buf.len(), 1);
-        let mut batch = buf[0].iter();
-        assert_eq!(&batch.next().unwrap(), payload.as_slice());
+        let mut out = Vec::new();
 
-        buf.clear();
-        let payload = b"bla";
-        let send_batch = SendPacketBatch {
-            dst: sock.local_addr(),
-            buf: payload,
-            segment_size: payload.len(),
+        // Retry loop for UDP loopback jitter
+        let remote_peer_addr = loop {
+            if server.try_recv_batch(&mut batcher, &mut out).is_ok() && !out.is_empty() {
+                break out[0].src;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert!(sock.try_send_batch(&send_batch).unwrap());
-        sock.try_recv_batch(&mut batcher, &mut buf).unwrap();
-        assert_eq!(buf.len(), 1);
-        let mut batch = buf[0].iter();
-        assert_eq!(&batch.next().unwrap(), payload.as_slice());
+
+        // --- 3. Data Transfer: Server -> Client ---
+        let num_packets = 100;
+        let packet_payload = b"important-media-data";
+
+        // Spawn a client-side receiver task
+        let rx_handle = tokio::spawn(async move {
+            let mut count = 0;
+            if let Some(mut tcp) = tcp_client {
+                let mut buf = vec![0u8; 1024];
+                while count < num_packets {
+                    let len = tcp.read_u16().await.unwrap() as usize;
+                    tcp.read_exact(&mut buf[..len]).await.unwrap();
+                    assert_eq!(&buf[..len], packet_payload);
+                    count += 1;
+                }
+            } else {
+                let mut buf = [0u8; 1024];
+                while count < num_packets {
+                    let (len, _) = udp_client
+                        .as_ref()
+                        .unwrap()
+                        .recv_from(&mut buf)
+                        .await
+                        .unwrap();
+                    assert_eq!(&buf[..len], packet_payload);
+                    count += 1;
+                }
+            }
+            count
+        });
+
+        // Server: Send packets using the unified interface
+        let mut sent = 0;
+        while sent < num_packets {
+            server.writable().await.unwrap();
+            let batch = SendPacketBatch {
+                dst: remote_peer_addr,
+                buf: packet_payload,
+                segment_size: packet_payload.len(),
+            };
+
+            match server.try_send_batch(&batch) {
+                Ok(true) => sent += 1,
+                Ok(false) | Err(_) => {
+                    // Handle backpressure/WouldBlock
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        // Verify all packets arrived
+        let received = tokio::time::timeout(Duration::from_secs(2), rx_handle)
+            .await
+            .expect("Test timed out")
+            .expect("Client task failed");
+
+        assert_eq!(
+            received, num_packets,
+            "Transport {:?} lost packets",
+            transport_type
+        );
+    }
+
+    #[tokio::test]
+    async fn test_udp() {
+        test_transport(Transport::Udp).await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp() {
+        test_transport(Transport::Tcp).await;
     }
 }
