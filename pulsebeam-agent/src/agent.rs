@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use reqwest::Client as HttpClient;
-use std::sync::Arc;
 use str0m::{
     Event, Input, Rtc,
-    media::{Direction, Mid},
+    change::SdpAnswer,
+    media::{Direction, Mid, Simulcast, SimulcastLayer},
     net::Receive,
 };
 use tokio::net::UdpSocket;
@@ -18,71 +18,75 @@ pub enum AgentEvent {
     Connected,
 }
 
+pub struct AgentBuilder {
+    api_base: Option<String>,
+    room_id: Option<String>,
+}
+
 #[derive(Clone)]
-pub struct WebRtcAgent {
+pub struct Agent {
     frame_tx: mpsc::Sender<Bytes>,
     events: broadcast::Sender<AgentEvent>,
     pub video_mid: Option<Mid>,
 }
 
-impl WebRtcAgent {
+impl Agent {
     /// Mirrored from your JS `start()` logic.
     /// Performs HTTP POST, sets up transceivers, and spawns the worker.
     pub async fn join(
+        http_client: HttpClient,
+        socket: UdpSocket,
         api_base: &str,
         room_id: &str,
-        publish: bool,
-        subscribe: bool,
     ) -> Result<Self> {
-        let http = HttpClient::new();
         let (event_tx, _event_rx) = broadcast::channel(128);
         let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(100);
 
-        // 1. Setup str0m (ice_lite should be true for client mode)
-        let mut rtc = Rtc::builder().set_ice_lite(true).build();
-
+        let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).build();
         let mut video_mid = None;
 
-        // 2. Configure Transceivers (Matching your JS Encodings)
-        if publish {
-            let mid = rtc.media().add_media(
-                Direction::SendOnly,
-                str0m::media::MediaKind::Video,
-                "video".to_string(),
-            );
+        // TODO: allow configurable transceivers
+        let mut sdp = rtc.sdp_api();
+        let simulcast = Simulcast {
+            send: vec![
+                SimulcastLayer::new("f"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("q"),
+            ],
+            recv: vec![],
+        };
+        let mid = sdp.add_media(
+            str0m::media::MediaKind::Video,
+            Direction::SendOnly,
+            None,
+            None,
+            Some(simulcast),
+        );
 
-            // Configure H264 codec
-            if let Some(m) = rtc.media_mut(mid) {
-                m.set_codec(str0m::media::CodecConfig::H264);
+        video_mid = Some(mid);
 
-                // Add Simulcast Rids: q (1/4), h (1/2), f (1/1)
-                m.set_rids(vec!["q".into(), "h".into(), "f".into()]);
-            }
+        sdp.add_media(
+            str0m::media::MediaKind::Video,
+            Direction::RecvOnly,
+            None,
+            None,
+            None,
+        );
 
-            video_mid = Some(mid);
-        }
-
-        if subscribe {
-            rtc.media().add_media(
-                Direction::RecvOnly,
-                str0m::media::MediaKind::Video,
-                "video-recv".to_string(),
-            );
-        }
-
-        // 3. Handshake (POST Offer -> Get Answer)
-        let offer = rtc.sdp_api().create_offer();
+        let (offer, pending_offer) = sdp.apply().unwrap();
         let sdp_offer = offer.to_sdp_string();
 
-        let res = http
-            .post(format!("{}/api/v1/rooms/{}", api_base, room_id))
+        let uri = format!("{}/api/v1/rooms/{}", api_base, room_id);
+        tracing::info!("connecting to {}", uri);
+        let res = http_client
+            .post(uri)
             .header("Content-Type", "application/sdp")
             .body(sdp_offer)
             .send()
             .await?;
 
         if !res.status().is_success() {
-            return Err(anyhow!("SFU Join Failed: {}", res.status()));
+            return Err(anyhow!("join failed: {}", res.status()));
         }
 
         let location = res
@@ -92,20 +96,11 @@ impl WebRtcAgent {
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("No Location header for cleanup"))?;
 
-        let sdp_answer = res.text().await?;
+        let answer = res.text().await?;
+        let answer = SdpAnswer::from_sdp_string(&answer)?;
+        sdp.accept_answer(pending_offer, answer)?;
 
-        // 4. Finalize WebRTC State
-        rtc.sdp_api().accept_answer(sdp_answer)?;
-
-        // 5. Initialize Networking (Compatible with Turmoil/Tokio)
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-        let remote_addr = rtc
-            .direct_api()
-            .remote_addr()
-            .ok_or_else(|| anyhow!("No ICE candidate"))?;
-
-        // 6. Spawn the Background Agent Worker
-        let agent_socket = socket.clone();
+        let agent_socket = socket;
         let agent_events = event_tx.clone();
         let agent_video_mid = video_mid;
 
