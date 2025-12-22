@@ -24,8 +24,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 str0m = { workspace = true }
 bytes = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
 
-tokio = { workspace = true, optional = true }
 reqwest = { version = "0.12.26", optional = true }
 maybe-async = "0.2.10"
 http = "1.4.0"
