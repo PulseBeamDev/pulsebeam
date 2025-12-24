@@ -179,7 +179,7 @@ impl ControllerActor {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
         let sockets = [&udp_egress, &tcp_egress];
-        for s in &sockets {
+        for s in sockets {
             let candidate = match s.transport() {
                 Transport::Udp => Candidate::builder()
                     .udp()

@@ -24,7 +24,7 @@ impl actor::MessageSet for GatewayMessageSet {
 }
 
 pub struct GatewayActor {
-    sockets: Vec<Arc<net::UnifiedSocket>>,
+    sockets: Vec<net::UnifiedSocketReader>,
     workers: Vec<GatewayWorkerHandle>,
 
     worker_tasks: JoinSet<(String, ActorStatus)>,
@@ -50,11 +50,9 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         &mut self,
         ctx: &mut actor::ActorContext<GatewayMessageSet>,
     ) -> Result<(), actor::ActorError> {
-        for (id, socket) in self.sockets.iter().enumerate() {
-            let (worker_handle, worker_task) = actor::prepare(
-                GatewayWorkerActor::new(id, socket.clone()),
-                RunnerConfig::default(),
-            );
+        for (id, socket) in self.sockets.drain(..).enumerate() {
+            let (worker_handle, worker_task) =
+                actor::prepare(GatewayWorkerActor::new(id, socket), RunnerConfig::default());
             self.worker_tasks.spawn(worker_task);
             self.workers.push(worker_handle);
         }
@@ -82,7 +80,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
 }
 
 impl GatewayActor {
-    pub fn new(sockets: Vec<Arc<net::UnifiedSocket>>) -> Self {
+    pub fn new(sockets: Vec<net::UnifiedSocketReader>) -> Self {
         let workers = Vec::with_capacity(sockets.len());
         Self {
             sockets,
@@ -96,9 +94,8 @@ pub type GatewayHandle = actor::ActorHandle<GatewayMessageSet>;
 
 pub struct GatewayWorkerActor {
     id: usize,
-    socket: Arc<net::UnifiedSocket>,
+    socket: net::UnifiedSocketReader,
     demuxer: Demuxer,
-    batcher: net::RecvPacketBatcher,
     recv_batches: Vec<net::RecvPacketBatch>,
 }
 
@@ -150,14 +147,12 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
 }
 
 impl GatewayWorkerActor {
-    pub fn new(id: usize, socket: Arc<net::UnifiedSocket>) -> Self {
+    pub fn new(id: usize, socket: net::UnifiedSocketReader) -> Self {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
-        let batcher = net::RecvPacketBatcher::new();
 
         Self {
             id,
             socket,
-            batcher,
             recv_batches: recv_batch,
             demuxer: Demuxer::new(),
         }
@@ -170,10 +165,7 @@ impl GatewayWorkerActor {
         loop {
             self.recv_batches.clear();
 
-            match self
-                .socket
-                .try_recv_batch(&mut self.batcher, &mut self.recv_batches)
-            {
+            match self.socket.try_recv_batch(&mut self.recv_batches) {
                 Ok(_) => {
                     for batch in self.recv_batches.drain(..) {
                         // Calculate logical packets (GRO awareness)
@@ -183,7 +175,10 @@ impl GatewayWorkerActor {
                             1
                         };
 
-                        self.demuxer.demux(batch).await;
+                        let src = batch.src;
+                        if !self.demuxer.demux(batch).await {
+                            self.socket.close_peer(&src);
+                        }
 
                         spent_budget += cost;
 

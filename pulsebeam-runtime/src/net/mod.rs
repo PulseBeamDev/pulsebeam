@@ -5,9 +5,6 @@ mod udp;
 use std::{io, net::SocketAddr};
 
 use bytes::Bytes;
-use quinn_udp::RecvMeta;
-
-use crate::net::{tcp::TcpTransport, udp::UdpTransport};
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 // Fit allocator page size and Linux GRO limit
@@ -84,49 +81,6 @@ impl<'a> Iterator for RecvPacketBatchIter<'a> {
     }
 }
 
-pub struct RecvPacketBatcher {
-    meta: [RecvMeta; BATCH_SIZE],
-    batch_buffer: Vec<u8>,
-}
-
-impl RecvPacketBatcher {
-    pub fn new() -> Self {
-        Self {
-            meta: [RecvMeta::default(); BATCH_SIZE],
-            batch_buffer: Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE),
-        }
-    }
-
-    fn collect(&mut self, local_addr: SocketAddr, count: usize, out: &mut Vec<RecvPacketBatch>) {
-        let new_buffer = Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE);
-        let filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
-        let master_bytes = Bytes::from(filled_buffer);
-
-        for i in 0..count {
-            let m = &self.meta[i];
-
-            let start = i * CHUNK_SIZE;
-            let end = start + m.len;
-
-            // Safety: Ensure we don't slice past the buffer (e.g., if kernel lied about len)
-            if end > master_bytes.len() {
-                continue;
-            }
-
-            let buf = master_bytes.slice(start..end);
-
-            out.push(RecvPacketBatch {
-                src: m.addr,
-                dst: local_addr,
-                buf,
-                stride: m.stride,
-                len: m.len,
-                transport: Transport::Udp,
-            });
-        }
-    }
-}
-
 /// A packet to send.
 #[derive(Debug, Clone)]
 pub struct SendPacket {
@@ -141,39 +95,50 @@ pub struct SendPacketBatch<'a> {
     pub segment_size: usize,
 }
 
-/// UnifiedSocket enum for different transport types
-pub enum UnifiedSocket {
-    Udp(UdpTransport),
-    Tcp(TcpTransport),
+/// Binds a socket to the given address and transport type.
+pub async fn bind(
+    addr: SocketAddr,
+    transport: Transport,
+    external_addr: Option<SocketAddr>,
+) -> io::Result<(UnifiedSocketReader, UnifiedSocketWriter)> {
+    let socks = match transport {
+        Transport::Udp => {
+            let (reader, writer) = udp::bind(addr, external_addr)?;
+            (
+                UnifiedSocketReader::Udp(Box::new(reader)),
+                UnifiedSocketWriter::Udp(writer),
+            )
+        }
+
+        Transport::Tcp => {
+            let (reader, writer) = tcp::bind(addr, external_addr).await?;
+            (
+                UnifiedSocketReader::Tcp(reader),
+                UnifiedSocketWriter::Tcp(writer),
+            )
+        }
+        _ => todo!(),
+    };
+    tracing::debug!("bound to {addr} ({transport:?})");
+    Ok(socks)
 }
 
-impl UnifiedSocket {
-    /// Binds a socket to the given address and transport type.
-    pub async fn bind(
-        addr: SocketAddr,
-        transport: Transport,
-        external_addr: Option<SocketAddr>,
-    ) -> io::Result<Self> {
-        let sock = match transport {
-            Transport::Udp => Self::Udp(UdpTransport::bind(addr, external_addr)?),
-            Transport::Tcp => Self::Tcp(TcpTransport::bind(addr, external_addr).await?),
-            _ => todo!(),
-        };
-        tracing::debug!("bound to {addr} ({transport:?})");
-        Ok(sock)
+pub enum UnifiedSocketReader {
+    Udp(Box<udp::UdpTransportReader>),
+    Tcp(tcp::TcpTransportReader),
+}
+
+impl UnifiedSocketReader {
+    pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
+        if let Self::Tcp(inner) = self {
+            inner.close_peer(peer_addr);
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::Tcp(inner) => inner.local_addr(),
-        }
-    }
-
-    pub fn max_gso_segments(&self) -> usize {
-        match self {
-            Self::Udp(inner) => inner.max_gso_segments(),
-            Self::Tcp(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -186,25 +151,36 @@ impl UnifiedSocket {
         }
     }
 
+    /// Receives a batch of packets into pre-allocated buffers.
+    #[inline]
+    pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
+        match self {
+            Self::Udp(inner) => inner.try_recv_batch(packets),
+            Self::Tcp(inner) => inner.try_recv_batch(packets),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum UnifiedSocketWriter {
+    Udp(udp::UdpTransportWriter),
+    Tcp(tcp::TcpTransportWriter),
+}
+
+impl UnifiedSocketWriter {
+    pub fn max_gso_segments(&self) -> usize {
+        match self {
+            Self::Udp(inner) => inner.max_gso_segments(),
+            Self::Tcp(inner) => inner.max_gso_segments(),
+        }
+    }
+
     /// Waits until the socket is writable.
     #[inline]
     pub async fn writable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::Tcp(inner) => inner.writable().await,
-        }
-    }
-
-    /// Receives a batch of packets into pre-allocated buffers.
-    #[inline]
-    pub fn try_recv_batch(
-        &self,
-        batch: &mut RecvPacketBatcher,
-        packets: &mut Vec<RecvPacketBatch>,
-    ) -> std::io::Result<()> {
-        match self {
-            Self::Udp(inner) => inner.try_recv_batch(batch, packets),
-            Self::Tcp(inner) => inner.try_recv_batch(packets),
         }
     }
 
@@ -221,6 +197,13 @@ impl UnifiedSocket {
         match self {
             Self::Udp(_) => Transport::Udp,
             Self::Tcp(_) => Transport::Tcp,
+        }
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Udp(inner) => inner.local_addr(),
+            Self::Tcp(inner) => inner.local_addr(),
         }
     }
 }
@@ -250,13 +233,14 @@ mod tests {
 
     async fn test_transport(transport_type: Transport) {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut server = UnifiedSocket::bind(bind_addr, transport_type, None)
-            .await
-            .unwrap();
-        let actual_server_addr = server.local_addr();
 
-        // --- 1. External Client Setup ---
-        // (We use raw sockets here to simulate an external browser/client)
+        // 1. Bind now returns a split Reader and Writer
+        let (mut reader, writer) = bind(bind_addr, transport_type, None).await.unwrap();
+
+        // We can get the address from either, but writer is usually the "identity"
+        let actual_server_addr = writer.local_addr();
+
+        // --- 2. External Client Setup ---
         let mut tcp_client: Option<TcpStream> = None;
         let mut udp_client: Option<UdpSocket> = None;
 
@@ -267,8 +251,7 @@ mod tests {
             udp_client = Some(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         }
 
-        // --- 2. Handshake: Client -> Server ---
-        // This allows the Server to discover the client's ephemeral port
+        // --- 3. Handshake: Client -> Server ---
         let handshake_payload = b"hello-sfu";
         if let Some(ref mut tcp) = tcp_client {
             let mut buf = Vec::new();
@@ -284,20 +267,23 @@ mod tests {
                 .unwrap();
         }
 
-        // Server: Wait for handshake
-        server.readable().await.unwrap();
-        let mut batcher = RecvPacketBatcher::new();
+        // Server: Wait for handshake using the Reader
+        reader.readable().await.unwrap();
+
+        // Note: RecvPacketBatcher is now internal to the reader and not seen here
         let mut out = Vec::new();
 
         // Retry loop for UDP loopback jitter
         let remote_peer_addr = loop {
-            if server.try_recv_batch(&mut batcher, &mut out).is_ok() && !out.is_empty() {
+            out.clear();
+            // try_recv_batch now takes mut self and handles its own batcher
+            if reader.try_recv_batch(&mut out).is_ok() && !out.is_empty() {
                 break out[0].src;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        // --- 3. Data Transfer: Server -> Client ---
+        // --- 4. Data Transfer: Server -> Client ---
         let num_packets = 100;
         let packet_payload = b"important-media-data";
 
@@ -328,21 +314,26 @@ mod tests {
             count
         });
 
-        // Server: Send packets using the unified interface
+        // Server: Send packets using the Writer
+        // We can even clone the writer to show multi-owner capability
+        let writer_tx = writer.clone();
         let mut sent = 0;
         while sent < num_packets {
-            server.writable().await.unwrap();
+            writer_tx.writable().await.unwrap();
             let batch = SendPacketBatch {
                 dst: remote_peer_addr,
                 buf: packet_payload,
                 segment_size: packet_payload.len(),
             };
 
-            match server.try_send_batch(&batch) {
+            match writer_tx.try_send_batch(&batch) {
                 Ok(true) => sent += 1,
-                Ok(false) | Err(_) => {
+                Ok(false) => {
                     // Handle backpressure/WouldBlock
                     tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    panic!("Send failed: {e}");
                 }
             }
         }

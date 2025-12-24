@@ -13,8 +13,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
     pub gateway: gateway::GatewayHandle,
-    pub udp_sockets: Vec<Arc<net::UnifiedSocket>>,
-    pub tcp_socket: Arc<net::UnifiedSocket>,
+    pub udp_sockets: Vec<net::UnifiedSocketWriter>,
+    pub tcp_socket: net::UnifiedSocketWriter,
     pub shards: Vec<ActorHandle<ShardMessageSet>>,
     udp_egress_counter: Arc<AtomicUsize>,
 }
@@ -37,7 +37,7 @@ impl NodeContext {
     //     }
     // }
     //
-    pub fn allocate_udp_egress(&self) -> Arc<net::UnifiedSocket> {
+    pub fn allocate_udp_egress(&self) -> net::UnifiedSocketWriter {
         let seq = self
             .udp_egress_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -47,7 +47,7 @@ impl NodeContext {
             .clone()
     }
 
-    pub fn allocate_tcp_egress(&self) -> Arc<net::UnifiedSocket> {
+    pub fn allocate_tcp_egress(&self) -> net::UnifiedSocketWriter {
         self.tcp_socket.clone()
     }
 }
@@ -60,14 +60,13 @@ pub async fn run(
     http_addr: SocketAddr,
     internal_http_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    let mut udp_sockets: Vec<Arc<net::UnifiedSocket>> = Vec::new();
+    let mut net_readers: Vec<net::UnifiedSocketReader> = Vec::new();
+    let mut udp_writers: Vec<net::UnifiedSocketWriter> = Vec::new();
     for _ in 0..workers {
-        let udp_socket =
-            match net::UnifiedSocket::bind(local_addr, net::Transport::Udp, Some(external_addr))
-                .await
-            {
+        let (reader, writer) =
+            match net::bind(local_addr, net::Transport::Udp, Some(external_addr)).await {
                 Ok(socket) => socket,
-                Err(err) if udp_sockets.is_empty() => {
+                Err(err) if udp_writers.is_empty() => {
                     return Err(anyhow::Error::new(err).context("failed to bind udp"));
                 }
                 Err(err) => {
@@ -76,12 +75,12 @@ pub async fn run(
                 }
             };
 
-        let socket = Arc::new(udp_socket);
-        udp_sockets.push(socket);
+        net_readers.push(reader);
+        udp_writers.push(writer);
     }
-    let tcp_socket =
-        net::UnifiedSocket::bind(local_addr, net::Transport::Tcp, Some(external_addr)).await?;
-    let tcp_socket = Arc::new(tcp_socket);
+    let (tcp_reader, tcp_writer) =
+        net::bind(local_addr, net::Transport::Tcp, Some(external_addr)).await?;
+    net_readers.push(tcp_reader);
 
     let cors = CorsLayer::very_permissive()
         .allow_origin(AllowOrigin::mirror_request())
@@ -89,10 +88,10 @@ pub async fn run(
         .max_age(Duration::from_secs(86400));
 
     let mut join_set = JoinSet::new();
-    let mut sockets = udp_sockets.clone();
-    sockets.push(tcp_socket.clone());
-    let (gateway, gateway_task) =
-        actor::prepare(gateway::GatewayActor::new(sockets), RunnerConfig::default());
+    let (gateway, gateway_task) = actor::prepare(
+        gateway::GatewayActor::new(net_readers),
+        RunnerConfig::default(),
+    );
     join_set.spawn(ignore(gateway_task));
 
     // let shard_count = 2 * workers;
@@ -109,8 +108,8 @@ pub async fn run(
     let node_ctx = NodeContext {
         rng,
         gateway,
-        udp_sockets,
-        tcp_socket,
+        udp_sockets: udp_writers,
+        tcp_socket: tcp_writer,
         shards: vec![],
         udp_egress_counter: Arc::new(AtomicUsize::new(0)),
     };

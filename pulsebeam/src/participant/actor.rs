@@ -2,9 +2,9 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use pulsebeam_runtime::actor::ActorKind;
-use pulsebeam_runtime::net::UnifiedSocket;
+use pulsebeam_runtime::net::UnifiedSocketWriter;
 use pulsebeam_runtime::prelude::*;
-use pulsebeam_runtime::{actor, mailbox, net};
+use pulsebeam_runtime::{actor, mailbox};
 use str0m::{Rtc, RtcError, error::SdpError};
 use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
@@ -12,7 +12,7 @@ use tokio_metrics::TaskMonitor;
 use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
-use crate::{entity, gateway, node, room, track};
+use crate::{entity, gateway, room, track};
 
 // The hard limit of IPv4/IPv6 total packet size is 65535
 // a bit lower to be less bursty and safer from possible off-by-one errors
@@ -46,8 +46,8 @@ impl actor::MessageSet for ParticipantMessageSet {
 pub struct ParticipantActor {
     core: ParticipantCore,
     gateway: GatewayWorkerHandle,
-    udp_egress: Arc<UnifiedSocket>,
-    tcp_egress: Arc<UnifiedSocket>,
+    udp_egress: UnifiedSocketWriter,
+    tcp_egress: UnifiedSocketWriter,
     room_handle: room::RoomHandle,
 }
 
@@ -172,8 +172,8 @@ impl ParticipantActor {
     pub fn new(
         gateway_handle: GatewayWorkerHandle,
         room_handle: room::RoomHandle,
-        udp_egress: Arc<UnifiedSocket>,
-        tcp_egress: Arc<UnifiedSocket>,
+        udp_egress: UnifiedSocketWriter,
+        tcp_egress: UnifiedSocketWriter,
         participant_id: Arc<entity::ParticipantId>,
         rtc: Rtc,
     ) -> Self {

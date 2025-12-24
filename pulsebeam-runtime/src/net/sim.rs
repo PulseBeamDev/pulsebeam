@@ -5,7 +5,7 @@ use std::{
 
 use crate::net::Transport;
 
-use super::{RecvPacketBatch, RecvPacketBatcher, SendPacketBatch};
+use super::{RecvPacketBatch, SendPacketBatch};
 use bytes::Bytes;
 
 pub struct SimUdpTransport {
@@ -46,11 +46,7 @@ impl SimUdpTransport {
     }
 
     #[inline]
-    pub fn try_recv_batch(
-        &self,
-        _batch: &mut RecvPacketBatcher,
-        packets: &mut Vec<RecvPacketBatch>,
-    ) -> std::io::Result<()> {
+    pub fn try_recv_batch(&self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
         let mut buf = [0u8; Self::MTU];
         let mut total_bytes = 0;
         let mut read_count = 0; // Track count to ensure we signal WouldBlock if empty
