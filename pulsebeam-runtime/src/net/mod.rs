@@ -117,7 +117,6 @@ pub async fn bind(
                 UnifiedSocketWriter::Tcp(writer),
             )
         }
-        // Transport::Tcp => Self::Tcp(TcpTransport::bind(addr, external_addr).await?),
         _ => todo!(),
     };
     tracing::debug!("bound to {addr} ({transport:?})");
