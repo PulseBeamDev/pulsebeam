@@ -15,11 +15,22 @@ use std::{
     num::NonZeroUsize,
 };
 
+use clap::Parser;
 use pulsebeam::node;
 use systemstat::{IpAddr as SysIpAddr, Platform, System};
 use tracing_subscriber::EnvFilter;
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Enable development mode preset
+    #[arg(short, long)]
+    dev: bool,
+}
+
 fn main() {
+    let args = Args::parse();
+
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
     tracing_subscriber::fmt()
@@ -33,28 +44,28 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        // .disable_lifo_slot()
         .worker_threads(workers)
         .build()
         .unwrap();
-    // let rt = tokio::runtime::LocalRuntime::new().unwrap();
 
+    let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers));
+    rt.block_on(run(shutdown.clone(), workers, rtc_port));
     shutdown.cancel();
 }
 
-pub async fn run(shutdown: CancellationToken, workers: usize) {
+pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let external_ip = select_host_address();
-    let external_addr: SocketAddr = format!("{}:3478", external_ip).parse().unwrap();
+    let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
 
-    let local_addr: SocketAddr = "0.0.0.0:3478".parse().unwrap();
+    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
     let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     let internal_http_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
     tracing::info!(
-        "server listening at {}:3000 (signaling), {}:3478 (webrtc), and 0.0.0.0:6060 (metrics/pprof)",
+        "server listening at {}:3000 (signaling), {}:{} (webrtc), and 0.0.0.0:6060 (metrics/pprof)",
         external_ip,
-        external_ip
+        external_ip,
+        rtc_port
     );
 
     // Run the main logic and signal handler concurrently

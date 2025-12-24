@@ -18,7 +18,7 @@ BINARY = $(TARGET_DIR)/pulsebeam
 all: build
 
 dev:
-	$(CARGO_CMD) run -p pulsebeam
+	$(CARGO_CMD) run -p pulsebeam -- --dev
 
 build:
 	$(CARGO_CMD) build --profile profiling -p pulsebeam
