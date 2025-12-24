@@ -1,9 +1,12 @@
-use super::{
-    BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, RecvPacketBatcher, SendPacketBatch, fmt_bytes,
-};
+use crate::net::Transport;
+
+use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
+use bytes::Bytes;
+use quinn_udp::RecvMeta;
 use std::{
     io::{self, ErrorKind, IoSliceMut},
     net::SocketAddr,
+    sync::Arc,
 };
 
 // Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
@@ -11,65 +14,77 @@ use std::{
 pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
 // per-client-pacer handles the latency bloat. But, big enough for keyframe bursts to many subscribers
 pub const SOCKET_SEND_SIZE: usize = 32 * BATCH_SIZE * CHUNK_SIZE;
+pub const MAX_MTU: usize = 1500;
 
-pub struct UdpTransport {
-    sock: tokio::net::UdpSocket,
-    state: quinn_udp::UdpSocketState,
-    local_addr: SocketAddr,
+pub fn bind(
+    addr: SocketAddr,
+    external_addr: Option<SocketAddr>,
+) -> io::Result<(UdpTransportReader, UdpTransportWriter)> {
+    let socket2_sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket2_sock.set_nonblocking(true)?;
+    socket2_sock.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    socket2_sock.set_reuse_port(true)?;
+
+    socket2_sock.set_recv_buffer_size(SOCKET_RECV_SIZE)?;
+    socket2_sock.set_send_buffer_size(SOCKET_SEND_SIZE)?;
+    socket2_sock.bind(&addr.into())?;
+
+    let send_buf_size = socket2_sock.send_buffer_size()?;
+    let recv_buf_size = socket2_sock.recv_buffer_size()?;
+
+    let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
+    let state = Arc::new(state);
+    let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
+    let writer_sock = Arc::new(sock);
+
+    let local_addr = external_addr.unwrap_or(writer_sock.local_addr()?);
+    let reader_sock = writer_sock.clone();
+
+    let reader = UdpTransportReader {
+        sock: reader_sock,
+        state: state.clone(),
+        local_addr,
+        meta: [RecvMeta::default(); BATCH_SIZE],
+        batch_buffer: Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE),
+    };
+
+    let writer = UdpTransportWriter {
+        sock: writer_sock,
+        state,
+        local_addr,
+    };
+
+    tracing::info!(
+        %addr,
+        %local_addr,
+        recv_buf = fmt_bytes(recv_buf_size),
+        send_buf = fmt_bytes(send_buf_size),
+        gro_segments = ?reader.gro_segments(),
+        gso_segments = ?writer.max_gso_segments(),
+        "UDP socket bound"
+    );
+
+    Ok((reader, writer))
 }
 
-impl UdpTransport {
-    pub const MAX_MTU: usize = 1500;
+pub struct UdpTransportReader {
+    sock: Arc<tokio::net::UdpSocket>,
+    state: Arc<quinn_udp::UdpSocketState>,
+    local_addr: SocketAddr,
 
-    pub fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<Self> {
-        let socket2_sock = socket2::Socket::new(
-            socket2::Domain::for_address(addr),
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        socket2_sock.set_nonblocking(true)?;
-        socket2_sock.set_reuse_address(true)?;
+    meta: [RecvMeta; BATCH_SIZE],
+    batch_buffer: Vec<u8>,
+}
 
-        #[cfg(unix)]
-        socket2_sock.set_reuse_port(true)?;
-
-        socket2_sock.set_recv_buffer_size(SOCKET_RECV_SIZE)?;
-        socket2_sock.set_send_buffer_size(SOCKET_SEND_SIZE)?;
-        socket2_sock.bind(&addr.into())?;
-
-        let send_buf_size = socket2_sock.send_buffer_size()?;
-        let recv_buf_size = socket2_sock.recv_buffer_size()?;
-
-        let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
-        let gro_segments = state.gro_segments();
-        let gso_segments = state.max_gso_segments();
-
-        let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
-        let local_addr = external_addr.unwrap_or(sock.local_addr()?);
-
-        tracing::info!(
-            %addr,
-            %local_addr,
-            recv_buf = fmt_bytes(recv_buf_size),
-            send_buf = fmt_bytes(send_buf_size),
-            gro_segments = ?gro_segments,
-            gso_segments = ?gso_segments,
-            "UDP socket bound"
-        );
-
-        Ok(Self {
-            sock,
-            local_addr,
-            state,
-        })
-    }
-
+impl UdpTransportReader {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
-    }
-
-    pub fn max_gso_segments(&self) -> usize {
-        self.state.max_gso_segments()
     }
 
     pub fn gro_segments(&self) -> usize {
@@ -83,26 +98,12 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub async fn writable(&self) -> io::Result<()> {
-        self.sock.ready(tokio::io::Interest::WRITABLE).await?;
-        Ok(())
-    }
-
-    #[inline]
-    pub fn try_recv_batch(
-        &self,
-        batcher: &mut RecvPacketBatcher,
-        out: &mut Vec<RecvPacketBatch>,
-    ) -> std::io::Result<()> {
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
         self.sock.try_io(tokio::io::Interest::READABLE, || {
             // Prepare the pointers for the kernel
             // We set len=capacity so we can take mutable slices of the uninitialized memory
-            unsafe {
-                batcher
-                    .batch_buffer
-                    .set_len(batcher.batch_buffer.capacity())
-            };
-            let ptr = batcher.batch_buffer.as_mut_ptr();
+            unsafe { self.batch_buffer.set_len(self.batch_buffer.capacity()) };
+            let ptr = self.batch_buffer.as_mut_ptr();
 
             let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|i| {
                 let offset = i * CHUNK_SIZE;
@@ -114,17 +115,65 @@ impl UdpTransport {
 
             let res = self
                 .state
-                .recv((&self.sock).into(), &mut slices, &mut batcher.meta);
+                .recv((&self.sock).into(), &mut slices, &mut self.meta);
             let _ = slices; // slices is no longer safe to use
 
             match res {
                 Ok(count) => {
-                    batcher.collect(self.local_addr, count, out);
+                    let new_buffer = Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE);
+                    let filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
+                    let master_bytes = Bytes::from(filled_buffer);
+
+                    for i in 0..count {
+                        let m = &self.meta[i];
+
+                        let start = i * CHUNK_SIZE;
+                        let end = start + m.len;
+
+                        // Safety: Ensure we don't slice past the buffer (e.g., if kernel lied about len)
+                        if end > master_bytes.len() {
+                            continue;
+                        }
+
+                        let buf = master_bytes.slice(start..end);
+
+                        out.push(RecvPacketBatch {
+                            src: m.addr,
+                            dst: self.local_addr,
+                            buf,
+                            stride: m.stride,
+                            len: m.len,
+                            transport: Transport::Udp,
+                        });
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
             }
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct UdpTransportWriter {
+    sock: Arc<tokio::net::UdpSocket>,
+    state: Arc<quinn_udp::UdpSocketState>,
+    local_addr: SocketAddr,
+}
+
+impl UdpTransportWriter {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn max_gso_segments(&self) -> usize {
+        self.state.max_gso_segments()
+    }
+
+    #[inline]
+    pub async fn writable(&self) -> io::Result<()> {
+        self.sock.ready(tokio::io::Interest::WRITABLE).await?;
+        Ok(())
     }
 
     #[inline]
