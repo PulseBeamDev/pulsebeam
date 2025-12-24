@@ -38,6 +38,7 @@ event-listener = "5.4.1"
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
 async-channel = "2.5.0"
+tokio-util = "0.7.17"
 
 [dev-dependencies]
 criterion = { version = "0.8.1", features = ["async", "async_tokio"] }

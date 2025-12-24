@@ -175,7 +175,10 @@ impl GatewayWorkerActor {
                             1
                         };
 
-                        self.demuxer.demux(batch).await;
+                        let src = batch.src;
+                        if !self.demuxer.demux(batch).await {
+                            self.socket.close_peer(&src);
+                        }
 
                         spent_budget += cost;
 

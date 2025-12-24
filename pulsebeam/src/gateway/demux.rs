@@ -67,7 +67,7 @@ impl Demuxer {
     }
 
     /// Routes a packet to the correct participant.
-    /// Returns `true` if sent, `false` if dropped (queue full or unknown destination).
+    /// Returns `true` if sent, `false` if dropped
     pub async fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
         let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
             handle
@@ -98,14 +98,6 @@ impl Demuxer {
             Ok(_) => true,
             Err(SendError(_)) => false,
         }
-        // match participant_handle.try_send(batch) {
-        //     Ok(_) => true,
-        //     Err(TrySendError::Full(_)) => {
-        //         metrics::counter!("gateway_demux_dropped", "reason" => "full").increment(1);
-        //         false
-        //     }
-        //     Err(TrySendError::Closed(_)) => false,
-        // }
     }
 }
 

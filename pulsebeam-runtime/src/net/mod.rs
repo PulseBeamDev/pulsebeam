@@ -130,6 +130,12 @@ pub enum UnifiedSocketReader {
 }
 
 impl UnifiedSocketReader {
+    pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
+        if let Self::Tcp(inner) = self {
+            inner.close_peer(peer_addr);
+        }
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
