@@ -41,6 +41,12 @@ pub async fn bind(
     let ip_counts_clone = ip_counts.clone();
     let semaphore_clone = conn_semaphore.clone();
 
+    tracing::info!(
+        %addr,
+        %local_addr,
+        "TCP socket bound"
+    );
+
     // Passive Listener Task
     tokio::spawn(async move {
         while let Ok((stream, peer_addr)) = listener.accept().await {
