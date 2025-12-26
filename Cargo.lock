@@ -2537,6 +2537,7 @@ dependencies = [
  "str0m",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

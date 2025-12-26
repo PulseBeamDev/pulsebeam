@@ -1,21 +1,18 @@
+use bytes::Bytes;
+
 pub struct H264Looper {
-    frames: Vec<Vec<u8>>,
+    frames: Vec<Bytes>,
     index: usize,
-    should_loop: bool,
 }
 
 impl H264Looper {
-    pub fn new(data: &[u8], should_loop: bool) -> Self {
+    pub fn new(data: &[u8]) -> Self {
         let slicer = H264FrameSlicer::new(data);
-        let frames: Vec<Vec<u8>> = slicer.map(|slice| slice.to_vec()).collect();
-        Self {
-            frames,
-            index: 0,
-            should_loop,
-        }
+        let frames: Vec<Bytes> = slicer.map(|slice| Bytes::from(slice)).collect();
+        Self { frames, index: 0 }
     }
 
-    pub fn get_next_frame(&mut self) -> Option<&[u8]> {
+    pub fn get_next_frame(&mut self) -> Option<Bytes> {
         if self.frames.is_empty() {
             return None;
         }
@@ -24,14 +21,10 @@ impl H264Looper {
 
         self.index += 1;
         if self.index >= self.frames.len() {
-            if self.should_loop {
-                self.index = 0;
-            } else {
-                return None;
-            }
+            self.index = 0;
         }
 
-        Some(frame)
+        Some(frame.clone())
     }
 }
 

@@ -1,5 +1,4 @@
-use bytes::Bytes;
-use futures_lite::FutureExt;
+use futures_lite::{FutureExt, Stream, StreamExt};
 use reqwest::Client as HttpClient;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -7,26 +6,15 @@ use str0m::{
     Event, Input, Output, Rtc, RtcError,
     change::SdpAnswer,
     error::SdpError,
-    media::{Direction, MediaData, MediaKind, MediaTime, Mid, Pt, Simulcast, SimulcastLayer},
+    media::{Direction, MediaKind, Mid, Pt, Simulcast, SimulcastLayer},
     net::{Protocol, Receive},
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tokio_stream::StreamMap;
 
-pub struct MediaFrame {
-    pub ts: MediaTime,
-    pub data: Bytes,
-}
-
-impl From<MediaData> for MediaFrame {
-    fn from(value: MediaData) -> Self {
-        Self {
-            ts: value.time,
-            data: value.data.into(),
-        }
-    }
-}
+use crate::MediaFrame;
 
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -83,6 +71,16 @@ pub struct MediaReceiver {
 impl MediaReceiver {
     pub async fn recv(&mut self) -> Option<MediaFrame> {
         self.rx.recv().await
+    }
+}
+
+impl Stream for MediaReceiver {
+    type Item = MediaFrame;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
     }
 }
 
@@ -163,6 +161,7 @@ impl Agent {
             rtc,
             udp: socket,
             event_tx,
+            senders: StreamMap::new(),
             receivers: HashMap::new(),
             dropped_events: 0,
         };
@@ -190,6 +189,7 @@ struct AgentActor {
     rtc: str0m::Rtc,
     udp: UdpSocket,
     event_tx: mpsc::Sender<AgentEvent>,
+    senders: StreamMap<Mid, MediaReceiver>,
     receivers: HashMap<Mid, MediaSender>,
     dropped_events: u64,
 }
@@ -201,17 +201,16 @@ impl AgentActor {
 
         while let Some(deadline) = maybe_deadline {
             tokio::select! {
-                // Some(envelope) = self.sender.recv() => {
-                //     if let Some(writer) = self.rtc.writer(envelope.mid) {
-                //         let pt = writer.payload_params().nth(0).unwrap().pt();
-                //         let now = Instant::now();
-                //         let frame = envelope.frame;
-                //         if let Err(e) = writer.write(pt, now.into(), frame.ts, frame.data) {
-                //             tracing::error!("Writer error for mid {}: {:?}", envelope.mid, e);
-                //         }
-                //     }
-                //     maybe_deadline = self.poll();
-                // }
+                Some((mid, frame)) = self.senders.next() => {
+                    if let Some(writer) = self.rtc.writer(mid) {
+                        let pt = writer.payload_params().nth(0).unwrap().pt();
+                        let now = Instant::now();
+                        if let Err(e) = writer.write(pt, now.into(), frame.ts, frame.data) {
+                            tracing::error!("Writer error for mid {}: {:?}", mid, e);
+                        }
+                    }
+                    maybe_deadline = self.poll();
+                }
                 res = self.udp.recv_from(&mut buf) => {
                     if let Ok((n, source)) = res {
                         let Ok(buf) = (&buf[..n]).try_into() else {
@@ -258,7 +257,6 @@ impl AgentActor {
                     return Some(deadline.into());
                 }
                 Ok(Output::Transmit(tx)) => {
-                    // Using try_send_to to maintain non-blocking poll
                     let _ = self.udp.try_send_to(&tx.contents, tx.destination);
                 }
                 Ok(Output::Event(event)) => self.handle_event(event),
@@ -288,6 +286,7 @@ impl AgentActor {
 
                 match media.direction {
                     Direction::SendOnly => {
+                        self.senders.insert(media.mid, rx);
                         self.emit_event(AgentEvent::SenderAdded(tx));
                     }
                     Direction::RecvOnly => {
