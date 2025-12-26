@@ -6,6 +6,7 @@ use std::panic::AssertUnwindSafe;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     change::SdpAnswer,
+    error::SdpError,
     media::{Direction, MediaData, MediaKind, MediaTime, Mid, Pt, Simulcast, SimulcastLayer},
     net::{Protocol, Receive},
 };
@@ -35,6 +36,30 @@ pub enum AgentEvent {
     Connected,
     Disconnected(DisconnectReason),
 }
+
+#[derive(thiserror::Error, Debug)]
+pub enum AgentError {
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("RTC engine error: {0}")]
+    Rtc(#[from] str0m::RtcError),
+
+    #[error("Join failed with status: {0}")]
+    JoinStatus(reqwest::StatusCode),
+
+    #[error("Missing 'Location' header for resource cleanup")]
+    MissingLocation,
+
+    #[error("SDP negotiation failed: {0}")]
+    SdpNegotiation(&'static str),
+
+    #[error("SDP parsing error: {0}")]
+    Sdp(SdpError),
+}
+
+// Update the result type for Agent::join
+pub type AgentResult<T> = std::result::Result<T, AgentError>;
 
 #[derive(Debug)]
 pub struct MediaSender {
@@ -78,7 +103,7 @@ impl Agent {
         socket: UdpSocket,
         api_base: &str,
         room_id: &str,
-    ) -> Result<Self> {
+    ) -> AgentResult<Self> {
         let (event_tx, event_rx) = mpsc::channel(128);
 
         let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).build();
@@ -117,7 +142,7 @@ impl Agent {
             .await?;
 
         if !res.status().is_success() {
-            return Err(anyhow!("join failed: {}", res.status()));
+            return Err(AgentError::JoinStatus(res.status()));
         }
 
         let location = res
@@ -125,9 +150,13 @@ impl Agent {
             .get("Location")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("No Location header"))?;
+            .ok_or(AgentError::MissingLocation)?;
 
-        let answer = SdpAnswer::from_sdp_string(&res.text().await?)?;
+        let body = res.text().await?;
+        let answer = SdpAnswer::from_sdp_string(&body).map_err(|e| {
+            tracing::error!("Failed to parse SDP answer. Raw body: {}", body);
+            AgentError::Sdp(e)
+        })?;
         rtc.sdp_api().accept_answer(pending_offer, answer)?;
 
         let actor = AgentActor {
@@ -161,7 +190,6 @@ struct AgentActor {
     rtc: str0m::Rtc,
     udp: UdpSocket,
     event_tx: mpsc::Sender<AgentEvent>,
-    sender: MediaReceiver,
     receivers: HashMap<Mid, MediaSender>,
     dropped_events: u64,
 }
@@ -173,17 +201,17 @@ impl AgentActor {
 
         while let Some(deadline) = maybe_deadline {
             tokio::select! {
-                Some(envelope) = self.sender.recv() => {
-                    if let Some(writer) = self.rtc.writer(envelope.mid) {
-                        let pt = writer.payload_params().nth(0).unwrap().pt();
-                        let now = Instant::now();
-                        let frame = envelope.frame;
-                        if let Err(e) = writer.write(pt, now.into(), frame.ts, frame.data) {
-                            tracing::error!("Writer error for mid {}: {:?}", envelope.mid, e);
-                        }
-                    }
-                    maybe_deadline = self.poll();
-                }
+                // Some(envelope) = self.sender.recv() => {
+                //     if let Some(writer) = self.rtc.writer(envelope.mid) {
+                //         let pt = writer.payload_params().nth(0).unwrap().pt();
+                //         let now = Instant::now();
+                //         let frame = envelope.frame;
+                //         if let Err(e) = writer.write(pt, now.into(), frame.ts, frame.data) {
+                //             tracing::error!("Writer error for mid {}: {:?}", envelope.mid, e);
+                //         }
+                //     }
+                //     maybe_deadline = self.poll();
+                // }
                 res = self.udp.recv_from(&mut buf) => {
                     if let Ok((n, source)) = res {
                         let Ok(buf) = (&buf[..n]).try_into() else {
