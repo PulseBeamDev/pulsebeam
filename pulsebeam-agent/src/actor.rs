@@ -119,7 +119,7 @@ impl Agent {
         };
 
         // Create the SendOnly transceiver
-        let video_mid = sdp.add_media(
+        sdp.add_media(
             MediaKind::Video,
             Direction::SendOnly,
             None,
@@ -275,7 +275,7 @@ impl AgentActor {
         match event {
             Event::Connected => self.emit_event(AgentEvent::Connected),
             Event::IceConnectionStateChange(s) => self.emit_event(AgentEvent::StateChanged(s)),
-            Event::MediaAdded(media) if media.direction == Direction::RecvOnly => {
+            Event::MediaAdded(media) => {
                 // TODO: handle error
                 let pt = self
                     .rtc
@@ -285,8 +285,22 @@ impl AgentActor {
                     .first()
                     .unwrap();
                 let (tx, rx) = new_media_channel(media.mid, *pt);
-                self.receivers.insert(media.mid, tx);
-                self.emit_event(AgentEvent::ReceiverAdded(rx));
+
+                match media.direction {
+                    Direction::SendOnly => {
+                        self.emit_event(AgentEvent::SenderAdded(tx));
+                    }
+                    Direction::RecvOnly => {
+                        self.receivers.insert(media.mid, tx);
+                        self.emit_event(AgentEvent::ReceiverAdded(rx));
+                    }
+                    Direction::SendRecv => {
+                        unreachable!("SendRecv is not supported");
+                    }
+                    Direction::Inactive => {
+                        unreachable!("Inactive is not supported");
+                    }
+                }
             }
             Event::MediaData(data) => {
                 if let Some(tx) = self.receivers.get(&data.mid) {
@@ -303,7 +317,7 @@ impl AgentActor {
     }
 
     fn emit_event(&mut self, event: AgentEvent) {
-        if let Err(_) = self.event_tx.try_send(event) {
+        if self.event_tx.try_send(event).is_err() {
             self.dropped_events += 1;
         }
     }
