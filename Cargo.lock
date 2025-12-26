@@ -2545,6 +2545,12 @@ dependencies = [
 [[package]]
 name = "pulsebeam-cli"
 version = "0.1.0"
+dependencies = [
+ "pulsebeam-agent",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "pulsebeam-runtime"
