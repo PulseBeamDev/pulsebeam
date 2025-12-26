@@ -4,6 +4,7 @@ use pulsebeam_agent::{
     media::H264Looper,
 };
 use std::time::Duration;
+use tokio::time::Instant;
 
 #[tokio::main]
 async fn main() {
@@ -23,21 +24,21 @@ async fn main() {
             AgentEvent::SenderAdded(sender) => {
                 tokio::spawn(async move {
                     let mut looper = H264Looper::new(raw_bytes);
-                    let mut interval = tokio::time::interval(Duration::from_millis(33));
-                    let mut ts = 0;
-
+                    let mut interval =
+                        tokio::time::interval(Duration::from_nanos(1_000_000_000 / 30));
+                    let start = Instant::now();
                     loop {
-                        interval.tick().await;
-                        let Some(frame) = looper.next() else {
-                            break;
-                        };
+                        let now = interval.tick().await;
+                        let elapsed = now - start;
+
+                        // Calculate TS based on actual elapsed time to prevent drift
+                        let ts = (elapsed.as_secs_f64() * 90000.0) as u64;
 
                         let frame = MediaFrame {
                             ts: MediaTime::from_90khz(ts),
-                            data: frame,
+                            data: looper.next().unwrap(),
                         };
                         sender.try_send(frame);
-                        ts += 3000;
                     }
                 });
             }
