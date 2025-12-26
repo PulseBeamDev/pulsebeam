@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use futures_lite::FutureExt;
 use reqwest::Client as HttpClient;
 use std::collections::HashMap;
@@ -6,41 +6,70 @@ use std::panic::AssertUnwindSafe;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     change::SdpAnswer,
-    media::{Direction, MediaData, MediaKind, Mid, Simulcast, SimulcastLayer},
+    media::{Direction, MediaData, MediaKind, MediaTime, Mid, Pt, Simulcast, SimulcastLayer},
     net::{Protocol, Receive},
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+pub struct MediaFrame {
+    pub ts: MediaTime,
+    pub data: Bytes,
+}
+
+impl From<MediaData> for MediaFrame {
+    fn from(value: MediaData) -> Self {
+        Self {
+            ts: value.time,
+            data: value.data.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AgentEvent {
-    /// Emitted when a RecvOnly transceiver is ready.
-    /// The user pulls MediaData from the receiver handle.
-    OnReceiver(Mid, mpsc::Receiver<MediaData>),
+    SenderAdded(MediaSender),
+    ReceiverAdded(MediaReceiver),
     StateChanged(str0m::IceConnectionState),
     Connected,
     Disconnected(DisconnectReason),
 }
 
-/// A handle to push media into a specific SendOnly transceiver.
+#[derive(Debug)]
 pub struct MediaSender {
     mid: Mid,
-    tx: mpsc::Sender<(Mid, MediaData)>,
+    tx: mpsc::Sender<MediaFrame>,
 }
 
 impl MediaSender {
-    pub async fn send(&self, sample: MediaData) -> Result<()> {
-        self.tx
-            .send((self.mid, sample))
-            .await
-            .map_err(|_| anyhow!("Actor closed"))
+    pub fn try_send(&self, frame: MediaFrame) {
+        if self.tx.try_send(frame).is_err() {}
     }
+}
+
+#[derive(Debug)]
+pub struct MediaReceiver {
+    pub mid: Mid,
+    pt: Pt,
+    rx: mpsc::Receiver<MediaFrame>,
+}
+
+impl MediaReceiver {
+    pub async fn recv(&mut self) -> Option<MediaFrame> {
+        self.rx.recv().await
+    }
+}
+
+fn new_media_channel(mid: Mid, pt: Pt) -> (MediaSender, MediaReceiver) {
+    let (tx, rx) = mpsc::channel(64);
+    let sender = MediaSender { mid, tx };
+    let receiver = MediaReceiver { mid, rx, pt };
+    (sender, receiver)
 }
 
 pub struct Agent {
     events: mpsc::Receiver<AgentEvent>,
-    video_sender: MediaSender,
 }
 
 impl Agent {
@@ -51,7 +80,6 @@ impl Agent {
         room_id: &str,
     ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(128);
-        let (sample_tx, sample_rx) = mpsc::channel(1024);
 
         let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).build();
 
@@ -106,7 +134,6 @@ impl Agent {
             rtc,
             udp: socket,
             event_tx,
-            sample_rx,
             receivers: HashMap::new(),
             dropped_events: 0,
         };
@@ -114,21 +141,11 @@ impl Agent {
         let actor_task = AssertUnwindSafe(actor.run(location)).catch_unwind();
         tokio::spawn(actor_task);
 
-        Ok(Self {
-            events: event_rx,
-            video_sender: MediaSender {
-                mid: video_mid,
-                tx: sample_tx,
-            },
-        })
+        Ok(Self { events: event_rx })
     }
 
     pub async fn next_event(&mut self) -> Option<AgentEvent> {
         self.events.recv().await
-    }
-
-    pub fn video_sender(&self) -> &MediaSender {
-        &self.video_sender
     }
 }
 
@@ -144,8 +161,8 @@ struct AgentActor {
     rtc: str0m::Rtc,
     udp: UdpSocket,
     event_tx: mpsc::Sender<AgentEvent>,
-    sample_rx: mpsc::Receiver<(Mid, MediaData)>,
-    receivers: HashMap<Mid, mpsc::Sender<MediaData>>,
+    sender: MediaReceiver,
+    receivers: HashMap<Mid, MediaSender>,
     dropped_events: u64,
 }
 
@@ -156,11 +173,13 @@ impl AgentActor {
 
         while let Some(deadline) = maybe_deadline {
             tokio::select! {
-                Some((mid, sample)) = self.sample_rx.recv() => {
-                    if let Some(writer) = self.rtc.writer(mid) {
+                Some(envelope) = self.sender.recv() => {
+                    if let Some(writer) = self.rtc.writer(envelope.mid) {
                         let pt = writer.payload_params().nth(0).unwrap().pt();
-                        if let Err(e) = writer.write(pt, sample.network_time, sample.time, sample.data) {
-                            tracing::error!("Writer error for mid {}: {:?}", mid, e);
+                        let now = Instant::now();
+                        let frame = envelope.frame;
+                        if let Err(e) = writer.write(pt, now.into(), frame.ts, frame.data) {
+                            tracing::error!("Writer error for mid {}: {:?}", envelope.mid, e);
                         }
                     }
                     maybe_deadline = self.poll();
@@ -229,15 +248,21 @@ impl AgentActor {
             Event::Connected => self.emit_event(AgentEvent::Connected),
             Event::IceConnectionStateChange(s) => self.emit_event(AgentEvent::StateChanged(s)),
             Event::MediaAdded(media) if media.direction == Direction::RecvOnly => {
-                let (tx, rx) = mpsc::channel(1024);
+                // TODO: handle error
+                let pt = self
+                    .rtc
+                    .media(media.mid)
+                    .unwrap()
+                    .remote_pts()
+                    .first()
+                    .unwrap();
+                let (tx, rx) = new_media_channel(media.mid, *pt);
                 self.receivers.insert(media.mid, tx);
-                self.emit_event(AgentEvent::OnReceiver(media.mid, rx));
+                self.emit_event(AgentEvent::ReceiverAdded(rx));
             }
             Event::MediaData(data) => {
                 if let Some(tx) = self.receivers.get(&data.mid) {
-                    if let Err(_) = tx.try_send(data) {
-                        // User is not pulling data fast enough from the receiver transceiver
-                    }
+                    tx.try_send(data.into());
                 }
             }
             _ => {}

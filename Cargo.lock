@@ -2529,11 +2529,11 @@ dependencies = [
 name = "pulsebeam-agent"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "futures-lite",
  "http",
  "maybe-async",
+ "metrics",
  "reqwest",
  "str0m",
  "thiserror 2.0.17",
