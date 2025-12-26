@@ -1,5 +1,5 @@
-use bytes::Bytes;
-use str0m::media::{MediaData, MediaTime};
+pub use bytes::Bytes;
+pub use str0m::media::{MediaData, MediaTime};
 
 pub mod actor;
 pub mod media;

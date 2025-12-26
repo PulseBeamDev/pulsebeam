@@ -9,21 +9,24 @@ impl H264Looper {
     pub fn new(data: &[u8]) -> Self {
         let slicer = H264FrameSlicer::new(data);
         let frames: Vec<Bytes> = slicer.map(Bytes::copy_from_slice).collect();
+        tracing::info!(
+            "H264Looper: found {} complete frames (Access Units)",
+            frames.len()
+        );
         Self { frames, index: 0 }
     }
+}
 
-    pub fn get_next_frame(&mut self) -> Option<Bytes> {
+impl Iterator for H264Looper {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
         if self.frames.is_empty() {
             return None;
         }
 
         let frame = &self.frames[self.index];
-
-        self.index += 1;
-        if self.index >= self.frames.len() {
-            self.index = 0;
-        }
-
+        self.index = (self.index + 1) % self.frames.len();
         Some(frame.clone())
     }
 }
@@ -38,11 +41,11 @@ impl<'a> H264FrameSlicer<'a> {
         Self { data, pos: 0 }
     }
 
-    /// Hardened NAL detection: returns (start_pos, end_pos, nalu_type)
+    /// Finds the boundaries of the next NALU in the Annex B stream.
     fn next_nalu_bounds(&self, start: usize) -> Option<(usize, usize, u8)> {
         let mut i = start;
-        // Find start code
         while i + 3 < self.data.len() {
+            // Check for start code 00 00 01 or 00 00 00 01
             if self.data[i] == 0
                 && self.data[i + 1] == 0
                 && (self.data[i + 2] == 1 || (self.data[i + 2] == 0 && self.data[i + 3] == 1))
@@ -51,7 +54,7 @@ impl<'a> H264FrameSlicer<'a> {
                 let header_pos = if self.data[i + 2] == 1 { i + 3 } else { i + 4 };
                 let nalu_type = self.data[header_pos] & 0x1F;
 
-                // Find next start code to get the end
+                // Find the start of the NEXT NALU to determine the end of this one
                 let mut next = header_pos;
                 while next + 3 < self.data.len() {
                     if self.data[next] == 0
@@ -70,23 +73,27 @@ impl<'a> H264FrameSlicer<'a> {
         None
     }
 
-    /// Production peeking: Does this NAL start a new frame?
-    fn starts_new_frame(nalu_type: u8, nalu_data: &[u8]) -> bool {
+    /// Determines if a NALU is the start of a brand new Access Unit (Frame).
+    fn is_new_access_unit(&self, nalu_type: u8, nalu_start: usize, nalu_end: usize) -> bool {
         match nalu_type {
-            // SPS, PPS, AUD, and SEI always start/precede a new AU
+            // AUD (9), SPS (7), PPS (8), SEI (6)
+            // These always precede the VCL slices of a new frame.
             6..=9 => true,
-            // Slices (1 = Non-IDR, 5 = IDR)
+            // IDR (5) or Non-IDR (1) slices
             1 | 5 => {
-                // Peek at slice header for first_mb_in_slice
-                // In Annex B, the header is at index 3 or 4.
-                // We find the first non-zero/one byte.
-                if let Some(pos) = nalu_data.iter().position(|&b| b != 0 && b != 1) {
-                    if nalu_data.len() > pos + 1 {
-                        let first_byte_of_payload = nalu_data[pos + 1];
-                        // Exp-Golomb for '0' is just the bit '1'.
-                        // If the first bit of the payload is 1, first_mb_in_slice is 0.
-                        return (first_byte_of_payload & 0x80) != 0;
-                    }
+                // To be precise, we check if first_mb_in_slice == 0.
+                // It is an Exp-Golomb encoded value. If the first bit of the
+                // slice header payload is 1, the value is 0.
+                let header_pos = if self.data[nalu_start + 2] == 1 {
+                    nalu_start + 3
+                } else {
+                    nalu_start + 4
+                };
+
+                if self.data.len() > header_pos + 1 {
+                    let first_byte_of_slice_header = self.data[header_pos + 1];
+                    // If high bit is 1, first_mb_in_slice is 0 -> New Frame
+                    return (first_byte_of_slice_header & 0x80) != 0;
                 }
                 false
             }
@@ -103,27 +110,34 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
             return None;
         }
 
+        let start_pos = self.pos;
         let mut end_pos = self.pos;
-        let mut first_nalu = true;
+        let mut has_vcl = false;
 
-        while let Some((n_start, n_end, n_type)) = self.next_nalu_bounds(end_pos) {
-            // If this NAL starts a new frame and isn't the first one we're looking at,
-            // then the PREVIOUS NALUs form the complete frame.
-            if !first_nalu && Self::starts_new_frame(n_type, &self.data[n_start..n_end]) {
-                let frame = &self.data[self.pos..n_start];
+        // We iterate through NALUs until we find one that belongs to the NEXT frame
+        let mut search_pos = self.pos;
+        while let Some((n_start, n_end, n_type)) = self.next_nalu_bounds(search_pos) {
+            // If we already have some VCL (slice) data and we hit a NALU that
+            // signals a new frame, we stop and return everything up to this point.
+            if has_vcl && self.is_new_access_unit(n_type, n_start, n_end) {
                 self.pos = n_start;
-                return Some(frame);
+                return Some(&self.data[start_pos..n_start]);
+            }
+
+            if n_type == 1 || n_type == 5 {
+                has_vcl = true;
             }
 
             end_pos = n_end;
-            first_nalu = false;
-            if n_end == self.data.len() {
-                break;
-            }
+            search_pos = n_end;
         }
 
-        let frame = &self.data[self.pos..];
+        // Handle the last frame in the buffer
         self.pos = self.data.len();
-        Some(frame)
+        if end_pos > start_pos {
+            Some(&self.data[start_pos..end_pos])
+        } else {
+            None
+        }
     }
 }

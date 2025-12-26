@@ -1,9 +1,10 @@
 use futures_lite::{FutureExt, Stream, StreamExt};
 use reqwest::Client as HttpClient;
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::{collections::HashMap, net::SocketAddr};
+use str0m::media::MediaAdded;
 use str0m::{
-    Event, Input, Output, Rtc, RtcError,
+    Candidate, Event, Input, Output, Rtc, RtcError,
     change::SdpAnswer,
     error::SdpError,
     media::{Direction, MediaKind, Mid, Pt, Simulcast, SimulcastLayer},
@@ -32,6 +33,9 @@ pub enum AgentError {
 
     #[error("RTC engine error: {0}")]
     Rtc(#[from] str0m::RtcError),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("Join failed with status: {0}")]
     JoinStatus(reqwest::StatusCode),
@@ -91,22 +95,69 @@ fn new_media_channel(mid: Mid, pt: Pt) -> (MediaSender, MediaReceiver) {
     (sender, receiver)
 }
 
+pub struct AgentBuilder {
+    api_base: String,
+    room_id: String,
+    http_client: Option<HttpClient>,
+    socket: Option<UdpSocket>,
+}
+
+impl AgentBuilder {
+    pub fn new(api_base: impl Into<String>, room_id: impl Into<String>) -> Self {
+        Self {
+            api_base: api_base.into(),
+            room_id: room_id.into(),
+            http_client: None,
+            socket: None,
+        }
+    }
+
+    pub fn http_client(mut self, client: HttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    pub fn socket(mut self, socket: UdpSocket) -> Self {
+        self.socket = Some(socket);
+        self
+    }
+
+    pub async fn join(self) -> AgentResult<Agent> {
+        let http_client = self.http_client.unwrap_or_default();
+        let socket = match self.socket {
+            Some(s) => s,
+            None => UdpSocket::bind("0.0.0.0:0").await?,
+        };
+
+        Agent::join(http_client, socket, &self.api_base, &self.room_id).await
+    }
+}
+
 pub struct Agent {
     events: mpsc::Receiver<AgentEvent>,
 }
 
 impl Agent {
-    pub async fn join(
+    async fn join(
         http_client: HttpClient,
         socket: UdpSocket,
         api_base: &str,
         room_id: &str,
     ) -> AgentResult<Self> {
+        let span = tracing::info_span!("join", room_id = %room_id);
+        let _enter = span.enter();
+
+        tracing::info!("Initiating join to room at {}", api_base);
+
         let (event_tx, event_rx) = mpsc::channel(128);
 
         let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).build();
-
+        let addr = format!("192.168.1.63:{}", socket.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        rtc.add_local_candidate(Candidate::host(addr, Protocol::Udp).unwrap());
         let mut sdp = rtc.sdp_api();
+
         let simulcast = Simulcast {
             send: vec![
                 SimulcastLayer::new("f"),
@@ -116,31 +167,49 @@ impl Agent {
             recv: vec![],
         };
 
-        // Create the SendOnly transceiver
-        sdp.add_media(
+        tracing::debug!("Configuring transceivers (Video: SendOnly w/ Simulcast, Video: RecvOnly)");
+        let mut medias = vec![];
+
+        // TODO: Major hack!
+        let mid = sdp.add_media(
             MediaKind::Video,
             Direction::SendOnly,
             None,
             None,
-            Some(simulcast),
+            // Some(simulcast.clone()),
+            None,
         );
-
-        // Create the RecvOnly transceiver
+        medias.push(MediaAdded {
+            mid,
+            kind: MediaKind::Video,
+            direction: Direction::SendOnly,
+            // simulcast: Some(simulcast.clone()),
+            simulcast: None,
+        });
         sdp.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
 
         let (offer, pending_offer) = sdp.apply().unwrap();
         let sdp_offer = offer.to_sdp_string();
+        tracing::trace!(sdp = %sdp_offer, "Generated local SDP offer");
 
         let uri = format!("{}/api/v1/rooms/{}", api_base, room_id);
+        tracing::info!(uri, "Sending SDP offer to signaling server");
+
         let res = http_client
-            .post(uri)
+            .post(&uri)
             .header("Content-Type", "application/sdp")
             .body(sdp_offer)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, uri, "Network error during HTTP signaling");
+                e
+            })?;
 
-        if !res.status().is_success() {
-            return Err(AgentError::JoinStatus(res.status()));
+        let status = res.status();
+        if !status.is_success() {
+            tracing::error!(uri, status = %status, "Signaling server rejected the join request");
+            return Err(AgentError::JoinStatus(status));
         }
 
         let location = res
@@ -148,17 +217,38 @@ impl Agent {
             .get("Location")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
-            .ok_or(AgentError::MissingLocation)?;
+            .ok_or_else(|| {
+                tracing::error!("Response status was 2xx but 'Location' header is missing");
+                AgentError::MissingLocation
+            })?;
+
+        tracing::debug!(
+            location,
+            "Resource created successfully, tracking for cleanup"
+        );
 
         let body = res.text().await?;
+        tracing::trace!(sdp = %body, "Received SDP answer from signaling server");
+
         let answer = SdpAnswer::from_sdp_string(&body).map_err(|e| {
-            tracing::error!("Failed to parse SDP answer. Raw body: {}", body);
+            // We log the raw body here because parsing errors are usually due to
+            // specific lines in the SDP string that str0m doesn't like.
+            tracing::error!(error = ?e, raw_body = %body, "Failed to parse remote SDP answer");
             AgentError::Sdp(e)
         })?;
-        rtc.sdp_api().accept_answer(pending_offer, answer)?;
+
+        rtc.sdp_api()
+            .accept_answer(pending_offer, answer)
+            .map_err(|e| {
+                tracing::error!(error = ?e, "RTC engine rejected the remote SDP answer");
+                e
+            })?;
+
+        tracing::info!("SDP exchange successful. Initializing AgentActor background task.");
 
         let actor = AgentActor {
             rtc,
+            addr,
             udp: socket,
             event_tx,
             senders: StreamMap::new(),
@@ -166,9 +256,10 @@ impl Agent {
             dropped_events: 0,
         };
 
-        let actor_task = AssertUnwindSafe(actor.run(location)).catch_unwind();
+        let actor_task = AssertUnwindSafe(actor.run(medias, location)).catch_unwind();
         tokio::spawn(actor_task);
 
+        tracing::info!("Agent joined and task spawned successfully");
         Ok(Self { events: event_rx })
     }
 
@@ -187,6 +278,7 @@ pub enum DisconnectReason {
 
 struct AgentActor {
     rtc: str0m::Rtc,
+    addr: SocketAddr,
     udp: UdpSocket,
     event_tx: mpsc::Sender<AgentEvent>,
     senders: StreamMap<Mid, MediaReceiver>,
@@ -195,9 +287,12 @@ struct AgentActor {
 }
 
 impl AgentActor {
-    async fn run(mut self, location: String) {
+    async fn run(mut self, mut medias: Vec<MediaAdded>, location: String) {
         let mut buf = vec![0u8; 2000];
         let mut maybe_deadline = self.poll();
+        for media in medias.drain(..) {
+            self.handle_media_added(media);
+        }
 
         while let Some(deadline) = maybe_deadline {
             tokio::select! {
@@ -208,12 +303,14 @@ impl AgentActor {
                         if let Err(e) = writer.write(pt, now.into(), frame.ts, frame.data) {
                             tracing::error!("Writer error for mid {}: {:?}", mid, e);
                         }
+                        tracing::info!("[{}] received from {}", frame.ts.numer(), mid);
                     }
                     maybe_deadline = self.poll();
                 }
                 res = self.udp.recv_from(&mut buf) => {
                     if let Ok((n, source)) = res {
                         let Ok(buf) = (&buf[..n]).try_into() else {
+                            tracing::warn!("invalid rtc packet");
                             continue;
                         };
 
@@ -222,7 +319,7 @@ impl AgentActor {
                             Receive {
                                 proto: Protocol::Udp,
                                 source,
-                                destination: self.udp.local_addr().unwrap(),
+                                destination: self.addr,
                                 contents: buf,
                             }
                         );
@@ -274,32 +371,7 @@ impl AgentActor {
             Event::Connected => self.emit_event(AgentEvent::Connected),
             Event::IceConnectionStateChange(s) => self.emit_event(AgentEvent::StateChanged(s)),
             Event::MediaAdded(media) => {
-                // TODO: handle error
-                let pt = self
-                    .rtc
-                    .media(media.mid)
-                    .unwrap()
-                    .remote_pts()
-                    .first()
-                    .unwrap();
-                let (tx, rx) = new_media_channel(media.mid, *pt);
-
-                match media.direction {
-                    Direction::SendOnly => {
-                        self.senders.insert(media.mid, rx);
-                        self.emit_event(AgentEvent::SenderAdded(tx));
-                    }
-                    Direction::RecvOnly => {
-                        self.receivers.insert(media.mid, tx);
-                        self.emit_event(AgentEvent::ReceiverAdded(rx));
-                    }
-                    Direction::SendRecv => {
-                        unreachable!("SendRecv is not supported");
-                    }
-                    Direction::Inactive => {
-                        unreachable!("Inactive is not supported");
-                    }
-                }
+                self.handle_media_added(media);
             }
             Event::MediaData(data) => {
                 if let Some(tx) = self.receivers.get(&data.mid) {
@@ -307,6 +379,35 @@ impl AgentActor {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_media_added(&mut self, media: MediaAdded) {
+        // TODO: handle error
+        let pt = self
+            .rtc
+            .media(media.mid)
+            .unwrap()
+            .remote_pts()
+            .first()
+            .unwrap();
+        let (tx, rx) = new_media_channel(media.mid, *pt);
+
+        match media.direction {
+            Direction::SendOnly => {
+                self.senders.insert(media.mid, rx);
+                self.emit_event(AgentEvent::SenderAdded(tx));
+            }
+            Direction::RecvOnly => {
+                self.receivers.insert(media.mid, tx);
+                self.emit_event(AgentEvent::ReceiverAdded(rx));
+            }
+            Direction::SendRecv => {
+                unreachable!("SendRecv is not supported");
+            }
+            Direction::Inactive => {
+                unreachable!("Inactive is not supported");
+            }
         }
     }
 
@@ -318,6 +419,7 @@ impl AgentActor {
     fn emit_event(&mut self, event: AgentEvent) {
         if self.event_tx.try_send(event).is_err() {
             self.dropped_events += 1;
+            tracing::warn!("event dropped");
         }
     }
 }
