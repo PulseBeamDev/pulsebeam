@@ -8,7 +8,7 @@ pub struct H264Looper {
 impl H264Looper {
     pub fn new(data: &[u8]) -> Self {
         let slicer = H264FrameSlicer::new(data);
-        let frames: Vec<Bytes> = slicer.map(|slice| Bytes::from(slice)).collect();
+        let frames: Vec<Bytes> = slicer.map(Bytes::copy_from_slice).collect();
         Self { frames, index: 0 }
     }
 
