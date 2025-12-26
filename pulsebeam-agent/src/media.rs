@@ -1,3 +1,40 @@
+pub struct H264Looper {
+    frames: Vec<Vec<u8>>,
+    index: usize,
+    should_loop: bool,
+}
+
+impl H264Looper {
+    pub fn new(data: &[u8], should_loop: bool) -> Self {
+        let slicer = H264FrameSlicer::new(data);
+        let frames: Vec<Vec<u8>> = slicer.map(|slice| slice.to_vec()).collect();
+        Self {
+            frames,
+            index: 0,
+            should_loop,
+        }
+    }
+
+    pub fn get_next_frame(&mut self) -> Option<&[u8]> {
+        if self.frames.is_empty() {
+            return None;
+        }
+
+        let frame = &self.frames[self.index];
+
+        self.index += 1;
+        if self.index >= self.frames.len() {
+            if self.should_loop {
+                self.index = 0;
+            } else {
+                return None;
+            }
+        }
+
+        Some(frame)
+    }
+}
+
 pub struct H264FrameSlicer<'a> {
     data: &'a [u8],
     pos: usize,
