@@ -6,18 +6,12 @@ use pulsebeam_runtime::net::UnifiedSocketWriter;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox};
 use str0m::{Rtc, RtcError, error::SdpError};
-use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
 
 use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, room, track};
-
-// The hard limit of IPv4/IPv6 total packet size is 65535
-// a bit lower to be less bursty and safer from possible off-by-one errors
-const MAX_GSO_SIZE: usize = 65507;
-const MAX_MTU: usize = 1500;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParticipantError {
@@ -164,16 +158,8 @@ impl ParticipantActor {
         participant_id: Arc<entity::ParticipantId>,
         rtc: Rtc,
     ) -> Self {
-        let udp_batcher = {
-            let gso_segments = udp_egress.max_gso_segments();
-            let batch_size_limit = std::cmp::min(gso_segments * MAX_MTU, MAX_GSO_SIZE);
-            Batcher::with_capacity(batch_size_limit)
-        };
-        let tcp_batcher = {
-            let gso_segments = tcp_egress.max_gso_segments();
-            let batch_size_limit = std::cmp::min(gso_segments * MAX_MTU, MAX_GSO_SIZE);
-            Batcher::with_capacity(batch_size_limit)
-        };
+        let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
+        let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
         let core = ParticipantCore::new(participant_id, rtc, udp_batcher, tcp_batcher);
         Self {
             gateway: gateway_handle,

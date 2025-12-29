@@ -1,6 +1,8 @@
+use pulsebeam_runtime::net;
 use std::{collections::VecDeque, io, net::SocketAddr};
 
-use pulsebeam_runtime::net;
+const MAX_GSO_SEGMENTS: usize = 8;
+const MAX_FREE_STATES: usize = 3;
 
 /// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
 pub struct Batcher {
@@ -13,9 +15,9 @@ impl Batcher {
     /// Creates a new `Batcher` where each internal buffer has the specified capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            cap,
+            cap: cap.min(MAX_GSO_SEGMENTS),
             active_states: VecDeque::with_capacity(3),
-            free_states: Vec::with_capacity(3),
+            free_states: Vec::with_capacity(MAX_FREE_STATES),
         }
     }
 
@@ -31,10 +33,10 @@ impl Batcher {
     pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
         debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
-        for state in &mut self.active_states {
-            if state.try_push(dst, content) {
-                return;
-            }
+        if let Some(state) = self.active_states.back_mut()
+            && state.try_push(dst, content)
+        {
+            return;
         }
 
         let mut new_state = match self.free_states.pop() {
@@ -66,7 +68,9 @@ impl Batcher {
 
     /// Reclaims a `BatcherState`, returning its memory to the pool for future reuse.
     pub fn reclaim(&mut self, state: BatcherState) {
-        self.free_states.push(state);
+        if self.free_states.len() < self.free_states.capacity() {
+            self.free_states.push(state);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -100,17 +104,22 @@ impl Batcher {
 pub struct BatcherState {
     pub dst: SocketAddr,
     pub segment_size: usize,
+    segment_count: usize,
+    max_segments: usize,
     sealed: bool,
     pub buf: Vec<u8>,
 }
 
 impl BatcherState {
+    const MAX_MTU: usize = 1500;
     fn with_capacity(cap: usize) -> Self {
         Self {
             dst: "0.0.0.0:0".parse().unwrap(),
             segment_size: 0,
+            segment_count: 0,
+            max_segments: cap,
             sealed: false,
-            buf: Vec::with_capacity(cap),
+            buf: Vec::with_capacity(cap * Self::MAX_MTU),
         }
     }
 
@@ -119,10 +128,12 @@ impl BatcherState {
         if self.sealed {
             return false;
         }
+
         if self.dst != dst {
             return false;
         }
-        if self.buf.len() + content.len() > self.buf.capacity() {
+
+        if self.segment_count >= self.max_segments {
             return false;
         }
 
@@ -132,9 +143,11 @@ impl BatcherState {
 
         if content.len() == self.segment_size {
             self.buf.extend_from_slice(content);
+            self.segment_count += 1;
             true
         } else if content.len() < self.segment_size {
             self.buf.extend_from_slice(content);
+            self.segment_count += 1;
             self.sealed = true;
             true
         } else {
@@ -146,6 +159,7 @@ impl BatcherState {
     fn reset(&mut self, dst: SocketAddr) {
         self.dst = dst;
         self.segment_size = 0;
+        self.segment_count = 0;
         self.sealed = false;
         self.buf.clear();
     }
@@ -163,7 +177,7 @@ mod tests {
     #[test]
     fn test_appends_same_size_and_stays_open() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(4096);
+        let mut batcher = Batcher::with_capacity(4);
 
         batcher.push_back(addr, &[1; 1000]);
         batcher.push_back(addr, &[2; 1000]);
@@ -178,7 +192,7 @@ mod tests {
     #[test]
     fn test_appends_tail_and_seals() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(4096);
+        let mut batcher = Batcher::with_capacity(4);
 
         batcher.push_back(addr, &[1; 1000]);
         batcher.push_back(addr, &[2; 1000]);
@@ -194,7 +208,7 @@ mod tests {
     #[test]
     fn test_sealed_batch_rejects_pushes_creating_new_batch() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(4096);
+        let mut batcher = Batcher::with_capacity(4);
 
         batcher.push_back(addr, &[1; 1000]);
         batcher.push_back(addr, &[3; 500]); // This seals the first batch
@@ -215,7 +229,7 @@ mod tests {
     #[test]
     fn test_reclaim_and_reuse_resets_sealed_state() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(4096);
+        let mut batcher = Batcher::with_capacity(4);
 
         // Create a batch and seal it
         batcher.push_back(addr, &[1; 100]);
@@ -241,7 +255,7 @@ mod tests {
     #[test]
     fn test_pool_miss_allocates_new_state() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(1024);
+        let mut batcher = Batcher::with_capacity(4);
         assert_eq!(batcher.free_states.len(), 0);
 
         // This is a pool miss
@@ -253,7 +267,7 @@ mod tests {
     #[test]
     fn test_pool_hit_reuses_state() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(1024);
+        let mut batcher = Batcher::with_capacity(1);
 
         // First push causes allocation
         batcher.push_back(addr, &[1; 10]);
@@ -285,7 +299,7 @@ mod tests {
     #[test]
     fn test_seal_unequal_size() {
         let addr = create_test_addr();
-        let mut batcher = Batcher::with_capacity(1024);
+        let mut batcher = Batcher::with_capacity(3);
 
         // First push causes allocation
         batcher.push_back(addr, &[1; 10]);
