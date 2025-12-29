@@ -46,6 +46,8 @@ docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.3.1 --dev
 - **UDP/3478:** WebRTC traffic (Multiplexed)
 - **TCP/3478:** WebRTC over TCP fallback (Multiplexed)
 
+> **Note:** The `--dev` flag used above configures PulseBeam to use port **3478** to avoid requiring root privileges. In production (running without `--dev`), WebRTC traffic defaults to standard port **443** (UDP/TCP).
+
 **Other options:**
 
 - **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
