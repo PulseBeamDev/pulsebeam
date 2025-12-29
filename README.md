@@ -114,3 +114,5 @@ Or view as a flamegraph on a browser by specifying `flamegraph=true` to the URL 
 - 📅 HTTP API & Webhooks (events)
 - 📅 Multi-node / cascading SFU support
 - 📅 Extensions: recording, SIP, AI agents
+
+You can view the full roadmap [here](https://github.com/orgs/PulseBeamDev/projects/2/views/4).
