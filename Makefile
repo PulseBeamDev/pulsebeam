@@ -41,7 +41,7 @@ brew-deps:
 	brew install git-cliff axodotdev/tap/cargo-dist
 
 cargo-deps:
-	$(CARGO_CMD) install cargo-smart-release --features allow-emoji
+	$(CARGO_CMD) install cargo-release cargo-dist git-cliff
 	$(CARGO_CMD) install flamegraph cargo-machete
 
 gh-deps:
