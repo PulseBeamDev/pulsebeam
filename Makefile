@@ -5,7 +5,7 @@ SCCACHE := $(shell which sccache)
 # >> force-frame-pointers is required for profiling, add ~1% CPU overhead
 # >> allow-multiple-definition is required so we can replace system allocator for C projects, like openssl, ffmpeg, etc.
 # These CFLAGS are needed to make sure everything compiles with frame-pointer otherwise segfault will happen.
-export RUSTFLAGS := $(RUSTFLAGS) -C link-arg=-Wl,--allow-multiple-definition -C force-frame-pointers=yes --cfg tracing_unstable --cfg tokio_unstable
+export RUSTFLAGS := $(RUSTFLAGS) -C link-arg=-Wl,--allow-multiple-definition -C force-frame-pointers=yes
 export CFLAGS := $(CFLAGS) -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
 export CXXFLAGS := $(CXXFLAGS) -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
 # ===
