@@ -2,6 +2,7 @@ use pulsebeam_agent::{
     MediaFrame, MediaTime,
     actor::{AgentBuilder, AgentEvent},
     media::H264Looper,
+    signaling::HttpSignalingClient,
 };
 use std::time::Duration;
 use tokio::time::Instant;
@@ -12,10 +13,8 @@ async fn main() {
 
     let raw_bytes = include_bytes!("video.h264");
     tracing::info!("joining");
-    let mut agent = AgentBuilder::new("http://localhost:3000", "demo")
-        .join()
-        .await
-        .unwrap();
+    let signaling = HttpSignalingClient::default();
+    let mut agent = AgentBuilder::new(signaling).join("demo").await.unwrap();
     tracing::info!("joined");
 
     while let Some(ev) = agent.next_event().await {

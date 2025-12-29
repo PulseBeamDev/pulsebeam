@@ -31,6 +31,7 @@ reqwest = "0.12.26"
 maybe-async = "0.2.10"
 http = "1.4.0"
 tokio-stream = "0.1.17"
+if-addrs = "0.14.0"
 
 # FFmpeg integration
 # ffmpeg-next = { version = "8.0.0", default-features = false, features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
