@@ -83,22 +83,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ))
             .await;
         let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
-        let mut current_deadline = Instant::now() + Duration::from_secs(1);
-        let mut new_deadline = Some(current_deadline);
+        let mut maybe_deadline = self.core.poll_rtc();
 
-        let rtc_timer = tokio::time::sleep_until(current_deadline);
-        tokio::pin!(rtc_timer);
-
-        loop {
-            match new_deadline {
-                Some(new_deadline) if new_deadline != current_deadline => {
-                    rtc_timer.as_mut().reset(new_deadline);
-                    current_deadline = new_deadline;
-                }
-                None => break,
-                _ => {}
-            }
-
+        while let Some(deadline) = maybe_deadline {
             let events: Vec<_> = self.core.drain_events().collect();
             for event in events {
                 self.handle_core_event(event).await;
@@ -127,6 +114,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
+
+                    maybe_deadline = self.core.poll_rtc();
                     // this indicates the first batch is filled.
                     if self.core.udp_batcher.len() >= 2 {
                         self.core.udp_batcher.flush(&self.udp_egress);
@@ -134,11 +123,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     if self.core.tcp_batcher.len() >= 2 {
                         self.core.tcp_batcher.flush(&self.tcp_egress);
                     }
-
-                    new_deadline = self.core.poll_rtc();
                 },
                 Some(batch) = gateway_rx.recv() => {
-                    new_deadline = self.core.handle_udp_packet_batch(batch);
+                    maybe_deadline = self.core.handle_udp_packet_batch(batch);
                 },
 
                 // Priority 3: Flush to network
@@ -153,8 +140,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 now = stats_interval.tick() => {
                     self.core.poll_slow(now);
                 }
-                _ = &mut rtc_timer => {
-                    new_deadline = self.core.handle_timeout();
+                _ = tokio::time::sleep_until(deadline) => {
+                    maybe_deadline = self.core.handle_timeout();
                 },
             }
         }
