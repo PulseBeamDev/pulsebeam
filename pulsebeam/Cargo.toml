@@ -20,6 +20,7 @@ tracing = { workspace = true }
 str0m = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true } 
+tokio-util.workspace = true
 
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8.7", features = ["macros"] }
@@ -32,7 +33,6 @@ sha3 = "0.10.8"
 metrics = "0.24.3"
 hyper = "1.7.0"
 pulsebeam-runtime = { version = "^0.1.0", path = "../pulsebeam-runtime" }
-tokio-util = "0.7.17"
 metrics-exporter-prometheus = "0.18.1"
 pprof = { version = "0.15.0", features = ["flamegraph", "prost-codec", "protobuf"] }
 tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration"] }

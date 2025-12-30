@@ -1,9 +1,7 @@
-pub mod sim;
 pub mod tcp;
 pub mod udp;
 
 use bytes::Bytes;
-use std::sync::Arc;
 use std::{io, net::SocketAddr};
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
@@ -97,55 +95,15 @@ pub async fn bind(
     tracing::debug!("bound to {addr} ({transport:?})");
     Ok(socks)
 }
-
-/// Helper to bind a pre-constructed simulation pair.
-pub fn bind_sim(
-    reader: sim::SimSocketReader,
-    writer: sim::SimSocketWriter,
-) -> (UnifiedSocketReader, UnifiedSocketWriter) {
-    (
-        UnifiedSocketReader::Sim(Box::new(reader)),
-        UnifiedSocketWriter::Sim(writer),
-    )
-}
-
-/// Creates a paired Reader/Writer wrapping a Turmoil UDP socket.
-pub fn create_sim_udp_pair(
-    turmoil_socket: Arc<turmoil::net::UdpSocket>,
-) -> (UnifiedSocketReader, UnifiedSocketWriter) {
-    let reader = sim::SimSocketReader::new_udp(turmoil_socket.clone());
-    let writer = sim::SimSocketWriter::new_udp(turmoil_socket);
-
-    bind_sim(reader, writer)
-}
-
-/// Creates a paired Reader/Writer wrapping a Turmoil TCP stream.
-pub fn create_sim_tcp_pair(
-    stream: turmoil::net::TcpStream,
-) -> (UnifiedSocketReader, UnifiedSocketWriter) {
-    let local_addr = stream.local_addr().unwrap();
-    let peer_addr = stream.peer_addr().unwrap();
-
-    // Split the stream so we can own Read/Write halves independently in background tasks
-    let (read_half, write_half) = tokio::io::split(stream);
-
-    let reader = sim::SimSocketReader::new_io(read_half, local_addr, peer_addr, Transport::Tcp);
-    let writer = sim::SimSocketWriter::new_io(write_half, local_addr, Transport::Tcp);
-
-    bind_sim(reader, writer)
-}
-
 pub enum UnifiedSocketReader {
     Udp(Box<udp::UdpTransportReader>),
     Tcp(tcp::TcpTransportReader),
-    Sim(Box<sim::SimSocketReader>),
 }
 
 impl UnifiedSocketReader {
     pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
         match self {
             Self::Tcp(inner) => inner.close_peer(peer_addr),
-            Self::Sim(inner) => inner.close_peer(peer_addr),
             Self::Udp(_) => {}
         }
     }
@@ -154,7 +112,6 @@ impl UnifiedSocketReader {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::Tcp(inner) => inner.local_addr(),
-            Self::Sim(inner) => inner.local_addr(),
         }
     }
 
@@ -163,7 +120,6 @@ impl UnifiedSocketReader {
         match self {
             Self::Udp(inner) => inner.readable().await,
             Self::Tcp(inner) => inner.readable().await,
-            Self::Sim(inner) => inner.readable().await,
         }
     }
 
@@ -172,7 +128,6 @@ impl UnifiedSocketReader {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(packets),
             Self::Tcp(inner) => inner.try_recv_batch(packets),
-            Self::Sim(inner) => inner.try_recv_batch(packets),
         }
     }
 }
@@ -181,7 +136,6 @@ impl UnifiedSocketReader {
 pub enum UnifiedSocketWriter {
     Udp(udp::UdpTransportWriter),
     Tcp(tcp::TcpTransportWriter),
-    Sim(sim::SimSocketWriter),
 }
 
 impl UnifiedSocketWriter {
@@ -189,7 +143,6 @@ impl UnifiedSocketWriter {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
             Self::Tcp(inner) => inner.max_gso_segments(),
-            Self::Sim(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -198,7 +151,6 @@ impl UnifiedSocketWriter {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::Tcp(inner) => inner.writable().await,
-            Self::Sim(inner) => inner.writable().await,
         }
     }
 
@@ -207,7 +159,6 @@ impl UnifiedSocketWriter {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::Tcp(inner) => inner.try_send_batch(batch),
-            Self::Sim(inner) => inner.try_send_batch(batch),
         }
     }
 
@@ -215,7 +166,6 @@ impl UnifiedSocketWriter {
         match self {
             Self::Udp(_) => Transport::Udp,
             Self::Tcp(_) => Transport::Tcp,
-            Self::Sim(inner) => inner.transport(),
         }
     }
 
@@ -223,7 +173,6 @@ impl UnifiedSocketWriter {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::Tcp(inner) => inner.local_addr(),
-            Self::Sim(inner) => inner.local_addr(),
         }
     }
 }

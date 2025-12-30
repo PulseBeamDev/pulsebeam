@@ -26,7 +26,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 futures-lite = { workspace = true }
-turmoil = "0.7.0"
+turmoil = { workspace = true, optional = true }
 quinn-udp = "0.5.14"
 socket2 = "0.6.1"
 tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration"] }

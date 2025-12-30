@@ -9,8 +9,12 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(not(feature = "turmoil"))]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "turmoil")]
+use turmoil::net::{TcpListener, TcpStream};
 
 const MAX_FRAME_SIZE: usize = 1500;
 const MAX_CONNECTIONS: usize = 10_000;

@@ -2642,8 +2642,12 @@ name = "pulsebeam-simulator"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "pulsebeam",
  "pulsebeam-agent",
+ "pulsebeam-runtime",
  "test-strategy",
+ "tokio",
+ "tokio-util",
  "turmoil",
 ]
 
