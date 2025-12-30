@@ -3,7 +3,7 @@ use futures_lite::StreamExt;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use str0m::media::{Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
@@ -12,6 +12,7 @@ use str0m::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
+use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -265,7 +266,7 @@ impl AgentActor {
             };
 
             let duration = timeout
-                .checked_duration_since(Instant::now())
+                .checked_duration_since(Instant::now().into())
                 .unwrap_or(Duration::ZERO);
 
             tokio::select! {
@@ -275,7 +276,7 @@ impl AgentActor {
                 }
 
                 _ = tokio::time::sleep(duration) => {
-                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now())) {
+                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                          return;
                     }
@@ -284,7 +285,7 @@ impl AgentActor {
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
                          let _ = self.rtc.handle_input(Input::Receive(
-                            Instant::now(),
+                            Instant::now().into(),
                             Receive {
                                 proto: Protocol::Udp,
                                 source,
@@ -299,7 +300,7 @@ impl AgentActor {
                 Some((mid, frame)) = self.senders.next() => {
                      if let Some(writer) = self.rtc.writer(mid) {
                          let pt = writer.payload_params().nth(0).unwrap().pt();
-                         let _ = writer.write(pt, Instant::now(), frame.ts, frame.data);
+                         let _ = writer.write(pt, Instant::now().into(), frame.ts, frame.data);
                      }
                 }
             }
