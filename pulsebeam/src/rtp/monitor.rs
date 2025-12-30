@@ -333,14 +333,20 @@ impl StreamMonitor {
 }
 
 #[derive(Debug)]
+struct Snapshot {
+    ts: Instant,
+    bytes: usize,
+}
+
+#[derive(Debug)]
 pub struct BitrateEstimate {
     controller: BitrateController,
     last_update: Instant,
     accumulated_bytes: usize,
 
-    history: VecDeque<f64>,
-    scratch: Vec<f64>,
-    window_size: usize,
+    history: VecDeque<Snapshot>,
+    window_sum: usize,
+    max_window_duration: Duration,
 }
 
 impl BitrateEstimate {
@@ -348,64 +354,63 @@ impl BitrateEstimate {
         let config = BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(10),
             max_bitrate: Bitrate::mbps(5),
-            default_bitrate: Bitrate::kbps(100),
-            headroom_factor: 1.0,
-            required_up_samples: 1,
-            quantization_step: Bitrate::kbps(10),
+            default_bitrate: Bitrate::kbps(300),
             ..Default::default()
         };
 
-        let controller = BitrateController::new(config);
-        let window_size = 35;
-
         Self {
+            controller: BitrateController::new(config),
             last_update: now,
             accumulated_bytes: 0,
-            history: VecDeque::with_capacity(window_size),
-            scratch: Vec::with_capacity(window_size),
-            window_size,
-            controller,
+            history: VecDeque::new(),
+            window_sum: 0,
+            max_window_duration: Duration::from_secs(1),
         }
     }
 
     pub fn record(&mut self, packet_len: usize) {
-        self.accumulated_bytes = self.accumulated_bytes.saturating_add(packet_len);
+        self.accumulated_bytes += packet_len;
     }
 
     pub fn poll(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_update);
-
         if elapsed < Duration::from_millis(200) {
             return;
         }
 
-        let elapsed_secs = elapsed.as_secs_f64();
-        if elapsed_secs == 0.0 {
-            return;
+        let snapshot = Snapshot {
+            ts: now,
+            bytes: self.accumulated_bytes,
+        };
+        self.window_sum += snapshot.bytes;
+        self.history.push_back(snapshot);
+
+        while let Some(front) = self.history.front() {
+            if now.saturating_duration_since(front.ts) > self.max_window_duration {
+                let removed = self.history.pop_front().unwrap();
+                self.window_sum = self.window_sum.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
         }
 
-        let raw_bps = (self.accumulated_bytes as f64 * 8.0) / elapsed_secs;
-
-        if self.history.len() >= self.window_size {
-            self.history.pop_front();
-        }
-        self.history.push_back(raw_bps);
-
-        self.scratch.clear();
-        self.scratch.extend(self.history.iter());
-
-        let robust_bps = if self.scratch.is_empty() {
-            raw_bps
+        let actual_window_duration = if let Some(front) = self.history.front() {
+            now.saturating_duration_since(front.ts)
         } else {
-            let target_idx = (self.scratch.len() as f64 * 0.5) as usize;
-            let target_idx = target_idx.min(self.scratch.len().saturating_sub(1));
-            let (_, &mut val, _) = self
-                .scratch
-                .select_nth_unstable_by(target_idx, |a, b| a.total_cmp(b));
-            val
+            Duration::ZERO
         };
 
-        self.controller.update(Bitrate::from(robust_bps));
+        // Safety: ensure we don't divide by zero at the very start
+        let valid_duration = actual_window_duration.max(elapsed).as_secs_f64();
+
+        // sliding window average
+        let bps = if valid_duration > 0.001 {
+            (self.window_sum as f64 * 8.0) / valid_duration
+        } else {
+            0.0
+        };
+
+        self.controller.update(Bitrate::from(bps));
         self.last_update = now;
         self.accumulated_bytes = 0;
     }

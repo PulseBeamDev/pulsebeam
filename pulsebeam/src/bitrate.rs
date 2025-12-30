@@ -23,7 +23,7 @@ impl Default for BitrateControllerConfig {
             headroom_factor: 1.0,
             max_decay_factor: 0.95,
             emergency_drop_threshold: 0.50,
-            required_up_samples: 5,
+            required_up_samples: 1,
             quantization_step: Bitrate::kbps(10),
         }
     }

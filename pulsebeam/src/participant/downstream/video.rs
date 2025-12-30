@@ -97,7 +97,7 @@ impl VideoAllocator {
             };
 
             next_track.1.assigned_mid.replace(slot.mid);
-            slot.switch_to(next_track.1.track.lowest_quality().clone());
+            slot.assign_to(next_track.1.track.lowest_quality().clone());
         }
     }
 
@@ -301,7 +301,7 @@ impl VideoAllocator {
         for (idx, plan) in committed.drain(..).enumerate() {
             let slot = &mut self.slots[idx];
             if plan.paused {
-                slot.pause(plan.receiver);
+                slot.assign_to(plan.receiver);
             } else {
                 slot.switch_to(plan.receiver);
             }
@@ -453,6 +453,11 @@ impl Slot {
         }
     }
 
+    // similar to switch_to but it will start as paused
+    pub fn assign_to(&mut self, receiver: SimulcastReceiver) {
+        self.transition_to(SlotState::Paused { active: receiver });
+    }
+
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
         if let Some(current) = self.target_receiver()
             && current.rid == receiver.rid
@@ -525,12 +530,6 @@ impl Slot {
 
     pub fn stop(&mut self) {
         self.transition_to(SlotState::Idle);
-    }
-
-    pub fn pause(&mut self, current_receiver: SimulcastReceiver) {
-        self.transition_to(SlotState::Paused {
-            active: current_receiver,
-        });
     }
 
     fn request_keyframe(&self, kind: KeyframeRequestKind) {

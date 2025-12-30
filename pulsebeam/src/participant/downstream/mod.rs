@@ -34,6 +34,7 @@ impl DownstreamAllocator {
             MediaKind::Audio => self.audio.add_track(track),
             MediaKind::Video => self.video.add_track(track),
         }
+        self.update_allocations();
     }
 
     pub fn remove_track(&mut self, track: &TrackReceiver) {
@@ -41,6 +42,7 @@ impl DownstreamAllocator {
             MediaKind::Audio => self.audio.remove_track(&track.meta.id),
             MediaKind::Video => self.video.remove_track(&track.meta.id),
         }
+        self.update_allocations();
     }
 
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
@@ -48,6 +50,7 @@ impl DownstreamAllocator {
             MediaKind::Audio => self.audio.add_slot(mid),
             MediaKind::Video => self.video.add_slot(mid),
         }
+        self.update_allocations();
     }
 
     /// Handle BWE and compute both current and desired bitrate in one pass.
