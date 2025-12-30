@@ -57,20 +57,20 @@ fn main() {
 pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let external_ip = select_host_address();
     let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
-
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
-    let http_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
-    let internal_http_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
-    tracing::info!(
-        "server listening at {}:3000 (signaling), {}:{} (webrtc), and 0.0.0.0:6060 (metrics/pprof)",
-        external_ip,
-        external_ip,
-        rtc_port
-    );
 
-    // Run the main logic and signal handler concurrently
+    let node_handle = node::NodeBuilder::new()
+        .workers(workers)
+        .local_addr(local_addr)
+        .external_addr(external_addr)
+        .with_http_api("0.0.0.0:3000".parse().unwrap())
+        .with_internal_metrics("0.0.0.0:6060".parse().unwrap())
+        .run(shutdown.clone());
+
+    tracing::info!("server started...");
+
     tokio::select! {
-        Err(err) = node::run(shutdown.clone(), workers, external_addr, local_addr, http_addr, internal_http_addr) => {
+        Err(err) = node_handle => {
             tracing::warn!("node exited with error: {err}");
         }
         _ = system::wait_for_signal() => {

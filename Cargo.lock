@@ -2551,7 +2551,6 @@ dependencies = [
  "bs58",
  "bytes",
  "clap",
- "futures-concurrency",
  "futures-lite",
  "hex",
  "hyper",

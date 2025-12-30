@@ -10,7 +10,6 @@ use crate::{
     entity::{ParticipantId, RoomId, TrackId},
     gateway, node,
     participant::{self, ParticipantActor},
-    shard::{ShardMessage, ShardTask},
     track::{self, TrackMeta},
 };
 use pulsebeam_runtime::actor;
@@ -128,24 +127,6 @@ impl RoomActor {
         }
     }
 
-    pub async fn schedule(&mut self, task: ShardTask) {
-        use ahash::AHasher;
-        use std::hash::{Hash, Hasher};
-
-        const GROUP_LIMIT: usize = 16;
-        let room_size = self.state.participants.len();
-        let shard_idx = {
-            let mut hasher = AHasher::default();
-            let group = room_size / GROUP_LIMIT;
-
-            (&self.room_id.internal, group).hash(&mut hasher);
-            (hasher.finish() as usize) % self.node_ctx.shards.len()
-        };
-        self.node_ctx.shards[shard_idx]
-            .send(ShardMessage::AddTask(task))
-            .await;
-    }
-
     async fn handle_participant_joined(
         &mut self,
         _ctx: &mut actor::ActorContext<RoomMessageSet>,
@@ -157,13 +138,6 @@ impl RoomActor {
 
         self.participant_tasks.spawn(participant_task);
 
-        // let participant_task = async move {
-        //     let (participant_id, _) = participant_task.await;
-        //     room_handle
-        //         .send(RoomMessage::RemoveParticipant(participant_id))
-        //         .await;
-        // };
-        // self.schedule(participant_task.boxed()).await;
         self.state.participants.insert(
             participant_id.clone(),
             ParticipantMeta {

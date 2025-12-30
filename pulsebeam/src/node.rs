@@ -1,13 +1,225 @@
-use crate::shard::ShardMessageSet;
 use crate::{api, controller, gateway};
+use anyhow::Result;
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
+use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+/// A pair of reader/writer for a transport connection.
+pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
+
+pub struct NodeBuilder {
+    // Configuration
+    workers: usize,
+    local_addr: Option<SocketAddr>,
+    external_addr: Option<SocketAddr>,
+
+    // Dependencies (Optional Side Effect Injection)
+    rng: Option<rand::Rng>,
+    udp_transports: Option<Vec<TransportPair>>,
+    tcp_transport: Option<TransportPair>,
+    gateway_handle: Option<gateway::GatewayHandle>,
+
+    // Optional Services
+    http_api_addr: Option<SocketAddr>,
+    internal_metrics_addr: Option<SocketAddr>,
+}
+
+impl Default for NodeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeBuilder {
+    pub fn new() -> Self {
+        Self {
+            workers: 1,
+            local_addr: None,
+            external_addr: None,
+            rng: None,
+            udp_transports: None,
+            tcp_transport: None,
+            gateway_handle: None,
+            http_api_addr: None,
+            internal_metrics_addr: None,
+        }
+    }
+
+    /// Set the number of UDP workers (default: 1).
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// Set the local bind address. Ignored if transports are injected manually.
+    pub fn local_addr(mut self, addr: SocketAddr) -> Self {
+        self.local_addr = Some(addr);
+        self
+    }
+
+    /// Set the external address advertised to peers.
+    pub fn external_addr(mut self, addr: SocketAddr) -> Self {
+        self.external_addr = Some(addr);
+        self
+    }
+
+    /// Inject a specific RNG (useful for deterministic simulation).
+    pub fn rng(mut self, rng: rand::Rng) -> Self {
+        self.rng = Some(rng);
+        self
+    }
+
+    /// Inject pre-created UDP transports.
+    /// If provided, socket binding logic is skipped for UDP.
+    pub fn with_udp_transports(mut self, transports: Vec<TransportPair>) -> Self {
+        self.udp_transports = Some(transports);
+        self
+    }
+
+    /// Inject a pre-created TCP transport.
+    /// If provided, socket binding logic is skipped for TCP.
+    pub fn with_tcp_transport(mut self, transport: TransportPair) -> Self {
+        self.tcp_transport = Some(transport);
+        self
+    }
+
+    /// Inject an existing Gateway handle.
+    pub fn with_gateway(mut self, gateway: gateway::GatewayHandle) -> Self {
+        self.gateway_handle = Some(gateway);
+        self
+    }
+
+    /// Enable the HTTP Signaling API on the specific address.
+    pub fn with_http_api(mut self, addr: SocketAddr) -> Self {
+        self.http_api_addr = Some(addr);
+        self
+    }
+
+    /// Enable the internal metrics/profiling server on the specific address.
+    pub fn with_internal_metrics(mut self, addr: SocketAddr) -> Self {
+        self.internal_metrics_addr = Some(addr);
+        self
+    }
+
+    /// Consumes the builder and runs the node until `shutdown` is cancelled.
+    pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
+        let workers_count = self.workers;
+        // Default to binding 0.0.0.0:0 if no address is provided but binding is required
+        let local_addr = self
+            .local_addr
+            .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
+        let external_addr = self.external_addr;
+
+        // 1. Prepare Transports (Side Effect: Binding)
+        let (udp_readers, udp_writers) = match self.udp_transports {
+            Some(pairs) => unzip_transports(pairs),
+            None => bind_udp_workers(local_addr, external_addr, workers_count).await?,
+        };
+
+        let (tcp_reader, tcp_writer) = match self.tcp_transport {
+            Some((r, w)) => (r, w),
+            None => net::bind(local_addr, net::Transport::Tcp, external_addr).await?,
+        };
+
+        let mut all_readers = udp_readers;
+        all_readers.push(tcp_reader);
+
+        // 2. Prepare Context Data
+        let rng = self.rng.unwrap_or_else(rand::Rng::from_os_rng);
+
+        // 3. Spawn Gateway (Side Effect: Spawning Actor)
+        let mut join_set = JoinSet::new();
+
+        let gateway_handle = if let Some(handle) = self.gateway_handle {
+            handle
+        } else {
+            let (handle, task) = actor::prepare(
+                gateway::GatewayActor::new(all_readers),
+                RunnerConfig::default(),
+            );
+            join_set.spawn(ignore(task));
+            handle
+        };
+
+        // 4. Build NodeContext
+        let node_ctx = NodeContext {
+            rng,
+            gateway: gateway_handle.clone(),
+            udp_sockets: udp_writers,
+            tcp_socket: tcp_writer,
+            udp_egress_counter: Arc::new(AtomicUsize::new(0)),
+        };
+
+        // 5. Spawn Controller (Side Effect: Spawning Actor)
+        let controller_actor =
+            controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
+        let (controller_handle, controller_task) =
+            actor::prepare(controller_actor, RunnerConfig::default());
+        join_set.spawn(ignore(controller_task));
+
+        // 6. Optional HTTP API (Side Effect: Binding TCP Port)
+        if let Some(http_addr) = self.http_api_addr {
+            let api_cfg = api::ApiConfig {
+                base_path: "/api/v1".to_string(),
+                default_host: http_addr.to_string(),
+            };
+
+            let cors = CorsLayer::very_permissive()
+                .allow_origin(AllowOrigin::mirror_request())
+                .expose_headers([hyper::header::LOCATION])
+                .max_age(Duration::from_secs(86400));
+
+            let router = api::router(controller_handle, api_cfg).layer(cors);
+            let http_shutdown = shutdown.clone();
+
+            join_set.spawn(async move {
+                match TcpListener::bind(http_addr).await {
+                    Ok(listener) => {
+                        tracing::debug!("signaling api listening on {http_addr}");
+                        tokio::select! {
+                            res = axum::serve(listener, router) => {
+                                if let Err(e) = res {
+                                    tracing::error!("http server error: {e}");
+                                }
+                            }
+                            _ = http_shutdown.cancelled() => {
+                                tracing::info!("http server shutting down");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!("failed to bind http api: {e}"),
+                }
+            });
+        }
+
+        // 7. Optional Internal Metrics (Side Effect: Binding TCP Port + Global Hooks)
+        if let Some(metrics_addr) = self.internal_metrics_addr {
+            join_set.spawn(ignore(internal::serve_internal_http(
+                metrics_addr,
+                shutdown.child_token(),
+            )));
+        }
+
+        // Wait for shutdown
+        tokio::select! {
+            _ = join_set.join_all() => {}
+            _ = shutdown.cancelled() => {
+                tracing::info!("node received shutdown");
+            }
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct NodeContext {
@@ -15,36 +227,15 @@ pub struct NodeContext {
     pub gateway: gateway::GatewayHandle,
     pub udp_sockets: Vec<net::UnifiedSocketWriter>,
     pub tcp_socket: net::UnifiedSocketWriter,
-    pub shards: Vec<ActorHandle<ShardMessageSet>>,
     udp_egress_counter: Arc<AtomicUsize>,
 }
 
 impl NodeContext {
-    // pub fn single(socket: net::UnifiedSocket) -> Self {
-    //     let socket = Arc::new(socket);
-    //
-    //     let (gw, _) = actor::prepare(
-    //         gateway::GatewayActor::new(vec![socket.clone()]),
-    //         RunnerConfig::default(),
-    //     );
-    //
-    //     Self {
-    //         rng: rand::Rng::from_os_rng(),
-    //         gateway: gw,
-    //         shards: vec![],
-    //         sockets: vec![socket.clone()],
-    //         egress_counter: Arc::new(AtomicUsize::new(0)),
-    //     }
-    // }
-    //
     pub fn allocate_udp_egress(&self) -> net::UnifiedSocketWriter {
         let seq = self
             .udp_egress_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.udp_sockets
-            .get(seq % self.udp_sockets.len())
-            .unwrap()
-            .clone()
+        self.udp_sockets[seq % self.udp_sockets.len()].clone()
     }
 
     pub fn allocate_tcp_egress(&self) -> net::UnifiedSocketWriter {
@@ -52,117 +243,48 @@ impl NodeContext {
     }
 }
 
-pub async fn run(
-    shutdown: CancellationToken,
-    workers: usize,
-    external_addr: SocketAddr,
+async fn bind_udp_workers(
     local_addr: SocketAddr,
-    http_addr: SocketAddr,
-    internal_http_addr: SocketAddr,
-) -> anyhow::Result<()> {
-    let mut net_readers: Vec<net::UnifiedSocketReader> = Vec::new();
-    let mut udp_writers: Vec<net::UnifiedSocketWriter> = Vec::new();
+    external_addr: Option<SocketAddr>,
+    workers: usize,
+) -> Result<(Vec<net::UnifiedSocketReader>, Vec<net::UnifiedSocketWriter>)> {
+    let mut readers = Vec::with_capacity(workers);
+    let mut writers = Vec::with_capacity(workers);
+
     for _ in 0..workers {
-        let (reader, writer) =
-            match net::bind(local_addr, net::Transport::Udp, Some(external_addr)).await {
-                Ok(socket) => socket,
-                Err(err) if udp_writers.is_empty() => {
-                    return Err(anyhow::Error::new(err).context("failed to bind udp"));
-                }
-                Err(err) => {
-                    tracing::warn!("SO_REUSEPORT is not supported, fallback to 1 socket: {err}");
-                    break;
-                }
-            };
-
-        net_readers.push(reader);
-        udp_writers.push(writer);
-    }
-    let (tcp_reader, tcp_writer) =
-        net::bind(local_addr, net::Transport::Tcp, Some(external_addr)).await?;
-    net_readers.push(tcp_reader);
-
-    let cors = CorsLayer::very_permissive()
-        .allow_origin(AllowOrigin::mirror_request())
-        .expose_headers([hyper::header::LOCATION])
-        .max_age(Duration::from_secs(86400));
-
-    let mut join_set = JoinSet::new();
-    let (gateway, gateway_task) = actor::prepare(
-        gateway::GatewayActor::new(net_readers),
-        RunnerConfig::default(),
-    );
-    join_set.spawn(ignore(gateway_task));
-
-    // let shard_count = 2 * workers;
-    // let mut shard_handles = Vec::with_capacity(shard_count);
-    //
-    // for i in 0..shard_count {
-    //     let (shard, shard_task) =
-    //         actor::prepare(shard::ShardActor::new(i), RunnerConfig::default());
-    //     join_set.spawn(ignore(shard_task));
-    //     shard_handles.push(shard);
-    // }
-
-    let rng = rand::Rng::from_os_rng();
-    let node_ctx = NodeContext {
-        rng,
-        gateway,
-        udp_sockets: udp_writers,
-        tcp_socket: tcp_writer,
-        shards: vec![],
-        udp_egress_counter: Arc::new(AtomicUsize::new(0)),
-    };
-
-    let controller_actor = controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
-    let (controller_handle, controller_task) =
-        actor::prepare(controller_actor, RunnerConfig::default());
-    join_set.spawn(ignore(controller_task));
-
-    // HTTP API
-    let api_cfg = api::ApiConfig {
-        base_path: "/api/v1".to_string(),
-        default_host: http_addr.to_string(),
-    };
-    let router = api::router(controller_handle, api_cfg).layer(cors);
-
-    let shutdown_for_http = shutdown.clone();
-    let signaling = async move {
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-        tracing::debug!("listening on {http_addr}");
-        tokio::select! {
-            res = axum::serve(listener, router) => {
-                if let Err(e) = res {
-                    tracing::error!("http server error: {e}");
-                }
+        let (reader, writer) = match net::bind(local_addr, net::Transport::Udp, external_addr).await
+        {
+            Ok(s) => s,
+            Err(e) if writers.is_empty() => {
+                return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
             }
-            _ = shutdown_for_http.cancelled() => {
-                tracing::info!("http server shutting down");
+            Err(e) => {
+                tracing::warn!(
+                    "SO_REUSEPORT not supported or failed after first bind, proceeding with {} workers: {}",
+                    writers.len(),
+                    e
+                );
+                break;
             }
-        }
-    };
-
-    join_set.spawn(signaling);
-    join_set.spawn(ignore(internal::serve_internal_http(
-        internal_http_addr,
-        shutdown.child_token(),
-    )));
-
-    // Wait for all tasks to complete OR shutdown
-    tokio::select! {
-        _ = join_set.join_all() => {}
-        _ = shutdown.cancelled() => {
-            tracing::info!("node received shutdown");
-        }
+        };
+        readers.push(reader);
+        writers.push(writer);
     }
+    Ok((readers, writers))
+}
 
-    Ok(())
+fn unzip_transports(
+    pairs: Vec<TransportPair>,
+) -> (Vec<net::UnifiedSocketReader>, Vec<net::UnifiedSocketWriter>) {
+    pairs.into_iter().unzip()
+}
+
+pub async fn ignore<T>(fut: impl Future<Output = T>) {
+    let _ = fut.await;
 }
 
 mod internal {
-    use std::net::SocketAddr;
-    use std::time::Duration;
-
+    use super::*;
     use anyhow::Result;
     use axum::{
         Router,
@@ -175,12 +297,12 @@ mod internal {
         header::{CONTENT_DISPOSITION, CONTENT_TYPE},
     };
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use pprof::{ProfilerGuard, protos::Message};
+    use pprof::ProfilerGuard;
+    use pprof::protos::Message;
     use pulsebeam_runtime::actor::Actor;
     use serde::Deserialize;
-    use tokio_util::sync::CancellationToken;
 
-    use crate::{controller, gateway, participant, room, shard};
+    use crate::{controller, gateway, participant, room};
 
     #[derive(Deserialize)]
     pub struct ProfileParams {
@@ -195,9 +317,16 @@ mod internal {
     }
 
     pub async fn serve_internal_http(addr: SocketAddr, shutdown: CancellationToken) -> Result<()> {
-        // Initialize Prometheus recorder
-        let builder = PrometheusBuilder::new();
-        let prometheus_handle = builder.install_recorder()?;
+        // Try to install the Prometheus recorder.
+        // In simulation or test environments running multiple nodes in one process,
+        // this might fail if already installed. We proceed gracefully.
+        let prometheus_handle = match PrometheusBuilder::new().install_recorder() {
+            Ok(h) => Some(h),
+            Err(_) => {
+                tracing::warn!("Prometheus recorder already installed; new handle not available.");
+                None
+            }
+        };
 
         const INDEX_HTML: &str = r#"
 <ul>
@@ -209,29 +338,32 @@ mod internal {
 </ul>
 "#;
 
-        // Router
-        let router = Router::new()
-            .route(
-                "/metrics",
-                get({
-                    let handle = prometheus_handle.clone();
-                    move || async move { handle.render() }
-                }),
-            )
+        let mut router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
-            .route("/debug/pprof/allocs", axum::routing::get(heap_profile))
-            .route("/", get(|| async { Html(INDEX_HTML) }))
-            .with_state(());
+            .route("/debug/pprof/allocs", get(heap_profile))
+            .route("/", get(|| async { Html(INDEX_HTML) }));
 
-        // Run HTTP server
+        // Only attach metrics route if we successfully got a handle
+        if let Some(handle) = prometheus_handle.clone() {
+            router = router.route("/metrics", get(move || async move { handle.render() }));
+        }
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("internal metrics listening on {addr}");
 
+        // Background tasks
         let runtime_metrics_join = tokio::spawn(
             tokio_metrics::RuntimeMetricsReporterBuilder::default()
-                .with_interval(std::time::Duration::from_secs(5))
+                .with_interval(Duration::from_secs(5))
                 .describe_and_run(),
         );
-        let actor_monitor_join = tokio::spawn(background_monitor(prometheus_handle));
+
+        let actor_monitor_join = if let Some(handle) = prometheus_handle {
+            tokio::spawn(background_monitor(handle))
+        } else {
+            // Spawn a dummy task if we can't monitor
+            tokio::spawn(async {})
+        };
 
         tokio::select! {
             res = axum::serve(listener, router) => {
@@ -265,7 +397,6 @@ mod internal {
                 "participant",
                 participant::ParticipantActor::monitor().intervals(),
             ),
-            ("shard", shard::ShardActor::monitor().intervals()),
         ];
 
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -273,9 +404,7 @@ mod internal {
         loop {
             interval.tick().await;
 
-            // https://docs.rs/metrics-exporter-prometheus/latest/metrics_exporter_prometheus/#upkeep-and-maintenance
             // Keep memory usage and CPU usage bounded per prometheus interval.
-            // 5 seconds matches the default from the crate.
             prometheus_handle.run_upkeep();
 
             for (actor_name, monitor) in &mut monitors {
@@ -310,18 +439,26 @@ mod internal {
     pub async fn heap_profile(
         Query(params): Query<ProfileParams>,
     ) -> Result<Response, (StatusCode, String)> {
-        let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
+        // Safe access to jemalloc control
+        let mut prof_ctl = match jemalloc_pprof::PROF_CTL.as_ref() {
+            Some(ctl) => ctl.lock().await,
+            None => {
+                return Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Jemalloc not enabled or configured".to_string(),
+                ));
+            }
+        };
+
         require_profiling_activated(&prof_ctl)?;
 
         let resp = if params.flamegraph {
-            use axum::http::header::CONTENT_TYPE;
-
             let svg = prof_ctl
                 .dump_flamegraph()
                 .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
             (
-                axum::http::StatusCode::OK,
+                StatusCode::OK,
                 [
                     (CONTENT_TYPE, "image/svg+xml"),
                     (CONTENT_DISPOSITION, "attachment; filename=allocs.svg"),
@@ -335,7 +472,7 @@ mod internal {
                 .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
             (
-                axum::http::StatusCode::OK,
+                StatusCode::OK,
                 [
                     (CONTENT_TYPE, "application/octet-stream"),
                     (CONTENT_DISPOSITION, "attachment; filename=allocs.pprof"),
@@ -347,25 +484,26 @@ mod internal {
         Ok(resp)
     }
 
-    /// Checks whether jemalloc profiling is activated an returns an error response if not.
     fn require_profiling_activated(
         prof_ctl: &jemalloc_pprof::JemallocProfCtl,
     ) -> Result<(), (StatusCode, String)> {
         if prof_ctl.activated() {
             Ok(())
         } else {
-            Err((
-                axum::http::StatusCode::FORBIDDEN,
-                "heap profiling not activated".into(),
-            ))
+            Err((StatusCode::FORBIDDEN, "heap profiling not activated".into()))
         }
     }
 
-    /// Handler: /debug/pprof/profile?seconds=30&flamegraph=true
     async fn pprof_profile(
         Query(params): Query<ProfileParams>,
     ) -> Result<impl IntoResponse, (StatusCode, String)> {
-        let guard = ProfilerGuard::new(100).unwrap(); // 100 Hz sampling
+        let guard = ProfilerGuard::new(100).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to start profiler: {e}"),
+            )
+        })?;
+
         tokio::time::sleep(Duration::from_secs(params.seconds)).await;
 
         let resp = match guard.report().build() {
@@ -377,7 +515,7 @@ mod internal {
                         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
                     (
-                        axum::http::StatusCode::OK,
+                        StatusCode::OK,
                         [
                             (CONTENT_TYPE, "image/svg+xml"),
                             (CONTENT_DISPOSITION, "attachment; filename=cpu.svg"),
@@ -392,7 +530,7 @@ mod internal {
 
                     let body = profile.encode_to_vec();
                     (
-                        axum::http::StatusCode::OK,
+                        StatusCode::OK,
                         [
                             (CONTENT_TYPE, "application/octet-stream"),
                             (CONTENT_DISPOSITION, "attachment; filename=cpu.pprof"),
@@ -403,7 +541,7 @@ mod internal {
                 }
             }
             Err(e) => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to build pprof report: {e}"),
             )
                 .into_response(),
@@ -411,8 +549,4 @@ mod internal {
 
         Ok(resp)
     }
-}
-
-pub async fn ignore<T>(fut: impl Future<Output = T>) {
-    let _ = fut.await;
 }
