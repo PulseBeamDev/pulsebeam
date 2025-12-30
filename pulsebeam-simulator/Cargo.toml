@@ -12,3 +12,4 @@ license.workspace = true
 [dependencies]
 proptest = "1.9.0"
 test-strategy = "0.4.3"
+turmoil = "0.7.0"
