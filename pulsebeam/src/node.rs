@@ -1,5 +1,5 @@
 use crate::{api, controller, gateway};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
@@ -16,21 +16,29 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
 
+/// Defines how a service listener is acquired.
+enum ListenerSource {
+    /// Bind to this address internally.
+    Bind(SocketAddr),
+    /// Use this pre-bound listener.
+    PreBound(TcpListener),
+}
+
 pub struct NodeBuilder {
     // Configuration
     workers: usize,
     local_addr: Option<SocketAddr>,
     external_addr: Option<SocketAddr>,
 
-    // Dependencies (Optional Side Effect Injection)
+    // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
     udp_transports: Option<Vec<TransportPair>>,
     tcp_transport: Option<TransportPair>,
     gateway_handle: Option<gateway::GatewayHandle>,
 
-    // Optional Services
-    http_api_addr: Option<SocketAddr>,
-    internal_metrics_addr: Option<SocketAddr>,
+    // Services
+    http_api: Option<ListenerSource>,
+    internal_metrics: Option<ListenerSource>,
 }
 
 impl Default for NodeBuilder {
@@ -49,8 +57,8 @@ impl NodeBuilder {
             udp_transports: None,
             tcp_transport: None,
             gateway_handle: None,
-            http_api_addr: None,
-            internal_metrics_addr: None,
+            http_api: None,
+            internal_metrics: None,
         }
     }
 
@@ -60,7 +68,8 @@ impl NodeBuilder {
         self
     }
 
-    /// Set the local bind address. Ignored if transports are injected manually.
+    /// Set the local bind address for UDP/TCP transports.
+    /// Ignored if transports are injected manually.
     pub fn local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
@@ -98,15 +107,28 @@ impl NodeBuilder {
         self
     }
 
-    /// Enable the HTTP Signaling API on the specific address.
+    /// Configure the HTTP Signaling API to bind to the specified address.
     pub fn with_http_api(mut self, addr: SocketAddr) -> Self {
-        self.http_api_addr = Some(addr);
+        self.http_api = Some(ListenerSource::Bind(addr));
         self
     }
 
-    /// Enable the internal metrics/profiling server on the specific address.
+    /// Configure the HTTP Signaling API to use a pre-bound listener.
+    /// Useful for testing with port 0 (ephemeral ports).
+    pub fn with_http_api_listener(mut self, listener: TcpListener) -> Self {
+        self.http_api = Some(ListenerSource::PreBound(listener));
+        self
+    }
+
+    /// Configure the Internal Metrics server to bind to the specified address.
     pub fn with_internal_metrics(mut self, addr: SocketAddr) -> Self {
-        self.internal_metrics_addr = Some(addr);
+        self.internal_metrics = Some(ListenerSource::Bind(addr));
+        self
+    }
+
+    /// Configure the Internal Metrics server to use a pre-bound listener.
+    pub fn with_internal_metrics_listener(mut self, listener: TcpListener) -> Self {
+        self.internal_metrics = Some(ListenerSource::PreBound(listener));
         self
     }
 
@@ -119,7 +141,7 @@ impl NodeBuilder {
             .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
         let external_addr = self.external_addr;
 
-        // 1. Prepare Transports (Side Effect: Binding)
+        // 1. Prepare Transports
         let (udp_readers, udp_writers) = match self.udp_transports {
             Some(pairs) => unzip_transports(pairs),
             None => bind_udp_workers(local_addr, external_addr, workers_count).await?,
@@ -136,7 +158,7 @@ impl NodeBuilder {
         // 2. Prepare Context Data
         let rng = self.rng.unwrap_or_else(rand::Rng::from_os_rng);
 
-        // 3. Spawn Gateway (Side Effect: Spawning Actor)
+        // 3. Spawn Gateway
         let mut join_set = JoinSet::new();
 
         let gateway_handle = if let Some(handle) = self.gateway_handle {
@@ -159,18 +181,32 @@ impl NodeBuilder {
             udp_egress_counter: Arc::new(AtomicUsize::new(0)),
         };
 
-        // 5. Spawn Controller (Side Effect: Spawning Actor)
+        // 5. Spawn Controller
         let controller_actor =
             controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
         let (controller_handle, controller_task) =
             actor::prepare(controller_actor, RunnerConfig::default());
         join_set.spawn(ignore(controller_task));
 
-        // 6. Optional HTTP API (Side Effect: Binding TCP Port)
-        if let Some(http_addr) = self.http_api_addr {
+        // 6. Optional HTTP API
+        if let Some(source) = self.http_api {
+            // Resolve listener
+            let listener = match source {
+                ListenerSource::Bind(addr) => {
+                    TcpListener::bind(addr).await.context("binding http api")?
+                }
+                ListenerSource::PreBound(l) => l,
+            };
+
+            let local_addr = listener.local_addr().ok();
+            tracing::debug!("signaling api listening on {:?}", local_addr);
+
             let api_cfg = api::ApiConfig {
                 base_path: "/api/v1".to_string(),
-                default_host: http_addr.to_string(),
+                // Best effort to guess host if bound randomly
+                default_host: local_addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "0.0.0.0:0".to_string()),
             };
 
             let cors = CorsLayer::very_permissive()
@@ -182,29 +218,30 @@ impl NodeBuilder {
             let http_shutdown = shutdown.clone();
 
             join_set.spawn(async move {
-                match TcpListener::bind(http_addr).await {
-                    Ok(listener) => {
-                        tracing::debug!("signaling api listening on {http_addr}");
-                        tokio::select! {
-                            res = axum::serve(listener, router) => {
-                                if let Err(e) = res {
-                                    tracing::error!("http server error: {e}");
-                                }
-                            }
-                            _ = http_shutdown.cancelled() => {
-                                tracing::info!("http server shutting down");
-                            }
+                tokio::select! {
+                    res = axum::serve(listener, router) => {
+                        if let Err(e) = res {
+                            tracing::error!("http server error: {e}");
                         }
                     }
-                    Err(e) => tracing::error!("failed to bind http api: {e}"),
+                    _ = http_shutdown.cancelled() => {
+                        tracing::info!("http server shutting down");
+                    }
                 }
             });
         }
 
-        // 7. Optional Internal Metrics (Side Effect: Binding TCP Port + Global Hooks)
-        if let Some(metrics_addr) = self.internal_metrics_addr {
+        // 7. Optional Internal Metrics
+        if let Some(source) = self.internal_metrics {
+            let listener = match source {
+                ListenerSource::Bind(addr) => TcpListener::bind(addr)
+                    .await
+                    .context("binding internal metrics")?,
+                ListenerSource::PreBound(l) => l,
+            };
+
             join_set.spawn(ignore(internal::serve_internal_http(
-                metrics_addr,
+                listener,
                 shutdown.child_token(),
             )));
         }
@@ -232,6 +269,10 @@ pub struct NodeContext {
 
 impl NodeContext {
     pub fn allocate_udp_egress(&self) -> net::UnifiedSocketWriter {
+        if self.udp_sockets.is_empty() {
+            // If no UDP sockets exist, fallback to TCP to prevent panic/div-by-zero
+            return self.tcp_socket.clone();
+        }
         let seq = self
             .udp_egress_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -316,7 +357,12 @@ mod internal {
         30
     }
 
-    pub async fn serve_internal_http(addr: SocketAddr, shutdown: CancellationToken) -> Result<()> {
+    pub async fn serve_internal_http(
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
+        let addr = listener.local_addr().ok();
+
         // Try to install the Prometheus recorder.
         // In simulation or test environments running multiple nodes in one process,
         // this might fail if already installed. We proceed gracefully.
@@ -348,8 +394,7 @@ mod internal {
             router = router.route("/metrics", get(move || async move { handle.render() }));
         }
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("internal metrics listening on {addr}");
+        tracing::info!("internal metrics listening on {:?}", addr);
 
         // Background tasks
         let runtime_metrics_join = tokio::spawn(
