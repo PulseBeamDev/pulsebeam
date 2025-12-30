@@ -1,15 +1,16 @@
 pub use bytes::Bytes;
 pub use str0m::Candidate;
 pub use str0m::media::{MediaData, MediaKind, MediaTime};
+use tokio::time::Instant;
 
 pub mod actor;
 pub mod media;
 pub mod signaling;
-// pub mod rt;
 
 pub struct MediaFrame {
     pub ts: MediaTime,
     pub data: Bytes,
+    pub capture_time: Instant,
 }
 
 impl From<MediaData> for MediaFrame {
@@ -17,6 +18,7 @@ impl From<MediaData> for MediaFrame {
         Self {
             ts: value.time,
             data: value.data.into(),
+            capture_time: value.network_time.into(),
         }
     }
 }

@@ -307,7 +307,7 @@ impl AgentActor {
                 Some((mid, frame)) = self.senders.next() => {
                      if let Some(writer) = self.rtc.writer(mid) {
                          let pt = writer.payload_params().nth(0).unwrap().pt();
-                         let _ = writer.write(pt, Instant::now().into(), frame.ts, frame.data);
+                         let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                      }
                 }
             }
@@ -321,10 +321,7 @@ impl AgentActor {
             Event::MediaData(data) => {
                 // Network -> User
                 if let Some(tx) = self.receivers.get(&data.mid) {
-                    let _ = tx.try_send(MediaFrame {
-                        data: Bytes::from(data.data),
-                        ts: data.time,
-                    });
+                    let _ = tx.try_send(data.into());
                 }
             }
 
