@@ -143,6 +143,7 @@ impl AgentBuilder {
             candidate_count += 1;
         }
 
+        let mut maybe_addr = None;
         for ip in local_ips {
             let addr = SocketAddr::new(ip, port);
             let candidate = match Candidate::builder().udp().host(addr).build() {
@@ -153,12 +154,18 @@ impl AgentBuilder {
                 }
             };
             rtc.add_local_candidate(candidate);
+            maybe_addr = Some(addr);
             candidate_count += 1;
         }
 
         if candidate_count == 0 {
             return Err(AgentError::NoCandidates);
         }
+
+        // TODO: map multiple addresses?
+        let Some(addr) = maybe_addr else {
+            return Err(AgentError::NoCandidates);
+        };
 
         let mut sdp = rtc.sdp_api();
         let mut mids = Vec::new();
@@ -194,6 +201,7 @@ impl AgentBuilder {
         let shutdown = Arc::new(Notify::new());
 
         let actor = AgentActor {
+            addr,
             rtc,
             socket,
             buf: vec![0u8; 2048],
@@ -237,6 +245,7 @@ impl Agent {
 }
 
 struct AgentActor {
+    addr: SocketAddr,
     rtc: Rtc,
     socket: UdpSocket,
     buf: Vec<u8>,
@@ -289,7 +298,7 @@ impl AgentActor {
                             Receive {
                                 proto: Protocol::Udp,
                                 source,
-                                destination: self.socket.local_addr().unwrap(),
+                                destination: self.addr,
                                 contents: self.buf[..n].try_into().unwrap(),
                             }
                         ));
