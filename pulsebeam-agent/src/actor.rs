@@ -1,6 +1,5 @@
 use futures_lite::StreamExt;
 use std::collections::HashMap;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +17,13 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::signaling::{HttpSignalingClient, SignalingError};
 use crate::{MediaFrame, TransceiverDirection};
+
+#[cfg(not(feature = "turmoil"))]
+use tokio::net as async_net;
+#[cfg(feature = "turmoil")]
+use turmoil::net as async_net;
+
+use async_net::UdpSocket;
 
 #[derive(Debug)]
 pub struct TrackSender {
@@ -74,14 +80,14 @@ struct TrackRequest {
     simulcast_layers: Option<Vec<SimulcastLayer>>,
 }
 
-pub struct AgentBuilder<S> {
+pub struct AgentBuilder {
     signaling: HttpSignalingClient,
-    udp_socket: S,
+    udp_socket: UdpSocket,
     tracks: Vec<TrackRequest>,
 }
 
-impl<S: UdpSocket> AgentBuilder<S> {
-    pub fn new(signaling: HttpSignalingClient, udp_socket: S) -> AgentBuilder<S> {
+impl AgentBuilder {
+    pub fn new(signaling: HttpSignalingClient, udp_socket: UdpSocket) -> AgentBuilder {
         Self {
             signaling,
             udp_socket,
@@ -225,10 +231,10 @@ impl Agent {
     }
 }
 
-struct AgentActor<S> {
+struct AgentActor {
     addr: SocketAddr,
     rtc: Rtc,
-    socket: S,
+    socket: UdpSocket,
     buf: Vec<u8>,
     event_tx: mpsc::Sender<AgentEvent>,
 
@@ -238,7 +244,7 @@ struct AgentActor<S> {
     shutdown: Arc<Notify>,
 }
 
-impl<S: UdpSocket> AgentActor<S> {
+impl AgentActor {
     async fn run(mut self, medias: Vec<MediaAdded>) {
         for media in medias {
             self.handle_media_added(media);
@@ -352,49 +358,5 @@ impl<S: UdpSocket> AgentActor<S> {
 
     fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.try_send(event);
-    }
-}
-
-pub trait UdpSocket: Send + Sync + 'static {
-    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
-    fn local_addr(&self) -> io::Result<SocketAddr>;
-}
-
-impl UdpSocket for tokio::net::UdpSocket {
-    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.try_send_to(buf, target)
-    }
-
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
-        self.recv_from(buf)
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.local_addr()
-    }
-}
-
-#[cfg(feature = "turmoil")]
-impl UdpSocket for turmoil::net::UdpSocket {
-    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.try_send_to(buf, target)
-    }
-
-    fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
-        self.recv_from(buf)
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.local_addr()
     }
 }
