@@ -22,7 +22,7 @@ pub struct HttpSignalingClient {
 
 impl Default for HttpSignalingClient {
     fn default() -> Self {
-        Self::new(HttpClient::new(), "http://locahost:3000")
+        Self::new(HttpClient::new(), "http://localhost:3000")
     }
 }
 

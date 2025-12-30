@@ -1,6 +1,6 @@
 pub use bytes::Bytes;
 pub use str0m::Candidate;
-pub use str0m::media::{MediaData, MediaTime};
+pub use str0m::media::{MediaData, MediaKind, MediaTime};
 
 pub mod actor;
 pub mod media;
@@ -19,4 +19,9 @@ impl From<MediaData> for MediaFrame {
             data: value.data.into(),
         }
     }
+}
+
+pub enum TransceiverDirection {
+    SendOnly,
+    RecvOnly,
 }

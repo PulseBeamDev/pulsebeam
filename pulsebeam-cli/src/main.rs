@@ -1,5 +1,5 @@
 use pulsebeam_agent::{
-    MediaFrame, MediaTime,
+    MediaFrame, MediaKind, MediaTime, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent},
     media::H264Looper,
     signaling::HttpSignalingClient,
@@ -14,7 +14,11 @@ async fn main() {
     let raw_bytes = include_bytes!("video.h264");
     tracing::info!("joining");
     let signaling = HttpSignalingClient::default();
-    let mut agent = AgentBuilder::new(signaling).join("demo").await.unwrap();
+    let mut agent = AgentBuilder::new(signaling)
+        .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+        .join("demo")
+        .await
+        .unwrap();
     tracing::info!("joined");
 
     while let Some(ev) = agent.next_event().await {

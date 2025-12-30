@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use str0m::media::{Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid, Pt},
@@ -14,8 +15,8 @@ use tokio::sync::{Notify, mpsc};
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::MediaFrame;
 use crate::signaling::{HttpSignalingClient, SignalingError};
+use crate::{MediaFrame, TransceiverDirection};
 
 #[derive(Debug)]
 pub struct TrackSender {
@@ -66,13 +67,10 @@ pub enum AgentError {
     NoCandidates,
 }
 
-// -----------------------------------------------------------------------------
-// Builder
-// -----------------------------------------------------------------------------
-
 struct TrackRequest {
     kind: MediaKind,
-    direction: Direction,
+    direction: TransceiverDirection,
+    simulcast_layers: Option<Vec<SimulcastLayer>>,
 }
 
 pub struct AgentBuilder {
@@ -92,13 +90,22 @@ impl AgentBuilder {
         }
     }
 
-    pub fn with_candidates(mut self, candidates: Vec<Candidate>) -> Self {
-        self.candidates = candidates;
+    pub fn with_candidate(mut self, candidate: Candidate) -> Self {
+        self.candidates.push(candidate);
         self
     }
 
-    pub fn with_track(mut self, kind: MediaKind, direction: Direction) -> Self {
-        self.tracks.push(TrackRequest { kind, direction });
+    pub fn with_track(
+        mut self,
+        kind: MediaKind,
+        direction: TransceiverDirection,
+        simulcast_layers: Option<Vec<SimulcastLayer>>,
+    ) -> Self {
+        self.tracks.push(TrackRequest {
+            kind,
+            direction,
+            simulcast_layers,
+        });
         self
     }
 
@@ -115,12 +122,13 @@ impl AgentBuilder {
         };
         let port = socket.local_addr()?.port();
 
-        tracing::debug!("Discovering local network interfaces...");
         let local_ips: Vec<IpAddr> = if_addrs::get_if_addrs()?
             .into_iter()
             .filter(|i| !i.is_loopback())
             .map(|i| i.ip())
             .collect();
+
+        tracing::info!("Discovered local ips: {:?}", local_ips);
 
         let mut rtc = Rtc::builder()
             .clear_codecs()
@@ -152,8 +160,26 @@ impl AgentBuilder {
         }
 
         let mut sdp = rtc.sdp_api();
-        for t in &self.tracks {
-            sdp.add_media(t.kind, t.direction, None, None, None);
+        let mut mids = Vec::new();
+        for track in self.tracks {
+            let (dir, simulcast) = match track.direction {
+                TransceiverDirection::SendOnly => (
+                    Direction::SendOnly,
+                    track.simulcast_layers.map(|layers| Simulcast {
+                        send: layers,
+                        recv: Vec::new(),
+                    }),
+                ),
+                TransceiverDirection::RecvOnly => (
+                    Direction::RecvOnly,
+                    track.simulcast_layers.map(|layers| Simulcast {
+                        send: Vec::new(),
+                        recv: layers,
+                    }),
+                ),
+            };
+            let mid = sdp.add_media(track.kind, dir, None, None, simulcast);
+            mids.push(mid);
         }
 
         let (offer, pending) = sdp.apply().expect("offer is required");
@@ -297,7 +323,9 @@ impl AgentActor {
             Event::IceConnectionStateChange(state) => {
                 self.emit(AgentEvent::State(state));
             }
-            _ => {}
+            e => {
+                tracing::debug!("unhandled event: {:?}", e);
+            }
         }
     }
 
@@ -308,6 +336,7 @@ impl AgentActor {
             .media(mid)
             .and_then(|m| m.remote_pts().first().copied());
 
+        tracing::info!("new media added: {:?}", media);
         match media.direction {
             Direction::SendOnly => {
                 // User wants to send. We create a channel: User(tx) -> Actor(rx)
