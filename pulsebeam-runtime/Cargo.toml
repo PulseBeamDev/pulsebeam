@@ -18,6 +18,7 @@ harness = false
 [features]
 default = []
 loom = ["dep:loom"]
+turmoil = ["dep:turmoil"]
 
 [dependencies]
 thiserror = { workspace = true }

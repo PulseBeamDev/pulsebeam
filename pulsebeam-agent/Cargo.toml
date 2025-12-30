@@ -9,7 +9,8 @@ documentation.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# [features]
+[features]
+turmoil = ["dep:turmoil"]
 # default = ["ffmpeg-static"]
 #
 # # Force static linking (default)
