@@ -1,9 +1,9 @@
-use bytes::Bytes;
 use futures_lite::StreamExt;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use str0m::bwe::Bitrate;
 use str0m::media::{Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
@@ -128,6 +128,7 @@ impl AgentBuilder {
             .clear_codecs()
             .enable_h264(true)
             .enable_opus(true)
+            .enable_bwe(Some(Bitrate::kbps(2000)))
             .build();
 
         let mut candidate_count = 0;
