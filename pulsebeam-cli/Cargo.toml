@@ -10,3 +10,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+pulsebeam-agent = { version = "0.1.0", path = "../pulsebeam-agent" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
