@@ -10,3 +10,5 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+proptest = "1.9.0"
+test-strategy = "0.4.3"
