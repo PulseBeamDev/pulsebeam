@@ -77,7 +77,6 @@ struct TrackRequest {
 pub struct AgentBuilder {
     signaling: HttpSignalingClient,
     udp_socket: Option<UdpSocket>,
-    candidates: Vec<Candidate>,
     tracks: Vec<TrackRequest>,
 }
 
@@ -86,14 +85,8 @@ impl AgentBuilder {
         Self {
             signaling,
             udp_socket: None,
-            candidates: Vec::new(),
             tracks: Vec::new(),
         }
-    }
-
-    pub fn with_candidate(mut self, candidate: Candidate) -> Self {
-        self.candidates.push(candidate);
-        self
     }
 
     pub fn with_track(
@@ -138,11 +131,6 @@ impl AgentBuilder {
             .build();
 
         let mut candidate_count = 0;
-        for c in self.candidates {
-            rtc.add_local_candidate(c);
-            candidate_count += 1;
-        }
-
         let mut maybe_addr = None;
         for ip in local_ips {
             let addr = SocketAddr::new(ip, port);
