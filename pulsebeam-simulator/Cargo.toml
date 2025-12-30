@@ -10,6 +10,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+turmoil.workspace = true
 proptest = "1.9.0"
+pulsebeam-agent = { version = "0.1.0", path = "../pulsebeam-agent", features = ["turmoil"] }
 test-strategy = "0.4.3"
-turmoil = "0.7.0"

@@ -2595,6 +2595,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "turmoil",
 ]
 
 [[package]]
@@ -2641,6 +2642,7 @@ name = "pulsebeam-simulator"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "pulsebeam-agent",
  "test-strategy",
  "turmoil",
 ]

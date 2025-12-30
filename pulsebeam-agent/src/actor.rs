@@ -1,5 +1,6 @@
 use futures_lite::StreamExt;
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,6 @@ use str0m::{
     media::{Direction, MediaAdded, MediaKind, Mid, Pt},
     net::{Protocol, Receive},
 };
-use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
@@ -74,17 +74,17 @@ struct TrackRequest {
     simulcast_layers: Option<Vec<SimulcastLayer>>,
 }
 
-pub struct AgentBuilder {
+pub struct AgentBuilder<S> {
     signaling: HttpSignalingClient,
-    udp_socket: Option<UdpSocket>,
+    udp_socket: S,
     tracks: Vec<TrackRequest>,
 }
 
-impl AgentBuilder {
-    pub fn new(signaling: HttpSignalingClient) -> Self {
+impl<S: UdpSocket> AgentBuilder<S> {
+    pub fn new(signaling: HttpSignalingClient, udp_socket: S) -> AgentBuilder<S> {
         Self {
             signaling,
-            udp_socket: None,
+            udp_socket,
             tracks: Vec::new(),
         }
     }
@@ -103,18 +103,8 @@ impl AgentBuilder {
         self
     }
 
-    pub fn with_udp_socket(mut self, socket: UdpSocket) -> Self {
-        self.udp_socket = Some(socket);
-        self
-    }
-
     pub async fn join(mut self, room_id: &str) -> Result<Agent, AgentError> {
-        let socket = if let Some(socket) = self.udp_socket {
-            socket
-        } else {
-            UdpSocket::bind("0.0.0.0:0").await?
-        };
-        let port = socket.local_addr()?.port();
+        let port = self.udp_socket.local_addr()?.port();
 
         let local_ips: Vec<IpAddr> = if_addrs::get_if_addrs()?
             .into_iter()
@@ -198,7 +188,7 @@ impl AgentBuilder {
         let actor = AgentActor {
             addr,
             rtc,
-            socket,
+            socket: self.udp_socket,
             buf: vec![0u8; 2048],
             event_tx,
             senders: StreamMap::new(),
@@ -225,10 +215,6 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn builder(signaling: HttpSignalingClient) -> AgentBuilder {
-        AgentBuilder::new(signaling)
-    }
-
     pub async fn next_event(&mut self) -> Option<AgentEvent> {
         self.events.recv().await
     }
@@ -239,10 +225,10 @@ impl Agent {
     }
 }
 
-struct AgentActor {
+struct AgentActor<S> {
     addr: SocketAddr,
     rtc: Rtc,
-    socket: UdpSocket,
+    socket: S,
     buf: Vec<u8>,
     event_tx: mpsc::Sender<AgentEvent>,
 
@@ -252,7 +238,7 @@ struct AgentActor {
     shutdown: Arc<Notify>,
 }
 
-impl AgentActor {
+impl<S: UdpSocket> AgentActor<S> {
     async fn run(mut self, medias: Vec<MediaAdded>) {
         for media in medias {
             self.handle_media_added(media);
@@ -366,5 +352,49 @@ impl AgentActor {
 
     fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.try_send(event);
+    }
+}
+
+pub trait UdpSocket: Send + Sync + 'static {
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+impl UdpSocket for tokio::net::UdpSocket {
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.try_send_to(buf, target)
+    }
+
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
+        self.recv_from(buf)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
+    }
+}
+
+#[cfg(feature = "turmoil")]
+impl UdpSocket for turmoil::net::UdpSocket {
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.try_send_to(buf, target)
+    }
+
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
+        self.recv_from(buf)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
     }
 }

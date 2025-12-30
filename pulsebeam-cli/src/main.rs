@@ -5,6 +5,7 @@ use pulsebeam_agent::{
     signaling::HttpSignalingClient,
 };
 use std::time::Duration;
+use tokio::net::UdpSocket;
 
 const RAW_H264: &[u8] = include_bytes!("video.h264");
 
@@ -13,7 +14,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let signaling = HttpSignalingClient::default();
-    let mut agent = AgentBuilder::new(signaling)
+    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let mut agent = AgentBuilder::new(signaling, socket)
         .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
         .join("demo")
         .await
