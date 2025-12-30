@@ -156,7 +156,7 @@ impl AgentBuilder {
         };
 
         let mut sdp = rtc.sdp_api();
-        let mut mids = Vec::new();
+        let mut medias = Vec::new();
         for track in self.tracks {
             let (dir, simulcast) = match track.direction {
                 TransceiverDirection::SendOnly => (
@@ -174,8 +174,14 @@ impl AgentBuilder {
                     }),
                 ),
             };
-            let mid = sdp.add_media(track.kind, dir, None, None, simulcast);
-            mids.push(mid);
+            let mid = sdp.add_media(track.kind, dir, None, None, simulcast.clone());
+            // TODO: why do we need to emit manually here?
+            medias.push(MediaAdded {
+                mid,
+                kind: track.kind,
+                direction: dir,
+                simulcast,
+            });
         }
 
         let (offer, pending) = sdp.apply().expect("offer is required");
@@ -200,7 +206,7 @@ impl AgentBuilder {
         };
 
         tokio::spawn(async move {
-            actor.run().await;
+            actor.run(medias).await;
         });
 
         Ok(Agent {
@@ -246,7 +252,11 @@ struct AgentActor {
 }
 
 impl AgentActor {
-    async fn run(mut self) {
+    async fn run(mut self, medias: Vec<MediaAdded>) {
+        for media in medias {
+            self.handle_media_added(media);
+        }
+
         loop {
             let timeout = loop {
                 match self.rtc.poll_output() {
