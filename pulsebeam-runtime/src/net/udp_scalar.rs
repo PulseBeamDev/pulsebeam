@@ -5,9 +5,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use turmoil::net::UdpSocket;
+use pulsebeam_core::net::UdpSocket;
 
-use crate::net::{RecvPacketBatch, SendPacketBatch, Transport};
+use crate::net::{RecvPacketBatch, SendPacketBatch, Transport, UdpMode};
 
 pub async fn bind(
     addr: SocketAddr,
@@ -29,7 +29,7 @@ pub async fn bind(
 }
 
 pub struct UdpTransportReader {
-    sock: Arc<turmoil::net::UdpSocket>,
+    sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
 }
 
@@ -54,7 +54,7 @@ impl UdpTransportReader {
         match self.sock.try_recv_from(&mut buf) {
             Ok((n, source)) => {
                 out.push(RecvPacketBatch {
-                    transport: Transport::Udp,
+                    transport: Transport::Udp(UdpMode::Batch),
                     src: source,
                     dst: self.local_addr,
                     buf: Bytes::from(buf).slice(..n),
@@ -71,7 +71,7 @@ impl UdpTransportReader {
 
 #[derive(Clone)]
 pub struct UdpTransportWriter {
-    sock: Arc<turmoil::net::UdpSocket>,
+    sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
 }
 

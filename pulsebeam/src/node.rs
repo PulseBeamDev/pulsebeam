@@ -316,7 +316,12 @@ async fn bind_udp_workers(
     let mut writers = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let (reader, writer) = match net::bind(local_addr, net::Transport::Udp, external_addr).await
+        let (reader, writer) = match net::bind(
+            local_addr,
+            net::Transport::Udp(net::UdpMode::Batch),
+            external_addr,
+        )
+        .await
         {
             Ok(s) => s,
             Err(e) if writers.is_empty() => {

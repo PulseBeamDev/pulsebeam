@@ -2609,6 +2609,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-core"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "pulsebeam-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2625,6 +2633,7 @@ dependencies = [
  "metrics",
  "once_cell",
  "parking_lot",
+ "pulsebeam-core",
  "quinn-udp",
  "rand 0.9.2",
  "socket2",
@@ -2634,7 +2643,6 @@ dependencies = [
  "tokio-metrics",
  "tokio-util",
  "tracing",
- "turmoil",
 ]
 
 [[package]]

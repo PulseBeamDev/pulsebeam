@@ -1,0 +1,17 @@
+[package]
+name = "pulsebeam-core"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+sim = ["dep:turmoil"]
+
+[dependencies]
+turmoil = { workspace = true, optional = true }
+tokio = { workspace = true }

@@ -18,7 +18,6 @@ harness = false
 [features]
 default = []
 loom = ["dep:loom"]
-sim = ["dep:turmoil"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -27,7 +26,6 @@ tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 futures-lite = { workspace = true }
-turmoil = { workspace = true, optional = true }
 
 quinn-udp = "0.5.14"
 socket2 = "0.6.1"
@@ -42,6 +40,7 @@ dashmap = "6.1.0"
 async-channel = "2.5.0"
 tokio-util = "0.7.17"
 systemstat = "0.2.5"
+pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core" }
 
 [dev-dependencies]
 criterion = { version = "0.8.1", features = ["async", "async_tokio"] }

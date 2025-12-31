@@ -84,7 +84,7 @@ impl ParticipantCore {
     pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) -> Option<Instant> {
         let mut last_deadline = None;
         let transport = match batch.transport {
-            Transport::Udp => str0m::net::Protocol::Udp,
+            Transport::Udp(_) => str0m::net::Protocol::Udp,
             Transport::Tcp => str0m::net::Protocol::Tcp,
             _ => str0m::net::Protocol::Udp,
         };
