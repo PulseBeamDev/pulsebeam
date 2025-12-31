@@ -4,8 +4,8 @@ use pulsebeam_agent::{
     media::H264Looper,
     signaling::HttpSignalingClient,
 };
+use pulsebeam_core::net::UdpSocket;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 
 const RAW_H264: &[u8] = include_bytes!("video.h264");
 

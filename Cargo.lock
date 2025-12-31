@@ -2589,13 +2589,13 @@ dependencies = [
  "if-addrs",
  "maybe-async",
  "metrics",
+ "pulsebeam-core",
  "reqwest",
  "str0m",
  "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
  "tracing",
- "turmoil",
 ]
 
 [[package]]
@@ -2603,6 +2603,7 @@ name = "pulsebeam-cli"
 version = "0.1.0"
 dependencies = [
  "pulsebeam-agent",
+ "pulsebeam-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2653,6 +2654,7 @@ dependencies = [
  "proptest",
  "pulsebeam",
  "pulsebeam-agent",
+ "pulsebeam-core",
  "pulsebeam-runtime",
  "test-strategy",
  "tokio",

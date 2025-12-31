@@ -25,6 +25,10 @@ mod sim {
             Ok(Self(inner))
         }
 
+        pub async fn accept(&self) -> io::Result<(TurmoilStream, SocketAddr)> {
+            self.0.accept().await
+        }
+
         pub fn local_addr(&self) -> io::Result<SocketAddr> {
             self.0.local_addr()
         }
