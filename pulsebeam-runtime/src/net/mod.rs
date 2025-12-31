@@ -1,5 +1,11 @@
 pub mod tcp;
+
+#[cfg(feature = "turmoil")]
+pub mod sim_udp;
+#[cfg(not(feature = "turmoil"))]
 pub mod udp;
+#[cfg(feature = "turmoil")]
+use sim_udp as udp;
 
 use bytes::Bytes;
 use std::{io, net::SocketAddr};
@@ -78,7 +84,7 @@ pub async fn bind(
 ) -> io::Result<(UnifiedSocketReader, UnifiedSocketWriter)> {
     let socks = match transport {
         Transport::Udp => {
-            let (reader, writer) = udp::bind(addr, external_addr)?;
+            let (reader, writer) = udp::bind(addr, external_addr).await?;
             (
                 UnifiedSocketReader::Udp(Box::new(reader)),
                 UnifiedSocketWriter::Udp(writer),

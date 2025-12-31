@@ -15,7 +15,7 @@ pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
 // per-client-pacer handles the latency bloat. But, big enough for keyframe bursts to many subscribers
 pub const SOCKET_SEND_SIZE: usize = 32 * BATCH_SIZE * CHUNK_SIZE;
 
-pub fn bind(
+pub async fn bind(
     addr: SocketAddr,
     external_addr: Option<SocketAddr>,
 ) -> io::Result<(UdpTransportReader, UdpTransportWriter)> {
