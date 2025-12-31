@@ -11,7 +11,7 @@ authors.workspace = true
 
 [features]
 default = []
-turmoil = ["dep:turmoil"]
+sim = ["dep:turmoil"]
 # default = ["ffmpeg-static"]
 #
 # # Force static linking (default)
@@ -26,9 +26,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 str0m = { workspace = true }
 bytes = { workspace = true }
-tokio = { workspace = true }
 turmoil = { workspace = true, optional = true }
 
+tokio = { workspace = true }
 metrics = "0.24.3"
 reqwest = "0.12.26"
 maybe-async = "0.2.10"

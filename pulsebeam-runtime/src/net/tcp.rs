@@ -11,9 +11,9 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(not(feature = "turmoil"))]
+#[cfg(not(feature = "sim"))]
 use tokio::net as async_net;
-#[cfg(feature = "turmoil")]
+#[cfg(feature = "sim")]
 use turmoil::net as async_net;
 
 use async_net::{TcpListener, TcpStream};

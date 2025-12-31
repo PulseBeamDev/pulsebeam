@@ -10,6 +10,10 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+sim = ["dep:turmoil"]
+
 [dependencies]
 anyhow = { workspace = true }
 futures-lite = { workspace = true }
@@ -21,6 +25,7 @@ str0m = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true } 
 tokio-util.workspace = true
+turmoil = { workspace = true, optional = true }
 
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8.7", features = ["macros"] }
@@ -49,7 +54,6 @@ jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 aws-lc-rs = { version = "1.15.2" }
 
 [dev-dependencies]
-turmoil = "0.7.0"
 more-asserts = { workspace = true } 
 
 [build-dependencies]

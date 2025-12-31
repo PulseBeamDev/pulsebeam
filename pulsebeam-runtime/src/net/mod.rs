@@ -1,10 +1,10 @@
 pub mod tcp;
 
-#[cfg(feature = "turmoil")]
+#[cfg(feature = "sim")]
 pub mod sim_udp;
-#[cfg(not(feature = "turmoil"))]
+#[cfg(not(feature = "sim"))]
 pub mod udp;
-#[cfg(feature = "turmoil")]
+#[cfg(feature = "sim")]
 use sim_udp as udp;
 
 use bytes::Bytes;

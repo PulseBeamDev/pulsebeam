@@ -10,6 +10,3 @@ pub mod proto;
 pub mod room;
 pub mod rtp;
 pub mod track;
-
-#[cfg(test)]
-pub mod test_utils;

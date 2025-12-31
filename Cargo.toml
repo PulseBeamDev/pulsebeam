@@ -30,7 +30,7 @@ lto = "thin"
 anyhow = "1"
 serde = { version = "1", features = ["derive"]}
 thiserror = "2.0"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7.17"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 futures-lite = "2.6.1"
@@ -58,4 +58,11 @@ members = [
   "pulsebeam-cli",
   "pulsebeam-runtime",
   "pulsebeam-simulator",
+]
+
+default-members = [
+  "pulsebeam", 
+  "pulsebeam-agent", 
+  "pulsebeam-cli",
+  "pulsebeam-runtime",
 ]

@@ -18,9 +18,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::signaling::{HttpSignalingClient, SignalingError};
 use crate::{MediaFrame, TransceiverDirection};
 
-#[cfg(not(feature = "turmoil"))]
+#[cfg(not(feature = "sim"))]
 use tokio::net as async_net;
-#[cfg(feature = "turmoil")]
+#[cfg(feature = "sim")]
 use turmoil::net as async_net;
 
 use async_net::UdpSocket;
