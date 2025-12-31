@@ -9,13 +9,14 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[dependencies]
+[dev-dependencies]
 tokio.workspace = true
 tokio-util.workspace = true
 turmoil.workspace = true
 
-proptest = "1.9.0"
 pulsebeam = { version = "0.3.1", path = "../pulsebeam" }
 pulsebeam-runtime = { version = "0.1.0", path = "../pulsebeam-runtime", features = ["turmoil"] }
 pulsebeam-agent = { version = "0.1.0", path = "../pulsebeam-agent", features = ["turmoil"] }
+
+proptest = "1.9.0"
 test-strategy = "0.4.3"

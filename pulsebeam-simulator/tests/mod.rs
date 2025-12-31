@@ -1,4 +1,5 @@
-use pulsebeam_simulator::add;
+mod common;
+
 use test_strategy::{Arbitrary, proptest};
 
 #[derive(Arbitrary, Debug)]
@@ -12,5 +13,5 @@ struct TestInputStruct {
 
 #[proptest]
 fn my_test(input: TestInputStruct) {
-    assert_eq!(add(input.a, input.b), input.a + input.b);
+    assert_eq!(common::add(input.a, input.b), input.a + input.b);
 }
