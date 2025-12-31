@@ -1,30 +1,45 @@
-use std::io::Result;
-use std::net::SocketAddr;
 #[cfg(not(feature = "sim"))]
-use tokio::net;
+pub use tokio::net::UdpSocket;
 #[cfg(feature = "sim")]
-use turmoil::net;
+pub use turmoil::net::UdpSocket;
 
-pub use net::*;
+#[cfg(not(feature = "sim"))]
+pub use tokio::net::{TcpListener, TcpStream};
 
-// pub trait UdpSocket: Send + Sync + 'static {
-//     fn local_addr(&self) -> Result<SocketAddr>;
-//     fn recv_from(&self, buf: &mut [u8])
-//     -> impl Future<Output = Result<(usize, SocketAddr)>> + Send;
-//     fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize>;
-// }
-//
-// #[cfg(feature = "sim")]
-// impl UdpSocket for net::UdpSocket {
-//     fn local_addr(&self) -> Result<SocketAddr> {
-//         self.local_addr()
-//     }
-//
-//     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-//         self.recv_from(buf).await
-//     }
-//
-//     fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize> {
-//         self.try_send_to(buf, target)
-//     }
-// }
+#[cfg(feature = "sim")]
+pub use sim::{TurmoilListener as TcpListener, TurmoilStream as TcpStream};
+
+#[cfg(feature = "sim")]
+mod sim {
+    use axum::serve::Listener;
+    use std::io;
+    use std::net::SocketAddr;
+    use turmoil::net::TcpListener as InnerListener;
+
+    pub type TurmoilStream = turmoil::net::TcpStream;
+    pub struct TurmoilListener(InnerListener);
+
+    impl TurmoilListener {
+        pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+            let inner = InnerListener::bind(addr).await?;
+            Ok(Self(inner))
+        }
+
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.0.local_addr()
+        }
+    }
+
+    impl Listener for TurmoilListener {
+        type Io = TurmoilStream;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            self.0.accept().await.unwrap()
+        }
+
+        fn local_addr(&self) -> io::Result<Self::Addr> {
+            self.0.local_addr()
+        }
+    }
+}

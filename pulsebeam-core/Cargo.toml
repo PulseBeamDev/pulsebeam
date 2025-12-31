@@ -10,8 +10,9 @@ license.workspace = true
 
 [features]
 default = []
-sim = ["dep:turmoil"]
+sim = ["dep:turmoil", "dep:axum"]
 
 [dependencies]
 turmoil = { workspace = true, optional = true }
+axum = { version = "^0.8", optional = true }
 tokio = { workspace = true }
