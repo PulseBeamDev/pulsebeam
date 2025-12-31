@@ -30,8 +30,8 @@ mod turmoil_listener {
 
         type Addr = SocketAddr;
 
-        fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
-            async move { self.0.accept().await.unwrap() }
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            self.0.accept().await.unwrap()
         }
 
         fn local_addr(&self) -> tokio::io::Result<Self::Addr> {
