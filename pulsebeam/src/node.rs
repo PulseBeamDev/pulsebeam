@@ -1,5 +1,6 @@
 use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
+use axum::serve::Listener;
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
@@ -8,10 +9,36 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+#[cfg(not(feature = "sim"))]
+use tokio::net::TcpListener;
+#[cfg(feature = "sim")]
+use turmoil::net::TcpListener;
+
+#[cfg(feature = "sim")]
+mod turmoil_listener {
+    use std::net::SocketAddr;
+
+    use axum::serve::Listener;
+    pub struct TurmoilListener(pub turmoil::net::TcpListener);
+
+    impl Listener for TurmoilListener {
+        type Io = turmoil::net::TcpStream;
+
+        type Addr = SocketAddr;
+
+        fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+            async move { self.0.accept().await.unwrap() }
+        }
+
+        fn local_addr(&self) -> tokio::io::Result<Self::Addr> {
+            self.0.local_addr()
+        }
+    }
+}
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -141,7 +168,6 @@ impl NodeBuilder {
             .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
         let external_addr = self.external_addr;
 
-        // 1. Prepare Transports
         let (udp_readers, udp_writers) = match self.udp_transports {
             Some(pairs) => unzip_transports(pairs),
             None => bind_udp_workers(local_addr, external_addr, workers_count).await?,
@@ -155,10 +181,8 @@ impl NodeBuilder {
         let mut all_readers = udp_readers;
         all_readers.push(tcp_reader);
 
-        // 2. Prepare Context Data
         let rng = self.rng.unwrap_or_else(rand::Rng::from_os_rng);
 
-        // 3. Spawn Gateway
         let mut join_set = JoinSet::new();
 
         let gateway_handle = if let Some(handle) = self.gateway_handle {
@@ -172,7 +196,6 @@ impl NodeBuilder {
             handle
         };
 
-        // 4. Build NodeContext
         let node_ctx = NodeContext {
             rng,
             gateway: gateway_handle.clone(),
@@ -181,14 +204,12 @@ impl NodeBuilder {
             udp_egress_counter: Arc::new(AtomicUsize::new(0)),
         };
 
-        // 5. Spawn Controller
         let controller_actor =
             controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
         let (controller_handle, controller_task) =
             actor::prepare(controller_actor, RunnerConfig::default());
         join_set.spawn(ignore(controller_task));
 
-        // 6. Optional HTTP API
         if let Some(source) = self.http_api {
             // Resolve listener
             let listener = match source {
@@ -197,6 +218,9 @@ impl NodeBuilder {
                 }
                 ListenerSource::PreBound(l) => l,
             };
+
+            #[cfg(feature = "sim")]
+            let listener = turmoil_listener::TurmoilListener(listener);
 
             let local_addr = listener.local_addr().ok();
             tracing::debug!("signaling api listening on {:?}", local_addr);
@@ -231,7 +255,6 @@ impl NodeBuilder {
             });
         }
 
-        // 7. Optional Internal Metrics
         if let Some(source) = self.internal_metrics {
             let listener = match source {
                 ListenerSource::Bind(addr) => TcpListener::bind(addr)
@@ -362,6 +385,8 @@ mod internal {
         shutdown: CancellationToken,
     ) -> Result<()> {
         let addr = listener.local_addr().ok();
+        #[cfg(feature = "sim")]
+        let listener = turmoil_listener::TurmoilListener(listener);
 
         // Try to install the Prometheus recorder.
         // In simulation or test environments running multiple nodes in one process,
