@@ -1,4 +1,4 @@
-use http::Method;
+use http::{Method, Uri};
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest};
 use str0m::{
     change::{SdpAnswer, SdpOffer},
@@ -20,7 +20,6 @@ pub enum SignalingError {
 pub struct HttpSignalingClient {
     http_client: Box<dyn AsyncHttpClient>,
     base_url: String,
-    resource_url: Option<String>,
 }
 
 impl HttpSignalingClient {
@@ -28,15 +27,14 @@ impl HttpSignalingClient {
         Self {
             http_client,
             base_url: base_url.into(),
-            resource_url: None,
         }
     }
 
     pub async fn join(
-        &mut self,
+        &self,
         room_id: &str,
         offer: SdpOffer,
-    ) -> Result<SdpAnswer, SignalingError> {
+    ) -> Result<(SdpAnswer, Option<Uri>), SignalingError> {
         let uri = format!("{}/api/v1/rooms/{}", self.base_url, room_id);
         tracing::info!(%uri, "Sending SDP Offer");
 
@@ -55,27 +53,27 @@ impl HttpSignalingClient {
             )));
         }
 
-        if let Some(loc) = res.headers().get("Location")
+        let resource_uri = if let Some(loc) = res.headers().get("Location")
             && let Ok(loc_str) = loc.to_str()
         {
-            self.resource_url = Some(loc_str.to_string());
-        }
+            Some(loc_str.parse()?)
+        } else {
+            None
+        };
 
         let body_bytes = res.into_body();
         let answer_str = String::from_utf8(body_bytes)
             .map_err(|e| SignalingError::Protocol(format!("Invalid UTF-8 response: {}", e)))?;
         let answer = SdpAnswer::from_sdp_string(&answer_str)?;
-        Ok(answer)
+        Ok((answer, resource_uri))
     }
 
-    pub async fn leave(&mut self) -> Result<(), SignalingError> {
-        if let Some(url) = self.resource_url.take() {
-            tracing::info!(url, "Cleaning up remote session");
-            let mut req = HttpRequest::new(vec![]);
-            *req.uri_mut() = url.parse()?;
-            *req.method_mut() = Method::DELETE;
-            self.http_client.execute(req).await?;
-        }
+    pub async fn leave(&self, resource_uri: Uri) -> Result<(), SignalingError> {
+        tracing::info!(%resource_uri, "Cleaning up remote session");
+        let mut req = HttpRequest::new(vec![]);
+        *req.uri_mut() = resource_uri;
+        *req.method_mut() = Method::DELETE;
+        self.http_client.execute(req).await?;
 
         Ok(())
     }

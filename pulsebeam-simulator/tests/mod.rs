@@ -45,7 +45,8 @@ fn my_test(_input: TestInputStruct) {
         use pulsebeam_core::net::UdpSocket;
 
         let client = common::create_http_client();
-        let signaling = HttpSignalingClient::new(client, format!("http://{}:3000", server_ip));
+        let server_base_uri = format!("http://{}:3000", server_ip);
+        let signaling = HttpSignalingClient::new(client, server_base_uri);
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let mut agent = AgentBuilder::new(signaling, socket)
             .with_local_ip(client_ip.parse()?)

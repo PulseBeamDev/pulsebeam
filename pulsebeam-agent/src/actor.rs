@@ -1,6 +1,7 @@
 use crate::signaling::{HttpSignalingClient, SignalingError};
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
+use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -185,7 +186,7 @@ impl AgentBuilder {
         }
 
         let (offer, pending) = sdp.apply().expect("offer is required");
-        let answer = self.signaling.join(room_id, offer).await?;
+        let (answer, resource_uri) = self.signaling.join(room_id, offer).await?;
 
         rtc.sdp_api()
             .accept_answer(pending, answer)
@@ -211,6 +212,7 @@ impl AgentBuilder {
         });
 
         Ok(Agent {
+            resource_uri,
             signaling: self.signaling,
             events: event_rx,
             _shutdown: shutdown,
@@ -219,6 +221,7 @@ impl AgentBuilder {
 }
 
 pub struct Agent {
+    resource_uri: Option<Uri>,
     signaling: HttpSignalingClient,
     events: mpsc::Receiver<AgentEvent>,
     _shutdown: Arc<Notify>,
@@ -231,7 +234,9 @@ impl Agent {
 
     pub async fn leave(&mut self) {
         self._shutdown.notify_waiters();
-        self.signaling.leave().await;
+        if let Some(resource_uri) = self.resource_uri.take() {
+            self.signaling.leave(resource_uri).await;
+        }
     }
 }
 
