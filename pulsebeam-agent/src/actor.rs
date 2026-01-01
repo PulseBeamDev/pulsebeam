@@ -232,11 +232,13 @@ impl Agent {
         self.events.recv().await
     }
 
-    pub async fn leave(&mut self) {
+    pub async fn leave(&mut self) -> Result<(), AgentError> {
         self._shutdown.notify_waiters();
         if let Some(resource_uri) = self.resource_uri.take() {
-            self.signaling.leave(resource_uri).await;
+            self.signaling.leave(resource_uri).await?;
         }
+
+        Ok(())
     }
 }
 

@@ -1,11 +1,13 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use pulsebeam_agent::media::H264Looper;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::sync::Once;
 use tracing_subscriber::EnvFilter;
 
 static INIT: Once = Once::new();
+const RAW_H264: &[u8] = include_bytes!("video.h264");
 
 pub fn setup_tracing() {
     INIT.call_once(|| {
@@ -23,6 +25,10 @@ pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
     let client = Client::builder(TokioExecutor::new()).build(connector::connector());
     let client = HyperClientWrapper(client);
     Box::new(client)
+}
+
+pub fn create_h264_looper(fps: u32) -> H264Looper {
+    H264Looper::new(RAW_H264, fps)
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

@@ -1,33 +1,58 @@
+use std::time::Duration;
+
 use bytes::Bytes;
+use str0m::media::MediaTime;
+
+use crate::{MediaFrame, actor::TrackSender};
 
 pub struct H264Looper {
     frames: Vec<Bytes>,
     index: usize,
+    fps: u32,
 }
 
 impl H264Looper {
-    pub fn new(data: &[u8]) -> Self {
+    pub fn new(data: &[u8], fps: u32) -> Self {
         let slicer = H264FrameSlicer::new(data);
         let frames: Vec<Bytes> = slicer.map(Bytes::copy_from_slice).collect();
         tracing::info!(
             "H264Looper: found {} complete frames (Access Units)",
             frames.len()
         );
-        Self { frames, index: 0 }
-    }
-}
-
-impl Iterator for H264Looper {
-    type Item = Bytes;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.frames.is_empty() {
-            return None;
+        Self {
+            frames,
+            index: 0,
+            fps,
         }
+    }
 
+    fn next(&mut self) -> Bytes {
         let frame = &self.frames[self.index];
         self.index = (self.index + 1) % self.frames.len();
-        Some(frame.clone())
+        frame.clone()
+    }
+
+    /// creates a task that pumps frames into the provided sender
+    pub async fn run(mut self, sender: TrackSender) {
+        let clock_rate = 90_000;
+        let frame_duration_ticks = clock_rate / self.fps;
+        let interval_ms = 1_000 / self.fps;
+
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms as u64));
+        let mut current_ts: u64 = 0;
+
+        loop {
+            let now = ticker.tick().await;
+            let frame_data = self.next();
+            let frame = MediaFrame {
+                ts: MediaTime::from_90khz(current_ts),
+                data: frame_data,
+                capture_time: now,
+            };
+
+            sender.try_send(frame);
+            current_ts += frame_duration_ticks as u64;
+        }
     }
 }
 
