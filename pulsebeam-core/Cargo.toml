@@ -12,9 +12,23 @@ authors.workspace = true
 
 [features]
 default = []
-sim = ["dep:turmoil", "dep:axum"]
+sim = [
+    "dep:turmoil",
+    "dep:axum",
+    "dep:tower",
+    "dep:http",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:pin-project-lite"
+]
 
 [dependencies]
-turmoil = { workspace = true, optional = true }
-axum = { version = "^0.8", optional = true }
 tokio = { workspace = true }
+
+axum = { version = "^0.8", optional = true }
+tower = { version = "^0.5", optional = true }
+http = { version = "^1", optional = true }
+hyper = { version = "1.8.1", optional = true }
+hyper-util = { version = "0.1.19", optional = true }
+pin-project-lite = { version = "0.2.16", optional = true }
+turmoil = { workspace = true, optional = true }

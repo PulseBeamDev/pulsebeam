@@ -13,6 +13,7 @@ license.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 turmoil.workspace = true
+tracing.workspace = true
 
 pulsebeam = { version = "0.3.1", path = "../pulsebeam" }
 pulsebeam-runtime = { version = "0.1.0", path = "../pulsebeam-runtime" }
@@ -21,3 +22,5 @@ pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core", features = ["s
 
 proptest = "1.9.0"
 test-strategy = "0.4.3"
+reqwest = "0.13.1"
+hyper-util = "0.1.19"

@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use axum::serve::Listener;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor::RunnerConfig;
+use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
 use std::future::Future;
@@ -33,8 +34,7 @@ pub struct NodeBuilder {
 
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
-    udp_transports: Option<Vec<TransportPair>>,
-    tcp_transport: Option<TransportPair>,
+    udp_mode: UdpMode,
     gateway_handle: Option<gateway::GatewayHandle>,
 
     // Services
@@ -55,8 +55,7 @@ impl NodeBuilder {
             local_addr: None,
             external_addr: None,
             rng: None,
-            udp_transports: None,
-            tcp_transport: None,
+            udp_mode: UdpMode::Batch,
             gateway_handle: None,
             http_api: None,
             internal_metrics: None,
@@ -88,17 +87,9 @@ impl NodeBuilder {
         self
     }
 
-    /// Inject pre-created UDP transports.
-    /// If provided, socket binding logic is skipped for UDP.
-    pub fn with_udp_transports(mut self, transports: Vec<TransportPair>) -> Self {
-        self.udp_transports = Some(transports);
-        self
-    }
-
-    /// Inject a pre-created TCP transport.
-    /// If provided, socket binding logic is skipped for TCP.
-    pub fn with_tcp_transport(mut self, transport: TransportPair) -> Self {
-        self.tcp_transport = Some(transport);
+    /// Set either scalar or batch mode. Default to batch.
+    pub fn with_udp_mode(mut self, mode: UdpMode) -> Self {
+        self.udp_mode = mode;
         self
     }
 
@@ -142,15 +133,11 @@ impl NodeBuilder {
             .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
         let external_addr = self.external_addr;
 
-        let (udp_readers, udp_writers) = match self.udp_transports {
-            Some(pairs) => unzip_transports(pairs),
-            None => bind_udp_workers(local_addr, external_addr, workers_count).await?,
-        };
+        let (udp_readers, udp_writers) =
+            bind_udp_workers(local_addr, external_addr, workers_count, self.udp_mode).await?;
 
-        let (tcp_reader, tcp_writer) = match self.tcp_transport {
-            Some((r, w)) => (r, w),
-            None => net::bind(local_addr, net::Transport::Tcp, external_addr).await?,
-        };
+        let (tcp_reader, tcp_writer) =
+            net::bind(local_addr, net::Transport::Tcp, external_addr).await?;
 
         let mut all_readers = udp_readers;
         all_readers.push(tcp_reader);
@@ -282,17 +269,14 @@ async fn bind_udp_workers(
     local_addr: SocketAddr,
     external_addr: Option<SocketAddr>,
     workers: usize,
+    mode: UdpMode,
 ) -> Result<(Vec<net::UnifiedSocketReader>, Vec<net::UnifiedSocketWriter>)> {
     let mut readers = Vec::with_capacity(workers);
     let mut writers = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let (reader, writer) = match net::bind(
-            local_addr,
-            net::Transport::Udp(net::UdpMode::Batch),
-            external_addr,
-        )
-        .await
+        let (reader, writer) = match net::bind(local_addr, net::Transport::Udp(mode), external_addr)
+            .await
         {
             Ok(s) => s,
             Err(e) if writers.is_empty() => {
