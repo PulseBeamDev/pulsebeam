@@ -52,14 +52,15 @@ pub type HttpRequest = http::Request<Vec<u8>>;
 pub type HttpResponse = Result<http::Response<Vec<u8>>, HttpError>;
 pub type HttpError = Box<dyn std::error::Error + Send + Sync>;
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type HttpResult<'a> = BoxFuture<'a, HttpResponse>;
 
 pub trait AsyncHttpClient: Send + Sync {
-    fn execute(&self, req: HttpRequest) -> BoxFuture<'_, HttpResponse>;
+    fn execute(&self, req: HttpRequest) -> HttpResult<'_>;
 }
 
 #[cfg(feature = "reqwest")]
 impl AsyncHttpClient for reqwest::Client {
-    fn execute(&self, req: HttpRequest) -> BoxFuture<'_, HttpResponse> {
+    fn execute(&self, req: HttpRequest) -> HttpResult<'_> {
         let client = self.clone();
         Box::pin(async move {
             let reqwest_req = req.try_into().map_err(|e| Box::new(e) as HttpError)?;

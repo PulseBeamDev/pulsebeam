@@ -42,21 +42,18 @@ fn my_test(input: TestInputStruct) {
     });
 
     sim.client("client", async move {
-        // use pulsebeam_agent::actor::AgentBuilder;
-        // use pulsebeam_agent::signaling::HttpSignalingClient;
-        // use pulsebeam_agent::{MediaKind, TransceiverDirection};
-        // use pulsebeam_core::net::UdpSocket;
-        //
-        // Client::builder()
-        //     .connector_layer(TurmoilLayer)
-        //     .build()
-        //     .expect("Failed to build simulated reqwest client");
-        // let signaling = HttpSignalingClient::new(client, "http://localhost:3000");
-        // let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        // let mut agent = AgentBuilder::new(signaling, socket)
-        //     .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-        //     .join("demo")
-        //     .await;
+        use pulsebeam_agent::actor::AgentBuilder;
+        use pulsebeam_agent::signaling::HttpSignalingClient;
+        use pulsebeam_agent::{MediaKind, TransceiverDirection};
+        use pulsebeam_core::net::UdpSocket;
+
+        let client = common::create_http_client();
+        let signaling = HttpSignalingClient::new(client, "http://localhost:3000");
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let mut agent = AgentBuilder::new(signaling, socket)
+            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+            .join("demo")
+            .await;
         Ok(())
     });
 }

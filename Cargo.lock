@@ -2561,12 +2561,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http",
- "hyper",
- "hyper-util",
- "pin-project-lite",
  "reqwest",
  "tokio",
- "tower",
  "turmoil",
 ]
 
@@ -2603,8 +2599,12 @@ dependencies = [
 name = "pulsebeam-simulator"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "http",
+ "http-body-util",
+ "hyper",
  "hyper-util",
+ "pin-project-lite",
  "proptest",
  "pulsebeam",
  "pulsebeam-agent",

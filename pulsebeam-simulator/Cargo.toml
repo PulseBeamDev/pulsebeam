@@ -23,6 +23,11 @@ pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core", features = ["s
 proptest = "1.9.0"
 test-strategy = "0.4.3"
 reqwest = "0.13.1"
-hyper-util = "0.1.19"
 tower = { version = "0.5.2", features = ["util"] }
 http = "1.4.0"
+
+pin-project-lite = "0.2.16"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
+http-body-util = "0.1" # Crucial for .collect().await
+bytes = "1"
