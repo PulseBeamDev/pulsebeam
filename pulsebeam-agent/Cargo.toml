@@ -11,7 +11,6 @@ authors.workspace = true
 
 [features]
 default = []
-sim = ["dep:turmoil"]
 # default = ["ffmpeg-static"]
 #
 # # Force static linking (default)
@@ -26,7 +25,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 str0m = { workspace = true }
 bytes = { workspace = true }
-turmoil = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 metrics = "0.24.3"
@@ -35,6 +33,7 @@ maybe-async = "0.2.10"
 http = "1.4.0"
 tokio-stream = "0.1.17"
 if-addrs = "0.14.0"
+pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core" }
 
 # FFmpeg integration
 # ffmpeg-next = { version = "8.0.0", default-features = false, features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }

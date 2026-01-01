@@ -21,12 +21,19 @@ dev:
 	$(CARGO_CMD) run -p pulsebeam -- --dev
 
 build:
-	$(CARGO_CMD) build --profile profiling -p pulsebeam
+	$(CARGO_CMD) build
 
 release:
 	$(CARGO_CMD) build --verbose --release -p pulsebeam
 
-profile: build
+profile:
+	$(CARGO_CMD) build --profile profiling -p pulsebeam
+
+test-all:
+	cargo test --workspace --exclude pulsebeam-simulator
+
+test-sim:
+	cargo test -p pulsebeam-simulator
 
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam

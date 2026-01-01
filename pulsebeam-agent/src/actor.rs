@@ -1,4 +1,7 @@
+use crate::signaling::{HttpSignalingClient, SignalingError};
+use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
+use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -14,16 +17,6 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
-
-use crate::signaling::{HttpSignalingClient, SignalingError};
-use crate::{MediaFrame, TransceiverDirection};
-
-#[cfg(not(feature = "sim"))]
-use tokio::net as async_net;
-#[cfg(feature = "sim")]
-use turmoil::net as async_net;
-
-use async_net::UdpSocket;
 
 #[derive(Debug)]
 pub struct TrackSender {

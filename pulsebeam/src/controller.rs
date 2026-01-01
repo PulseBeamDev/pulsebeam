@@ -8,12 +8,7 @@ use crate::{
 };
 use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
 use pulsebeam_runtime::{net::Transport, prelude::*};
-use str0m::{
-    Candidate, RtcConfig, RtcError,
-    change::SdpOffer,
-    error::SdpError,
-    net::{Protocol, TcpType},
-};
+use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError, net::TcpType};
 use tokio::{sync::oneshot, task::JoinSet};
 
 #[derive(thiserror::Error, Debug)]
@@ -181,7 +176,7 @@ impl ControllerActor {
         let sockets = [&udp_egress, &tcp_egress];
         for s in sockets {
             let candidate = match s.transport() {
-                Transport::Udp => Candidate::builder()
+                Transport::Udp(_) => Candidate::builder()
                     .udp()
                     .host(s.local_addr())
                     .build()

@@ -1,4 +1,4 @@
-use crate::net::Transport;
+use crate::net::{Transport, UdpMode};
 
 use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
 use bytes::Bytes;
@@ -142,7 +142,7 @@ impl UdpTransportReader {
                             buf,
                             stride: m.stride,
                             len: m.len,
-                            transport: Transport::Udp,
+                            transport: Transport::Udp(UdpMode::Scalar),
                         });
                     }
                     Ok(())

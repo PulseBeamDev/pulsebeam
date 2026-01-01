@@ -1,6 +1,7 @@
 use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
 use axum::serve::Listener;
+use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
@@ -12,33 +13,6 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-
-#[cfg(not(feature = "sim"))]
-use tokio::net::TcpListener;
-#[cfg(feature = "sim")]
-use turmoil::net::TcpListener;
-
-#[cfg(feature = "sim")]
-mod turmoil_listener {
-    use std::net::SocketAddr;
-
-    use axum::serve::Listener;
-    pub struct TurmoilListener(pub turmoil::net::TcpListener);
-
-    impl Listener for TurmoilListener {
-        type Io = turmoil::net::TcpStream;
-
-        type Addr = SocketAddr;
-
-        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-            self.0.accept().await.unwrap()
-        }
-
-        fn local_addr(&self) -> tokio::io::Result<Self::Addr> {
-            self.0.local_addr()
-        }
-    }
-}
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -219,9 +193,6 @@ impl NodeBuilder {
                 ListenerSource::PreBound(l) => l,
             };
 
-            #[cfg(feature = "sim")]
-            let listener = turmoil_listener::TurmoilListener(listener);
-
             let local_addr = listener.local_addr().ok();
             tracing::debug!("signaling api listening on {:?}", local_addr);
 
@@ -316,7 +287,12 @@ async fn bind_udp_workers(
     let mut writers = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let (reader, writer) = match net::bind(local_addr, net::Transport::Udp, external_addr).await
+        let (reader, writer) = match net::bind(
+            local_addr,
+            net::Transport::Udp(net::UdpMode::Batch),
+            external_addr,
+        )
+        .await
         {
             Ok(s) => s,
             Err(e) if writers.is_empty() => {
@@ -385,8 +361,6 @@ mod internal {
         shutdown: CancellationToken,
     ) -> Result<()> {
         let addr = listener.local_addr().ok();
-        #[cfg(feature = "sim")]
-        let listener = turmoil_listener::TurmoilListener(listener);
 
         // Try to install the Prometheus recorder.
         // In simulation or test environments running multiple nodes in one process,

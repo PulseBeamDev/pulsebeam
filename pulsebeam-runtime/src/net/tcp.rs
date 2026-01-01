@@ -2,6 +2,7 @@ use super::{BATCH_SIZE, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
+use pulsebeam_core::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::{
     io,
@@ -10,13 +11,6 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-
-#[cfg(not(feature = "sim"))]
-use tokio::net as async_net;
-#[cfg(feature = "sim")]
-use turmoil::net as async_net;
-
-use async_net::{TcpListener, TcpStream};
 
 const MAX_FRAME_SIZE: usize = 1500;
 const MAX_CONNECTIONS: usize = 10_000;

@@ -1,11 +1,6 @@
 pub mod tcp;
-
-#[cfg(feature = "sim")]
-pub mod sim_udp;
-#[cfg(not(feature = "sim"))]
 pub mod udp;
-#[cfg(feature = "sim")]
-use sim_udp as udp;
+pub mod udp_scalar;
 
 use bytes::Bytes;
 use std::{io, net::SocketAddr};
@@ -14,8 +9,16 @@ pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UdpMode {
+    /// Standard `send_to` (Low latency, lower throughput)
+    Scalar,
+    /// Batch `sendmmsg`/GSO (Higher throughput, slight buffering latency)
+    Batch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
-    Udp,
+    Udp(UdpMode),
     Tcp,
 }
 
@@ -83,11 +86,18 @@ pub async fn bind(
     external_addr: Option<SocketAddr>,
 ) -> io::Result<(UnifiedSocketReader, UnifiedSocketWriter)> {
     let socks = match transport {
-        Transport::Udp => {
+        Transport::Udp(UdpMode::Batch) => {
             let (reader, writer) = udp::bind(addr, external_addr).await?;
             (
                 UnifiedSocketReader::Udp(Box::new(reader)),
                 UnifiedSocketWriter::Udp(writer),
+            )
+        }
+        Transport::Udp(UdpMode::Scalar) => {
+            let (reader, writer) = udp_scalar::bind(addr, external_addr).await?;
+            (
+                UnifiedSocketReader::UdpScalar(reader),
+                UnifiedSocketWriter::UdpScalar(writer),
             )
         }
         Transport::Tcp => {
@@ -103,6 +113,7 @@ pub async fn bind(
 }
 pub enum UnifiedSocketReader {
     Udp(Box<udp::UdpTransportReader>),
+    UdpScalar(udp_scalar::UdpTransportReader),
     Tcp(tcp::TcpTransportReader),
 }
 
@@ -111,12 +122,14 @@ impl UnifiedSocketReader {
         match self {
             Self::Tcp(inner) => inner.close_peer(peer_addr),
             Self::Udp(_) => {}
+            Self::UdpScalar(_) => {}
         }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
+            Self::UdpScalar(inner) => inner.local_addr(),
             Self::Tcp(inner) => inner.local_addr(),
         }
     }
@@ -125,6 +138,7 @@ impl UnifiedSocketReader {
     pub async fn readable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.readable().await,
+            Self::UdpScalar(inner) => inner.readable().await,
             Self::Tcp(inner) => inner.readable().await,
         }
     }
@@ -133,6 +147,7 @@ impl UnifiedSocketReader {
     pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(packets),
+            Self::UdpScalar(inner) => inner.try_recv_batch(packets),
             Self::Tcp(inner) => inner.try_recv_batch(packets),
         }
     }
@@ -141,6 +156,7 @@ impl UnifiedSocketReader {
 #[derive(Clone)]
 pub enum UnifiedSocketWriter {
     Udp(udp::UdpTransportWriter),
+    UdpScalar(udp_scalar::UdpTransportWriter),
     Tcp(tcp::TcpTransportWriter),
 }
 
@@ -148,6 +164,7 @@ impl UnifiedSocketWriter {
     pub fn max_gso_segments(&self) -> usize {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
+            Self::UdpScalar(inner) => inner.max_gso_segments(),
             Self::Tcp(inner) => inner.max_gso_segments(),
         }
     }
@@ -156,6 +173,7 @@ impl UnifiedSocketWriter {
     pub async fn writable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.writable().await,
+            Self::UdpScalar(inner) => inner.writable().await,
             Self::Tcp(inner) => inner.writable().await,
         }
     }
@@ -164,13 +182,15 @@ impl UnifiedSocketWriter {
     pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
+            Self::UdpScalar(inner) => inner.try_send_batch(batch),
             Self::Tcp(inner) => inner.try_send_batch(batch),
         }
     }
 
     pub fn transport(&self) -> Transport {
         match self {
-            Self::Udp(_) => Transport::Udp,
+            Self::Udp(_) => Transport::Udp(UdpMode::Batch),
+            Self::UdpScalar(_) => Transport::Udp(UdpMode::Scalar),
             Self::Tcp(_) => Transport::Tcp,
         }
     }
@@ -178,6 +198,7 @@ impl UnifiedSocketWriter {
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Udp(inner) => inner.local_addr(),
+            Self::UdpScalar(inner) => inner.local_addr(),
             Self::Tcp(inner) => inner.local_addr(),
         }
     }
