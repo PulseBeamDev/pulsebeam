@@ -28,7 +28,7 @@ bytes = { workspace = true }
 
 tokio = { workspace = true }
 metrics = "0.24.3"
-reqwest = "0.12.26"
+reqwest = "0.13.1"
 maybe-async = "0.2.10"
 http = "1.4.0"
 tokio-stream = "0.1.17"
