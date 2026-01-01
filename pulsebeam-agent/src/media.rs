@@ -74,7 +74,7 @@ impl<'a> H264FrameSlicer<'a> {
     }
 
     /// Determines if a NALU is the start of a brand new Access Unit (Frame).
-    fn is_new_access_unit(&self, nalu_type: u8, nalu_start: usize, nalu_end: usize) -> bool {
+    fn is_new_access_unit(&self, nalu_type: u8, nalu_start: usize, _nalu_end: usize) -> bool {
         match nalu_type {
             // AUD (9), SPS (7), PPS (8), SEI (6)
             // These always precede the VCL slices of a new frame.

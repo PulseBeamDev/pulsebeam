@@ -2,9 +2,21 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
+use std::sync::Once;
+use tracing_subscriber::EnvFilter;
 
-pub fn add(a: u32, b: u32) -> u32 {
-    a + b
+static INIT: Once = Once::new();
+
+pub fn setup_tracing() {
+    INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .with_ansi(false)
+            .init();
+    });
 }
 
 pub fn create_http_client() -> Box<dyn AsyncHttpClient> {

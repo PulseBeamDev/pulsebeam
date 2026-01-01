@@ -5,7 +5,7 @@ use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use str0m::IceConnectionState;
 use str0m::bwe::Bitrate;
 use str0m::media::{Simulcast, SimulcastLayer};
 use str0m::{
@@ -51,7 +51,7 @@ impl TrackReceiver {
 pub enum AgentEvent {
     SenderAdded(TrackSender),
     ReceiverAdded(TrackReceiver),
-    State(str0m::IceConnectionState),
+    Connected,
     Disconnected(String),
 }
 
@@ -77,6 +77,7 @@ pub struct AgentBuilder {
     signaling: HttpSignalingClient,
     udp_socket: UdpSocket,
     tracks: Vec<TrackRequest>,
+    local_ips: Vec<IpAddr>,
 }
 
 impl AgentBuilder {
@@ -85,6 +86,7 @@ impl AgentBuilder {
             signaling,
             udp_socket,
             tracks: Vec::new(),
+            local_ips: Vec::new(),
         }
     }
 
@@ -102,16 +104,24 @@ impl AgentBuilder {
         self
     }
 
+    pub fn with_local_ip(mut self, ip: IpAddr) -> Self {
+        self.local_ips.push(ip);
+        self
+    }
+
     pub async fn join(mut self, room_id: &str) -> Result<Agent, AgentError> {
         let port = self.udp_socket.local_addr()?.port();
 
-        let local_ips: Vec<IpAddr> = if_addrs::get_if_addrs()?
-            .into_iter()
-            .filter(|i| !i.is_loopback())
-            .map(|i| i.ip())
-            .collect();
+        if self.local_ips.is_empty() {
+            self.local_ips.extend(
+                if_addrs::get_if_addrs()?
+                    .into_iter()
+                    .filter(|i| !i.is_loopback())
+                    .map(|i| i.ip()),
+            )
+        }
 
-        tracing::info!("Discovered local ips: {:?}", local_ips);
+        tracing::info!("local ips: {:?}", self.local_ips);
 
         let mut rtc = Rtc::builder()
             .clear_codecs()
@@ -122,7 +132,7 @@ impl AgentBuilder {
 
         let mut candidate_count = 0;
         let mut maybe_addr = None;
-        for ip in local_ips {
+        for ip in self.local_ips {
             let addr = SocketAddr::new(ip, port);
             let candidate = match Candidate::builder().udp().host(addr).build() {
                 Ok(candidate) => candidate,
@@ -193,6 +203,7 @@ impl AgentBuilder {
             senders: StreamMap::new(),
             receivers: HashMap::new(),
             shutdown: shutdown.clone(),
+            disconnected_reason: None,
         };
 
         tokio::spawn(async move {
@@ -235,6 +246,7 @@ struct AgentActor {
     receivers: HashMap<Mid, mpsc::Sender<MediaFrame>>,
 
     shutdown: Arc<Notify>,
+    disconnected_reason: Option<String>,
 }
 
 impl AgentActor {
@@ -243,32 +255,14 @@ impl AgentActor {
             self.handle_media_added(media);
         }
 
-        loop {
-            let timeout = loop {
-                match self.rtc.poll_output() {
-                    Ok(Output::Transmit(tx)) => {
-                        let _ = self.socket.try_send_to(&tx.contents, tx.destination);
-                    }
-                    Ok(Output::Event(e)) => self.handle_rtc_event(e),
-                    Ok(Output::Timeout(t)) => break t,
-                    Err(e) => {
-                        self.emit(AgentEvent::Disconnected(format!("RTC Error: {:?}", e)));
-                        return;
-                    }
-                }
-            };
-
-            let duration = timeout
-                .checked_duration_since(Instant::now().into())
-                .unwrap_or(Duration::ZERO);
-
+        while let Some(deadline) = self.poll_rtc() {
             tokio::select! {
                 _ = self.shutdown.notified() => {
                     let _ = self.rtc.disconnect();
                     return;
                 }
 
-                _ = tokio::time::sleep(duration) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                          return;
@@ -300,22 +294,47 @@ impl AgentActor {
         }
     }
 
-    fn handle_rtc_event(&mut self, event: Event) {
-        match event {
-            Event::MediaAdded(media) => self.handle_media_added(media),
-
-            Event::MediaData(data) => {
-                // Network -> User
-                if let Some(tx) = self.receivers.get(&data.mid) {
-                    let _ = tx.try_send(data.into());
+    fn poll_rtc(&mut self) -> Option<Instant> {
+        loop {
+            match self.rtc.poll_output() {
+                Ok(Output::Transmit(tx)) => {
+                    let _ = self.socket.try_send_to(&tx.contents, tx.destination);
                 }
-            }
+                Ok(Output::Event(e)) => {
+                    match e {
+                        Event::MediaAdded(media) => self.handle_media_added(media),
 
-            Event::IceConnectionStateChange(state) => {
-                self.emit(AgentEvent::State(state));
-            }
-            e => {
-                tracing::debug!("unhandled event: {:?}", e);
+                        Event::MediaData(data) => {
+                            // Network -> User
+                            if let Some(tx) = self.receivers.get(&data.mid) {
+                                let _ = tx.try_send(data.into());
+                            }
+                        }
+
+                        Event::IceConnectionStateChange(state) => {
+                            tracing::info!("connection state changed: {:?}", state);
+                            if state == IceConnectionState::Disconnected {
+                                let reason = self
+                                    .disconnected_reason
+                                    .clone()
+                                    .unwrap_or("unknown reason".to_string());
+                                self.emit(AgentEvent::Disconnected(reason));
+                                return None;
+                            }
+                        }
+                        Event::Connected => {
+                            self.emit(AgentEvent::Connected);
+                        }
+                        e => {
+                            tracing::debug!("unhandled event: {:?}", e);
+                        }
+                    }
+                }
+                Ok(Output::Timeout(t)) => return Some(t.into()),
+                Err(e) => {
+                    self.disconnected_reason = Some(format!("RTC Error: {:?}", e));
+                    self.rtc.disconnect();
+                }
             }
         }
     }
