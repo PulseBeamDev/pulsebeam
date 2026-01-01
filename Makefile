@@ -42,16 +42,16 @@ perf: profile
 	taskset -c 2-5 perf record --call-graph dwarf $(BINARY)
 	hotspot perf.data
 
-deps: brew-deps cargo-deps
+deps: deps-brew deps-cargo gh-deps
 
-brew-deps:
+deps-brew:
 	brew install git-cliff axodotdev/tap/cargo-dist
 
-cargo-deps:
+deps-cargo:
 	$(CARGO_CMD) install cargo-release cargo-dist git-cliff
 	$(CARGO_CMD) install flamegraph cargo-machete
 
-gh-deps:
+deps-gh:
 	gh extension install yusukebe/gh-markdown-preview
 
 preview-markdown:
@@ -60,6 +60,9 @@ preview-markdown:
 clean:
 	$(CARGO_CMD) clean
 	rm -f perf.data flamegraph.svg
+
+chore-release:
+	cargo release
 
 unused:
 	cargo machete
