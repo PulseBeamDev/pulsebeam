@@ -235,9 +235,9 @@ dependencies = [
 
 [[package]]
 name = "axum"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b098575ebe77cb6d14fc7f32749631a6e44edbef6b796f89b020e99ba20d425"
+checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
  "axum-core",
  "axum-macros",
@@ -288,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "axum-extra"
-version = "0.12.2"
+version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbfe9f610fe4e99cf0cfcd03ccf8c63c28c616fe714d80475ef731f3b13dd21b"
+checksum = "fef252edff26ddba56bbcdf2ee3307b8129acb86f5749b68990c168a6fcc9c76"
 dependencies = [
  "axum",
  "axum-core",
@@ -3362,7 +3362,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "str0m"
 version = "0.14.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
 dependencies = [
  "combine",
  "crc",
@@ -3380,7 +3380,7 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -3390,7 +3390,7 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
 dependencies = [
  "base64ct",
  "dimpl",
@@ -3400,7 +3400,7 @@ dependencies = [
 [[package]]
 name = "str0m-wincrypto"
 version = "0.3.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#c0e1f49c54902c81ad5545c783b6ce173a0bb597"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
 dependencies = [
  "str0m-proto",
  "tracing",
@@ -3834,9 +3834,9 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tracing"
-version = "0.1.43"
+version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d15d90a0b5c19378952d479dc858407149d7bb45a14de0142f6c534b16fc647"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "log",
  "pin-project-lite",
@@ -3857,9 +3857,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-core"
-version = "0.1.35"
+version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a04e24fab5c89c6a36eb8558c9656f30d81de51dfa4d3b45f26b21d61fa0a6c"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
