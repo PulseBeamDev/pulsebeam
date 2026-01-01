@@ -1,7 +1,5 @@
 # `pulsebeam-simulator`
 
-**STATUS: PLANNED - NOT YET IMPLEMENTED**
-
 Deterministic integration testing for the `pulsebeam` SFU and `pulsebeam-agent`.
 
 ## Purpose
@@ -43,16 +41,16 @@ The plan is to run the entire system (SFU and all agents) in-memory on a single 
 
 ## Core Mechanics (The Plan)
 
--   **`tokio-turmoil`:** We will use `tokio-turmoil` to provide a deterministic `tokio` runtime. It will replace the real scheduler, clock, and network with virtual counterparts.
--   **Simulated Clock:** Time will only advance when the simulation allows it. `tokio::time::sleep` will pause a task until the simulation clock has advanced enough. This will eliminate timing-related race conditions.
--   **Simulated Network:** All network calls (`TcpListener`, `UdpSocket`, etc.) will be intercepted. Packets will be routed through an in-memory buffer, not the OS network stack.
+- **`tokio-turmoil`:** We will use `tokio-turmoil` to provide a deterministic `tokio` runtime. It will replace the real scheduler, clock, and network with virtual counterparts.
+- **Simulated Clock:** Time will only advance when the simulation allows it. `tokio::time::sleep` will pause a task until the simulation clock has advanced enough. This will eliminate timing-related race conditions.
+- **Simulated Network:** All network calls (`TcpListener`, `UdpSocket`, etc.) will be intercepted. Packets will be routed through an in-memory buffer, not the OS network stack.
 
 ## Developer Benefits (The Goal)
 
--   **Reproducible Failures:** A failing test will fail **identically every time**. The logs and execution trace will be the same, making debugging trivial.
--   **Safe Refactoring:** We will be able to refactor complex concurrent logic with high confidence. If the simulations pass, the change is likely correct.
--   **Test Critical Edge Cases:** We will be able to reliably script and test scenarios like two clients publishing at the exact same logical time.
--   **Fast Execution:** The entire test suite will run in-memory and complete in seconds.
+- **Reproducible Failures:** A failing test will fail **identically every time**. The logs and execution trace will be the same, making debugging trivial.
+- **Safe Refactoring:** We will be able to refactor complex concurrent logic with high confidence. If the simulations pass, the change is likely correct.
+- **Test Critical Edge Cases:** We will be able to reliably script and test scenarios like two clients publishing at the exact same logical time.
+- **Fast Execution:** The entire test suite will run in-memory and complete in seconds.
 
 ## Current Status & Next Steps
 
