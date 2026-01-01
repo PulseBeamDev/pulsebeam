@@ -142,7 +142,7 @@ impl UdpTransportReader {
                             buf,
                             stride: m.stride,
                             len: m.len,
-                            transport: Transport::Udp(UdpMode::Scalar),
+                            transport: Transport::Udp(UdpMode::Batch),
                         });
                     }
                     Ok(())

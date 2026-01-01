@@ -54,7 +54,7 @@ impl UdpTransportReader {
         match self.sock.try_recv_from(&mut buf) {
             Ok((n, source)) => {
                 out.push(RecvPacketBatch {
-                    transport: Transport::Udp(UdpMode::Batch),
+                    transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
                     buf: Bytes::from(buf).slice(..n),
