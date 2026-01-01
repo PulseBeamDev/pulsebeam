@@ -60,10 +60,3 @@ members = [
   "pulsebeam-runtime",
   "pulsebeam-simulator",
 ]
-
-# default-members = [
-#   "pulsebeam", 
-#   "pulsebeam-agent", 
-#   "pulsebeam-cli",
-#   "pulsebeam-runtime",
-# ]

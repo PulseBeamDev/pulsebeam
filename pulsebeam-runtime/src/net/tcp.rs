@@ -317,7 +317,7 @@ fn handle_new_connection(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
     use std::time::Duration;
