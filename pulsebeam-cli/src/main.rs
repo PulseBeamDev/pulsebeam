@@ -17,7 +17,7 @@ async fn main() {
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let mut agent = AgentBuilder::new(signaling, socket)
         .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-        .join("demo")
+        .connect("demo")
         .await
         .unwrap();
 

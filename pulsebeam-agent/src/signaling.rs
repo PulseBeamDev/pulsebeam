@@ -30,7 +30,7 @@ impl HttpSignalingClient {
         }
     }
 
-    pub async fn join(
+    pub async fn connect(
         &self,
         room_id: &str,
         offer: SdpOffer,
@@ -68,7 +68,7 @@ impl HttpSignalingClient {
         Ok((answer, resource_uri))
     }
 
-    pub async fn leave(&self, resource_uri: Uri) -> Result<(), SignalingError> {
+    pub async fn disconnect(&self, resource_uri: Uri) -> Result<(), SignalingError> {
         tracing::info!(%resource_uri, "Cleaning up remote session");
         let mut req = HttpRequest::new(vec![]);
         *req.uri_mut() = resource_uri;

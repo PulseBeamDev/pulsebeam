@@ -8,6 +8,7 @@ use pulsebeam_core::net::UdpSocket;
 use pulsebeam_runtime::net::UdpMode;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::time::Duration;
 use test_strategy::{Arbitrary, proptest};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -56,7 +57,7 @@ fn my_test(_input: TestInputStruct) {
         let mut agent = AgentBuilder::new(signaling, socket)
             .with_local_ip(receiver_ip)
             .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .join("demo")
+            .connect("demo")
             .await?;
 
         while let Some(event) = agent.next_event().await {
@@ -84,9 +85,10 @@ fn my_test(_input: TestInputStruct) {
         let mut agent = AgentBuilder::new(signaling, socket)
             .with_local_ip(sender_ip)
             .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-            .join("demo")
+            .connect("demo")
             .await?;
         let mut join_set = JoinSet::new();
+        let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -102,6 +104,10 @@ fn my_test(_input: TestInputStruct) {
                         }
                         _ => {}
                     }
+                }
+                _ = stats_interval.tick() => {
+                    let stats = agent.get_stats().await;
+                    tracing::info!("sender stats: {:?}", stats);
                 }
                 _ = sender_token.cancelled() => {
                     break;

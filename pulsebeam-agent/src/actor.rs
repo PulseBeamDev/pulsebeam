@@ -5,19 +5,31 @@ use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::bwe::Bitrate;
-use str0m::media::{Simulcast, SimulcastLayer};
+use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid, Pt},
     net::{Protocol, Receive},
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
+
+#[derive(Debug, Default, Clone)]
+pub struct AgentStats {
+    pub peer: Option<str0m::stats::PeerStats>,
+    pub tracks: HashMap<Mid, TrackStats>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TrackStats {
+    pub rx_layers: HashMap<Option<Rid>, str0m::stats::MediaIngressStats>,
+    pub tx_layers: HashMap<Option<Rid>, str0m::stats::MediaEgressStats>,
+}
 
 #[derive(Debug)]
 pub struct TrackSender {
@@ -110,7 +122,7 @@ impl AgentBuilder {
         self
     }
 
-    pub async fn join(mut self, room_id: &str) -> Result<Agent, AgentError> {
+    pub async fn connect(mut self, room_id: &str) -> Result<Agent, AgentError> {
         let port = self.udp_socket.local_addr()?.port();
 
         if self.local_ips.is_empty() {
@@ -129,6 +141,7 @@ impl AgentBuilder {
             .enable_h264(true)
             .enable_opus(true)
             .enable_bwe(Some(Bitrate::kbps(2000)))
+            .set_stats_interval(Some(Duration::from_millis(200)))
             .build();
 
         let mut candidate_count = 0;
@@ -186,24 +199,25 @@ impl AgentBuilder {
         }
 
         let (offer, pending) = sdp.apply().expect("offer is required");
-        let (answer, resource_uri) = self.signaling.join(room_id, offer).await?;
+        let (answer, resource_uri) = self.signaling.connect(room_id, offer).await?;
 
         rtc.sdp_api()
             .accept_answer(pending, answer)
             .map_err(AgentError::Rtc)?;
 
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
         let (event_tx, event_rx) = mpsc::channel(100);
-        let shutdown = Arc::new(Notify::new());
 
         let actor = AgentActor {
             addr,
             rtc,
+            stats: AgentStats::default(),
             socket: self.udp_socket,
             buf: vec![0u8; 2048],
+            cmd_rx,
             event_tx,
             senders: StreamMap::new(),
             receivers: HashMap::new(),
-            shutdown: shutdown.clone(),
             disconnected_reason: None,
         };
 
@@ -214,28 +228,40 @@ impl AgentBuilder {
         Ok(Agent {
             resource_uri,
             signaling: self.signaling,
-            events: event_rx,
-            _shutdown: shutdown,
+            cmd_tx,
+            event_rx,
         })
     }
+}
+
+enum AgentCommand {
+    Disconnect,
+    GetStats(oneshot::Sender<AgentStats>),
 }
 
 pub struct Agent {
     resource_uri: Option<Uri>,
     signaling: HttpSignalingClient,
-    events: mpsc::Receiver<AgentEvent>,
-    _shutdown: Arc<Notify>,
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    event_rx: mpsc::Receiver<AgentEvent>,
 }
 
 impl Agent {
     pub async fn next_event(&mut self) -> Option<AgentEvent> {
-        self.events.recv().await
+        self.event_rx.recv().await
     }
 
-    pub async fn leave(&mut self) -> Result<(), AgentError> {
-        self._shutdown.notify_waiters();
+    pub async fn get_stats(&self) -> Option<AgentStats> {
+        let (stats_tx, stats_rx) = oneshot::channel();
+        self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
+
+        stats_rx.await.ok()
+    }
+
+    pub async fn disconnect(&mut self) -> Result<(), AgentError> {
+        let _ = self.cmd_tx.send(AgentCommand::Disconnect).await;
         if let Some(resource_uri) = self.resource_uri.take() {
-            self.signaling.leave(resource_uri).await?;
+            self.signaling.disconnect(resource_uri).await?;
         }
 
         Ok(())
@@ -247,12 +273,13 @@ struct AgentActor {
     rtc: Rtc,
     socket: UdpSocket,
     buf: Vec<u8>,
+    stats: AgentStats,
+    cmd_rx: mpsc::Receiver<AgentCommand>,
     event_tx: mpsc::Sender<AgentEvent>,
 
     senders: StreamMap<Mid, ReceiverStream<MediaFrame>>,
     receivers: HashMap<Mid, mpsc::Sender<MediaFrame>>,
 
-    shutdown: Arc<Notify>,
     disconnected_reason: Option<String>,
 }
 
@@ -264,11 +291,9 @@ impl AgentActor {
 
         while let Some(deadline) = self.poll_rtc() {
             tokio::select! {
-                _ = self.shutdown.notified() => {
-                    let _ = self.rtc.disconnect();
-                    return;
+                Some(cmd) = self.cmd_rx.recv() => {
+                    self.handle_command(cmd)
                 }
-
                 _ = tokio::time::sleep_until(deadline) => {
                     if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
@@ -332,6 +357,17 @@ impl AgentActor {
                         Event::Connected => {
                             self.emit(AgentEvent::Connected);
                         }
+                        Event::PeerStats(stats) => {
+                            self.stats.peer = Some(stats);
+                        }
+                        Event::MediaIngressStats(stats) => {
+                            let track_stats = self.stats.tracks.entry(stats.mid).or_default();
+                            track_stats.rx_layers.insert(stats.rid, stats);
+                        }
+                        Event::MediaEgressStats(stats) => {
+                            let track_stats = self.stats.tracks.entry(stats.mid).or_default();
+                            track_stats.tx_layers.insert(stats.rid, stats);
+                        }
                         e => {
                             tracing::debug!("unhandled event: {:?}", e);
                         }
@@ -371,6 +407,15 @@ impl AgentActor {
             }
             dir => {
                 tracing::warn!("{} transceiver direction is not supported", dir);
+            }
+        }
+    }
+
+    fn handle_command(&mut self, cmd: AgentCommand) {
+        match cmd {
+            AgentCommand::Disconnect => self.rtc.disconnect(),
+            AgentCommand::GetStats(stats_tx) => {
+                let _ = stats_tx.send(self.stats.clone());
             }
         }
     }
