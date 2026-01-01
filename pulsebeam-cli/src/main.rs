@@ -13,7 +13,8 @@ const RAW_H264: &[u8] = include_bytes!("video.h264");
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let signaling = HttpSignalingClient::default();
+    let http_client = Box::new(reqwest::Client::new());
+    let signaling = HttpSignalingClient::new(http_client, "http://localhost:3000");
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let mut agent = AgentBuilder::new(signaling, socket)
         .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)

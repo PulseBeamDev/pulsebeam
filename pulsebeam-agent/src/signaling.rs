@@ -1,4 +1,5 @@
-use reqwest::Client as HttpClient;
+use http::Method;
+use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest};
 use str0m::{
     change::{SdpAnswer, SdpOffer},
     error::SdpError,
@@ -7,7 +8,9 @@ use str0m::{
 #[derive(thiserror::Error, Debug)]
 pub enum SignalingError {
     #[error("Http request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] HttpError),
+    #[error("Invalid uri: {0}")]
+    InvalidUri(#[from] http::uri::InvalidUri),
     #[error("Protocol error: {0}")]
     Protocol(String),
     #[error("SDP error: {0}")]
@@ -15,19 +18,13 @@ pub enum SignalingError {
 }
 
 pub struct HttpSignalingClient {
-    http_client: HttpClient,
+    http_client: Box<dyn AsyncHttpClient>,
     base_url: String,
     resource_url: Option<String>,
 }
 
-impl Default for HttpSignalingClient {
-    fn default() -> Self {
-        Self::new(HttpClient::new(), "http://localhost:3000")
-    }
-}
-
 impl HttpSignalingClient {
-    pub fn new(http_client: HttpClient, base_url: impl Into<String>) -> Self {
+    pub fn new(http_client: Box<dyn AsyncHttpClient>, base_url: impl Into<String>) -> Self {
         Self {
             http_client,
             base_url: base_url.into(),
@@ -43,14 +40,14 @@ impl HttpSignalingClient {
         let uri = format!("{}/api/v1/rooms/{}", self.base_url, room_id);
         tracing::info!(%uri, "Sending SDP Offer");
 
-        let res = self
-            .http_client
-            .post(&uri)
-            .header("Content-Type", "application/sdp")
-            .body(offer.to_sdp_string())
-            .send()
-            .await?;
+        let raw_body = offer.to_sdp_string().into_bytes();
+        let mut req = HttpRequest::new(raw_body);
+        *req.uri_mut() = uri.parse()?;
+        req.headers_mut()
+            .insert("Content-Type", "application/sdp".parse().unwrap());
+        *req.method_mut() = Method::POST;
 
+        let res = self.http_client.execute(req).await?;
         if !res.status().is_success() {
             return Err(SignalingError::Protocol(format!(
                 "Server rejected join: {}",
@@ -64,15 +61,22 @@ impl HttpSignalingClient {
             self.resource_url = Some(loc_str.to_string());
         }
 
-        let answer = res.text().await?;
-        let answer = SdpAnswer::from_sdp_string(&answer)?;
+        let body_bytes = res.into_body();
+        let answer_str = String::from_utf8(body_bytes)
+            .map_err(|e| SignalingError::Protocol(format!("Invalid UTF-8 response: {}", e)))?;
+        let answer = SdpAnswer::from_sdp_string(&answer_str)?;
         Ok(answer)
     }
 
-    pub async fn leave(&mut self) {
+    pub async fn leave(&mut self) -> Result<(), SignalingError> {
         if let Some(url) = self.resource_url.take() {
             tracing::info!(url, "Cleaning up remote session");
-            let _ = self.http_client.delete(url).send().await;
+            let mut req = HttpRequest::new(vec![]);
+            *req.uri_mut() = url.parse()?;
+            *req.method_mut() = Method::DELETE;
+            self.http_client.execute(req).await?;
         }
+
+        Ok(())
     }
 }

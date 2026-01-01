@@ -1,6 +1,5 @@
 mod common;
 
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_runtime::net::UdpMode;
 use std::net::SocketAddr;
 use test_strategy::{Arbitrary, proptest};
@@ -46,9 +45,12 @@ fn my_test(input: TestInputStruct) {
         // use pulsebeam_agent::actor::AgentBuilder;
         // use pulsebeam_agent::signaling::HttpSignalingClient;
         // use pulsebeam_agent::{MediaKind, TransceiverDirection};
-        // use pulsebeam_core::net::connector;
-
-        // let client = Client::builder(TokioExecutor::new()).build(connector());
+        // use pulsebeam_core::net::UdpSocket;
+        //
+        // Client::builder()
+        //     .connector_layer(TurmoilLayer)
+        //     .build()
+        //     .expect("Failed to build simulated reqwest client");
         // let signaling = HttpSignalingClient::new(client, "http://localhost:3000");
         // let socket = UdpSocket::bind("0.0.0.0:0").await?;
         // let mut agent = AgentBuilder::new(signaling, socket)

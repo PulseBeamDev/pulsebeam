@@ -7,7 +7,7 @@ pub use turmoil::net::UdpSocket;
 pub use tokio::net::{TcpListener, TcpStream};
 
 #[cfg(feature = "sim")]
-pub use sim::{TurmoilListener as TcpListener, TurmoilStream as TcpStream, connector};
+pub use sim::{TurmoilListener as TcpListener, TurmoilStream as TcpStream};
 
 #[cfg(feature = "sim")]
 mod sim {
@@ -46,87 +46,42 @@ mod sim {
             self.0.local_addr()
         }
     }
+}
 
-    pub use connector::connector;
+pub type HttpRequest = http::Request<Vec<u8>>;
+pub type HttpResponse = Result<http::Response<Vec<u8>>, HttpError>;
+pub type HttpError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-    mod connector {
-        use hyper::Uri;
-        use pin_project_lite::pin_project;
-        use std::{future::Future, io::Error, pin::Pin};
-        use tokio::io::AsyncWrite;
-        use tower::Service;
-        use turmoil::net::TcpStream;
+pub trait AsyncHttpClient: Send + Sync {
+    fn execute(&self, req: HttpRequest) -> BoxFuture<'_, HttpResponse>;
+}
 
-        type Fut = Pin<Box<dyn Future<Output = Result<TurmoilConnection, Error>> + Send>>;
+#[cfg(feature = "reqwest")]
+impl AsyncHttpClient for reqwest::Client {
+    fn execute(&self, req: HttpRequest) -> BoxFuture<'_, HttpResponse> {
+        let client = self.clone();
+        Box::pin(async move {
+            let reqwest_req = req.try_into().map_err(|e| Box::new(e) as HttpError)?;
 
-        pub fn connector()
-        -> impl Service<Uri, Response = TurmoilConnection, Error = Error, Future = Fut> + Clone
-        {
-            tower::service_fn(|uri: Uri| {
-                Box::pin(async move {
-                    let conn = TcpStream::connect(uri.authority().unwrap().as_str()).await?;
-                    Ok::<_, Error>(TurmoilConnection { fut: conn })
-                }) as Fut
-            })
-        }
+            let res = client
+                .execute(reqwest_req)
+                .await
+                .map_err(|e| Box::new(e) as HttpError)?;
 
-        pin_project! {
-            pub struct TurmoilConnection{
-                #[pin]
-                fut: turmoil::net::TcpStream
-            }
-        }
+            let status = res.status();
+            let headers = res.headers().clone();
+            let body_bytes = res.bytes().await.map_err(|e| Box::new(e) as HttpError)?;
 
-        impl hyper::rt::Read for TurmoilConnection {
-            fn poll_read(
-                self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-                mut buf: hyper::rt::ReadBufCursor<'_>,
-            ) -> std::task::Poll<Result<(), Error>> {
-                let n = unsafe {
-                    let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
-                    let result = tokio::io::AsyncRead::poll_read(self.project().fut, cx, &mut tbuf);
-                    match result {
-                        std::task::Poll::Ready(Ok(())) => tbuf.filled().len(),
-                        other => return other,
-                    }
-                };
+            let mut builder = http::Response::builder().status(status);
 
-                unsafe {
-                    buf.advance(n);
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-        }
-
-        impl hyper::rt::Write for TurmoilConnection {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-                buf: &[u8],
-            ) -> std::task::Poll<Result<usize, Error>> {
-                Pin::new(&mut self.fut).poll_write(cx, buf)
+            if let Some(h) = builder.headers_mut() {
+                *h = headers;
             }
 
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Result<(), Error>> {
-                Pin::new(&mut self.fut).poll_flush(cx)
-            }
-
-            fn poll_shutdown(
-                mut self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Result<(), Error>> {
-                Pin::new(&mut self.fut).poll_shutdown(cx)
-            }
-        }
-
-        impl hyper_util::client::legacy::connect::Connection for TurmoilConnection {
-            fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
-                hyper_util::client::legacy::connect::Connected::new()
-            }
-        }
+            builder
+                .body(body_bytes.to_vec())
+                .map_err(|e| Box::new(e) as HttpError)
+        })
     }
 }
