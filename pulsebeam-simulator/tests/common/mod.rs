@@ -1,13 +1,13 @@
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use pulsebeam_agent::media::H264Looper;
-use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
-use std::sync::Once;
+pub mod client;
+
+use pulsebeam_runtime::net::UdpMode;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Once,
+};
 use tracing_subscriber::EnvFilter;
 
 static INIT: Once = Once::new();
-const RAW_H264: &[u8] = include_bytes!("video.h264");
 
 pub fn setup_tracing() {
     INIT.call_once(|| {
@@ -21,133 +21,19 @@ pub fn setup_tracing() {
     });
 }
 
-pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
-    let client = Client::builder(TokioExecutor::new()).build(connector::connector());
-    let client = HyperClientWrapper(client);
-    Box::new(client)
-}
+pub async fn start_sfu_node(ip: IpAddr) -> anyhow::Result<()> {
+    let rtc_port = 3478;
+    let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
+    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
+    let http_api_addr: SocketAddr = "0.0.0.0:3000".parse()?;
 
-pub fn create_h264_looper(fps: u32) -> H264Looper {
-    H264Looper::new(RAW_H264, fps)
-}
-
-pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);
-
-impl<C> AsyncHttpClient for HyperClientWrapper<C>
-where
-    // These bounds are required for Hyper to actually send a request
-    C: tower::Service<http::Uri> + Clone + Send + Sync + 'static,
-    C::Response: hyper::rt::Read
-        + hyper::rt::Write
-        + hyper_util::client::legacy::connect::Connection
-        + Send
-        + Unpin,
-    C::Future: Send + Unpin,
-    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    fn execute(&self, req: HttpRequest) -> HttpResult<'_> {
-        let client = self.0.clone();
-
-        Box::pin(async move {
-            // 1. Convert http::Request<Vec<u8>> -> http::Request<Full<Bytes>>
-            let (parts, body) = req.into_parts();
-            let hyper_req = http::Request::from_parts(parts, Full::new(Bytes::from(body)));
-
-            // 2. Execute via Hyper
-            let res = client
-                .request(hyper_req)
-                .await
-                .map_err(|e| Box::new(e) as HttpError)?;
-
-            // 3. Buffer the streaming body back into a Vec<u8>
-            let (parts, res_body) = res.into_parts();
-            let bytes = res_body
-                .collect()
-                .await
-                .map_err(|e| Box::new(e) as HttpError)?
-                .to_bytes();
-
-            Ok(http::Response::from_parts(parts, bytes.to_vec()))
-        })
-    }
-}
-
-mod connector {
-    use hyper::Uri;
-    use pin_project_lite::pin_project;
-    use std::{future::Future, io::Error, pin::Pin};
-    use tokio::io::AsyncWrite;
-    use tower::Service;
-    use turmoil::net::TcpStream;
-
-    type Fut = Pin<Box<dyn Future<Output = Result<TurmoilConnection, Error>> + Send>>;
-
-    pub fn connector()
-    -> impl Service<Uri, Response = TurmoilConnection, Error = Error, Future = Fut> + Clone {
-        tower::service_fn(|uri: Uri| {
-            Box::pin(async move {
-                let conn = TcpStream::connect(uri.authority().unwrap().as_str()).await?;
-                Ok::<_, Error>(TurmoilConnection { fut: conn })
-            }) as Fut
-        })
-    }
-
-    pin_project! {
-        pub struct TurmoilConnection{
-            #[pin]
-            fut: turmoil::net::TcpStream
-        }
-    }
-
-    impl hyper::rt::Read for TurmoilConnection {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            mut buf: hyper::rt::ReadBufCursor<'_>,
-        ) -> std::task::Poll<Result<(), Error>> {
-            let n = unsafe {
-                let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
-                let result = tokio::io::AsyncRead::poll_read(self.project().fut, cx, &mut tbuf);
-                match result {
-                    std::task::Poll::Ready(Ok(())) => tbuf.filled().len(),
-                    other => return other,
-                }
-            };
-
-            unsafe {
-                buf.advance(n);
-            }
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    impl hyper::rt::Write for TurmoilConnection {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<Result<usize, Error>> {
-            Pin::new(&mut self.fut).poll_write(cx, buf)
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Error>> {
-            Pin::new(&mut self.fut).poll_flush(cx)
-        }
-
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Error>> {
-            Pin::new(&mut self.fut).poll_shutdown(cx)
-        }
-    }
-
-    impl hyper_util::client::legacy::connect::Connection for TurmoilConnection {
-        fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
-            hyper_util::client::legacy::connect::Connected::new()
-        }
-    }
+    pulsebeam::node::NodeBuilder::new()
+        .workers(1)
+        .local_addr(local_addr)
+        .external_addr(external_addr)
+        .with_udp_mode(UdpMode::Scalar)
+        .with_http_api(http_api_addr)
+        .run(tokio_util::sync::CancellationToken::new())
+        .await?;
+    Ok(())
 }
