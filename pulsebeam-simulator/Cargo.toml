@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[dev-dependencies]
+[dependencies]
 tokio.workspace = true
 tokio-util.workspace = true
 turmoil.workspace = true
@@ -33,5 +33,4 @@ http-body-util = "0.1" # Crucial for .collect().await
 bytes = "1"
 anyhow.workspace = true
 
-[dependencies]
 tracing-subscriber = "0.3.22"
