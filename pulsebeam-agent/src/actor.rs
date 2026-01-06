@@ -254,8 +254,7 @@ impl Agent {
 
     pub async fn get_stats(&self) -> Option<AgentStats> {
         let (stats_tx, stats_rx) = oneshot::channel();
-        self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
-
+        let _ = self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
         stats_rx.await.ok()
     }
 
