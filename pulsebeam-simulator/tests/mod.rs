@@ -24,7 +24,7 @@ fn simulation_test(topo: TestInputStruct) {
 
     let ip1: IpAddr = "192.168.1.1".parse().unwrap();
     sim.client(ip1, async move {
-        let mut client = common::client::SimClientBuilder::new(ip1, server_ip)
+        let mut client = common::client::SimClientBuilder::bind(ip1, server_ip)
             .await?
             .with_track(MediaKind::Video, TransceiverDirection::SendOnly)
             .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
@@ -52,7 +52,7 @@ fn simulation_test(topo: TestInputStruct) {
 
     let ip2: IpAddr = "192.168.2.1".parse().unwrap();
     sim.client(ip2, async move {
-        let mut client = common::client::SimClientBuilder::new(ip2, server_ip)
+        let mut client = common::client::SimClientBuilder::bind(ip2, server_ip)
             .await?
             .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
             .connect("room1")

@@ -234,6 +234,7 @@ impl AgentBuilder {
     }
 }
 
+#[derive(Debug)]
 enum AgentCommand {
     Disconnect,
     GetStats(oneshot::Sender<AgentStats>),

@@ -33,7 +33,7 @@ test-all:
 	cargo test --workspace --exclude pulsebeam-simulator
 
 test-sim:
-	cargo test -p pulsebeam-simulator
+	cargo test -p pulsebeam-simulator -- --no-capture
 
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam

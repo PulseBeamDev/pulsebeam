@@ -19,7 +19,7 @@ pub struct SimClientBuilder {
 }
 
 impl SimClientBuilder {
-    pub async fn new(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
+    pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
         let server_base_uri = format!("http://{}:3000", server_ip);
         let signaling = HttpSignalingClient::new(client, server_base_uri);
@@ -39,6 +39,7 @@ impl SimClientBuilder {
 
     pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
         let agent = self.agent_builder.connect(room).await?;
+        tracing::info!("connected to {room}");
         Ok(SimClient {
             ip: self.ip,
             agent,
