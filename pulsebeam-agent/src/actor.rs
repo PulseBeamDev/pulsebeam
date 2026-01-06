@@ -19,6 +19,8 @@ use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
+const MIN_QUANTA: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Default, Clone)]
 pub struct AgentStats {
     pub peer: Option<str0m::stats::PeerStats>,
@@ -289,7 +291,7 @@ impl AgentActor {
             self.handle_media_added(media);
         }
 
-        let sleep = tokio::time::sleep(Duration::from_millis(1));
+        let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
 
         while let Some(deadline) = self.poll_rtc().await {
@@ -298,7 +300,7 @@ impl AgentActor {
             // If the deadline is 'now' or in the past, we must not busy-wait.
             // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
             let adjusted_deadline = if deadline <= now {
-                now + Duration::from_millis(1)
+                now + MIN_QUANTA
             } else {
                 deadline
             };

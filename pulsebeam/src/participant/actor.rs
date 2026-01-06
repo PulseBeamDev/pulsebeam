@@ -6,12 +6,15 @@ use pulsebeam_runtime::net::UnifiedSocketWriter;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox};
 use str0m::{Rtc, RtcError, error::SdpError};
+use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
 
 use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, room, track};
+
+const MIN_QUANTA: Duration = Duration::from_millis(1);
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParticipantError {
@@ -78,11 +81,27 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             .await;
         let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
         let mut maybe_deadline = self.core.poll_rtc();
+        let sleep = tokio::time::sleep(MIN_QUANTA);
+        tokio::pin!(sleep);
 
         while let Some(deadline) = maybe_deadline {
             let events: Vec<_> = self.core.drain_events().collect();
             for event in events {
                 self.handle_core_event(event).await;
+            }
+
+            let now = Instant::now();
+
+            // If the deadline is 'now' or in the past, we must not busy-wait.
+            // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
+            let adjusted_deadline = if deadline <= now {
+                now + MIN_QUANTA
+            } else {
+                deadline
+            };
+
+            if sleep.deadline() != adjusted_deadline {
+                sleep.as_mut().reset(adjusted_deadline);
             }
 
             tokio::select! {
@@ -134,7 +153,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 now = stats_interval.tick() => {
                     self.core.poll_slow(now);
                 }
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = &mut sleep => {
                     maybe_deadline = self.core.handle_timeout();
                 },
             }
