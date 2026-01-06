@@ -11,10 +11,17 @@ use tokio::task::JoinSet;
 
 const RAW_H264: &[u8] = include_bytes!("video.h264");
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt::init();
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(main_loop());
+}
+
+async fn main_loop() {
     let http_client = Box::new(reqwest::Client::new());
     let signaling = HttpSignalingClient::new(http_client, "http://localhost:3000");
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
