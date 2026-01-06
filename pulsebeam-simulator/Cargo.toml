@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[dependencies]
+[dev-dependencies]
 tokio.workspace = true
 tokio-util.workspace = true
 turmoil.workspace = true
@@ -32,5 +32,5 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
 http-body-util = "0.1" # Crucial for .collect().await
 bytes = "1"
 anyhow.workspace = true
-
 tracing-subscriber = "0.3.22"
+

@@ -1,4 +1,4 @@
-use crate::common;
+mod common;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
 use std::net::IpAddr;
 use std::time::Duration;
