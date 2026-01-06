@@ -289,18 +289,29 @@ impl AgentActor {
             self.handle_media_added(media);
         }
 
-        while let Some(deadline) = self.poll_rtc() {
+        let sleep = tokio::time::sleep(Duration::from_millis(1));
+        tokio::pin!(sleep);
+
+        while let Some(deadline) = self.poll_rtc().await {
+            let now = Instant::now();
+
+            // If the deadline is 'now' or in the past, we must not busy-wait.
+            // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
+            let adjusted_deadline = if deadline <= now {
+                now + Duration::from_millis(1)
+            } else {
+                deadline
+            };
+
+            if sleep.deadline() != adjusted_deadline {
+                sleep.as_mut().reset(adjusted_deadline);
+            }
+
             tokio::select! {
+                biased;
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd)
                 }
-                _ = tokio::time::sleep_until(deadline) => {
-                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
-                         self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
-                         return;
-                    }
-                }
-
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
                          let _ = self.rtc.handle_input(Input::Receive(
@@ -322,15 +333,23 @@ impl AgentActor {
                          let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                      }
                 }
+
+                 _ = &mut sleep => {
+                    // Update str0m (Time has now advanced by at least 1us)
+                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
+                         self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
+                         return;
+                    }
+                }
             }
         }
     }
 
-    fn poll_rtc(&mut self) -> Option<Instant> {
+    async fn poll_rtc(&mut self) -> Option<Instant> {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(tx)) => {
-                    let _ = self.socket.try_send_to(&tx.contents, tx.destination);
+                    let _ = self.socket.send_to(&tx.contents, tx.destination).await;
                 }
                 Ok(Output::Event(e)) => {
                     match e {

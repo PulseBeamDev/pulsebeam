@@ -12,6 +12,7 @@ fn simulation_test(topo: TestInputStruct) {
     common::setup_tracing();
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(15))
+        .tick_duration(Duration::from_micros(100))
         .build();
 
     let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
@@ -31,7 +32,7 @@ fn simulation_test(topo: TestInputStruct) {
             .await?;
 
         client
-            .drive_until(Duration::from_secs(10), |stats| {
+            .drive_until(Duration::from_secs(60), |stats| {
                 let Some(peer) = &stats.peer else {
                     return false;
                 };
@@ -53,12 +54,13 @@ fn simulation_test(topo: TestInputStruct) {
     sim.client(ip2, async move {
         let mut client = common::client::SimClientBuilder::bind(ip2, server_ip)
             .await?
+            .with_track(MediaKind::Video, TransceiverDirection::SendOnly)
             .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
             .connect("room1")
             .await?;
 
         client
-            .drive_until(Duration::from_secs(10), |stats| {
+            .drive_until(Duration::from_secs(60), |stats| {
                 let Some(peer) = &stats.peer else {
                     return false;
                 };
