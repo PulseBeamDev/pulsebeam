@@ -22,61 +22,42 @@ fn simulation_test(topo: TestInputStruct) {
             .map_err(|e| e.into())
     });
 
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let create_fully_interactive =
+        async |server_ip: IpAddr, ip: IpAddr, barrier: std::sync::Arc<tokio::sync::Barrier>| {
+            let mut client = common::client::SimClientBuilder::bind(ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::SendOnly)
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
+                .connect("room1")
+                .await?;
 
-    let ip1: IpAddr = "192.168.1.1".parse().unwrap();
-    let b1 = barrier.clone();
-    sim.client(ip1, async move {
-        let mut client = common::client::SimClientBuilder::bind(ip1, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::SendOnly)
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
-            .connect("room1")
-            .await?;
+            client
+                .drive_until(Duration::from_secs(60), |stats| {
+                    let Some(peer) = &stats.peer else {
+                        return false;
+                    };
 
-        client
-            .drive_until(Duration::from_secs(60), |stats| {
-                let Some(peer) = &stats.peer else {
-                    return false;
-                };
+                    let tx_ok = peer.bytes_tx > 0;
+                    let rx_ok = peer.bytes_rx > 50_000;
+                    if tx_ok && rx_ok {
+                        tracing::info!("Client {}: Bidirectional flow established!", ip);
+                        return true;
+                    }
+                    false
+                })
+                .await?;
 
-                let tx_ok = peer.bytes_tx > 0;
-                let rx_ok = peer.bytes_rx > 50_000;
-                if tx_ok && rx_ok {
-                    tracing::info!("Client 1: Bidirectional flow established!");
-                    return true;
-                }
-                false
-            })
-            .await?;
+            barrier.wait().await;
+            Ok(())
+        };
 
-        b1.wait().await;
-        Ok(())
-    });
-
-    let ip2: IpAddr = "192.168.2.1".parse().unwrap();
-    let b2 = barrier.clone();
-    sim.client(ip2, async move {
-        let mut client = common::client::SimClientBuilder::bind(ip2, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::SendOnly)
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
-            .connect("room1")
-            .await?;
-
-        client
-            .drive_until(Duration::from_secs(60), |stats| {
-                let Some(peer) = &stats.peer else {
-                    return false;
-                };
-                peer.bytes_rx > 50_000
-            })
-            .await?;
-
-        b2.wait().await;
-        Ok(())
-    });
+    let peers = 2;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(peers));
+    for i in 1..=peers {
+        let ip: IpAddr = format!("192.168.{}.1", i).parse().unwrap();
+        let barrier = barrier.clone();
+        sim.client(ip, create_fully_interactive(server_ip, ip, barrier));
+    }
 
     sim.run().unwrap();
-    tracing::info!("PASSED");
 }
