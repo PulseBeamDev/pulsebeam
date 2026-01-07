@@ -99,7 +99,8 @@ pub struct Receiver<T> {
 
 impl<T: Clone> Receiver<T> {
     pub fn reset(&mut self) {
-        self.next_seq = self.ring.head.load(Ordering::Acquire);
+        self.local_head = self.ring.head.load(Ordering::Acquire);
+        self.next_seq = self.local_head;
     }
 
     pub async fn recv(&mut self) -> Result<T, RecvError> {
@@ -197,11 +198,10 @@ impl<T: Clone> Stream for Receiver<T> {
 
 impl<T: Clone> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        let head = self.ring.head.load(Ordering::Acquire);
         Self {
             ring: self.ring.clone(),
-            next_seq: head,
-            local_head: head,
+            next_seq: self.next_seq,
+            local_head: self.local_head,
             listener: None,
         }
     }
