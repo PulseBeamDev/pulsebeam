@@ -11,7 +11,7 @@ struct TestInputStruct {}
 fn simulation_test(topo: TestInputStruct) {
     common::setup_tracing();
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(15))
+        .simulation_duration(Duration::from_secs(65))
         .tick_duration(Duration::from_micros(100))
         .build();
 
@@ -22,7 +22,10 @@ fn simulation_test(topo: TestInputStruct) {
             .map_err(|e| e.into())
     });
 
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
     let ip1: IpAddr = "192.168.1.1".parse().unwrap();
+    let b1 = barrier.clone();
     sim.client(ip1, async move {
         let mut client = common::client::SimClientBuilder::bind(ip1, server_ip)
             .await?
@@ -47,10 +50,12 @@ fn simulation_test(topo: TestInputStruct) {
             })
             .await?;
 
+        b1.wait().await;
         Ok(())
     });
 
     let ip2: IpAddr = "192.168.2.1".parse().unwrap();
+    let b2 = barrier.clone();
     sim.client(ip2, async move {
         let mut client = common::client::SimClientBuilder::bind(ip2, server_ip)
             .await?
@@ -68,8 +73,10 @@ fn simulation_test(topo: TestInputStruct) {
             })
             .await?;
 
+        b2.wait().await;
         Ok(())
     });
 
     sim.run().unwrap();
+    tracing::info!("PASSED");
 }

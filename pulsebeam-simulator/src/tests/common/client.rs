@@ -72,7 +72,6 @@ impl SimClient {
                 anyhow::bail!("Client {} timed out. Final Stats:\n{:?}", self.ip, stats);
             }
 
-            tracing::info!("client looping");
             tokio::select! {
                 Some(event) = self.agent.next_event() => {
                     match event {
@@ -90,7 +89,6 @@ impl SimClient {
 
                 _ = check_interval.tick() => {
                     if let Some(stats) = self.agent.get_stats().await && predicate(&stats) {
-                            tracing::info!("done");
                         return Ok(stats);
                     }
                 }
