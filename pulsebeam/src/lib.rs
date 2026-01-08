@@ -6,7 +6,6 @@ pub mod gateway;
 pub mod message;
 pub mod node;
 pub mod participant;
-pub mod proto;
 pub mod room;
 pub mod rtp;
 pub mod track;

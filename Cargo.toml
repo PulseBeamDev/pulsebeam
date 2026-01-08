@@ -56,7 +56,8 @@ members = [
   "pulsebeam", 
   "pulsebeam-agent", 
   "pulsebeam-cli", 
-  "pulsebeam-core",
+  "pulsebeam-core", 
+  "pulsebeam-proto",
   "pulsebeam-runtime",
   "pulsebeam-simulator",
 ]

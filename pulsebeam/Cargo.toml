@@ -30,7 +30,6 @@ axum = { version = "0.8.8", features = ["macros"] }
 axum-extra = { version = "0.12.5", features = ["typed-header"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 hex = "0.4.3"
-prost = "0.14.1"
 bs58 = "0.5.1"
 sha3 = "0.10.8"
 metrics = "0.24.3"
@@ -54,10 +53,6 @@ aws-lc-rs = { version = "1.15.2" }
 
 [dev-dependencies]
 more-asserts = { workspace = true } 
-
-[build-dependencies]
-prost-build = "0.14.1"
-
 
 # Windows-specific str0m override
 [target.'cfg(windows)'.dependencies]

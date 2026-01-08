@@ -1,0 +1,16 @@
+[package]
+name = "pulsebeam-proto"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+prost = "0.14.1"
+prost-types = "0.14.1"
+
+[build-dependencies]
+prost-build = "0.14.1"

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package sfu;
+package signaling;
 
 // Represents the kind of media track.
 enum TrackKind {
