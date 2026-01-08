@@ -21,7 +21,6 @@ pulsebeam-agent = { version = "0.1.0", path = "../pulsebeam-agent" }
 pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core", features = ["sim"] }
 
 proptest = "1.9.0"
-test-strategy = "0.4.3"
 reqwest = "0.13.1"
 tower = { version = "0.5.2", features = ["util"] }
 http = "1.4.0"
@@ -31,6 +30,6 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
 http-body-util = "0.1" # Crucial for .collect().await
 bytes = "1"
-
-[dependencies]
+anyhow.workspace = true
 tracing-subscriber = "0.3.22"
+

@@ -1,24 +1,104 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use pulsebeam_agent::actor::{Agent, AgentBuilder, AgentEvent, AgentStats};
 use pulsebeam_agent::media::H264Looper;
+use pulsebeam_agent::signaling::HttpSignalingClient;
+use pulsebeam_agent::{MediaKind, TransceiverDirection};
+use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
-use std::sync::Once;
-use tracing_subscriber::EnvFilter;
+use std::net::IpAddr;
+use std::time::Duration;
+use tokio::task::JoinSet;
 
-static INIT: Once = Once::new();
-const RAW_H264: &[u8] = include_bytes!("video.h264");
+// TODO: These are very CPU taxing for simulations.
+// Maybe we can reduce these even further as long as we test the simulcast stuff.
+// const RAW_H264_FULL: &[u8] = include_bytes!("full_f.h264");
+// const RAW_H264_HALF: &[u8] = include_bytes!("half_h.h264");
+const RAW_H264_QUARTER: &[u8] = include_bytes!("quarter_q.h264");
 
-pub fn setup_tracing() {
-    INIT.call_once(|| {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_target(true)
-            .with_ansi(false)
-            .init();
-    });
+pub struct SimClientBuilder {
+    ip: IpAddr,
+    agent_builder: AgentBuilder,
+}
+
+impl SimClientBuilder {
+    pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
+        let client = create_http_client();
+        let server_base_uri = format!("http://{}:3000", server_ip);
+        let signaling = HttpSignalingClient::new(client, server_base_uri);
+
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+        Ok(Self {
+            ip,
+            agent_builder: AgentBuilder::new(signaling, socket).with_local_ip(ip),
+        })
+    }
+
+    pub fn with_track(mut self, kind: MediaKind, dir: TransceiverDirection) -> Self {
+        self.agent_builder = self.agent_builder.with_track(kind, dir, None);
+        self
+    }
+
+    pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
+        let agent = self.agent_builder.connect(room).await?;
+        tracing::info!("connected to {room}");
+        Ok(SimClient {
+            ip: self.ip,
+            agent,
+            join_set: JoinSet::new(),
+        })
+    }
+}
+
+pub struct SimClient {
+    pub ip: IpAddr,
+    pub agent: Agent,
+    join_set: JoinSet<()>,
+}
+
+impl SimClient {
+    pub async fn drive_until<F>(
+        &mut self,
+        timeout: Duration,
+        mut predicate: F,
+    ) -> anyhow::Result<AgentStats>
+    where
+        F: FnMut(&AgentStats) -> bool,
+    {
+        let start = tokio::time::Instant::now();
+        let mut check_interval = tokio::time::interval(Duration::from_millis(200));
+
+        loop {
+            if start.elapsed() > timeout {
+                let stats = self.agent.get_stats().await.unwrap_or_default();
+                anyhow::bail!("Client {} timed out. Final Stats:\n{:?}", self.ip, stats);
+            }
+
+            tokio::select! {
+                Some(event) = self.agent.next_event() => {
+                    match event {
+                        AgentEvent::SenderAdded(sender) => {
+                            tracing::info!("{} starting publisher for mid: {:?}", self.ip, sender.mid);
+                            let looper = create_h264_looper(30);
+                            self.join_set.spawn(looper.run(sender));
+                        }
+                        AgentEvent::ReceiverAdded(recv) => {
+                            tracing::info!("{} subscribed to remote track mid: {:?}", self.ip, recv.mid);
+                        }
+                        _ => {}
+                    }
+                }
+
+                _ = check_interval.tick() => {
+                    if let Some(stats) = self.agent.get_stats().await && predicate(&stats) {
+                        return Ok(stats);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
@@ -28,7 +108,7 @@ pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
 }
 
 pub fn create_h264_looper(fps: u32) -> H264Looper {
-    H264Looper::new(RAW_H264, fps)
+    H264Looper::new(RAW_H264_QUARTER, fps)
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

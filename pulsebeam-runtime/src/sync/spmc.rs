@@ -99,7 +99,18 @@ pub struct Receiver<T> {
 
 impl<T: Clone> Receiver<T> {
     pub fn reset(&mut self) {
-        self.next_seq = self.ring.head.load(Ordering::Acquire);
+        self.local_head = self.ring.head.load(Ordering::Acquire);
+        let half_ring_cap = (self.ring.slots.len() / 2) as u64;
+        let ring_len = self.local_head.wrapping_sub(self.next_seq);
+
+        // Defensive: detect if next_seq is impossibly far behind
+        if ring_len > self.ring.slots.len() as u64 {
+            // Something is very wrong - reset to head
+            self.next_seq = self.local_head;
+        } else {
+            let offset = half_ring_cap.min(ring_len);
+            self.next_seq = self.local_head.wrapping_sub(offset);
+        }
     }
 
     pub async fn recv(&mut self) -> Result<T, RecvError> {
@@ -197,11 +208,10 @@ impl<T: Clone> Stream for Receiver<T> {
 
 impl<T: Clone> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        let head = self.ring.head.load(Ordering::Acquire);
         Self {
             ring: self.ring.clone(),
-            next_seq: head,
-            local_head: head,
+            next_seq: self.next_seq,
+            local_head: self.local_head,
             listener: None,
         }
     }

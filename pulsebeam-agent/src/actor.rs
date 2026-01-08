@@ -19,6 +19,8 @@ use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
+const MIN_QUANTA: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Default, Clone)]
 pub struct AgentStats {
     pub peer: Option<str0m::stats::PeerStats>,
@@ -140,7 +142,7 @@ impl AgentBuilder {
             .clear_codecs()
             .enable_h264(true)
             .enable_opus(true)
-            .enable_bwe(Some(Bitrate::kbps(2000)))
+            // .enable_bwe(Some(Bitrate::kbps(2000)))
             .set_stats_interval(Some(Duration::from_millis(200)))
             .build();
 
@@ -234,6 +236,7 @@ impl AgentBuilder {
     }
 }
 
+#[derive(Debug)]
 enum AgentCommand {
     Disconnect,
     GetStats(oneshot::Sender<AgentStats>),
@@ -253,8 +256,7 @@ impl Agent {
 
     pub async fn get_stats(&self) -> Option<AgentStats> {
         let (stats_tx, stats_rx) = oneshot::channel();
-        self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
-
+        let _ = self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
         stats_rx.await.ok()
     }
 
@@ -289,18 +291,29 @@ impl AgentActor {
             self.handle_media_added(media);
         }
 
-        while let Some(deadline) = self.poll_rtc() {
+        let sleep = tokio::time::sleep(MIN_QUANTA);
+        tokio::pin!(sleep);
+
+        while let Some(deadline) = self.poll_rtc().await {
+            let now = Instant::now();
+
+            // If the deadline is 'now' or in the past, we must not busy-wait.
+            // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
+            let adjusted_deadline = if deadline <= now {
+                now + MIN_QUANTA
+            } else {
+                deadline
+            };
+
+            if sleep.deadline() != adjusted_deadline {
+                sleep.as_mut().reset(adjusted_deadline);
+            }
+
             tokio::select! {
+                biased;
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd)
                 }
-                _ = tokio::time::sleep_until(deadline) => {
-                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
-                         self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
-                         return;
-                    }
-                }
-
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
                          let _ = self.rtc.handle_input(Input::Receive(
@@ -322,15 +335,22 @@ impl AgentActor {
                          let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                      }
                 }
+
+                 _ = &mut sleep => {
+                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
+                         self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
+                         return;
+                    }
+                }
             }
         }
     }
 
-    fn poll_rtc(&mut self) -> Option<Instant> {
+    async fn poll_rtc(&mut self) -> Option<Instant> {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(tx)) => {
-                    let _ = self.socket.try_send_to(&tx.contents, tx.destination);
+                    let _ = self.socket.send_to(&tx.contents, tx.destination).await;
                 }
                 Ok(Output::Event(e)) => {
                     match e {
@@ -369,7 +389,7 @@ impl AgentActor {
                             track_stats.tx_layers.insert(stats.rid, stats);
                         }
                         e => {
-                            tracing::debug!("unhandled event: {:?}", e);
+                            tracing::trace!("unhandled event: {:?}", e);
                         }
                     }
                 }

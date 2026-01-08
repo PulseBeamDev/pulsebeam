@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use str0m::media::MediaTime;
+use tokio::time::Instant;
 
 use crate::{MediaFrame, actor::TrackSender};
 
@@ -35,23 +36,26 @@ impl H264Looper {
     /// creates a task that pumps frames into the provided sender
     pub async fn run(mut self, sender: TrackSender) {
         let clock_rate = 90_000;
-        let frame_duration_ticks = clock_rate / self.fps;
-        let interval_ms = 1_000 / self.fps;
+        let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
 
-        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms as u64));
-        let mut current_ts: u64 = 0;
+        let start_time = Instant::now();
+        let mut frame_count: u64 = 0;
 
         loop {
-            let now = ticker.tick().await;
+            let target_time = start_time + (frame_interval.mul_f64(frame_count as f64));
+            tokio::time::sleep_until(target_time).await;
+
             let frame_data = self.next();
+            let next_ts = (frame_count * clock_rate as u64) / self.fps as u64;
+
             let frame = MediaFrame {
-                ts: MediaTime::from_90khz(current_ts),
+                ts: MediaTime::from_90khz(next_ts),
                 data: frame_data,
-                capture_time: now,
+                capture_time: Instant::now(),
             };
 
             sender.try_send(frame);
-            current_ts += frame_duration_ticks as u64;
+            frame_count += 1;
         }
     }
 }

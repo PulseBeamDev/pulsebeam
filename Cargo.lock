@@ -626,9 +626,9 @@ dependencies = [
 
 [[package]]
 name = "crc"
-version = "3.3.0"
+version = "3.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9710d3b3739c2e349eb44fe848ad0b7c8cb1e42bd87ee49371df2f7acaf3e675"
+checksum = "69e6e4d7b33a94f0991c26729976b10ebde1d34c3ee82408fb536164fa10d636"
 dependencies = [
  "crc-catalog",
 ]
@@ -811,18 +811,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive-ex"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bba95f299f6b9cd47f68a847eca2ae9060a2713af532dc35c342065544845407"
-dependencies = [
- "proc-macro2",
- "quote",
- "structmeta",
- "syn",
-]
-
-[[package]]
 name = "diatomic-waker"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,9 +828,9 @@ dependencies = [
 
 [[package]]
 name = "dimpl"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e22956ce1bf433b0cd0f544d71f4994ac5dee5f1515bb1d2d1cb1401a770851"
+checksum = "a27d8e2d24b0147f64aec4e9f662ae152eaa1209805da3b63e2533e658204a3d"
 dependencies = [
  "arrayvec",
  "aws-lc-rs",
@@ -2599,6 +2587,7 @@ dependencies = [
 name = "pulsebeam-simulator"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "http",
  "http-body-util",
@@ -2611,7 +2600,6 @@ dependencies = [
  "pulsebeam-core",
  "pulsebeam-runtime",
  "reqwest",
- "test-strategy",
  "tokio",
  "tokio-util",
  "tower",
@@ -3123,9 +3111,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sctp-proto"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "423139d8cca3021b9d800f084a711ba2d23b508ae71b33dba167f11ca33e54c7"
+checksum = "572b7e45d72e65e8f5ab350f06c205f5cd2a9bb12642d5f087870c8fdd47a331"
 dependencies = [
  "bytes",
  "crc",
@@ -3361,8 +3349,8 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 
 [[package]]
 name = "str0m"
-version = "0.14.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
+version = "0.14.3"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#1a8a5b6591c6c465fd18fe3939e09f422528af4e"
 dependencies = [
  "combine",
  "crc",
@@ -3379,8 +3367,8 @@ dependencies = [
 
 [[package]]
 name = "str0m-aws-lc-rs"
-version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
+version = "0.1.1"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#1a8a5b6591c6c465fd18fe3939e09f422528af4e"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -3389,8 +3377,8 @@ dependencies = [
 
 [[package]]
 name = "str0m-proto"
-version = "0.1.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
+version = "0.1.1"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#1a8a5b6591c6c465fd18fe3939e09f422528af4e"
 dependencies = [
  "base64ct",
  "dimpl",
@@ -3399,8 +3387,8 @@ dependencies = [
 
 [[package]]
 name = "str0m-wincrypto"
-version = "0.3.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#31ecda17cc9d36370b855815ad8deab6ed82025f"
+version = "0.3.2"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Ftcptype#1a8a5b6591c6c465fd18fe3939e09f422528af4e"
 dependencies = [
  "str0m-proto",
  "tracing",
@@ -3418,29 +3406,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "structmeta"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e1575d8d40908d70f6fd05537266b90ae71b15dbbe7a8b7dffa2b759306d329"
-dependencies = [
- "proc-macro2",
- "quote",
- "structmeta-derive",
- "syn",
-]
-
-[[package]]
-name = "structmeta-derive"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "152a0b65a590ff6c3da95cabe2353ee04e6167c896b28e3b14478c2636c922fc"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "subtle"
@@ -3548,19 +3513,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "test-strategy"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43b12f9683de37f9980e485167ee624bfaa0b6b04da661e98e25ef9c2669bc1b"
-dependencies = [
- "derive-ex",
- "proc-macro2",
- "quote",
- "structmeta",
- "syn",
 ]
 
 [[package]]
