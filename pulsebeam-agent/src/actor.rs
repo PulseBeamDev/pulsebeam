@@ -337,7 +337,6 @@ impl AgentActor {
                 }
 
                  _ = &mut sleep => {
-                    // Update str0m (Time has now advanced by at least 1us)
                     if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                          return;
