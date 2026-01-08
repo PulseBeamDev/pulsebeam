@@ -21,7 +21,6 @@ pulsebeam-agent = { version = "0.1.0", path = "../pulsebeam-agent" }
 pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core", features = ["sim"] }
 
 proptest = "1.9.0"
-test-strategy = "0.4.3"
 reqwest = "0.13.1"
 tower = { version = "0.5.2", features = ["util"] }
 http = "1.4.0"

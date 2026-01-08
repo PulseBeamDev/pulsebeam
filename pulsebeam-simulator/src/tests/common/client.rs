@@ -68,7 +68,7 @@ impl SimClient {
         F: FnMut(&AgentStats) -> bool,
     {
         let start = tokio::time::Instant::now();
-        let mut check_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut check_interval = tokio::time::interval(Duration::from_millis(200));
 
         loop {
             if start.elapsed() > timeout {
