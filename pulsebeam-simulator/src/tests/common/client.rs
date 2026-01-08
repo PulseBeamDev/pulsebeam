@@ -11,7 +11,11 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
-const RAW_H264: &[u8] = include_bytes!("video.h264");
+// TODO: These are very CPU taxing for simulations.
+// Maybe we can reduce these even further as long as we test the simulcast stuff.
+// const RAW_H264_FULL: &[u8] = include_bytes!("full_f.h264");
+// const RAW_H264_HALF: &[u8] = include_bytes!("half_h.h264");
+const RAW_H264_QUARTER: &[u8] = include_bytes!("quarter_q.h264");
 
 pub struct SimClientBuilder {
     ip: IpAddr,
@@ -104,7 +108,7 @@ pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
 }
 
 pub fn create_h264_looper(fps: u32) -> H264Looper {
-    H264Looper::new(RAW_H264, fps)
+    H264Looper::new(RAW_H264_QUARTER, fps)
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

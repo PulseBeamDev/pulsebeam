@@ -142,7 +142,7 @@ impl AgentBuilder {
             .clear_codecs()
             .enable_h264(true)
             .enable_opus(true)
-            .enable_bwe(Some(Bitrate::kbps(2000)))
+            // .enable_bwe(Some(Bitrate::kbps(2000)))
             .set_stats_interval(Some(Duration::from_millis(200)))
             .build();
 
@@ -390,7 +390,7 @@ impl AgentActor {
                             track_stats.tx_layers.insert(stats.rid, stats);
                         }
                         e => {
-                            tracing::debug!("unhandled event: {:?}", e);
+                            tracing::trace!("unhandled event: {:?}", e);
                         }
                     }
                 }

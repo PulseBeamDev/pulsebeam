@@ -11,7 +11,7 @@ struct TestInputStruct {}
 fn simulation_test(topo: TestInputStruct) {
     common::setup_tracing();
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(65))
+        .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))
         .build();
 
@@ -32,7 +32,7 @@ fn simulation_test(topo: TestInputStruct) {
                 .await?;
 
             client
-                .drive_until(Duration::from_secs(60), |stats| {
+                .drive_until(Duration::from_secs(10), |stats| {
                     let Some(peer) = &stats.peer else {
                         return false;
                     };
