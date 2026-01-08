@@ -2,7 +2,7 @@ mod common;
 use proptest::prelude::*;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
 use std::net::IpAddr;
-use std::time::Duration; // Use proptest prelude directly
+use std::time::Duration;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
