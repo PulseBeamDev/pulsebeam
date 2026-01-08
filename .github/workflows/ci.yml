@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+      with:
+        lfs: true
     - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
     - name: Run tests
       run: make test-all
