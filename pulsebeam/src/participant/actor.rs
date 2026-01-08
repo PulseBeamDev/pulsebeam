@@ -70,6 +70,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
         let (gateway_tx, mut gateway_rx) = mailbox::new(64);
+        let room_handle = self.room_handle.clone();
 
         let _ = self
             .gateway
@@ -85,12 +86,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         tokio::pin!(sleep);
 
         while let Some(deadline) = maybe_deadline {
-            let events: Vec<_> = self.core.drain_events().collect();
-            for event in events {
-                self.handle_core_event(event).await;
-            }
-
             let now = Instant::now();
+            let batch_size = self.core.events.len().min(16);
 
             // If the deadline is 'now' or in the past, we must not busy-wait.
             // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
@@ -119,6 +116,23 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     }
                 }
                 Some(msg) = ctx.rx.recv() => self.handle_control_message(msg).await,
+                res = room_handle.tx.reserve_many(batch_size), if !self.core.events.is_empty() => {
+                    match res {
+                        Ok(permits) => {
+                            for (event, permit) in self.core.events.drain(..batch_size).zip(permits) {
+                                match event {
+                                    CoreEvent::SpawnTrack(rx) => {
+                                        permit.send(room::RoomMessage::PublishTrack(rx));
+                                    }
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            tracing::error!("Room handle closed, shutting down participant actor");
+                            break; // Stop the actor so it doesn't spin forever
+                        }
+                    }
+                }
 
                 // Priority 2: CPU Work
                 // TODO: consolidate pollings in core
@@ -186,17 +200,6 @@ impl ParticipantActor {
             room_handle,
             udp_egress,
             tcp_egress,
-        }
-    }
-
-    async fn handle_core_event(&mut self, event: CoreEvent) {
-        match event {
-            CoreEvent::SpawnTrack(rx) => {
-                let _ = self
-                    .room_handle
-                    .send(room::RoomMessage::PublishTrack(rx))
-                    .await;
-            }
         }
     }
 

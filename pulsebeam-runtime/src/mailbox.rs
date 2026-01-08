@@ -1,12 +1,20 @@
 use std::error::Error;
 use std::fmt;
 
+pub type PermitIterator<'a, T> = tokio::sync::mpsc::PermitIterator<'a, T>;
+
 /// An error returned when sending on a closed mailbox.
 ///
 /// This error is returned by the asynchronous `send` method. It contains
 /// the message that could not be sent.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SendError<T>(pub T);
+
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for SendError<T> {
+    fn from(value: tokio::sync::mpsc::error::SendError<T>) -> Self {
+        SendError(value.0)
+    }
+}
 
 impl<T> fmt::Display for SendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -21,6 +29,15 @@ pub enum TrySendError<T> {
     Full(T),
     /// The receiving actor has terminated and the mailbox is closed.
     Closed(T),
+}
+
+impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for TrySendError<T> {
+    fn from(e: tokio::sync::mpsc::error::TrySendError<T>) -> Self {
+        match e {
+            tokio::sync::mpsc::error::TrySendError::Full(e) => TrySendError::Full(e),
+            tokio::sync::mpsc::error::TrySendError::Closed(e) => TrySendError::Closed(e),
+        }
+    }
 }
 
 impl<T> fmt::Display for TrySendError<T> {
@@ -63,25 +80,23 @@ impl<T> Clone for Sender<T> {
 }
 
 impl<T> Sender<T> {
+    pub async fn reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, SendError<()>> {
+        self.sender.reserve_many(n).await.map_err(|e| e.into())
+    }
+
     /// Sends a message asynchronously, waiting if the mailbox is full.
     ///
     /// Returns a `SendError` only if the receiving actor has terminated.
-    pub async fn send(&mut self, message: T) -> Result<(), SendError<T>> {
-        self.sender
-            .send(message)
-            .await
-            .map_err(|tokio::sync::mpsc::error::SendError(e)| SendError(e))
+    pub async fn send(&self, message: T) -> Result<(), SendError<T>> {
+        self.sender.send(message).await.map_err(|e| e.into())
     }
 
     /// Attempts to immediately send a message.
     ///
     /// Returns a `TrySendError` if the mailbox is full or if the
     /// receiving actor has terminated.
-    pub fn try_send(&mut self, message: T) -> Result<(), TrySendError<T>> {
-        self.sender.try_send(message).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(e) => TrySendError::Full(e),
-            tokio::sync::mpsc::error::TrySendError::Closed(e) => TrySendError::Closed(e),
-        })
+    pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        self.sender.try_send(message).map_err(|e| e.into())
     }
 }
 

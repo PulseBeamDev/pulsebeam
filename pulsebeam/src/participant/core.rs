@@ -40,8 +40,8 @@ pub struct ParticipantCore {
     pub tcp_batcher: Batcher,
     pub upstream: UpstreamAllocator,
     pub downstream: DownstreamAllocator,
+    pub events: Vec<CoreEvent>,
     disconnect_reason: Option<DisconnectReason>,
-    events: Vec<CoreEvent>,
 }
 
 impl ParticipantCore {
@@ -65,10 +65,6 @@ impl ParticipantCore {
 
     pub fn disconnect_reason(&self) -> Option<&DisconnectReason> {
         self.disconnect_reason.as_ref()
-    }
-
-    pub fn drain_events(&mut self) -> impl Iterator<Item = CoreEvent> + '_ {
-        self.events.drain(..)
     }
 
     pub fn handle_keyframe_request(&mut self, key: KeyframeRequest) {
