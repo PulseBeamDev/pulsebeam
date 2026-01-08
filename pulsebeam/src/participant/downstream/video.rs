@@ -313,8 +313,8 @@ impl VideoAllocator {
         if self.ticks >= 30 {
             tracing::debug!(
                 available = %available_bandwidth,
-                budget = %Bitrate::from(budget),
                 allocated = %total_allocated,
+                budget = %Bitrate::from(budget),
                 desired = %total_desired,
                 "allocation summary"
             );
@@ -480,12 +480,10 @@ impl Slot {
         self.switching_started_at = Some(Instant::now());
         self.keyframe_retries = 0;
 
-        tracing::info!(
-            mid = %self.mid,
-            to_rid = ?receiver.rid,
-            track = %receiver.meta.id,
-            "switch_to: initiating switch"
-        );
+        let old_state_str = old_state.to_string();
+        let track_id = receiver.meta.id.to_string();
+        let rid = receiver.rid;
+
         let new_state = match old_state {
             SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
 
@@ -511,6 +509,14 @@ impl Slot {
                 }
             }
         };
+        tracing::info!(
+            mid = %self.mid,
+            to_rid = ?rid,
+            track = track_id,
+            old_state = old_state_str,
+            new_state = %new_state,
+            "switch_to: initiating switch"
+        );
 
         self.transition_to(new_state);
         self.switcher.clear();
@@ -636,8 +642,10 @@ impl Slot {
                             // Continue loop to drain switcher or process more
                         }
                         Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
-                            tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, pausing");
-                            self.transition_to(SlotState::Paused { active: staging });
+                            // We're still resuming, it is okay to continue since we haven't sent
+                            // any packet yet to downstream
+                            tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, keep going");
+                            self.transition_to(SlotState::Resuming { staging });
                         }
                         Poll::Ready(Err(spmc::RecvError::Closed)) => {
                             tracing::warn!(mid = %self.mid, "Resuming closed");
