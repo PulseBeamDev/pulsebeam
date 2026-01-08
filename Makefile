@@ -29,7 +29,9 @@ release:
 profile:
 	$(CARGO_CMD) build --profile profiling -p pulsebeam
 
-test-all:
+test: test-unit test-sim
+
+test-unit:
 	cargo test --workspace --exclude pulsebeam-simulator
 
 test-sim:
