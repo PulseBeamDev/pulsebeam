@@ -298,7 +298,7 @@ impl AgentActor {
             let now = Instant::now();
 
             // If the deadline is 'now' or in the past, we must not busy-wait.
-            // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
+            // We enforce a minimum quanta (MIN_QUANTA) to prevent CPU starvation; see its definition for the exact duration.
             let adjusted_deadline = if deadline <= now {
                 now + MIN_QUANTA
             } else {
