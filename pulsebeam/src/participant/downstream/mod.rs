@@ -16,8 +16,8 @@ use tokio::time::Instant;
 pub struct DownstreamAllocator {
     available_bandwidth: BitrateController,
 
-    audio: AudioAllocator,
-    video: VideoAllocator,
+    pub audio: AudioAllocator,
+    pub video: VideoAllocator,
 }
 
 impl DownstreamAllocator {

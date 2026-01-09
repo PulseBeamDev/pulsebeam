@@ -43,6 +43,7 @@ ahash = "0.8.12"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 clap = { version = "4.5.53", features = ["derive"] }
 pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core" }
+pulsebeam-proto = { version = "0.1.0", path = "../pulsebeam-proto" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms", "disable_initial_exec_tls"] }

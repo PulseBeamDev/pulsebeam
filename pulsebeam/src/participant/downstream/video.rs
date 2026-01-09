@@ -13,7 +13,12 @@ use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastReceiver, TrackReceiver};
+use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
+
+pub struct SlotAssignment {
+    pub mid: Mid,
+    pub track: Arc<TrackMeta>,
+}
 
 #[derive(Default)]
 pub struct VideoAllocator {
@@ -30,6 +35,19 @@ impl VideoAllocator {
         if let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) {
             slot.max_height = max_height;
         }
+    }
+
+    pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
+        self.tracks.values().map(|s| &*s.track.meta)
+    }
+
+    pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> {
+        self.slots.iter().filter_map(|s| {
+            Some(SlotAssignment {
+                mid: s.mid,
+                track: s.current_receiver()?.meta.clone(),
+            })
+        })
     }
 
     pub fn add_track(&mut self, track: TrackReceiver) {
