@@ -1,65 +1,97 @@
 syntax = "proto3";
 package signaling;
 
+// ========================================================================
+// Shared Structures
+// ========================================================================
+
 enum TrackKind {
   TRACK_KIND_UNSPECIFIED = 0;
   VIDEO = 1;
   AUDIO = 2;
 }
 
-// --- Client to Server: Declare Desired State ---
-
-message DesiredSubscription {
-  string mid = 1;
-  string remote_track_id = 2;
-}
-
-// Client declares what it wants subscribed (always full state)
-message ClientState {
-  repeated DesiredSubscription subscriptions = 1;
-}
-
-message ClientRequestSync {
-  // Empty - signals client wants full snapshot
-}
-
-message ClientMessage {
-  oneof payload {
-    ClientState state = 1;
-    ClientRequestSync request_sync = 2;
-  }
-}
-
-// --- Server to Client: Report Actual State ---
-
 message TrackInfo {
   string track_id = 1;
   TrackKind kind = 2;
   string participant_id = 3;
+  
+  // Extensible metadata (e.g., "display_name", "muted", "role").
+  // Allows application-layer logic without protocol changes.
+  // map<string, string> attributes = 4;
+}
+
+// ========================================================================
+// Client -> Server (Intent)
+// ========================================================================
+
+message SubscriptionConfiguration {
+  // Reserved for future parameters (e.g., spatial_layer, max_fps, priority).
+  // uint32 quality_layer = 1;
+  // uint32 priority = 2;
+}
+
+message DesiredSubscription {
+  string mid = 1;
+  string remote_track_id = 2;
+  
+  // Optional configuration for this specific subscription.
+  SubscriptionConfiguration config = 3;
+}
+
+message DesiredSubscriptions {
+  repeated DesiredSubscription subscriptions = 1;
+}
+
+message RequestSync {}
+
+message ClientMessage {
+  oneof payload {
+    DesiredSubscriptions desired_state = 1;
+    RequestSync request_sync = 2;
+  }
+}
+
+// ========================================================================
+// Server -> Client (State Snapshots)
+// ========================================================================
+
+enum SubscriptionStatus {
+  STATUS_UNSPECIFIED = 0;
+  ACTIVE = 1;
+  PAUSED = 2;     // E.g., user muted locally
+  DEGRADED = 3;   // E.g., insufficient bandwidth
 }
 
 message ActiveSubscription {
   string mid = 1;
   TrackInfo track = 2;
+  
+  // Provides visibility into the subscription health/state.
+  // SubscriptionStatus status = 3;
 }
 
-// Delta: incremental changes (can contain track AND subscription changes atomically)
-message ServerStateDelta {
-  repeated TrackInfo tracks_added = 1;
-  repeated string tracks_removed = 2;  // track_ids
-  repeated ActiveSubscription subscriptions_added = 3;
-  repeated string subscriptions_removed = 4;  // mids
+message AvailableTracksSnapshot {
+  repeated TrackInfo tracks = 1;
 }
 
-// Snapshot: full state (on connect, reconnect, or resync request)
-message ServerStateSnapshot {
-  repeated TrackInfo available_tracks = 1;
-  repeated ActiveSubscription subscriptions = 2;
+message ActiveSubscriptionsSnapshot {
+  repeated ActiveSubscription subscriptions = 1;
+}
+
+message SignalError {
+  int32 code = 1;
+  string message = 2;
 }
 
 message ServerMessage {
-  oneof payload {
-    ServerStateSnapshot snapshot = 1;  // Initialization and recovery
-    ServerStateDelta delta = 2;      // Normal operation
-  }
+  // Independent fields. Presence implies a full replacement of that state.
+  
+  AvailableTracksSnapshot available_tracks = 1;
+  ActiveSubscriptionsSnapshot active_subscriptions = 2;
+  
+  // Future proofing: A slot for room-level state (recording status, locked, etc).
+  // RoomStateSnapshot room_state = 3;
+
+  SignalError error = 4;
 }

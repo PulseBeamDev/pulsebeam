@@ -240,9 +240,13 @@ impl ParticipantCore {
                 }),
             })
             .collect();
-        let states = signaling::ServerStateSnapshot {
-            available_tracks,
-            subscriptions,
+
+        let states = signaling::ServerMessage {
+            available_tracks: Some(signaling::AvailableTracksSnapshot {
+                tracks: available_tracks,
+            }),
+            active_subscriptions: Some(signaling::ActiveSubscriptionsSnapshot { subscriptions }),
+            error: None,
         };
         let buf = states.encode_to_vec();
 
