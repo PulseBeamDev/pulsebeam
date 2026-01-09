@@ -14,9 +14,20 @@ message DesiredSubscription {
   string remote_track_id = 2;
 }
 
-// Client declares what it wants subscribed
+// Client declares what it wants subscribed (always full state)
 message ClientState {
-  repeated DesiredSubscription subscriptions = 1;  // Full list of desired subscriptions
+  repeated DesiredSubscription subscriptions = 1;
+}
+
+message ClientRequestSync {
+  // Empty - signals client wants full snapshot
+}
+
+message ClientMessage {
+  oneof payload {
+    ClientState state = 1;
+    ClientRequestSync request_sync = 2;
+  }
 }
 
 // --- Server to Client: Report Actual State ---
@@ -32,8 +43,23 @@ message ActiveSubscription {
   TrackInfo track = 2;
 }
 
-// Server reports current reality
-message ServerState {
-  repeated TrackInfo available_tracks = 1;      // All tracks available to subscribe
-  repeated ActiveSubscription subscriptions = 2; // Your actual active subscriptions
+// Delta: incremental changes (can contain track AND subscription changes atomically)
+message ServerStateDelta {
+  repeated TrackInfo tracks_added = 1;
+  repeated string tracks_removed = 2;  // track_ids
+  repeated ActiveSubscription subscriptions_added = 3;
+  repeated string subscriptions_removed = 4;  // mids
+}
+
+// Snapshot: full state (on connect, reconnect, or resync request)
+message ServerStateSnapshot {
+  repeated TrackInfo available_tracks = 1;
+  repeated ActiveSubscription subscriptions = 2;
+}
+
+message ServerMessage {
+  oneof payload {
+    ServerStateSnapshot snapshot = 1;  // Initialization and recovery
+    ServerStateDelta delta = 2;      // Normal operation
+  }
 }

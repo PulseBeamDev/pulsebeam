@@ -240,7 +240,7 @@ impl ParticipantCore {
                 }),
             })
             .collect();
-        let states = signaling::ServerState {
+        let states = signaling::ServerStateSnapshot {
             available_tracks,
             subscriptions,
         };

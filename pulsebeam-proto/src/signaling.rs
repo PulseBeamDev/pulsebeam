@@ -6,12 +6,29 @@ pub struct DesiredSubscription {
     #[prost(string, tag = "2")]
     pub remote_track_id: ::prost::alloc::string::String,
 }
-/// Client declares what it wants subscribed
+/// Client declares what it wants subscribed (always full state)
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientState {
-    /// Full list of desired subscriptions
     #[prost(message, repeated, tag = "1")]
     pub subscriptions: ::prost::alloc::vec::Vec<DesiredSubscription>,
+}
+/// Empty - signals client wants full snapshot
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClientRequestSync {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClientMessage {
+    #[prost(oneof = "client_message::Payload", tags = "1, 2")]
+    pub payload: ::core::option::Option<client_message::Payload>,
+}
+/// Nested message and enum types in `ClientMessage`.
+pub mod client_message {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        State(super::ClientState),
+        #[prost(message, tag = "2")]
+        RequestSync(super::ClientRequestSync),
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TrackInfo {
@@ -29,15 +46,44 @@ pub struct ActiveSubscription {
     #[prost(message, optional, tag = "2")]
     pub track: ::core::option::Option<TrackInfo>,
 }
-/// Server reports current reality
+/// Delta: incremental changes (can contain track AND subscription changes atomically)
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ServerState {
-    /// All tracks available to subscribe
+pub struct ServerStateDelta {
+    #[prost(message, repeated, tag = "1")]
+    pub tracks_added: ::prost::alloc::vec::Vec<TrackInfo>,
+    /// track_ids
+    #[prost(string, repeated, tag = "2")]
+    pub tracks_removed: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub subscriptions_added: ::prost::alloc::vec::Vec<ActiveSubscription>,
+    /// mids
+    #[prost(string, repeated, tag = "4")]
+    pub subscriptions_removed: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Snapshot: full state (on connect, reconnect, or resync request)
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServerStateSnapshot {
     #[prost(message, repeated, tag = "1")]
     pub available_tracks: ::prost::alloc::vec::Vec<TrackInfo>,
-    /// Your actual active subscriptions
     #[prost(message, repeated, tag = "2")]
     pub subscriptions: ::prost::alloc::vec::Vec<ActiveSubscription>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServerMessage {
+    #[prost(oneof = "server_message::Payload", tags = "1, 2")]
+    pub payload: ::core::option::Option<server_message::Payload>,
+}
+/// Nested message and enum types in `ServerMessage`.
+pub mod server_message {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        /// Initialization and recovery
+        #[prost(message, tag = "1")]
+        Snapshot(super::ServerStateSnapshot),
+        /// Normal operation
+        #[prost(message, tag = "2")]
+        Delta(super::ServerStateDelta),
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
