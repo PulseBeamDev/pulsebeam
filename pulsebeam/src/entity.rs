@@ -78,7 +78,7 @@ pub enum IdValidationError {
 }
 
 pub fn validate_track_id(s: &str) -> Result<(), IdValidationError> {
-    validate_id_string(s, 20)
+    validate_id_string(s, 32)
 }
 
 pub fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> {
@@ -479,6 +479,6 @@ mod tests {
     #[test]
     fn test_validate_track_id() {
         let track_id = TrackId::new();
-        validate_track_id(&track_id.to_string()).unwrap();
+        validate_track_id(track_id.as_ref()).unwrap();
     }
 }
