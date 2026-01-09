@@ -93,10 +93,14 @@ impl Signaling {
     }
 
     fn apply_client_intent(
-        &self,
+        &mut self,
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
     ) {
+        if intent.requests.is_empty() {
+            return;
+        }
+
         for req in intent.requests {
             // Ensure the MID isn't massive
             if req.mid.len() > 64 {
@@ -105,6 +109,8 @@ impl Signaling {
 
             // TODO:
         }
+
+        self.mark_assignments_dirty();
     }
 
     /// Call this when the list of available tracks in the room changes

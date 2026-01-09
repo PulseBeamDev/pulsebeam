@@ -124,6 +124,7 @@ impl ParticipantCore {
             }
         }
         self.signaling.mark_tracks_dirty();
+        self.signaling.mark_assignments_dirty();
         self.update_desired_bitrate();
     }
 
@@ -135,6 +136,7 @@ impl ParticipantCore {
             self.downstream.remove_track(track);
         }
         self.signaling.mark_tracks_dirty();
+        self.signaling.mark_assignments_dirty();
         self.update_desired_bitrate();
     }
 
