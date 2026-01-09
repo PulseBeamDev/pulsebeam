@@ -81,7 +81,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ))
             .await;
         let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
-        let mut maybe_deadline = self.core.poll_rtc();
+        let mut maybe_deadline = self.core.poll();
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
 
@@ -142,7 +142,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
 
-                    maybe_deadline = self.core.poll_rtc();
+                    maybe_deadline = self.core.poll();
                     // this indicates the first batch is filled.
                     if self.core.udp_batcher.len() >= 2 {
                         self.core.udp_batcher.flush(&self.udp_egress);

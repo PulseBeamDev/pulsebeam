@@ -1,10 +1,8 @@
-use pulsebeam_proto::prelude::*;
-use pulsebeam_proto::signaling;
+use super::signaling::Signaling;
 use pulsebeam_runtime::net::{self, Transport};
 use std::collections::HashMap;
 use std::sync::Arc;
 use str0m::bwe::BweKind;
-use str0m::channel::ChannelId;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use str0m::net::Protocol;
 use str0m::{
@@ -14,18 +12,19 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::entity;
+use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
 
-const SIGNALING_CHANNEL_LABEL: &str = "__internal/v1/signaling";
-
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
     #[error("RTC engine error")]
     RtcError(#[from] RtcError),
+    #[error("Signaling error")]
+    SignalingError(#[from] signaling::SignalingError),
     #[error("ICE connection disconnected")]
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
@@ -46,8 +45,7 @@ pub struct ParticipantCore {
     pub downstream: DownstreamAllocator,
     pub events: Vec<CoreEvent>,
     disconnect_reason: Option<DisconnectReason>,
-
-    signaling_cid: Option<ChannelId>,
+    signaling: Signaling,
 }
 
 impl ParticipantCore {
@@ -66,7 +64,7 @@ impl ParticipantCore {
             downstream: DownstreamAllocator::new(),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
-            signaling_cid: None,
+            signaling: Signaling::new(),
         }
     }
 
@@ -102,7 +100,7 @@ impl ParticipantCore {
                 let _ = self
                     .rtc
                     .handle_input(Input::Receive(Instant::now().into(), recv));
-                last_deadline = self.poll_rtc();
+                last_deadline = self.poll();
             } else {
                 tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
             }
@@ -113,7 +111,7 @@ impl ParticipantCore {
 
     pub fn handle_timeout(&mut self) -> Option<Instant> {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
-        self.poll_rtc()
+        self.poll()
     }
 
     pub fn handle_available_tracks(
@@ -125,6 +123,7 @@ impl ParticipantCore {
                 self.downstream.add_track(track_handle.clone());
             }
         }
+        self.signaling.mark_tracks_dirty();
         self.update_desired_bitrate();
     }
 
@@ -135,6 +134,7 @@ impl ParticipantCore {
         for track in tracks.values() {
             self.downstream.remove_track(track);
         }
+        self.signaling.mark_tracks_dirty();
         self.update_desired_bitrate();
     }
 
@@ -144,16 +144,33 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll_rtc(&mut self) -> Option<Instant> {
+    /// The Main Orchestrator.
+    /// Drives the feedback loop between the RTC Engine and the Signaling Logic.
+    pub fn poll(&mut self) -> Option<Instant> {
         if self.disconnect_reason.is_some() {
             return None;
         }
 
+        loop {
+            let deadline = self.poll_rtc()?;
+            let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
+            if did_work {
+                // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
+                // We loop back to `poll_rtc` immediately to flush `Output::Transmit`.
+                continue;
+            }
+
+            // No new work generated. We are synced. Return the RTC deadline.
+            return Some(deadline);
+        }
+    }
+
+    /// Internal helper: Drains the RTC engine until it yields a Timeout.
+    /// Handles Transmits (UDP/TCP) and Events (Logic).
+    fn poll_rtc(&mut self) -> Option<Instant> {
         while self.rtc.is_alive() {
             match self.rtc.poll_output() {
-                Ok(Output::Timeout(deadline)) => {
-                    return Some(deadline.into());
-                }
+                Ok(Output::Timeout(deadline)) => return Some(deadline.into()),
                 Ok(Output::Transmit(tx)) => match tx.proto {
                     Protocol::Udp => self.udp_batcher.push_back(tx.destination, &tx.contents),
                     Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
@@ -166,7 +183,6 @@ impl ParticipantCore {
                 }
             }
         }
-
         None
     }
 
@@ -207,53 +223,6 @@ impl ParticipantCore {
         }
     }
 
-    fn reconcile_states(&mut self) {
-        let Some(cid) = self.signaling_cid else {
-            return;
-        };
-
-        let Some(mut ch) = self.rtc.channel(cid) else {
-            return;
-        };
-
-        // TODO: handle audio tracks
-        let available_tracks = self
-            .downstream
-            .video
-            .tracks()
-            .map(|t| signaling::TrackInfo {
-                track_id: t.id.to_string(),
-                kind: signaling::TrackKind::Video.into(),
-                participant_id: t.origin_participant.to_string(),
-            })
-            .collect();
-        let subscriptions = self
-            .downstream
-            .video
-            .slots()
-            .map(|s| signaling::ActiveSubscription {
-                mid: s.mid.to_string(),
-                track: Some(signaling::TrackInfo {
-                    track_id: s.track.id.to_string(),
-                    kind: signaling::TrackKind::Video.into(),
-                    participant_id: s.track.origin_participant.to_string(),
-                }),
-            })
-            .collect();
-
-        let states = signaling::ServerMessage {
-            available_tracks: Some(signaling::AvailableTracksSnapshot {
-                tracks: available_tracks,
-            }),
-            active_subscriptions: Some(signaling::ActiveSubscriptionsSnapshot { subscriptions }),
-            error: None,
-        };
-        let buf = states.encode_to_vec();
-
-        // TODO: handle reconcilation error
-        ch.write(true, &buf);
-    }
-
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
@@ -268,10 +237,14 @@ impl ParticipantCore {
                     self.rtc.bwe().set_desired_bitrate(desired);
                 }
             }
-            Event::ChannelOpen(cid, label) => {
-                if label == SIGNALING_CHANNEL_LABEL {
-                    self.signaling_cid = Some(cid);
-                    self.reconcile_states();
+            Event::ChannelOpen(cid, label) => self.signaling.handle_channel_open(cid, label),
+            Event::ChannelData(data) => {
+                if Some(data.id) == self.signaling.cid
+                    && let Err(err) = self
+                        .signaling
+                        .handle_input(&data.data, &mut self.downstream)
+                {
+                    self.disconnect(err.into());
                 }
             }
             // rtp monitor handles this

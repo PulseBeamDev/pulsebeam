@@ -2,7 +2,7 @@ syntax = "proto3";
 package signaling;
 
 // ========================================================================
-// Shared Structures
+// 1. Enums & Core Entities
 // ========================================================================
 
 enum TrackKind {
@@ -11,87 +11,75 @@ enum TrackKind {
   AUDIO = 2;
 }
 
-message TrackInfo {
-  string track_id = 1;
+message Track {
+  string id = 1;
   TrackKind kind = 2;
   string participant_id = 3;
-  
-  // Extensible metadata (e.g., "display_name", "muted", "role").
-  // Allows application-layer logic without protocol changes.
-  // map<string, string> attributes = 4;
+  // Extensible metadata (e.g. "display_name", "is_muted", "avatar_url").
+  map<string, string> meta = 4;
 }
 
-// ========================================================================
-// Client -> Server (Intent)
-// ========================================================================
-
-message SubscriptionConfiguration {
-  // Reserved for future parameters (e.g., spatial_layer, max_fps, priority).
-  // uint32 quality_layer = 1;
-  // uint32 priority = 2;
-}
-
-message DesiredSubscription {
+message VideoAssignment {
   string mid = 1;
-  string remote_track_id = 2;
+  string track_id = 2;
+  // Feedback indicating if the stream is actively flowing or halted by the SFU.
+  bool paused = 3;
+}
+
+// ========================================================================
+// 2. Server -> Client (Unified State Synchronization)
+// ========================================================================
+
+message StateUpdate {
+  // Monotonically strictly incrementing sequence number.
+  // Used for gap detection and ordering validation.
+  uint64 seq = 1;
+
+  // If true, the client must clear local state before applying this update.
+  // If false, the client applies changes incrementally.
+  bool is_snapshot = 2;
+
+  // Room Topology (Available Tracks)
+  repeated Track tracks_upsert = 3;
+  repeated string tracks_remove = 4;
+
+  // User State (Active Assignments)
+  repeated VideoAssignment assignments_upsert = 5;
+  repeated string assignments_remove = 6;
+}
+
+// ========================================================================
+// 3. Client -> Server (Declarative Intent)
+// ========================================================================
+
+message VideoRequest {
+  string mid = 1;
+  string track_id = 2;
   
-  // Optional configuration for this specific subscription.
-  SubscriptionConfiguration config = 3;
+  // Render height in physical pixels. 
+  // 0 = Off-screen/Hidden (Server pauses stream).
+  // >0 = Visible (Server optimizes simulcast layer).
+  uint32 height = 3;
 }
 
-message DesiredSubscriptions {
-  repeated DesiredSubscription subscriptions = 1;
+message ClientIntent {
+  repeated VideoRequest requests = 1;
 }
 
-message RequestSync {}
+// ========================================================================
+// 4. Root Transport Messages
+// ========================================================================
 
 message ClientMessage {
   oneof payload {
-    DesiredSubscriptions desired_state = 1;
-    RequestSync request_sync = 2;
+    ClientIntent intent = 1;
+    bool request_sync = 2;
   }
 }
 
-// ========================================================================
-// Server -> Client (State Snapshots)
-// ========================================================================
-
-enum SubscriptionStatus {
-  STATUS_UNSPECIFIED = 0;
-  ACTIVE = 1;
-  PAUSED = 2;     // E.g., user muted locally
-  DEGRADED = 3;   // E.g., insufficient bandwidth
-}
-
-message ActiveSubscription {
-  string mid = 1;
-  TrackInfo track = 2;
-  
-  // Provides visibility into the subscription health/state.
-  // SubscriptionStatus status = 3;
-}
-
-message AvailableTracksSnapshot {
-  repeated TrackInfo tracks = 1;
-}
-
-message ActiveSubscriptionsSnapshot {
-  repeated ActiveSubscription subscriptions = 1;
-}
-
-message SignalError {
-  int32 code = 1;
-  string message = 2;
-}
-
 message ServerMessage {
-  // Independent fields. Presence implies a full replacement of that state.
-  
-  AvailableTracksSnapshot available_tracks = 1;
-  ActiveSubscriptionsSnapshot active_subscriptions = 2;
-  
-  // Future proofing: A slot for room-level state (recording status, locked, etc).
-  // RoomStateSnapshot room_state = 3;
-
-  SignalError error = 4;
+  oneof payload {
+    StateUpdate update = 1;
+    string error = 2;
+  }
 }
