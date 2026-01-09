@@ -104,10 +104,17 @@ impl Signaling {
         }
 
         for req in intent.requests {
-            let Ok(mid_bytes) = req.mid.as_bytes().try_into() else {
-                tracing::error!("MID must be exactly 16 bytes, got {}", req.mid.len());
+            let raw_bytes = req.mid.as_bytes();
+            if raw_bytes.len() > 16 {
+                tracing::error!(
+                    mid = %req.mid,
+                    len = raw_bytes.len(),
+                    "MID exceeds maximum buffer of 16 bytes; skipping request"
+                );
                 continue;
-            };
+            }
+            let mut mid_bytes = [0u8; 16];
+            mid_bytes[..raw_bytes.len()].copy_from_slice(raw_bytes);
 
             if let Err(err) = entity::validate_track_id(&req.track_id) {
                 tracing::error!("Invalid track_id: {}", err);
@@ -116,6 +123,12 @@ impl Signaling {
 
             let mid: Mid = Mid::from_array(mid_bytes);
 
+            tracing::debug!(
+                %mid,
+                track_id = %req.track_id,
+                height = req.height,
+                "configuring downstream video slot"
+            );
             downstream
                 .video
                 .configure_slot(mid, req.track_id, req.height);
