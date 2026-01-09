@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::{fmt, hash, str::FromStr, sync::Arc};
 
 use pulsebeam_runtime::prelude::*;
@@ -76,7 +77,11 @@ pub enum IdValidationError {
     Empty,
 }
 
-fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> {
+pub fn validate_track_id(s: &str) -> Result<(), IdValidationError> {
+    validate_id_string(s, 20)
+}
+
+pub fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> {
     if s.is_empty() {
         return Err(IdValidationError::Empty);
     }
@@ -336,6 +341,12 @@ impl AsRef<str> for TrackId {
     }
 }
 
+impl Borrow<String> for TrackId {
+    fn borrow(&self) -> &String {
+        &self.internal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +474,11 @@ mod tests {
         id1.hash(&mut h1);
         id2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn test_validate_track_id() {
+        let track_id = TrackId::new();
+        validate_track_id(&track_id.to_string()).unwrap();
     }
 }

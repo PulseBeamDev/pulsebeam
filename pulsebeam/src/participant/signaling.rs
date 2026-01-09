@@ -1,8 +1,10 @@
+use crate::entity;
 use crate::participant::downstream::DownstreamAllocator;
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
 use str0m::Rtc;
 use str0m::channel::ChannelId;
+use str0m::media::Mid;
 
 const CHANNEL_LABEL: &str = "__internal/v1/signaling";
 
@@ -102,12 +104,21 @@ impl Signaling {
         }
 
         for req in intent.requests {
-            // Ensure the MID isn't massive
-            if req.mid.len() > 64 {
+            let Ok(mid_bytes) = req.mid.as_bytes().try_into() else {
+                tracing::error!("MID must be exactly 16 bytes, got {}", req.mid.len());
+                continue;
+            };
+
+            if let Err(err) = entity::validate_track_id(&req.track_id) {
+                tracing::error!("Invalid track_id: {}", err);
                 continue;
             }
 
-            // TODO:
+            let mid: Mid = Mid::from_array(mid_bytes);
+
+            downstream
+                .video
+                .configure_slot(mid, req.track_id, req.height);
         }
 
         self.mark_assignments_dirty();

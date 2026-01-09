@@ -26,9 +26,9 @@ pub enum ParticipantError {
 
 #[derive(Debug, Clone)]
 pub enum ParticipantControlMessage {
-    TracksSnapshot(HashMap<Arc<entity::TrackId>, track::TrackReceiver>),
-    TracksPublished(Arc<HashMap<Arc<entity::TrackId>, track::TrackReceiver>>),
-    TracksUnpublished(Arc<HashMap<Arc<entity::TrackId>, track::TrackReceiver>>),
+    TracksSnapshot(HashMap<entity::TrackId, track::TrackReceiver>),
+    TracksPublished(Arc<HashMap<entity::TrackId, track::TrackReceiver>>),
+    TracksUnpublished(Arc<HashMap<entity::TrackId, track::TrackReceiver>>),
     TrackPublishRejected(track::TrackReceiver),
 }
 

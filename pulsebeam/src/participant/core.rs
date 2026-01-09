@@ -114,10 +114,7 @@ impl ParticipantCore {
         self.poll()
     }
 
-    pub fn handle_available_tracks(
-        &mut self,
-        tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
-    ) {
+    pub fn handle_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
         for track_handle in tracks.values() {
             if track_handle.meta.origin_participant != self.participant_id {
                 self.downstream.add_track(track_handle.clone());
@@ -128,10 +125,7 @@ impl ParticipantCore {
         self.update_desired_bitrate();
     }
 
-    pub fn remove_available_tracks(
-        &mut self,
-        tracks: &HashMap<Arc<entity::TrackId>, TrackReceiver>,
-    ) {
+    pub fn remove_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
         for track in tracks.values() {
             self.downstream.remove_track(track);
         }
@@ -280,7 +274,7 @@ impl ParticipantCore {
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id = Arc::new(entity::TrackId::new());
+                let track_id = entity::TrackId::new();
                 let track_meta = Arc::new(track::TrackMeta {
                     id: track_id,
                     origin_participant: self.participant_id.clone(),

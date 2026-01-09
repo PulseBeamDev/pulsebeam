@@ -25,7 +25,7 @@ pub enum RoomMessage {
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
-    tracks: HashMap<Arc<TrackId>, track::TrackReceiver>,
+    tracks: HashMap<TrackId, track::TrackReceiver>,
 }
 
 pub struct RoomMessageSet;
@@ -54,7 +54,7 @@ pub struct RoomActor {
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
     participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
-    tracks: HashMap<Arc<TrackId>, track::TrackReceiver>,
+    tracks: HashMap<TrackId, track::TrackReceiver>,
 }
 
 impl actor::Actor<RoomMessageSet> for RoomActor {

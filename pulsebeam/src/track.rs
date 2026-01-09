@@ -43,7 +43,7 @@ impl std::fmt::Debug for SimulcastQuality {
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct TrackMeta {
-    pub id: Arc<crate::entity::TrackId>,
+    pub id: crate::entity::TrackId,
     pub origin_participant: Arc<crate::entity::ParticipantId>,
     pub kind: MediaKind,
     pub simulcast_rids: Option<Vec<Rid>>,

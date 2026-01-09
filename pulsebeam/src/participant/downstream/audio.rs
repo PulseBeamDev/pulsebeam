@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use tokio_stream::StreamMap;
 
 pub struct AudioAllocator {
-    inputs: StreamMap<Arc<TrackId>, spmc::Receiver<RtpPacket>>,
+    inputs: StreamMap<TrackId, spmc::Receiver<RtpPacket>>,
     slots: Vec<AudioSlot>,
     waker: Option<Waker>,
 }
@@ -40,7 +40,7 @@ impl AudioAllocator {
         }
     }
 
-    pub fn remove_track(&mut self, id: &Arc<TrackId>) {
+    pub fn remove_track(&mut self, id: &TrackId) {
         for slot in &mut self.slots {
             if slot.current_track_id.as_ref() == Some(id) {
                 slot.current_track_id = None;
@@ -100,7 +100,7 @@ impl AudioAllocator {
 struct AudioSlot {
     mid: Mid,
     timeline: Timeline,
-    current_track_id: Option<Arc<TrackId>>,
+    current_track_id: Option<TrackId>,
     last_active_at: Instant,
 }
 
@@ -114,7 +114,7 @@ impl AudioSlot {
         }
     }
 
-    fn process(&mut self, track_id: &Arc<TrackId>, packet: RtpPacket) -> (Mid, RtpPacket) {
+    fn process(&mut self, track_id: &TrackId, packet: RtpPacket) -> (Mid, RtpPacket) {
         let now = Instant::now();
 
         if self.current_track_id.as_ref() != Some(track_id) {

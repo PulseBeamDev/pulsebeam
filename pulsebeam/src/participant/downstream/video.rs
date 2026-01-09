@@ -12,7 +12,7 @@ use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
 use tokio::time::Instant;
 
-use crate::entity::TrackId;
+use crate::entity::{EntityId, TrackId};
 use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
 pub struct SlotAssignment {
@@ -22,7 +22,7 @@ pub struct SlotAssignment {
 
 #[derive(Default)]
 pub struct VideoAllocator {
-    tracks: HashMap<Arc<TrackId>, TrackState>,
+    tracks: HashMap<TrackId, TrackState>,
     slots: Vec<Slot>,
 
     ticks: u32,
@@ -31,10 +31,35 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
-    pub fn set_slot_max_height(&mut self, mid: Mid, max_height: u32) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) {
-            slot.max_height = max_height;
+    pub fn configure_slot(&mut self, mid: Mid, track_id: EntityId, max_height: u32) {
+        if !self.tracks.contains_key(&track_id) {
+            tracing::warn!(%track_id, "ignoring slot configuration, track doesn't exist");
+            return;
         }
+
+        let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) else {
+            tracing::warn!("ignoring slot configuration, mid={} doesn't exist", mid);
+            return;
+        };
+
+        if let Some(current) = slot.current_receiver()
+            && let Some(current_state) = self.tracks.get_mut(&current.meta.id)
+        {
+            current_state.assigned_mid = None;
+        }
+
+        let Some(track_state) = self.tracks.get_mut(&track_id) else {
+            // This shouldn't happen
+            return;
+        };
+        slot.max_height = max_height;
+        let layer = track_state.track.lowest_quality().clone();
+        if slot.max_height == 0 {
+            slot.assign_to(layer);
+        } else {
+            slot.switch_to(layer);
+        }
+        track_state.assigned_mid = Some(mid);
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
@@ -69,7 +94,7 @@ impl VideoAllocator {
         self.rebalance();
     }
 
-    pub fn remove_track(&mut self, track_id: &Arc<TrackId>) {
+    pub fn remove_track(&mut self, track_id: &TrackId) {
         if let Some(track) = self.tracks.remove(track_id) {
             tracing::info!(
                 track = %track_id,
