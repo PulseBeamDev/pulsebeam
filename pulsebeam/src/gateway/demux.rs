@@ -1,4 +1,5 @@
 use pulsebeam_runtime::mailbox::SendError;
+use pulsebeam_runtime::net::UnifiedSocketReader;
 use pulsebeam_runtime::{mailbox, net};
 
 use crate::entity::ParticipantId;
@@ -54,13 +55,18 @@ impl Demuxer {
     }
 
     /// Removes a participant and all associated state (ufrag and address mappings).
-    pub fn unregister(&mut self, participant_id: &Arc<ParticipantId>) {
+    pub fn unregister(
+        &mut self,
+        socket: &mut UnifiedSocketReader,
+        participant_id: &Arc<ParticipantId>,
+    ) {
         if let Some(ufrag) = self.participant_ufrag.remove(participant_id) {
             self.ufrag_map.remove(&ufrag);
             // Use the ufrag_addrs map to efficiently clean the addr_map
             if let Some(addrs) = self.ufrag_addrs.remove(&ufrag) {
                 for addr in addrs {
                     self.addr_map.remove(&addr);
+                    socket.close_peer(&addr);
                 }
             }
         }

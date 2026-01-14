@@ -140,7 +140,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
                     .register_ice_ufrag(participant_id, ufrag.as_bytes(), handle);
             }
             GatewayControlMessage::RemoveParticipant(participant_id) => {
-                self.demuxer.unregister(&participant_id);
+                self.demuxer.unregister(&mut self.socket, &participant_id);
             }
         };
     }
