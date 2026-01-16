@@ -89,6 +89,14 @@ pub struct SimulcastSender {
     keyframe_requests: Option<mpsc::Receiver<KeyframeRequestKind>>,
 }
 
+impl PartialEq for SimulcastSender {
+    fn eq(&self, other: &Self) -> bool {
+        self.mid == other.mid && self.rid == other.rid
+    }
+}
+
+impl Eq for SimulcastSender {}
+
 impl SimulcastSender {
     pub fn poll_stats(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.monitor.poll(now, is_any_sibling_active);
@@ -117,6 +125,7 @@ impl SimulcastSender {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub struct TrackSender {
     pub meta: Arc<TrackMeta>,
     pub simulcast: Vec<SimulcastSender>,
