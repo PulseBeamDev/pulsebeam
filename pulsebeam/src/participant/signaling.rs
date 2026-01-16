@@ -101,12 +101,10 @@ impl Signaling {
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
     ) {
-        if intent.requests.is_empty() {
-            return;
-        }
+        let mut requested_mids = std::collections::HashSet::new();
 
+        // Configure requested slots
         for req in intent.requests {
-            // Validation logic omitted for brevity (same as original)
             if req.mid.len() > 16 {
                 continue;
             }
@@ -114,11 +112,25 @@ impl Signaling {
                 continue;
             }
 
-            let mid: Mid = Mid::from(req.mid.as_str());
+            let mid = Mid::from(req.mid.as_str());
+            requested_mids.insert(mid);
+
             downstream
                 .video
                 .configure_slot(mid, req.track_id, req.height);
         }
+
+        // Clear unrequested slots (Garbage Collect)
+        // We query the allocator for what is CURRENTLY active
+        let active_mids: Vec<Mid> = downstream.video.slots().map(|s| s.mid).collect();
+
+        for mid in active_mids {
+            // If the client didn't ask for it in this intent, kill it.
+            if !requested_mids.contains(&mid) {
+                downstream.video.clear_slot(mid);
+            }
+        }
+
         self.mark_assignments_dirty();
     }
 

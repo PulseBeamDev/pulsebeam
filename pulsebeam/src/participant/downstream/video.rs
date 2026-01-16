@@ -31,6 +31,27 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
+    /// Explicitly releases a slot, stopping any media and unbinding the track.
+    pub fn clear_slot(&mut self, mid: Mid) {
+        let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) else {
+            return;
+        };
+
+        if let Some(current) = slot.current_receiver()
+            && let Some(state) = self.tracks.get_mut(&current.meta.id)
+        {
+            state.assigned_mid = None;
+        }
+
+        tracing::debug!(%mid, "clearing video slot");
+        slot.stop();
+        slot.max_height = 0;
+
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
     pub fn configure_slot(&mut self, mid: Mid, track_id: EntityId, max_height: u32) {
         if !self.tracks.contains_key(&track_id) {
             tracing::warn!(%track_id, "ignoring slot configuration, track doesn't exist");
