@@ -57,7 +57,7 @@ impl VideoAllocator {
         if slot.max_height == 0 {
             slot.assign_to(layer);
         } else {
-            slot.switch_to(layer);
+            slot.switch_to(layer, false);
         }
         track_state.assigned_mid = Some(mid);
     }
@@ -346,7 +346,7 @@ impl VideoAllocator {
             if plan.paused {
                 slot.assign_to(plan.receiver);
             } else {
-                slot.switch_to(plan.receiver);
+                slot.switch_to(plan.receiver, false);
             }
         }
 
@@ -498,34 +498,43 @@ impl Slot {
 
     // similar to switch_to but it will start as paused
     pub fn assign_to(&mut self, receiver: SimulcastReceiver) {
-        self.transition_to(SlotState::Paused { active: receiver });
+        self.transition_to(SlotState::Paused {
+            active: receiver.clone(),
+        });
     }
 
-    pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
+    pub fn is_switchable(&mut self, receiver: &SimulcastReceiver) -> bool {
         if let Some(current) = self.target_receiver() {
             // Case 1: nothing change, do nothing.
             if current.rid == receiver.rid && current.meta.id == receiver.meta.id {
                 // if we're paused currently, we're resuming with same receiver.
                 if !self.is_paused() {
-                    return;
+                    return false;
                 }
             // Case 2: Block rapid upgrades while already switching
             } else if current.meta.id == receiver.meta.id
                 && receiver.quality >= current.quality
                 && self.is_switching()
             {
-                return;
+                return false;
             }
         }
 
         // there are buffered packets, we must flush them first before dropping packets
         if !self.switcher.ready_to_switch() {
+            return false;
+        }
+
+        return true;
+    }
+
+    pub fn switch_to(&mut self, mut receiver: SimulcastReceiver, force: bool) {
+        if force || !self.is_switchable(&receiver) {
             return;
         }
 
         // Take ownership of state to move internals
         let old_state = self.state.take().unwrap_or(SlotState::Idle);
-
         receiver.channel.reset();
         receiver.request_keyframe(KeyframeRequestKind::Fir);
         self.switching_started_at = Some(Instant::now());
