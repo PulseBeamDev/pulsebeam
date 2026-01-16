@@ -502,12 +502,20 @@ impl Slot {
     }
 
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver) {
-        if let Some(current) = self.target_receiver()
-            && current.rid == receiver.rid
-            && current.meta.id == receiver.meta.id
-            && !self.is_paused()
-        {
-            return;
+        if let Some(current) = self.target_receiver() {
+            // Case 1: nothing change, do nothing.
+            if current.rid == receiver.rid && current.meta.id == receiver.meta.id {
+                // if we're paused currently, we're resuming with same receiver.
+                if !self.is_paused() {
+                    return;
+                }
+            // Case 2: Block rapid upgrades while already switching
+            } else if current.meta.id == receiver.meta.id
+                && receiver.quality >= current.quality
+                && self.is_switching()
+            {
+                return;
+            }
         }
 
         // there are buffered packets, we must flush them first before dropping packets
@@ -575,6 +583,13 @@ impl Slot {
 
     pub fn is_idle(&self) -> bool {
         matches!(self.state(), SlotState::Idle)
+    }
+
+    pub fn is_switching(&self) -> bool {
+        matches!(
+            self.state(),
+            SlotState::Resuming { .. } | SlotState::Switching { .. }
+        )
     }
 
     pub fn stop(&mut self) {

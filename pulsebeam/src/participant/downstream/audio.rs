@@ -6,7 +6,6 @@ use crate::rtp;
 use crate::rtp::RtpPacket;
 use crate::rtp::timeline::Timeline;
 use crate::track::TrackReceiver;
-use std::sync::Arc;
 use std::task::Waker;
 use std::task::ready;
 use std::task::{Context, Poll};
