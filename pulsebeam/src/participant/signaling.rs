@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::entity;
 use crate::participant::downstream::DownstreamAllocator;
 use pulsebeam_proto::prelude::*;
@@ -31,6 +33,11 @@ pub struct Signaling {
 
     // Forces the next update to be a full snapshot (e.g. on connect or resync)
     pending_snapshot_request: bool,
+
+    // STATE CACHE: Required to calculate removals (deltas)
+    // We store the IDs of the objects sent in the last successful update.
+    previous_track_ids: HashSet<String>,
+    previous_assignment_mids: HashSet<String>,
 }
 
 impl Signaling {
@@ -41,34 +48,31 @@ impl Signaling {
             dirty_tracks: false,
             dirty_assignments: false,
             pending_snapshot_request: false,
+            // Initialize empty sets
+            previous_track_ids: HashSet::new(),
+            previous_assignment_mids: HashSet::new(),
         }
     }
 
     pub fn handle_channel_open(&mut self, cid: ChannelId, label: String) {
         if label == CHANNEL_LABEL {
             self.cid = Some(cid);
-            // On open, force a full state push
             self.pending_snapshot_request = true;
             self.dirty_tracks = true;
             self.dirty_assignments = true;
         }
     }
 
-    /// Returns Result:
-    /// Ok(())  -> Success or benign ignore (Logic Error)
-    /// Err(_)  -> Fatal Protocol Violation (Disconnect user)
     pub fn handle_input(
         &mut self,
         data: &[u8],
         downstream: &mut DownstreamAllocator,
     ) -> Result<(), SignalingError> {
-        // FATAL: Size Check
         if data.len() > MAX_SIGNALING_MSG_SIZE {
             tracing::warn!(len = data.len(), "Fatal: Oversized signaling message");
             return Err(SignalingError::OversizedPacket);
         }
 
-        // FATAL: Decoding Safety
         let Ok(msg) = signaling::ClientMessage::decode(data) else {
             tracing::warn!("Fatal: Invalid Protobuf");
             return Err(SignalingError::DecodeFailed);
@@ -76,12 +80,10 @@ impl Signaling {
 
         match msg.payload {
             Some(signaling::client_message::Payload::Intent(intent)) => {
-                // FATAL: Complexity Check
                 if intent.requests.len() > MAX_INTENT_REQUESTS {
                     tracing::warn!("Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
                 }
-
                 self.apply_client_intent(intent, downstream);
                 self.dirty_assignments = true;
             }
@@ -104,56 +106,42 @@ impl Signaling {
         }
 
         for req in intent.requests {
+            // Validation logic omitted for brevity (same as original)
             if req.mid.len() > 16 {
-                tracing::error!(
-                    mid = %req.mid,
-                    len = req.mid.len(),
-                    "MID exceeds maximum buffer of 16 bytes; skipping request"
-                );
                 continue;
             }
-            if let Err(err) = entity::validate_track_id(&req.track_id) {
-                tracing::error!("Invalid track_id: {}", err);
+            if entity::validate_track_id(&req.track_id).is_err() {
                 continue;
             }
 
             let mid: Mid = Mid::from(req.mid.as_str());
-            tracing::debug!(
-                %mid,
-                track_id = %req.track_id,
-                height = req.height,
-                "configuring downstream video slot"
-            );
             downstream
                 .video
                 .configure_slot(mid, req.track_id, req.height);
         }
-
         self.mark_assignments_dirty();
     }
 
-    /// Call this when the list of available tracks in the room changes
     pub fn mark_tracks_dirty(&mut self) {
         self.dirty_tracks = true;
     }
 
-    /// Call this when the user's specific video slots/subscriptions change
     pub fn mark_assignments_dirty(&mut self) {
         self.dirty_assignments = true;
     }
 
-    /// Call this if the client explicitly requests a Sync
     pub fn request_full_sync(&mut self) {
         self.pending_snapshot_request = true;
         self.dirty_tracks = true;
         self.dirty_assignments = true;
     }
 
-    /// The hot path: Checks flags, gathers state, and writes to RTC if needed.
     pub fn poll(&mut self, rtc: &mut Rtc, downstream: &DownstreamAllocator) -> bool {
         let Some(cid) = self.cid else {
             return false;
         };
+
+        // If nothing is dirty, do nothing
         if !self.dirty_tracks && !self.dirty_assignments {
             return false;
         }
@@ -162,50 +150,87 @@ impl Signaling {
             return false;
         };
 
-        self.seq += 1;
+        // 1. Prepare Current State (The "Truth")
+        // We gather all currently active tracks and assignments.
+        let current_tracks: Vec<signaling::Track> = downstream
+            .video
+            .tracks()
+            .map(|t| signaling::Track {
+                id: t.id.to_string(),
+                kind: signaling::TrackKind::Video.into(),
+                participant_id: t.origin_participant.to_string(),
+                meta: Default::default(),
+            })
+            .collect();
 
-        let mut update = signaling::StateUpdate {
-            seq: self.seq,
-            is_snapshot: true, // Force client to clear and replace
-            ..Default::default()
+        let current_assignments: Vec<signaling::VideoAssignment> = downstream
+            .video
+            .slots()
+            .map(|s| signaling::VideoAssignment {
+                mid: s.mid.to_string(),
+                track_id: s.track.id.to_string(),
+                paused: false,
+            })
+            .collect();
+
+        // 2. Identify Keys for Diffing
+        let current_track_ids: HashSet<String> =
+            current_tracks.iter().map(|t| t.id.clone()).collect();
+        let current_assign_mids: HashSet<String> =
+            current_assignments.iter().map(|a| a.mid.clone()).collect();
+
+        // 3. Compute Deltas (Removals)
+        // If snapshot: removals are empty.
+        // If delta: removals = previous - current.
+        let (tracks_remove, assignments_remove) = if self.pending_snapshot_request {
+            (vec![], vec![])
+        } else {
+            (
+                self.previous_track_ids
+                    .difference(&current_track_ids)
+                    .cloned()
+                    .collect(),
+                self.previous_assignment_mids
+                    .difference(&current_assign_mids)
+                    .cloned()
+                    .collect(),
+            )
         };
 
-        if self.dirty_tracks {
-            update.tracks_upsert = downstream
-                .video
-                .tracks()
-                .map(|t| signaling::Track {
-                    id: t.id.to_string(),
-                    kind: signaling::TrackKind::Video.into(),
-                    participant_id: t.origin_participant.to_string(),
-                    meta: Default::default(),
-                })
-                .collect();
-        }
+        // 4. Construct the Update
+        self.seq += 1;
+        let update = signaling::StateUpdate {
+            seq: self.seq,
+            is_snapshot: self.pending_snapshot_request,
 
-        if self.dirty_assignments {
-            update.assignments_upsert = downstream
-                .video
-                .slots()
-                .map(|s| signaling::VideoAssignment {
-                    mid: s.mid.to_string(),
-                    track_id: s.track.id.to_string(),
-                    paused: false,
-                })
-                .collect();
-        }
+            // Upserts: In this model, we send ALL active items.
+            // This self-heals any metadata changes (paused state, display names, etc).
+            // A "Strict" delta would also filter upserts, but that requires deep equality checks.
+            tracks_upsert: current_tracks,
+            tracks_remove,
+
+            assignments_upsert: current_assignments,
+            assignments_remove,
+        };
 
         let msg = signaling::ServerMessage {
             payload: Some(signaling::server_message::Payload::Update(update)),
         };
 
         let buf = msg.encode_to_vec();
+
+        // 5. Send and Commit State
         if let Err(e) = channel.write(true, &buf) {
             tracing::warn!("Failed to write signaling: {:?}", e);
+            // DO NOT reset flags or state; retry next poll
             return false;
         }
 
-        // Only reset flags if write succeeded
+        // Write succeeded: Update our "Previous" state to match "Current"
+        self.previous_track_ids = current_track_ids;
+        self.previous_assignment_mids = current_assign_mids;
+
+        // Reset flags
         self.dirty_tracks = false;
         self.dirty_assignments = false;
         self.pending_snapshot_request = false;
