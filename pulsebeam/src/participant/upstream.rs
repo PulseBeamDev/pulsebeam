@@ -3,9 +3,11 @@ use tokio::time::Instant;
 use tokio_stream::StreamMap;
 
 use crate::{rtp::RtpPacket, track::KeyframeRequestStream};
-use str0m::media::{Mid, Rid};
+use str0m::media::{MediaKind, Mid, Rid};
 
 use crate::track::TrackSender;
+
+const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
 
 const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 type StreamKey = (Mid, Option<Rid>);
@@ -37,19 +39,46 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, mid: Mid, mut track: TrackSender) {
-        if track.meta.kind.is_video() {
-            for sender in track.simulcast.iter_mut() {
-                let key = (mid, sender.rid);
-                self.keyframe_request_streams
-                    .insert(key, sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
+    pub fn add_published_track(&mut self, mid: Mid, mut track: TrackSender) -> bool {
+        if self.published_tracks.iter().any(|s| s.mid == mid) {
+            tracing::warn!("duplicated slot mid={}.", mid);
+            return false;
+        }
+
+        match track.meta.kind {
+            MediaKind::Video => {
+                let video_count = self
+                    .published_tracks
+                    .iter()
+                    .filter(|s| s.track.meta.kind == MediaKind::Video)
+                    .count();
+
+                if video_count >= MAX_UPSTREAM_SLOT_PER_TYPE {
+                    return false;
+                }
+
+                for sender in track.simulcast.iter_mut() {
+                    let key = (mid, sender.rid);
+                    self.keyframe_request_streams
+                        .insert(key, sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
+                }
+            }
+            MediaKind::Audio => {
+                let audio_count = self
+                    .published_tracks
+                    .iter()
+                    .filter(|s| s.track.meta.kind == MediaKind::Audio)
+                    .count();
+
+                if audio_count >= MAX_UPSTREAM_SLOT_PER_TYPE {
+                    return false;
+                }
             }
         }
 
         let slot = UpstreamSlot { mid, track };
-        if !self.published_tracks.contains(&slot) {
-            self.published_tracks.push(slot);
-        }
+        self.published_tracks.push(slot);
+        true
     }
 
     pub fn handle_incoming_rtp(

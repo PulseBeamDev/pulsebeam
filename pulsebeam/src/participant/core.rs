@@ -29,6 +29,8 @@ pub enum DisconnectReason {
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
     InvalidMediaDirection,
+    #[error("Exceeded maximum upstream tracks: only 1 video and 1 audio allowed")]
+    TooManyUpstreamTracks,
 }
 
 #[derive(Debug)]
@@ -284,7 +286,10 @@ impl ParticipantCore {
                         .map(|s| s.recv.iter().map(|l| l.rid).collect()),
                 });
                 let (tx, rx) = track::new(media.mid, track_meta, 128);
-                self.upstream.add_published_track(media.mid, tx);
+                let accepted = self.upstream.add_published_track(media.mid, tx);
+                if !accepted {
+                    self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+                }
                 self.events.push(CoreEvent::SpawnTrack(rx));
             }
             Direction::SendOnly => {
