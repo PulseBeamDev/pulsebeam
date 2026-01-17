@@ -37,6 +37,10 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn configure(&mut self, intents: Vec<Intent>) {
         let tracks = &mut self.tracks;
         for slot in &mut self.slots {

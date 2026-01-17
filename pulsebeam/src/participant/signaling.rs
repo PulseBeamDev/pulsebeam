@@ -25,6 +25,7 @@ pub enum SignalingError {
 pub struct Signaling {
     pub cid: Option<ChannelId>,
     seq: u64,
+    slot_count: usize,
 
     // Dirty flags allow us to batch updates and only serialize when necessary
     dirty_tracks: bool,
@@ -50,7 +51,13 @@ impl Signaling {
             // Initialize empty sets
             previous_track_ids: HashSet::new(),
             previous_assignment_mids: HashSet::new(),
+
+            slot_count: 0,
         }
+    }
+
+    pub fn set_slot_count(&mut self, slot_count: usize) {
+        self.slot_count = slot_count;
     }
 
     pub fn handle_channel_open(&mut self, cid: ChannelId, label: String) {
@@ -79,7 +86,7 @@ impl Signaling {
 
         match msg.payload {
             Some(signaling::client_message::Payload::Intent(intent)) => {
-                if intent.requests.len() > self.previous_assignment_mids.len() {
+                if intent.requests.len() > self.slot_count {
                     tracing::warn!("Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
                 }

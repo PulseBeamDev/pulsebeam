@@ -294,6 +294,8 @@ impl ParticipantCore {
             }
             Direction::SendOnly => {
                 self.downstream.add_slot(media.mid, media.kind);
+                self.signaling
+                    .set_slot_count(self.downstream.video.slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
