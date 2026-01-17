@@ -20,6 +20,12 @@ pub struct SlotAssignment {
     pub track: Arc<TrackMeta>,
 }
 
+pub struct Intent {
+    pub mid: Mid,
+    pub track_id: EntityId,
+    pub max_height: u32,
+}
+
 #[derive(Default)]
 pub struct VideoAllocator {
     tracks: HashMap<TrackId, TrackState>,
@@ -31,56 +37,52 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
-    /// Explicitly releases a slot, stopping any media and unbinding the track.
-    pub fn clear_slot(&mut self, mid: Mid) {
-        let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) else {
-            return;
-        };
+    pub fn configure(&mut self, intents: Vec<Intent>) {
+        let tracks = &mut self.tracks;
+        for slot in &mut self.slots {
+            if let Some(intent) = intents.iter().find(|i| i.mid == slot.mid) {
+                Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id));
+            } else {
+                Self::configure_slot(tracks, slot, 0, None);
+            }
+        }
+    }
 
-        if let Some(current) = slot.current_receiver()
-            && let Some(state) = self.tracks.get_mut(&current.meta.id)
+    fn configure_slot(
+        tracks: &mut HashMap<TrackId, TrackState>,
+        slot: &mut Slot,
+        max_height: u32,
+        track_id: Option<&EntityId>,
+    ) {
+        // If we are switching A->B, 'B' is the one holding the assignment,
+        // so we must clear B if we are about to change our mind.
+        if let Some(target) = slot.target_receiver()
+            && let Some(state) = tracks.get_mut(&target.meta.id)
         {
             state.assigned_mid = None;
         }
 
-        tracing::debug!(%mid, "clearing video slot");
-        slot.stop();
-        slot.max_height = 0;
-
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-    }
-
-    pub fn configure_slot(&mut self, mid: Mid, track_id: EntityId, max_height: u32) {
-        if !self.tracks.contains_key(&track_id) {
-            tracing::warn!(%track_id, "ignoring slot configuration, track doesn't exist");
-            return;
-        }
-
-        let Some(slot) = self.slots.iter_mut().find(|s| s.mid == mid) else {
-            tracing::warn!("ignoring slot configuration, mid={} doesn't exist", mid);
-            return;
-        };
-
-        if let Some(current) = slot.current_receiver()
-            && let Some(current_state) = self.tracks.get_mut(&current.meta.id)
+        if let Some(track_id) = track_id
+            && max_height > 0
         {
-            current_state.assigned_mid = None;
+            let Some(track_state) = tracks.get_mut(track_id) else {
+                return;
+            };
+
+            let layer = if let Some(target) = slot.target_receiver()
+                && target.meta.id == track_state.track.meta.id
+            {
+                target
+            } else {
+                track_state.track.lowest_quality()
+            };
+            slot.switch_to(layer.clone(), false);
+            track_state.assigned_mid = Some(slot.mid);
+        } else {
+            slot.stop();
         }
 
-        let Some(track_state) = self.tracks.get_mut(&track_id) else {
-            // This shouldn't happen
-            return;
-        };
         slot.max_height = max_height;
-        let layer = track_state.track.lowest_quality().clone();
-        if slot.max_height == 0 {
-            slot.assign_to(layer);
-        } else {
-            slot.switch_to(layer, false);
-        }
-        track_state.assigned_mid = Some(mid);
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {

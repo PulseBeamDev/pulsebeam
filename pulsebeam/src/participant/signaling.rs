@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::entity;
-use crate::participant::downstream::DownstreamAllocator;
+use crate::participant::downstream::{DownstreamAllocator, Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
 use str0m::Rtc;
@@ -11,7 +11,6 @@ use str0m::media::Mid;
 const CHANNEL_LABEL: &str = "__internal/v1/signaling";
 
 const MAX_SIGNALING_MSG_SIZE: usize = 16 * 1024; // 16 KB (Signaling shouldn't be huge)
-const MAX_INTENT_REQUESTS: usize = 50; // Max video tracks a user can subscribe to at once
 
 #[derive(Debug, thiserror::Error)]
 pub enum SignalingError {
@@ -80,7 +79,7 @@ impl Signaling {
 
         match msg.payload {
             Some(signaling::client_message::Payload::Intent(intent)) => {
-                if intent.requests.len() > MAX_INTENT_REQUESTS {
+                if intent.requests.len() > self.previous_assignment_mids.len() {
                     tracing::warn!("Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
                 }
@@ -101,9 +100,7 @@ impl Signaling {
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
     ) {
-        let mut requested_mids = std::collections::HashSet::new();
-
-        // Configure requested slots
+        let mut intents = Vec::with_capacity(intent.requests.len());
         for req in intent.requests {
             if req.mid.len() > 16 {
                 continue;
@@ -113,24 +110,18 @@ impl Signaling {
             }
 
             let mid = Mid::from(req.mid.as_str());
-            requested_mids.insert(mid);
 
-            downstream
-                .video
-                .configure_slot(mid, req.track_id, req.height);
-        }
-
-        // Clear unrequested slots (Garbage Collect)
-        // We query the allocator for what is CURRENTLY active
-        let active_mids: Vec<Mid> = downstream.video.slots().map(|s| s.mid).collect();
-
-        for mid in active_mids {
-            // If the client didn't ask for it in this intent, kill it.
-            if !requested_mids.contains(&mid) {
-                downstream.video.clear_slot(mid);
+            if req.height == 0 {
+                continue;
             }
-        }
 
+            intents.push(Intent {
+                mid,
+                track_id: req.track_id,
+                max_height: req.height,
+            });
+        }
+        downstream.video.configure(intents);
         self.mark_assignments_dirty();
     }
 
