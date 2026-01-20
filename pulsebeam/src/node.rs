@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 /// A pair of reader/writer for a transport connection.
@@ -201,7 +202,9 @@ impl NodeBuilder {
                 ])
                 .max_age(Duration::from_secs(86400));
 
-            let router = api::router(controller_handle, api_cfg).layer(cors);
+            let router = api::router(controller_handle, api_cfg)
+                .layer(cors)
+                .layer(CompressionLayer::new().zstd(true));
             let http_shutdown = shutdown.clone();
 
             join_set.spawn(async move {
