@@ -189,7 +189,7 @@ impl Signaling {
         let current_assign_mids: HashSet<String> =
             current_assignments.iter().map(|a| a.mid.clone()).collect();
 
-        // 3. Compute Deltas (Removals)
+        // 3. Compute Deltas
         // If snapshot: removals are empty.
         // If delta: removals = previous - current.
         let (tracks_remove, assignments_remove) = if self.pending_snapshot_request {
@@ -206,6 +206,29 @@ impl Signaling {
                     .collect(),
             )
         };
+        let (tracks_upsert, assignments_upsert) = if self.pending_snapshot_request {
+            (current_tracks, current_assignments)
+        } else {
+            let track_ids_upsert: HashSet<String> = current_track_ids
+                .difference(&self.previous_track_ids)
+                .cloned()
+                .collect();
+            let assignment_mids_upsert: HashSet<String> = current_assign_mids
+                .difference(&self.previous_assignment_mids)
+                .cloned()
+                .collect();
+
+            (
+                current_tracks
+                    .into_iter()
+                    .filter(|t| track_ids_upsert.contains(&t.id))
+                    .collect(),
+                current_assignments
+                    .into_iter()
+                    .filter(|a| assignment_mids_upsert.contains(&a.mid))
+                    .collect(),
+            )
+        };
 
         // 4. Construct the Update
         self.seq += 1;
@@ -213,13 +236,10 @@ impl Signaling {
             seq: self.seq,
             is_snapshot: self.pending_snapshot_request,
 
-            // Upserts: In this model, we send ALL active items.
-            // This self-heals any metadata changes (paused state, display names, etc).
-            // A "Strict" delta would also filter upserts, but that requires deep equality checks.
-            tracks_upsert: current_tracks,
+            tracks_upsert,
             tracks_remove,
 
-            assignments_upsert: current_assignments,
+            assignments_upsert,
             assignments_remove,
         };
 
