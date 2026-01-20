@@ -5,3 +5,4 @@ dist
 *.data
 *.data.old
 venv
+workspace.*
