@@ -26,7 +26,7 @@ impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
         let server_base_uri = format!("http://{}:3000", server_ip);
-        let api = HttpApiClient::new(client, server_base_uri);
+        let api = HttpApiClient::new(client, &server_base_uri)?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
 

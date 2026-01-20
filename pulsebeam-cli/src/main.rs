@@ -23,10 +23,10 @@ fn main() {
 
 async fn main_loop() {
     let http_client = Box::new(reqwest::Client::new());
-    let signaling = HttpApiClient::new(http_client, "http://localhost:3000");
+    let api = HttpApiClient::new(http_client, "http://localhost:3000").unwrap();
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let mut join_set = JoinSet::new();
-    let mut agent = AgentBuilder::new(signaling, socket)
+    let mut agent = AgentBuilder::new(api, socket)
         .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
         .connect("demo")
         .await

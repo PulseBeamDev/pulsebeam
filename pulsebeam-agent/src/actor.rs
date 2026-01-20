@@ -1,7 +1,6 @@
-use crate::api::{ApiError, HttpApiClient};
+use crate::api::{ApiError, CreateParticipantRequest, DeleteParticipantRequest, HttpApiClient};
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
-use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -200,10 +199,16 @@ impl AgentBuilder {
         }
 
         let (offer, pending) = sdp.apply().expect("offer is required");
-        let (answer, resource_uri) = self.api.connect(room_id, offer).await?;
+        let resp = self
+            .api
+            .create_participant(CreateParticipantRequest {
+                room_id: room_id.to_string(),
+                offer,
+            })
+            .await?;
 
         rtc.sdp_api()
-            .accept_answer(pending, answer)
+            .accept_answer(pending, resp.answer)
             .map_err(AgentError::Rtc)?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
@@ -227,7 +232,8 @@ impl AgentBuilder {
         });
 
         Ok(Agent {
-            resource_uri,
+            room_id: room_id.to_string(),
+            participant_id: resp.participant_id,
             api: self.api,
             cmd_tx,
             event_rx,
@@ -242,7 +248,8 @@ enum AgentCommand {
 }
 
 pub struct Agent {
-    resource_uri: Option<Uri>,
+    room_id: String,
+    participant_id: String,
     api: HttpApiClient,
     cmd_tx: mpsc::Sender<AgentCommand>,
     event_rx: mpsc::Receiver<AgentEvent>,
@@ -261,9 +268,12 @@ impl Agent {
 
     pub async fn disconnect(&mut self) -> Result<(), AgentError> {
         let _ = self.cmd_tx.send(AgentCommand::Disconnect).await;
-        if let Some(resource_uri) = self.resource_uri.take() {
-            self.api.disconnect(resource_uri).await?;
-        }
+        self.api
+            .delete_participant(DeleteParticipantRequest {
+                room_id: self.room_id.clone(),
+                participant_id: self.participant_id.clone(),
+            })
+            .await?;
 
         Ok(())
     }

@@ -12,6 +12,18 @@ use std::sync::Arc;
 use crate::controller;
 use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
 
+enum HeaderExt {
+    ParticipantId,
+}
+
+impl HeaderExt {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::ParticipantId => "PB-Participant-Id",
+        }
+    }
+}
+
 /// Configuration shared across handlers
 #[derive(Clone)]
 pub struct ApiConfig {
@@ -71,7 +83,7 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
 }
 
 #[axum::debug_handler]
-async fn join_room(
+async fn create_participant(
     Path(room_id): Path<ExternalRoomId>,
     State((mut con, cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
@@ -103,12 +115,16 @@ async fn join_room(
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(LOCATION, location_url.parse().unwrap());
+    response_headers.insert(
+        HeaderExt::ParticipantId.as_str(),
+        participant_id.internal.parse().unwrap(),
+    );
 
     Ok((StatusCode::CREATED, response_headers, answer_sdp))
 }
 
 #[axum::debug_handler]
-async fn leave_room(
+async fn delete_participant(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -134,11 +150,14 @@ pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Route
     let api = Router::new()
         // TODO: deprecate this endpoint in favor of /participants subpatch to be more consistent
         // with REST API
-        .route("/rooms/{external_room_id}", post(join_room))
-        .route("/rooms/{external_room_id}/participants", post(join_room))
+        .route("/rooms/{external_room_id}", post(create_participant))
+        .route(
+            "/rooms/{external_room_id}/participants",
+            post(create_participant),
+        )
         .route(
             "/rooms/{external_room_id}/participants/{participant_id}",
-            delete(leave_room),
+            delete(delete_participant),
         );
 
     Router::new()
