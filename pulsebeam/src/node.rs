@@ -1,6 +1,6 @@
 use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
-use axum::serve::Listener;
+use axum::http::HeaderName;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::net::UdpMode;
@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{Any, CorsLayer};
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -191,9 +191,14 @@ impl NodeBuilder {
                     .unwrap_or_else(|| "0.0.0.0:0".to_string()),
             };
 
-            let cors = CorsLayer::very_permissive()
-                .allow_origin(AllowOrigin::mirror_request())
-                .expose_headers([hyper::header::LOCATION])
+            let cors = CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers([hyper::header::AUTHORIZATION, hyper::header::CONTENT_TYPE])
+                .expose_headers([
+                    hyper::header::LOCATION,
+                    HeaderName::from_static(api::HeaderExt::ParticipantId.as_str()),
+                ])
                 .max_age(Duration::from_secs(86400));
 
             let router = api::router(controller_handle, api_cfg).layer(cors);

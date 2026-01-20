@@ -12,14 +12,14 @@ use std::sync::Arc;
 use crate::controller;
 use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
 
-enum HeaderExt {
+pub enum HeaderExt {
     ParticipantId,
 }
 
 impl HeaderExt {
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::ParticipantId => "PB-Participant-Id",
+            Self::ParticipantId => "pb-participant-id",
         }
     }
 }

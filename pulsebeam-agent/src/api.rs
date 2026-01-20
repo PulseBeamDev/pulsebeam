@@ -12,7 +12,7 @@ enum HeaderExt {
 impl HeaderExt {
     fn as_str(&self) -> &str {
         match self {
-            Self::ParticipantId => "PB-Participant-Id",
+            Self::ParticipantId => "pb-participant-id",
         }
     }
 }
