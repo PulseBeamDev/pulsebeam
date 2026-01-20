@@ -91,10 +91,11 @@ pub struct HttpApiClient {
 }
 
 impl HttpApiClient {
-    pub fn new(http_client: Box<dyn AsyncHttpClient>, base_url: &str) -> Result<Self, ApiError> {
+    pub fn new(http_client: Box<dyn AsyncHttpClient>, base_uri: &str) -> Result<Self, ApiError> {
+        let base_uri = format!("{}/api/v1", base_uri).parse()?;
         Ok(Self {
             http_client,
-            base_uri: base_url.parse()?,
+            base_uri,
         })
     }
 
@@ -102,7 +103,7 @@ impl HttpApiClient {
         &self,
         req: CreateParticipantRequest,
     ) -> Result<CreateParticipantResponse, ApiError> {
-        let uri = format!("{}api/v1/rooms/{}/participants", self.base_uri, req.room_id);
+        let uri = format!("{}/rooms/{}/participants", self.base_uri, req.room_id);
         tracing::info!(%uri, "Sending SDP Offer");
 
         let raw_body = req.offer.to_sdp_string().into_bytes();
@@ -123,7 +124,7 @@ impl HttpApiClient {
             "Cleaning up remote session"
         );
         let uri = format!(
-            "{}api/v1/rooms/{}/participants/{}",
+            "{}/rooms/{}/participants/{}",
             self.base_uri, req.room_id, req.participant_id
         );
         let mut req = HttpRequest::new(vec![]);
