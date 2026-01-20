@@ -2,8 +2,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent::actor::{Agent, AgentBuilder, AgentEvent, AgentStats};
+use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
-use pulsebeam_agent::signaling::HttpSignalingClient;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
@@ -26,13 +26,13 @@ impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
         let server_base_uri = format!("http://{}:3000", server_ip);
-        let signaling = HttpSignalingClient::new(client, server_base_uri);
+        let api = HttpApiClient::new(client, server_base_uri);
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
         Ok(Self {
             ip,
-            agent_builder: AgentBuilder::new(signaling, socket).with_local_ip(ip),
+            agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
         })
     }
 

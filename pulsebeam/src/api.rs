@@ -19,9 +19,9 @@ pub struct ApiConfig {
     pub default_host: String, // fallback if no Host header, e.g. "localhost:3000"
 }
 
-/// Error type for signaling operations
+/// Error type for api operations
 #[derive(thiserror::Error, Debug)]
-pub enum SignalingError {
+pub enum ApiError {
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
     #[error("server is busy, please try again later.")]
@@ -32,30 +32,26 @@ pub enum SignalingError {
     Unknown(String),
 }
 
-impl IntoResponse for SignalingError {
+impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
-            SignalingError::JoinError(controller::ControllerError::OfferInvalid(_))
-            | SignalingError::JoinError(controller::ControllerError::OfferRejected(_)) => {
+            ApiError::JoinError(controller::ControllerError::OfferInvalid(_))
+            | ApiError::JoinError(controller::ControllerError::OfferRejected(_)) => {
                 StatusCode::BAD_REQUEST
             }
-            SignalingError::JoinError(controller::ControllerError::ServiceUnavailable)
-            | SignalingError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            SignalingError::JoinError(controller::ControllerError::Unknown(_))
-            | SignalingError::JoinError(controller::ControllerError::IOError(_))
-            | SignalingError::BadUrl
-            | SignalingError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
+            | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::JoinError(controller::ControllerError::Unknown(_))
+            | ApiError::JoinError(controller::ControllerError::IOError(_))
+            | ApiError::BadUrl
+            | ApiError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()
     }
 }
 
 /// Build an absolute URL for Location header
-fn build_location(
-    headers: &HeaderMap,
-    cfg: &ApiConfig,
-    path: &str,
-) -> Result<String, SignalingError> {
+fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<String, ApiError> {
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -69,7 +65,7 @@ fn build_location(
 
     let url = format!("{}://{}{}{}", scheme, host, cfg.base_path, path);
 
-    url.parse::<Uri>().map_err(|_| SignalingError::BadUrl)?;
+    url.parse::<Uri>().map_err(|_| ApiError::BadUrl)?;
 
     Ok(url)
 }
@@ -81,7 +77,7 @@ async fn join_room(
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
-) -> Result<impl IntoResponse, SignalingError> {
+) -> Result<impl IntoResponse, ApiError> {
     let room_id = Arc::new(RoomId::new(room_id));
     let participant_id = Arc::new(ParticipantId::new());
 
@@ -115,7 +111,7 @@ async fn join_room(
 async fn leave_room(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
-) -> Result<impl IntoResponse, SignalingError> {
+) -> Result<impl IntoResponse, ApiError> {
     let room_id = Arc::new(RoomId::new(room_id));
     let participant_id = Arc::new(participant_id);
 
@@ -136,7 +132,10 @@ async fn healthcheck() -> impl IntoResponse {
 /// Router setup
 pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Router {
     let api = Router::new()
+        // TODO: deprecate this endpoint in favor of /participants subpatch to be more consistent
+        // with REST API
         .route("/rooms/{external_room_id}", post(join_room))
+        .route("/rooms/{external_room_id}/participants", post(join_room))
         .route(
             "/rooms/{external_room_id}/participants/{participant_id}",
             delete(leave_room),

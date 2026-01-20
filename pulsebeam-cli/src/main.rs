@@ -3,8 +3,8 @@ use std::time::Duration;
 use pulsebeam_agent::{
     MediaKind, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent},
+    api::HttpApiClient,
     media::H264Looper,
-    signaling::HttpSignalingClient,
 };
 use pulsebeam_core::net::UdpSocket;
 use tokio::task::JoinSet;
@@ -23,7 +23,7 @@ fn main() {
 
 async fn main_loop() {
     let http_client = Box::new(reqwest::Client::new());
-    let signaling = HttpSignalingClient::new(http_client, "http://localhost:3000");
+    let signaling = HttpApiClient::new(http_client, "http://localhost:3000");
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let mut join_set = JoinSet::new();
     let mut agent = AgentBuilder::new(signaling, socket)

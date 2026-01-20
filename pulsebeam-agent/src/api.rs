@@ -6,7 +6,7 @@ use str0m::{
 };
 
 #[derive(thiserror::Error, Debug)]
-pub enum SignalingError {
+pub enum ApiError {
     #[error("Http request failed: {0}")]
     Http(#[from] HttpError),
     #[error("Invalid uri: {0}")]
@@ -17,12 +17,12 @@ pub enum SignalingError {
     SdpError(#[from] SdpError),
 }
 
-pub struct HttpSignalingClient {
+pub struct HttpApiClient {
     http_client: Box<dyn AsyncHttpClient>,
     base_url: String,
 }
 
-impl HttpSignalingClient {
+impl HttpApiClient {
     pub fn new(http_client: Box<dyn AsyncHttpClient>, base_url: impl Into<String>) -> Self {
         Self {
             http_client,
@@ -34,7 +34,7 @@ impl HttpSignalingClient {
         &self,
         room_id: &str,
         offer: SdpOffer,
-    ) -> Result<(SdpAnswer, Option<Uri>), SignalingError> {
+    ) -> Result<(SdpAnswer, Option<Uri>), ApiError> {
         let uri = format!("{}/api/v1/rooms/{}", self.base_url, room_id);
         tracing::info!(%uri, "Sending SDP Offer");
 
@@ -47,7 +47,7 @@ impl HttpSignalingClient {
 
         let res = self.http_client.execute(req).await?;
         if !res.status().is_success() {
-            return Err(SignalingError::Protocol(format!(
+            return Err(ApiError::Protocol(format!(
                 "Server rejected join: {}",
                 res.status()
             )));
@@ -63,12 +63,12 @@ impl HttpSignalingClient {
 
         let body_bytes = res.into_body();
         let answer_str = String::from_utf8(body_bytes)
-            .map_err(|e| SignalingError::Protocol(format!("Invalid UTF-8 response: {}", e)))?;
+            .map_err(|e| ApiError::Protocol(format!("Invalid UTF-8 response: {}", e)))?;
         let answer = SdpAnswer::from_sdp_string(&answer_str)?;
         Ok((answer, resource_uri))
     }
 
-    pub async fn disconnect(&self, resource_uri: Uri) -> Result<(), SignalingError> {
+    pub async fn disconnect(&self, resource_uri: Uri) -> Result<(), ApiError> {
         tracing::info!(%resource_uri, "Cleaning up remote session");
         let mut req = HttpRequest::new(vec![]);
         *req.uri_mut() = resource_uri;

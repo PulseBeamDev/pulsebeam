@@ -5,8 +5,8 @@ pub use str0m::media::{MediaData, MediaKind, MediaTime};
 use tokio::time::Instant;
 
 pub mod actor;
+pub mod api;
 pub mod media;
-pub mod signaling;
 
 pub struct MediaFrame {
     pub ts: MediaTime,

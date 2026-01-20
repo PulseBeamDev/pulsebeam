@@ -1,4 +1,4 @@
-use crate::signaling::{HttpSignalingClient, SignalingError};
+use crate::api::{ApiError, HttpApiClient};
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
 use http::Uri;
@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use str0m::IceConnectionState;
-use str0m::bwe::Bitrate;
 use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
@@ -72,8 +71,8 @@ pub enum AgentEvent {
 
 #[derive(thiserror::Error, Debug)]
 pub enum AgentError {
-    #[error("Signaling failed: {0}")]
-    Signaling(#[from] SignalingError),
+    #[error("API call failed: {0}")]
+    Api(#[from] ApiError),
     #[error("RTC Error: {0}")]
     Rtc(#[from] str0m::RtcError),
     #[error("IO Error: {0}")]
@@ -89,16 +88,16 @@ struct TrackRequest {
 }
 
 pub struct AgentBuilder {
-    signaling: HttpSignalingClient,
+    api: HttpApiClient,
     udp_socket: UdpSocket,
     tracks: Vec<TrackRequest>,
     local_ips: Vec<IpAddr>,
 }
 
 impl AgentBuilder {
-    pub fn new(signaling: HttpSignalingClient, udp_socket: UdpSocket) -> AgentBuilder {
+    pub fn new(api: HttpApiClient, udp_socket: UdpSocket) -> AgentBuilder {
         Self {
-            signaling,
+            api,
             udp_socket,
             tracks: Vec::new(),
             local_ips: Vec::new(),
@@ -201,7 +200,7 @@ impl AgentBuilder {
         }
 
         let (offer, pending) = sdp.apply().expect("offer is required");
-        let (answer, resource_uri) = self.signaling.connect(room_id, offer).await?;
+        let (answer, resource_uri) = self.api.connect(room_id, offer).await?;
 
         rtc.sdp_api()
             .accept_answer(pending, answer)
@@ -229,7 +228,7 @@ impl AgentBuilder {
 
         Ok(Agent {
             resource_uri,
-            signaling: self.signaling,
+            api: self.api,
             cmd_tx,
             event_rx,
         })
@@ -244,7 +243,7 @@ enum AgentCommand {
 
 pub struct Agent {
     resource_uri: Option<Uri>,
-    signaling: HttpSignalingClient,
+    api: HttpApiClient,
     cmd_tx: mpsc::Sender<AgentCommand>,
     event_rx: mpsc::Receiver<AgentEvent>,
 }
@@ -263,7 +262,7 @@ impl Agent {
     pub async fn disconnect(&mut self) -> Result<(), AgentError> {
         let _ = self.cmd_tx.send(AgentCommand::Disconnect).await;
         if let Some(resource_uri) = self.resource_uri.take() {
-            self.signaling.disconnect(resource_uri).await?;
+            self.api.disconnect(resource_uri).await?;
         }
 
         Ok(())
