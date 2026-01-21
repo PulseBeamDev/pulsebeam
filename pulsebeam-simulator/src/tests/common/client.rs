@@ -85,7 +85,7 @@ impl SimClient {
                             self.join_set.spawn(looper.run(sender));
                         }
                         AgentEvent::RemoteTrackAdded(recv) => {
-                            tracing::info!("{} subscribed to remote track mid: {:?}", self.ip, recv.mid);
+                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
                         }
                         _ => {}
                     }
