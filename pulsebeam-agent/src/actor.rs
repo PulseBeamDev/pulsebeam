@@ -251,6 +251,7 @@ impl AgentBuilder {
             cmd_rx,
             event_tx,
             senders: StreamMap::new(),
+            pending: PendingState::new(),
             slot_manager: SlotManager::new(),
             disconnected_reason: None,
             signaling_cid: None,
@@ -364,6 +365,8 @@ impl AgentActor {
             self.handle_media_added(media);
         }
 
+        let debounce_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(debounce_timer);
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
 
@@ -386,6 +389,9 @@ impl AgentActor {
                 biased;
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd)
+                }
+                _ = &mut debounce_timer, if self.pending.ready() => {
+                    self.flush_pending_state();
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
@@ -549,6 +555,23 @@ impl AgentActor {
     fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.try_send(event);
     }
+
+    fn flush_pending_state(&mut self) {
+        let Some(cid) = self.signaling_cid else {
+            return;
+        };
+
+        let Some(mut ch) = self.rtc.channel(cid) else {
+            return;
+        };
+
+        let requests = self.pending.take();
+        let msg = signaling::ClientIntent { requests };
+        let encoded = msg.encode_to_vec();
+        if let Err(err) = ch.write(true, encoded.as_slice()) {
+            tracing::warn!("failed to send signaling: {:?}", err);
+        }
+    }
 }
 
 struct PendingState {
@@ -556,6 +579,12 @@ struct PendingState {
 }
 
 impl PendingState {
+    fn new() -> Self {
+        Self {
+            requests: Vec::new(),
+        }
+    }
+
     fn assign(&mut self, mid: Mid, track_id: TrackId, height: u32) -> Option<()> {
         if let Some(req) = self
             .requests
@@ -577,6 +606,10 @@ impl PendingState {
 
     fn unassign(&mut self, mid: Mid) {
         self.requests.retain(|r| r.mid.as_bytes() != mid.as_bytes());
+    }
+
+    fn ready(&self) -> bool {
+        !self.requests.is_empty()
     }
 
     fn take(&mut self) -> Vec<pulsebeam_proto::signaling::VideoRequest> {
