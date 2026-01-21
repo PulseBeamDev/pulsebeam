@@ -32,4 +32,6 @@ http-body-util = "0.1" # Crucial for .collect().await
 bytes = "1"
 anyhow.workspace = true
 tracing-subscriber = "0.3.22"
+futures = "0.3.31"
+
 
