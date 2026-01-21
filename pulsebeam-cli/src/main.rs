@@ -37,11 +37,11 @@ async fn main_loop() {
         tokio::select! {
             Some(event) = agent.next_event() => {
                 match event {
-                    AgentEvent::SenderAdded(sender) => {
+                    AgentEvent::LocalTrackAdded(sender) => {
                         let looper = H264Looper::new(RAW_H264, 30);
                         join_set.spawn(looper.run(sender));
                     }
-                    AgentEvent::ReceiverAdded(_recv) => {
+                    AgentEvent::RemoteTrackAdded(_recv) => {
                     }
                     _ => {}
                 }

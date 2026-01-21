@@ -2,14 +2,19 @@ use crate::api::{ApiError, CreateParticipantRequest, DeleteParticipantRequest, H
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
 use pulsebeam_core::net::UdpSocket;
+use pulsebeam_proto::prelude::*;
+use pulsebeam_proto::signaling::Track;
+use pulsebeam_proto::{namespace, signaling};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
+use str0m::channel::{ChannelData, ChannelId};
 use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
-    media::{Direction, MediaAdded, MediaKind, Mid, Pt},
+    media::{Direction, MediaAdded, MediaKind, Mid},
     net::{Protocol, Receive},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -18,6 +23,9 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
+
+pub type TrackId = String;
+pub type ParticipantId = String;
 
 #[derive(Debug, Default, Clone)]
 pub struct AgentStats {
@@ -32,12 +40,39 @@ pub struct TrackStats {
 }
 
 #[derive(Debug)]
-pub struct TrackSender {
+pub struct LocalTrack {
     pub mid: Mid,
     tx: mpsc::Sender<MediaFrame>,
 }
 
-impl TrackSender {
+impl LocalTrack {
+    pub fn try_send(&self, frame: MediaFrame) {
+        let _ = self.tx.try_send(frame);
+    }
+
+    pub async fn send(&self, frame: MediaFrame) {
+        let _ = self.tx.send(frame).await;
+    }
+}
+
+fn new_remote_track(track: Arc<Track>) -> (RemoteTrackTx, RemoteTrackRx) {
+    let (ch_tx, ch_rx) = mpsc::channel(128);
+    let tx = RemoteTrackTx {
+        track: track.clone(),
+        tx: ch_tx,
+    };
+    let rx = RemoteTrackRx { track, rx: ch_rx };
+
+    (tx, rx)
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteTrackTx {
+    pub track: Arc<Track>,
+    tx: mpsc::Sender<MediaFrame>,
+}
+
+impl RemoteTrackTx {
     pub fn try_send(&self, frame: MediaFrame) {
         let _ = self.tx.try_send(frame);
     }
@@ -48,24 +83,15 @@ impl TrackSender {
 }
 
 #[derive(Debug)]
-pub struct TrackReceiver {
-    pub mid: Mid,
-    pub pt: Option<Pt>,
+pub struct RemoteTrackRx {
+    pub track: Arc<Track>,
     rx: mpsc::Receiver<MediaFrame>,
 }
 
-impl TrackReceiver {
+impl RemoteTrackRx {
     pub async fn recv(&mut self) -> Option<MediaFrame> {
         self.rx.recv().await
     }
-}
-
-#[derive(Debug)]
-pub enum AgentEvent {
-    SenderAdded(TrackSender),
-    ReceiverAdded(TrackReceiver),
-    Connected,
-    Disconnected(String),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -76,6 +102,8 @@ pub enum AgentError {
     Rtc(#[from] str0m::RtcError),
     #[error("IO Error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Comand Error: {0}")]
+    Command(#[from] mpsc::error::SendError<AgentCommand>),
     #[error("No valid network candidates found")]
     NoCandidates,
 }
@@ -223,8 +251,10 @@ impl AgentBuilder {
             cmd_rx,
             event_tx,
             senders: StreamMap::new(),
-            receivers: HashMap::new(),
+            pending: PendingState::new(),
+            slot_manager: SlotManager::new(),
             disconnected_reason: None,
+            signaling_cid: None,
         };
 
         tokio::spawn(async move {
@@ -242,9 +272,37 @@ impl AgentBuilder {
 }
 
 #[derive(Debug)]
-enum AgentCommand {
+pub enum AgentCommand {
     Disconnect,
     GetStats(oneshot::Sender<AgentStats>),
+
+    /// Assigns a specific Track to a specific Receiver Slot (MID) at a target resolution.
+    ///
+    /// - `mid`: The ID of the `TrackReceiver` you want to use.
+    /// - `track_id`: The remote track to subscribe to.
+    /// - `height`: Desired resolution (e.g. 720, 1080).
+    ///   Use `0` to pause the stream while keeping the assignment.
+    Subscribe {
+        mid: Mid,
+        track_id: String,
+        height: u32,
+    },
+
+    /// Stops receiving media on the specified slot and clears the assignment.
+    ///
+    /// The Actor will look up the `track_id` currently assigned to this `mid`
+    /// and send a `VideoRequest` with `height: 0`.
+    Unsubscribe {
+        mid: Mid,
+    },
+}
+
+#[derive(Debug)]
+pub enum AgentEvent {
+    LocalTrackAdded(LocalTrack),
+    RemoteTrackAdded(RemoteTrackRx),
+    Connected,
+    Disconnected(String),
 }
 
 pub struct Agent {
@@ -264,6 +322,11 @@ impl Agent {
         let (stats_tx, stats_rx) = oneshot::channel();
         let _ = self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
         stats_rx.await.ok()
+    }
+
+    pub async fn send(&self, cmd: AgentCommand) -> Result<(), AgentError> {
+        self.cmd_tx.send(cmd).await?;
+        Ok(())
     }
 
     pub async fn disconnect(&mut self) -> Result<(), AgentError> {
@@ -289,8 +352,10 @@ struct AgentActor {
     event_tx: mpsc::Sender<AgentEvent>,
 
     senders: StreamMap<Mid, ReceiverStream<MediaFrame>>,
-    receivers: HashMap<Mid, mpsc::Sender<MediaFrame>>,
+    pending: PendingState,
+    slot_manager: SlotManager,
 
+    signaling_cid: Option<ChannelId>,
     disconnected_reason: Option<String>,
 }
 
@@ -300,6 +365,8 @@ impl AgentActor {
             self.handle_media_added(media);
         }
 
+        let debounce_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(debounce_timer);
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
 
@@ -322,6 +389,9 @@ impl AgentActor {
                 biased;
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd)
+                }
+                _ = &mut debounce_timer, if self.pending.ready() => {
+                    self.flush_pending_state();
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
@@ -363,11 +433,21 @@ impl AgentActor {
                 }
                 Ok(Output::Event(e)) => {
                     match e {
+                        Event::ChannelOpen(cid, label) => {
+                            if label == namespace::Signaling::Reliable.as_str() {
+                                self.signaling_cid.replace(cid);
+                            }
+                        }
+                        Event::ChannelData(data) => {
+                            if Some(data.id) == self.signaling_cid {
+                                self.handle_signaling_data(data);
+                            }
+                        }
                         Event::MediaAdded(media) => self.handle_media_added(media),
 
                         Event::MediaData(data) => {
                             // Network -> User
-                            if let Some(tx) = self.receivers.get(&data.mid) {
+                            if let Some(tx) = self.slot_manager.get_sender(&data.mid) {
                                 let _ = tx.try_send(data.into());
                             }
                         }
@@ -413,11 +493,6 @@ impl AgentActor {
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         let mid = media.mid;
-        let pt = self
-            .rtc
-            .media(mid)
-            .and_then(|m| m.remote_pts().first().copied());
-
         tracing::info!("new media added: {:?}", media);
         match media.direction {
             Direction::SendOnly => {
@@ -425,14 +500,11 @@ impl AgentActor {
                 let (tx, rx) = mpsc::channel(128);
                 self.senders.insert(mid, ReceiverStream::new(rx));
 
-                self.emit(AgentEvent::SenderAdded(TrackSender { mid, tx }));
+                self.emit(AgentEvent::LocalTrackAdded(LocalTrack { mid, tx }));
             }
             Direction::RecvOnly => {
                 // Remote wants to send. We create a channel: Actor(tx) -> User(rx)
-                let (tx, rx) = mpsc::channel(128);
-                self.receivers.insert(mid, tx);
-
-                self.emit(AgentEvent::ReceiverAdded(TrackReceiver { mid, pt, rx }));
+                self.slot_manager.register(mid);
             }
             dir => {
                 tracing::warn!("{} transceiver direction is not supported", dir);
@@ -446,10 +518,187 @@ impl AgentActor {
             AgentCommand::GetStats(stats_tx) => {
                 let _ = stats_tx.send(self.stats.clone());
             }
+            AgentCommand::Subscribe {
+                mid,
+                track_id,
+                height,
+            } => {
+                self.pending.assign(mid, track_id, height);
+            }
+            AgentCommand::Unsubscribe { mid } => {
+                self.pending.unassign(mid);
+            }
+        }
+    }
+
+    fn handle_signaling_data(&mut self, cd: ChannelData) {
+        let Ok(msg) = signaling::ServerMessage::decode(cd.data.as_slice()) else {
+            tracing::warn!("Invalid Protobuf");
+            return;
+        };
+
+        let Some(payload) = msg.payload else {
+            tracing::warn!("empty protobuf");
+            return;
+        };
+
+        match payload {
+            signaling::server_message::Payload::Update(update) => {
+                self.slot_manager.sync(update);
+            }
+            signaling::server_message::Payload::Error(err) => {
+                tracing::warn!("signaling error: {}", err);
+            }
         }
     }
 
     fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.try_send(event);
+    }
+
+    fn flush_pending_state(&mut self) {
+        let Some(cid) = self.signaling_cid else {
+            return;
+        };
+
+        let Some(mut ch) = self.rtc.channel(cid) else {
+            return;
+        };
+
+        let requests = self.pending.take();
+        let msg = signaling::ClientIntent { requests };
+        let encoded = msg.encode_to_vec();
+        if let Err(err) = ch.write(true, encoded.as_slice()) {
+            tracing::warn!("failed to send signaling: {:?}", err);
+        }
+    }
+}
+
+struct PendingState {
+    requests: Vec<pulsebeam_proto::signaling::VideoRequest>,
+}
+
+impl PendingState {
+    fn new() -> Self {
+        Self {
+            requests: Vec::new(),
+        }
+    }
+
+    fn assign(&mut self, mid: Mid, track_id: TrackId, height: u32) -> Option<()> {
+        if let Some(req) = self
+            .requests
+            .iter_mut()
+            .find(|r| r.mid.as_bytes() == mid.as_bytes())
+        {
+            req.track_id = track_id;
+            req.height = height;
+        } else {
+            self.requests
+                .push(pulsebeam_proto::signaling::VideoRequest {
+                    mid: mid.to_string(),
+                    track_id,
+                    height,
+                });
+        }
+        Some(())
+    }
+
+    fn unassign(&mut self, mid: Mid) {
+        self.requests.retain(|r| r.mid.as_bytes() != mid.as_bytes());
+    }
+
+    fn ready(&self) -> bool {
+        !self.requests.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<pulsebeam_proto::signaling::VideoRequest> {
+        let replacement = Vec::with_capacity(self.requests.len());
+        std::mem::replace(&mut self.requests, replacement)
+    }
+}
+
+struct ReceiverSlot {
+    mid: Mid,
+    track_id: Option<TrackId>,
+}
+
+struct SlotManager {
+    remote_tracks: HashMap<TrackId, RemoteTrackTx>,
+    // The fixed set of Receive Transceivers (MIDs) available to this Agent.
+    slots: Vec<ReceiverSlot>,
+}
+
+impl SlotManager {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            remote_tracks: HashMap::new(),
+        }
+    }
+
+    /// Registers a permanent receiver slot (called during Agent init).
+    fn register(&mut self, mid: Mid) {
+        self.slots.push(ReceiverSlot {
+            mid,
+            track_id: None,
+        });
+    }
+
+    fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> Vec<RemoteTrackRx> {
+        let mut new_remote_tracks = Vec::new();
+
+        for t in update.tracks_remove {
+            self.remote_tracks.remove(&t);
+        }
+
+        for t in update.tracks_upsert {
+            if self.remote_tracks.contains_key(&t.id) {
+                tracing::warn!("detected a track entry duplicate: {}", t.id);
+                continue;
+            }
+
+            let t = Arc::new(t);
+            let (tx, rx) = new_remote_track(t.clone());
+            self.remote_tracks.insert(t.id.clone(), tx);
+            new_remote_tracks.push(rx);
+        }
+
+        for a in update.assignments_remove {
+            let Some(idx) = self
+                .slots
+                .iter()
+                .position(|s| s.mid.as_bytes() == a.as_bytes())
+            else {
+                continue;
+            };
+
+            self.slots.remove(idx);
+        }
+
+        for a in update.assignments_upsert {
+            if !self.remote_tracks.contains_key(&a.track_id) {
+                tracing::warn!(
+                    "remote_track doesn't exist, ignore assignment update: {}",
+                    a.track_id
+                );
+                continue;
+            }
+
+            for s in &mut self.slots {
+                if s.mid.as_bytes() == a.mid.as_bytes() {
+                    s.track_id.replace(a.track_id);
+                    break;
+                }
+            }
+        }
+
+        new_remote_tracks
+    }
+
+    fn get_sender(&self, mid: &Mid) -> Option<&RemoteTrackTx> {
+        let slot = self.slots.iter().find(|s| s.mid == *mid)?;
+        let track_id = slot.track_id.as_ref()?;
+        self.remote_tracks.get(track_id)
     }
 }

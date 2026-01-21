@@ -79,13 +79,13 @@ impl SimClient {
             tokio::select! {
                 Some(event) = self.agent.next_event() => {
                     match event {
-                        AgentEvent::SenderAdded(sender) => {
+                        AgentEvent::LocalTrackAdded(sender) => {
                             tracing::info!("{} starting publisher for mid: {:?}", self.ip, sender.mid);
                             let looper = create_h264_looper(30);
                             self.join_set.spawn(looper.run(sender));
                         }
-                        AgentEvent::ReceiverAdded(recv) => {
-                            tracing::info!("{} subscribed to remote track mid: {:?}", self.ip, recv.mid);
+                        AgentEvent::RemoteTrackAdded(recv) => {
+                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
                         }
                         _ => {}
                     }
