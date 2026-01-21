@@ -23,6 +23,7 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
+const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub type TrackId = String;
 pub type ParticipantId = String;
@@ -386,7 +387,9 @@ impl AgentActor {
             tokio::select! {
                 biased;
                 Some(cmd) = self.cmd_rx.recv() => {
-                    self.handle_command(cmd)
+                    if self.handle_command(cmd) {
+                        debounce_timer.as_mut().reset(now + STATE_DEBOUNCE);
+                    }
                 }
                 _ = &mut debounce_timer, if self.pending.is_dirty() => {
                     self.flush_pending_state();
@@ -510,7 +513,7 @@ impl AgentActor {
         }
     }
 
-    fn handle_command(&mut self, cmd: AgentCommand) {
+    fn handle_command(&mut self, cmd: AgentCommand) -> bool {
         match cmd {
             AgentCommand::Disconnect => self.rtc.disconnect(),
             AgentCommand::GetStats(stats_tx) => {
@@ -518,11 +521,14 @@ impl AgentActor {
             }
             AgentCommand::Subscribe { track_id, height } => {
                 self.pending.assign(&self.slot_manager, track_id, height);
+                return true;
             }
             AgentCommand::Unsubscribe { track_id } => {
                 self.pending.unassign(&self.slot_manager, track_id);
+                return true;
             }
         }
+        false
     }
 
     fn handle_signaling_data(&mut self, cd: ChannelData) {
