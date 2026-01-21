@@ -227,6 +227,7 @@ impl AgentBuilder {
             });
         }
 
+        let signaling_cid = sdp.add_channel(namespace::Signaling::Reliable.as_str().to_string());
         let (offer, pending) = sdp.apply().expect("offer is required");
         let resp = self
             .api
@@ -255,7 +256,7 @@ impl AgentBuilder {
             pending: PendingState::new(),
             slot_manager: SlotManager::new(),
             disconnected_reason: None,
-            signaling_cid: None,
+            signaling_cid,
         };
 
         tokio::spawn(async move {
@@ -354,7 +355,7 @@ struct AgentActor {
     pending: PendingState,
     slot_manager: SlotManager,
 
-    signaling_cid: Option<ChannelId>,
+    signaling_cid: ChannelId,
     disconnected_reason: Option<String>,
 }
 
@@ -435,15 +436,9 @@ impl AgentActor {
                 }
                 Ok(Output::Event(e)) => {
                     match e {
-                        Event::ChannelOpen(cid, label) => {
-                            if label == namespace::Signaling::Reliable.as_str() {
-                                self.signaling_cid.replace(cid);
-                            }
-                        }
+                        Event::ChannelOpen(_cid, _label) => {}
                         Event::ChannelData(data) => {
-                            if Some(data.id) == self.signaling_cid {
-                                self.handle_signaling_data(data);
-                            }
+                            self.handle_signaling_data(data);
                         }
                         Event::MediaAdded(media) => self.handle_media_added(media),
 
@@ -560,11 +555,7 @@ impl AgentActor {
         // if channel is not ready, schedule for a retry
         self.pending.deadline.replace(now + STATE_DEBOUNCE);
 
-        let Some(cid) = self.signaling_cid else {
-            return;
-        };
-
-        let Some(mut ch) = self.rtc.channel(cid) else {
+        let Some(mut ch) = self.rtc.channel(self.signaling_cid) else {
             return;
         };
 
