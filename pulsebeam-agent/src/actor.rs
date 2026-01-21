@@ -351,6 +351,7 @@ struct AgentActor {
     event_tx: mpsc::Sender<AgentEvent>,
 
     senders: StreamMap<Mid, ReceiverStream<MediaFrame>>,
+    pending: PendingState,
     slot_manager: SlotManager,
 
     signaling_cid: Option<ChannelId>,
@@ -516,10 +517,10 @@ impl AgentActor {
                 track_id,
                 height,
             } => {
-                self.slot_manager.assign(&mid, track_id);
+                self.pending.assign(mid, track_id, height);
             }
             AgentCommand::Unsubscribe { mid } => {
-                self.slot_manager.unassign_mid(&mid);
+                self.pending.unassign(mid);
             }
         }
     }
@@ -550,10 +551,43 @@ impl AgentActor {
     }
 }
 
+struct PendingState {
+    requests: Vec<pulsebeam_proto::signaling::VideoRequest>,
+}
+
+impl PendingState {
+    fn assign(&mut self, mid: Mid, track_id: TrackId, height: u32) -> Option<()> {
+        if let Some(req) = self
+            .requests
+            .iter_mut()
+            .find(|r| r.mid.as_bytes() == mid.as_bytes())
+        {
+            req.track_id = track_id;
+            req.height = height;
+        } else {
+            self.requests
+                .push(pulsebeam_proto::signaling::VideoRequest {
+                    mid: mid.to_string(),
+                    track_id,
+                    height,
+                });
+        }
+        Some(())
+    }
+
+    fn unassign(&mut self, mid: Mid) {
+        self.requests.retain(|r| r.mid.as_bytes() != mid.as_bytes());
+    }
+
+    fn take(&mut self) -> Vec<pulsebeam_proto::signaling::VideoRequest> {
+        let replacement = Vec::with_capacity(self.requests.len());
+        std::mem::replace(&mut self.requests, replacement)
+    }
+}
+
 struct ReceiverSlot {
     mid: Mid,
     track_id: Option<TrackId>,
-    height: u32,
 }
 
 struct SlotManager {
@@ -575,7 +609,6 @@ impl SlotManager {
         self.slots.push(ReceiverSlot {
             mid,
             track_id: None,
-            height: 0,
         });
     }
 
