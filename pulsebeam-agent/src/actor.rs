@@ -278,12 +278,10 @@ pub enum AgentCommand {
 
     /// Assigns a specific Track to a specific Receiver Slot (MID) at a target resolution.
     ///
-    /// - `mid`: The ID of the `TrackReceiver` you want to use.
     /// - `track_id`: The remote track to subscribe to.
     /// - `height`: Desired resolution (e.g. 720, 1080).
     ///   Use `0` to pause the stream while keeping the assignment.
     Subscribe {
-        mid: Mid,
         track_id: String,
         height: u32,
     },
@@ -293,7 +291,7 @@ pub enum AgentCommand {
     /// The Actor will look up the `track_id` currently assigned to this `mid`
     /// and send a `VideoRequest` with `height: 0`.
     Unsubscribe {
-        mid: Mid,
+        track_id: String,
     },
 }
 
@@ -390,7 +388,7 @@ impl AgentActor {
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd)
                 }
-                _ = &mut debounce_timer, if self.pending.ready() => {
+                _ = &mut debounce_timer, if self.pending.is_dirty() => {
                     self.flush_pending_state();
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
@@ -518,15 +516,11 @@ impl AgentActor {
             AgentCommand::GetStats(stats_tx) => {
                 let _ = stats_tx.send(self.stats.clone());
             }
-            AgentCommand::Subscribe {
-                mid,
-                track_id,
-                height,
-            } => {
-                self.pending.assign(mid, track_id, height);
+            AgentCommand::Subscribe { track_id, height } => {
+                self.pending.assign(&self.slot_manager, track_id, height);
             }
-            AgentCommand::Unsubscribe { mid } => {
-                self.pending.unassign(mid);
+            AgentCommand::Unsubscribe { track_id } => {
+                self.pending.unassign(&self.slot_manager, track_id);
             }
         }
     }
@@ -585,7 +579,8 @@ impl PendingState {
         }
     }
 
-    fn assign(&mut self, mid: Mid, track_id: TrackId, height: u32) -> Option<()> {
+    /// Adds or updates a request in the pending list
+    fn upsert(&mut self, mid: Mid, track_id: String, height: u32) {
         if let Some(req) = self
             .requests
             .iter_mut()
@@ -601,14 +596,64 @@ impl PendingState {
                     height,
                 });
         }
-        Some(())
     }
 
-    fn unassign(&mut self, mid: Mid) {
-        self.requests.retain(|r| r.mid.as_bytes() != mid.as_bytes());
+    /// Assigns a track to a slot (finding the slot happens outside or via helper)
+    fn assign(&mut self, slots: &SlotManager, track_id: String, height: u32) {
+        if let Some(mid) = self.find_mid_for_track(slots, &track_id) {
+            self.upsert(mid, track_id, height);
+            return;
+        }
+
+        if let Some(mid) = self.find_free_mid(slots) {
+            self.upsert(mid, track_id, height);
+        } else {
+            tracing::warn!("No free receiver slots available for track: {}", track_id);
+        }
     }
 
-    fn ready(&self) -> bool {
+    /// Stops receiving a track
+    fn unassign(&mut self, slots: &SlotManager, track_id: String) {
+        if let Some(mid) = self.find_mid_for_track(slots, &track_id) {
+            // Send height: 0 to stop
+            self.upsert(mid, track_id, 0);
+        }
+    }
+
+    /// Returns the track_id effectively assigned to a MID.
+    /// Looks at Pending first, falls back to SlotManager.
+    fn get_effective_track<'a>(&'a self, slots: &'a SlotManager, mid: &str) -> Option<&'a str> {
+        if let Some(req) = self.requests.iter().find(|r| r.mid == mid) {
+            if req.height > 0 {
+                return Some(&req.track_id);
+            } else {
+                // Explicitly stopped in pending
+                return None;
+            }
+        }
+
+        slots.get_track_for_mid(mid)
+    }
+
+    fn find_mid_for_track(&self, slots: &SlotManager, track_id: &str) -> Option<Mid> {
+        for slot in &slots.slots {
+            if self.get_effective_track(slots, &slot.mid) == Some(track_id) {
+                return Some(slot.mid);
+            }
+        }
+        None
+    }
+
+    fn find_free_mid(&self, slots: &SlotManager) -> Option<Mid> {
+        for slot in &slots.slots {
+            if self.get_effective_track(slots, &slot.mid).is_none() {
+                return Some(slot.mid);
+            }
+        }
+        None
+    }
+
+    fn is_dirty(&self) -> bool {
         !self.requests.is_empty()
     }
 
@@ -643,6 +688,13 @@ impl SlotManager {
             mid,
             track_id: None,
         });
+    }
+
+    fn get_track_for_mid(&self, mid: &str) -> Option<&str> {
+        self.slots
+            .iter()
+            .find(|s| s.mid.as_bytes() == mid.as_bytes())
+            .and_then(|s| s.track_id.as_deref())
     }
 
     fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> Vec<RemoteTrackRx> {
