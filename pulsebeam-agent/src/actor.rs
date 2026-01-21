@@ -2,10 +2,14 @@ use crate::api::{ApiError, CreateParticipantRequest, DeleteParticipantRequest, H
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
 use pulsebeam_core::net::UdpSocket;
+use pulsebeam_proto::prelude::*;
+use pulsebeam_proto::signaling::{ServerMessage, Track};
+use pulsebeam_proto::{namespace, signaling};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use str0m::IceConnectionState;
+use str0m::channel::{ChannelData, ChannelId};
 use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
@@ -18,6 +22,9 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
+
+pub type TrackId = String;
+pub type ParticipantId = String;
 
 #[derive(Debug, Default, Clone)]
 pub struct AgentStats {
@@ -32,12 +39,12 @@ pub struct TrackStats {
 }
 
 #[derive(Debug)]
-pub struct TrackSender {
+pub struct LocalTrack {
     pub mid: Mid,
     tx: mpsc::Sender<MediaFrame>,
 }
 
-impl TrackSender {
+impl LocalTrack {
     pub fn try_send(&self, frame: MediaFrame) {
         let _ = self.tx.try_send(frame);
     }
@@ -48,24 +55,16 @@ impl TrackSender {
 }
 
 #[derive(Debug)]
-pub struct TrackReceiver {
-    pub mid: Mid,
+pub struct RemoteTrack {
+    pub track: Track,
     pub pt: Option<Pt>,
     rx: mpsc::Receiver<MediaFrame>,
 }
 
-impl TrackReceiver {
+impl RemoteTrack {
     pub async fn recv(&mut self) -> Option<MediaFrame> {
         self.rx.recv().await
     }
-}
-
-#[derive(Debug)]
-pub enum AgentEvent {
-    SenderAdded(TrackSender),
-    ReceiverAdded(TrackReceiver),
-    Connected,
-    Disconnected(String),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -76,6 +75,8 @@ pub enum AgentError {
     Rtc(#[from] str0m::RtcError),
     #[error("IO Error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Comand Error: {0}")]
+    Command(#[from] mpsc::error::SendError<AgentCommand>),
     #[error("No valid network candidates found")]
     NoCandidates,
 }
@@ -223,7 +224,7 @@ impl AgentBuilder {
             cmd_rx,
             event_tx,
             senders: StreamMap::new(),
-            receivers: HashMap::new(),
+            slot_manager: SlotManager::new(),
             disconnected_reason: None,
         };
 
@@ -242,9 +243,37 @@ impl AgentBuilder {
 }
 
 #[derive(Debug)]
-enum AgentCommand {
+pub enum AgentCommand {
     Disconnect,
     GetStats(oneshot::Sender<AgentStats>),
+
+    /// Assigns a specific Track to a specific Receiver Slot (MID) at a target resolution.
+    ///
+    /// - `mid`: The ID of the `TrackReceiver` you want to use.
+    /// - `track_id`: The remote track to subscribe to.
+    /// - `height`: Desired resolution (e.g. 720, 1080).
+    ///   Use `0` to pause the stream while keeping the assignment.
+    Subscribe {
+        mid: Mid,
+        track_id: String,
+        height: u32,
+    },
+
+    /// Stops receiving media on the specified slot and clears the assignment.
+    ///
+    /// The Actor will look up the `track_id` currently assigned to this `mid`
+    /// and send a `VideoRequest` with `height: 0`.
+    Unsubscribe {
+        mid: Mid,
+    },
+}
+
+#[derive(Debug)]
+pub enum AgentEvent {
+    LocalTrackAdded(LocalTrack),
+    RemoteTrackAdded(RemoteTrack),
+    Connected,
+    Disconnected(String),
 }
 
 pub struct Agent {
@@ -264,6 +293,11 @@ impl Agent {
         let (stats_tx, stats_rx) = oneshot::channel();
         let _ = self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
         stats_rx.await.ok()
+    }
+
+    pub async fn send(&self, cmd: AgentCommand) -> Result<(), AgentError> {
+        self.cmd_tx.send(cmd).await?;
+        Ok(())
     }
 
     pub async fn disconnect(&mut self) -> Result<(), AgentError> {
@@ -289,8 +323,9 @@ struct AgentActor {
     event_tx: mpsc::Sender<AgentEvent>,
 
     senders: StreamMap<Mid, ReceiverStream<MediaFrame>>,
-    receivers: HashMap<Mid, mpsc::Sender<MediaFrame>>,
+    slot_manager: SlotManager,
 
+    signaling_cid: Option<ChannelId>,
     disconnected_reason: Option<String>,
 }
 
@@ -363,11 +398,21 @@ impl AgentActor {
                 }
                 Ok(Output::Event(e)) => {
                     match e {
+                        Event::ChannelOpen(cid, label) => {
+                            if label == namespace::Signaling::Reliable.as_str() {
+                                self.signaling_cid.replace(cid);
+                            }
+                        }
+                        Event::ChannelData(data) => {
+                            if Some(data.id) == self.signaling_cid {
+                                self.handle_signaling_data(data);
+                            }
+                        }
                         Event::MediaAdded(media) => self.handle_media_added(media),
 
                         Event::MediaData(data) => {
                             // Network -> User
-                            if let Some(tx) = self.receivers.get(&data.mid) {
+                            if let Some(tx) = self.slot_manager.get_sender(&data.mid) {
                                 let _ = tx.try_send(data.into());
                             }
                         }
@@ -413,11 +458,6 @@ impl AgentActor {
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         let mid = media.mid;
-        let pt = self
-            .rtc
-            .media(mid)
-            .and_then(|m| m.remote_pts().first().copied());
-
         tracing::info!("new media added: {:?}", media);
         match media.direction {
             Direction::SendOnly => {
@@ -425,14 +465,11 @@ impl AgentActor {
                 let (tx, rx) = mpsc::channel(128);
                 self.senders.insert(mid, ReceiverStream::new(rx));
 
-                self.emit(AgentEvent::SenderAdded(TrackSender { mid, tx }));
+                self.emit(AgentEvent::LocalTrackAdded(LocalTrack { mid, tx }));
             }
             Direction::RecvOnly => {
                 // Remote wants to send. We create a channel: Actor(tx) -> User(rx)
-                let (tx, rx) = mpsc::channel(128);
-                self.receivers.insert(mid, tx);
-
-                self.emit(AgentEvent::ReceiverAdded(TrackReceiver { mid, pt, rx }));
+                self.slot_manager.register(mid);
             }
             dir => {
                 tracing::warn!("{} transceiver direction is not supported", dir);
@@ -446,10 +483,119 @@ impl AgentActor {
             AgentCommand::GetStats(stats_tx) => {
                 let _ = stats_tx.send(self.stats.clone());
             }
+            AgentCommand::Subscribe {
+                mid,
+                track_id,
+                height,
+            } => {
+                self.slot_manager.assign(&mid, track_id);
+            }
+            AgentCommand::Unsubscribe { mid } => {
+                self.slot_manager.unassign_mid(&mid);
+            }
+        }
+    }
+
+    fn handle_signaling_data(&self, cd: ChannelData) {
+        let Ok(msg) = signaling::ServerMessage::decode(cd.data.as_slice()) else {
+            tracing::warn!("Invalid Protobuf");
+            return;
+        };
+
+        let Some(payload) = msg.payload else {
+            tracing::warn!("empty protobuf");
+            return;
+        };
+
+        match payload {
+            signaling::server_message::Payload::Update(update) => {}
+            signaling::server_message::Payload::Error(err) => {
+                tracing::warn!("signaling error: {}", err);
+            }
         }
     }
 
     fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.try_send(event);
+    }
+}
+
+struct ReceiverSlot {
+    track_id: Option<TrackId>,
+    height: u32,
+}
+
+struct SlotManager {
+    // The fixed set of Receive Transceivers (MIDs) available to this Agent.
+    slots: HashMap<Mid, ReceiverSlot>,
+}
+
+impl SlotManager {
+    fn new() -> Self {
+        Self {
+            slots: HashMap::new(),
+        }
+    }
+
+    /// Registers a permanent receiver slot (called during Agent init).
+    fn register(&mut self, mid: Mid) {
+        self.slots.insert(
+            mid,
+            ReceiverSlot {
+                track_id: None,
+                height: 0,
+            },
+        );
+    }
+
+    /// Explicitly binds a Track ID to a specific MID (Viewport).
+    /// Returns true if the MID existed and was updated.
+    fn assign(&mut self, mid: &Mid, track_id: TrackId) -> bool {
+        if let Some(slot) = self.slots.get_mut(mid) {
+            slot.track_id = Some(track_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clears the track assignment for a specific MID.
+    fn unassign_mid(&mut self, mid: &Mid) -> Option<TrackId> {
+        if let Some(slot) = self.slots.get_mut(mid) {
+            slot.track_id.take()
+        } else {
+            None
+        }
+    }
+
+    /// Finds and clears the MID assignment for a specific Track ID.
+    /// Useful if we want to unsubscribe by Track ID without knowing the MID.
+    fn unassign_track(&mut self, track_id: &str) -> Option<Mid> {
+        let mid = self.get_mid_for_track(track_id)?;
+        self.unassign_mid(&mid);
+        Some(mid)
+    }
+
+    fn get_mid_for_track(&self, track_id: &str) -> Option<Mid> {
+        self.slots
+            .iter()
+            .find(|(_, slot)| slot.track_id.as_deref() == Some(track_id))
+            .map(|(mid, _)| *mid)
+    }
+
+    fn get_track_for_mid(&self, mid: &Mid) -> Option<&TrackId> {
+        self.slots.get(mid).and_then(|slot| slot.track_id.as_ref())
+    }
+
+    fn get_sender(&self, mid: &Mid) -> Option<&mpsc::Sender<MediaFrame>> {
+        self.slots.get(mid).map(|slot| &slot.tx)
+    }
+
+    fn available_mids(&self) -> Vec<Mid> {
+        self.slots
+            .iter()
+            .filter(|(_, slot)| slot.track_id.is_none())
+            .map(|(mid, _)| *mid)
+            .collect()
     }
 }

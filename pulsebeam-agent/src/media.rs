@@ -4,7 +4,7 @@ use bytes::Bytes;
 use str0m::media::MediaTime;
 use tokio::time::Instant;
 
-use crate::{MediaFrame, actor::TrackSender};
+use crate::{MediaFrame, actor::LocalTrack};
 
 pub struct H264Looper {
     frames: Vec<Bytes>,
@@ -34,7 +34,7 @@ impl H264Looper {
     }
 
     /// creates a task that pumps frames into the provided sender
-    pub async fn run(mut self, sender: TrackSender) {
+    pub async fn run(mut self, sender: LocalTrack) {
         let clock_rate = 90_000;
         let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
 

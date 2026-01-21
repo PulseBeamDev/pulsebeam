@@ -2,13 +2,11 @@ use std::collections::HashSet;
 
 use crate::entity;
 use crate::participant::downstream::{DownstreamAllocator, Intent};
-use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
+use pulsebeam_proto::{namespace, prelude::*};
 use str0m::Rtc;
 use str0m::channel::ChannelId;
 use str0m::media::Mid;
-
-const CHANNEL_LABEL: &str = "__internal/v1/signaling";
 
 const MAX_SIGNALING_MSG_SIZE: usize = 16 * 1024; // 16 KB (Signaling shouldn't be huge)
 
@@ -61,7 +59,7 @@ impl Signaling {
     }
 
     pub fn handle_channel_open(&mut self, cid: ChannelId, label: String) {
-        if label == CHANNEL_LABEL {
+        if label == namespace::Signaling::Reliable.as_str() {
             self.cid = Some(cid);
             self.pending_snapshot_request = true;
             self.dirty_tracks = true;
