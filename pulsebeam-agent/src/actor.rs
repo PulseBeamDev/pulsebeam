@@ -3,17 +3,18 @@ use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::prelude::*;
-use pulsebeam_proto::signaling::{ServerMessage, Track};
+use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{namespace, signaling};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::channel::{ChannelData, ChannelId};
 use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
-    media::{Direction, MediaAdded, MediaKind, Mid, Pt},
+    media::{Direction, MediaAdded, MediaKind, Mid},
     net::{Protocol, Receive},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -54,14 +55,40 @@ impl LocalTrack {
     }
 }
 
+fn new_remote_track(track: Arc<Track>) -> (RemoteTrackTx, RemoteTrackRx) {
+    let (ch_tx, ch_rx) = mpsc::channel(128);
+    let tx = RemoteTrackTx {
+        track: track.clone(),
+        tx: ch_tx,
+    };
+    let rx = RemoteTrackRx { track, rx: ch_rx };
+
+    (tx, rx)
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteTrackTx {
+    pub track: Arc<Track>,
+    tx: mpsc::Sender<MediaFrame>,
+}
+
+impl RemoteTrackTx {
+    pub fn try_send(&self, frame: MediaFrame) {
+        let _ = self.tx.try_send(frame);
+    }
+
+    pub async fn send(&self, frame: MediaFrame) {
+        let _ = self.tx.send(frame).await;
+    }
+}
+
 #[derive(Debug)]
-pub struct RemoteTrack {
-    pub track: Track,
-    pub pt: Option<Pt>,
+pub struct RemoteTrackRx {
+    pub track: Arc<Track>,
     rx: mpsc::Receiver<MediaFrame>,
 }
 
-impl RemoteTrack {
+impl RemoteTrackRx {
     pub async fn recv(&mut self) -> Option<MediaFrame> {
         self.rx.recv().await
     }
@@ -226,6 +253,7 @@ impl AgentBuilder {
             senders: StreamMap::new(),
             slot_manager: SlotManager::new(),
             disconnected_reason: None,
+            signaling_cid: None,
         };
 
         tokio::spawn(async move {
@@ -271,7 +299,7 @@ pub enum AgentCommand {
 #[derive(Debug)]
 pub enum AgentEvent {
     LocalTrackAdded(LocalTrack),
-    RemoteTrackAdded(RemoteTrack),
+    RemoteTrackAdded(RemoteTrackRx),
     Connected,
     Disconnected(String),
 }
@@ -496,7 +524,7 @@ impl AgentActor {
         }
     }
 
-    fn handle_signaling_data(&self, cd: ChannelData) {
+    fn handle_signaling_data(&mut self, cd: ChannelData) {
         let Ok(msg) = signaling::ServerMessage::decode(cd.data.as_slice()) else {
             tracing::warn!("Invalid Protobuf");
             return;
@@ -508,7 +536,9 @@ impl AgentActor {
         };
 
         match payload {
-            signaling::server_message::Payload::Update(update) => {}
+            signaling::server_message::Payload::Update(update) => {
+                self.slot_manager.sync(update);
+            }
             signaling::server_message::Payload::Error(err) => {
                 tracing::warn!("signaling error: {}", err);
             }
@@ -521,81 +551,88 @@ impl AgentActor {
 }
 
 struct ReceiverSlot {
+    mid: Mid,
     track_id: Option<TrackId>,
     height: u32,
 }
 
 struct SlotManager {
+    remote_tracks: HashMap<TrackId, RemoteTrackTx>,
     // The fixed set of Receive Transceivers (MIDs) available to this Agent.
-    slots: HashMap<Mid, ReceiverSlot>,
+    slots: Vec<ReceiverSlot>,
 }
 
 impl SlotManager {
     fn new() -> Self {
         Self {
-            slots: HashMap::new(),
+            slots: Vec::new(),
+            remote_tracks: HashMap::new(),
         }
     }
 
     /// Registers a permanent receiver slot (called during Agent init).
     fn register(&mut self, mid: Mid) {
-        self.slots.insert(
+        self.slots.push(ReceiverSlot {
             mid,
-            ReceiverSlot {
-                track_id: None,
-                height: 0,
-            },
-        );
+            track_id: None,
+            height: 0,
+        });
     }
 
-    /// Explicitly binds a Track ID to a specific MID (Viewport).
-    /// Returns true if the MID existed and was updated.
-    fn assign(&mut self, mid: &Mid, track_id: TrackId) -> bool {
-        if let Some(slot) = self.slots.get_mut(mid) {
-            slot.track_id = Some(track_id);
-            true
-        } else {
-            false
+    fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> Vec<RemoteTrackRx> {
+        let mut new_remote_tracks = Vec::new();
+
+        for t in update.tracks_remove {
+            self.remote_tracks.remove(&t);
         }
-    }
 
-    /// Clears the track assignment for a specific MID.
-    fn unassign_mid(&mut self, mid: &Mid) -> Option<TrackId> {
-        if let Some(slot) = self.slots.get_mut(mid) {
-            slot.track_id.take()
-        } else {
-            None
+        for t in update.tracks_upsert {
+            if self.remote_tracks.contains_key(&t.id) {
+                tracing::warn!("detected a track entry duplicate: {}", t.id);
+                continue;
+            }
+
+            let t = Arc::new(t);
+            let (tx, rx) = new_remote_track(t.clone());
+            self.remote_tracks.insert(t.id.clone(), tx);
+            new_remote_tracks.push(rx);
         }
+
+        for a in update.assignments_remove {
+            let Some(idx) = self
+                .slots
+                .iter()
+                .position(|s| s.mid.as_bytes() == a.as_bytes())
+            else {
+                continue;
+            };
+
+            self.slots.remove(idx);
+        }
+
+        for a in update.assignments_upsert {
+            if !self.remote_tracks.contains_key(&a.track_id) {
+                tracing::warn!(
+                    "remote_track doesn't exist, ignore assignment update: {}",
+                    a.track_id
+                );
+                continue;
+            }
+
+            for s in &mut self.slots {
+                if s.mid.as_bytes() == a.mid.as_bytes() {
+                    s.track_id.replace(a.track_id);
+                    break;
+                }
+            }
+        }
+
+        new_remote_tracks
     }
 
-    /// Finds and clears the MID assignment for a specific Track ID.
-    /// Useful if we want to unsubscribe by Track ID without knowing the MID.
-    fn unassign_track(&mut self, track_id: &str) -> Option<Mid> {
-        let mid = self.get_mid_for_track(track_id)?;
-        self.unassign_mid(&mid);
-        Some(mid)
-    }
-
-    fn get_mid_for_track(&self, track_id: &str) -> Option<Mid> {
-        self.slots
-            .iter()
-            .find(|(_, slot)| slot.track_id.as_deref() == Some(track_id))
-            .map(|(mid, _)| *mid)
-    }
-
-    fn get_track_for_mid(&self, mid: &Mid) -> Option<&TrackId> {
-        self.slots.get(mid).and_then(|slot| slot.track_id.as_ref())
-    }
-
-    fn get_sender(&self, mid: &Mid) -> Option<&mpsc::Sender<MediaFrame>> {
-        self.slots.get(mid).map(|slot| &slot.tx)
-    }
-
-    fn available_mids(&self) -> Vec<Mid> {
-        self.slots
-            .iter()
-            .filter(|(_, slot)| slot.track_id.is_none())
-            .map(|(mid, _)| *mid)
-            .collect()
+    fn get_sender(&self, mid: &Mid) -> Option<&RemoteTrackTx> {
+        let slot = self.slots.iter().find(|s| s.mid == *mid)?;
+        let track_id = slot.track_id.as_ref()?;
+        self.remote_tracks.get(track_id)
     }
 }
