@@ -387,12 +387,13 @@ impl AgentActor {
             tokio::select! {
                 biased;
                 Some(cmd) = self.cmd_rx.recv() => {
-                    if self.handle_command(cmd) {
-                        debounce_timer.as_mut().reset(now + STATE_DEBOUNCE);
+                    self.handle_command(cmd, now);
+                    if let Some(deadline) = self.pending.deadline {
+                        debounce_timer.as_mut().reset(deadline);
                     }
                 }
                 _ = &mut debounce_timer, if self.pending.is_dirty() => {
-                    self.flush_pending_state();
+                    self.flush_pending_state(now);
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
@@ -513,7 +514,7 @@ impl AgentActor {
         }
     }
 
-    fn handle_command(&mut self, cmd: AgentCommand) -> bool {
+    fn handle_command(&mut self, cmd: AgentCommand, now: Instant) {
         match cmd {
             AgentCommand::Disconnect => self.rtc.disconnect(),
             AgentCommand::GetStats(stats_tx) => {
@@ -521,14 +522,13 @@ impl AgentActor {
             }
             AgentCommand::Subscribe { track_id, height } => {
                 self.pending.assign(&self.slot_manager, track_id, height);
-                return true;
+                self.pending.deadline.replace(now + STATE_DEBOUNCE);
             }
             AgentCommand::Unsubscribe { track_id } => {
                 self.pending.unassign(&self.slot_manager, track_id);
-                return true;
+                self.pending.deadline.replace(now + STATE_DEBOUNCE);
             }
         }
-        false
     }
 
     fn handle_signaling_data(&mut self, cd: ChannelData) {
@@ -556,7 +556,10 @@ impl AgentActor {
         let _ = self.event_tx.try_send(event);
     }
 
-    fn flush_pending_state(&mut self) {
+    fn flush_pending_state(&mut self, now: Instant) {
+        // if channel is not ready, schedule for a retry
+        self.pending.deadline.replace(now + STATE_DEBOUNCE);
+
         let Some(cid) = self.signaling_cid else {
             return;
         };
@@ -575,6 +578,7 @@ impl AgentActor {
 }
 
 struct PendingState {
+    deadline: Option<Instant>,
     requests: Vec<pulsebeam_proto::signaling::VideoRequest>,
 }
 
@@ -582,6 +586,7 @@ impl PendingState {
     fn new() -> Self {
         Self {
             requests: Vec::new(),
+            deadline: None,
         }
     }
 
@@ -664,8 +669,8 @@ impl PendingState {
     }
 
     fn take(&mut self) -> Vec<pulsebeam_proto::signaling::VideoRequest> {
-        let replacement = Vec::with_capacity(self.requests.len());
-        std::mem::replace(&mut self.requests, replacement)
+        self.deadline.take();
+        self.requests.drain(..).collect()
     }
 }
 
