@@ -70,7 +70,7 @@ impl AudioAllocator {
                     tracing::warn!("{} stream is lagging: {:?}", track_id, err);
                     continue;
                 }
-                None => return Poll::Ready(None), // All inputs closed
+                None => continue, // All inputs closed
             };
 
             let now = Instant::now();

@@ -135,7 +135,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
                 // Priority 2: CPU Work
                 // TODO: consolidate pollings in core
-                Some((_, req)) = self.core.upstream.keyframe_request_streams.next() => {
+                Some((_, req)) = self.core.upstream.keyframe_request_streams.next(), if !self.core.upstream.keyframe_request_streams.is_empty() => {
                     self.core.handle_keyframe_request(req);
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
