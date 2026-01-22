@@ -102,7 +102,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             }
 
             tokio::select! {
-                biased;
                 // Priority 1: Control Messages
                 res = ctx.sys_rx.recv() => {
                     match res {
