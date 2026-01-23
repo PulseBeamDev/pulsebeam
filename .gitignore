@@ -6,3 +6,4 @@ dist
 *.data.old
 venv
 workspace.*
+!workspace.override.json
