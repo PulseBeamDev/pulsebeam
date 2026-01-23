@@ -575,6 +575,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0f7ac3e5b97fdce45e8922fb05cae2c37f7bbd63d30dd94821dacfd8f3f2bf2"
 dependencies = [
  "compression-core",
+ "flate2",
+ "memchr",
  "zstd",
  "zstd-safe",
 ]
@@ -3833,6 +3835,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tokio",

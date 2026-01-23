@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -195,7 +196,11 @@ impl NodeBuilder {
             let cors = CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
-                .allow_headers([hyper::header::AUTHORIZATION, hyper::header::CONTENT_TYPE])
+                .allow_headers([
+                    hyper::header::AUTHORIZATION,
+                    hyper::header::CONTENT_TYPE,
+                    hyper::header::CONTENT_ENCODING,
+                ])
                 .expose_headers([
                     hyper::header::LOCATION,
                     HeaderName::from_static(api::HeaderExt::ParticipantId.as_str()),
@@ -204,7 +209,8 @@ impl NodeBuilder {
 
             let router = api::router(controller_handle, api_cfg)
                 .layer(cors)
-                .layer(CompressionLayer::new().zstd(true));
+                .layer(CompressionLayer::new().zstd(true))
+                .layer(RequestDecompressionLayer::new().zstd(true).gzip(true));
             let http_shutdown = shutdown.clone();
 
             join_set.spawn(async move {
