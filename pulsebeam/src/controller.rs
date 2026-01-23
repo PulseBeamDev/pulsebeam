@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use crate::{
     entity::{ParticipantId, RoomId},
@@ -128,6 +128,9 @@ impl ControllerActor {
             // .set_stats_interval(Some(Duration::from_secs(1)))
             // enable for compatibility, some clients don't support remote ice-lite
             .set_ice_lite(false);
+        rtc_config.set_initial_stun_rto(Duration::from_millis(200));
+        rtc_config.set_max_stun_rto(Duration::from_millis(1500));
+        rtc_config.set_max_stun_retransmits(5);
         let codec_config = rtc_config.codec_config();
         codec_config.enable_opus(true);
         // codec_config.enable_vp8(true);
