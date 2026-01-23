@@ -56,7 +56,7 @@ impl NodeBuilder {
             local_addr: None,
             external_addr: None,
             rng: None,
-            udp_mode: UdpMode::Batch,
+            udp_mode: UdpMode::Scalar,
             gateway_handle: None,
             http_api: None,
             internal_metrics: None,
