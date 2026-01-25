@@ -102,6 +102,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             }
 
             tokio::select! {
+                biased;
                 // Priority 1: Control Messages
                 res = ctx.sys_rx.recv() => {
                     match res {
@@ -133,7 +134,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     }
                 }
 
-                // Priority 2: CPU Work
+                // Priority 2: Egress Work
                 // TODO: consolidate pollings in core
                 Some((_, req)) = self.core.upstream.keyframe_request_streams.next(), if !self.core.upstream.keyframe_request_streams.is_empty() => {
                     self.core.handle_keyframe_request(req);
@@ -150,16 +151,16 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         self.core.tcp_batcher.flush(&self.tcp_egress);
                     }
                 },
-                Some(batch) = gateway_rx.recv() => {
-                    maybe_deadline = self.core.handle_udp_packet_batch(batch);
-                },
-
-                // Priority 3: Flush to network
                 Ok(_) = self.udp_egress.writable(), if !self.core.udp_batcher.is_empty() => {
                     self.core.udp_batcher.flush(&self.udp_egress);
                 },
                 Ok(_) = self.tcp_egress.writable(), if !self.core.tcp_batcher.is_empty() => {
                     self.core.tcp_batcher.flush(&self.tcp_egress);
+                },
+
+                // Priority 3: Ingress Work
+                Some(batch) = gateway_rx.recv() => {
+                    maybe_deadline = self.core.handle_udp_packet_batch(batch);
                 },
 
                 // Priority 4: Background tasks
