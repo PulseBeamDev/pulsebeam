@@ -49,9 +49,6 @@ pulsebeam-proto = { version = "0.1.0", path = "../pulsebeam-proto" }
 tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms", "disable_initial_exec_tls"] }
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 
-[patch.crates-io]
-aws-lc-rs = { version = "1.15.2" }
-
 [dev-dependencies]
 more-asserts = { workspace = true } 
 

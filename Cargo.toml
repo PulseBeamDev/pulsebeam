@@ -36,14 +36,15 @@ tracing = { version = "0.1", features = ["release_max_level_debug"] }
 futures-lite = "2.6.1"
 rand = "0.9"
 bytes = "1.11.0"
-str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
+# str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
 # str0m = { git = "https://github.com/algesten/str0m.git",  rev = "fe599b7847779e9dfd822daea943fa9e272c71b0", default-features = false, features = ["openssl", "vendored"] }
-# str0m = { version = "0.11.1", default-features = false, features = ["openssl", "vendored", "sha1"] }
+str0m = { version = "0.15.0" }
 
 more-asserts = "0.3.1"
 turmoil = "0.7.0"
 
-# [patch.crates-io]
+[patch.crates-io]
+dimpl = { git = "https://github.com/PulseBeamDev/dimpl.git", branch = "patch/0.2.1" }
 # str0m = { path = "../str0m" }
 # [patch."https://github.com/algesten/str0m.git"]
 # str0m = { path = "../str0m" }
