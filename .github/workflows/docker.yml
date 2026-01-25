@@ -201,7 +201,7 @@ jobs:
 
 
       - name: Docker meta
-        # This step generates metadata for the Docker image.
+        # This step generates metadata for the Docker image including git commit hash.
         # It uses the docker/metadata-action to create metadata based on the repository information.
         # The metadata includes information such as the image name, tags, and labels.
         id: meta
@@ -211,6 +211,8 @@ jobs:
           annotations: |
             type=org.opencontainers.image.description,value=${{ github.event.repository.description || 'No description provided' }}
           tags: |
+            type=sha,prefix=,format=short
+            type=sha,prefix=,format=long
             type=raw,value=main,enable=${{ github.ref_name == 'main' }}
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
