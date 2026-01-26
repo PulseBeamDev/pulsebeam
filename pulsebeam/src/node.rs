@@ -373,6 +373,7 @@ mod internal {
 
         const INDEX_HTML: &str = r#"
 <ul>
+  <li><a href="/healthz">Healthcheck</a></li>
   <li><a href="/metrics">Metrics</a></li>
   <li><a href="/debug/pprof/profile?seconds=30">CPU Profile (pprof)</a></li>
   <li><a href="/debug/pprof/profile?seconds=30&flamegraph=true">CPU Flamegraph</a></li>
@@ -384,6 +385,7 @@ mod internal {
         let mut router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
             .route("/debug/pprof/allocs", get(heap_profile))
+            .route("/healthz", get(healthcheck))
             .route("/", get(|| async { Html(INDEX_HTML) }));
 
         // Only attach metrics route if we successfully got a handle
@@ -590,5 +592,9 @@ mod internal {
         };
 
         Ok(resp)
+    }
+
+    async fn healthcheck() -> impl IntoResponse {
+        StatusCode::OK
     }
 }

@@ -3,11 +3,13 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, post},
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::LOCATION;
 use std::sync::Arc;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::controller;
 use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
@@ -36,11 +38,11 @@ pub struct ApiConfig {
 pub enum ApiError {
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
-    #[error("server is busy, please try again later.")]
+    #[error("server is busy, please try again later")]
     ServiceUnavailable,
     #[error("failed to construct response URL")]
     BadUrl,
-    #[error("unknown error: {0}")]
+    #[error("{0}")]
     Unknown(String),
 }
 
@@ -58,6 +60,7 @@ impl IntoResponse for ApiError {
             | ApiError::BadUrl
             | ApiError::Unknown(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+
         (status, self.to_string()).into_response()
     }
 }
@@ -82,6 +85,32 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
     Ok(url)
 }
 
+/// Create a new participant in a room
+///
+/// Creates a new participant by processing a WebRTC offer and returning an answer.
+/// The participant ID is generated and returned in both the Location header and
+/// the pb-participant-id header.
+#[utoipa::path(
+    post,
+    path = "/rooms/{external_room_id}/participants",
+    request_body(content = String, description = "WebRTC SDP offer", content_type = "application/sdp"),
+    params(
+        ("external_room_id" = String, Path, description = "External room identifier")
+    ),
+    responses(
+        (status = 201, description = "Participant created successfully", body = String,
+            headers(
+                ("Location" = String, description = "URL of the created participant resource"),
+                ("pb-participant-id" = String, description = "Internal participant ID")
+            ),
+            content_type = "application/sdp"
+        ),
+        (status = 400, description = "Invalid or rejected offer", body = String, content_type = "text/plain"),
+        (status = 500, description = "Internal server error", body = String, content_type = "text/plain"),
+        (status = 503, description = "Service unavailable", body = String, content_type = "text/plain")
+    ),
+    tag = "participants"
+)]
 #[axum::debug_handler]
 async fn create_participant(
     Path(room_id): Path<ExternalRoomId>,
@@ -123,6 +152,23 @@ async fn create_participant(
     Ok((StatusCode::CREATED, response_headers, answer_sdp))
 }
 
+/// Delete a participant from a room
+///
+/// Removes a participant from the specified room. This will clean up all
+/// resources associated with the participant.
+#[utoipa::path(
+    delete,
+    path = "/rooms/{external_room_id}/participants/{participant_id}",
+    params(
+        ("external_room_id" = String, Path, description = "External room identifier"),
+        ("participant_id" = String, Path, description = "Participant identifier")
+    ),
+    responses(
+        (status = 204, description = "Participant deleted successfully"),
+        (status = 500, description = "Internal server error", body = String, content_type = "text/plain")
+    ),
+    tag = "participants"
+)]
 #[axum::debug_handler]
 async fn delete_participant(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
@@ -141,16 +187,59 @@ async fn delete_participant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn healthcheck() -> impl IntoResponse {
-    StatusCode::OK
+/// Build OpenAPI spec with dynamic server configuration
+fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
+    use utoipa::openapi::{ContactBuilder, InfoBuilder, OpenApi as OpenApiSpec, ServerBuilder};
+
+    let info = InfoBuilder::new()
+        .title("PulseBeam API")
+        .version("1.0.0")
+        .description(Some("API for managing PulseBeam room & participants"))
+        .contact(Some(
+            ContactBuilder::new()
+                .name(Some("API Support"))
+                .email(Some("lukas@pulsebeam.dev"))
+                .build(),
+        ))
+        .build();
+
+    let mut openapi = OpenApiSpec::new(info, utoipa::openapi::path::Paths::new());
+
+    // Add server with the configured base path
+    openapi.servers = Some(vec![
+        ServerBuilder::new()
+            .url(base_path)
+            .description(Some("API Server"))
+            .build(),
+    ]);
+
+    // Merge in the generated paths
+    let generated = ApiDoc::openapi();
+    openapi.paths = generated.paths;
+    openapi.components = generated.components;
+    openapi.tags = generated.tags;
+
+    openapi
 }
 
-/// Router setup
+/// OpenAPI documentation structure
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        create_participant,
+        delete_participant,
+    ),
+    tags(
+        (name = "participants", description = "Participant management endpoints"),
+    )
+)]
+struct ApiDoc;
+
+/// Router setup with OpenAPI documentation
 pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Router {
+    let openapi = build_openapi(&cfg.base_path);
+
     let api = Router::new()
-        // TODO: deprecate this endpoint in favor of /participants subpatch to be more consistent
-        // with REST API
-        .route("/rooms/{external_room_id}", post(create_participant))
         .route(
             "/rooms/{external_room_id}/participants",
             post(create_participant),
@@ -161,7 +250,7 @@ pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Route
         );
 
     Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi))
         .nest(&cfg.base_path, api)
-        .route("/healthz", get(healthcheck))
         .with_state((controller, cfg))
 }
