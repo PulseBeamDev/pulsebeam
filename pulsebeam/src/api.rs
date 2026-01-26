@@ -1,14 +1,18 @@
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, Uri},
+    http::{
+        HeaderMap, StatusCode, Uri,
+        header::{HeaderName, HeaderValue},
+    },
     response::IntoResponse,
-    routing::{delete, post},
+    routing::{patch, post},
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::LOCATION;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::controller;
@@ -23,6 +27,82 @@ impl HeaderExt {
         match self {
             Self::ParticipantId => "pb-participant-id",
         }
+    }
+}
+
+/// Request headers for participant reconnection
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReconnectionRequestHeaders {
+    /// Video track ID
+    #[serde(rename = "pb-vid")]
+    pub video_track_id: String,
+    /// Audio track ID
+    #[serde(rename = "pb-aid")]
+    pub audio_track_id: String,
+    /// Ed25519 signature proving ownership
+    #[serde(rename = "pb-sig")]
+    pub signature: String,
+    /// ETag for concurrency control
+    /// https://www.rfc-editor.org/rfc/rfc9110.html#name-etag
+    #[serde(rename = "etag")]
+    pub etag: String,
+}
+
+impl ReconnectionRequestHeaders {
+    pub fn from_header_map(headers: &HeaderMap) -> Result<Self, ApiError> {
+        let video_track_id = headers
+            .get("pb-vid")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ApiError::BadRequest("missing pb-vid header".to_string()))?
+            .to_string();
+
+        let audio_track_id = headers
+            .get("pb-aid")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ApiError::BadRequest("missing pb-aid header".to_string()))?
+            .to_string();
+
+        let signature = headers
+            .get("pb-sig")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ApiError::BadRequest("missing pb-sig header".to_string()))?
+            .to_string();
+
+        let etag = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ApiError::BadRequest("missing ETag header".to_string()))?
+            .to_string();
+
+        Ok(Self {
+            video_track_id,
+            audio_track_id,
+            signature,
+            etag,
+        })
+    }
+}
+
+/// Response headers for participant creation
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ParticipantResponseHeaders {
+    /// URL of the created participant resource
+    #[serde(rename = "Location")]
+    pub location: String,
+    /// Internal participant ID
+    #[serde(rename = "pb-participant-id")]
+    pub participant_id: String,
+}
+
+impl ParticipantResponseHeaders {
+    pub fn to_header_map(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, self.location.parse().unwrap());
+        headers.insert(
+            HeaderName::from_static(HeaderExt::ParticipantId.as_str()),
+            HeaderValue::from_str(&self.participant_id).unwrap(),
+        );
+        headers
     }
 }
 
@@ -42,6 +122,8 @@ pub enum ApiError {
     ServiceUnavailable,
     #[error("failed to construct response URL")]
     BadUrl,
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("{0}")]
     Unknown(String),
 }
@@ -50,9 +132,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
             ApiError::JoinError(controller::ControllerError::OfferInvalid(_))
-            | ApiError::JoinError(controller::ControllerError::OfferRejected(_)) => {
-                StatusCode::BAD_REQUEST
-            }
+            | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
+            | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::JoinError(controller::ControllerError::Unknown(_))
@@ -101,7 +182,7 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
         (status = 201, description = "Participant created successfully", body = String,
             headers(
                 ("Location" = String, description = "URL of the created participant resource"),
-                ("pb-participant-id" = String, description = "Internal participant ID")
+                ("pb-participant-id" = String, description = "participant ID")
             ),
             content_type = "application/sdp"
         ),
@@ -142,14 +223,16 @@ async fn create_participant(
     );
     let location_url = build_location(&headers, &cfg, &path)?;
 
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(LOCATION, location_url.parse().unwrap());
-    response_headers.insert(
-        HeaderExt::ParticipantId.as_str(),
-        participant_id.internal.parse().unwrap(),
-    );
+    let response_headers = ParticipantResponseHeaders {
+        location: location_url,
+        participant_id: participant_id.internal.to_string(),
+    };
 
-    Ok((StatusCode::CREATED, response_headers, answer_sdp))
+    Ok((
+        StatusCode::CREATED,
+        response_headers.to_header_map(),
+        answer_sdp,
+    ))
 }
 
 /// Delete a participant from a room
@@ -187,6 +270,68 @@ async fn delete_participant(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Reconnect a participant to a room
+///
+/// Allows a participant to reconnect to a room with new WebRTC offer,
+/// using their existing track IDs and providing authentication signature.
+#[utoipa::path(
+    patch,
+    path = "/rooms/{external_room_id}/participants/{participant_id}",
+    request_body(content = String, description = "WebRTC SDP offer for reconnection", content_type = "application/sdp"),
+    params(
+        ("external_room_id" = String, Path, description = "External room identifier"),
+        ("participant_id" = String, Path, description = "Participant identifier")
+    ),
+    responses(
+        (status = 200, description = "Reconnection successful", body = String,
+            content_type = "application/sdp"
+        ),
+        (status = 400, description = "Invalid request or missing headers", body = String, content_type = "text/plain"),
+        (status = 401, description = "Invalid signature", body = String, content_type = "text/plain"),
+        (status = 412, description = "Precondition failed - ETag mismatch", body = String, content_type = "text/plain"),
+        (status = 500, description = "Internal server error", body = String, content_type = "text/plain"),
+        (status = 503, description = "Service unavailable", body = String, content_type = "text/plain")
+    ),
+    tag = "participants"
+)]
+#[axum::debug_handler]
+async fn reconnect_participant(
+    Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+    TypedHeader(_content_type): TypedHeader<ContentType>,
+    headers: HeaderMap,
+    raw_offer: String,
+) -> Result<impl IntoResponse, ApiError> {
+    let room_id = Arc::new(RoomId::new(room_id));
+    let participant_id = Arc::new(participant_id);
+
+    // Extract and validate headers
+    let reconnection_headers = ReconnectionRequestHeaders::from_header_map(&headers)?;
+
+    return Ok((StatusCode::OK, "todo"));
+
+    // let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+
+    // con.send(controller::ControllerMessage::Reconnect(
+    //     room_id,
+    //     participant_id,
+    //     raw_offer,
+    //     reconnection_headers.video_track_id,
+    //     reconnection_headers.audio_track_id,
+    //     reconnection_headers.signature,
+    //     reconnection_headers.etag,
+    //     answer_tx,
+    // ))
+    // .await
+    // .map_err(|_| controller::ControllerError::ServiceUnavailable)?;
+
+    // let answer_sdp = answer_rx
+    //     .await
+    //     .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
+    //
+    // Ok((StatusCode::OK, answer_sdp))
+}
+
 /// Build OpenAPI spec with dynamic server configuration
 fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
     use utoipa::openapi::{ContactBuilder, InfoBuilder, OpenApi as OpenApiSpec, ServerBuilder};
@@ -222,12 +367,16 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
     openapi
 }
 
-/// OpenAPI documentation structure
+/// OpenAPI documentation structure (without servers, we'll set those dynamically)
 #[derive(OpenApi)]
 #[openapi(
     paths(
         create_participant,
+        reconnect_participant,
         delete_participant,
+    ),
+    components(
+        schemas(ParticipantResponseHeaders, ReconnectionRequestHeaders)
     ),
     tags(
         (name = "participants", description = "Participant management endpoints"),
@@ -246,7 +395,7 @@ pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Route
         )
         .route(
             "/rooms/{external_room_id}/participants/{participant_id}",
-            delete(delete_participant),
+            patch(reconnect_participant).delete(delete_participant),
         );
 
     Router::new()
