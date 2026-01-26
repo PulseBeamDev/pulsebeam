@@ -5,5 +5,4 @@ dist
 *.data
 *.data.old
 venv
-workspace.*
-!workspace.override.json
+workspace.lock.json

@@ -1,3 +1,0 @@
-{
-  "resolver": "fd -H '^Cargo.toml$' * | xargs -I{} dirname {}"
-}

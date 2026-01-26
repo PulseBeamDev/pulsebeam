@@ -1,0 +1,8 @@
+{
+  "resolver": "fd -H 'Cargo.toml' * | xargs -I{} dirname {}",
+  "workflows": {
+    "echo": {
+      "resolver": "echo \"{{.Resolver}}\""
+    }
+  }
+}
