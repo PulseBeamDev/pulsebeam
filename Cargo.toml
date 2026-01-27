@@ -37,8 +37,9 @@ futures-lite = "2.6.1"
 rand = "0.9"
 bytes = "1.11.0"
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
-str0m = { git = "https://github.com/algesten/str0m.git",  rev = "a236b94be5d3cf7a56f596fc8a4da252bb8fa93b"  }
-# str0m = { version = "0.15.0" }
+# str0m = { git = "https://github.com/algesten/str0m.git",  rev = "a236b94be5d3cf7a56f596fc8a4da252bb8fa93b"  }
+# str0m = { path = "../str0m" }
+str0m = { version = "0.16.0" }
 
 more-asserts = "0.3.1"
 turmoil = "0.7.0"

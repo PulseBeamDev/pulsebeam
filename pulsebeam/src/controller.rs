@@ -9,7 +9,7 @@ use crate::{
 use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
 use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError, net::TcpType};
-use tokio::{sync::oneshot, task::JoinSet};
+use tokio::{sync::oneshot, task::JoinSet, time::Instant};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
@@ -172,7 +172,7 @@ impl ControllerActor {
         // // Constrained Baseline Level 4.0, (pt=108, rtx=109)
         // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
 
-        let mut rtc = rtc_config.build();
+        let mut rtc = rtc_config.build(Instant::now().into());
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
         let sockets = [&udp_egress, &tcp_egress];
