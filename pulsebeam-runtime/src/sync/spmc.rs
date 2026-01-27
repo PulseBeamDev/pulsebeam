@@ -35,11 +35,16 @@ struct Ring<T> {
 }
 
 impl<T> Ring<T> {
-    fn new(capacity: usize) -> Arc<Self> {
-        assert!(
-            capacity > 0 && capacity.is_power_of_two(),
-            "Capacity must be power of 2"
-        );
+    fn new(mut capacity: usize) -> Arc<Self> {
+        if capacity > 0 && capacity.is_power_of_two() {
+            let old_cap = capacity;
+            capacity = capacity.next_power_of_two();
+            tracing::warn!(
+                "Capacity should be power of 2, use nearest: {} -> {}",
+                old_cap,
+                capacity
+            );
+        }
 
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {

@@ -243,24 +243,24 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, base_cap: usize) -> (TrackSender, Tra
             MediaKind::Video => (rtp::VIDEO_FREQUENCY, should_forward_noop as PacketFilter),
         };
         let (quality, bitrate, cap_tier) = match (meta.kind, rid) {
-            (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000, 0.5),
-            (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000, 2.0),
+            (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000, 1),
+            (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000, 4),
             (MediaKind::Video, Some(r)) if r.starts_with('f') => {
-                (SimulcastQuality::High, 800_000, 2.0)
+                (SimulcastQuality::High, 800_000, 4)
             }
             (MediaKind::Video, Some(r)) if r.starts_with('h') => {
-                (SimulcastQuality::Medium, 300_000, 1.5)
+                (SimulcastQuality::Medium, 300_000, 2)
             }
             (MediaKind::Video, Some(r)) if r.starts_with('q') => {
-                (SimulcastQuality::Low, 150_000, 1.0)
+                (SimulcastQuality::Low, 150_000, 1)
             }
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");
-                (SimulcastQuality::Undefined, 500_000, 2.0)
+                (SimulcastQuality::Undefined, 500_000, 2)
             }
         };
 
-        let (tx, rx) = spmc::channel(((base_cap as f64) * cap_tier) as usize);
+        let (tx, rx) = spmc::channel(base_cap * cap_tier);
         let (keyframe_tx, keyframe_rx) = mpsc::channel(1);
 
         let stream_state = StreamState::new(true, bitrate);

@@ -283,7 +283,7 @@ impl ParticipantCore {
                         .simulcast
                         .map(|s| s.recv.iter().map(|l| l.rid).collect()),
                 });
-                let (tx, rx) = track::new(media.mid, track_meta, 32);
+                let (tx, rx) = track::new(media.mid, track_meta, 16);
                 let accepted = self.upstream.add_published_track(media.mid, tx);
                 if !accepted {
                     self.disconnect(DisconnectReason::TooManyUpstreamTracks);
