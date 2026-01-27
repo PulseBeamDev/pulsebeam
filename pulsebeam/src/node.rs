@@ -334,11 +334,13 @@ mod internal {
         StatusCode,
         header::{CONTENT_DISPOSITION, CONTENT_TYPE},
     };
+    use metrics::{Unit, describe_gauge, gauge};
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::ProfilerGuard;
     use pprof::protos::Message;
     use pulsebeam_runtime::actor::Actor;
     use serde::Deserialize;
+    use tokio::runtime::Handle;
 
     use crate::{controller, gateway, participant, room};
 
@@ -363,13 +365,7 @@ mod internal {
         // Try to install the Prometheus recorder.
         // In simulation or test environments running multiple nodes in one process,
         // this might fail if already installed. We proceed gracefully.
-        let prometheus_handle = match PrometheusBuilder::new().install_recorder() {
-            Ok(h) => Some(h),
-            Err(_) => {
-                tracing::warn!("Prometheus recorder already installed; new handle not available.");
-                None
-            }
-        };
+        let prometheus_handle = PrometheusBuilder::new().install_recorder()?;
 
         const INDEX_HTML: &str = r#"
 <ul>
@@ -382,32 +378,29 @@ mod internal {
 </ul>
 "#;
 
-        let mut router = Router::new()
+        let router_prometheus = prometheus_handle.clone();
+        let router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
             .route("/debug/pprof/allocs", get(heap_profile))
             .route("/healthz", get(healthcheck))
-            .route("/", get(|| async { Html(INDEX_HTML) }));
-
-        // Only attach metrics route if we successfully got a handle
-        if let Some(handle) = prometheus_handle.clone() {
-            router = router.route("/metrics", get(move || async move { handle.render() }));
-        }
+            .route("/", get(async move || Html(INDEX_HTML)))
+            .route("/metrics", get(async move || router_prometheus.render()));
+        let rt_monitor_join = tokio::spawn(rt_background_monitor(prometheus_handle));
 
         tracing::info!("internal metrics listening on {:?}", addr);
 
         // Background tasks
-        let runtime_metrics_join = tokio::spawn(
-            tokio_metrics::RuntimeMetricsReporterBuilder::default()
-                .with_interval(Duration::from_secs(5))
-                .describe_and_run(),
-        );
-
-        let actor_monitor_join = if let Some(handle) = prometheus_handle {
-            tokio::spawn(background_monitor(handle))
-        } else {
-            // Spawn a dummy task if we can't monitor
-            tokio::spawn(async {})
-        };
+        // let runtime_metrics_join = tokio::spawn(
+        //     tokio_metrics::RuntimeMetricsReporterBuilder::default()
+        //         .with_interval(Duration::from_secs(5))
+        //         .describe_and_run(),
+        // );
+        // let actor_monitor_join = if let Some(handle) = prometheus_handle {
+        //     tokio::spawn(actor_background_monitor(handle))
+        // } else {
+        //     // Spawn a dummy task if we can't monitor
+        //     tokio::spawn(async {})
+        // };
 
         tokio::select! {
             res = axum::serve(listener, router) => {
@@ -415,8 +408,9 @@ mod internal {
                     tracing::error!("internal http server error: {e}");
                 }
             }
-            _ = runtime_metrics_join => {}
-            _ = actor_monitor_join => {}
+            _ = rt_monitor_join => {}
+            // _ = runtime_metrics_join => {}
+            // _ = actor_monitor_join => {}
             _ = shutdown.cancelled() => {
                 tracing::info!("internal http server shutting down");
             }
@@ -425,7 +419,125 @@ mod internal {
         Ok(())
     }
 
-    async fn background_monitor(prometheus_handle: PrometheusHandle) {
+    async fn rt_background_monitor(prometheus_handle: PrometheusHandle) {
+        let metrics = Handle::current().metrics();
+
+        describe_gauge!(
+            "tokio_active_tasks",
+            Unit::Count,
+            "Current number of active tasks"
+        );
+        describe_gauge!(
+            "tokio_injection_queue_depth",
+            Unit::Count,
+            "Current depth of the global injection queue"
+        );
+        describe_gauge!(
+            "tokio_worker_count",
+            Unit::Count,
+            "Total number of worker threads"
+        );
+        describe_gauge!(
+            "tokio_blocking_threads",
+            Unit::Count,
+            "Current number of blocking threads"
+        );
+        describe_gauge!(
+            "tokio_idle_blocking_threads",
+            Unit::Count,
+            "Current number of idle blocking threads"
+        );
+        describe_gauge!(
+            "tokio_spawned_tasks_total",
+            Unit::Count,
+            "Total number of tasks spawned since runtime start"
+        );
+
+        // Worker specific
+        describe_gauge!(
+            "tokio_worker_park_count",
+            Unit::Count,
+            "Total number of times this worker parked"
+        );
+        describe_gauge!(
+            "tokio_worker_steal_count",
+            Unit::Count,
+            "Total number of times this worker stole tasks"
+        );
+        describe_gauge!(
+            "tokio_worker_poll_count",
+            Unit::Count,
+            "Total number of times this worker polled"
+        );
+        describe_gauge!(
+            "tokio_worker_busy_duration_seconds",
+            Unit::Seconds,
+            "Total duration this worker has been busy"
+        );
+        describe_gauge!(
+            "tokio_worker_local_queue_depth",
+            Unit::Count,
+            "Current depth of this worker's local queue"
+        );
+        describe_gauge!(
+            "tokio_worker_mean_poll_time_us",
+            Unit::Microseconds,
+            "Mean poll time for this worker"
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            interval.tick().await;
+
+            // Current State (Gauges)
+            gauge!("tokio_num_alive_tasks").set(metrics.num_alive_tasks() as f64);
+            gauge!("tokio_injection_queue_depth",).set(metrics.global_queue_depth() as f64);
+            gauge!("tokio_blocking_queue_depth",).set(metrics.blocking_queue_depth() as f64);
+            gauge!("tokio_worker_count").set(metrics.num_workers() as f64);
+            gauge!("tokio_blocking_threads").set(metrics.num_blocking_threads() as f64);
+            gauge!("tokio_idle_blocking_threads").set(metrics.num_idle_blocking_threads() as f64);
+
+            // Cumulative Totals (Technically Counters, but we emit as Gauges because
+            // Tokio gives us the absolute total, not the delta).
+            gauge!("tokio_spawned_tasks_total").set(metrics.spawned_tasks_count() as f64);
+            gauge!("tokio_remote_schedule_total").set(metrics.remote_schedule_count() as f64);
+            gauge!("tokio_budget_forced_yield_total")
+                .set(metrics.budget_forced_yield_count() as f64);
+
+            gauge!("tokio_io_driver_ready_total").set(metrics.io_driver_ready_count() as f64);
+
+            for i in 0..metrics.num_workers() {
+                let labels = [("worker", i.to_string())];
+
+                gauge!("tokio_worker_local_queue_depth", &labels,)
+                    .set(metrics.worker_local_queue_depth(i) as f64);
+
+                gauge!("tokio_worker_park_count", &labels).set(metrics.worker_park_count(i) as f64);
+
+                gauge!("tokio_worker_noop_count", &labels).set(metrics.worker_noop_count(i) as f64);
+
+                gauge!("tokio_worker_steal_count", &labels)
+                    .set(metrics.worker_steal_count(i) as f64);
+
+                gauge!("tokio_worker_poll_count", &labels).set(metrics.worker_poll_count(i) as f64);
+
+                gauge!("tokio_worker_overflow_count", &labels)
+                    .set(metrics.worker_overflow_count(i) as f64);
+
+                gauge!("tokio_worker_busy_duration_seconds", &labels)
+                    .set(metrics.worker_total_busy_duration(i).as_secs_f64());
+
+                gauge!("tokio_worker_mean_poll_time_us", &labels)
+                    .set(metrics.worker_mean_poll_time(i).as_micros() as f64);
+            }
+
+            // Keep memory usage and CPU usage bounded per prometheus interval.
+            prometheus_handle.run_upkeep();
+        }
+    }
+
+    async fn actor_background_monitor(prometheus_handle: PrometheusHandle) {
         let mut monitors = [
             ("gateway", gateway::GatewayActor::monitor().intervals()),
             (

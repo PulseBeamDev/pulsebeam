@@ -251,7 +251,7 @@ where
 
     // Wrap the actor's run in instrumentation and unwind safety
     let runnable = CURRENT_SCOPE.scope(RefCell::new(scope_for_child), run(a, ctx));
-    let runnable = A::monitor().instrument(runnable);
+    // let runnable = A::monitor().instrument(runnable);
     let runnable = tracing::Instrument::instrument(runnable, span);
 
     let actor_id = handle.meta.clone();
