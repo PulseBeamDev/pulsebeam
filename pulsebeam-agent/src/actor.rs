@@ -171,7 +171,7 @@ impl AgentBuilder {
             .enable_opus(true)
             // .enable_bwe(Some(Bitrate::kbps(2000)))
             .set_stats_interval(Some(Duration::from_millis(200)))
-            .build();
+            .build(Instant::now().into());
 
         let mut candidate_count = 0;
         let mut maybe_addr = None;
