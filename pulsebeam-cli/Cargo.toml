@@ -2,6 +2,7 @@
 name = "pulsebeam-cli"
 license = "Apache-2.0"
 publish = false
+
 version.workspace = true
 edition.workspace = true
 homepage.workspace = true

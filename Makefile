@@ -75,5 +75,8 @@ clean:
 chore-release:
 	cargo release
 
+chore-changelog:
+	git-cliff -o CHANGELOG.md
+
 unused:
 	cargo machete

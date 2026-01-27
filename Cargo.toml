@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.1.0"
+version = "0.3.2"
 edition = "2024"
 homepage = "https://pulsebeam.dev/"
 documentation = "https://pulsebeam.dev/"
