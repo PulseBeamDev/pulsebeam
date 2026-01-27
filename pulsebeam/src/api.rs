@@ -10,6 +10,7 @@ use axum::{
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::LOCATION;
+use pulsebeam_runtime::mailbox::TrySendError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
@@ -118,6 +119,8 @@ pub struct ApiConfig {
 pub enum ApiError {
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
+    #[error("too many requests, please try again later.")]
+    RateLimited,
     #[error("server is busy, please try again later")]
     ServiceUnavailable,
     #[error("failed to construct response URL")]
@@ -136,6 +139,7 @@ impl IntoResponse for ApiError {
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ApiError::JoinError(controller::ControllerError::Unknown(_))
             | ApiError::JoinError(controller::ControllerError::IOError(_))
             | ApiError::BadUrl
@@ -204,14 +208,16 @@ async fn create_participant(
     let participant_id = Arc::new(ParticipantId::new());
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    con.send(controller::ControllerMessage::Allocate(
+    con.try_send(controller::ControllerMessage::Allocate(
         room_id.clone(),
         participant_id.clone(),
         raw_offer,
         answer_tx,
     ))
-    .await
-    .map_err(|_| controller::ControllerError::ServiceUnavailable)?;
+    .map_err(|e| match e {
+        TrySendError::Full(_) => ApiError::RateLimited,
+        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+    })?;
 
     let answer_sdp = answer_rx
         .await
