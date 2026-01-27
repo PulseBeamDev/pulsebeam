@@ -224,7 +224,7 @@ impl TrackReceiver {
     }
 }
 
-pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, TrackReceiver) {
+pub fn new(mid: Mid, meta: Arc<TrackMeta>, base_cap: usize) -> (TrackSender, TrackReceiver) {
     let mut simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
         rids.iter().map(|rid| Some(*rid)).collect()
     } else {
@@ -237,27 +237,32 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, capacity: usize) -> (TrackSender, Tra
     let mut receivers = Vec::new();
 
     for rid in simulcast_rids {
-        let (tx, rx) = spmc::channel(capacity);
-        let (keyframe_tx, keyframe_rx) = mpsc::channel(1);
-
         // TODO: get this from SDP instead
         let (clock_rate, filter) = match meta.kind {
             MediaKind::Audio => (rtp::AUDIO_FREQUENCY, should_forward_audio as PacketFilter),
             MediaKind::Video => (rtp::VIDEO_FREQUENCY, should_forward_noop as PacketFilter),
         };
-        let (quality, bitrate) = match (meta.kind, rid) {
-            (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000),
-            (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000),
-            (MediaKind::Video, Some(r)) if r.starts_with('f') => (SimulcastQuality::High, 800_000),
-            (MediaKind::Video, Some(r)) if r.starts_with('h') => {
-                (SimulcastQuality::Medium, 300_000)
+        let (quality, bitrate, cap_tier) = match (meta.kind, rid) {
+            (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000, 0.5),
+            (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000, 2.0),
+            (MediaKind::Video, Some(r)) if r.starts_with('f') => {
+                (SimulcastQuality::High, 800_000, 2.0)
             }
-            (MediaKind::Video, Some(r)) if r.starts_with('q') => (SimulcastQuality::Low, 150_000),
+            (MediaKind::Video, Some(r)) if r.starts_with('h') => {
+                (SimulcastQuality::Medium, 300_000, 1.5)
+            }
+            (MediaKind::Video, Some(r)) if r.starts_with('q') => {
+                (SimulcastQuality::Low, 150_000, 1.0)
+            }
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");
-                (SimulcastQuality::Undefined, 500_000)
+                (SimulcastQuality::Undefined, 500_000, 2.0)
             }
         };
+
+        let (tx, rx) = spmc::channel(((base_cap as f64) * cap_tier) as usize);
+        let (keyframe_tx, keyframe_rx) = mpsc::channel(1);
+
         let stream_state = StreamState::new(true, bitrate);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());

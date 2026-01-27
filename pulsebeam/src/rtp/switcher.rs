@@ -9,7 +9,7 @@ use crate::rtp::timeline::Timeline;
 
 // It's possible for the new stream packets to arrive later than the old stream despite
 // having a playout time that is earlier.
-const PLAYOUT_JITTER_TOLERANCE: Duration = Duration::from_millis(20);
+const PLAYOUT_JITTER_TOLERANCE: Duration = Duration::from_millis(5);
 
 #[derive(Debug)]
 pub struct Switcher {

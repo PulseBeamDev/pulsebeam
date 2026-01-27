@@ -99,6 +99,8 @@ pub struct Receiver<T> {
 
 impl<T: Clone> Receiver<T> {
     pub fn reset(&mut self) {
+        // Half cap to give a chance to load from cache while not too close
+        // to tail to cause a lag error.
         self.local_head = self.ring.head.load(Ordering::Acquire);
         let half_ring_cap = (self.ring.slots.len() / 2) as u64;
         let ring_len = self.local_head.wrapping_sub(self.next_seq);
