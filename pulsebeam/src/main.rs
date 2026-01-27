@@ -40,6 +40,8 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(workers)
+        // https://github.com/tokio-rs/tokio/issues/7745
+        .enable_alt_timer()
         .build()
         .unwrap();
 
