@@ -117,6 +117,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      RUSTFLAGS: "--cfg tracing_unstable --cfg tokio_unstable -C force-frame-pointers=yes -C link-arg=-Wl,--allow-multiple-definition"
     steps:
       - name: enable windows longpaths
         run: |
@@ -170,16 +171,39 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  custom-docker:
+    needs:
+      - plan
+      - custom-ci
+    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
+    uses: ./.github/workflows/docker.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "actions": "read"
+      "attestations": "write"
+      "checks": "write"
+      "contents": "write"
+      "discussions": "read"
+      "id-token": "write"
+      "issues": "read"
+      "packages": "write"
+      "pull-requests": "read"
+      "repository-projects": "read"
+      "security-events": "read"
+      "statuses": "read"
+
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
       - plan
       - build-local-artifacts
+      - custom-docker
     runs-on: "ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
-      RUSTFLAGS: "--cfg tracing_unstable --cfg tokio_unstable -C force-frame-pointers=yes -C link-arg=-Wl,--allow-multiple-definition"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -217,37 +241,15 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-
-  custom-docker:
-    needs:
-      - plan
-      - build-local-artifacts
-    uses: ./.github/workflows/docker.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    permissions:
-      "actions": "read"
-      "attestations": "write"
-      "checks": "write"
-      "contents": "write"
-      "discussions": "read"
-      "id-token": "write"
-      "issues": "read"
-      "packages": "write"
-      "pull-requests": "read"
-      "repository-projects": "read"
-      "security-events": "read"
-      "statuses": "read"
   # Determines if we should publish/announce
   host:
     needs:
       - plan
       - build-local-artifacts
-      - build-global-artifacts
       - custom-docker
+      - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-docker.result == 'skipped' || needs.custom-docker.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-docker.result == 'skipped' || needs.custom-docker.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-24.04"
