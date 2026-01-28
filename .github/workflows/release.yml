@@ -117,7 +117,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      RUSTFLAGS: "--cfg tracing_unstable --cfg tokio_unstable -C force-frame-pointers=yes -C link-arg=-Wl,--allow-multiple-definition"
+      RUSTFLAGS: "--cfg tracing_unstable --cfg tokio_unstable -C force-frame-pointers=yes"
     steps:
       - name: enable windows longpaths
         run: |
