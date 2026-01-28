@@ -1,0 +1,19 @@
+pre-release-hook = [
+  "git-cliff",
+  "--include-path",
+  "./pulsebeam-core/**/*",
+  "--include-path",
+  "./pulsebeam-proto/**/*",
+  "--include-path",
+  "./pulsebeam-runtime/**/*",
+  "--include-path",
+  "./pulsebeam/**/*",
+  "-o",
+  "CHANGELOG.md",
+  "--tag",
+  "{{tag_name}}"
+]
+# pre-release-replacements = [
+#   { file = "./CHANGELOG.md", search = "## \\[unreleased\\]", replace = "## [{{version}}] - {{date}}" },
+# ]
+tag = true
