@@ -21,6 +21,10 @@ install-path = "CARGO_HOME"
 install-updater = true
 # Plan jobs to run in CI
 plan-jobs = ["./ci", "./docker"]
+# Allow adding RUSTFLAGS to release.yml
+allow-dirty = ["ci"]
+# Build only the required packages, and individually
+precise-builds = true
 
 [dist.github-custom-job-permissions.docker]
 actions = "read"
