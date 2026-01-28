@@ -1,47 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+  "pulsebeam",
+  "pulsebeam-agent",
+  "pulsebeam-cli",
+  "pulsebeam-core",
+  "pulsebeam-proto",
+  "pulsebeam-runtime",
+  "pulsebeam-simulator",
+]
+
 [workspace.package]
 version = "0.3.2"
-edition = "2024"
-homepage = "https://pulsebeam.dev/"
-documentation = "https://pulsebeam.dev/"
-repository = "https://github.com/PulseBeamDev/pulsebeam"
 authors = ["Lukas Herman <lukas@pulsebeam.dev>"]
+edition = "2024"
+documentation = "https://pulsebeam.dev/"
+homepage = "https://pulsebeam.dev/"
+repository = "https://github.com/PulseBeamDev/pulsebeam"
 license = "AGPL-3.0"
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-panic = "unwind"
-debug = 1
-strip = "debuginfo"
-
-[profile.profiling]
-inherits = "release"
-debug = true # Full debug info for symbols and source lines
-strip = false # Retain symbols for profiling
-debug-assertions = false # Match release behavior
-panic = "abort" # make sure we don't include unwind in profile
-
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
 
 [workspace.dependencies]
 anyhow = "1"
-serde = { version = "1", features = ["derive"]}
+bytes = "1.11.0"
+futures-lite = "2.6.1"
+more-asserts = "0.3.1"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+# str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
+# str0m = { git = "https://github.com/algesten/str0m.git",  rev = "a236b94be5d3cf7a56f596fc8a4da252bb8fa93b"  }
+# str0m = { path = "../str0m" }
+str0m = { version = "0.16.1" }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7.17"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
-futures-lite = "2.6.1"
-rand = "0.9"
-bytes = "1.11.0"
-# str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
-# str0m = { git = "https://github.com/algesten/str0m.git",  rev = "a236b94be5d3cf7a56f596fc8a4da252bb8fa93b"  }
-# str0m = { path = "../str0m" }
-str0m = { version = "0.16.0" }
-
-more-asserts = "0.3.1"
 turmoil = "0.7.0"
 
 [patch.crates-io]
@@ -52,14 +44,21 @@ turmoil = "0.7.0"
 # [patch."https://github.com/PulseBeamDev/str0m.git"]
 # str0m = { path = "../str0m" }
 
-[workspace]
-resolver = "2"
-members = [
-  "pulsebeam", 
-  "pulsebeam-agent", 
-  "pulsebeam-cli", 
-  "pulsebeam-core", 
-  "pulsebeam-proto",
-  "pulsebeam-runtime",
-  "pulsebeam-simulator",
-]
+[profile.release]
+opt-level = 3
+debug = 1
+strip = "debuginfo"
+lto = "thin"
+panic = "unwind"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[profile.profiling]
+inherits = "release"
+debug = true  # Full debug info for symbols and source lines
+strip = false  # Retain symbols for profiling
+debug-assertions = false  # Match release behavior
+panic = "abort"  # make sure we don't include unwind in profile
