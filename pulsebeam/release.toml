@@ -11,7 +11,7 @@ pre-release-hook = [
   "-o",
   "CHANGELOG.md",
   "--tag",
-  "{{version}}"
+  "{{tag_name}}"
 ]
 # pre-release-replacements = [
 #   { file = "./CHANGELOG.md", search = "## \\[unreleased\\]", replace = "## [{{version}}] - {{date}}" },
