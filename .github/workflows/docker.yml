@@ -9,6 +9,10 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
 
 env:
   # The name of the Docker image to be built and pushed to GHCR
