@@ -10,13 +10,31 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu"
+]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
 # Plan jobs to run in CI
 plan-jobs = ["./ci", "./docker"]
+
+[dist.github-custom-job-permissions.docker]
+actions = "read"
+attestations = "write"
+checks = "write"
+contents = "write"
+discussions = "read"
+id-token = "write"
+issues = "read"
+packages = "write"
+pull-requests = "read"
+repository-projects = "read"
+security-events = "read"
+statuses = "read"
 
 [dist.github-custom-runners]
 global = "ubuntu-24.04"
