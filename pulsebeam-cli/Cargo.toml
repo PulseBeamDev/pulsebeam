@@ -14,7 +14,7 @@ authors.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
 
-pulsebeam-agent = { version = "0.1.0", path = "../pulsebeam-agent" }
+pulsebeam-agent = { path = "../pulsebeam-agent" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-pulsebeam-core = { version = "0.1.0", path = "../pulsebeam-core", features = ["reqwest"] }
+pulsebeam-core = { path = "../pulsebeam-core", features = ["reqwest"] }
 reqwest = "0.13.1"

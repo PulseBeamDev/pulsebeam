@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam-agent"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "futures-lite",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam-cli"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "pulsebeam-agent",
  "pulsebeam-core",
@@ -2611,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam-core"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "axum",
  "http",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam-proto"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "prost 0.14.3",
  "prost-build 0.14.3",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam-runtime"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "async-channel",
  "async-stream",
@@ -2660,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "pulsebeam-simulator"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "bytes",
