@@ -19,6 +19,7 @@ pre-release-replacements = [
   {file="../CHANGELOG.md", search="## \\[unreleased\\]", replace="## [{{version}}] - {{date}}"},
 ]
 shared-version = true
+publish = false
 
 [features]
 default = []
