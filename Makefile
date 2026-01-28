@@ -59,7 +59,7 @@ deps-brew:
 	brew install git-cliff axodotdev/tap/cargo-dist
 
 deps-cargo:
-	$(CARGO_CMD) install cargo-release cargo-dist git-cliff
+	$(CARGO_CMD) install cargo-dist git-cliff
 	$(CARGO_CMD) install flamegraph cargo-machete
 
 deps-gh:
@@ -71,12 +71,6 @@ preview-markdown:
 clean:
 	$(CARGO_CMD) clean
 	rm -f perf.data flamegraph.svg
-
-chore-release:
-	cargo release -v
-
-chore-prerelease:
-	cargo release hook -v
 
 unused:
 	cargo machete
