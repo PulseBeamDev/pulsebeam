@@ -91,23 +91,6 @@ jobs:
     uses: ./.github/workflows/ci.yml
     secrets: inherit
 
-  custom-docker:
-    uses: ./.github/workflows/docker.yml
-    secrets: inherit
-    permissions:
-      "actions": "read"
-      "attestations": "write"
-      "checks": "write"
-      "contents": "write"
-      "discussions": "read"
-      "id-token": "write"
-      "issues": "read"
-      "packages": "write"
-      "pull-requests": "read"
-      "repository-projects": "read"
-      "security-events": "read"
-      "statuses": "read"
-
   # Build and packages all the platform-specific things
   build-local-artifacts:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
@@ -115,7 +98,6 @@ jobs:
     needs:
       - plan
       - custom-ci
-      - custom-docker
     if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
@@ -235,14 +217,37 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+
+  custom-docker:
+    needs:
+      - plan
+      - build-local-artifacts
+    uses: ./.github/workflows/docker.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "actions": "read"
+      "attestations": "write"
+      "checks": "write"
+      "contents": "write"
+      "discussions": "read"
+      "id-token": "write"
+      "issues": "read"
+      "packages": "write"
+      "pull-requests": "read"
+      "repository-projects": "read"
+      "security-events": "read"
+      "statuses": "read"
   # Determines if we should publish/announce
   host:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+      - custom-docker
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-docker.result == 'skipped' || needs.custom-docker.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-24.04"
