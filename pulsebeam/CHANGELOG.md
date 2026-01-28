@@ -1,4 +1,4 @@
-## [pulsebeam-v0.3.2] - 2026-01-28
+## [pulsebeam-v0.3.3] - 2026-01-28
 
 ### 🚀 Features
 
@@ -21,6 +21,10 @@
 ### 💼 Other
 
 - Tokio alt timer on 1.49
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump to 0.3.3
 ## [pulsebeam-v0.3.1] - 2025-12-29
 
 ### 🚀 Features
