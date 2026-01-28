@@ -28,6 +28,9 @@ test-unit:
 test-sim:
 	cargo test -p pulsebeam-simulator -- --no-capture
 
+lint:
+	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty
+
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
