@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use crate::entity;
 use crate::participant::downstream::{DownstreamAllocator, Intent};
 use pulsebeam_proto::signaling;
 use pulsebeam_proto::{namespace, prelude::*};

@@ -12,7 +12,7 @@ use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
 use tokio::time::Instant;
 
-use crate::entity::{EntityId, TrackId};
+use crate::entity::TrackId;
 use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
 pub struct SlotAssignment {
@@ -552,7 +552,7 @@ impl Slot {
             return false;
         }
 
-        return true;
+        true
     }
 
     pub fn switch_to(&mut self, mut receiver: SimulcastReceiver, force: bool) {
@@ -687,12 +687,9 @@ impl Slot {
 
     #[inline]
     fn transition_to(&mut self, new_state: SlotState) {
-        match &new_state {
-            SlotState::Streaming { .. } => {
-                self.switching_started_at = None;
-                self.keyframe_retries = 0;
-            }
-            _ => {}
+        if let SlotState::Streaming { .. } = &new_state {
+            self.switching_started_at = None;
+            self.keyframe_retries = 0;
         }
         self.state = Some(new_state);
     }

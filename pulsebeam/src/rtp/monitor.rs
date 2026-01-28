@@ -868,6 +868,12 @@ pub struct AudioMonitor {
     last_speech_at: Instant,
 }
 
+impl Default for AudioMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioMonitor {
     pub fn new() -> Self {
         let now = Instant::now();

@@ -419,7 +419,7 @@ impl AgentActor {
                 }
 
                  _ = &mut sleep => {
-                    if let Err(_) = self.rtc.handle_input(Input::Timeout(Instant::now().into())) {
+                    if self.rtc.handle_input(Input::Timeout(Instant::now().into())).is_err() {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                          return;
                     }
@@ -445,7 +445,7 @@ impl AgentActor {
                         Event::MediaData(data) => {
                             // Network -> User
                             if let Some(tx) = self.slot_manager.get_sender(&data.mid) {
-                                let _ = tx.try_send(data.into());
+                                tx.try_send(data.into());
                             }
                         }
 

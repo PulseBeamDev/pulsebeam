@@ -248,7 +248,7 @@ fn handle_new_connection(
             tokio::select! {
                 _ = _guard.1.cancelled() => break,
                 res = tokio::time::timeout(READ_TIMEOUT, tcp_reader.read_buf(&mut recv_buf)) => {
-                    let n = match res {
+                    let _n = match res {
                         Ok(Ok(n)) if n > 0 => n,
                         _ => break, // Timeout, Error, or EOF
                     };

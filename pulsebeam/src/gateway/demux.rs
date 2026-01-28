@@ -6,7 +6,6 @@ use crate::entity::ParticipantId;
 use crate::gateway::ice;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 pub type ParticipantHandle = mailbox::Sender<net::RecvPacketBatch>;
 

@@ -108,7 +108,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     match res {
                         Some(msg) => match msg {
                             actor::SystemMsg::GetState(responder) => {
-                                responder.send(self.get_observable_state());
+                                let _: () = self.get_observable_state();
+                                responder.send(());
                             }
                             actor::SystemMsg::Terminate => break,
                         },

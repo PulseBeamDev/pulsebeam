@@ -304,18 +304,18 @@ async fn delete_participant(
 #[axum::debug_handler]
 async fn reconnect_participant(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
-    State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+    State((_con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
-    raw_offer: String,
+    _raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = Arc::new(RoomId::new(room_id));
-    let participant_id = Arc::new(participant_id);
+    let _room_id = Arc::new(RoomId::new(room_id));
+    let _participant_id = Arc::new(participant_id);
 
     // Extract and validate headers
-    let reconnection_headers = ReconnectionRequestHeaders::from_header_map(&headers)?;
+    let _reconnection_headers = ReconnectionRequestHeaders::from_header_map(&headers)?;
 
-    return Ok((StatusCode::OK, "todo"));
+    Ok((StatusCode::OK, "todo"))
 
     // let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
 
