@@ -165,12 +165,15 @@ impl<M: MessageSet> Debug for ActorHandle<M> {
 }
 
 impl<M: MessageSet> ActorHandle<M> {
-    pub async fn send(&mut self, msg: M::Msg) -> Result<(), mailbox::SendError<M::Msg>> {
-        self.tx.send(msg).await
+    pub async fn send(&mut self, msg: impl Into<M::Msg>) -> Result<(), mailbox::SendError<M::Msg>> {
+        self.tx.send(msg.into()).await
     }
 
-    pub fn try_send(&mut self, msg: M::Msg) -> Result<(), mailbox::TrySendError<M::Msg>> {
-        self.tx.try_send(msg)
+    pub fn try_send(
+        &mut self,
+        msg: impl Into<M::Msg>,
+    ) -> Result<(), mailbox::TrySendError<M::Msg>> {
+        self.tx.try_send(msg.into())
     }
 
     pub async fn get_state(&mut self) -> Result<M::ObservableState, ActorError> {

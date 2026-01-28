@@ -208,12 +208,12 @@ async fn create_participant(
     let participant_id = Arc::new(ParticipantId::new());
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    con.try_send(controller::ControllerMessage::Allocate(
-        room_id.clone(),
-        participant_id.clone(),
-        raw_offer,
-        answer_tx,
-    ))
+    con.try_send(controller::CreateParticipant {
+        room_id: room_id.clone(),
+        participant_id: participant_id.clone(),
+        offer: raw_offer,
+        reply_tx: answer_tx,
+    })
     .map_err(|e| match e {
         TrySendError::Full(_) => ApiError::RateLimited,
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
@@ -267,10 +267,10 @@ async fn delete_participant(
     let participant_id = Arc::new(participant_id);
 
     let _ = con
-        .send(controller::ControllerMessage::RemoveParticipant(
+        .send(controller::DeleteParticipant {
             room_id,
             participant_id,
-        ))
+        })
         .await;
 
     Ok(StatusCode::NO_CONTENT)

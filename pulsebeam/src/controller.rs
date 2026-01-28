@@ -11,6 +11,26 @@ use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError, net::TcpType};
 use tokio::{sync::oneshot, task::JoinSet, time::Instant};
 
+#[derive(Debug, derive_more::From)]
+pub enum ControllerMessage {
+    CreateParticipant(CreateParticipant),
+    DeleteParticipant(DeleteParticipant),
+}
+
+#[derive(Debug)]
+pub struct CreateParticipant {
+    pub room_id: Arc<RoomId>,
+    pub participant_id: Arc<ParticipantId>,
+    pub offer: String,
+    pub reply_tx: oneshot::Sender<Result<String, ControllerError>>,
+}
+
+#[derive(Debug)]
+pub struct DeleteParticipant {
+    pub room_id: Arc<RoomId>,
+    pub participant_id: Arc<ParticipantId>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
     #[error("sdp offer is invalid: {0}")]
@@ -27,17 +47,6 @@ pub enum ControllerError {
 
     #[error("unknown error: {0}")]
     Unknown(String),
-}
-
-#[derive(Debug)]
-pub enum ControllerMessage {
-    Allocate(
-        Arc<RoomId>,
-        Arc<ParticipantId>,
-        String,
-        oneshot::Sender<Result<String, ControllerError>>,
-    ),
-    RemoveParticipant(Arc<RoomId>, Arc<ParticipantId>),
 }
 
 pub struct ControllerMessageSet;
@@ -92,15 +101,18 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
         msg: ControllerMessage,
     ) -> () {
         match msg {
-            ControllerMessage::Allocate(room_id, participant_id, offer, resp) => {
-                let _ = resp.send(self.allocate(ctx, room_id, participant_id, offer).await);
+            ControllerMessage::CreateParticipant(m) => {
+                let answer = self
+                    .allocate(ctx, m.room_id, m.participant_id, m.offer)
+                    .await;
+                let _ = m.reply_tx.send(answer);
             }
 
-            ControllerMessage::RemoveParticipant(room_id, participant_id) => {
-                if let Some(room_handle) = self.rooms.get_mut(&room_id) {
+            ControllerMessage::DeleteParticipant(m) => {
+                if let Some(room_handle) = self.rooms.get_mut(&m.room_id) {
                     // if the room has exited, the participants have already cleaned up too.
                     let _ = room_handle
-                        .send(room::RoomMessage::RemoveParticipant(participant_id))
+                        .send(room::RoomMessage::RemoveParticipant(m.participant_id))
                         .await;
                 }
             }
