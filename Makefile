@@ -73,7 +73,7 @@ clean:
 	rm -f perf.data flamegraph.svg
 
 chore-release:
-	cargo release
+	cargo release -v
 
 chore-changelog:
 	git-cliff -o CHANGELOG.md
