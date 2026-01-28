@@ -4,12 +4,11 @@
 name: PulseBeam Docker Build
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-    tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_call:
 
 env:
   # The name of the Docker image to be built and pushed to GHCR
