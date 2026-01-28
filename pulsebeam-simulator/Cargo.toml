@@ -1,37 +1,32 @@
 [package]
 name = "pulsebeam-simulator"
-publish = false
 version.workspace = true
-edition.workspace = true
-homepage.workspace = true
-documentation.workspace = true
-repository.workspace = true
 authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
 license.workspace = true
+publish = false
 
 [dev-dependencies]
-tokio.workspace = true
-tokio-util.workspace = true
-turmoil.workspace = true
-tracing.workspace = true
-
-pulsebeam = { version = "0.3.1", path = "../pulsebeam" }
-pulsebeam-runtime = { path = "../pulsebeam-runtime" }
-pulsebeam-agent = {  path = "../pulsebeam-agent" }
-pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
-
-proptest = "1.9.0"
-reqwest = "0.13.1"
-tower = { version = "0.5.2", features = ["util"] }
+anyhow.workspace = true
+bytes = "1"
+futures = "0.3.31"
 http = "1.4.0"
-
-pin-project-lite = "0.2.16"
+http-body-util = "0.1"  # Crucial for .collect().await
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
-http-body-util = "0.1" # Crucial for .collect().await
-bytes = "1"
-anyhow.workspace = true
+pin-project-lite = "0.2.16"
+proptest = "1.9.0"
+pulsebeam = { path = "../pulsebeam" }
+pulsebeam-agent = { path = "../pulsebeam-agent" }
+pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
+pulsebeam-runtime = { path = "../pulsebeam-runtime" }
+reqwest = "0.13.1"
+tokio.workspace = true
+tokio-util.workspace = true
+tower = { version = "0.5.2", features = ["util"] }
+tracing.workspace = true
 tracing-subscriber = "0.3.22"
-futures = "0.3.31"
-
-
+turmoil.workspace = true
