@@ -73,10 +73,7 @@ clean:
 	rm -f perf.data flamegraph.svg
 
 chore-release:
-	cargo release -v
-
-chore-prerelease:
-	cargo release hook -v
+	cargo release -v --execute
 
 unused:
 	cargo machete
