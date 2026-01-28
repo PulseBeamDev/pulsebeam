@@ -204,8 +204,8 @@ async fn create_participant(
     headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = Arc::new(RoomId::new(room_id));
-    let participant_id = Arc::new(ParticipantId::new());
+    let room_id = RoomId::new(room_id);
+    let participant_id = ParticipantId::new();
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     con.try_send(controller::CreateParticipant {
@@ -225,13 +225,14 @@ async fn create_participant(
 
     let path = format!(
         "/rooms/{}/participants/{}",
-        &room_id.external, &participant_id
+        &room_id.external(),
+        &participant_id
     );
     let location_url = build_location(&headers, &cfg, &path)?;
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
-        participant_id: participant_id.internal.to_string(),
+        participant_id: participant_id.to_string(),
     };
 
     Ok((
@@ -263,8 +264,8 @@ async fn delete_participant(
     Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = Arc::new(RoomId::new(room_id));
-    let participant_id = Arc::new(participant_id);
+    let room_id = RoomId::new(room_id);
+    let participant_id = participant_id;
 
     let _ = con
         .send(controller::DeleteParticipant {

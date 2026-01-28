@@ -1,6 +1,7 @@
-use std::borrow::Borrow;
-use std::{fmt, hash, str::FromStr, sync::Arc};
+use std::sync::Arc;
+use std::{fmt, str::FromStr};
 
+use derive_more::{AsRef, Display};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::rand;
 use sha3::{Digest, Sha3_256};
@@ -57,17 +58,13 @@ pub fn get_encoded_part(id: &str) -> Option<&str> {
     id.split_once('_').map(|(_, b58)| b58)
 }
 
-/// Returns the ID as a string reference (useful if passed as EntityId).
-pub fn as_str(id: &EntityId) -> &str {
-    id.as_str()
-}
-
 fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     let encoded = bs58::encode(bytes).into_string();
     format!("{}_{}", prefix, encoded)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IdValidationError {
     #[error("ID exceeds maximum length of {0} characters")]
     TooLong(usize),
@@ -75,10 +72,8 @@ pub enum IdValidationError {
     InvalidCharacters,
     #[error("ID is empty")]
     Empty,
-}
-
-pub fn validate_track_id(s: &str) -> Result<(), IdValidationError> {
-    validate_id_string(s, 32)
+    #[error("Invalid prefix: expected {expected}, got {got}")]
+    InvalidPrefix { expected: String, got: String },
 }
 
 pub fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationError> {
@@ -88,7 +83,6 @@ pub fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationErr
     if s.len() > max_len {
         return Err(IdValidationError::TooLong(max_len));
     }
-    // Check if all characters are in the allowed set: 0-9, A-Z, a-z, _, -
     if !s
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -98,15 +92,28 @@ pub fn validate_id_string(s: &str, max_len: usize) -> Result<(), IdValidationErr
     Ok(())
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RoomId {
-    pub external: ExternalRoomId,
-    pub internal: EntityId,
+    external: ExternalRoomId,
+    internal: Arc<EntityId>,
 }
 
 impl RoomId {
     pub fn new(external: ExternalRoomId) -> Self {
-        let internal = new_hashed_id(prefix::ROOM_ID, external.as_str());
+        let internal = Arc::new(new_hashed_id(prefix::ROOM_ID, external.as_str()));
         Self { external, internal }
+    }
+
+    pub fn external(&self) -> &ExternalRoomId {
+        &self.external
+    }
+
+    pub fn internal(&self) -> &str {
+        &self.internal
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.internal
     }
 }
 
@@ -119,29 +126,18 @@ impl TryFrom<&str> for RoomId {
     }
 }
 
-impl hash::Hash for RoomId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.internal.hash(state);
-    }
-}
-
-impl Eq for RoomId {}
-
-impl PartialEq for RoomId {
-    fn eq(&self, other: &Self) -> bool {
-        self.internal.eq(&other.internal)
-    }
-}
-
 impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.internal, f)
+        fmt::Display::fmt(&*self.internal, f)
     }
 }
 
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.internal, f)
+        f.debug_struct("RoomId")
+            .field("external", &self.external)
+            .field("internal", &*self.internal)
+            .finish()
     }
 }
 
@@ -151,8 +147,11 @@ impl AsRef<str> for RoomId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Display, AsRef, serde::Serialize, serde::Deserialize,
+)]
 #[serde(try_from = "String")]
+#[as_ref(forward)]
 pub struct ExternalRoomId(String);
 
 impl ExternalRoomId {
@@ -160,12 +159,15 @@ impl ExternalRoomId {
 
     pub fn new(id: String) -> Result<Self, IdValidationError> {
         validate_id_string(&id, Self::MAX_LEN)?;
-        Ok(ExternalRoomId(id))
+        Ok(Self(id))
     }
 
-    /// Returns a reference to the inner string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -173,13 +175,7 @@ impl FromStr for ExternalRoomId {
     type Err = IdValidationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ExternalRoomId::new(s.to_string())
-    }
-}
-
-impl fmt::Display for ExternalRoomId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        Self::new(s.to_string())
     }
 }
 
@@ -187,26 +183,25 @@ impl TryFrom<String> for ExternalRoomId {
     type Error = IdValidationError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        ExternalRoomId::new(value)
-    }
-}
-
-impl AsRef<str> for ExternalRoomId {
-    fn as_ref(&self) -> &str {
-        &self.0
+        Self::new(value)
     }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct ParticipantId {
-    pub internal: EntityId,
+    internal: Arc<EntityId>,
 }
 
 impl ParticipantId {
     pub fn new() -> Self {
-        let internal = new_entity_id(prefix::PARTICIPANT_ID);
-        Self { internal }
+        Self {
+            internal: Arc::new(new_entity_id(prefix::PARTICIPANT_ID)),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.internal
     }
 }
 
@@ -220,33 +215,49 @@ impl TryFrom<String> for ParticipantId {
     type Error = IdValidationError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        // Check prefix
-        let (prefix, encoded) = value
-            .split_once('_')
-            .ok_or(IdValidationError::InvalidCharacters)?;
+        let expected_prefix = prefix::PARTICIPANT_ID;
 
-        if prefix != prefix::PARTICIPANT_ID {
-            return Err(IdValidationError::InvalidCharacters);
+        if !value.starts_with(&format!("{}_", expected_prefix)) {
+            let got = get_prefix(&value).unwrap_or("none").to_string();
+            return Err(IdValidationError::InvalidPrefix {
+                expected: expected_prefix.to_string(),
+                got,
+            });
         }
 
-        // Check if the encoded part is valid base58
+        let encoded = value
+            .strip_prefix(&format!("{}_", expected_prefix))
+            .ok_or(IdValidationError::InvalidCharacters)?;
+
         bs58::decode(encoded)
             .into_vec()
             .map_err(|_| IdValidationError::InvalidCharacters)?;
 
-        Ok(ParticipantId { internal: value })
+        Ok(Self {
+            internal: Arc::new(value),
+        })
+    }
+}
+
+impl FromStr for ParticipantId {
+    type Err = IdValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_string())
     }
 }
 
 impl fmt::Display for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.internal, f)
+        fmt::Display::fmt(&*self.internal, f)
     }
 }
 
 impl fmt::Debug for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.internal, f)
+        f.debug_tuple("ParticipantId")
+            .field(&*self.internal)
+            .finish()
     }
 }
 
@@ -257,9 +268,20 @@ impl AsRef<str> for ParticipantId {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd, Ord,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Display,
+    AsRef,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[serde(try_from = "String")]
+#[as_ref(forward)]
 pub struct ExternalParticipantId(String);
 
 impl ExternalParticipantId {
@@ -267,11 +289,15 @@ impl ExternalParticipantId {
 
     pub fn new(id: String) -> Result<Self, IdValidationError> {
         validate_id_string(&id, Self::MAX_LEN)?;
-        Ok(ExternalParticipantId(id))
+        Ok(Self(id))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -279,13 +305,7 @@ impl FromStr for ExternalParticipantId {
     type Err = IdValidationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ExternalParticipantId::new(s.to_string())
-    }
-}
-
-impl fmt::Display for ExternalParticipantId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        Self::new(s.to_string())
     }
 }
 
@@ -293,19 +313,25 @@ impl TryFrom<String> for ExternalParticipantId {
     type Error = IdValidationError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        ExternalParticipantId::new(value)
+        Self::new(value)
     }
 }
 
-impl AsRef<str> for ExternalParticipantId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(PartialOrd, Ord, Eq, PartialEq, Hash, Clone)]
+#[derive(Clone, PartialOrd, Ord, Eq, PartialEq, Hash)]
 pub struct TrackId {
-    pub internal: Arc<EntityId>,
+    internal: Arc<EntityId>,
+}
+
+impl TrackId {
+    pub fn new() -> Self {
+        Self {
+            internal: Arc::new(new_entity_id(prefix::TRACK_ID)),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.internal
+    }
 }
 
 impl Default for TrackId {
@@ -314,35 +340,56 @@ impl Default for TrackId {
     }
 }
 
-impl TrackId {
-    pub fn new() -> Self {
-        let internal = new_entity_id(prefix::TRACK_ID);
-        Self {
-            internal: Arc::new(internal),
+impl TryFrom<String> for TrackId {
+    type Error = IdValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let expected_prefix = prefix::TRACK_ID;
+
+        if !value.starts_with(&format!("{}_", expected_prefix)) {
+            let got = get_prefix(&value).unwrap_or("none").to_string();
+            return Err(IdValidationError::InvalidPrefix {
+                expected: expected_prefix.to_string(),
+                got,
+            });
         }
+
+        let encoded = value
+            .strip_prefix(&format!("{}_", expected_prefix))
+            .ok_or(IdValidationError::InvalidCharacters)?;
+
+        bs58::decode(encoded)
+            .into_vec()
+            .map_err(|_| IdValidationError::InvalidCharacters)?;
+
+        Ok(Self {
+            internal: Arc::new(value),
+        })
+    }
+}
+
+impl FromStr for TrackId {
+    type Err = IdValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_string())
     }
 }
 
 impl fmt::Display for TrackId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.internal, f)
+        fmt::Display::fmt(&*self.internal, f)
     }
 }
 
 impl fmt::Debug for TrackId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.internal, f)
+        f.debug_tuple("TrackId").field(&*self.internal).finish()
     }
 }
 
 impl AsRef<str> for TrackId {
     fn as_ref(&self) -> &str {
-        &self.internal
-    }
-}
-
-impl Borrow<String> for TrackId {
-    fn borrow(&self) -> &String {
         &self.internal
     }
 }
@@ -376,15 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn test_as_str() {
-        let id: EntityId = "p_ABCDEFG".to_string();
-        assert_eq!(as_str(&id), "p_ABCDEFG");
-    }
-
-    #[test]
     fn test_decode_id_invalid_format() {
         assert_eq!(decode_id("invalidid"), None);
-        assert_eq!(decode_id("no_base58_"), None); // invalid base58
+        assert_eq!(decode_id("no_base58_"), None);
     }
 
     #[test]
@@ -431,24 +472,28 @@ mod tests {
 
     #[test]
     fn test_room_id_equality_and_hash() {
-        let internal = "rm_abc123".to_string();
         let ext = ExternalRoomId::new("external".into()).unwrap();
-        let id1 = RoomId {
-            external: ext.clone(),
-            internal: internal.clone(),
-        };
-        let id2 = RoomId {
-            external: ext,
-            internal,
-        };
+        let id1 = RoomId::new(ext.clone());
+        let id2 = RoomId::new(ext);
 
         assert_eq!(id1, id2);
+
         use std::collections::hash_map::DefaultHasher;
         let mut h1 = DefaultHasher::new();
         let mut h2 = DefaultHasher::new();
         id1.hash(&mut h1);
         id2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn test_room_id_clone_is_cheap() {
+        let ext = ExternalRoomId::new("test".into()).unwrap();
+        let id1 = RoomId::new(ext);
+        let id2 = id1.clone();
+
+        // Verify they share the same Arc
+        assert!(Arc::ptr_eq(&id1.internal, &id2.internal));
     }
 
     #[test]
@@ -461,13 +506,12 @@ mod tests {
 
     #[test]
     fn test_participant_id_equality_and_hash() {
-        let internal = "pa_xyz987".to_string();
-        let id1 = ParticipantId {
-            internal: internal.clone(),
-        };
-        let id2 = ParticipantId { internal };
+        let id1 = ParticipantId::new();
+        let id2 = id1.clone();
 
-        assert_eq!(id1, id2);
+        // Clones should share same Arc
+        assert!(Arc::ptr_eq(&id1.internal, &id2.internal));
+
         use std::collections::hash_map::DefaultHasher;
         let mut h1 = DefaultHasher::new();
         let mut h2 = DefaultHasher::new();
@@ -477,8 +521,49 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_track_id() {
-        let track_id = TrackId::new();
-        validate_track_id(track_id.as_ref()).unwrap();
+    fn test_participant_id_try_from() {
+        let id = ParticipantId::new();
+        let id_str = id.to_string();
+
+        let parsed: ParticipantId = id_str.parse().unwrap();
+        assert_eq!(parsed.as_str(), id.as_str());
+    }
+
+    #[test]
+    fn test_participant_id_invalid_prefix() {
+        let result = ParticipantId::try_from("rm_123456".to_string());
+        assert!(matches!(
+            result.unwrap_err(),
+            IdValidationError::InvalidPrefix { .. }
+        ));
+    }
+
+    #[test]
+    fn test_track_id_new_and_clone() {
+        let id1 = TrackId::new();
+        let id2 = id1.clone();
+
+        // Verify they share the same Arc
+        assert!(Arc::ptr_eq(&id1.internal, &id2.internal));
+    }
+
+    #[test]
+    fn test_track_id_try_from() {
+        let id = TrackId::new();
+        let id_str = id.to_string();
+
+        let parsed: TrackId = id_str.parse().unwrap();
+        assert_eq!(parsed.as_str(), id.as_str());
+    }
+
+    #[test]
+    fn test_all_ids_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<RoomId>();
+        assert_send_sync::<ParticipantId>();
+        assert_send_sync::<TrackId>();
+        assert_send_sync::<ExternalRoomId>();
+        assert_send_sync::<ExternalParticipantId>();
     }
 }

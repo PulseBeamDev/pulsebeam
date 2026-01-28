@@ -39,7 +39,7 @@ pub enum CoreEvent {
 }
 
 pub struct ParticipantCore {
-    pub participant_id: Arc<entity::ParticipantId>,
+    pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
@@ -52,7 +52,7 @@ pub struct ParticipantCore {
 
 impl ParticipantCore {
     pub fn new(
-        participant_id: Arc<entity::ParticipantId>,
+        participant_id: entity::ParticipantId,
         rtc: Rtc,
         udp_batcher: Batcher,
         tcp_batcher: Batcher,

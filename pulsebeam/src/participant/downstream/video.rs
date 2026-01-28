@@ -22,7 +22,7 @@ pub struct SlotAssignment {
 
 pub struct Intent {
     pub mid: Mid,
-    pub track_id: EntityId,
+    pub track_id: TrackId,
     pub max_height: u32,
 }
 
@@ -56,7 +56,7 @@ impl VideoAllocator {
         tracks: &mut HashMap<TrackId, TrackState>,
         slot: &mut Slot,
         max_height: u32,
-        track_id: Option<&EntityId>,
+        track_id: Option<&TrackId>,
     ) {
         // If we are switching A->B, 'B' is the one holding the assignment,
         // so we must clear B if we are about to change our mind.

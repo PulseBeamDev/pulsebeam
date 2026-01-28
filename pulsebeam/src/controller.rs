@@ -19,16 +19,16 @@ pub enum ControllerMessage {
 
 #[derive(Debug)]
 pub struct CreateParticipant {
-    pub room_id: Arc<RoomId>,
-    pub participant_id: Arc<ParticipantId>,
+    pub room_id: RoomId,
+    pub participant_id: ParticipantId,
     pub offer: String,
     pub reply_tx: oneshot::Sender<Result<String, ControllerError>>,
 }
 
 #[derive(Debug)]
 pub struct DeleteParticipant {
-    pub room_id: Arc<RoomId>,
-    pub participant_id: Arc<ParticipantId>,
+    pub room_id: RoomId,
+    pub participant_id: ParticipantId,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -61,8 +61,8 @@ pub struct ControllerActor {
     node_ctx: node::NodeContext,
 
     id: Arc<String>,
-    rooms: HashMap<Arc<RoomId>, room::RoomHandle>,
-    room_tasks: JoinSet<(Arc<RoomId>, ActorStatus)>,
+    rooms: HashMap<RoomId, room::RoomHandle>,
+    room_tasks: JoinSet<(RoomId, ActorStatus)>,
 }
 
 impl actor::Actor<ControllerMessageSet> for ControllerActor {
@@ -124,8 +124,8 @@ impl ControllerActor {
     pub async fn allocate(
         &mut self,
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
-        room_id: Arc<RoomId>,
-        participant_id: Arc<ParticipantId>,
+        room_id: RoomId,
+        participant_id: ParticipantId,
         offer: String,
     ) -> Result<String, ControllerError> {
         let offer = SdpOffer::from_sdp_string(&offer)?;
@@ -233,7 +233,7 @@ impl ControllerActor {
         Ok(answer.to_sdp_string())
     }
 
-    fn get_or_create_room(&mut self, room_id: Arc<RoomId>) -> room::RoomHandle {
+    fn get_or_create_room(&mut self, room_id: RoomId) -> room::RoomHandle {
         if let Some(handle) = self.rooms.get(&room_id) {
             tracing::info!("get_room: {}", room_id);
             handle.clone()

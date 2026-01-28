@@ -26,7 +26,7 @@ pub struct Demuxer {
     /// A fast-path cache mapping a remote `SocketAddr` to a known participant.
     addr_map: HashMap<SocketAddr, ParticipantHandle>,
     /// A reverse map from a participant to their ufrag, for cleanup.
-    participant_ufrag: HashMap<Arc<ParticipantId>, Box<[u8]>>,
+    participant_ufrag: HashMap<ParticipantId, Box<[u8]>>,
     /// A reverse map from a ufrag to all known addresses, for efficient cleanup.
     ufrag_addrs: HashMap<Box<[u8]>, Vec<SocketAddr>>,
 }
@@ -44,7 +44,7 @@ impl Demuxer {
     /// Registers a participant with their ICE username fragment.
     pub fn register_ice_ufrag(
         &mut self,
-        participant_id: Arc<ParticipantId>,
+        participant_id: ParticipantId,
         ufrag: &[u8],
         participant_handle: ParticipantHandle,
     ) {
@@ -55,11 +55,7 @@ impl Demuxer {
     }
 
     /// Removes a participant and all associated state (ufrag and address mappings).
-    pub fn unregister(
-        &mut self,
-        socket: &mut UnifiedSocketReader,
-        participant_id: &Arc<ParticipantId>,
-    ) {
+    pub fn unregister(&mut self, socket: &mut UnifiedSocketReader, participant_id: &ParticipantId) {
         if let Some(ufrag) = self.participant_ufrag.remove(participant_id) {
             self.ufrag_map.remove(&ufrag);
             // Use the ufrag_addrs map to efficiently clean the addr_map

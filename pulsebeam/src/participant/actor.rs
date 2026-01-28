@@ -36,7 +36,7 @@ pub struct ParticipantMessageSet;
 
 impl actor::MessageSet for ParticipantMessageSet {
     type Msg = ParticipantControlMessage;
-    type Meta = Arc<entity::ParticipantId>;
+    type Meta = entity::ParticipantId;
     type ObservableState = ();
 }
 
@@ -58,7 +58,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         "participant"
     }
 
-    fn meta(&self) -> Arc<entity::ParticipantId> {
+    fn meta(&self) -> entity::ParticipantId {
         self.core.participant_id.clone()
     }
 
@@ -188,7 +188,7 @@ impl ParticipantActor {
         room_handle: room::RoomHandle,
         udp_egress: UnifiedSocketWriter,
         tcp_egress: UnifiedSocketWriter,
-        participant_id: Arc<entity::ParticipantId>,
+        participant_id: entity::ParticipantId,
         rtc: Rtc,
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());

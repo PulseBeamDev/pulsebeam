@@ -7,12 +7,8 @@ use tokio::task::JoinSet;
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(
-        Arc<ParticipantId>,
-        String,
-        mailbox::Sender<net::RecvPacketBatch>,
-    ),
-    RemoveParticipant(Arc<ParticipantId>),
+    AddParticipant(ParticipantId, String, mailbox::Sender<net::RecvPacketBatch>),
+    RemoveParticipant(ParticipantId),
 }
 
 pub struct GatewayMessageSet;

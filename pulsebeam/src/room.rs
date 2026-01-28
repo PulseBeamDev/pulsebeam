@@ -19,7 +19,7 @@ const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum RoomMessage {
     PublishTrack(track::TrackReceiver),
     AddParticipant(ParticipantActor),
-    RemoveParticipant(Arc<ParticipantId>),
+    RemoveParticipant(ParticipantId),
 }
 
 #[derive(Clone, Debug)]
@@ -31,7 +31,7 @@ pub struct ParticipantMeta {
 pub struct RoomMessageSet;
 
 impl actor::MessageSet for RoomMessageSet {
-    type Meta = Arc<RoomId>;
+    type Meta = RoomId;
     type Msg = RoomMessage;
     type ObservableState = RoomState;
 }
@@ -45,15 +45,15 @@ impl actor::MessageSet for RoomMessageSet {
 pub struct RoomActor {
     node_ctx: node::NodeContext,
     // participant_factory: Box<dyn actor::ActorFactory<participant::ParticipantActor>>,
-    room_id: Arc<RoomId>,
+    room_id: RoomId,
     state: RoomState,
 
-    participant_tasks: JoinSet<(Arc<ParticipantId>, ActorStatus)>,
+    participant_tasks: JoinSet<(ParticipantId, ActorStatus)>,
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
-    participants: HashMap<Arc<ParticipantId>, ParticipantMeta>,
+    participants: HashMap<ParticipantId, ParticipantMeta>,
     tracks: HashMap<TrackId, track::TrackReceiver>,
 }
 
@@ -67,7 +67,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         "room"
     }
 
-    fn meta(&self) -> Arc<RoomId> {
+    fn meta(&self) -> RoomId {
         self.room_id.clone()
     }
 
@@ -118,7 +118,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 }
 
 impl RoomActor {
-    pub fn new(node_ctx: node::NodeContext, room_id: Arc<RoomId>) -> Self {
+    pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
         Self {
             node_ctx,
             room_id,
@@ -156,7 +156,7 @@ impl RoomActor {
             .await;
     }
 
-    async fn handle_participant_left(&mut self, participant_id: Arc<ParticipantId>) {
+    async fn handle_participant_left(&mut self, participant_id: ParticipantId) {
         let Some(mut participant) = self.state.participants.remove(&participant_id) else {
             return;
         };

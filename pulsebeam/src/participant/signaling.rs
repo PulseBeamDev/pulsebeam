@@ -110,9 +110,9 @@ impl Signaling {
             if req.mid.len() > 16 {
                 continue;
             }
-            if entity::validate_track_id(&req.track_id).is_err() {
+            let Ok(track_id) = req.track_id.try_into() else {
                 continue;
-            }
+            };
 
             let mid = Mid::from(req.mid.as_str());
 
@@ -122,7 +122,7 @@ impl Signaling {
 
             intents.push(Intent {
                 mid,
-                track_id: req.track_id,
+                track_id,
                 max_height: req.height,
             });
         }
