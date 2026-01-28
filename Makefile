@@ -1,16 +1,7 @@
 include makefiles/net.mk
 
 SCCACHE := $(shell which sccache)
-# https://github.com/tikv/jemallocator/issues/146
-# >> force-frame-pointers is required for profiling, add ~1% CPU overhead
-# >> allow-multiple-definition is required so we can replace system allocator for C projects, like openssl, ffmpeg, etc.
-# These CFLAGS are needed to make sure everything compiles with frame-pointer otherwise segfault will happen.
-export RUSTFLAGS := $(RUSTFLAGS) --cfg tokio_unstable -C link-arg=-Wl,--allow-multiple-definition -C force-frame-pointers=yes
-export CFLAGS := $(CFLAGS) -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
-export CXXFLAGS := $(CXXFLAGS) -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
-# ===
-
-CARGO_CMD = RUSTC_WRAPPER=$(SCCACHE) RUSTFLAGS="$(RUSTFLAGS)" cargo
+CARGO_CMD = RUSTC_WRAPPER=$(SCCACHE) cargo
 TARGET_DIR = target/profiling
 BINARY = $(TARGET_DIR)/pulsebeam
 

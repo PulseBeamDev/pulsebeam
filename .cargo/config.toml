@@ -1,8 +1,20 @@
 [build]
-rustflags = ["--cfg", "tracing_unstable" , "--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
+rustflags = [
+  "--cfg",
+  "tracing_unstable",
+  "--cfg",
+  "tokio_unstable",
+  "-C",
+  "force-frame-pointers=yes",
+  "-C",
+  "link-arg=-Wl,--allow-multiple-definition"
+]
 
 # [unstable]
 # codegen-backend = true
 #
 # [profile.dev]
 # codegen-backend = "cranelift"
+[env]
+CFLAGS = "-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"
+CXXFLAGS = "-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"
