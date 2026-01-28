@@ -19,10 +19,13 @@
 - Add debounce after mutating pending state
 - Create signaling cid on connect
 - Missing start time in agent
+- Broken build on mismatch version
+- Cargo release config
 
 ### 💼 Other
 
 - Tokio alt timer on 1.49
+
 ## [pulsebeam-v0.3.1] - 2025-12-29
 
 ### 🐛 Bug Fixes
@@ -32,6 +35,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.3.1
+
 ## [pulsebeam-v0.3.0] - 2025-12-24
 
 ### 🚀 Features
@@ -58,11 +62,13 @@
 - Update str0m to 0.14
 - More consistent pprof endpoints
 - Bump to 0.3.0
+
 ## [pulsebeam-v0.2.25] - 2025-12-13
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.25
+
 ## [pulsebeam-v0.2.24] - 2025-12-13
 
 ### 🚀 Features
@@ -77,6 +83,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.24
+
 ## [pulsebeam-v0.2.23] - 2025-12-05
 
 ### 🐛 Bug Fixes
@@ -86,6 +93,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.23
+
 ## [pulsebeam-v0.2.22] - 2025-12-02
 
 ### 🚀 Features
@@ -99,6 +107,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.22
+
 ## [pulsebeam-v0.2.21] - 2025-11-24
 
 ### 🚀 Features
@@ -108,16 +117,19 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.21
+
 ## [pulsebeam-v0.2.20] - 2025-11-21
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.20
+
 ## [pulsebeam-v0.2.19] - 2025-11-21
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.19
+
 ## [pulsebeam-v0.2.18] - 2025-11-21
 
 ### 🐛 Bug Fixes
@@ -127,6 +139,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.18
+
 ## [pulsebeam-v0.2.17] - 2025-11-20
 
 ### 🚀 Features
@@ -142,16 +155,19 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.17
+
 ## [pulsebeam-v0.2.16] - 2025-11-15
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.16
+
 ## [pulsebeam-v0.2.15] - 2025-11-15
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.15
+
 ## [pulsebeam-v0.2.14] - 2025-11-15
 
 ### 🚀 Features
@@ -164,6 +180,7 @@
 - Reduce track_id scope
 - Bump to 0.2.13
 - Bump to 0.2.14
+
 ## [pulsebeam-v0.2.12] - 2025-11-11
 
 ### 🚀 Features
@@ -177,6 +194,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.12
+
 ## [pulsebeam-v0.2.11] - 2025-11-11
 
 ### 🐛 Bug Fixes
@@ -186,6 +204,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.11
+
 ## [pulsebeam-v0.2.10] - 2025-11-10
 
 ### 🚀 Features
@@ -200,6 +219,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.10
+
 ## [pulsebeam-v0.2.9] - 2025-11-05
 
 ### 🚀 Features
@@ -220,6 +240,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.9
+
 ## [pulsebeam-v0.2.8] - 2025-10-29
 
 ### 💼 Other
@@ -230,6 +251,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.8
+
 ## [pulsebeam-v0.2.7] - 2025-10-28
 
 ### 🚀 Features
@@ -243,11 +265,13 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.7
+
 ## [pulsebeam-v0.2.6] - 2025-10-25
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.6
+
 ## [pulsebeam-v0.2.5] - 2025-10-24
 
 ### 🐛 Bug Fixes
@@ -257,6 +281,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.5
+
 ## [pulsebeam-v0.2.4] - 2025-10-24
 
 ### 🐛 Bug Fixes
@@ -275,6 +300,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.4
+
 ## [pulsebeam-v0.2.3] - 2025-10-21
 
 ### 🚀 Features
@@ -296,6 +322,7 @@
 ### ◀️ Revert
 
 - Multi-thread as default runtime
+
 ## [pulsebeam-v0.2.2] - 2025-10-03
 
 ### 🚀 Features
@@ -313,6 +340,7 @@
 ### ◀️ Revert
 
 - Readme docker version
+
 ## [pulsebeam-v0.2.1] - 2025-10-01
 
 ### 🐛 Bug Fixes
@@ -322,11 +350,13 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.2.1
+
 ## [pulsebeam-v0.1.13] - 2025-09-26
 
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.1.13
+
 ## [pulsebeam-v0.1.12] - 2025-09-25
 
 ### 🚀 Features
@@ -364,6 +394,7 @@
 - Bump to 0.1.12
 - Make demo step-by-step
 - Use ubuntu for windows
+
 ## [pulsebeam-v0.1.11] - 2025-09-19
 
 ### 🐛 Bug Fixes
@@ -373,6 +404,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.1.11
+
 ## [pulsebeam-v0.1.9] - 2025-09-19
 
 ### 🐛 Bug Fixes
@@ -389,6 +421,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.1.9
+
 ## [pulsebeam-v0.1.8] - 2025-09-18
 
 ### 🐛 Bug Fixes
@@ -396,6 +429,7 @@
 - Batching ownership and socket config
 - Hot loop in sending and stuck on reading
 - Missing outgoing packets
+
 ## [0.1.0] - 2025-09-11
 
 ### 🚀 Features
@@ -442,6 +476,7 @@
 - Remove cd comment
 - Move build.rs
 - Bump to 0.1.3
+
 ## [0.0.3] - 2025-05-14
 
 ### 🐛 Bug Fixes
@@ -454,6 +489,7 @@
 
 - Use SDN architecture
 - Propagate media and subscriptions
+
 ## [0.0.2] - 2025-04-20
 
 ### 🚀 Features
@@ -485,6 +521,7 @@
 ### 💼 Other
 
 - Move validation to a separate struct
+
 ## [0.0.1] - 2025-03-03
 
 ### 🚀 Features

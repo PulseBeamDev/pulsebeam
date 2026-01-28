@@ -10,6 +10,16 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
+# Workaround cargo-release only works at package level
+# https://github.com/crate-ci/cargo-release/issues/901
+[package.metadata.release]
+tag-prefix = ""
+pre-release-hook = ["git-cliff", "--output", "../CHANGELOG.md", "--tag", "{{version}}"]
+pre-release-replacements = [
+  {file="../CHANGELOG.md", search="## \\[unreleased\\]", replace="## [{{version}}] - {{date}}"},
+]
+shared-version = true
+
 [features]
 default = []
 

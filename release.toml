@@ -1,5 +1,0 @@
-pre-release-hook = ["git-cliff", "--output", "CHANGELOG.md", "--tag", "{{version}}"]
-pre-release-replacements = [
-  {file="CHANGELOG.md", search="## \\[Unreleased\\]", replace="## [{{version}}] - {{date}}"},
-]
-shared-version = true
