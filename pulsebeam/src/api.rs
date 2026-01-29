@@ -12,12 +12,11 @@ use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::LOCATION;
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::controller;
-use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
+use crate::entity::{ParticipantId, RoomId};
 
 pub enum HeaderExt {
     ParticipantId,
@@ -198,13 +197,12 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
 )]
 #[axum::debug_handler]
 async fn create_participant(
-    Path(room_id): Path<ExternalRoomId>,
+    Path(room_id): Path<RoomId>,
     State((mut con, cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = RoomId::new(room_id);
     let participant_id = ParticipantId::new();
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
@@ -261,12 +259,9 @@ async fn create_participant(
 )]
 #[axum::debug_handler]
 async fn delete_participant(
-    Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let room_id = RoomId::new(room_id);
-    let participant_id = participant_id;
-
     let _ = con
         .send(controller::DeleteParticipant {
             room_id,
@@ -303,15 +298,12 @@ async fn delete_participant(
 )]
 #[axum::debug_handler]
 async fn reconnect_participant(
-    Path((room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    Path((_room_id, _participant_id)): Path<(RoomId, ParticipantId)>,
     State((_con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     _raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _room_id = Arc::new(RoomId::new(room_id));
-    let _participant_id = Arc::new(participant_id);
-
     // Extract and validate headers
     let _reconnection_headers = ReconnectionRequestHeaders::from_header_map(&headers)?;
 
