@@ -1,6 +1,10 @@
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::gateway::GatewayWorkerHandle;
+use crate::participant::batcher::Batcher;
+use crate::participant::core::{CoreEvent, ParticipantCore};
+use crate::{entity, gateway, room, track};
 use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::net::UnifiedSocketWriter;
 use pulsebeam_runtime::prelude::*;
@@ -9,10 +13,7 @@ use str0m::{Rtc, RtcError, error::SdpError};
 use tokio::time::Instant;
 use tokio_metrics::TaskMonitor;
 
-use crate::gateway::GatewayWorkerHandle;
-use crate::participant::batcher::Batcher;
-use crate::participant::core::{CoreEvent, ParticipantCore};
-use crate::{entity, gateway, room, track};
+pub use crate::participant::core::TrackMapping;
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 
@@ -191,10 +192,17 @@ impl ParticipantActor {
         tcp_egress: UnifiedSocketWriter,
         participant_id: entity::ParticipantId,
         rtc: Rtc,
+        track_mappings: Vec<TrackMapping>,
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
-        let core = ParticipantCore::new(participant_id, rtc, udp_batcher, tcp_batcher);
+        let core = ParticipantCore::new(
+            track_mappings,
+            participant_id,
+            rtc,
+            udp_batcher,
+            tcp_batcher,
+        );
         Self {
             gateway: gateway_handle,
             core,

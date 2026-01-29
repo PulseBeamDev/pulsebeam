@@ -1,15 +1,46 @@
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use crate::{
-    entity::{ParticipantId, RoomId},
+    entity::{ParticipantId, RoomId, TrackId},
     node,
-    participant::ParticipantActor,
+    participant::{ParticipantActor, TrackMapping},
     room,
 };
 use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
 use pulsebeam_runtime::{net::Transport, prelude::*};
-use str0m::{Candidate, RtcConfig, RtcError, change::SdpOffer, error::SdpError, net::TcpType};
+use str0m::{
+    Candidate, RtcConfig, RtcError,
+    change::{SdpAnswer, SdpOffer},
+    error::SdpError,
+    media::Direction,
+    net::TcpType,
+};
 use tokio::{sync::oneshot, task::JoinSet, time::Instant};
+
+pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
+pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
+pub const MAX_SEND_VIDEO_SLOTS: usize = 16;
+pub const MAX_SEND_AUDIO_SLOTS: usize = 9;
+pub const MAX_DATA_CHANNELS: usize = 1;
+
+#[derive(Debug)]
+pub enum MediaType {
+    Video,
+    Audio,
+    Application,
+    Unknown,
+}
+
+impl std::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Video => write!(f, "video"),
+            Self::Audio => write!(f, "audio"),
+            Self::Application => write!(f, "application"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
 
 #[derive(Debug, derive_more::From)]
 pub enum ControllerMessage {
@@ -49,12 +80,22 @@ pub struct PatchParticipant {
 }
 
 #[derive(thiserror::Error, Debug)]
+pub enum OfferRejectedReason {
+    #[error("RTC engine error: {0}")]
+    Rtc(#[from] RtcError),
+    #[error("{0} {1} slots limit exceeded (max {2})")]
+    SlotsLimit(MediaType, Direction, usize),
+    #[error("SendRecv direction is not supported for {0}")]
+    DirectionNotSupported(MediaType),
+}
+
+#[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
     #[error("sdp offer is invalid: {0}")]
     OfferInvalid(#[from] SdpError),
 
     #[error("sdp offer is rejected: {0}")]
-    OfferRejected(#[from] RtcError),
+    OfferRejected(#[from] OfferRejectedReason),
 
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
@@ -227,7 +268,9 @@ impl ControllerActor {
         let answer = rtc
             .sdp_api()
             .accept_offer(offer)
-            .map_err(ControllerError::OfferRejected)?;
+            .map_err(OfferRejectedReason::Rtc)?;
+        let track_mappings = Self::get_track_mappings(&answer)?;
+
         let mut room_handle = self.get_or_create_room(room_id);
         let gateway = self.node_ctx.gateway.clone();
         let participant = ParticipantActor::new(
@@ -237,6 +280,7 @@ impl ControllerActor {
             tcp_egress,
             participant_id,
             rtc,
+            track_mappings,
         );
 
         // TODO: probably retry? Or, let the client to retry instead?
@@ -268,6 +312,94 @@ impl ControllerActor {
 
             room_handle
         }
+    }
+
+    fn get_track_mappings(answer: &SdpAnswer) -> Result<Vec<TrackMapping>, OfferRejectedReason> {
+        let mut track_mappings = Vec::new();
+        let mut video_recv_count = 0;
+        let mut video_send_count = 0;
+        let mut audio_recv_count = 0;
+        let mut audio_send_count = 0;
+        let mut data_channel_count = 0;
+
+        for m in &answer.media_lines {
+            let kind = m.typ.to_string();
+            let dir = m.direction();
+
+            let media_type = match kind.as_str() {
+                "video" => MediaType::Video,
+                "audio" => MediaType::Audio,
+                "application" => MediaType::Application,
+                _ => MediaType::Unknown,
+            };
+
+            if (dir == Direction::SendRecv || dir == Direction::Inactive) && kind != "application" {
+                return Err(OfferRejectedReason::DirectionNotSupported(
+                    MediaType::Application,
+                ));
+            }
+
+            match (media_type, dir) {
+                (MediaType::Video, Direction::RecvOnly) => {
+                    video_recv_count += 1;
+                    if video_recv_count > MAX_RECV_VIDEO_SLOTS {
+                        return Err(OfferRejectedReason::SlotsLimit(
+                            MediaType::Video,
+                            Direction::SendOnly,
+                            MAX_RECV_VIDEO_SLOTS,
+                        ));
+                    }
+                }
+                (MediaType::Video, Direction::SendOnly) => {
+                    video_send_count += 1;
+                    if video_send_count > MAX_SEND_VIDEO_SLOTS {
+                        return Err(OfferRejectedReason::SlotsLimit(
+                            MediaType::Video,
+                            Direction::RecvOnly,
+                            MAX_SEND_VIDEO_SLOTS,
+                        ));
+                    }
+                }
+                (MediaType::Audio, Direction::RecvOnly) => {
+                    audio_recv_count += 1;
+                    if audio_recv_count > MAX_RECV_AUDIO_SLOTS {
+                        return Err(OfferRejectedReason::SlotsLimit(
+                            MediaType::Audio,
+                            Direction::SendOnly,
+                            MAX_RECV_AUDIO_SLOTS,
+                        ));
+                    }
+                }
+                (MediaType::Audio, Direction::SendOnly) => {
+                    audio_send_count += 1;
+                    if audio_send_count > MAX_SEND_AUDIO_SLOTS {
+                        return Err(OfferRejectedReason::SlotsLimit(
+                            MediaType::Audio,
+                            Direction::RecvOnly,
+                            MAX_SEND_AUDIO_SLOTS,
+                        ));
+                    }
+                }
+                (MediaType::Application, dir) => {
+                    data_channel_count += 1;
+                    if data_channel_count > MAX_DATA_CHANNELS {
+                        return Err(OfferRejectedReason::SlotsLimit(
+                            MediaType::Application,
+                            dir,
+                            MAX_DATA_CHANNELS,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+
+            track_mappings.push(TrackMapping {
+                mid: m.mid(),
+                track_id: TrackId::new(),
+            });
+        }
+
+        Ok(track_mappings)
     }
 }
 

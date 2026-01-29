@@ -11,13 +11,18 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity;
+use crate::entity::{self, TrackId};
 use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
+
+pub struct TrackMapping {
+    pub mid: Mid,
+    pub track_id: TrackId,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
@@ -39,6 +44,7 @@ pub enum CoreEvent {
 }
 
 pub struct ParticipantCore {
+    pub track_mappings: Vec<TrackMapping>,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
@@ -52,12 +58,14 @@ pub struct ParticipantCore {
 
 impl ParticipantCore {
     pub fn new(
+        track_mappings: Vec<TrackMapping>,
         participant_id: entity::ParticipantId,
         rtc: Rtc,
         udp_batcher: Batcher,
         tcp_batcher: Batcher,
     ) -> Self {
         Self {
+            track_mappings,
             participant_id,
             rtc,
             udp_batcher,
