@@ -1,15 +1,18 @@
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use crate::{
-    entity::{ParticipantId, RoomId, TrackId},
+    entity::{self, ParticipantId, RoomId, TrackId},
     node,
     participant::{ParticipantActor, TrackMapping},
-    room,
+    room::{self, RoomHandle},
 };
-use pulsebeam_runtime::actor::{self, ActorKind, ActorStatus};
+use pulsebeam_runtime::{
+    actor::{self, ActorKind, ActorStatus},
+    net::UnifiedSocketWriter,
+};
 use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{
-    Candidate, RtcConfig, RtcError,
+    Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
     error::SdpError,
     media::Direction,
@@ -53,7 +56,7 @@ pub enum ControllerMessage {
 pub struct CreateParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
-    pub offer: String,
+    pub offer: SdpOffer,
     pub reply_tx: oneshot::Sender<Result<String, ControllerError>>,
 }
 
@@ -91,9 +94,6 @@ pub enum OfferRejectedReason {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
-    #[error("sdp offer is invalid: {0}")]
-    OfferInvalid(#[from] SdpError),
-
     #[error("sdp offer is rejected: {0}")]
     OfferRejected(#[from] OfferRejectedReason),
 
@@ -185,9 +185,42 @@ impl ControllerActor {
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         room_id: RoomId,
         participant_id: ParticipantId,
-        offer: String,
+        offer: SdpOffer,
     ) -> Result<String, ControllerError> {
-        let offer = SdpOffer::from_sdp_string(&offer)?;
+        let udp_egress = self.node_ctx.allocate_udp_egress();
+        let tcp_egress = self.node_ctx.allocate_tcp_egress();
+        let sockets = [&udp_egress, &tcp_egress];
+
+        let (rtc, answer) = self.create_answer(offer, &sockets)?;
+        let track_mappings = Self::create_track_mappings(&answer);
+        let mut room_handle = self.get_or_create_room(room_id);
+        let gateway = self.node_ctx.gateway.clone();
+        let participant = ParticipantActor::new(
+            gateway,
+            room_handle.clone(),
+            udp_egress,
+            tcp_egress,
+            participant_id,
+            rtc,
+            track_mappings,
+        );
+
+        // TODO: probably retry? Or, let the client to retry instead?
+        // Each room will always have a graceful timeout before closing.
+        // But, a data race can still occur nonetheless
+        room_handle
+            .send(room::RoomMessage::AddParticipant(participant))
+            .await
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
+
+        Ok(answer.to_sdp_string())
+    }
+
+    fn create_answer(
+        &mut self,
+        offer: SdpOffer,
+        sockets: &[&UnifiedSocketWriter],
+    ) -> Result<(Rtc, SdpAnswer), ControllerError> {
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
@@ -244,9 +277,6 @@ impl ControllerActor {
         // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
 
         let mut rtc = rtc_config.build(Instant::now().into());
-        let udp_egress = self.node_ctx.allocate_udp_egress();
-        let tcp_egress = self.node_ctx.allocate_tcp_egress();
-        let sockets = [&udp_egress, &tcp_egress];
         for s in sockets {
             let candidate = match s.transport() {
                 Transport::Udp(_) => Candidate::builder()
@@ -269,30 +299,10 @@ impl ControllerActor {
             .sdp_api()
             .accept_offer(offer)
             .map_err(OfferRejectedReason::Rtc)?;
-        let track_mappings = Self::get_track_mappings(&answer)?;
-
-        let mut room_handle = self.get_or_create_room(room_id);
-        let gateway = self.node_ctx.gateway.clone();
-        let participant = ParticipantActor::new(
-            gateway,
-            room_handle.clone(),
-            udp_egress,
-            tcp_egress,
-            participant_id,
-            rtc,
-            track_mappings,
-        );
-
-        // TODO: probably retry? Or, let the client to retry instead?
-        // Each room will always have a graceful timeout before closing.
-        // But, a data race can still occur nonetheless
-        room_handle
-            .send(room::RoomMessage::AddParticipant(participant))
-            .await
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
+        Self::enforce_media_lines(&answer)?;
 
         tracing::debug!("{answer}");
-        Ok(answer.to_sdp_string())
+        Ok((rtc, answer))
     }
 
     fn get_or_create_room(&mut self, room_id: RoomId) -> room::RoomHandle {
@@ -314,8 +324,26 @@ impl ControllerActor {
         }
     }
 
-    fn get_track_mappings(answer: &SdpAnswer) -> Result<Vec<TrackMapping>, OfferRejectedReason> {
-        let mut track_mappings = Vec::new();
+    fn create_track_mappings(answer: &SdpAnswer) -> Vec<TrackMapping> {
+        let mut mappings = Vec::new();
+        for m in &answer.media_lines {
+            if m.typ.is_channel() {
+                continue;
+            }
+
+            if m.direction() != Direction::RecvOnly {
+                continue;
+            }
+
+            mappings.push(TrackMapping {
+                mid: m.mid(),
+                track_id: entity::TrackId::new(),
+            });
+        }
+        mappings
+    }
+
+    fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), OfferRejectedReason> {
         let mut video_recv_count = 0;
         let mut video_send_count = 0;
         let mut audio_recv_count = 0;
@@ -392,14 +420,9 @@ impl ControllerActor {
                 }
                 _ => {}
             }
-
-            track_mappings.push(TrackMapping {
-                mid: m.mid(),
-                track_id: TrackId::new(),
-            });
         }
 
-        Ok(track_mappings)
+        Ok(())
     }
 }
 

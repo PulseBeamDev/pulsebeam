@@ -12,6 +12,7 @@ use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::LOCATION;
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::Serialize;
+use str0m::{change::SdpOffer, error::SdpError};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -112,6 +113,8 @@ pub struct ApiConfig {
 /// Error type for api operations
 #[derive(thiserror::Error, Debug)]
 pub enum ApiError {
+    #[error("sdp offer is invalid: {0}")]
+    OfferInvalid(#[from] SdpError),
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
     #[error("too many requests, please try again later.")]
@@ -129,7 +132,7 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
-            ApiError::JoinError(controller::ControllerError::OfferInvalid(_))
+            ApiError::OfferInvalid(_)
             | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
@@ -200,12 +203,13 @@ async fn create_participant(
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
     let participant_id = ParticipantId::new();
+    let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     con.try_send(controller::CreateParticipant {
         room_id: room_id.clone(),
         participant_id: participant_id.clone(),
-        offer: raw_offer,
+        offer,
         reply_tx: answer_tx,
     })
     .map_err(|e| match e {
