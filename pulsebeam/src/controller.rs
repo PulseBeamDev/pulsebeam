@@ -15,6 +15,7 @@ use tokio::{sync::oneshot, task::JoinSet, time::Instant};
 pub enum ControllerMessage {
     CreateParticipant(CreateParticipant),
     DeleteParticipant(DeleteParticipant),
+    PatchParticipant(PatchParticipant),
 }
 
 #[derive(Debug)]
@@ -29,6 +30,22 @@ pub struct CreateParticipant {
 pub struct DeleteParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+}
+
+#[derive(Debug)]
+pub struct PatchParticipant {
+    pub room_id: RoomId,
+    pub participant_id: ParticipantId,
+    /// Video track ID
+    pub video_track_id: String,
+    /// Audio track ID
+    pub audio_track_id: String,
+    /// Ed25519 signature proving ownership
+    pub signature: String,
+    /// ETag for concurrency control
+    /// https://www.rfc-editor.org/rfc/rfc9110.html#name-etag
+    pub etag: String,
+    pub reply_tx: oneshot::Sender<Result<String, ControllerError>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -116,6 +133,7 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
                         .await;
                 }
             }
+            ControllerMessage::PatchParticipant(_m) => {}
         }
     }
 }

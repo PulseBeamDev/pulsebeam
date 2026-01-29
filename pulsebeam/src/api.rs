@@ -11,7 +11,7 @@ use axum::{
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::LOCATION;
 use pulsebeam_runtime::mailbox::TrySendError;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -31,20 +31,16 @@ impl HeaderExt {
 }
 
 /// Request headers for participant reconnection
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, ToSchema)]
 pub struct ReconnectionRequestHeaders {
     /// Video track ID
-    #[serde(rename = "pb-vid")]
     pub video_track_id: String,
     /// Audio track ID
-    #[serde(rename = "pb-aid")]
     pub audio_track_id: String,
     /// Ed25519 signature proving ownership
-    #[serde(rename = "pb-sig")]
     pub signature: String,
     /// ETag for concurrency control
     /// https://www.rfc-editor.org/rfc/rfc9110.html#name-etag
-    #[serde(rename = "etag")]
     pub etag: String,
 }
 
@@ -262,12 +258,14 @@ async fn delete_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = con
-        .send(controller::DeleteParticipant {
-            room_id,
-            participant_id,
-        })
-        .await;
+    con.try_send(controller::DeleteParticipant {
+        room_id,
+        participant_id,
+    })
+    .map_err(|e| match e {
+        TrySendError::Full(_) => ApiError::RateLimited,
+        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+    })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -297,38 +295,35 @@ async fn delete_participant(
     tag = "participants"
 )]
 #[axum::debug_handler]
-async fn reconnect_participant(
-    Path((_room_id, _participant_id)): Path<(RoomId, ParticipantId)>,
-    State((_con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+async fn patch_participant(
+    Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
+    State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     _raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Extract and validate headers
-    let _reconnection_headers = ReconnectionRequestHeaders::from_header_map(&headers)?;
+    let h = ReconnectionRequestHeaders::from_header_map(&headers)?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-    Ok((StatusCode::OK, "todo"))
+    let msg = controller::PatchParticipant {
+        room_id,
+        participant_id,
+        video_track_id: h.video_track_id,
+        audio_track_id: h.audio_track_id,
+        signature: h.signature,
+        etag: h.etag,
+        reply_tx,
+    };
+    con.try_send(msg).map_err(|e| match e {
+        TrySendError::Full(_) => ApiError::RateLimited,
+        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+    })?;
 
-    // let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let answer_sdp = reply_rx
+        .await
+        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
-    // con.send(controller::ControllerMessage::Reconnect(
-    //     room_id,
-    //     participant_id,
-    //     raw_offer,
-    //     reconnection_headers.video_track_id,
-    //     reconnection_headers.audio_track_id,
-    //     reconnection_headers.signature,
-    //     reconnection_headers.etag,
-    //     answer_tx,
-    // ))
-    // .await
-    // .map_err(|_| controller::ControllerError::ServiceUnavailable)?;
-
-    // let answer_sdp = answer_rx
-    //     .await
-    //     .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
-    //
-    // Ok((StatusCode::OK, answer_sdp))
+    Ok((StatusCode::OK, answer_sdp))
 }
 
 /// Build OpenAPI spec with dynamic server configuration
@@ -371,7 +366,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 #[openapi(
     paths(
         create_participant,
-        reconnect_participant,
+        patch_participant,
         delete_participant,
     ),
     components(
@@ -394,7 +389,7 @@ pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Route
         )
         .route(
             "/rooms/{external_room_id}/participants/{participant_id}",
-            patch(reconnect_participant).delete(delete_participant),
+            patch(patch_participant).delete(delete_participant),
         );
 
     Router::new()
