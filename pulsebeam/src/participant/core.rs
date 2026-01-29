@@ -22,6 +22,7 @@ use crate::track::{self, TrackReceiver};
 pub struct TrackMapping {
     pub mid: Mid,
     pub track_id: TrackId,
+    pub kind: MediaKind,
 }
 
 #[derive(thiserror::Error, Debug)]

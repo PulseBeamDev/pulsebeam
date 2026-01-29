@@ -4,7 +4,7 @@ use crate::{
     entity::{self, ParticipantId, RoomId, TrackId},
     node,
     participant::{ParticipantActor, TrackMapping},
-    room::{self, RoomHandle},
+    room,
 };
 use pulsebeam_runtime::{
     actor::{self, ActorKind, ActorStatus},
@@ -14,8 +14,7 @@ use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
-    error::SdpError,
-    media::Direction,
+    media::{Direction, MediaKind},
     net::TcpType,
 };
 use tokio::{sync::oneshot, task::JoinSet, time::Instant};
@@ -56,22 +55,43 @@ impl From<&str> for MediaType {
     }
 }
 
+impl From<MediaType> for MediaKind {
+    fn from(value: MediaType) -> Self {
+        match value {
+            MediaType::Video => MediaKind::Video,
+            MediaType::Audio => MediaKind::Audio,
+            typ => panic!("unexpected media type: {}", typ),
+        }
+    }
+}
+
 impl std::fmt::Display for MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
+#[derive(Debug)]
+pub struct ParticipantState {
+    pub manual_sub: bool,
+    pub room_id: RoomId,
+    pub participant_id: ParticipantId,
+    /// Video track ID
+    pub video_track_id: Option<TrackId>,
+    /// Audio track ID
+    pub audio_track_id: Option<TrackId>,
+}
+
 #[derive(Debug, derive_more::From)]
 pub enum ControllerMessage {
     CreateParticipant(
         CreateParticipant,
-        oneshot::Sender<Result<String, ControllerError>>,
+        oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
     ),
     DeleteParticipant(DeleteParticipant),
     PatchParticipant(
         PatchParticipant,
-        oneshot::Sender<Result<String, ControllerError>>,
+        oneshot::Sender<Result<PatchParticipantReply, ControllerError>>,
     ),
 }
 
@@ -84,6 +104,12 @@ pub struct CreateParticipant {
 }
 
 #[derive(Debug)]
+pub struct CreateParticipantReply {
+    pub answer: SdpAnswer,
+    pub state: ParticipantState,
+}
+
+#[derive(Debug)]
 pub struct DeleteParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
@@ -91,17 +117,13 @@ pub struct DeleteParticipant {
 
 #[derive(Debug)]
 pub struct PatchParticipant {
-    pub manual_sub: bool,
-    pub room_id: RoomId,
-    pub participant_id: ParticipantId,
-    /// Video track ID
-    pub video_track_id: Option<TrackId>,
-    /// Audio track ID
-    pub audio_track_id: Option<TrackId>,
-    /// Ed25519 signature proving ownership
-    pub signature: String,
-
     pub offer: SdpOffer,
+    pub state: ParticipantState,
+}
+
+#[derive(Debug)]
+pub struct PatchParticipantReply {
+    pub answer: SdpAnswer,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -207,15 +229,30 @@ impl ControllerActor {
         &mut self,
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: CreateParticipant,
-    ) -> Result<String, ControllerError> {
+    ) -> Result<CreateParticipantReply, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
         let sockets = [&udp_egress, &tcp_egress];
 
         let (rtc, answer) = self.create_answer(m.offer, &sockets)?;
         let track_mappings = Self::create_track_mappings(&answer);
-        let mut room_handle = self.get_or_create_room(m.room_id);
+        let mut room_handle = self.get_or_create_room(&m.room_id);
         let gateway = self.node_ctx.gateway.clone();
+        let state = ParticipantState {
+            manual_sub: m.manual_sub,
+            room_id: m.room_id.clone(),
+            participant_id: m.participant_id.clone(),
+            audio_track_id: track_mappings
+                .iter()
+                .filter(|m| m.kind.is_audio())
+                .map(|m| m.track_id.clone())
+                .next(),
+            video_track_id: track_mappings
+                .iter()
+                .filter(|m| m.kind.is_video())
+                .map(|m| m.track_id.clone())
+                .next(),
+        };
         let participant = ParticipantActor::new(
             gateway,
             room_handle.clone(),
@@ -235,22 +272,23 @@ impl ControllerActor {
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
-        Ok(answer.to_sdp_string())
+        Ok(CreateParticipantReply { answer, state })
     }
 
     pub async fn handle_patch_participant(
         &mut self,
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
-        mut m: PatchParticipant,
-    ) -> Result<String, ControllerError> {
+        m: PatchParticipant,
+    ) -> Result<PatchParticipantReply, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
         let sockets = [&udp_egress, &tcp_egress];
+        let PatchParticipant { offer, mut state } = m;
 
-        let (rtc, answer) = self.create_answer(m.offer, &sockets)?;
+        let (rtc, answer) = self.create_answer(offer, &sockets)?;
         let mut track_mappings = Vec::new();
         for media in &answer.media_lines {
-            if media.typ.is_channel() {
+            if !media.typ.is_media() {
                 continue;
             }
 
@@ -262,18 +300,20 @@ impl ControllerActor {
 
             match typ {
                 MediaType::Video => {
-                    if let Some(track_id) = m.video_track_id.take() {
+                    if let Some(track_id) = state.video_track_id.take() {
                         track_mappings.push(TrackMapping {
                             mid: media.mid(),
                             track_id,
+                            kind: MediaKind::Video,
                         });
                     }
                 }
                 MediaType::Audio => {
-                    if let Some(track_id) = m.audio_track_id.take() {
+                    if let Some(track_id) = state.audio_track_id.take() {
                         track_mappings.push(TrackMapping {
                             mid: media.mid(),
                             track_id,
+                            kind: MediaKind::Audio,
                         });
                     }
                 }
@@ -281,17 +321,17 @@ impl ControllerActor {
             }
         }
 
-        let mut room_handle = self.get_or_create_room(m.room_id);
+        let mut room_handle = self.get_or_create_room(&state.room_id);
         let gateway = self.node_ctx.gateway.clone();
         let participant = ParticipantActor::new(
             gateway,
             room_handle.clone(),
             udp_egress,
             tcp_egress,
-            m.participant_id,
+            state.participant_id,
             rtc,
             track_mappings,
-            m.manual_sub,
+            state.manual_sub,
         );
 
         // TODO: probably retry? Or, let the client to retry instead?
@@ -302,7 +342,7 @@ impl ControllerActor {
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
-        Ok(answer.to_sdp_string())
+        Ok(PatchParticipantReply { answer })
     }
 
     fn create_answer(
@@ -394,8 +434,8 @@ impl ControllerActor {
         Ok((rtc, answer))
     }
 
-    fn get_or_create_room(&mut self, room_id: RoomId) -> room::RoomHandle {
-        if let Some(handle) = self.rooms.get(&room_id) {
+    fn get_or_create_room(&mut self, room_id: &RoomId) -> room::RoomHandle {
+        if let Some(handle) = self.rooms.get(room_id) {
             tracing::info!("get_room: {}", room_id);
             handle.clone()
         } else {
@@ -416,7 +456,7 @@ impl ControllerActor {
     fn create_track_mappings(answer: &SdpAnswer) -> Vec<TrackMapping> {
         let mut mappings = Vec::new();
         for m in &answer.media_lines {
-            if m.typ.is_channel() {
+            if !m.typ.is_media() {
                 continue;
             }
 
@@ -424,9 +464,12 @@ impl ControllerActor {
                 continue;
             }
 
+            let typ: MediaType = m.typ.to_string().as_str().into();
+            let kind: MediaKind = typ.into();
             mappings.push(TrackMapping {
                 mid: m.mid(),
                 track_id: entity::TrackId::new(),
+                kind,
             });
         }
         mappings

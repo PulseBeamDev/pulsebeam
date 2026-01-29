@@ -18,7 +18,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{controller, entity::TrackId};
 use crate::{
-    controller::PatchParticipant,
+    controller::ParticipantState,
     entity::{ParticipantId, RoomId},
 };
 
@@ -103,7 +103,12 @@ impl IntoResponse for ApiError {
 }
 
 /// Build an absolute URL for Location header
-fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<String, ApiError> {
+fn build_location(
+    headers: &HeaderMap,
+    cfg: &ApiConfig,
+    path: &str,
+    _state: ParticipantState,
+) -> Result<String, ApiError> {
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -166,7 +171,7 @@ async fn create_participant(
     let participant_id = ParticipantId::new();
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
-    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     con.try_send((
         controller::CreateParticipant {
             manual_sub: query.manual_sub,
@@ -174,14 +179,14 @@ async fn create_participant(
             participant_id: participant_id.clone(),
             offer,
         },
-        answer_tx,
+        reply_tx,
     ))
     .map_err(|e| match e {
         TrySendError::Full(_) => ApiError::RateLimited,
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
     })?;
 
-    let answer_sdp = answer_rx
+    let reply = reply_rx
         .await
         .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
@@ -190,7 +195,7 @@ async fn create_participant(
         &room_id.external(),
         &participant_id
     );
-    let location_url = build_location(&headers, &cfg, &path)?;
+    let location_url = build_location(&headers, &cfg, &path, reply.state)?;
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
@@ -200,7 +205,7 @@ async fn create_participant(
     Ok((
         StatusCode::CREATED,
         response_headers.to_header_map(),
-        answer_sdp,
+        reply.answer.to_sdp_string(),
     ))
 }
 
@@ -283,12 +288,13 @@ async fn patch_participant(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
     let msg = controller::PatchParticipant {
-        manual_sub: query.manual_sub,
-        room_id,
-        participant_id,
-        video_track_id: None,
-        audio_track_id: None,
-        signature: "".to_string(),
+        state: ParticipantState {
+            manual_sub: query.manual_sub,
+            room_id,
+            participant_id,
+            video_track_id: query.vid,
+            audio_track_id: query.aid,
+        },
         offer,
     };
     con.try_send((msg, reply_tx)).map_err(|e| match e {
@@ -296,11 +302,11 @@ async fn patch_participant(
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
     })?;
 
-    let answer_sdp = reply_rx
+    let reply = reply_rx
         .await
         .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
-    Ok((StatusCode::OK, answer_sdp))
+    Ok((StatusCode::OK, reply.answer.to_sdp_string()))
 }
 
 /// Build OpenAPI spec with dynamic server configuration
