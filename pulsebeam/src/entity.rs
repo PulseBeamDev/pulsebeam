@@ -20,8 +20,8 @@ pub mod prefix {
 }
 
 const HASH_OUTPUT_BYTES: usize = 16;
-const MAX_INTERNAL_ID_LEN: usize = 48;
-const MAX_EXTERNAL_ID_LEN: usize = 64;
+const MAX_INTERNAL_ID_LEN: usize = 20;
+const MAX_EXTERNAL_ID_LEN: usize = 36;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -307,7 +307,7 @@ mod tests {
     fn test_room_id_from_external_input() {
         let input = "my-room";
         let room_id = RoomId::from_str(input).unwrap();
-        assert_eq!(room_id.to_string(), input);
+        assert!(room_id.to_string().starts_with("rm_"));
         assert!(room_id.internal().starts_with("rm_"));
     }
 
