@@ -16,8 +16,8 @@ use str0m::{change::SdpOffer, error::SdpError};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::controller;
 use crate::entity::{ParticipantId, RoomId};
+use crate::{controller, entity::TrackId};
 
 pub enum HeaderExt {
     ParticipantId,
@@ -28,55 +28,6 @@ impl HeaderExt {
         match self {
             Self::ParticipantId => "pb-participant-id",
         }
-    }
-}
-
-/// Request headers for participant reconnection
-#[derive(Debug, ToSchema)]
-pub struct ReconnectionRequestHeaders {
-    /// Video track ID
-    pub video_track_id: String,
-    /// Audio track ID
-    pub audio_track_id: String,
-    /// Ed25519 signature proving ownership
-    pub signature: String,
-    /// ETag for concurrency control
-    /// https://www.rfc-editor.org/rfc/rfc9110.html#name-etag
-    pub etag: String,
-}
-
-impl ReconnectionRequestHeaders {
-    pub fn from_header_map(headers: &HeaderMap) -> Result<Self, ApiError> {
-        let video_track_id = headers
-            .get("pb-vid")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ApiError::BadRequest("missing pb-vid header".to_string()))?
-            .to_string();
-
-        let audio_track_id = headers
-            .get("pb-aid")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ApiError::BadRequest("missing pb-aid header".to_string()))?
-            .to_string();
-
-        let signature = headers
-            .get("pb-sig")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ApiError::BadRequest("missing pb-sig header".to_string()))?
-            .to_string();
-
-        let etag = headers
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ApiError::BadRequest("missing ETag header".to_string()))?
-            .to_string();
-
-        Ok(Self {
-            video_track_id,
-            audio_track_id,
-            signature,
-            etag,
-        })
     }
 }
 
@@ -206,12 +157,14 @@ async fn create_participant(
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    con.try_send(controller::CreateParticipant {
-        room_id: room_id.clone(),
-        participant_id: participant_id.clone(),
-        offer,
-        reply_tx: answer_tx,
-    })
+    con.try_send((
+        controller::CreateParticipant {
+            room_id: room_id.clone(),
+            participant_id: participant_id.clone(),
+            offer,
+        },
+        answer_tx,
+    ))
     .map_err(|e| match e {
         TrySendError::Full(_) => ApiError::RateLimited,
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
@@ -303,22 +256,21 @@ async fn patch_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
-    headers: HeaderMap,
-    _raw_offer: String,
+    raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    let h = ReconnectionRequestHeaders::from_header_map(&headers)?;
+    let offer = SdpOffer::from_sdp_string(&raw_offer)?;
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
     let msg = controller::PatchParticipant {
         room_id,
         participant_id,
-        video_track_id: h.video_track_id,
-        audio_track_id: h.audio_track_id,
-        signature: h.signature,
-        etag: h.etag,
-        reply_tx,
+        video_track_id: None,
+        audio_track_id: None,
+        signature: "".to_string(),
+        offer,
     };
-    con.try_send(msg).map_err(|e| match e {
+    con.try_send((msg, reply_tx)).map_err(|e| match e {
         TrySendError::Full(_) => ApiError::RateLimited,
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
     })?;
@@ -374,7 +326,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
         delete_participant,
     ),
     components(
-        schemas(ParticipantResponseHeaders, ReconnectionRequestHeaders)
+        schemas(ParticipantResponseHeaders)
     ),
     tags(
         (name = "participants", description = "Participant management endpoints"),

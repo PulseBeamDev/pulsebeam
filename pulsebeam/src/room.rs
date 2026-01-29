@@ -20,6 +20,7 @@ pub enum RoomMessage {
     PublishTrack(track::TrackReceiver),
     AddParticipant(ParticipantActor),
     RemoveParticipant(ParticipantId),
+    ReplaceParticipant(ParticipantActor),
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +110,9 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                     let _ = participant_handle.handle.terminate().await;
                     self.handle_participant_left(participant_id).await;
                 }
+            }
+            RoomMessage::ReplaceParticipant(_participant) => {
+                todo!()
             }
             RoomMessage::PublishTrack(track_handle) => {
                 self.handle_track_published(track_handle).await;

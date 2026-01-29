@@ -34,22 +34,45 @@ pub enum MediaType {
     Unknown,
 }
 
+impl MediaType {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::Application => "application",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<&str> for MediaType {
+    fn from(value: &str) -> Self {
+        match value {
+            "video" => MediaType::Video,
+            "audio" => MediaType::Audio,
+            "application" => MediaType::Application,
+            _ => MediaType::Unknown,
+        }
+    }
+}
+
 impl std::fmt::Display for MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Video => write!(f, "video"),
-            Self::Audio => write!(f, "audio"),
-            Self::Application => write!(f, "application"),
-            Self::Unknown => write!(f, "unknown"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
 #[derive(Debug, derive_more::From)]
 pub enum ControllerMessage {
-    CreateParticipant(CreateParticipant),
+    CreateParticipant(
+        CreateParticipant,
+        oneshot::Sender<Result<String, ControllerError>>,
+    ),
     DeleteParticipant(DeleteParticipant),
-    PatchParticipant(PatchParticipant),
+    PatchParticipant(
+        PatchParticipant,
+        oneshot::Sender<Result<String, ControllerError>>,
+    ),
 }
 
 #[derive(Debug)]
@@ -57,7 +80,6 @@ pub struct CreateParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
     pub offer: SdpOffer,
-    pub reply_tx: oneshot::Sender<Result<String, ControllerError>>,
 }
 
 #[derive(Debug)]
@@ -71,15 +93,13 @@ pub struct PatchParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
     /// Video track ID
-    pub video_track_id: String,
+    pub video_track_id: Option<TrackId>,
     /// Audio track ID
-    pub audio_track_id: String,
+    pub audio_track_id: Option<TrackId>,
     /// Ed25519 signature proving ownership
     pub signature: String,
-    /// ETag for concurrency control
-    /// https://www.rfc-editor.org/rfc/rfc9110.html#name-etag
-    pub etag: String,
-    pub reply_tx: oneshot::Sender<Result<String, ControllerError>>,
+
+    pub offer: SdpOffer,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -159,11 +179,9 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
         msg: ControllerMessage,
     ) -> () {
         match msg {
-            ControllerMessage::CreateParticipant(m) => {
-                let answer = self
-                    .allocate(ctx, m.room_id, m.participant_id, m.offer)
-                    .await;
-                let _ = m.reply_tx.send(answer);
+            ControllerMessage::CreateParticipant(m, reply_tx) => {
+                let answer = self.handle_create_participant(ctx, m).await;
+                let _ = reply_tx.send(answer);
             }
 
             ControllerMessage::DeleteParticipant(m) => {
@@ -174,33 +192,34 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
                         .await;
                 }
             }
-            ControllerMessage::PatchParticipant(_m) => {}
+            ControllerMessage::PatchParticipant(m, reply_tx) => {
+                let answer = self.handle_patch_participant(ctx, m).await;
+                let _ = reply_tx.send(answer);
+            }
         }
     }
 }
 
 impl ControllerActor {
-    pub async fn allocate(
+    pub async fn handle_create_participant(
         &mut self,
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
-        room_id: RoomId,
-        participant_id: ParticipantId,
-        offer: SdpOffer,
+        m: CreateParticipant,
     ) -> Result<String, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
         let sockets = [&udp_egress, &tcp_egress];
 
-        let (rtc, answer) = self.create_answer(offer, &sockets)?;
+        let (rtc, answer) = self.create_answer(m.offer, &sockets)?;
         let track_mappings = Self::create_track_mappings(&answer);
-        let mut room_handle = self.get_or_create_room(room_id);
+        let mut room_handle = self.get_or_create_room(m.room_id);
         let gateway = self.node_ctx.gateway.clone();
         let participant = ParticipantActor::new(
             gateway,
             room_handle.clone(),
             udp_egress,
             tcp_egress,
-            participant_id,
+            m.participant_id,
             rtc,
             track_mappings,
         );
@@ -210,6 +229,72 @@ impl ControllerActor {
         // But, a data race can still occur nonetheless
         room_handle
             .send(room::RoomMessage::AddParticipant(participant))
+            .await
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
+
+        Ok(answer.to_sdp_string())
+    }
+
+    pub async fn handle_patch_participant(
+        &mut self,
+        _ctx: &mut actor::ActorContext<ControllerMessageSet>,
+        mut m: PatchParticipant,
+    ) -> Result<String, ControllerError> {
+        let udp_egress = self.node_ctx.allocate_udp_egress();
+        let tcp_egress = self.node_ctx.allocate_tcp_egress();
+        let sockets = [&udp_egress, &tcp_egress];
+
+        let (rtc, answer) = self.create_answer(m.offer, &sockets)?;
+        let mut track_mappings = Vec::new();
+        for media in &answer.media_lines {
+            if media.typ.is_channel() {
+                continue;
+            }
+
+            if media.direction() != Direction::RecvOnly {
+                continue;
+            }
+
+            let typ: MediaType = media.typ.to_string().as_str().into();
+
+            match typ {
+                MediaType::Video => {
+                    if let Some(track_id) = m.video_track_id.take() {
+                        track_mappings.push(TrackMapping {
+                            mid: media.mid(),
+                            track_id,
+                        });
+                    }
+                }
+                MediaType::Audio => {
+                    if let Some(track_id) = m.audio_track_id.take() {
+                        track_mappings.push(TrackMapping {
+                            mid: media.mid(),
+                            track_id,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut room_handle = self.get_or_create_room(m.room_id);
+        let gateway = self.node_ctx.gateway.clone();
+        let participant = ParticipantActor::new(
+            gateway,
+            room_handle.clone(),
+            udp_egress,
+            tcp_egress,
+            m.participant_id,
+            rtc,
+            track_mappings,
+        );
+
+        // TODO: probably retry? Or, let the client to retry instead?
+        // Each room will always have a graceful timeout before closing.
+        // But, a data race can still occur nonetheless
+        room_handle
+            .send(room::RoomMessage::ReplaceParticipant(participant))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
 
@@ -353,13 +438,7 @@ impl ControllerActor {
         for m in &answer.media_lines {
             let kind = m.typ.to_string();
             let dir = m.direction();
-
-            let media_type = match kind.as_str() {
-                "video" => MediaType::Video,
-                "audio" => MediaType::Audio,
-                "application" => MediaType::Application,
-                _ => MediaType::Unknown,
-            };
+            let media_type = kind.as_str().into();
 
             if (dir == Direction::SendRecv || dir == Direction::Inactive) && kind != "application" {
                 return Err(OfferRejectedReason::DirectionNotSupported(
