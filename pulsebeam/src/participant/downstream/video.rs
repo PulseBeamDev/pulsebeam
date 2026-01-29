@@ -28,6 +28,7 @@ pub struct Intent {
 
 #[derive(Default)]
 pub struct VideoAllocator {
+    manual_sub: bool,
     tracks: HashMap<TrackId, TrackState>,
     slots: Vec<Slot>,
 
@@ -37,6 +38,13 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
+    pub fn new(manual_sub: bool) -> Self {
+        Self {
+            manual_sub,
+            ..Default::default()
+        }
+    }
+
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
@@ -152,6 +160,10 @@ impl VideoAllocator {
     }
 
     fn rebalance(&mut self) {
+        if self.manual_sub {
+            return;
+        }
+
         let mut unassigned_tracks = self.tracks.iter_mut().filter(|(_, state)| {
             assert!(state.track.meta.kind.is_video());
             state.assigned_mid.is_none()

@@ -44,7 +44,7 @@ pub enum CoreEvent {
 }
 
 pub struct ParticipantCore {
-    pub track_mappings: Vec<TrackMapping>,
+    track_mappings: Vec<TrackMapping>,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
@@ -58,6 +58,7 @@ pub struct ParticipantCore {
 
 impl ParticipantCore {
     pub fn new(
+        manual_sub: bool,
         track_mappings: Vec<TrackMapping>,
         participant_id: entity::ParticipantId,
         rtc: Rtc,
@@ -71,7 +72,7 @@ impl ParticipantCore {
             udp_batcher,
             tcp_batcher,
             upstream: UpstreamAllocator::new(),
-            downstream: DownstreamAllocator::new(),
+            downstream: DownstreamAllocator::new(manual_sub),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
             signaling: Signaling::new(),

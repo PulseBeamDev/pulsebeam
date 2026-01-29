@@ -22,11 +22,11 @@ pub struct DownstreamAllocator {
 }
 
 impl DownstreamAllocator {
-    pub fn new() -> Self {
+    pub fn new(manual_sub: bool) -> Self {
         Self {
             available_bandwidth: BitrateController::default(),
             audio: AudioAllocator::new(),
-            video: VideoAllocator::default(),
+            video: VideoAllocator::new(manual_sub),
         }
     }
 

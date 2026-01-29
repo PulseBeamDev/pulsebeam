@@ -193,10 +193,12 @@ impl ParticipantActor {
         participant_id: entity::ParticipantId,
         rtc: Rtc,
         track_mappings: Vec<TrackMapping>,
+        manual_sub: bool,
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
         let core = ParticipantCore::new(
+            manual_sub,
             track_mappings,
             participant_id,
             rtc,

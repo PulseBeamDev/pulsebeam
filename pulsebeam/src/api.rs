@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{
         HeaderMap, StatusCode, Uri,
         header::{HeaderName, HeaderValue},
@@ -16,8 +16,11 @@ use str0m::{change::SdpOffer, error::SdpError};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::entity::{ParticipantId, RoomId};
 use crate::{controller, entity::TrackId};
+use crate::{
+    controller::PatchParticipant,
+    entity::{ParticipantId, RoomId},
+};
 
 pub enum HeaderExt {
     ParticipantId,
@@ -119,6 +122,12 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
     Ok(url)
 }
 
+#[derive(serde::Deserialize)]
+pub struct CreateParticipantQuery {
+    #[serde(default)]
+    pub manual_sub: bool,
+}
+
 /// Create a new participant in a room
 ///
 /// Creates a new participant by processing a WebRTC offer and returning an answer.
@@ -148,6 +157,7 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
 #[axum::debug_handler]
 async fn create_participant(
     Path(room_id): Path<RoomId>,
+    Query(query): Query<CreateParticipantQuery>,
     State((mut con, cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
@@ -159,6 +169,7 @@ async fn create_participant(
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     con.try_send((
         controller::CreateParticipant {
+            manual_sub: query.manual_sub,
             room_id: room_id.clone(),
             participant_id: participant_id.clone(),
             offer,
@@ -227,6 +238,14 @@ async fn delete_participant(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(serde::Deserialize)]
+pub struct PatchParticipantQuery {
+    #[serde(default)]
+    pub manual_sub: bool,
+    pub vid: Option<TrackId>,
+    pub aid: Option<TrackId>,
+}
+
 /// Reconnect a participant to a room
 ///
 /// Allows a participant to reconnect to a room with new WebRTC offer,
@@ -254,6 +273,7 @@ async fn delete_participant(
 #[axum::debug_handler]
 async fn patch_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
+    Query(query): Query<PatchParticipantQuery>,
     State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     raw_offer: String,
@@ -263,6 +283,7 @@ async fn patch_participant(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
     let msg = controller::PatchParticipant {
+        manual_sub: query.manual_sub,
         room_id,
         participant_id,
         video_track_id: None,

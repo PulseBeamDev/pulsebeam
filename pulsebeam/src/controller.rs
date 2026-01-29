@@ -77,6 +77,7 @@ pub enum ControllerMessage {
 
 #[derive(Debug)]
 pub struct CreateParticipant {
+    pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
     pub offer: SdpOffer,
@@ -90,6 +91,7 @@ pub struct DeleteParticipant {
 
 #[derive(Debug)]
 pub struct PatchParticipant {
+    pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
     /// Video track ID
@@ -222,6 +224,7 @@ impl ControllerActor {
             m.participant_id,
             rtc,
             track_mappings,
+            m.manual_sub,
         );
 
         // TODO: probably retry? Or, let the client to retry instead?
@@ -288,6 +291,7 @@ impl ControllerActor {
             m.participant_id,
             rtc,
             track_mappings,
+            m.manual_sub,
         );
 
         // TODO: probably retry? Or, let the client to retry instead?
