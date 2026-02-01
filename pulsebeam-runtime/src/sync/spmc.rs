@@ -36,7 +36,7 @@ struct Ring<T> {
 
 impl<T> Ring<T> {
     fn new(mut capacity: usize) -> Arc<Self> {
-        if capacity > 0 && capacity.is_power_of_two() {
+        if capacity > 0 && !capacity.is_power_of_two() {
             let old_cap = capacity;
             capacity = capacity.next_power_of_two();
             tracing::warn!(
