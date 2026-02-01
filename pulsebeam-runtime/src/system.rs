@@ -70,10 +70,10 @@ pub fn select_host_address() -> IpAddr {
         }
 
         // optionally restrict to known LAN interface patterns
-        if !(name.starts_with("en") || name.starts_with("eth") || name.starts_with("wlp")) {
-            tracing::debug!("skipping non-lan interface {}", name);
-            continue;
-        }
+        // if !(name.starts_with("en") || name.starts_with("eth") || name.starts_with("wlp")) {
+        //     tracing::debug!("skipping non-lan interface {}", name);
+        //     continue;
+        // }
 
         for n in &net.addrs {
             if let SysIpAddr::V4(ipv4) = n.addr {
