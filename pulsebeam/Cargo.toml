@@ -16,7 +16,7 @@ axum = { version = "0.8.8", features = ["macros"] }
 axum-extra = { version = "0.12.5", features = ["typed-header"] }
 bs58 = "0.5.1"
 bytes = { workspace = true }
-clap = { version = "4.5.53", features = ["derive"] }
+clap = { version = "4.5.56", features = ["derive"] }
 derive_more = { workspace = true }
 futures-lite = { workspace = true }
 hex = "0.4.3"
