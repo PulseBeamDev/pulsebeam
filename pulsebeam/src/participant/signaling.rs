@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::participant::downstream::{DownstreamAllocator, Intent};
+use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
-use pulsebeam_proto::{namespace, prelude::*};
 use str0m::Rtc;
 use str0m::channel::ChannelId;
 use str0m::media::Mid;
@@ -20,7 +20,7 @@ pub enum SignalingError {
 }
 
 pub struct Signaling {
-    pub cid: Option<ChannelId>,
+    pub cid: ChannelId,
     seq: u64,
     slot_count: usize,
 
@@ -38,13 +38,13 @@ pub struct Signaling {
 }
 
 impl Signaling {
-    pub fn new() -> Self {
+    pub fn new(cid: ChannelId) -> Self {
         Self {
-            cid: None,
+            cid,
             seq: 0,
             dirty_tracks: false,
             dirty_assignments: false,
-            pending_snapshot_request: false,
+            pending_snapshot_request: true,
             // Initialize empty sets
             previous_track_ids: HashSet::new(),
             previous_assignment_mids: HashSet::new(),
@@ -55,15 +55,6 @@ impl Signaling {
 
     pub fn set_slot_count(&mut self, slot_count: usize) {
         self.slot_count = slot_count;
-    }
-
-    pub fn handle_channel_open(&mut self, cid: ChannelId, label: String) {
-        if label == namespace::Signaling::Reliable.as_str() {
-            self.cid = Some(cid);
-            self.pending_snapshot_request = true;
-            self.dirty_tracks = true;
-            self.dirty_assignments = true;
-        }
     }
 
     pub fn handle_input(
@@ -144,16 +135,12 @@ impl Signaling {
     }
 
     pub fn poll(&mut self, rtc: &mut Rtc, downstream: &DownstreamAllocator) -> bool {
-        let Some(cid) = self.cid else {
-            return false;
-        };
-
         // If nothing is dirty, do nothing
         if !self.dirty_tracks && !self.dirty_assignments {
             return false;
         }
 
-        let Some(mut channel) = rtc.channel(cid) else {
+        let Some(mut channel) = rtc.channel(self.cid) else {
             return false;
         };
 

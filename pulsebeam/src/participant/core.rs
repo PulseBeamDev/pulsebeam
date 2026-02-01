@@ -1,8 +1,10 @@
 use super::signaling::Signaling;
+use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
 use std::collections::HashMap;
 use std::sync::Arc;
 use str0m::bwe::BweKind;
+use str0m::channel::ChannelConfig;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use str0m::net::Protocol;
 use str0m::{
@@ -62,10 +64,17 @@ impl ParticipantCore {
         manual_sub: bool,
         track_mappings: Vec<TrackMapping>,
         participant_id: entity::ParticipantId,
-        rtc: Rtc,
+        mut rtc: Rtc,
         udp_batcher: Batcher,
         tcp_batcher: Batcher,
     ) -> Self {
+        let cid = rtc.direct_api().create_data_channel(ChannelConfig {
+            label: namespace::Signaling::Reliable.as_str().to_string(),
+            ordered: true,
+            reliability: str0m::channel::Reliability::Reliable,
+            negotiated: Some(0),
+            protocol: "v1".to_string(),
+        });
         Self {
             track_mappings,
             participant_id,
@@ -76,7 +85,7 @@ impl ParticipantCore {
             downstream: DownstreamAllocator::new(manual_sub),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
-            signaling: Signaling::new(),
+            signaling: Signaling::new(cid),
         }
     }
 
@@ -244,16 +253,14 @@ impl ParticipantCore {
                     self.rtc.bwe().set_desired_bitrate(desired);
                 }
             }
-            Event::ChannelOpen(cid, label) => self.signaling.handle_channel_open(cid, label),
+            Event::ChannelOpen(_cid, _label) => {}
             Event::ChannelData(data) => {
-                if Some(data.id) == self.signaling.cid
+                if data.id == self.signaling.cid
                     && let Err(err) = self
                         .signaling
                         .handle_input(&data.data, &mut self.downstream)
                 {
                     self.disconnect(err.into());
-                } else {
-                    tracing::warn!("unrecognized cid: {:?}", data.id);
                 }
             }
             // rtp monitor handles this
