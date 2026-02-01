@@ -105,11 +105,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                 self.handle_participant_joined(ctx, participant).await
             }
             RoomMessage::RemoveParticipant(participant_id) => {
-                if let Some(participant_handle) = self.state.participants.get_mut(&participant_id) {
-                    // if it's closed, then the participant has exited
-                    let _ = participant_handle.handle.terminate().await;
-                    self.handle_participant_left(participant_id).await;
-                }
+                self.handle_participant_left(participant_id).await;
             }
             RoomMessage::ReplaceParticipant(participant) => {
                 self.handle_replace_participant(ctx, participant).await;
@@ -165,6 +161,8 @@ impl RoomActor {
             return;
         };
 
+        // if it's closed, then the participant has exited
+        let _ = participant.handle.terminate().await;
         for (track_id, _) in participant.tracks.iter_mut() {
             // Remove the track from the central registry.
             self.state.tracks.remove(track_id);
