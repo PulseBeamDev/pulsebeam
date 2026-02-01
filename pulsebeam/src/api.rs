@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -107,7 +109,7 @@ fn build_location(
     headers: &HeaderMap,
     cfg: &ApiConfig,
     path: &str,
-    _state: ParticipantState,
+    state: ParticipantState,
 ) -> Result<String, ApiError> {
     let scheme = headers
         .get("x-forwarded-proto")
@@ -120,8 +122,28 @@ fn build_location(
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&cfg.default_host);
 
-    let url = format!("{}://{}{}{}", scheme, host, cfg.base_path, path);
+    // TODO: Can these keys be strongly typed?
+    let mut params = BTreeMap::new();
+    if let Some(vid) = state.video_track_id {
+        params.insert("vid".to_string(), vid.to_string());
+    }
+    if let Some(aid) = state.audio_track_id {
+        params.insert("aid".to_string(), aid.to_string());
+    }
 
+    if state.manual_sub {
+        params.insert("manual_sub".to_string(), "true".to_string());
+    }
+
+    // url::form_urlencoded uses the BTreeMap iterator, maintaining alphabetical order
+    let query_string = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params.iter())
+        .finish();
+
+    let url = format!(
+        "{}://{}{}{}?{}",
+        scheme, host, cfg.base_path, path, query_string
+    );
     url.parse::<Uri>().map_err(|_| ApiError::BadUrl)?;
 
     Ok(url)

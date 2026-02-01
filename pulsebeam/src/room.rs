@@ -111,8 +111,8 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                     self.handle_participant_left(participant_id).await;
                 }
             }
-            RoomMessage::ReplaceParticipant(_participant) => {
-                todo!()
+            RoomMessage::ReplaceParticipant(participant) => {
+                self.handle_replace_participant(ctx, participant).await;
             }
             RoomMessage::PublishTrack(track_handle) => {
                 self.handle_track_published(track_handle).await;
@@ -215,25 +215,19 @@ impl RoomActor {
         self.broadcast_message(msg).await;
     }
 
-    async fn handle_track_unpublished(&mut self, track_meta: Arc<TrackMeta>) {
-        let track_handle = if let Some(track_handle) = self.state.tracks.remove(&track_meta.id) {
-            track_handle
-        } else {
-            return;
-        };
-        if let Some(meta) = self
-            .state
-            .participants
-            .get_mut(&track_meta.origin_participant)
-        {
-            meta.tracks.remove(&track_meta.id);
+    async fn handle_replace_participant(
+        &mut self,
+        ctx: &mut actor::ActorContext<RoomMessageSet>,
+        new_participant: ParticipantActor,
+    ) {
+        let participant_id = new_participant.meta();
+
+        if self.state.participants.contains_key(&participant_id) {
+            tracing::info!(%participant_id, "Replacing existing participant session (takeover)");
+            self.handle_participant_left(participant_id).await;
         }
 
-        let mut removed_tracks = HashMap::new();
-        removed_tracks.insert(track_meta.id.clone(), track_handle);
-        let removed_tracks = Arc::new(removed_tracks);
-        let msg = participant::ParticipantControlMessage::TracksUnpublished(removed_tracks);
-        self.broadcast_message(msg).await;
+        self.handle_participant_joined(ctx, new_participant).await;
     }
 
     async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {
