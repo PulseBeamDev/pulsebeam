@@ -90,7 +90,7 @@ impl Batcher {
                     self.reclaim(state);
                 }
                 Err(err) if err.kind() != io::ErrorKind::WouldBlock => {
-                    tracing::warn!("error on writing to egress socket: {:?}", err);
+                    tracing::trace!("error on writing to egress socket: {:?}", err);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }

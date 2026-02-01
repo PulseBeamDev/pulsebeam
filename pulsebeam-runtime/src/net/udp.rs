@@ -193,7 +193,7 @@ impl UdpTransportWriter {
             Ok(_) => Ok(true),
             Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(err) => {
-                tracing::warn!("try_send_batch failed with {err}");
+                tracing::trace!("try_send_batch failed with {err}");
                 Err(err)
             }
         }

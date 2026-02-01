@@ -252,6 +252,8 @@ impl ParticipantCore {
                         .handle_input(&data.data, &mut self.downstream)
                 {
                     self.disconnect(err.into());
+                } else {
+                    tracing::warn!("unrecognized cid: {:?}", data.id);
                 }
             }
             // rtp monitor handles this
