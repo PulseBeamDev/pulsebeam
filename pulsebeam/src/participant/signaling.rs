@@ -150,9 +150,9 @@ impl Signaling {
             .video
             .tracks()
             .map(|t| signaling::Track {
-                id: t.id.to_string(),
+                id: t.id.as_str(),
                 kind: signaling::TrackKind::Video.into(),
-                participant_id: t.origin_participant.to_string(),
+                participant_id: t.origin_participant.as_str(),
                 meta: Default::default(),
             })
             .collect();
@@ -162,7 +162,7 @@ impl Signaling {
             .slots()
             .map(|s| signaling::VideoAssignment {
                 mid: s.mid.to_string(),
-                track_id: s.track.id.to_string(),
+                track_id: s.track.id.as_str(),
                 paused: false,
             })
             .collect();

@@ -53,6 +53,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5.8"
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+uuid = { version = "1.20.0", features = ["v5", "v4"] }
 
 [dev-dependencies]
 more-asserts = { workspace = true }

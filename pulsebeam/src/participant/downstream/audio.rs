@@ -31,7 +31,7 @@ impl AudioAllocator {
 
     pub fn add_track(&mut self, track: TrackReceiver) {
         self.inputs.insert(
-            track.meta.id.clone(),
+            track.meta.id,
             track.lowest_quality().channel.clone(),
         );
         if let Some(waker) = self.waker.take() {
@@ -117,7 +117,7 @@ impl AudioSlot {
         let now = Instant::now();
 
         if self.current_track_id.as_ref() != Some(track_id) {
-            self.current_track_id = Some(track_id.clone());
+            self.current_track_id = Some(*track_id);
             self.timeline.rebase(&packet);
         }
 

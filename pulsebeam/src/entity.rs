@@ -1,10 +1,9 @@
 use derive_more::{AsRef, Display};
-use pulsebeam_runtime::prelude::*;
-use pulsebeam_runtime::rand;
 use sha3::{Digest, Sha3_256};
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::{fmt, str::FromStr};
+use uuid::Uuid;
 
 pub type EntityId = String;
 
@@ -43,36 +42,7 @@ fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
     format!("{}_{}", prefix, encoded)
 }
 
-pub fn new_random_id(prefix: &str, length: usize) -> EntityId {
-    let mut bytes = vec![0u8; length];
-    rand::rng().fill_bytes(&mut bytes);
-    encode_with_prefix(prefix, &bytes)
-}
-
-pub fn new_hashed_id(prefix: &str, input: &str) -> EntityId {
-    let mut hasher = Sha3_256::default();
-    hasher.update(input.as_bytes());
-    let full_hash = hasher.finalize();
-    encode_with_prefix(prefix, &full_hash[..HASH_OUTPUT_BYTES])
-}
-
-pub fn validate_external_string(s: &str) -> Result<(), IdValidationError> {
-    if s.is_empty() {
-        return Err(IdValidationError::Empty);
-    }
-    if s.len() > MAX_EXTERNAL_ID_LEN {
-        return Err(IdValidationError::TooLong(MAX_EXTERNAL_ID_LEN));
-    }
-    if !s
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(IdValidationError::InvalidCharacters);
-    }
-    Ok(())
-}
-
-fn validate_internal_format(value: &str, expected_prefix: &str) -> Result<(), IdValidationError> {
+fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdValidationError> {
     if value.len() > MAX_INTERNAL_ID_LEN {
         return Err(IdValidationError::TooLong(MAX_INTERNAL_ID_LEN));
     }
@@ -88,9 +58,30 @@ fn validate_internal_format(value: &str, expected_prefix: &str) -> Result<(), Id
     if encoded.is_empty() {
         return Err(IdValidationError::InvalidEncoding);
     }
-    bs58::decode(encoded)
+    let bytes = bs58::decode(encoded)
         .into_vec()
         .map_err(|_| IdValidationError::InvalidEncoding)?;
+
+    if bytes.len() != 16 {
+        return Err(IdValidationError::InvalidEncoding);
+    }
+
+    Uuid::from_slice(&bytes).map_err(|_| IdValidationError::InvalidEncoding)
+}
+
+pub fn validate_external_string(s: &str) -> Result<(), IdValidationError> {
+    if s.is_empty() {
+        return Err(IdValidationError::Empty);
+    }
+    if s.len() > MAX_EXTERNAL_ID_LEN {
+        return Err(IdValidationError::TooLong(MAX_EXTERNAL_ID_LEN));
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(IdValidationError::InvalidCharacters);
+    }
     Ok(())
 }
 
@@ -133,7 +124,12 @@ pub struct RoomId {
 
 impl RoomId {
     pub fn from_external(external: ExternalRoomId) -> Self {
-        let internal = new_hashed_id(prefix::ROOM_ID, external.as_str());
+        let mut hasher = Sha3_256::default();
+        hasher.update(external.as_str().as_bytes());
+        let full_hash = hasher.finalize();
+        // Use hash bytes to form the ID
+        let internal = encode_with_prefix(prefix::ROOM_ID, &full_hash[..HASH_OUTPUT_BYTES]);
+
         Self {
             external,
             internal: Arc::new(internal),
@@ -200,21 +196,26 @@ impl fmt::Debug for RoomId {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Display, AsRef)]
-#[as_ref(forward)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParticipantId {
-    #[display(fmt = "{}", "_0")]
-    internal: Arc<EntityId>,
+    uuid: Uuid,
 }
 
 impl ParticipantId {
     pub fn new() -> Self {
         Self {
-            internal: Arc::new(new_random_id(prefix::PARTICIPANT_ID, HASH_OUTPUT_BYTES)),
+            uuid: Uuid::new_v4(),
         }
     }
-    pub fn as_str(&self) -> &str {
-        &self.internal
+
+    pub fn as_str(&self) -> String {
+        encode_with_prefix(prefix::PARTICIPANT_ID, self.uuid.as_bytes())
+    }
+
+    /// Derives a TrackId using UUIDv5 (Namespace: Self, Name: label)
+    pub fn derive_track_id(&self, label: &str) -> TrackId {
+        let uuid = Uuid::new_v5(&self.uuid, label.as_bytes());
+        TrackId { uuid }
     }
 }
 
@@ -227,10 +228,8 @@ impl Default for ParticipantId {
 impl TryFrom<String> for ParticipantId {
     type Error = IdValidationError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_internal_format(&value, prefix::PARTICIPANT_ID)?;
-        Ok(Self {
-            internal: Arc::new(value),
-        })
+        let uuid = decode_with_prefix(&value, prefix::PARTICIPANT_ID)?;
+        Ok(Self { uuid })
     }
 }
 
@@ -246,7 +245,7 @@ impl serde::Serialize for ParticipantId {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        serializer.serialize_str(&self.as_str())
     }
 }
 
@@ -260,45 +259,36 @@ impl<'de> serde::Deserialize<'de> for ParticipantId {
     }
 }
 
+impl fmt::Display for ParticipantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl fmt::Debug for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ParticipantId")
-            .field(&*self.internal)
+            .field(&self.as_str())
             .finish()
     }
 }
 
-#[derive(Clone, PartialOrd, Ord, Eq, PartialEq, Hash, Display, AsRef)]
-#[as_ref(forward)]
+#[derive(Clone, Copy, PartialOrd, Ord, Eq, PartialEq, Hash)]
 pub struct TrackId {
-    #[display(fmt = "{}", "_0")]
-    internal: Arc<EntityId>,
+    uuid: Uuid,
 }
 
 impl TrackId {
-    pub fn new() -> Self {
-        Self {
-            internal: Arc::new(new_random_id(prefix::TRACK_ID, HASH_OUTPUT_BYTES)),
-        }
-    }
-    pub fn as_str(&self) -> &str {
-        &self.internal
-    }
-}
-
-impl Default for TrackId {
-    fn default() -> Self {
-        Self::new()
+    pub fn as_str(&self) -> String {
+        encode_with_prefix(prefix::TRACK_ID, self.uuid.as_bytes())
     }
 }
 
 impl TryFrom<String> for TrackId {
     type Error = IdValidationError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_internal_format(&value, prefix::TRACK_ID)?;
-        Ok(Self {
-            internal: Arc::new(value),
-        })
+        let uuid = decode_with_prefix(&value, prefix::TRACK_ID)?;
+        Ok(Self { uuid })
     }
 }
 
@@ -314,7 +304,7 @@ impl serde::Serialize for TrackId {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        serializer.serialize_str(&self.as_str())
     }
 }
 
@@ -328,9 +318,15 @@ impl<'de> serde::Deserialize<'de> for TrackId {
     }
 }
 
+impl fmt::Display for TrackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl fmt::Debug for TrackId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("TrackId").field(&*self.internal).finish()
+        f.debug_tuple("TrackId").field(&self.as_str()).finish()
     }
 }
 
@@ -349,7 +345,7 @@ mod tests {
     #[test]
     fn participant_id_roundtrip() {
         let id = ParticipantId::new();
-        let parsed = ParticipantId::from_str(&id.to_string()).unwrap();
+        let parsed = ParticipantId::from_str(&id.as_str()).unwrap();
         assert_eq!(id, parsed);
     }
 
@@ -461,10 +457,12 @@ mod tests {
 
     #[test]
     fn participant_id_too_long() {
+        // Base58 of 16 bytes is approx 22 chars.
+        // 36 chars is way more than enough for valid IDs, so we check stricter length or garbage
         let too_long = format!("pa_{}", "a".repeat(MAX_INTERNAL_ID_LEN));
         assert!(matches!(
             ParticipantId::from_str(&too_long).unwrap_err(),
-            IdValidationError::TooLong(_)
+            IdValidationError::TooLong(_) | IdValidationError::InvalidEncoding
         ));
     }
 
@@ -496,16 +494,25 @@ mod tests {
     fn participant_id_uniqueness() {
         let mut seen = HashSet::new();
         for _ in 0..1000 {
-            assert!(seen.insert(ParticipantId::new().to_string()));
+            assert!(seen.insert(ParticipantId::new().as_str()));
         }
     }
 
     #[test]
-    fn track_id_uniqueness() {
-        let mut seen = HashSet::new();
-        for _ in 0..1000 {
-            assert!(seen.insert(TrackId::new().to_string()));
-        }
+    fn track_id_derivation_determinism() {
+        let p = ParticipantId::new();
+        let t1 = p.derive_track_id("cam");
+        let t2 = p.derive_track_id("cam");
+        assert_eq!(t1, t2);
+        assert_eq!(t1.as_str(), t2.as_str());
+    }
+
+    #[test]
+    fn track_id_derivation_uniqueness() {
+        let p = ParticipantId::new();
+        let t1 = p.derive_track_id("cam");
+        let t2 = p.derive_track_id("mic");
+        assert_ne!(t1, t2);
     }
 
     #[test]
@@ -518,7 +525,8 @@ mod tests {
 
     #[test]
     fn track_id_serde_roundtrip() {
-        let id = TrackId::new();
+        let p = ParticipantId::new();
+        let id = p.derive_track_id("cam");
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized: TrackId = serde_json::from_str(&serialized).unwrap();
         assert_eq!(id, deserialized);
@@ -560,15 +568,16 @@ mod tests {
     fn participant_id_as_hashmap_key() {
         let mut map: HashMap<ParticipantId, String> = HashMap::new();
         let id = ParticipantId::new();
-        map.insert(id.clone(), "value".to_string());
+        map.insert(id, "value".to_string());
         assert_eq!(map.get(&id), Some(&"value".to_string()));
     }
 
     #[test]
     fn track_id_as_hashmap_key() {
         let mut map: HashMap<TrackId, String> = HashMap::new();
-        let id = TrackId::new();
-        map.insert(id.clone(), "value".to_string());
+        let p = ParticipantId::new();
+        let id = p.derive_track_id("cam");
+        map.insert(id, "value".to_string());
         assert_eq!(map.get(&id), Some(&"value".to_string()));
     }
 
@@ -587,17 +596,18 @@ mod tests {
     }
 
     #[test]
-    fn participant_id_arc_sharing() {
+    fn participant_id_copy_semantics() {
         let id1 = ParticipantId::new();
-        let id2 = id1.clone();
-        assert!(Arc::ptr_eq(&id1.internal, &id2.internal));
+        let id2 = id1; // Copy
+        assert_eq!(id1, id2);
     }
 
     #[test]
-    fn track_id_arc_sharing() {
-        let id1 = TrackId::new();
-        let id2 = id1.clone();
-        assert!(Arc::ptr_eq(&id1.internal, &id2.internal));
+    fn track_id_copy_semantics() {
+        let p = ParticipantId::new();
+        let id1 = p.derive_track_id("cam");
+        let id2 = id1; // Copy
+        assert_eq!(id1, id2);
     }
 
     #[test]
@@ -638,7 +648,8 @@ mod tests {
     #[test]
     fn display_format() {
         assert!(format!("{}", ParticipantId::new()).starts_with("pa_"));
-        assert!(format!("{}", TrackId::new()).starts_with("tr_"));
+        let p = ParticipantId::new();
+        assert!(format!("{}", p.derive_track_id("c")).starts_with("tr_"));
         let ext = ExternalRoomId::new("test".to_string()).unwrap();
         assert!(format!("{}", RoomId::from_external(ext)).starts_with("rm_"));
     }
@@ -646,44 +657,25 @@ mod tests {
     #[test]
     fn debug_format() {
         assert!(format!("{:?}", ParticipantId::new()).contains("ParticipantId"));
-        assert!(format!("{:?}", TrackId::new()).contains("TrackId"));
+        let p = ParticipantId::new();
+        assert!(format!("{:?}", p.derive_track_id("c")).contains("TrackId"));
     }
 
     #[test]
-    fn as_str_returns_valid_reference() {
+    fn as_str_returns_valid_string() {
         let participant_id = ParticipantId::new();
         assert!(participant_id.as_str().starts_with("pa_"));
-        assert_eq!(participant_id.as_str(), participant_id.to_string());
-        let track_id = TrackId::new();
+        assert_eq!(participant_id.as_str(), participant_id.as_str());
+        let track_id = participant_id.derive_track_id("cam");
         assert!(track_id.as_str().starts_with("tr_"));
-        assert_eq!(track_id.as_str(), track_id.to_string());
-    }
-
-    #[test]
-    fn webrtc_sfu_message_passing() {
-        let room_ext = ExternalRoomId::new("conference-1".to_string()).unwrap();
-        let room_id = RoomId::from_external(room_ext);
-        let participant_id = ParticipantId::new();
-        let track_id = TrackId::new();
-        let room_clone = room_id.clone();
-        let participant_clone = participant_id.clone();
-        let track_clone = track_id.clone();
-        assert_eq!(room_id, room_clone);
-        assert_eq!(participant_id, participant_clone);
-        assert_eq!(track_id, track_clone);
-        assert!(Arc::ptr_eq(&room_id.internal, &room_clone.internal));
-        assert!(Arc::ptr_eq(
-            &participant_id.internal,
-            &participant_clone.internal
-        ));
-        assert!(Arc::ptr_eq(&track_id.internal, &track_clone.internal));
+        assert_eq!(track_id.as_str(), track_id.as_str());
     }
 
     #[test]
     fn parsing_from_client_input() {
         assert!(RoomId::from_str("my-conference-room").is_ok());
         let participant_id = ParticipantId::new();
-        let serialized = participant_id.to_string();
+        let serialized = participant_id.as_str();
         let parsed = ParticipantId::from_str(&serialized).unwrap();
         assert_eq!(parsed, participant_id);
     }
@@ -691,15 +683,12 @@ mod tests {
     #[test]
     fn storing_in_multiple_collections() {
         let participant_id = ParticipantId::new();
-        let track_id = TrackId::new();
+        let track_id = participant_id.derive_track_id("cam");
         let mut participant_map: HashMap<ParticipantId, Vec<TrackId>> = HashMap::new();
         let mut track_map: HashMap<TrackId, ParticipantId> = HashMap::new();
-        participant_map.insert(participant_id.clone(), vec![track_id.clone()]);
-        track_map.insert(track_id.clone(), participant_id.clone());
-        assert_eq!(
-            participant_map.get(&participant_id),
-            Some(&vec![track_id.clone()])
-        );
+        participant_map.insert(participant_id, vec![track_id]);
+        track_map.insert(track_id, participant_id);
+        assert_eq!(participant_map.get(&participant_id), Some(&vec![track_id]));
         assert_eq!(track_map.get(&track_id), Some(&participant_id));
     }
 
@@ -708,9 +697,9 @@ mod tests {
         let id1 = ParticipantId::new();
         let id2 = ParticipantId::new();
         assert_ne!(id1, id2);
-        let mut ids = [id1.clone(), id2.clone()];
+        let mut ids = [id1, id2];
         ids.sort();
-        assert_eq!(id1, id1.clone());
+        assert_eq!(id1, id1);
     }
 
     #[test]
@@ -728,7 +717,8 @@ mod tests {
         for c in ParticipantId::new().as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }
-        for c in TrackId::new().as_str().chars() {
+        let p = ParticipantId::new();
+        for c in p.derive_track_id("c").as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }
     }

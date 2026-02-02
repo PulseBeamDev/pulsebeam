@@ -60,7 +60,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
     }
 
     fn meta(&self) -> entity::ParticipantId {
-        self.core.participant_id.clone()
+        self.core.participant_id
     }
 
     fn get_observable_state(&self) {}
@@ -192,19 +192,11 @@ impl ParticipantActor {
         tcp_egress: UnifiedSocketWriter,
         participant_id: entity::ParticipantId,
         rtc: Rtc,
-        track_mappings: Vec<TrackMapping>,
         manual_sub: bool,
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
-        let core = ParticipantCore::new(
-            manual_sub,
-            track_mappings,
-            participant_id,
-            rtc,
-            udp_batcher,
-            tcp_batcher,
-        );
+        let core = ParticipantCore::new(manual_sub, participant_id, rtc, udp_batcher, tcp_batcher);
         Self {
             gateway: gateway_handle,
             core,

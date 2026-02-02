@@ -120,7 +120,7 @@ impl VideoAllocator {
             "video track added"
         );
         self.tracks.insert(
-            track.meta.id.clone(),
+            track.meta.id,
             TrackState {
                 track,
                 assigned_mid: None,
@@ -580,7 +580,7 @@ impl Slot {
         self.keyframe_retries = 0;
 
         let old_state_str = old_state.to_string();
-        let track_id = receiver.meta.id.to_string();
+        let track_id = receiver.meta.id.as_str();
         let rid = receiver.rid;
 
         let new_state = match old_state {

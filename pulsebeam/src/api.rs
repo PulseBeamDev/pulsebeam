@@ -18,7 +18,7 @@ use str0m::{change::SdpOffer, error::SdpError};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::{controller, entity::TrackId};
+use crate::controller::{self, CreateParticipantReply};
 use crate::{
     controller::ParticipantState,
     entity::{ParticipantId, RoomId},
@@ -124,13 +124,6 @@ fn build_location(
 
     // TODO: Can these keys be strongly typed?
     let mut params = BTreeMap::new();
-    if let Some(vid) = &state.video_track_id {
-        params.insert("vid".to_string(), vid.to_string());
-    }
-    if let Some(aid) = &state.audio_track_id {
-        params.insert("aid".to_string(), aid.to_string());
-    }
-
     if state.manual_sub {
         params.insert("manual_sub".to_string(), "true".to_string());
     }
@@ -194,21 +187,21 @@ async fn create_participant(
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    con.try_send((
-        controller::CreateParticipant {
-            manual_sub: query.manual_sub,
-            room_id: room_id.clone(),
-            participant_id: participant_id.clone(),
-            offer,
-        },
-        reply_tx,
-    ))
-    .map_err(|e| match e {
+    let state = ParticipantState {
+        manual_sub: query.manual_sub,
+        room_id: room_id.clone(),
+        participant_id,
+    };
+    let msg = controller::CreateParticipant {
+        state: state.clone(),
+        offer,
+    };
+    con.try_send((msg, reply_tx)).map_err(|e| match e {
         TrySendError::Full(_) => ApiError::RateLimited,
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
     })?;
 
-    let reply = reply_rx
+    let reply: CreateParticipantReply = reply_rx
         .await
         .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
@@ -217,11 +210,11 @@ async fn create_participant(
         &room_id.external(),
         &participant_id
     );
-    let location_url = build_location(&headers, &cfg, &path, &reply.state)?;
+    let location_url = build_location(&headers, &cfg, &path, &state)?;
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
-        participant_id: participant_id.to_string(),
+        participant_id: participant_id.as_str(),
     };
 
     Ok((
@@ -269,8 +262,6 @@ async fn delete_participant(
 pub struct PatchParticipantQuery {
     #[serde(default)]
     pub manual_sub: bool,
-    pub vid: Option<TrackId>,
-    pub aid: Option<TrackId>,
 }
 
 /// Reconnect a participant to a room
@@ -319,14 +310,12 @@ async fn patch_participant(
     let state = ParticipantState {
         manual_sub: query.manual_sub,
         room_id,
-        participant_id: participant_id.clone(),
-        video_track_id: query.vid,
-        audio_track_id: query.aid,
+        participant_id,
     };
     let location_url = build_location(&headers, &cfg, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
-        participant_id: participant_id.to_string(),
+        participant_id: participant_id.as_str(),
     };
     let msg = controller::PatchParticipant { offer, state };
     con.try_send((msg, reply_tx)).map_err(|e| match e {

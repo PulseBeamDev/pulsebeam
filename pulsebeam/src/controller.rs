@@ -1,9 +1,9 @@
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use crate::{
-    entity::{self, ParticipantId, RoomId, TrackId},
+    entity::{ParticipantId, RoomId},
     node,
-    participant::{ParticipantActor, TrackMapping},
+    participant::ParticipantActor,
     room,
 };
 use pulsebeam_runtime::{
@@ -71,15 +71,11 @@ impl std::fmt::Display for MediaType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParticipantState {
     pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
-    /// Video track ID
-    pub video_track_id: Option<TrackId>,
-    /// Audio track ID
-    pub audio_track_id: Option<TrackId>,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -97,16 +93,13 @@ pub enum ControllerMessage {
 
 #[derive(Debug)]
 pub struct CreateParticipant {
-    pub manual_sub: bool,
-    pub room_id: RoomId,
-    pub participant_id: ParticipantId,
+    pub state: ParticipantState,
     pub offer: SdpOffer,
 }
 
 #[derive(Debug)]
 pub struct CreateParticipantReply {
     pub answer: SdpAnswer,
-    pub state: ParticipantState,
 }
 
 #[derive(Debug)]
@@ -117,8 +110,8 @@ pub struct DeleteParticipant {
 
 #[derive(Debug)]
 pub struct PatchParticipant {
-    pub offer: SdpOffer,
     pub state: ParticipantState,
+    pub offer: SdpOffer,
 }
 
 #[derive(Debug)]
@@ -230,49 +223,8 @@ impl ControllerActor {
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: CreateParticipant,
     ) -> Result<CreateParticipantReply, ControllerError> {
-        let udp_egress = self.node_ctx.allocate_udp_egress();
-        let tcp_egress = self.node_ctx.allocate_tcp_egress();
-        let sockets = [&udp_egress, &tcp_egress];
-
-        let (rtc, answer) = self.create_answer(m.offer, &sockets)?;
-        let track_mappings = Self::create_track_mappings(&answer);
-        let mut room_handle = self.get_or_create_room(&m.room_id);
-        let gateway = self.node_ctx.gateway.clone();
-        let state = ParticipantState {
-            manual_sub: m.manual_sub,
-            room_id: m.room_id.clone(),
-            participant_id: m.participant_id.clone(),
-            audio_track_id: track_mappings
-                .iter()
-                .filter(|m| m.kind.is_audio())
-                .map(|m| m.track_id.clone())
-                .next(),
-            video_track_id: track_mappings
-                .iter()
-                .filter(|m| m.kind.is_video())
-                .map(|m| m.track_id.clone())
-                .next(),
-        };
-        let participant = ParticipantActor::new(
-            gateway,
-            room_handle.clone(),
-            udp_egress,
-            tcp_egress,
-            m.participant_id,
-            rtc,
-            track_mappings,
-            m.manual_sub,
-        );
-
-        // TODO: probably retry? Or, let the client to retry instead?
-        // Each room will always have a graceful timeout before closing.
-        // But, a data race can still occur nonetheless
-        room_handle
-            .send(room::RoomMessage::AddParticipant(participant))
-            .await
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
-
-        Ok(CreateParticipantReply { answer, state })
+        let answer = self.create_participant(m.offer, m.state, false).await?;
+        Ok(CreateParticipantReply { answer })
     }
 
     pub async fn handle_patch_participant(
@@ -280,69 +232,40 @@ impl ControllerActor {
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: PatchParticipant,
     ) -> Result<PatchParticipantReply, ControllerError> {
+        let answer = self.create_participant(m.offer, m.state, true).await?;
+        Ok(PatchParticipantReply { answer })
+    }
+
+    async fn create_participant(
+        &mut self,
+        offer: SdpOffer,
+        s: ParticipantState,
+        reconnect: bool,
+    ) -> Result<SdpAnswer, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
         let sockets = [&udp_egress, &tcp_egress];
-        let PatchParticipant { offer, mut state } = m;
 
         let (rtc, answer) = self.create_answer(offer, &sockets)?;
-        let mut track_mappings = Vec::new();
-        for media in &answer.media_lines {
-            if !media.typ.is_media() {
-                continue;
-            }
-
-            if media.direction() != Direction::RecvOnly {
-                continue;
-            }
-
-            let typ: MediaType = media.typ.to_string().as_str().into();
-
-            match typ {
-                MediaType::Video => {
-                    if let Some(track_id) = state.video_track_id.take() {
-                        track_mappings.push(TrackMapping {
-                            mid: media.mid(),
-                            track_id,
-                            kind: MediaKind::Video,
-                        });
-                    }
-                }
-                MediaType::Audio => {
-                    if let Some(track_id) = state.audio_track_id.take() {
-                        track_mappings.push(TrackMapping {
-                            mid: media.mid(),
-                            track_id,
-                            kind: MediaKind::Audio,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut room_handle = self.get_or_create_room(&state.room_id);
+        let mut room_handle = self.get_or_create_room(&s.room_id);
         let gateway = self.node_ctx.gateway.clone();
         let participant = ParticipantActor::new(
             gateway,
             room_handle.clone(),
             udp_egress,
             tcp_egress,
-            state.participant_id,
+            s.participant_id,
             rtc,
-            track_mappings,
-            state.manual_sub,
+            s.manual_sub,
         );
-
         // TODO: probably retry? Or, let the client to retry instead?
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .send(room::RoomMessage::ReplaceParticipant(participant))
+            .send(room::RoomMessage::AddParticipant(participant, reconnect))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
-
-        Ok(PatchParticipantReply { answer })
+        Ok(answer)
     }
 
     fn create_answer(
@@ -451,28 +374,6 @@ impl ControllerActor {
 
             room_handle
         }
-    }
-
-    fn create_track_mappings(answer: &SdpAnswer) -> Vec<TrackMapping> {
-        let mut mappings = Vec::new();
-        for m in &answer.media_lines {
-            if !m.typ.is_media() {
-                continue;
-            }
-
-            if m.direction() != Direction::RecvOnly {
-                continue;
-            }
-
-            let typ: MediaType = m.typ.to_string().as_str().into();
-            let kind: MediaKind = typ.into();
-            mappings.push(TrackMapping {
-                mid: m.mid(),
-                track_id: entity::TrackId::new(),
-                kind,
-            });
-        }
-        mappings
     }
 
     fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), OfferRejectedReason> {

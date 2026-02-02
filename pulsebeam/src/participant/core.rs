@@ -47,7 +47,6 @@ pub enum CoreEvent {
 }
 
 pub struct ParticipantCore {
-    track_mappings: Vec<TrackMapping>,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
@@ -62,7 +61,6 @@ pub struct ParticipantCore {
 impl ParticipantCore {
     pub fn new(
         manual_sub: bool,
-        track_mappings: Vec<TrackMapping>,
         participant_id: entity::ParticipantId,
         mut rtc: Rtc,
         udp_batcher: Batcher,
@@ -76,7 +74,6 @@ impl ParticipantCore {
             protocol: "v1".to_string(),
         });
         Self {
-            track_mappings,
             participant_id,
             rtc,
             udp_batcher,
@@ -293,25 +290,10 @@ impl ParticipantCore {
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id = if let Some(track_id) = self
-                    .track_mappings
-                    .iter()
-                    .find(|m| m.mid == media.mid)
-                    .map(|m| m.track_id.clone())
-                {
-                    track_id
-                } else {
-                    // This is being paranoid, it shouldn't happen since the higher level should
-                    // guarantee this.
-                    tracing::warn!(
-                        "track_id mapping is not found for {}, generating one.",
-                        media.mid
-                    );
-                    entity::TrackId::new()
-                };
+                let track_id = self.participant_id.derive_track_id(&media.mid);
                 let track_meta = Arc::new(track::TrackMeta {
                     id: track_id,
-                    origin_participant: self.participant_id.clone(),
+                    origin_participant: self.participant_id,
                     kind: media.kind,
                     simulcast_rids: media
                         .simulcast
