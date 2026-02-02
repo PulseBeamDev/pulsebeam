@@ -76,7 +76,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let _ = self
             .gateway
             .send(gateway::GatewayControlMessage::AddParticipant(
-                self.meta(),
                 ufrag.clone(),
                 gateway_tx,
             ))
@@ -180,6 +179,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         } else {
             tracing::info!(participant_id = %self.meta(), "Shutting down actor.");
         }
+        let _ = self
+            .gateway
+            .send(gateway::GatewayControlMessage::RemoveParticipant(ufrag))
+            .await;
         Ok(())
     }
 }

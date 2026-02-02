@@ -7,8 +7,7 @@ use pulsebeam_runtime::{
 use tokio::task::JoinSet;
 
 use crate::{
-    entity::{ParticipantId, RoomId, TrackId},
-    gateway, node,
+    entity::{ParticipantId, RoomId, TrackId}, node,
     participant::{self, ParticipantActor},
     track::{self},
 };
@@ -168,13 +167,6 @@ impl RoomActor {
             self.state.tracks.remove(track_id);
         }
 
-        self.node_ctx
-            .gateway
-            .send(gateway::GatewayControlMessage::RemoveParticipant(
-                participant_id,
-            ))
-            .await;
-
         // mark this tracks to be shared and immutable
         let tracks = Arc::new(participant.tracks);
         let msg = participant::ParticipantControlMessage::TracksUnpublished(tracks);
@@ -202,9 +194,7 @@ impl RoomActor {
         );
 
         origin.tracks.insert(track_id, track_handle.clone());
-        self.state
-            .tracks
-            .insert(track_id, track_handle.clone());
+        self.state.tracks.insert(track_id, track_handle.clone());
 
         let mut new_tracks = HashMap::new();
         new_tracks.insert(track_id, track_handle.clone());

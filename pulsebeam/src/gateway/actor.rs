@@ -1,4 +1,4 @@
-use crate::{entity::ParticipantId, gateway::demux::Demuxer};
+use crate::gateway::demux::Demuxer;
 use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, mailbox, net};
@@ -7,8 +7,8 @@ use tokio::task::JoinSet;
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(ParticipantId, String, mailbox::Sender<net::RecvPacketBatch>),
-    RemoveParticipant(ParticipantId),
+    AddParticipant(String, mailbox::Sender<net::RecvPacketBatch>),
+    RemoveParticipant(String),
 }
 
 pub struct GatewayMessageSet;
@@ -131,12 +131,11 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         msg: <GatewayMessageSet as actor::MessageSet>::Msg,
     ) -> () {
         match msg {
-            GatewayControlMessage::AddParticipant(participant_id, ufrag, handle) => {
-                self.demuxer
-                    .register_ice_ufrag(participant_id, ufrag.as_bytes(), handle);
+            GatewayControlMessage::AddParticipant(ufrag, handle) => {
+                self.demuxer.register_ice_ufrag(ufrag.as_bytes(), handle);
             }
-            GatewayControlMessage::RemoveParticipant(participant_id) => {
-                self.demuxer.unregister(&mut self.socket, &participant_id);
+            GatewayControlMessage::RemoveParticipant(ufrag) => {
+                self.demuxer.unregister(&mut self.socket, ufrag.as_bytes());
             }
         };
     }
@@ -172,7 +171,9 @@ impl GatewayWorkerActor {
                         };
 
                         let src = batch.src;
-                        if !self.demuxer.demux(batch).await {
+                        if !self.demuxer.demux(&mut self.socket, batch).await {
+                            // In case there's a malicious actor, close immediately as there's no
+                            // associated participant.
                             self.socket.close_peer(&src);
                         }
 

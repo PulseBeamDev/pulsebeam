@@ -1,8 +1,6 @@
-use pulsebeam_runtime::mailbox::SendError;
 use pulsebeam_runtime::net::UnifiedSocketReader;
 use pulsebeam_runtime::{mailbox, net};
 
-use crate::entity::ParticipantId;
 use crate::gateway::ice;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,10 +22,10 @@ pub struct Demuxer {
     ufrag_map: HashMap<Box<[u8]>, ParticipantHandle>,
     /// A fast-path cache mapping a remote `SocketAddr` to a known participant.
     addr_map: HashMap<SocketAddr, ParticipantHandle>,
-    /// A reverse map from a participant to their ufrag, for cleanup.
-    participant_ufrag: HashMap<ParticipantId, Box<[u8]>>,
     /// A reverse map from a ufrag to all known addresses, for efficient cleanup.
     ufrag_addrs: HashMap<Box<[u8]>, Vec<SocketAddr>>,
+    /// A reverse map from a socket addr to ufrag, for cleanup.
+    addr_to_ufrag: HashMap<SocketAddr, Box<[u8]>>,
 }
 
 impl Demuxer {
@@ -35,70 +33,66 @@ impl Demuxer {
         Self {
             ufrag_map: HashMap::new(),
             addr_map: HashMap::new(),
-            participant_ufrag: HashMap::new(),
             ufrag_addrs: HashMap::new(),
+            addr_to_ufrag: HashMap::new(),
         }
     }
 
     /// Registers a participant with their ICE username fragment.
-    pub fn register_ice_ufrag(
-        &mut self,
-        participant_id: ParticipantId,
-        ufrag: &[u8],
-        participant_handle: ParticipantHandle,
-    ) {
+    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_handle: ParticipantHandle) {
         let boxed_ufrag = ufrag.to_vec().into_boxed_slice();
-        self.participant_ufrag
-            .insert(participant_id, boxed_ufrag.clone());
         self.ufrag_map.insert(boxed_ufrag, participant_handle);
     }
 
     /// Removes a participant and all associated state (ufrag and address mappings).
-    pub fn unregister(&mut self, socket: &mut UnifiedSocketReader, participant_id: &ParticipantId) {
-        if let Some(ufrag) = self.participant_ufrag.remove(participant_id) {
-            self.ufrag_map.remove(&ufrag);
-            // Use the ufrag_addrs map to efficiently clean the addr_map
-            if let Some(addrs) = self.ufrag_addrs.remove(&ufrag) {
-                for addr in addrs {
-                    self.addr_map.remove(&addr);
-                    socket.close_peer(&addr);
-                }
+    pub fn unregister(&mut self, socket: &mut UnifiedSocketReader, ufrag: &[u8]) {
+        self.ufrag_map.remove(ufrag);
+        if let Some(addrs) = self.ufrag_addrs.remove(ufrag) {
+            for addr in addrs {
+                self.addr_map.remove(&addr);
+                socket.close_peer(&addr);
             }
         }
     }
 
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped
-    pub async fn demux(&mut self, batch: net::RecvPacketBatch) -> bool {
-        let participant_handle = if let Some(handle) = self.addr_map.get_mut(&batch.src) {
-            handle
-        } else if let Some(ufrag) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
-            if let Some(handle) = self.ufrag_map.get_mut(ufrag) {
-                tracing::debug!("New connection from ufrag: {:?} -> {}", ufrag, batch.src);
+    pub async fn demux(
+        &mut self,
+        socket: &mut UnifiedSocketReader,
+        batch: net::RecvPacketBatch,
+    ) -> bool {
+        let src = batch.src;
 
-                self.addr_map.insert(batch.src, handle.clone());
-                let key = ufrag.to_vec().into_boxed_slice();
-                self.ufrag_addrs.entry(key).or_default().push(batch.src);
+        let handle = if let Some(h) = self.addr_map.get_mut(&src) {
+            h
+        } else if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
+            if let Some(h) = self.ufrag_map.get_mut(ufrag_raw) {
+                let boxed_ufrag = ufrag_raw.to_vec().into_boxed_slice();
 
-                handle
+                // Link address to handle and ufrag
+                self.addr_map.insert(src, h.clone());
+                self.addr_to_ufrag.insert(src, boxed_ufrag.clone());
+                self.ufrag_addrs.entry(boxed_ufrag).or_default().push(src);
+
+                h
             } else {
-                // Packet from unknown ufrag
-                tracing::trace!("Dropped: unregistered stun binding from {}", batch.src);
-                metrics::counter!("gateway_demux_dropped", "reason" => "unknown_ufrag")
-                    .increment(1);
                 return false;
             }
         } else {
-            // Packet from unknown source without ufrag cache
-            tracing::trace!("Dropped: unknown source {}", batch.src);
-            metrics::counter!("gateway_demux_dropped", "reason" => "unknown_source").increment(1);
             return false;
         };
 
-        match participant_handle.send(batch).await {
-            Ok(_) => true,
-            Err(SendError(_)) => false,
+        if let Err(_) = handle.send(batch).await {
+            // Handle is closed! Clean up everything related to this participant.
+            if let Some(ufrag) = self.addr_to_ufrag.get(&src).cloned() {
+                tracing::info!("Participant handle closed, cleaning up ufrag: {:?}", ufrag);
+                self.unregister(socket, &ufrag);
+            }
+            return false;
         }
+
+        true
     }
 }
 
