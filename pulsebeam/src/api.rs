@@ -109,7 +109,7 @@ fn build_location(
     headers: &HeaderMap,
     cfg: &ApiConfig,
     path: &str,
-    state: ParticipantState,
+    state: &ParticipantState,
 ) -> Result<String, ApiError> {
     let scheme = headers
         .get("x-forwarded-proto")
@@ -124,10 +124,10 @@ fn build_location(
 
     // TODO: Can these keys be strongly typed?
     let mut params = BTreeMap::new();
-    if let Some(vid) = state.video_track_id {
+    if let Some(vid) = &state.video_track_id {
         params.insert("vid".to_string(), vid.to_string());
     }
-    if let Some(aid) = state.audio_track_id {
+    if let Some(aid) = &state.audio_track_id {
         params.insert("aid".to_string(), aid.to_string());
     }
 
@@ -217,7 +217,7 @@ async fn create_participant(
         &room_id.external(),
         &participant_id
     );
-    let location_url = build_location(&headers, &cfg, &path, reply.state)?;
+    let location_url = build_location(&headers, &cfg, &path, &reply.state)?;
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
@@ -301,24 +301,34 @@ pub struct PatchParticipantQuery {
 async fn patch_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     Query(query): Query<PatchParticipantQuery>,
-    State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+    State((mut con, cfg)): State<(controller::ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
+    headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-    let msg = controller::PatchParticipant {
-        state: ParticipantState {
-            manual_sub: query.manual_sub,
-            room_id,
-            participant_id,
-            video_track_id: query.vid,
-            audio_track_id: query.aid,
-        },
-        offer,
+    // TODO: merge this logic with POST
+    let path = format!(
+        "/rooms/{}/participants/{}",
+        &room_id.external(),
+        &participant_id
+    );
+    let state = ParticipantState {
+        manual_sub: query.manual_sub,
+        room_id,
+        participant_id: participant_id.clone(),
+        video_track_id: query.vid,
+        audio_track_id: query.aid,
     };
+    let location_url = build_location(&headers, &cfg, &path, &state)?;
+    let response_headers = ParticipantResponseHeaders {
+        location: location_url,
+        participant_id: participant_id.to_string(),
+    };
+    let msg = controller::PatchParticipant { offer, state };
     con.try_send((msg, reply_tx)).map_err(|e| match e {
         TrySendError::Full(_) => ApiError::RateLimited,
         TrySendError::Closed(_) => ApiError::ServiceUnavailable,
@@ -328,7 +338,11 @@ async fn patch_participant(
         .await
         .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
-    Ok((StatusCode::OK, reply.answer.to_sdp_string()))
+    Ok((
+        StatusCode::OK,
+        response_headers.to_header_map(),
+        reply.answer.to_sdp_string(),
+    ))
 }
 
 /// Build OpenAPI spec with dynamic server configuration
