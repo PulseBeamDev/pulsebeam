@@ -3,6 +3,7 @@ use sha3::{Digest, Sha3_256};
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::{fmt, str::FromStr};
+use str0m::media::MediaKind;
 use uuid::Uuid;
 
 pub type EntityId = String;
@@ -15,7 +16,8 @@ pub mod prefix {
     pub const ROOM_ID: &str = "rm";
     pub const PARTICIPANT_ID: &str = "pa";
     pub const USER_ID: &str = "u";
-    pub const TRACK_ID: &str = "tr";
+    pub const AUDIO_TRACK_ID: &str = "aud";
+    pub const VIDEO_TRACK_ID: &str = "vid";
 }
 
 const HASH_OUTPUT_BYTES: usize = 16;
@@ -207,9 +209,9 @@ impl ParticipantId {
     }
 
     /// Derives a TrackId using UUIDv5 (Namespace: Self, Name: label)
-    pub fn derive_track_id(&self, label: &str) -> TrackId {
+    pub fn derive_track_id(&self, kind: MediaKind, label: &str) -> TrackId {
         let uuid = Uuid::new_v5(&self.uuid, label.as_bytes());
-        TrackId { uuid }
+        TrackId { kind, uuid }
     }
 }
 
@@ -267,22 +269,43 @@ impl fmt::Debug for ParticipantId {
     }
 }
 
-#[derive(Clone, Copy, PartialOrd, Ord, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TrackId {
     uuid: Uuid,
+    kind: MediaKind,
 }
 
 impl TrackId {
     pub fn as_str(&self) -> String {
-        encode_with_prefix(prefix::TRACK_ID, self.uuid.as_bytes())
+        let prefix_str = match self.kind {
+            MediaKind::Audio => prefix::AUDIO_TRACK_ID,
+            MediaKind::Video => prefix::VIDEO_TRACK_ID,
+        };
+
+        encode_with_prefix(prefix_str, self.uuid.as_bytes())
     }
 }
 
 impl TryFrom<String> for TrackId {
     type Error = IdValidationError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        let uuid = decode_with_prefix(&value, prefix::TRACK_ID)?;
-        Ok(Self { uuid })
+        let Some((prefix_str, _)) = value.split_once('_') else {
+            return Err(IdValidationError::InvalidEncoding);
+        };
+
+        let (kind, expected_prefix) = match prefix_str {
+            p if p == prefix::AUDIO_TRACK_ID => (MediaKind::Audio, prefix::AUDIO_TRACK_ID),
+            p if p == prefix::VIDEO_TRACK_ID => (MediaKind::Video, prefix::VIDEO_TRACK_ID),
+            _ => {
+                return Err(IdValidationError::InvalidPrefix {
+                    expected: format!("{} or {}", prefix::AUDIO_TRACK_ID, prefix::VIDEO_TRACK_ID),
+                    got: prefix_str.to_string(),
+                });
+            }
+        };
+
+        let uuid = decode_with_prefix(&value, expected_prefix)?;
+        Ok(Self { uuid, kind })
     }
 }
 
@@ -461,11 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn track_id_empty_encoded_part() {
-        assert!(TrackId::from_str("tr_").is_err());
-    }
-
-    #[test]
     fn room_id_deterministic_hashing() {
         let external = ExternalRoomId::new("test-room".to_string()).unwrap();
         let room1 = RoomId::from_external(external.clone());
@@ -495,8 +513,8 @@ mod tests {
     #[test]
     fn track_id_derivation_determinism() {
         let p = ParticipantId::new();
-        let t1 = p.derive_track_id("cam");
-        let t2 = p.derive_track_id("cam");
+        let t1 = p.derive_track_id(MediaKind::Video, "cam");
+        let t2 = p.derive_track_id(MediaKind::Video, "cam");
         assert_eq!(t1, t2);
         assert_eq!(t1.as_str(), t2.as_str());
     }
@@ -504,8 +522,8 @@ mod tests {
     #[test]
     fn track_id_derivation_uniqueness() {
         let p = ParticipantId::new();
-        let t1 = p.derive_track_id("cam");
-        let t2 = p.derive_track_id("mic");
+        let t1 = p.derive_track_id(MediaKind::Video, "cam");
+        let t2 = p.derive_track_id(MediaKind::Audio, "mic");
         assert_ne!(t1, t2);
     }
 
@@ -520,7 +538,7 @@ mod tests {
     #[test]
     fn track_id_serde_roundtrip() {
         let p = ParticipantId::new();
-        let id = p.derive_track_id("cam");
+        let id = p.derive_track_id(MediaKind::Video, "cam");
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized: TrackId = serde_json::from_str(&serialized).unwrap();
         assert_eq!(id, deserialized);
@@ -570,7 +588,7 @@ mod tests {
     fn track_id_as_hashmap_key() {
         let mut map: HashMap<TrackId, String> = HashMap::new();
         let p = ParticipantId::new();
-        let id = p.derive_track_id("cam");
+        let id = p.derive_track_id(MediaKind::Video, "cam");
         map.insert(id, "value".to_string());
         assert_eq!(map.get(&id), Some(&"value".to_string()));
     }
@@ -599,7 +617,7 @@ mod tests {
     #[test]
     fn track_id_copy_semantics() {
         let p = ParticipantId::new();
-        let id1 = p.derive_track_id("cam");
+        let id1 = p.derive_track_id(MediaKind::Video, "cam");
         let id2 = id1; // Copy
         assert_eq!(id1, id2);
     }
@@ -643,7 +661,7 @@ mod tests {
     fn display_format() {
         assert!(format!("{}", ParticipantId::new()).starts_with("pa_"));
         let p = ParticipantId::new();
-        assert!(format!("{}", p.derive_track_id("c")).starts_with("tr_"));
+        assert!(format!("{}", p.derive_track_id(MediaKind::Video, "c")).starts_with("vid_"));
         let ext = ExternalRoomId::new("test".to_string()).unwrap();
         assert!(format!("{}", RoomId::from_external(ext)).starts_with("rm_"));
     }
@@ -652,7 +670,7 @@ mod tests {
     fn debug_format() {
         assert!(format!("{:?}", ParticipantId::new()).contains("ParticipantId"));
         let p = ParticipantId::new();
-        assert!(format!("{:?}", p.derive_track_id("c")).contains("TrackId"));
+        assert!(format!("{:?}", p.derive_track_id(MediaKind::Video, "c")).contains("TrackId"));
     }
 
     #[test]
@@ -660,8 +678,8 @@ mod tests {
         let participant_id = ParticipantId::new();
         assert!(participant_id.as_str().starts_with("pa_"));
         assert_eq!(participant_id.as_str(), participant_id.as_str());
-        let track_id = participant_id.derive_track_id("cam");
-        assert!(track_id.as_str().starts_with("tr_"));
+        let track_id = participant_id.derive_track_id(MediaKind::Video, "cam");
+        assert!(track_id.as_str().starts_with("vid_"));
         assert_eq!(track_id.as_str(), track_id.as_str());
     }
 
@@ -677,7 +695,7 @@ mod tests {
     #[test]
     fn storing_in_multiple_collections() {
         let participant_id = ParticipantId::new();
-        let track_id = participant_id.derive_track_id("cam");
+        let track_id = participant_id.derive_track_id(MediaKind::Video, "cam");
         let mut participant_map: HashMap<ParticipantId, Vec<TrackId>> = HashMap::new();
         let mut track_map: HashMap<TrackId, ParticipantId> = HashMap::new();
         participant_map.insert(participant_id, vec![track_id]);
@@ -712,7 +730,7 @@ mod tests {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }
         let p = ParticipantId::new();
-        for c in p.derive_track_id("c").as_str().chars() {
+        for c in p.derive_track_id(MediaKind::Video, "c").as_str().chars() {
             assert!(c.is_ascii_alphanumeric() || c == '_');
         }
     }

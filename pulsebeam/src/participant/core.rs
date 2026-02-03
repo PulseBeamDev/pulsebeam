@@ -304,7 +304,7 @@ impl ParticipantCore {
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id = self.participant_id.derive_track_id(&media.mid);
+                let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
                 let track_meta = Arc::new(track::TrackMeta {
                     id: track_id,
                     origin_participant: self.participant_id,
