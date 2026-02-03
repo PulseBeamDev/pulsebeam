@@ -38,7 +38,7 @@ pub enum IdValidationError {
 }
 
 fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
-    let encoded = bs58::encode(bytes).into_string();
+    let encoded = base32::encode(base32::Alphabet::Crockford, bytes);
     format!("{}_{}", prefix, encoded)
 }
 
@@ -58,14 +58,8 @@ fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdVali
     if encoded.is_empty() {
         return Err(IdValidationError::InvalidEncoding);
     }
-    let bytes = bs58::decode(encoded)
-        .into_vec()
-        .map_err(|_| IdValidationError::InvalidEncoding)?;
-
-    if bytes.len() != 16 {
-        return Err(IdValidationError::InvalidEncoding);
-    }
-
+    let bytes = base32::decode(base32::Alphabet::Crockford, encoded)
+        .ok_or(IdValidationError::InvalidEncoding)?;
     Uuid::from_slice(&bytes).map_err(|_| IdValidationError::InvalidEncoding)
 }
 
