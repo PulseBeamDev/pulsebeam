@@ -150,7 +150,6 @@ impl VideoAllocator {
     }
 
     pub fn add_slot(&mut self, mid: Mid) {
-        tracing::info!(%mid, "video slot added");
         self.slots.push(Slot::new(mid));
         self.rebalance();
 

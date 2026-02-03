@@ -127,6 +127,7 @@ fn build_location(
     if state.manual_sub {
         params.insert("manual_sub".to_string(), "true".to_string());
     }
+    params.insert("version".to_string(), state.version.to_string());
 
     // url::form_urlencoded uses the BTreeMap iterator, maintaining alphabetical order
     let query_string = url::form_urlencoded::Serializer::new(String::new())
@@ -191,6 +192,7 @@ async fn create_participant(
         manual_sub: query.manual_sub,
         room_id: room_id.clone(),
         participant_id,
+        version: 0,
     };
     let msg = controller::CreateParticipant {
         state: state.clone(),
@@ -262,6 +264,8 @@ async fn delete_participant(
 pub struct PatchParticipantQuery {
     #[serde(default)]
     pub manual_sub: bool,
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Reconnect a participant to a room
@@ -311,6 +315,7 @@ async fn patch_participant(
         manual_sub: query.manual_sub,
         room_id,
         participant_id,
+        version: query.version + 1,
     };
     let location_url = build_location(&headers, &cfg, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},
@@ -7,7 +11,8 @@ use pulsebeam_runtime::{
 use tokio::task::JoinSet;
 
 use crate::{
-    entity::{ParticipantId, RoomId, TrackId}, node,
+    entity::{ParticipantId, RoomId, TrackId},
+    node,
     participant::{self, ParticipantActor},
     track::{self},
 };
@@ -15,16 +20,24 @@ use pulsebeam_runtime::actor;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(derive_more::From)]
 pub enum RoomMessage {
     PublishTrack(track::TrackReceiver),
-    AddParticipant(ParticipantActor, bool),
+    AddParticipant(AddParticipant),
     RemoveParticipant(ParticipantId),
+}
+
+pub struct AddParticipant {
+    pub participant: ParticipantActor,
+    pub reconnect: bool,
+    pub version: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
     tracks: HashMap<TrackId, track::TrackReceiver>,
+    version: u64,
 }
 
 pub struct RoomMessageSet;
@@ -47,12 +60,12 @@ pub struct RoomActor {
     room_id: RoomId,
     state: RoomState,
 
-    participant_tasks: JoinSet<(ParticipantId, ActorStatus)>,
+    participant_tasks: JoinSet<(ParticipantId, u64, ActorStatus)>,
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
-    participants: HashMap<ParticipantId, ParticipantMeta>,
+    participants: BTreeMap<(ParticipantId, u64), ParticipantMeta>,
     tracks: HashMap<TrackId, track::TrackReceiver>,
 }
 
@@ -80,8 +93,8 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
             select: {
-                Some(Ok((participant_id, _))) = self.participant_tasks.join_next() => {
-                    self.handle_participant_left(participant_id).await;
+                Some(Ok((participant_id, session_id, _))) = self.participant_tasks.join_next() => {
+                    self.handle_participant_left(participant_id, session_id).await;
                 }
                 _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
                     tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
@@ -99,15 +112,26 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         msg: RoomMessage,
     ) -> () {
         match msg {
-            RoomMessage::AddParticipant(participant, reconnect) => {
-                if reconnect {
-                    self.handle_replace_participant(ctx, participant).await;
+            RoomMessage::AddParticipant(m) => {
+                if m.reconnect {
+                    self.handle_replace_participant(ctx, m.participant, m.version)
+                        .await;
                 } else {
-                    self.handle_participant_joined(ctx, participant).await
+                    self.handle_participant_joined(ctx, m.participant, m.version)
+                        .await
                 }
             }
             RoomMessage::RemoveParticipant(participant_id) => {
-                self.handle_participant_left(participant_id).await;
+                let versions_to_remove: Vec<_> = self
+                    .state
+                    .participants
+                    .range((participant_id, u64::MIN)..=(participant_id, u64::MAX))
+                    .map(|(_, meta)| meta.version)
+                    .collect();
+
+                for version in versions_to_remove {
+                    self.handle_participant_left(participant_id, version).await;
+                }
             }
             RoomMessage::PublishTrack(track_handle) => {
                 self.handle_track_published(track_handle).await;
@@ -130,18 +154,23 @@ impl RoomActor {
         &mut self,
         _ctx: &mut actor::ActorContext<RoomMessageSet>,
         participant_actor: ParticipantActor,
+        version: u64,
     ) {
         let (mut participant_handle, participant_task) =
             actor::prepare(participant_actor, RunnerConfig::default());
         let participant_id = participant_handle.meta;
 
-        self.participant_tasks.spawn(participant_task);
+        self.participant_tasks.spawn(async move {
+            let (id, status) = participant_task.await;
+            (id, version, status)
+        });
 
         self.state.participants.insert(
-            participant_id,
+            (participant_id, version),
             ParticipantMeta {
                 handle: participant_handle.clone(),
                 tracks: HashMap::new(),
+                version,
             },
         );
 
@@ -155,8 +184,18 @@ impl RoomActor {
             .await;
     }
 
-    async fn handle_participant_left(&mut self, participant_id: ParticipantId) {
-        let Some(mut participant) = self.state.participants.remove(&participant_id) else {
+    async fn handle_participant_left(&mut self, participant_id: ParticipantId, version: u64) {
+        if let Some(participant) = self.state.participants.get(&(participant_id, version)) {
+            if participant.version != version {
+                tracing::info!(%participant_id, %version, current_version = %participant.version, "Ignoring stale participant exit");
+                return;
+            }
+        } else {
+            return;
+        }
+
+        let Some(mut participant) = self.state.participants.remove(&(participant_id, version))
+        else {
             return;
         };
 
@@ -174,11 +213,16 @@ impl RoomActor {
     }
 
     async fn handle_track_published(&mut self, track_handle: track::TrackReceiver) {
-        let Some(origin) = self
+        let target_id = track_handle.meta.origin_participant;
+
+        // TODO: handle versioning properly here
+        let latest_entry = self
             .state
             .participants
-            .get_mut(&track_handle.meta.origin_participant)
-        else {
+            .range_mut((target_id, u64::MIN)..=(target_id, u64::MAX))
+            .next_back();
+
+        let Some(((_id, _version), origin)) = latest_entry else {
             tracing::warn!(
                 "{} is missing from participants, ignoring track",
                 track_handle.meta.id
@@ -207,15 +251,18 @@ impl RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
         new_participant: ParticipantActor,
+        version: u64,
     ) {
         let participant_id = new_participant.meta();
 
-        if self.state.participants.contains_key(&participant_id) {
+        if let Some(p) = self.state.participants.get(&(participant_id, version)) {
             tracing::info!(%participant_id, "Replacing existing participant session (takeover)");
-            self.handle_participant_left(participant_id).await;
+            self.handle_participant_left(participant_id, p.version)
+                .await;
         }
 
-        self.handle_participant_joined(ctx, new_participant).await;
+        self.handle_participant_joined(ctx, new_participant, version)
+            .await;
     }
 
     async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {

@@ -76,6 +76,7 @@ pub struct ParticipantState {
     pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+    pub version: u64,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -262,7 +263,11 @@ impl ControllerActor {
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
-            .send(room::RoomMessage::AddParticipant(participant, reconnect))
+            .send(room::RoomMessage::AddParticipant(room::AddParticipant {
+                participant,
+                reconnect,
+                version: s.version,
+            }))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
         Ok(answer)
