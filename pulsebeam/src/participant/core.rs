@@ -21,6 +21,8 @@ use crate::participant::{
 use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
 
+const RESERVED_DATA_CHANNEL_COUNT: u16 = 32;
+
 pub struct TrackMapping {
     pub mid: Mid,
     pub track_id: TrackId,
@@ -66,13 +68,25 @@ impl ParticipantCore {
         udp_batcher: Batcher,
         tcp_batcher: Batcher,
     ) -> Self {
-        let cid = rtc.direct_api().create_data_channel(ChannelConfig {
+        let mut api = rtc.direct_api();
+        let cid = api.create_data_channel(ChannelConfig {
             label: namespace::Signaling::Reliable.as_str().to_string(),
             ordered: true,
             reliability: str0m::channel::Reliability::Reliable,
             negotiated: Some(0),
             protocol: "v1".to_string(),
         });
+        // reserving sctp IDs for future expansion
+        for i in 1..RESERVED_DATA_CHANNEL_COUNT {
+            api.create_data_channel(ChannelConfig {
+                label: "".to_string(),
+                ordered: true,
+                reliability: str0m::channel::Reliability::Reliable,
+                negotiated: Some(i),
+                protocol: "v1".to_string(),
+            });
+        }
+
         Self {
             participant_id,
             rtc,
