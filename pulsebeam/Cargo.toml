@@ -55,6 +55,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.20.0", features = ["v4", "v5"] }
 
 [dev-dependencies]
+hex = "0.4.3"
 more-asserts = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
