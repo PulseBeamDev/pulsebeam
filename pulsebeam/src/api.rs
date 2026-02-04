@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
-    http::{
-        HeaderMap, StatusCode, Uri,
-    },
-    response::IntoResponse,
+    extract::{MatchedPath, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode, Uri},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{patch, post},
 };
 use axum_extra::{TypedHeader, headers::ContentType};
@@ -14,6 +13,7 @@ use hyper::header::{ETAG, IF_MATCH, LOCATION};
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::Serialize;
 use str0m::{change::SdpOffer, error::SdpError};
+use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -411,10 +411,29 @@ pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Route
         .route(
             "/rooms/{external_room_id}/participants/{participant_id}",
             patch(patch_participant).delete(delete_participant),
-        );
+        )
+        .layer(middleware::from_fn(track_route_duration));
 
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi))
         .nest(&cfg.base_path, api)
         .with_state((controller, cfg))
+}
+
+async fn track_route_duration(req: Request<axum::body::Body>, next: Next) -> Response {
+    let start = Instant::now();
+
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "unknown_route".to_string());
+
+    let method = req.method().to_string();
+    let response = next.run(req).await;
+    let duration = start.elapsed().as_secs_f64();
+
+    metrics::histogram!("http_request_duration_seconds", "path" => path, "method" => method)
+        .record(duration);
+    response
 }
