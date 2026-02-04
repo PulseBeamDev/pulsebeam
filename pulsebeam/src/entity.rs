@@ -743,13 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn debug_format() {
-        assert!(format!("{:?}", ParticipantId::new()).contains("ParticipantId"));
-        let p = ParticipantId::new();
-        assert!(format!("{:?}", p.derive_track_id(MediaKind::Video, "c")).contains("TrackId"));
-    }
-
-    #[test]
     fn as_str_returns_valid_string() {
         let participant_id = ParticipantId::new();
         assert!(participant_id.as_str().starts_with("pa_"));

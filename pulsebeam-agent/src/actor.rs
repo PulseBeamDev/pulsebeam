@@ -416,11 +416,15 @@ impl AgentActor {
                  _ = &mut sleep => {
                     if self.rtc.handle_input(Input::Timeout(Instant::now().into())).is_err() {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
-                         return;
                     }
                 }
             }
         }
+
+        let _ = self
+            .api
+            .delete_participant_by_uri(self.resource_uri.clone())
+            .await;
     }
 
     async fn poll_rtc(&mut self) -> Option<Instant> {
@@ -475,9 +479,6 @@ impl AgentActor {
                     }
                 }
                 Ok(Output::Timeout(t)) => {
-                    self.api
-                        .delete_participant_by_uri(self.resource_uri.clone())
-                        .await;
                     return Some(t.into());
                 }
                 Err(e) => {
