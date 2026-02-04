@@ -4,6 +4,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::{fmt, str::FromStr};
 use str0m::media::MediaKind;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub type EntityId = String;
@@ -15,6 +16,7 @@ pub mod prefix {
     pub const PROJECT_ID: &str = "p";
     pub const ROOM_ID: &str = "rm";
     pub const PARTICIPANT_ID: &str = "pa";
+    pub const CONNECTION_ID: &str = "c";
     pub const USER_ID: &str = "u";
     pub const AUDIO_TRACK_ID: &str = "aud";
     pub const VIDEO_TRACK_ID: &str = "vid";
@@ -262,6 +264,84 @@ impl fmt::Display for ParticipantId {
 }
 
 impl fmt::Debug for ParticipantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ParticipantId")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ToSchema)]
+pub struct ConnectionId {
+    uuid: Uuid,
+}
+
+impl ConnectionId {
+    pub const MIN: ConnectionId = ConnectionId {
+        uuid: Uuid::from_u128(0),
+    };
+    pub const MAX: ConnectionId = ConnectionId {
+        uuid: Uuid::from_u128(u128::MAX),
+    };
+
+    pub fn new() -> Self {
+        Self {
+            uuid: Uuid::now_v7(),
+        }
+    }
+
+    pub fn as_str(&self) -> String {
+        encode_with_prefix(prefix::CONNECTION_ID, self.uuid.as_bytes())
+    }
+}
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TryFrom<&str> for ConnectionId {
+    type Error = IdValidationError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let uuid = decode_with_prefix(value, prefix::CONNECTION_ID)?;
+        Ok(Self { uuid })
+    }
+}
+
+impl FromStr for ConnectionId {
+    type Err = IdValidationError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s)
+    }
+}
+
+impl serde::Serialize for ConnectionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ConnectionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::try_from(s.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl fmt::Debug for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ParticipantId")
             .field(&self.as_str())

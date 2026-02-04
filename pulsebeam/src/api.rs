@@ -5,23 +5,25 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         HeaderMap, StatusCode, Uri,
-        header::{HeaderName, HeaderValue},
     },
     response::IntoResponse,
     routing::{patch, post},
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-use hyper::header::LOCATION;
+use hyper::header::{ETAG, IF_MATCH, LOCATION};
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::Serialize;
 use str0m::{change::SdpOffer, error::SdpError};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::controller::{self, CreateParticipantReply};
 use crate::{
     controller::ParticipantState,
-    entity::{ParticipantId, RoomId},
+    entity::{IdValidationError, ParticipantId, RoomId},
+};
+use crate::{
+    controller::{self, CreateParticipantReply},
+    entity::ConnectionId,
 };
 
 pub enum HeaderExt {
@@ -42,19 +44,16 @@ pub struct ParticipantResponseHeaders {
     /// URL of the created participant resource
     #[serde(rename = "Location")]
     pub location: String,
-    /// Internal participant ID
-    #[serde(rename = "pb-participant-id")]
-    pub participant_id: String,
+
+    #[serde(rename = "ETag")]
+    pub etag: ConnectionId,
 }
 
 impl ParticipantResponseHeaders {
     pub fn to_header_map(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(LOCATION, self.location.parse().unwrap());
-        headers.insert(
-            HeaderName::from_static(HeaderExt::ParticipantId.as_str()),
-            HeaderValue::from_str(&self.participant_id).unwrap(),
-        );
+        headers.insert(ETAG, self.etag.as_str().parse().unwrap());
         headers
     }
 }
@@ -69,6 +68,8 @@ pub struct ApiConfig {
 /// Error type for api operations
 #[derive(thiserror::Error, Debug)]
 pub enum ApiError {
+    #[error("invalid entity id format: {0}")]
+    IdValidation(#[from] IdValidationError),
     #[error("sdp offer is invalid: {0}")]
     OfferInvalid(#[from] SdpError),
     #[error("join failed: {0}")]
@@ -88,7 +89,8 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
-            ApiError::OfferInvalid(_)
+            ApiError::IdValidation(_)
+            | ApiError::OfferInvalid(_)
             | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
@@ -127,7 +129,6 @@ fn build_location(
     if state.manual_sub {
         params.insert("manual_sub".to_string(), "true".to_string());
     }
-    params.insert("version".to_string(), state.version.to_string());
 
     // url::form_urlencoded uses the BTreeMap iterator, maintaining alphabetical order
     let query_string = url::form_urlencoded::Serializer::new(String::new())
@@ -192,7 +193,8 @@ async fn create_participant(
         manual_sub: query.manual_sub,
         room_id: room_id.clone(),
         participant_id,
-        version: 0,
+        connection_id: ConnectionId::new(),
+        old_connection_id: None,
     };
     let msg = controller::CreateParticipant {
         state: state.clone(),
@@ -216,7 +218,7 @@ async fn create_participant(
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
-        participant_id: participant_id.as_str(),
+        etag: state.connection_id,
     };
 
     Ok((
@@ -264,8 +266,6 @@ async fn delete_participant(
 pub struct PatchParticipantQuery {
     #[serde(default)]
     pub manual_sub: bool,
-    #[serde(default)]
-    pub version: u64,
 }
 
 /// Reconnect a participant to a room
@@ -303,6 +303,13 @@ async fn patch_participant(
 ) -> Result<impl IntoResponse, ApiError> {
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
+    let old_connection_id: ConnectionId = headers
+        .get(IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"'))
+        .ok_or(ApiError::BadRequest("If-Match header required".into()))?
+        .try_into()?;
+
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
     // TODO: merge this logic with POST
@@ -315,12 +322,13 @@ async fn patch_participant(
         manual_sub: query.manual_sub,
         room_id,
         participant_id,
-        version: query.version + 1,
+        connection_id: ConnectionId::new(),
+        old_connection_id: Some(old_connection_id),
     };
     let location_url = build_location(&headers, &cfg, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
-        participant_id: participant_id.as_str(),
+        etag: state.connection_id,
     };
     let msg = controller::PatchParticipant { offer, state };
     con.try_send((msg, reply_tx)).map_err(|e| match e {

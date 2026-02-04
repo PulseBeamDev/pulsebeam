@@ -37,7 +37,6 @@ pub struct CreateParticipantRequest {
 pub struct CreateParticipantResponse {
     pub answer: SdpAnswer,
     pub resource_uri: Uri,
-    pub participant_id: String,
 }
 
 impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
@@ -50,15 +49,6 @@ impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
                 resp.status()
             )));
         }
-
-        let participant_id = resp
-            .headers()
-            .get(HeaderExt::ParticipantId.as_str())
-            .ok_or_else(|| ApiError::Protocol("Missing PB-Participant-Id header".to_string()))?
-            .to_str()
-            .map_err(|_| ApiError::Protocol("Invalid UTF-8 in Participant-Id header".to_string()))?
-            .to_string();
-
         let resource_uri = resp
             .headers()
             .get(http::header::LOCATION)
@@ -75,7 +65,6 @@ impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
         Ok(CreateParticipantResponse {
             answer,
             resource_uri,
-            participant_id,
         })
     }
 }
@@ -127,11 +116,14 @@ impl HttpApiClient {
             "{}/rooms/{}/participants/{}",
             self.base_uri, req.room_id, req.participant_id
         );
+        self.delete_participant_by_uri(uri.parse()?).await
+    }
+
+    pub async fn delete_participant_by_uri(&self, uri: Uri) -> Result<(), ApiError> {
         let mut req = HttpRequest::new(vec![]);
-        *req.uri_mut() = uri.parse()?;
+        *req.uri_mut() = uri;
         *req.method_mut() = Method::DELETE;
         self.http_client.execute(req).await?;
-
         Ok(())
     }
 }

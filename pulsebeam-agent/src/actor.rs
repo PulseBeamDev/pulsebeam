@@ -1,6 +1,7 @@
-use crate::api::{ApiError, CreateParticipantRequest, DeleteParticipantRequest, HttpApiClient};
+use crate::api::{ApiError, CreateParticipantRequest, HttpApiClient};
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
+use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling::Track;
@@ -245,6 +246,7 @@ impl AgentBuilder {
         let (event_tx, event_rx) = mpsc::channel(100);
 
         let actor = AgentActor {
+            api: self.api,
             addr,
             rtc,
             stats: AgentStats::default(),
@@ -252,6 +254,7 @@ impl AgentBuilder {
             buf: vec![0u8; 2048],
             cmd_rx,
             event_tx,
+            resource_uri: resp.resource_uri,
             senders: StreamMap::new(),
             pending: PendingState::new(),
             slot_manager: SlotManager::new(),
@@ -265,8 +268,6 @@ impl AgentBuilder {
 
         Ok(Agent {
             room_id: room_id.to_string(),
-            participant_id: resp.participant_id,
-            api: self.api,
             cmd_tx,
             event_rx,
         })
@@ -307,8 +308,6 @@ pub enum AgentEvent {
 
 pub struct Agent {
     room_id: String,
-    participant_id: String,
-    api: HttpApiClient,
     cmd_tx: mpsc::Sender<AgentCommand>,
     event_rx: mpsc::Receiver<AgentEvent>,
 }
@@ -331,12 +330,6 @@ impl Agent {
 
     pub async fn disconnect(&mut self) -> Result<(), AgentError> {
         let _ = self.cmd_tx.send(AgentCommand::Disconnect).await;
-        self.api
-            .delete_participant(DeleteParticipantRequest {
-                room_id: self.room_id.clone(),
-                participant_id: self.participant_id.clone(),
-            })
-            .await?;
 
         Ok(())
     }
@@ -355,7 +348,9 @@ struct AgentActor {
     pending: PendingState,
     slot_manager: SlotManager,
 
+    api: HttpApiClient,
     signaling_cid: ChannelId,
+    resource_uri: Uri,
     disconnected_reason: Option<String>,
 }
 
@@ -479,7 +474,12 @@ impl AgentActor {
                         }
                     }
                 }
-                Ok(Output::Timeout(t)) => return Some(t.into()),
+                Ok(Output::Timeout(t)) => {
+                    self.api
+                        .delete_participant_by_uri(self.resource_uri.clone())
+                        .await;
+                    return Some(t.into());
+                }
                 Err(e) => {
                     self.disconnected_reason = Some(format!("RTC Error: {:?}", e));
                     self.rtc.disconnect();

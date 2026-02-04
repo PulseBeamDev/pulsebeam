@@ -200,9 +200,11 @@ impl NodeBuilder {
                     hyper::header::AUTHORIZATION,
                     hyper::header::CONTENT_TYPE,
                     hyper::header::CONTENT_ENCODING,
+                    hyper::header::IF_MATCH,
                 ])
                 .expose_headers([
                     hyper::header::LOCATION,
+                    hyper::header::ETAG,
                     HeaderName::from_static(api::HeaderExt::ParticipantId.as_str()),
                 ])
                 .max_age(Duration::from_secs(86400));

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use crate::{
-    entity::{ParticipantId, RoomId},
+    entity::{ConnectionId, ParticipantId, RoomId},
     node,
     participant::ParticipantActor,
     room,
@@ -76,7 +76,8 @@ pub struct ParticipantState {
     pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
-    pub version: u64,
+    pub connection_id: ConnectionId,
+    pub old_connection_id: Option<ConnectionId>,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -206,7 +207,9 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
                 if let Some(room_handle) = self.rooms.get_mut(&m.room_id) {
                     // if the room has exited, the participants have already cleaned up too.
                     let _ = room_handle
-                        .send(room::RoomMessage::RemoveParticipant(m.participant_id))
+                        .send(room::RemoveParticipant {
+                            participant_id: m.participant_id,
+                        })
                         .await;
                 }
             }
@@ -224,7 +227,7 @@ impl ControllerActor {
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: CreateParticipant,
     ) -> Result<CreateParticipantReply, ControllerError> {
-        let answer = self.create_participant(m.offer, m.state, false).await?;
+        let answer = self.create_participant(m.offer, m.state).await?;
         Ok(CreateParticipantReply { answer })
     }
 
@@ -233,7 +236,7 @@ impl ControllerActor {
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: PatchParticipant,
     ) -> Result<PatchParticipantReply, ControllerError> {
-        let answer = self.create_participant(m.offer, m.state, true).await?;
+        let answer = self.create_participant(m.offer, m.state).await?;
         Ok(PatchParticipantReply { answer })
     }
 
@@ -241,7 +244,6 @@ impl ControllerActor {
         &mut self,
         offer: SdpOffer,
         s: ParticipantState,
-        reconnect: bool,
     ) -> Result<SdpAnswer, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
@@ -265,8 +267,8 @@ impl ControllerActor {
         room_handle
             .send(room::RoomMessage::AddParticipant(room::AddParticipant {
                 participant,
-                reconnect,
-                version: s.version,
+                connection_id: s.connection_id,
+                old_connection_id: s.old_connection_id,
             }))
             .await
             .map_err(|_| ControllerError::ServiceUnavailable)?;
