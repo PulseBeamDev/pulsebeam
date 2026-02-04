@@ -21,7 +21,7 @@ license = "AGPL-3.0"
 
 [workspace.dependencies]
 anyhow = "1"
-bytes = "1.11.0"
+bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"
@@ -35,7 +35,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7.17"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
-turmoil = "0.7.0"
+turmoil = "0.7.1"
 
 [patch.crates-io]
 # dimpl = { git = "https://github.com/PulseBeamDev/dimpl.git", branch = "patch/0.2.1" }
