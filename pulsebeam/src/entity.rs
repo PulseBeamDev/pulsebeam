@@ -265,9 +265,7 @@ impl fmt::Display for ParticipantId {
 
 impl fmt::Debug for ParticipantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ParticipantId")
-            .field(&self.as_str())
-            .finish()
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -343,9 +341,7 @@ impl fmt::Display for ConnectionId {
 
 impl fmt::Debug for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ParticipantId")
-            .field(&self.as_str())
-            .finish()
+        write!(f, "{}", self.as_str())
     }
 }
 

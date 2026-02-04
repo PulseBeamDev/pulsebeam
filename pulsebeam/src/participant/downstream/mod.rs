@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
-pub use video::Intent;
+pub use video::{Intent, SlotAssignment};
 
 pub struct DownstreamAllocator {
     available_bandwidth: BitrateController,

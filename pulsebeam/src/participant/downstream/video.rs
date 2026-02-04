@@ -21,7 +21,6 @@ pub struct SlotAssignment {
 }
 
 pub struct Intent {
-    pub mid: Mid,
     pub track_id: TrackId,
     pub max_height: u32,
 }
@@ -49,10 +48,10 @@ impl VideoAllocator {
         self.slots.len()
     }
 
-    pub fn configure(&mut self, intents: Vec<Intent>) {
+    pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
         let tracks = &mut self.tracks;
         for slot in &mut self.slots {
-            if let Some(intent) = intents.iter().find(|i| i.mid == slot.mid) {
+            if let Some(intent) = intents.get(&slot.mid) {
                 Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id));
             } else {
                 Self::configure_slot(tracks, slot, 0, None);

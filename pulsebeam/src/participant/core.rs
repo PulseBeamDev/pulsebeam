@@ -154,6 +154,9 @@ impl ParticipantCore {
         }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
+        // This is used to self-healing state drifting especially when a participant has just
+        // reconnected. The viewer won't get a notification, so we have to be proactive.
+        self.signaling.reconcile(&mut self.downstream);
         self.update_desired_bitrate();
     }
 

@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use crate::participant::downstream::SlotAssignment;
 use crate::participant::downstream::{DownstreamAllocator, Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
@@ -35,6 +36,7 @@ pub struct Signaling {
     // We store the IDs of the objects sent in the last successful update.
     previous_track_ids: HashSet<String>,
     previous_assignment_mids: HashSet<String>,
+    last_client_intents: Option<HashMap<Mid, Intent>>,
 }
 
 impl Signaling {
@@ -48,6 +50,7 @@ impl Signaling {
             // Initialize empty sets
             previous_track_ids: HashSet::new(),
             previous_assignment_mids: HashSet::new(),
+            last_client_intents: None,
 
             slot_count: 0,
         }
@@ -55,6 +58,13 @@ impl Signaling {
 
     pub fn set_slot_count(&mut self, slot_count: usize) {
         self.slot_count = slot_count;
+    }
+
+    pub fn reconcile(&mut self, downstream: &mut DownstreamAllocator) {
+        if let Some(last_client_intents) = &self.last_client_intents {
+            downstream.video.configure(last_client_intents);
+            self.mark_assignments_dirty();
+        }
     }
 
     pub fn handle_input(
@@ -78,6 +88,7 @@ impl Signaling {
                     tracing::warn!("Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
                 }
+                tracing::info!("received client intent: {:?}", intent);
                 self.apply_client_intent(intent, downstream);
                 self.dirty_assignments = true;
             }
@@ -95,7 +106,7 @@ impl Signaling {
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
     ) {
-        let mut intents = Vec::with_capacity(intent.requests.len());
+        let mut intents = HashMap::with_capacity(intent.requests.len());
         for req in intent.requests {
             if req.mid.len() > 16 {
                 continue;
@@ -110,14 +121,16 @@ impl Signaling {
                 continue;
             }
 
-            intents.push(Intent {
+            intents.insert(
                 mid,
-                track_id,
-                max_height: req.height,
-            });
+                Intent {
+                    track_id,
+                    max_height: req.height,
+                },
+            );
         }
-        downstream.video.configure(intents);
-        self.mark_assignments_dirty();
+        self.last_client_intents = Some(intents);
+        self.reconcile(downstream);
     }
 
     pub fn mark_tracks_dirty(&mut self) {
