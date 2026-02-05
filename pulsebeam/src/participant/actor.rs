@@ -80,7 +80,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 gateway_tx,
             ))
             .await;
-        let mut stats_interval = tokio::time::interval(Duration::from_millis(200));
         let mut maybe_deadline = self.core.poll();
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
@@ -165,11 +164,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 },
 
                 // Priority 4: Background tasks
-                now = stats_interval.tick() => {
-                    self.core.poll_slow(now);
-                }
                 _ = &mut sleep => {
-                    maybe_deadline = self.core.handle_timeout();
+                    maybe_deadline = self.core.handle_tick();
                 },
             }
         }

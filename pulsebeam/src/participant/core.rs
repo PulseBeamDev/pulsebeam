@@ -3,6 +3,7 @@ use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
@@ -22,6 +23,7 @@ use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 32;
+const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct TrackMapping {
     pub mid: Mid,
@@ -58,6 +60,7 @@ pub struct ParticipantCore {
     pub events: Vec<CoreEvent>,
     disconnect_reason: Option<DisconnectReason>,
     signaling: Signaling,
+    last_slow_poll: Instant,
 }
 
 impl ParticipantCore {
@@ -97,6 +100,7 @@ impl ParticipantCore {
             disconnect_reason: None,
             events: Vec::with_capacity(32),
             signaling: Signaling::new(cid),
+            last_slow_poll: Instant::now(),
         }
     }
 
@@ -141,7 +145,7 @@ impl ParticipantCore {
         last_deadline
     }
 
-    pub fn handle_timeout(&mut self) -> Option<Instant> {
+    pub fn handle_tick(&mut self) -> Option<Instant> {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
         self.poll()
     }
@@ -178,12 +182,15 @@ impl ParticipantCore {
     /// The Main Orchestrator.
     /// Drives the feedback loop between the RTC Engine and the Signaling Logic.
     pub fn poll(&mut self) -> Option<Instant> {
-        if self.disconnect_reason.is_some() {
-            return None;
+        let now = Instant::now();
+
+        if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
+            self.poll_slow(now);
+            self.last_slow_poll = now;
         }
 
         loop {
-            let deadline = self.poll_rtc()?;
+            let rtc_deadline = self.poll_rtc()?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
                 // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
@@ -191,8 +198,10 @@ impl ParticipantCore {
                 continue;
             }
 
+            let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
+
             // No new work generated. We are synced. Return the RTC deadline.
-            return Some(deadline);
+            return Some(rtc_deadline.min(next_slow_poll));
         }
     }
 
