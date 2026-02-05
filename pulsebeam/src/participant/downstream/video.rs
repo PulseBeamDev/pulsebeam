@@ -321,13 +321,13 @@ impl VideoAllocator {
                 if plan.committed {
                     continue;
                 }
-                plan.committed = true;
+                plan.committed = true; // Mark as visited for this iteration
 
                 let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
                     continue;
                 };
 
-                // Step 1 has created a baseline for healthy layers.
+                // Find the next higher quality layer
                 let Some(desired_receiver) = state
                     .track
                     .higher_quality(plan.target_receiver.quality)
@@ -340,23 +340,28 @@ impl VideoAllocator {
                 };
 
                 let desired_bitrate = desired_receiver.state.bitrate_bps();
-                let upgrade_cost = desired_bitrate - plan.current_bitrate;
+                let current_bitrate = plan.current_bitrate;
+                let upgrade_cost = desired_bitrate - current_bitrate;
 
-                let hysteresis = if desired_receiver.quality > plan.current_receiver.quality {
-                    UPGRADE_HYSTERESIS_FACTOR
-                } else {
-                    1.0
-                };
+                // If we are actually moving to a higher quality than what is LIVE,
+                // we demand a buffer.
+                let hysteresis_overhead =
+                    if desired_receiver.quality > plan.current_receiver.quality {
+                        desired_bitrate * (UPGRADE_HYSTERESIS_FACTOR - 1.0)
+                    } else {
+                        0.0
+                    };
 
-                let effective_cost = upgrade_cost * hysteresis;
-
-                if effective_cost > budget {
-                    plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
+                // We check if the budget can cover the Cost + The Safety Buffer
+                if (upgrade_cost + hysteresis_overhead) > budget {
+                    plan.desired_bitrate = desired_bitrate;
                     continue;
                 }
 
+                // We only subtract the ACTUAL cost, not the hysteresis overhead.
                 budget -= upgrade_cost;
-                plan.committed = false;
+
+                plan.committed = false; // Allow further upgrades for this track in the next while-loop pass
                 plan.target_receiver = desired_receiver;
                 plan.current_bitrate = desired_bitrate;
                 plan.desired_bitrate = desired_bitrate;
