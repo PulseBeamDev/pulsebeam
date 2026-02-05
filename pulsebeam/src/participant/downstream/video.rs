@@ -187,7 +187,7 @@ impl VideoAllocator {
         available_bandwidth: Bitrate,
     ) -> Option<(Bitrate, Bitrate)> {
         const DOWNGRADE_TOLERANCE: f64 = 0.25;
-        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.3;
+        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.15;
         const MIN_BANDWIDTH: f64 = 300_000.0;
 
         struct SlotPlan<'a> {
