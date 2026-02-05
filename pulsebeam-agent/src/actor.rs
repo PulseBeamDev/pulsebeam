@@ -166,14 +166,28 @@ impl AgentBuilder {
 
         tracing::info!("local ips: {:?}", self.local_ips);
 
-        let mut rtc = Rtc::builder()
+        let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            .enable_h264(true)
-            .enable_opus(true)
             // .enable_bwe(Some(Bitrate::kbps(2000)))
-            .set_stats_interval(Some(Duration::from_millis(200)))
-            .build(Instant::now().into());
+            .set_stats_interval(Some(Duration::from_millis(200)));
+        let codec_config = rtc_builder.codec_config();
+        codec_config.enable_opus(true);
 
+        let baseline_levels = [0x34]; // 5.2 level matching OpenH264
+        let mut pt = 96; // start around 96–127 range for dynamic types
+
+        for level in &baseline_levels {
+            // Constrained Baseline
+            codec_config.add_h264(
+                pt.into(),
+                Some((pt + 1).into()), // RTX PT
+                true,
+                0x42e000 | level,
+            );
+            pt += 2;
+        }
+
+        let mut rtc = rtc_builder.build(Instant::now().into());
         let mut candidate_count = 0;
         let mut maybe_addr = None;
         for ip in self.local_ips {
@@ -408,7 +422,7 @@ impl AgentActor {
                 // Data coming from User -> Network
                 Some((mid, frame)) = self.senders.next() => {
                      if let Some(writer) = self.rtc.writer(mid) {
-                         let pt = writer.payload_params().nth(0).unwrap().pt();
+                         let pt = writer.payload_params().next().unwrap().pt();
                          let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                      }
                 }
