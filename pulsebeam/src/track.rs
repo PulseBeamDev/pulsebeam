@@ -224,7 +224,9 @@ impl TrackReceiver {
     }
 }
 
-pub fn new(mid: Mid, meta: Arc<TrackMeta>, base_cap: usize) -> (TrackSender, TrackReceiver) {
+pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
+    const BASE_CAP: usize = 32;
+
     let mut simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
         rids.iter().map(|rid| Some(*rid)).collect()
     } else {
@@ -260,7 +262,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>, base_cap: usize) -> (TrackSender, Tra
             }
         };
 
-        let (tx, rx) = spmc::channel(base_cap * cap_tier);
+        let (tx, rx) = spmc::channel(BASE_CAP * cap_tier);
         let (keyframe_tx, keyframe_rx) = mpsc::channel(1);
 
         let stream_state = StreamState::new(true, bitrate);
