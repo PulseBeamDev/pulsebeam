@@ -359,7 +359,7 @@ impl VideoAllocator {
                 plan.committed = false;
                 plan.target_receiver = desired_receiver;
                 plan.current_bitrate = desired_bitrate;
-                plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
+                plan.desired_bitrate = desired_bitrate;
                 made_progress = true;
             }
         }
@@ -387,8 +387,8 @@ impl VideoAllocator {
             }
         }
 
-        let total_allocated = Bitrate::from(total_allocated.max(MIN_BANDWIDTH));
-        let total_desired = Bitrate::from(total_desired.max(MIN_BANDWIDTH));
+        let total_allocated = Bitrate::from(total_allocated);
+        let total_desired = Bitrate::from(total_desired);
 
         if self.ticks >= 30 {
             tracing::debug!(

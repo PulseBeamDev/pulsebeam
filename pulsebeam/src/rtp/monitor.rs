@@ -373,6 +373,7 @@ impl BitrateEstimate {
     }
 
     pub fn poll(&mut self, now: Instant) {
+        const HEADROOM: f64 = 1.25;
         let elapsed = now.saturating_duration_since(self.last_update);
         if elapsed < Duration::from_millis(200) {
             return;
@@ -405,7 +406,7 @@ impl BitrateEstimate {
 
         // sliding window average
         let bps = if valid_duration > 0.001 {
-            (self.window_sum as f64 * 8.0) / valid_duration
+            (self.window_sum as f64 * 8.0) / valid_duration * HEADROOM
         } else {
             0.0
         };
@@ -957,7 +958,7 @@ impl AudioMonitor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use more_asserts::assert_le;
+    use more_asserts::{assert_gt, assert_le, assert_lt};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -1224,7 +1225,8 @@ mod test {
         let baseline = sim.current();
 
         println!("Baseline: {:.0} bps", baseline);
-        assert!(baseline > 900_000.0 && baseline < 1_100_000.0);
+        assert_gt!(baseline, 1_200_000.0);
+        assert_le!(baseline, 1_400_000.0);
 
         // 2. Inject Massive Keyframe
         // Normal 100ms = 12,500 bytes. Keyframe = 62,500 bytes (5x spike).
