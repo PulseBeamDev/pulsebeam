@@ -168,14 +168,12 @@ impl<T: Clone> Receiver<T> {
 
             // Slot overwritten before we got here
             if slot_seq < earliest {
-                drop(slot);
                 self.next_seq = self.local_head;
                 return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
             }
 
             // Seq mismatch — producer overwrote after head snapshot
             if slot_seq != self.next_seq {
-                drop(slot);
                 self.next_seq = self.local_head;
                 return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
             }
@@ -183,7 +181,6 @@ impl<T: Clone> Receiver<T> {
             // Valid message
             if let Some(v) = &slot.val {
                 let out = v.clone();
-                drop(slot);
                 coop.made_progress();
                 self.next_seq += 1;
                 return Poll::Ready(Ok(out));
@@ -191,7 +188,6 @@ impl<T: Clone> Receiver<T> {
 
             // This shouldn't never happen, but just in case..
             // Seq was correct but value missing — treat as lag
-            drop(slot);
             self.next_seq = self.local_head;
             return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
         }

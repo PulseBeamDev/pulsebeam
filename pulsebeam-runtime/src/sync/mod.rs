@@ -1,3 +1,4 @@
+pub mod mpsc;
 pub mod spmc;
 
 #[cfg(not(feature = "loom"))]
