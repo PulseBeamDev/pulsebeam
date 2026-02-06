@@ -25,6 +25,9 @@ struct Slot<T> {
 
 #[derive(Debug)]
 struct Ring<T> {
+    // This is mspc, but we expect very low contention on the producers.
+    // Mutex is generally cheaper than RWLock. So, no reason to pay
+    // RWLock overhead.
     slots: Vec<Mutex<Slot<T>>>, // per-slot mutex
     mask: usize,
     head: AtomicU64, // next free sequence number

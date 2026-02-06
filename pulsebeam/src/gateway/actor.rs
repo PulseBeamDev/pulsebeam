@@ -1,13 +1,16 @@
 use crate::gateway::demux::Demuxer;
 use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
 use pulsebeam_runtime::prelude::*;
-use pulsebeam_runtime::{actor, mailbox, net};
+use pulsebeam_runtime::{actor, net};
 use std::{io, sync::Arc};
 use tokio::task::JoinSet;
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(String, mailbox::Sender<net::RecvPacketBatch>),
+    AddParticipant(
+        String,
+        pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>,
+    ),
     RemoveParticipant(String),
 }
 
@@ -154,7 +157,8 @@ impl GatewayWorkerActor {
     }
 
     async fn read_socket(&mut self) -> io::Result<()> {
-        const COOP_BUDGET: usize = 128;
+        // ~1,000 yields per second = ~99% CPU for other work
+        const COOP_BUDGET: usize = 256;
         let mut spent_budget: usize = 0;
 
         loop {
@@ -171,7 +175,7 @@ impl GatewayWorkerActor {
                         };
 
                         let src = batch.src;
-                        if !self.demuxer.demux(&mut self.socket, batch).await {
+                        if !self.demuxer.demux(&mut self.socket, batch) {
                             // In case there's a malicious actor, close immediately as there's no
                             // associated participant.
                             self.socket.close_peer(&src);

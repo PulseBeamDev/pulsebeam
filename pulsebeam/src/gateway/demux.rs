@@ -1,11 +1,11 @@
+use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UnifiedSocketReader;
-use pulsebeam_runtime::{mailbox, net};
 
 use crate::gateway::ice;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-pub type ParticipantHandle = mailbox::Sender<net::RecvPacketBatch>;
+pub type ParticipantHandle = pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>;
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///
@@ -57,11 +57,7 @@ impl Demuxer {
 
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped
-    pub async fn demux(
-        &mut self,
-        socket: &mut UnifiedSocketReader,
-        batch: net::RecvPacketBatch,
-    ) -> bool {
+    pub fn demux(&mut self, socket: &mut UnifiedSocketReader, batch: net::RecvPacketBatch) -> bool {
         let src = batch.src;
 
         let handle = if let Some(h) = self.addr_map.get_mut(&src) {
@@ -83,7 +79,7 @@ impl Demuxer {
             return false;
         };
 
-        if let Err(_) = handle.send(batch).await {
+        if let Err(_) = handle.try_send(batch) {
             // Handle is closed! Clean up everything related to this participant.
             if let Some(ufrag) = self.addr_to_ufrag.get(&src).cloned() {
                 tracing::info!("Participant handle closed, cleaning up ufrag: {:?}", ufrag);
