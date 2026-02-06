@@ -110,6 +110,7 @@ pub struct StreamMonitor {
     shared_state: StreamState,
 
     stream_id: String,
+    kind: MediaKind, // distinguish Audio/Video for scoring
 
     delta_delta: DeltaDeltaState,
     last_packet_at: Instant,
@@ -131,6 +132,7 @@ impl StreamMonitor {
         };
         Self {
             stream_id,
+            kind,
             shared_state,
             last_packet_at: now,
             delta_delta: DeltaDeltaState::new(DELTA_DELTA_WINDOW_SIZE),
@@ -184,7 +186,8 @@ impl StreamMonitor {
             );
         }
 
-        let metrics: RawMetrics = (&self.delta_delta).into();
+        // Pass MediaKind to metrics to handle Jitter vs Loss sensitivity
+        let metrics = RawMetrics::new(&self.delta_delta, self.kind);
         // Reset the counters so we measure the interval (windowed) metrics next time.
         // This makes the loss score reactive to RECENT conditions rather than lifetime average.
         self.delta_delta.snapshot_and_reset();
@@ -373,6 +376,8 @@ impl BitrateEstimate {
     }
 
     pub fn poll(&mut self, now: Instant) {
+        // Headroom strategy implies that if we see a burst (like a keyframe),
+        // we likely have the bandwidth capacity for it.
         const HEADROOM: f64 = 1.25;
         let elapsed = now.saturating_duration_since(self.last_update);
         if elapsed < Duration::from_millis(200) {
@@ -426,20 +431,20 @@ struct RawMetrics {
     pub frame_duration: Duration,
     pub packets_actual: u64,
     pub packets_expected: u64,
+    pub kind: MediaKind, // context-aware scoring
 }
 
-impl From<&DeltaDeltaState> for RawMetrics {
-    fn from(value: &DeltaDeltaState) -> Self {
+impl RawMetrics {
+    fn new(value: &DeltaDeltaState, kind: MediaKind) -> Self {
         Self {
             m_hat: value.m_hat,
             frame_duration: Duration::from_millis(value.frame_duration_ms_ewma as u64),
             packets_actual: value.packets_actual,
             packets_expected: value.packets_expected,
+            kind,
         }
     }
-}
 
-impl RawMetrics {
     fn packet_loss(&self) -> f64 {
         if self.packets_expected == 0 {
             return 0.0;
@@ -451,9 +456,15 @@ impl RawMetrics {
     pub fn calculate_jitter_score(&self) -> f64 {
         // We use its absolute value to penalize both overuse (positive)
         // and underuse (negative, which can also indicate instability).
-        // The midpoint will need to be re-tuned. The paper RECOMMENDS
-        // a threshold of 12.5ms to detect overuse.
-        sigmoid(self.m_hat.abs(), 100.0, -0.2, 12.5)
+
+        // Audio is extremely sensitive to jitter (robot voice).
+        // Video (Simulcast/Screen) can buffer jitter (latency vs quality tradeoff).
+        let (sensitivity, midpoint) = match self.kind {
+            MediaKind::Audio => (-0.3, 10.0), // Strict: penalize > 10ms jitter
+            MediaKind::Video => (-0.1, 50.0), // Loose: allow up to 50ms jitter (screen share bursts)
+        };
+
+        sigmoid(self.m_hat.abs(), 100.0, sensitivity, midpoint)
     }
 
     pub fn calculate_loss_score(&self) -> f64 {
@@ -464,21 +475,23 @@ impl RawMetrics {
 
         let loss_ratio = self.packet_loss();
 
-        // small packet loss is easy to recover
-        const GRACE_THRESHOLD: f64 = 0.02;
-        if loss_ratio <= GRACE_THRESHOLD {
+        // Audio PLC (Packet Loss Concealment) handles small loss well (~5%).
+        // Video I-frames/P-frames are sensitive to loss (artifacts).
+        let (grace_threshold, panic_threshold) = match self.kind {
+            MediaKind::Audio => (0.05, 0.15),
+            MediaKind::Video => (0.02, 0.10), // Video hates loss
+        };
+
+        if loss_ratio <= grace_threshold {
             return 100.0;
         }
-
-        const PANIC_THRESHOLD: f64 = 0.12;
-        if loss_ratio >= PANIC_THRESHOLD {
+        if loss_ratio >= panic_threshold {
             return 0.0;
         }
 
-        // We map the range [0.02 ... 0.12] to score [100 ... 0]
-        // Range size = 0.10
-        let range = PANIC_THRESHOLD - GRACE_THRESHOLD;
-        let excess_loss = loss_ratio - GRACE_THRESHOLD;
+        // Map range to score [100 ... 0]
+        let range = panic_threshold - grace_threshold;
+        let excess_loss = loss_ratio - grace_threshold;
         let penalty_fraction = excess_loss / range;
 
         (100.0 * (1.0 - penalty_fraction)).max(0.0)
@@ -487,7 +500,7 @@ impl RawMetrics {
     pub fn quality_hysteresis(&self, score: f64, current: StreamQuality) -> StreamQuality {
         match current {
             StreamQuality::Excellent => {
-                if score < 80.0 {
+                if score < 75.0 {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Excellent
@@ -652,6 +665,24 @@ impl DeltaDeltaState {
         let expected_ms = (group.rtp_ts.numer().wrapping_sub(self.last_rtp_ts.numer()) as f64)
             * 1000.0
             / self.frequency.get() as f64;
+
+        // If the gap between frames is huge (common in screen share or audio pause/DTX),
+        // the network delay calculation will be misleadingly large (wake-up jitter).
+        // If > 500ms, we assume this was a pause, not network congestion.
+        if expected_ms > 500.0 {
+            // Soft-reset the filter.
+            // We set m_hat to 0 to assume "normal" delay for this specific jump.
+            // We boost 'e' (variance) to adapt quickly to whatever new state exists.
+            self.m_hat = 0.0;
+            self.e = 0.5;
+
+            // Advance pointers but skip Kalman update
+            self.last_arrival = group.last_arrival;
+            self.last_rtp_ts = group.rtp_ts;
+            self.packets_actual += 1;
+            self.packets_expected += 1;
+            return;
+        }
 
         // `d(i)` from the GCC paper (inter-group delay variation).
         let skew = actual_ms - expected_ms;
