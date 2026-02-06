@@ -34,6 +34,7 @@ impl KeyframeBuffer {
         // TODO: use target_playout to decide
         // self.segment.is_some()
         let Some(segment) = self.segment.as_ref() else {
+            tracing::trace!("KeyframeBuffer is_ready: false (no segment)");
             return false;
         };
 

@@ -19,6 +19,7 @@ pub struct DownstreamAllocator {
 
     pub audio: AudioAllocator,
     pub video: VideoAllocator,
+    yield_audio: bool,
 }
 
 impl DownstreamAllocator {
@@ -27,6 +28,7 @@ impl DownstreamAllocator {
             available_bandwidth: BitrateController::default(),
             audio: AudioAllocator::new(),
             video: VideoAllocator::new(manual_sub),
+            yield_audio: false,
         }
     }
 
@@ -74,11 +76,31 @@ impl DownstreamAllocator {
     }
 
     pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        if let Poll::Ready(item) = self.audio.poll_next(cx) {
-            return Poll::Ready(item);
+        if self.yield_audio {
+            // Try video first
+            if let Poll::Ready(res) = self.video.poll_fast(cx) {
+                self.yield_audio = false;
+                return Poll::Ready(res);
+            }
+            // Fallback to audio if video is pending
+            if let Poll::Ready(res) = self.audio.poll_next(cx) {
+                self.yield_audio = true;
+                return Poll::Ready(res);
+            }
+        } else {
+            // Try audio first
+            if let Poll::Ready(res) = self.audio.poll_next(cx) {
+                self.yield_audio = true;
+                return Poll::Ready(res);
+            }
+            // Fallback to video if audio is pending
+            if let Poll::Ready(res) = self.video.poll_fast(cx) {
+                self.yield_audio = false;
+                return Poll::Ready(res);
+            }
         }
 
-        self.video.poll_fast(cx)
+        Poll::Pending
     }
 }
 

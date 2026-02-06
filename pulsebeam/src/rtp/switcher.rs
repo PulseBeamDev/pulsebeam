@@ -57,14 +57,17 @@ impl Switcher {
     /// Returns true if the new stream has received a keyframe and is ready to be popped.
     pub fn ready_to_stream(&self) -> bool {
         let Some(staging) = self.staging.as_ref() else {
+            tracing::trace!("ready_to_stream: false (no staging)");
             return false;
         };
 
-        staging.is_ready(
-            self.latest_playout
-                .checked_sub(PLAYOUT_JITTER_TOLERANCE)
-                .unwrap_or(self.latest_playout),
-        )
+        let target = self.latest_playout
+            .checked_sub(PLAYOUT_JITTER_TOLERANCE)
+            .unwrap_or(self.latest_playout);
+            
+        let ready = staging.is_ready(target);
+        tracing::trace!("ready_to_stream: {} (target={:?}, latest_playout={:?})", ready, target, self.latest_playout);
+        ready
     }
 
     /// Pops the next available packet, prioritizing the old stream to ensure a smooth drain.
