@@ -124,9 +124,6 @@ impl<T: Clone> Receiver<T> {
                 self.local_head = self.ring.head.load(Ordering::Acquire);
             }
 
-            let capacity = (self.ring.mask as u64) + 1;
-            let earliest = self.local_head.saturating_sub(capacity);
-
             // Closed + nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= self.local_head {
                 return Poll::Ready(Err(RecvError::Closed));
@@ -152,11 +149,6 @@ impl<T: Clone> Receiver<T> {
             let idx = (self.next_seq as usize) & self.ring.mask;
             let slot = self.ring.slots[idx].lock();
             let slot_seq = slot.seq;
-
-            if slot_seq < earliest {
-                self.next_seq = self.local_head;
-                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
-            }
 
             if slot_seq != self.next_seq {
                 self.next_seq = self.local_head;
