@@ -14,7 +14,8 @@ use pulsebeam_runtime::{net::Transport, prelude::*};
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
-    media::{Direction, MediaKind},
+    format::{Codec, FormatParams},
+    media::{Direction, Frequency, MediaKind, Pt},
     net::TcpType,
 };
 use tokio::{sync::oneshot, task::JoinSet, time::Instant};
@@ -280,6 +281,8 @@ impl ControllerActor {
         offer: SdpOffer,
         sockets: &[&UnifiedSocketWriter],
     ) -> Result<(Rtc, SdpAnswer), ControllerError> {
+        const PT_OPUS: Pt = Pt::new_with_value(111);
+
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
@@ -295,7 +298,19 @@ impl ControllerActor {
         rtc_config.set_max_stun_rto(Duration::from_millis(1500));
         rtc_config.set_max_stun_retransmits(5);
         let codec_config = rtc_config.codec_config();
-        codec_config.enable_opus(true);
+        codec_config.add_config(
+            PT_OPUS,
+            None,
+            Codec::Opus,
+            Frequency::FORTY_EIGHT_KHZ,
+            Some(2),
+            FormatParams {
+                min_p_time: Some(10),
+                use_inband_fec: Some(true),
+                use_dtx: Some(true),
+                ..Default::default()
+            },
+        );
         // codec_config.enable_vp8(true);
         // h264 as the lowest common denominator due to small clients like
         // embedded devices, smartphones, OBS only supports H264.
