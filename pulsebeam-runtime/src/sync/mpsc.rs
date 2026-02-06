@@ -78,9 +78,11 @@ impl<T> Sender<T> {
         let seq = self.ring.head.fetch_add(1, Ordering::AcqRel);
         let idx = (seq as usize) & self.ring.mask;
 
-        let mut slot = self.ring.slots[idx].lock();
-        slot.val = Some(val);
-        slot.seq = seq;
+        {
+            let mut slot = self.ring.slots[idx].lock();
+            slot.val = Some(val);
+            slot.seq = seq;
+        }
 
         // there's only 1 consumer
         self.ring.event.notify(1);
@@ -154,9 +156,21 @@ impl<T: Clone> Receiver<T> {
             let slot_seq = slot.seq;
 
             if slot_seq != self.next_seq {
-                self.next_seq = self.local_head;
-                metrics::counter!("mpsc_receive_lag_total").increment(1);
-                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+                // Sanity check: seq should be ahead of us if we lagged
+                let lagged = slot.seq > self.next_seq;
+                drop(slot);
+
+                if lagged {
+                    self.next_seq = self.local_head;
+                    metrics::counter!("mpsc_receive_lag_total").increment(1);
+                    return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+                } else {
+                    // Stale slot, producer hasn't reached here yet
+                    if self.listener.is_none() {
+                        self.listener = Some(self.ring.event.listen());
+                    }
+                    return Poll::Pending;
+                }
             }
 
             if let Some(ref v) = slot.val {

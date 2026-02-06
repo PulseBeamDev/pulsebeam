@@ -169,9 +169,21 @@ impl<T: Clone> Receiver<T> {
 
             // Seq mismatch — producer overwrote after head snapshot
             if slot_seq != self.next_seq {
-                self.next_seq = self.local_head;
-                metrics::counter!("spmc_receive_lag_total").increment(1);
-                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+                // Sanity check: seq should be ahead of us if we lagged
+                let lagged = slot.seq > self.next_seq;
+                drop(slot);
+
+                if lagged {
+                    self.next_seq = self.local_head;
+                    metrics::counter!("spmc_receive_lag_total").increment(1);
+                    return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+                } else {
+                    // Stale slot, producer hasn't reached here yet
+                    if self.listener.is_none() {
+                        self.listener = Some(self.ring.event.listen());
+                    }
+                    return Poll::Pending;
+                }
             }
 
             // Valid message
@@ -189,7 +201,7 @@ impl<T: Clone> Receiver<T> {
                 return Poll::Ready(Ok(out));
             }
 
-            // This shouldn't never happen, but just in case..
+            // This shouldn't ever happen, but just in case..
             // Seq was correct but value missing — treat as lag
             self.next_seq = self.local_head;
             metrics::counter!("spmc_receive_lag_total").increment(1);
