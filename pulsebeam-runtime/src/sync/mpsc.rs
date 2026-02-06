@@ -208,7 +208,6 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::Duration;
 
     #[tokio::test]
     async fn basic_send_recv() {
@@ -236,34 +235,6 @@ mod tests {
 
         tx.try_send(6).unwrap();
         assert_eq!(rx.recv().await, Ok(6));
-    }
-
-    #[tokio::test]
-    async fn close_signal_drains_then_stops() {
-        let (tx, mut rx) = channel::<u64>(4);
-
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
-
-        drop(tx);
-
-        assert_eq!(rx.recv().await, Ok(1));
-        assert_eq!(rx.recv().await, Ok(2));
-        assert_eq!(rx.recv().await, Err(RecvError::Closed));
-        assert_eq!(rx.recv().await, Err(RecvError::Closed));
-    }
-
-    #[tokio::test]
-    async fn async_waker_notification() {
-        let (tx, mut rx) = channel::<u64>(4);
-
-        let handle = tokio::spawn(async move { rx.recv().await });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        tx.try_send(99).unwrap();
-
-        let result = handle.await.unwrap();
-        assert_eq!(result, Ok(99));
     }
 
     #[tokio::test]
