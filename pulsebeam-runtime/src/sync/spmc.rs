@@ -100,9 +100,12 @@ pub struct Receiver<T> {
     next_seq: u64,
     local_head: u64,
     listener: Option<EventListener>,
+    pkts_received: u64,
 }
 
 impl<T: Clone> Receiver<T> {
+    const METRIC_FLUSH_MASK: u64 = 1023;
+
     pub fn reset(&mut self) {
         // Half cap to give a chance to load from cache while not too close
         // to tail to cause a lag error.
@@ -167,6 +170,7 @@ impl<T: Clone> Receiver<T> {
             // Seq mismatch — producer overwrote after head snapshot
             if slot_seq != self.next_seq {
                 self.next_seq = self.local_head;
+                metrics::counter!("spmc_receive_lag_total").increment(1);
                 return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
             }
 
@@ -174,15 +178,34 @@ impl<T: Clone> Receiver<T> {
             if let Some(v) = &slot.val {
                 let out = v.clone();
                 coop.made_progress();
+
+                self.pkts_received += 1;
                 self.next_seq += 1;
+
+                if (self.pkts_received & Self::METRIC_FLUSH_MASK) == 0 {
+                    drop(slot);
+                    self.flush_metrics();
+                }
                 return Poll::Ready(Ok(out));
             }
 
             // This shouldn't never happen, but just in case..
             // Seq was correct but value missing — treat as lag
             self.next_seq = self.local_head;
+            metrics::counter!("spmc_receive_lag_total").increment(1);
             return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
         }
+    }
+
+    fn flush_metrics(&mut self) {
+        // Use the existing local_head snapshot.
+        // This tells us how much is still left in the current "batch".
+        let current_drift = self.local_head.saturating_sub(self.next_seq);
+        let capacity = (self.ring.mask + 1) as f64;
+
+        metrics::histogram!("spmc_receive_drift_ratio").record(current_drift as f64 / capacity);
+        metrics::counter!("spmc_receive_throughput_total").increment(self.pkts_received);
+        self.pkts_received = 0;
     }
 }
 
@@ -208,11 +231,29 @@ impl<T: Clone> Clone for Receiver<T> {
             next_seq: self.next_seq,
             local_head: self.local_head,
             listener: None,
+            pkts_received: 0,
         }
     }
 }
 
 pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    metrics::describe_histogram!(
+        "spmc_receive_drift_ratio",
+        "The ratio of the buffer capacity currently occupied by unread packets \
+        at the moment of processing. A value of 1.0 indicates the receiver is \
+        about to be overwritten (lagged)."
+    );
+
+    metrics::describe_counter!(
+        "spmc_receive_throughput_total",
+        "The total number of packets successfully delivered across all SPMC channels."
+    );
+
+    metrics::describe_counter!(
+        "spmc_receive_lag_total",
+        "The total number of times a receiver was too slow and was overwritten by \
+        the producer, resulting in dropped data."
+    );
     let ring = Ring::new(capacity);
     (
         Sender {
@@ -224,6 +265,7 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
             next_seq: 0,
             local_head: 0,
             listener: None,
+            pkts_received: 0,
         },
     )
 }
