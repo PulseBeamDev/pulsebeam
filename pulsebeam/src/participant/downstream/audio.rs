@@ -1,21 +1,19 @@
 use futures_lite::StreamExt;
 use pulsebeam_runtime::sync::spmc;
+use std::collections::HashMap;
+use std::task::{Context, Poll, Waker};
 
 use crate::entity::TrackId;
 use crate::rtp;
 use crate::rtp::RtpPacket;
 use crate::rtp::timeline::Timeline;
 use crate::track::TrackReceiver;
-use std::task::Waker;
-use std::task::ready;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::media::Mid;
 use tokio::time::Instant;
-use tokio_stream::StreamMap;
 
 pub struct AudioAllocator {
-    inputs: StreamMap<TrackId, spmc::Receiver<RtpPacket>>,
+    inputs: HashMap<TrackId, spmc::Receiver<RtpPacket>>,
     slots: Vec<AudioSlot>,
     waker: Option<Waker>,
 }
@@ -23,23 +21,23 @@ pub struct AudioAllocator {
 impl AudioAllocator {
     pub fn new() -> Self {
         Self {
-            inputs: StreamMap::new(),
+            inputs: HashMap::new(),
             slots: Vec::new(),
             waker: None,
         }
     }
 
     pub fn add_track(&mut self, track: TrackReceiver) {
-        self.inputs.insert(
-            track.meta.id,
-            track.lowest_quality().channel.clone(),
-        );
+        self.inputs
+            .insert(track.meta.id, track.lowest_quality().channel.clone());
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
     }
 
     pub fn remove_track(&mut self, id: &TrackId) {
+        self.inputs.remove(id);
+
         for slot in &mut self.slots {
             if slot.current_track_id.as_ref() == Some(id) {
                 slot.current_track_id = None;
@@ -55,26 +53,37 @@ impl AudioAllocator {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        // TODO: use assignment then poll just the assignment
-
         loop {
-            // SelectAll will return Ready(None) with an empty list
             if self.inputs.is_empty() || self.slots.is_empty() {
                 self.waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
 
-            let (track_id, packet) = match ready!(self.inputs.poll_next(cx)) {
-                Some((track_id, Ok(packet))) => (track_id, packet),
-                Some((track_id, Err(err))) => {
-                    tracing::warn!("{} stream is lagging: {:?}", track_id, err);
-                    continue;
+            let mut found_packet = None;
+            for (track_id, receiver) in &mut self.inputs {
+                match receiver.poll_next(cx) {
+                    Poll::Ready(Some(Ok(packet))) => {
+                        found_packet = Some((*track_id, packet));
+                        break; // Process one packet at a time
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        tracing::warn!("{} stream is lagging: {:?}", track_id, err);
+                        continue;
+                    }
+                    Poll::Ready(None) | Poll::Pending => {
+                        continue;
+                    }
                 }
-                None => continue, // All inputs closed
+            }
+
+            let (track_id, packet) = match found_packet {
+                Some(p) => p,
+                None => return Poll::Pending,
             };
 
             let now = Instant::now();
 
+            // Try to find existing slot for this track
             if let Some(slot) = self
                 .slots
                 .iter_mut()
@@ -83,14 +92,17 @@ impl AudioAllocator {
                 return Poll::Ready(Some(slot.process(&track_id, packet)));
             }
 
+            // Try to find an empty slot
             if let Some(slot) = self.slots.iter_mut().find(|s| s.current_track_id.is_none()) {
                 return Poll::Ready(Some(slot.process(&track_id, packet)));
             }
 
+            // Try to find an evictable slot
             if let Some(slot) = self.slots.iter_mut().find(|s| s.can_evict(now)) {
-                // Take the seat
                 return Poll::Ready(Some(slot.process(&track_id, packet)));
             }
+
+            // No slot available, drop and continue
             continue;
         }
     }

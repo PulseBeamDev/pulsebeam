@@ -106,7 +106,15 @@ pub struct Receiver<T> {
 impl<T: Clone> Receiver<T> {
     const METRIC_FLUSH_MASK: u64 = 1023;
 
-    pub fn reset(&mut self) {
+    /// Jump to the producer's current position (Audio/Low-latency).
+    pub fn sync(&mut self) {
+        self.local_head = self.ring.head.load(Ordering::Acquire);
+        self.next_seq = self.local_head;
+        self.listener = None;
+    }
+
+    /// Jump back halfway to provide a processing window (Video/Burst).
+    pub fn rewind(&mut self) {
         // Half cap to give a chance to load from cache while not too close
         // to tail to cause a lag error.
         self.local_head = self.ring.head.load(Ordering::Acquire);

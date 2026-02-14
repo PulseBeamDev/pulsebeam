@@ -577,7 +577,7 @@ impl Slot {
 
         // Take ownership of state to move internals
         let old_state = self.state.take().unwrap_or(SlotState::Idle);
-        receiver.channel.reset();
+        receiver.channel.rewind();
         receiver.request_keyframe(KeyframeRequestKind::Fir);
         self.switching_started_at = Some(Instant::now());
         self.keyframe_retries = 0;
