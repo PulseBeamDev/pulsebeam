@@ -108,11 +108,4 @@ Or view as a flamegraph on a browser by specifying `flamegraph=true` to the URL 
 
 ## Roadmap
 
-- ✅ Prototype: Rust SFU + demo apps
-- ✅ Bandwidth estimator, simulcast support
-- 🚧 Top-N audio selection, Data channel, Web Client SDK
-- 📅 HTTP API & Webhooks (events)
-- 📅 Multi-node / cascading SFU support
-- 📅 Extensions: recording, SIP, AI agents
-
 You can view the full roadmap [here](https://github.com/orgs/PulseBeamDev/projects/2/views/4).
