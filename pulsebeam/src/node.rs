@@ -195,24 +195,28 @@ impl NodeBuilder {
 
             let cors = CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods(Any)
+                .allow_methods([
+                    hyper::Method::GET,
+                    hyper::Method::POST,
+                    hyper::Method::PATCH,
+                    hyper::Method::PUT,
+                    hyper::Method::DELETE,
+                    hyper::Method::OPTIONS,
+                ])
                 .allow_headers([
                     hyper::header::AUTHORIZATION,
                     hyper::header::CONTENT_TYPE,
                     hyper::header::CONTENT_ENCODING,
                     hyper::header::IF_MATCH,
+                    hyper::header::ACCEPT,
                 ])
-                .expose_headers([
-                    hyper::header::LOCATION,
-                    hyper::header::ETAG,
-                    HeaderName::from_static(api::HeaderExt::ParticipantId.as_str()),
-                ])
+                .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
                 .max_age(Duration::from_secs(86400));
 
             let router = api::router(controller_handle, api_cfg)
-                .layer(cors)
                 .layer(CompressionLayer::new().zstd(true))
-                .layer(RequestDecompressionLayer::new().zstd(true).gzip(true));
+                .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
+                .layer(cors);
             let http_shutdown = shutdown.clone();
 
             join_set.spawn(async move {
