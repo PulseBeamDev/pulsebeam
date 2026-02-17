@@ -7,7 +7,7 @@ members = [
   "pulsebeam-core",
   "pulsebeam-proto",
   "pulsebeam-runtime",
-  "pulsebeam-simulator",
+  "pulsebeam-simulator", "pulsebeam-testdata",
 ]
 
 [workspace.package]

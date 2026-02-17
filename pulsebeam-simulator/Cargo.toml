@@ -23,6 +23,7 @@ pulsebeam = { path = "../pulsebeam" }
 pulsebeam-agent = { path = "../pulsebeam-agent" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 reqwest = "0.13.1"
 tokio.workspace = true
 tokio-util.workspace = true

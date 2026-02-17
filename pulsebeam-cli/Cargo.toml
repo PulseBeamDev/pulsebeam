@@ -1,20 +1,21 @@
 [package]
 name = "pulsebeam-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
 license = "Apache-2.0"
 publish = false
 
-version.workspace = true
-edition.workspace = true
-homepage.workspace = true
-documentation.workspace = true
-repository.workspace = true
-authors.workspace = true
-
 [dependencies]
+anyhow.workspace = true
+clap = { version = "4.5.59", features = ["derive"] }
+pulsebeam-agent = { path = "../pulsebeam-agent" }
+pulsebeam-core = { path = "../pulsebeam-core", features = ["reqwest"] }
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+reqwest = "0.13.1"
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-pulsebeam-agent = { path = "../pulsebeam-agent" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-pulsebeam-core = { path = "../pulsebeam-core", features = ["reqwest"] }
-reqwest = "0.13.1"
