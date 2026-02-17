@@ -44,6 +44,7 @@ pub struct TrackStats {
 #[derive(Debug)]
 pub struct LocalTrack {
     pub mid: Mid,
+    pub rid: Option<Rid>,
     tx: mpsc::Sender<MediaFrame>,
 }
 
@@ -508,11 +509,19 @@ impl AgentActor {
         tracing::info!("new media added: {:?}", media);
         match media.direction {
             Direction::SendOnly => {
-                // User wants to send. We create a channel: User(tx) -> Actor(rx)
-                let (tx, rx) = mpsc::channel(128);
-                self.senders.insert(mid, ReceiverStream::new(rx));
+                let rids = if let Some(layers) = media.simulcast {
+                    layers.send.iter().map(|s| Some(s.rid)).collect()
+                } else {
+                    vec![None]
+                };
 
-                self.emit(AgentEvent::LocalTrackAdded(LocalTrack { mid, tx }));
+                for rid in rids {
+                    // User wants to send. We create a channel: User(tx) -> Actor(rx)
+                    let (tx, rx) = mpsc::channel(128);
+                    self.senders.insert(mid, ReceiverStream::new(rx));
+
+                    self.emit(AgentEvent::LocalTrackAdded(LocalTrack { mid, tx, rid }));
+                }
             }
             Direction::RecvOnly => {
                 // Remote wants to send. We create a channel: Actor(tx) -> User(rx)

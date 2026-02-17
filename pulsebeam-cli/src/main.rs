@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use pulsebeam_agent::{
-    MediaKind, TransceiverDirection,
-    actor::{AgentBuilder, AgentEvent},
+    MediaKind, SimulcastLayer, TransceiverDirection,
+    actor::{AgentBuilder, AgentEvent, LocalTrack},
     api::HttpApiClient,
     media::H264Looper,
 };
@@ -27,7 +27,15 @@ async fn main_loop() {
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let mut join_set = JoinSet::new();
     let mut agent = AgentBuilder::new(api, socket)
-        .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+        .with_track(
+            MediaKind::Video,
+            TransceiverDirection::SendOnly,
+            Some(vec![
+                SimulcastLayer::new("f"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("q"),
+            ]),
+        )
         .connect("demo")
         .await
         .unwrap();
@@ -37,9 +45,8 @@ async fn main_loop() {
         tokio::select! {
             Some(event) = agent.next_event() => {
                 match event {
-                    AgentEvent::LocalTrackAdded(sender) => {
-                        let looper = H264Looper::new(RAW_H264, 30);
-                        join_set.spawn(looper.run(sender));
+                    AgentEvent::LocalTrackAdded(track) => {
+                        join_set.spawn(handle_local_track(track));
                     }
                     AgentEvent::RemoteTrackAdded(_recv) => {
                     }
@@ -54,4 +61,10 @@ async fn main_loop() {
             }
         }
     }
+}
+
+async fn handle_local_track(track: LocalTrack) {
+    tracing::info!("handling: {}(rid={:?})", track.mid, track.rid);
+    let looper = H264Looper::new(RAW_H264, 30);
+    looper.run(track).await;
 }
