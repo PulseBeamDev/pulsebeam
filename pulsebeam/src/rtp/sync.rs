@@ -11,7 +11,7 @@ use tracing::warn;
 
 const SR_HISTORY_CAPACITY: usize = 5;
 const MIN_SR_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
-const MAX_PLAYOUT_FUTURE: Duration = Duration::from_millis(1000);
+// const MAX_PLAYOUT_FUTURE: Duration = Duration::from_millis(1000);
 const MAX_PLAYOUT_PAST: Duration = Duration::from_millis(500);
 const CLOCK_SMEAR_DURATION: Duration = Duration::from_millis(500);
 
@@ -235,17 +235,21 @@ impl Synchronizer {
     }
 
     fn validate_playout_time(&self, playout_time: Instant, now: Instant) -> Instant {
-        if playout_time > now + MAX_PLAYOUT_FUTURE {
-            warn!(
-                "Far future playout_time: {:?}. Limiting to {:?}.",
-                playout_time,
-                now + MAX_PLAYOUT_FUTURE
-            );
-            return now + MAX_PLAYOUT_FUTURE;
-        }
+        // if playout_time > now + MAX_PLAYOUT_FUTURE {
+        //     warn!(
+        //         "Far future playout_time: {:?}. Limiting to {:?}.",
+        //         playout_time,
+        //         now + MAX_PLAYOUT_FUTURE
+        //     );
+        //     return now + MAX_PLAYOUT_FUTURE;
+        // }
         if let Some(past_limit) = now.checked_sub(MAX_PLAYOUT_PAST)
             && playout_time < past_limit
         {
+            warn!(
+                "Far past playout_time: {:?}. Limiting to {:?}.",
+                playout_time, past_limit
+            );
             return past_limit;
         }
         playout_time
