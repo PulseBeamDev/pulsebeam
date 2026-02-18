@@ -1,6 +1,5 @@
 use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
-use axum::http::HeaderName;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::net::UdpMode;
@@ -217,18 +216,14 @@ impl NodeBuilder {
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);
-            let http_shutdown = shutdown.clone();
+            // https://github.com/tokio-rs/axum/issues/3112
+            // missing graceful shutdown will cause task leaks
+            let api_server = axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown.child_token().cancelled_owned());
 
             join_set.spawn(async move {
-                tokio::select! {
-                    res = axum::serve(listener, router) => {
-                        if let Err(e) = res {
-                            tracing::error!("http server error: {e}");
-                        }
-                    }
-                    _ = http_shutdown.cancelled() => {
-                        tracing::info!("http server shutting down");
-                    }
+                if let Err(e) = api_server.await {
+                    tracing::error!("http server error: {e}");
                 }
             });
         }
