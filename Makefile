@@ -34,9 +34,12 @@ lint:
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
-perf: profile
-	taskset -c 2-5 perf record --call-graph dwarf $(BINARY)
-	hotspot perf.data
+perf:
+	@# Capture PIDs, replace newlines with commas, and trim the trailing comma
+	$(eval PIDS := $(shell pgrep pulsebeam | paste -sd "," -))
+	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi; \
+	sudo perf record -m 4M -p $(PIDS) -s --call-graph dwarf,16384 -F 1000 -- sleep 10
+	sudo hotspot perf.data
 
 prepare-video:
 	ffmpeg -r 30 -i video.h264 \
