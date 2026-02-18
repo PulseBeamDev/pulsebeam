@@ -25,8 +25,10 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
+    let use_tokio_console = cfg!(feature = "tokio-console");
 
-    if cfg!(feature = "tokio-console") {
+    if use_tokio_console {
+        #[cfg(feature = "tokio-console")]
         console_subscriber::init();
     } else {
         let env_filter =
