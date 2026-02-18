@@ -17,6 +17,7 @@ axum-extra = { version = "0.12.5", features = ["typed-header"] }
 base32 = "0.5.1"
 bytes = { workspace = true }
 clap = { version = "4.5.57", features = ["derive"] }
+console-subscriber = { version = "0.5", optional = true }
 derive_more = { workspace = true }
 futures-lite = { workspace = true }
 hyper = "1.7.0"
@@ -72,3 +73,4 @@ str0m = { workspace = true, features = ["wincrypto"] }
 
 [features]
 default = []
+tokio-console = ["console-subscriber", "tokio/tracing"]

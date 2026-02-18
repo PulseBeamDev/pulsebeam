@@ -3,7 +3,8 @@ use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::system;
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -25,14 +26,20 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-    tracing_subscriber::fmt()
-        .pretty()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .with_ansi(true)
-        .init();
+    if cfg!(feature = "tokio-console") {
+        console_subscriber::init();
+    } else {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_ansi(true);
+
+        let registry = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer);
+        registry.init();
+    }
 
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
