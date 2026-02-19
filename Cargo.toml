@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
 # str0m = { git = "https://github.com/algesten/str0m.git",  rev = "a236b94be5d3cf7a56f596fc8a4da252bb8fa93b"  }
 # str0m = { path = "../str0m" }
-str0m = { version = "0.16.1" }
+str0m = { version = "0.16.2" }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7.17"
@@ -48,10 +48,15 @@ turmoil = "0.7.1"
 
 [profile.release]
 opt-level = 3
-debug = 1
-strip = "debuginfo"
+debug = true  # Full debug info for symbols and source lines
+strip = false  # Retain symbols for profiling
+debug-assertions = false
 lto = "thin"
 panic = "unwind"
+
+# We want to crash during simulation
+[profile.test]
+panic = "abort"
 
 # The profile that 'dist' will build with
 [profile.dist]
@@ -60,7 +65,3 @@ lto = "thin"
 
 [profile.profiling]
 inherits = "release"
-debug = true  # Full debug info for symbols and source lines
-strip = false  # Retain symbols for profiling
-debug-assertions = false  # Match release behavior
-panic = "abort"  # make sure we don't include unwind in profile

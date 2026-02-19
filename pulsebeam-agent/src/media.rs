@@ -51,7 +51,7 @@ impl H264Looper {
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz(next_ts),
                 data: frame_data,
-                capture_time: Instant::now(),
+                capture_time: target_time,
             };
 
             sender.try_send(frame);
