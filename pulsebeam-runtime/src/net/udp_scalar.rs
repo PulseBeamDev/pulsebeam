@@ -1,13 +1,11 @@
+use pulsebeam_core::net::UdpSocket;
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
     sync::Arc,
 };
 
-use bytes::Bytes;
-use pulsebeam_core::net::UdpSocket;
-
-use crate::net::{RecvPacketBatch, SendPacketBatch, Transport, UdpMode};
+use crate::net::{GroPayload, RecvPacketBatch, SendPacketBatch, Transport, UdpMode};
 
 pub async fn bind(
     addr: SocketAddr,
@@ -53,13 +51,16 @@ impl UdpTransportReader {
         let mut buf = vec![0; 1500];
         match self.sock.try_recv_from(&mut buf) {
             Ok((n, source)) => {
+                buf.truncate(n);
                 out.push(RecvPacketBatch {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: Bytes::from(buf).slice(..n),
-                    stride: n,
-                    len: n,
+                    payload: GroPayload {
+                        buf,
+                        stride: n,
+                        len: n,
+                    },
                 });
             }
             Err(err) => return Err(err),

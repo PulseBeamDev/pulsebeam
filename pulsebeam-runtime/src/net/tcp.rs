@@ -1,6 +1,6 @@
-use super::{BATCH_SIZE, RecvPacketBatch, SendPacketBatch};
+use super::{BATCH_SIZE, GroPayload, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 use dashmap::DashMap;
 use pulsebeam_core::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -242,7 +242,7 @@ fn handle_new_connection(
     tokio::spawn(async move {
         // Guard to release semaphore and cleanup DashMap on task exit
         let _guard = (permit, r_cancel);
-        let mut recv_buf = BytesMut::with_capacity(MAX_FRAME_SIZE + 2);
+        let mut recv_buf = Vec::with_capacity(MAX_FRAME_SIZE + 2);
 
         loop {
             tokio::select! {
@@ -263,16 +263,18 @@ fn handle_new_connection(
 
                         if recv_buf.len() < 2 + len { break; }
 
-                        recv_buf.advance(2);
-                        let data = recv_buf.split_to(len).freeze();
+                        let mut without_header = recv_buf.split_off(2); // [2..] — skip length prefix
+                        recv_buf = without_header.split_off(len);
 
                         // Use try_send to prevent reader task from blocking if SFU logic lags
                         if let Err(_) = packet_tx.try_send(RecvPacketBatch {
                             src: peer_addr,
                             dst: local_addr,
-                            buf: data,
-                            stride: len,
-                            len,
+                                payload: GroPayload {
+                                buf: without_header,
+                                stride: len,
+                                len,
+                            },
                             transport: Transport::Tcp,
                         }) {
                             tracing::debug!("TCP packet dropped: Global queue full");
@@ -350,8 +352,8 @@ mod tests {
         reader.try_recv_batch(&mut out).unwrap();
 
         assert_eq!(out.len(), 2);
-        assert_eq!(&out[0].buf[..], p1);
-        assert_eq!(&out[1].buf[..], p2);
+        assert_eq!(&out[0].payload.buf[..], p1);
+        assert_eq!(&out[1].payload.buf[..], p2);
         let client_addr = out[0].src;
 
         // 4. Test RFC 4571 Egress (Server -> Client)

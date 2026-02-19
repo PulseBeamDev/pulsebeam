@@ -168,8 +168,8 @@ impl GatewayWorkerActor {
                 Ok(_) => {
                     for batch in self.recv_batches.drain(..) {
                         // Calculate logical packets (GRO awareness)
-                        let cost = if batch.stride > 0 {
-                            std::cmp::max(1, batch.len / batch.stride)
+                        let cost = if batch.payload.stride > 0 {
+                            std::cmp::max(1, batch.payload.len / batch.payload.stride)
                         } else {
                             1
                         };

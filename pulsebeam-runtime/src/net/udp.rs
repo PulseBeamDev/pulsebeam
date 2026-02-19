@@ -1,7 +1,6 @@
-use crate::net::{Transport, UdpMode};
+use crate::net::{GroPayload, Transport, UdpMode};
 
 use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
-use bytes::Bytes;
 use quinn_udp::RecvMeta;
 use std::{
     io::{self, ErrorKind, IoSliceMut},
@@ -120,30 +119,29 @@ impl UdpTransportReader {
             match res {
                 Ok(count) => {
                     let new_buffer = Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE);
-                    let filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
-                    let master_bytes = Bytes::from(filled_buffer);
+                    let mut filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
 
                     for i in 0..count {
                         let m = &self.meta[i];
 
-                        let start = i * CHUNK_SIZE;
-                        let end = start + m.len;
-
                         // Safety: Ensure we don't slice past the buffer (e.g., if kernel lied about len)
-                        if end > master_bytes.len() {
+                        if m.len > filled_buffer.len() {
                             continue;
                         }
 
-                        let buf = master_bytes.slice(start..end);
+                        let next_buf = filled_buffer.split_off(m.len);
 
                         out.push(RecvPacketBatch {
                             src: m.addr,
                             dst: self.local_addr,
-                            buf,
-                            stride: m.stride,
-                            len: m.len,
+                            payload: GroPayload {
+                                buf: filled_buffer,
+                                stride: m.stride,
+                                len: m.len,
+                            },
                             transport: Transport::Udp(UdpMode::Batch),
                         });
+                        filled_buffer = next_buf;
                     }
                     Ok(())
                 }

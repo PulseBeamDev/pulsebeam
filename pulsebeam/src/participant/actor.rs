@@ -5,6 +5,7 @@ use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, room, track};
+use futures_util::FutureExt;
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::net::UnifiedSocketWriter;
@@ -141,6 +142,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
+
+                    while let Some(Some((meta, pkt))) = self.core.downstream.next().now_or_never() {
+                        self.core.handle_forward_rtp(meta, pkt);
+                    }
 
                     maybe_deadline = self.core.poll();
                     // this indicates the first batch is filled.

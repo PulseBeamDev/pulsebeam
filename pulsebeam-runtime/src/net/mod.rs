@@ -1,12 +1,10 @@
 pub mod tcp;
 pub mod udp;
 pub mod udp_scalar;
-
-use bytes::Bytes;
 use std::{io, net::SocketAddr};
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
-pub const CHUNK_SIZE: usize = 64 * 1024;
+pub const CHUNK_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UdpMode {
@@ -22,18 +20,26 @@ pub enum Transport {
     Tcp,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RecvPacketBatch {
     pub src: SocketAddr,
     pub dst: SocketAddr,
-    pub buf: Bytes,
-    pub stride: usize,
-    pub len: usize,
     pub transport: Transport,
+    pub payload: GroPayload,
 }
 
-impl RecvPacketBatch {
-    pub fn iter(&self) -> RecvPacketBatchIter<'_> {
+#[derive(Debug)]
+pub struct GroPayload {
+    pub buf: Vec<u8>,
+    pub stride: usize,
+    pub len: usize,
+}
+
+impl IntoIterator for GroPayload {
+    type Item = Vec<u8>;
+    type IntoIter = RecvPacketBatchIter;
+
+    fn into_iter(self) -> Self::IntoIter {
         RecvPacketBatchIter {
             batch: self,
             offset: 0,
@@ -41,22 +47,13 @@ impl RecvPacketBatch {
     }
 }
 
-impl<'a> IntoIterator for &'a RecvPacketBatch {
-    type Item = Bytes;
-    type IntoIter = RecvPacketBatchIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-pub struct RecvPacketBatchIter<'a> {
-    batch: &'a RecvPacketBatch,
+pub struct RecvPacketBatchIter {
+    batch: GroPayload,
     offset: usize,
 }
 
-impl<'a> Iterator for RecvPacketBatchIter<'a> {
-    type Item = Bytes;
+impl Iterator for RecvPacketBatchIter {
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset >= self.batch.len {
@@ -67,9 +64,11 @@ impl<'a> Iterator for RecvPacketBatchIter<'a> {
         if seg_len == 0 {
             return None;
         }
-        let packet_buf = self.batch.buf.slice(self.offset..self.offset + seg_len);
+        // split_off returns the tail [seg_len..], we want the head [..seg_len]
+        let tail = self.batch.buf.split_off(seg_len);
+        let segment = std::mem::replace(&mut self.batch.buf, tail);
         self.offset += seg_len;
-        Some(packet_buf)
+        Some(segment)
     }
 }
 
