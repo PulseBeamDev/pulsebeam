@@ -28,9 +28,9 @@ struct Ring<T> {
     // This is mspc, but we expect very low contention on the producers.
     // Mutex is generally cheaper than RWLock. So, no reason to pay
     // RWLock overhead.
-    slots: Vec<Mutex<Slot<T>>>, // per-slot mutex
+    slots: Vec<Mutex<Slot<T>>>,
     mask: usize,
-    head: AtomicU64, // next free sequence number
+    head: AtomicU64,
     event: Event,
     closed: AtomicU64,
 }
@@ -63,7 +63,7 @@ pub enum TrySendError<T> {
     Closed(T),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Sender<T> {
     ring: Arc<Ring<T>>,
 }
@@ -74,7 +74,6 @@ impl<T> Sender<T> {
             return Err(TrySendError::Closed(val));
         }
 
-        // Atomically claim slot
         let seq = self.ring.head.fetch_add(1, Ordering::AcqRel);
         let idx = (seq as usize) & self.ring.mask;
 
@@ -84,18 +83,21 @@ impl<T> Sender<T> {
             slot.seq = seq;
         }
 
-        // there's only 1 consumer
         self.ring.event.notify(1);
         Ok(())
     }
 }
 
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        // TODO: there's no notification for receiver when no senders left.
-        // self.ring.closed.store(1, Ordering::Release);
-        // self.ring.event.notify(usize::MAX);
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: self.ring.clone(),
+        }
     }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -113,7 +115,7 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-impl<T: Clone> Receiver<T> {
+impl<T> Receiver<T> {
     const METRIC_FLUSH_MASK: u64 = 1023;
 
     pub async fn recv(&mut self) -> Result<T, RecvError> {
@@ -124,17 +126,14 @@ impl<T: Clone> Receiver<T> {
         loop {
             let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
 
-            // Refresh local snapshot of head
             if self.next_seq == self.local_head {
                 self.local_head = self.ring.head.load(Ordering::Acquire);
             }
 
-            // Closed + nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= self.local_head {
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
-            // No new items
             if self.next_seq >= self.local_head {
                 match &mut self.listener {
                     Some(l) => {
@@ -152,11 +151,10 @@ impl<T: Clone> Receiver<T> {
             }
 
             let idx = (self.next_seq as usize) & self.ring.mask;
-            let slot = self.ring.slots[idx].lock();
+            let mut slot = self.ring.slots[idx].lock();
             let slot_seq = slot.seq;
 
             if slot_seq != self.next_seq {
-                // Sanity check: seq should be ahead of us if we lagged
                 let lagged = slot.seq > self.next_seq;
                 drop(slot);
 
@@ -165,7 +163,6 @@ impl<T: Clone> Receiver<T> {
                     metrics::counter!("mpsc_receive_lag_total").increment(1);
                     return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
                 } else {
-                    // Stale slot, producer hasn't reached here yet
                     if self.listener.is_none() {
                         self.listener = Some(self.ring.event.listen());
                     }
@@ -173,9 +170,8 @@ impl<T: Clone> Receiver<T> {
                 }
             }
 
-            if let Some(ref v) = slot.val {
+            if let Some(val) = slot.val.take() {
                 coop.made_progress();
-                let out = v.clone();
                 self.next_seq += 1;
                 self.pkts_received += 1;
 
@@ -183,7 +179,7 @@ impl<T: Clone> Receiver<T> {
                     drop(slot);
                     self.flush_metrics();
                 }
-                return Poll::Ready(Ok(out));
+                return Poll::Ready(Ok(val));
             }
 
             self.next_seq = self.local_head;
@@ -193,8 +189,6 @@ impl<T: Clone> Receiver<T> {
     }
 
     fn flush_metrics(&mut self) {
-        // Use the existing local_head snapshot.
-        // This tells us how much is still left in the current "batch".
         let current_drift = self.local_head.saturating_sub(self.next_seq);
         let capacity = (self.ring.mask + 1) as f64;
 
@@ -204,7 +198,7 @@ impl<T: Clone> Receiver<T> {
     }
 }
 
-impl<T: Clone> Stream for Receiver<T> {
+impl<T> Stream for Receiver<T> {
     type Item = Result<T, StreamRecvError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -217,19 +211,7 @@ impl<T: Clone> Stream for Receiver<T> {
     }
 }
 
-impl<T: Clone> Clone for Receiver<T> {
-    fn clone(&self) -> Self {
-        Self {
-            ring: self.ring.clone(),
-            next_seq: self.next_seq,
-            local_head: self.local_head,
-            listener: None,
-            pkts_received: 0,
-        }
-    }
-}
-
-pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+pub fn channel<T: Send + Sync + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     metrics::describe_histogram!(
         "mpsc_receive_drift_ratio",
         "The ratio of the buffer capacity currently occupied by unread packets \
@@ -247,6 +229,7 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
         "The total number of times a receiver was too slow and was overwritten by \
         the producer, resulting in dropped data."
     );
+
     let ring = Ring::new(capacity);
     (
         Sender { ring: ring.clone() },
