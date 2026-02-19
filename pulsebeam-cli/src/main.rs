@@ -217,7 +217,7 @@ async fn run_bench(api_url: String, scenario: Scenario, users: usize, duration: 
             }
         });
 
-        let jitter = rand::random_range(0..200_000);
+        let jitter = rand::random_range(0..2_000);
         tokio::time::sleep(Duration::from_millis(10) + Duration::from_micros(jitter)).await;
     }
 
