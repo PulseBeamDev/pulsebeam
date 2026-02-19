@@ -41,7 +41,8 @@ perf:
 	sudo sysctl -w kernel.kptr_restrict=0
 	sudo sysctl -w kernel.perf_event_paranoid=-1
 	sudo perf record -p $(PIDS) \
-		-e cycles --sample-cpu \
+		--sample-cpu \
+		-e cycles,cache-misses,LLC-load-misses \
 		-e sched:sched_switch --switch-events \
 		--call-graph fp \
 		-m 16M \

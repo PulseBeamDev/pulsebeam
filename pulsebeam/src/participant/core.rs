@@ -119,11 +119,9 @@ impl ParticipantCore {
     }
 
     pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) -> Option<Instant> {
-        let mut last_deadline = None;
         let transport = match batch.transport {
             Transport::Udp(_) => str0m::net::Protocol::Udp,
             Transport::Tcp => str0m::net::Protocol::Tcp,
-            _ => str0m::net::Protocol::Udp,
         };
         for pkt in batch.into_iter() {
             if let Ok(contents) = (*pkt).try_into() {
@@ -136,13 +134,12 @@ impl ParticipantCore {
                 let _ = self
                     .rtc
                     .handle_input(Input::Receive(Instant::now().into(), recv));
-                last_deadline = self.poll();
             } else {
                 tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
             }
         }
 
-        last_deadline
+        self.poll()
     }
 
     pub fn handle_tick(&mut self) -> Option<Instant> {

@@ -68,13 +68,14 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
 
     tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
-    let node_handle = NodeBuilder::new()
+    let node = NodeBuilder::new()
         .workers(workers)
         .local_addr(local_addr)
         .external_addr(external_addr)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr)
         .run(shutdown.child_token());
+    let node_handle = tokio::spawn(node);
 
     tracing::info!("server started...");
 
