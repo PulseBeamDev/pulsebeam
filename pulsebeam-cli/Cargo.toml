@@ -15,6 +15,7 @@ clap = { version = "4.5.59", features = ["derive"] }
 pulsebeam-agent = { path = "../pulsebeam-agent" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["reqwest"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+rand.workspace = true
 reqwest = "0.13.1"
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -36,24 +36,17 @@ flamegraph: profile
 
 perf:
 	@# Capture PIDs, replace newlines with commas, and trim the trailing comma
-	$(eval PIDS := $(shell pgrep pulsebeam | paste -sd "," -))
+	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi; \
+	sudo sysctl -w kernel.kptr_restrict=0
+	sudo sysctl -w kernel.perf_event_paranoid=-1
 	sudo perf record -p $(PIDS) \
-    -F 997 \
-    --call-graph dwarf,8192 \
-    -m 8M \
-    -e cycles,cache-misses,context-switches \
-    -- sleep 30
+		-e cycles --sample-cpu \
+		-e sched:sched_switch --switch-events \
+		--call-graph fp \
+		-m 16M \
+    -- sleep 30 
 	sudo hotspot perf.data
-
-prepare-video:
-	ffmpeg -r 30 -i video.h264 \
-    -filter_complex "[0:v]split=3[v_f][v_h][v_q]; \
-                     [v_h]scale=iw/2:-2[h_scaled]; \
-                     [v_q]scale=iw/4:-2[q_scaled]" \
-    -map "[v_f]" -c:v:0 libx264 -profile:v:0 baseline -b:v:0 1250k -maxrate:v:0 1250k -bufsize:v:0 2500k -g 60 -tune zerolatency -x264-params "annexb=1:repeat-headers=1" -bf 0 -r 30 full_f.h264 \
-    -map "[h_scaled]" -c:v:1 libx264 -profile:v:1 baseline -b:v:1 400k -maxrate:v:1 400k -bufsize:v:1 800k -g 60 -tune zerolatency -x264-params "annexb=1:repeat-headers=1" -bf 0 -r 30 half_h.h264 \
-    -map "[q_scaled]" -c:v:2 libx264 -profile:v:2 baseline -b:v:2 150k -maxrate:v:2 150k -bufsize:v:2 300k -g 60 -tune zerolatency -x264-params "annexb=1:repeat-headers=1" -bf 0 -r 30 quarter_q.h264
 
 deps: deps-brew deps-cargo gh-deps
 

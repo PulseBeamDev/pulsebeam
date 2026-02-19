@@ -2734,6 +2734,7 @@ dependencies = [
  "pulsebeam-agent",
  "pulsebeam-core",
  "pulsebeam-testdata",
+ "rand",
  "reqwest",
  "tokio",
  "tracing",

@@ -48,7 +48,7 @@ turmoil = "0.7.1"
 
 [profile.release]
 opt-level = 3
-debug = true  # Full debug info for symbols and source lines
+debug = 1
 strip = false  # Retain symbols for profiling
 debug-assertions = false
 lto = "thin"

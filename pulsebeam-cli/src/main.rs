@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use pulsebeam_agent::{
-    MediaKind, Rid, SimulcastLayer, TransceiverDirection,
+    MediaKind, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack},
     api::HttpApiClient,
     media::H264Looper,
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::error;
 
 #[derive(Parser)]
 struct Cli {
@@ -37,26 +37,45 @@ enum Commands {
 
 #[derive(Copy, Clone, ValueEnum, Debug)]
 enum Scenario {
-    Meeting, // Many-to-Many
-    Webinar, // One-to-Many
+    Meeting,
+    Webinar,
 }
 
-// --- Statistics Messages ---
 #[derive(Debug)]
-struct StatReport {
+struct PeerStatReport {
+    agent_id: usize,
+    rtt_ms: Option<u128>,
+}
+
+#[derive(Debug)]
+struct TxStatReport {
     agent_id: usize,
     rid: String,
-    bytes_tx: u64,
-    bytes_rx: u64,
-    packets_lost: u64,
+    bytes: u64,
     nacks: u64,
     plis: u64,
-    rtt_ms: Option<u128>,
+}
+
+#[derive(Debug)]
+struct RxStatReport {
+    agent_id: usize,
+    rid: String,
+    bytes: u64,
+    packets: u64,
+    packets_lost: f32,
+    nacks: u64,
+    plis: u64,
+}
+
+#[derive(Debug)]
+enum StatReport {
+    Peer(PeerStatReport),
+    Tx(TxStatReport),
+    Rx(RxStatReport),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Only log warnings/errors to avoid polluting the stats table
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .init();
@@ -68,91 +87,113 @@ async fn main() -> Result<()> {
             scenario,
             duration,
             users,
-        } => {
-            run_bench(cli.api_url, scenario, users, duration).await?;
-        }
+        } => run_bench(cli.api_url, scenario, users, duration).await?,
     }
+
     Ok(())
 }
 
 async fn run_bench(api_url: String, scenario: Scenario, users: usize, duration: u64) -> Result<()> {
-    let (stats_tx, mut stats_rx) = mpsc::channel::<StatReport>(1000);
+    let (stats_tx, mut stats_rx) = mpsc::channel::<StatReport>(5000);
     let mut join_set = JoinSet::new();
     let room = format!("bench-{}", Instant::now().elapsed().as_micros());
     let running = Arc::new(AtomicBool::new(true));
 
     println!(
-        "🚀 Starting Benchmark: {:?} | Users: {} | Duration: {}s",
-        scenario, users, duration
-    );
-    println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!(
-        "|  Time  |   Tx Mbps  |   Rx Mbps  |  Loss (pkts) |  NACKs/s |  PLIs/s  | Avg RTT  |"
-    );
-    println!(
-        "-----------------------------------------------------------------------------------------"
+        "🚀 Starting Benchmark: {:?} | Users: {} | Duration: {}s | Room: {}",
+        scenario, users, duration, room
     );
 
-    // 1. Spawn the Monitor Task (The Aggregator)
+    println!(
+        "--------------------------------------------------------------------------------------------------------"
+    );
+    println!(
+        "| Time  | Tx Mbps | Rx Mbps | Rx Loss pkts/s | Tx NACK/s | Rx NACK/s | Tx PLI/s | Rx PLI/s | Avg RTT |"
+    );
+    println!(
+        "--------------------------------------------------------------------------------------------------------"
+    );
+
     let monitor_running = running.clone();
     let monitor_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let start = Instant::now();
 
-        // Aggregation Buckets
-        let mut total_tx_bytes = 0u64;
-        let mut total_rx_bytes = 0u64;
-        let mut total_loss = 0u64;
-        let mut total_nacks = 0u64;
-        let mut total_plis = 0u64;
+        let mut tx_bytes = 0u64;
+        let mut rx_bytes = 0u64;
+        let mut rx_loss = 0.0f32;
+
+        let mut tx_nacks = 0u64;
+        let mut rx_nacks = 0u64;
+
+        let mut tx_plis = 0u64;
+        let mut rx_plis = 0u64;
+
         let mut rtt_sum = 0u128;
         let mut rtt_count = 0u128;
 
-        let start = Instant::now();
-
         loop {
             tokio::select! {
-                // Collect incoming stats
                 Some(report) = stats_rx.recv() => {
-                    total_tx_bytes += report.bytes_tx;
-                    total_rx_bytes += report.bytes_rx;
-                    total_loss += report.packets_lost;
-                    total_nacks += report.nacks;
-                    total_plis += report.plis;
-                    if let Some(rtt) = report.rtt_ms {
-                        rtt_sum += rtt;
-                        rtt_count += 1;
+                    match report {
+                        StatReport::Peer(peer) => {
+                            if let Some(rtt) = peer.rtt_ms {
+                                rtt_sum += rtt;
+                                rtt_count += 1;
+                            }
+                        }
+                        StatReport::Tx(tx) => {
+                            tx_bytes += tx.bytes;
+                            tx_nacks += tx.nacks;
+                            tx_plis += tx.plis;
+                        }
+                        StatReport::Rx(rx) => {
+                            rx_bytes += rx.bytes;
+                            rx_loss += rx.packets_lost;
+                            rx_nacks += rx.nacks;
+                            rx_plis += rx.plis;
+                        }
                     }
                 }
-                // Print Summary every second
+
                 _ = interval.tick() => {
-                    if !monitor_running.load(Ordering::Relaxed) { break; }
+                    if !monitor_running.load(Ordering::Relaxed) {
+                        break;
+                    }
 
-                    // Avoid printing the very first tick (zeros)
-                    if start.elapsed().as_secs() == 0 { continue; }
+                    if start.elapsed().as_secs() == 0 {
+                        continue;
+                    }
 
-                    let tx_mbps = (total_tx_bytes * 8) as f64 / 1_000_000.0;
-                    let rx_mbps = (total_rx_bytes * 8) as f64 / 1_000_000.0;
-                    let avg_rtt = if rtt_count > 0 { rtt_sum / rtt_count } else { 0 };
+                    let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
+                    let rx_mbps = (rx_bytes * 8) as f64 / 1_000_000.0;
+
+                    let avg_rtt = if rtt_count > 0 {
+                        rtt_sum / rtt_count
+                    } else {
+                        0
+                    };
 
                     println!(
-                        "| {:>5}s | {:>9.2} | {:>9.2} | {:>11} | {:>8} | {:>7} | {:>6}ms |",
+                        "| {:>5}s | {:>6.2} | {:>6.2} | {:>13} | {:>9} | {:>9} | {:>8} | {:>8} | {:>6}ms |",
                         start.elapsed().as_secs(),
                         tx_mbps,
                         rx_mbps,
-                        total_loss,
-                        total_nacks,
-                        total_plis,
-                        avg_rtt
+                        rx_loss,
+                        tx_nacks,
+                        rx_nacks,
+                        tx_plis,
+                        rx_plis,
+                        avg_rtt,
                     );
 
-                    // Reset counters for the next second (Windowed Stats)
-                    total_tx_bytes = 0;
-                    total_rx_bytes = 0;
-                    total_loss = 0;
-                    total_nacks = 0;
-                    total_plis = 0;
+                    tx_bytes = 0;
+                    rx_bytes = 0;
+                    rx_loss = 0.0;
+                    tx_nacks = 0;
+                    rx_nacks = 0;
+                    tx_plis = 0;
+                    rx_plis = 0;
                     rtt_sum = 0;
                     rtt_count = 0;
                 }
@@ -160,7 +201,6 @@ async fn run_bench(api_url: String, scenario: Scenario, users: usize, duration: 
         }
     });
 
-    // 2. Spawn Agents
     for i in 0..users {
         let url = api_url.clone();
         let r_id = room.clone();
@@ -177,28 +217,34 @@ async fn run_bench(api_url: String, scenario: Scenario, users: usize, duration: 
             }
         });
 
-        // Stagger joins slightly to be realistic
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let jitter = rand::random_range(0..200_000);
+        tokio::time::sleep(Duration::from_millis(10) + Duration::from_micros(jitter)).await;
     }
 
-    // Drop the local tx so the receiver knows when all agents are gone (if we wanted to wait)
     drop(stats_tx);
 
-    // 3. Wait for Duration
     tokio::time::sleep(Duration::from_secs(duration)).await;
 
-    // Shutdown
     running.store(false, Ordering::Relaxed);
+
     println!(
-        "-----------------------------------------------------------------------------------------"
+        "--------------------------------------------------------------------------------------------------------"
     );
     println!("🏁 Benchmark Completed.");
 
-    // Cleanup
     join_set.shutdown().await;
     let _ = monitor_handle.await;
 
     Ok(())
+}
+
+#[derive(Default, Clone)]
+struct CounterSnapshot {
+    bytes: u64,
+    packets: u64,
+    nacks: u64,
+    plis: u64,
+    lost: f32,
 }
 
 async fn spawn_agent(
@@ -211,25 +257,28 @@ async fn spawn_agent(
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-    let mut builder = AgentBuilder::new(api, socket);
+    let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
+
     if is_pub {
         builder = builder.with_track(
             MediaKind::Video,
             TransceiverDirection::SendOnly,
-            Some(vec![
-                SimulcastLayer::new("f"),
-                SimulcastLayer::new("h"),
-                SimulcastLayer::new("q"),
-            ]),
+            None,
+            // Some(vec![
+            //     SimulcastLayer::new("f"),
+            //     SimulcastLayer::new("h"),
+            //     SimulcastLayer::new("q"),
+            // ]),
         );
     }
+
+    builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
 
     let mut agent = builder.connect(&room).await?;
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
 
-    // We need to track the *previous* value to calculate the delta (per second)
-    let mut prev_tx_bytes: HashMap<String, u64> = HashMap::new();
-    let mut prev_rx_bytes: HashMap<String, u64> = HashMap::new();
+    let mut prev_tx: HashMap<String, CounterSnapshot> = HashMap::new();
+    let mut prev_rx: HashMap<String, CounterSnapshot> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -238,60 +287,89 @@ async fn spawn_agent(
                     tokio::spawn(handle_local_track(track));
                 }
             }
+
             _ = stats_interval.tick() => {
-                if let Some(stats) = agent.get_stats().await {
-                    let mut rtt_ms = None;
-                    if let Some(peer) = &stats.peer {
-                        if let Some(rtt) = peer.rtt {
-                            rtt_ms = Some(rtt.as_millis());
+                let Some(stats) = agent.get_stats().await else { continue };
+
+                // ---- PEER stats (RTT) ----
+                let rtt_ms = stats.peer
+                    .as_ref()
+                    .and_then(|p| p.rtt)
+                    .map(|r| r.as_millis());
+
+                let _ = stats_tx.send(StatReport::Peer(PeerStatReport {
+                    agent_id: id,
+                    rtt_ms,
+                })).await;
+
+                // ---- TRACK stats ----
+                for (_, track_stat) in &stats.tracks {
+
+                    // ---- TX layers ----
+                    for (rid, egress) in &track_stat.tx_layers {
+                        let rid_key = rid.as_ref()
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+
+                        let prev = prev_tx.get(&rid_key).cloned().unwrap_or_default();
+
+                        let bytes_delta = egress.bytes.saturating_sub(prev.bytes);
+                        let nacks_delta = egress.nacks.saturating_sub(prev.nacks);
+                        let plis_delta = egress.plis.saturating_sub(prev.plis);
+
+                        prev_tx.insert(rid_key.clone(), CounterSnapshot {
+                            bytes: egress.bytes,
+                            packets: 0,
+                            nacks: egress.nacks,
+                            plis: egress.plis,
+                            lost: 0.0,
+                        });
+
+                        if bytes_delta > 0 || nacks_delta > 0 || plis_delta > 0 {
+                            let _ = stats_tx.send(StatReport::Tx(TxStatReport {
+                                agent_id: id,
+                                rid: rid_key,
+                                bytes: bytes_delta,
+                                nacks: nacks_delta,
+                                plis: plis_delta,
+                            })).await;
                         }
                     }
 
-                    // Collect TX (Publisher) Stats
-                    for (_, track_stat) in &stats.tracks {
-                        for (rid, egress) in &track_stat.tx_layers {
-                            let rid_key = rid.as_ref().map(|r| r.to_string()).unwrap_or_else(|| "none".to_string());
+                    // ---- RX layers ----
+                    for (rid, ingress) in &track_stat.rx_layers {
+                        let rid_key = rid.as_ref()
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "none".to_string());
 
-                            let last = *prev_tx_bytes.get(&rid_key).unwrap_or(&0);
-                            let delta = egress.bytes.saturating_sub(last);
-                            prev_tx_bytes.insert(rid_key.clone(), egress.bytes);
+                        let prev = prev_rx.get(&rid_key).cloned().unwrap_or_default();
 
-                            if delta > 0 || egress.nacks > 0 {
-                                let _ = stats_tx.send(StatReport {
-                                    agent_id: id,
-                                    rid: rid_key,
-                                    bytes_tx: delta,
-                                    bytes_rx: 0, // TX only
-                                    packets_lost: 0, // Usually calculated on RX side
-                                    nacks: egress.nacks, // NACKs received
-                                    plis: egress.plis,
-                                    rtt_ms,
-                                }).await;
-                            }
-                        }
+                        let bytes_delta = ingress.bytes.saturating_sub(prev.bytes);
+                        let packets_delta = ingress.packets.saturating_sub(prev.packets);
 
-                        // Collect RX (Subscriber) Stats
-                        for (rid, ingress) in &track_stat.rx_layers {
-                            let rid_key = rid.as_ref().map(|r| r.to_string()).unwrap_or_else(|| "none".to_string());
+                        let loss = ingress.loss.unwrap_or(0.0);
 
-                            let last = *prev_rx_bytes.get(&rid_key).unwrap_or(&0);
-                            let delta = ingress.bytes.saturating_sub(last);
-                            prev_rx_bytes.insert(rid_key.clone(), ingress.bytes);
+                        let nacks_delta = ingress.nacks.saturating_sub(prev.nacks);
+                        let plis_delta = ingress.plis.saturating_sub(prev.plis);
 
-                            let lost_pkts = (ingress.loss.unwrap_or(0.0) * ingress.packets as f32) as u64;
+                        prev_rx.insert(rid_key.clone(), CounterSnapshot {
+                            bytes: ingress.bytes,
+                            packets: ingress.packets,
+                            nacks: ingress.nacks,
+                            plis: ingress.plis,
+                            lost: loss,
+                        });
 
-                            if delta > 0 {
-                                let _ = stats_tx.send(StatReport {
-                                    agent_id: id,
-                                    rid: rid_key,
-                                    bytes_tx: 0,
-                                    bytes_rx: delta,
-                                    packets_lost: lost_pkts,
-                                    nacks: ingress.nacks,
-                                    plis: ingress.plis,
-                                    rtt_ms,
-                                }).await;
-                            }
+                        if bytes_delta > 0 || packets_delta > 0 || loss > 0.0 || nacks_delta > 0 || plis_delta > 0 {
+                            let _ = stats_tx.send(StatReport::Rx(RxStatReport {
+                                agent_id: id,
+                                rid: rid_key,
+                                bytes: bytes_delta,
+                                packets: packets_delta,
+                                packets_lost: loss,
+                                nacks: nacks_delta,
+                                plis: plis_delta,
+                            })).await;
                         }
                     }
                 }
@@ -307,10 +385,9 @@ async fn handle_local_track(track: LocalTrack) {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL,
         Some("h") => pulsebeam_testdata::RAW_H264_HALF,
         Some("q") => pulsebeam_testdata::RAW_H264_QUARTER,
-        _ => pulsebeam_testdata::RAW_H264_FULL,
+        _ => pulsebeam_testdata::RAW_H264_HALF,
     };
 
     let looper = H264Looper::new(data, 30);
-    // Ignore errors here to keep the CLI output clean
     let _ = looper.run(track).await;
 }
