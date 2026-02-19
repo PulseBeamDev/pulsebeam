@@ -52,8 +52,15 @@ perf:
 stats:
 	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi; \
-	perf stat -e cpu_core/L1-dcache-loads/,cpu_core/L1-dcache-load-misses/,cpu_core/LLC-loads/,cpu_core/LLC-load-misses/,cpu_core/instructions/,cpu_core/cpu-cycles/ \
-		-p $(PIDS)
+	perf stat -e cpu_core/L1-dcache-loads/ \
+		-e cpu_core/L1-dcache-load-misses/ \
+    -e cpu_core/L1-dcache-stores/ \
+		-e cpu_core/L1-dcache-store-misses/ \
+    -e cpu_core/l2_rqsts.miss/ \
+    -e cpu_core/LLC-loads/,cpu_core/LLC-load-misses/ \
+    -e dtlb-load-misses,dtlb-store-misses \
+    -e instructions,cpu-cycles \
+    -p $(PIDS)
 
 deps: deps-brew deps-cargo gh-deps
 
