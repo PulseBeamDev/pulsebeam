@@ -38,7 +38,12 @@ perf:
 	@# Capture PIDs, replace newlines with commas, and trim the trailing comma
 	$(eval PIDS := $(shell pgrep pulsebeam | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi; \
-	sudo perf record -m 4M -p $(PIDS) -s --call-graph dwarf,16384 -F 1000 -- sleep 10
+	sudo perf record -p $(PIDS) \
+    -F 997 \
+    --call-graph dwarf,8192 \
+    -m 8M \
+    -e cycles,cache-misses,context-switches \
+    -- sleep 30
 	sudo hotspot perf.data
 
 prepare-video:
@@ -58,6 +63,13 @@ deps-brew:
 deps-cargo:
 	$(CARGO_CMD) install cargo-release cargo-dist git-cliff
 	$(CARGO_CMD) install flamegraph cargo-machete
+
+deps-profile:
+	# used for perf record speed up
+	$(CARGO_CMD) install addr2line --features=bin
+	# https://github.com/flamegraph-rs/flamegraph/issues/74
+	sudo cp /usr/bin/addr2line /usr/bin/addr2line-bak
+	sudo cp target/release/examples/addr2line /usr/bin/addr2line
 
 deps-gh:
 	gh extension install yusukebe/gh-markdown-preview
