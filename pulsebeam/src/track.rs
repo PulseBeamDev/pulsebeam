@@ -1,15 +1,10 @@
 use std::fmt::Display;
-use std::pin::Pin;
-use std::{
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
-use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{sync::Arc, time::Duration};
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::rtp::{
@@ -18,7 +13,63 @@ use crate::rtp::{
     sync::Synchronizer,
 };
 
-pub type KeyframeRequestStream = Pin<Box<dyn Stream<Item = KeyframeRequest> + Send>>;
+/// Leading-edge debounce interval for keyframe requests forwarded upstream.
+pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Sends keyframe requests from a [`SimulcastReceiver`] to the upstream publisher.
+///
+/// Always requests PLI — the publisher decides the exact RTCP feedback type.
+#[derive(Clone, Debug)]
+pub struct KeyframeRequester {
+    signal: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl KeyframeRequester {
+    /// Signal that a PLI keyframe is needed.
+    pub fn request(&self) {
+        self.signal.store(true, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+}
+
+/// Polls a pending keyframe request with leading-edge debounce.
+///
+/// Owned by `UpstreamAllocator`; the corresponding [`KeyframeRequester`] is held
+/// by each [`SimulcastReceiver`].
+#[derive(Debug)]
+pub struct KeyframePoll {
+    signal: Arc<AtomicBool>,
+    pub mid: Mid,
+    pub rid: Option<Rid>,
+    debounce: Duration,
+    last_sent: Option<Instant>,
+}
+
+impl KeyframePoll {
+    /// Return a pending PLI [`KeyframeRequest`] if one is flagged and debounce permits.
+    ///
+    /// Leading-edge semantics: the first request in any window passes through
+    /// immediately; subsequent requests within the same window are discarded.
+    pub fn take_pending(&mut self, now: Instant) -> Option<KeyframeRequest> {
+        if !self.signal.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.signal.store(false, Ordering::Relaxed);
+        // Within debounce window: discard.
+        if let Some(last) = self.last_sent {
+            if now.duration_since(last) < self.debounce {
+                return None;
+            }
+        }
+        self.last_sent = Some(now);
+        Some(KeyframeRequest {
+            kind: KeyframeRequestKind::Pli,
+            rid: self.rid,
+            mid: self.mid,
+        })
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -55,7 +106,7 @@ pub struct SimulcastReceiver {
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
     pub channel: spmc::Receiver<RtpPacket>,
-    pub keyframe_requester: mpsc::Sender<KeyframeRequestKind>,
+    pub keyframe_requester: KeyframeRequester,
     pub state: StreamState,
 }
 
@@ -70,10 +121,8 @@ impl Display for SimulcastReceiver {
 }
 
 impl SimulcastReceiver {
-    pub fn request_keyframe(&self, kind: KeyframeRequestKind) {
-        if let Err(err) = self.keyframe_requester.try_send(kind) {
-            tracing::warn!("failed to request keyframe: {err:?}");
-        }
+    pub fn request_keyframe(&self) {
+        self.keyframe_requester.request();
     }
 }
 
@@ -86,7 +135,6 @@ pub struct SimulcastSender {
     synchronizer: Synchronizer,
     channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
-    keyframe_requests: Option<mpsc::Receiver<KeyframeRequestKind>>,
 }
 
 impl PartialEq for SimulcastSender {
@@ -111,25 +159,24 @@ impl SimulcastSender {
             self.channel.send(pkt);
         }
     }
-
-    pub fn keyframe_request_stream(&mut self, debounce: Duration) -> KeyframeRequestStream {
-        let stream = self.keyframe_requests.take().unwrap();
-        let rid = self.rid;
-        let mid = self.mid;
-        let watch_stream = ReceiverStream::new(stream);
-
-        let debounced = LeadingEdgeDebounce::new(watch_stream, debounce)
-            .map(move |kind| KeyframeRequest { kind, rid, mid });
-
-        Box::pin(debounced)
-    }
 }
 
-#[derive(PartialEq, Eq)]
 pub struct TrackSender {
     pub meta: Arc<TrackMeta>,
     pub simulcast: Vec<SimulcastSender>,
+    /// Shared notification handle; set by subscribers via [`KeyframeRequester`].
+    pub keyframe_notify: Arc<Notify>,
+    /// Per-simulcast-layer poll handles, drained by the upstream actor.
+    pub keyframe_polls: Vec<KeyframePoll>,
 }
+
+impl PartialEq for TrackSender {
+    fn eq(&self, other: &Self) -> bool {
+        self.meta == other.meta && self.simulcast == other.simulcast
+    }
+}
+
+impl Eq for TrackSender {}
 
 impl TrackSender {
     pub fn forward(&mut self, rid: Option<&Rid>, packet: RtpPacket) {
@@ -235,8 +282,10 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
 
     simulcast_rids.sort_by_key(|rid| rid.unwrap_or_default().to_string());
 
+    let keyframe_notify = Arc::new(Notify::new());
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
+    let mut keyframe_polls = Vec::new();
 
     for rid in simulcast_rids {
         // TODO: get this from SDP instead
@@ -263,11 +312,23 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
         };
 
         let (tx, rx) = spmc::channel(BASE_CAP * cap_tier);
-        let (keyframe_tx, keyframe_rx) = mpsc::channel(1);
+        // Shared atomic signal: receiver writes, poll-side reads.
+        let signal = Arc::new(AtomicBool::new(false));
 
         let stream_state = StreamState::new(true, bitrate);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
+
+        // Only video tracks need keyframe polling.
+        if meta.kind == MediaKind::Video {
+            keyframe_polls.push(KeyframePoll {
+                signal: signal.clone(),
+                mid,
+                rid,
+                debounce: KEYFRAME_DEBOUNCE,
+                last_sent: None,
+            });
+        }
 
         senders.push(SimulcastSender {
             mid,
@@ -276,7 +337,6 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             filter,
             synchronizer: Synchronizer::new(clock_rate),
             channel: tx,
-            keyframe_requests: Some(keyframe_rx),
             monitor,
         });
         receivers.push(SimulcastReceiver {
@@ -284,7 +344,10 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             quality,
             rid,
             channel: rx,
-            keyframe_requester: keyframe_tx,
+            keyframe_requester: KeyframeRequester {
+                signal,
+                notify: keyframe_notify.clone(),
+            },
             state: stream_state,
         });
     }
@@ -295,6 +358,8 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
         TrackSender {
             meta: meta.clone(),
             simulcast: senders,
+            keyframe_notify,
+            keyframe_polls,
         },
         TrackReceiver {
             meta,
@@ -340,56 +405,58 @@ fn should_forward_noop(_: &RtpPacket) -> bool {
     true
 }
 
-/// A stream wrapper for leading-edge debounce
-pub struct LeadingEdgeDebounce<S> {
-    inner: S,
-    debounce_duration: Duration,
-    last_emitted: Option<Instant>,
-}
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+    use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
-impl<S> LeadingEdgeDebounce<S> {
-    pub fn new(inner: S, debounce_duration: Duration) -> Self {
-        Self {
-            inner,
-            debounce_duration,
-            last_emitted: None,
-        }
+    /// Stream wrapper that implements leading-edge debounce (test helper only).
+    struct LeadingEdgeDebounce<S> {
+        inner: S,
+        debounce_duration: Duration,
+        last_emitted: Option<Instant>,
     }
-}
 
-impl<S, T> Stream for LeadingEdgeDebounce<S>
-where
-    S: Stream<Item = T> + Unpin,
-{
-    type Item = T;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match Pin::new(&mut self.inner).poll_next(cx) {
-                Poll::Ready(Some(item)) => {
-                    let now = Instant::now();
-                    match self.last_emitted {
-                        Some(last) if now.duration_since(last) < self.debounce_duration => {
-                            // Ignore item, still in debounce period
-                            continue;
-                        }
-                        _ => {
-                            // Leading edge: emit immediately
-                            self.last_emitted = Some(now);
-                            return Poll::Ready(Some(item));
-                        }
-                    }
-                }
-                other => return other,
+    impl<S> LeadingEdgeDebounce<S> {
+        fn new(inner: S, debounce_duration: Duration) -> Self {
+            Self {
+                inner,
+                debounce_duration,
+                last_emitted: None,
             }
         }
     }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
+
+    impl<S, T> Stream for LeadingEdgeDebounce<S>
+    where
+        S: Stream<Item = T> + Unpin,
+    {
+        type Item = T;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            loop {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(item)) => {
+                        let now = Instant::now();
+                        match self.last_emitted {
+                            Some(last) if now.duration_since(last) < self.debounce_duration => {
+                                continue;
+                            }
+                            _ => {
+                                self.last_emitted = Some(now);
+                                return Poll::Ready(Some(item));
+                            }
+                        }
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn test_leading_edge_debounce() {

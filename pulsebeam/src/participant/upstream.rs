@@ -1,16 +1,12 @@
-use std::time::Duration;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::time::Instant;
-use tokio_stream::StreamMap;
 
-use crate::{rtp::RtpPacket, track::KeyframeRequestStream};
-use str0m::media::{MediaKind, Mid, Rid};
-
-use crate::track::TrackSender;
+use crate::rtp::RtpPacket;
+use crate::track::{KeyframePoll, TrackSender};
+use str0m::media::{KeyframeRequest, MediaKind, Mid};
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
-
-const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
-type StreamKey = (Mid, Option<Rid>);
 
 struct UpstreamSlot {
     mid: Mid,
@@ -27,14 +23,18 @@ impl Eq for UpstreamSlot {}
 
 pub struct UpstreamAllocator {
     published_tracks: Vec<UpstreamSlot>,
-    pub keyframe_request_streams: StreamMap<StreamKey, KeyframeRequestStream>,
+    /// Wake handle shared by every [`KeyframeRequester`] for the active video track.
+    pub keyframe_notify: Option<Arc<Notify>>,
+    /// Per-simulcast-layer poll handles; drained by the upstream actor.
+    pub keyframe_polls: Vec<KeyframePoll>,
 }
 
 impl UpstreamAllocator {
     pub fn new() -> Self {
         Self {
             published_tracks: Vec::new(),
-            keyframe_request_streams: StreamMap::new(),
+            keyframe_notify: None,
+            keyframe_polls: Vec::new(),
         }
     }
 
@@ -57,11 +57,10 @@ impl UpstreamAllocator {
                     return false;
                 }
 
-                for sender in track.simulcast.iter_mut() {
-                    let key = (mid, sender.rid);
-                    self.keyframe_request_streams
-                        .insert(key, sender.keyframe_request_stream(KEYFRAME_DEBOUNCE));
-                }
+                // Take ownership of the keyframe infrastructure.
+                // MAX_UPSTREAM_SLOT_PER_TYPE == 1, so there is at most one video track.
+                self.keyframe_notify = Some(track.keyframe_notify.clone());
+                self.keyframe_polls.extend(track.keyframe_polls.drain(..));
             }
             MediaKind::Audio => {
                 let audio_count = self
@@ -79,6 +78,30 @@ impl UpstreamAllocator {
         let slot = UpstreamSlot { mid, track };
         self.published_tracks.push(slot);
         true
+    }
+
+    /// Await a keyframe notification.
+    ///
+    /// Returns immediately (via `std::future::pending`) when no video track is
+    /// registered, so this can be used unconditionally in a `select!` branch.
+    pub async fn notified(&self) {
+        match &self.keyframe_notify {
+            Some(n) => n.notified().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Drain all pending keyframe requests, applying per-layer leading-edge debounce.
+    ///
+    /// Call this immediately after [`notified`] resolves. It is O(n) in the number
+    /// of simulcast layers (typically 1–3) with no dynamic dispatch or allocation.
+    pub fn drain_keyframe_requests(
+        &mut self,
+        now: Instant,
+    ) -> impl Iterator<Item = KeyframeRequest> + '_ {
+        self.keyframe_polls
+            .iter_mut()
+            .filter_map(move |p| p.take_pending(now))
     }
 
     pub fn handle_incoming_rtp(

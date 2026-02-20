@@ -500,7 +500,9 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
     }
 
-    builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
+    for _ in 0..4 {
+        builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
+    }
 
     let mut agent = builder.connect(&room).await?;
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
@@ -526,49 +528,68 @@ async fn spawn_agent(
             _ = stats_interval.tick() => {
                 let Some(stats) = agent.get_stats().await else { continue };
 
-                let rtt_ms = stats.peer
-                    .as_ref()
-                    .and_then(|p| p.rtt)
-                    .map(|r| r.as_millis());
-
+                let peer = stats.peer.as_ref();
+                let rtt_ms = peer.and_then(|p| p.rtt).map(|r| r.as_millis());
                 let _ = stats_tx.send(StatReport::Peer { rtt_ms }).await;
 
+                // Bytes at peer/connection level to avoid per-track double counting
+                let peer_tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
+                let peer_rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
+
+                let prev_peer_tx = prev_tx.get("peer").map(|s| s.bytes).unwrap_or(0);
+                let prev_peer_rx = prev_rx.get("peer").map(|s| s.bytes).unwrap_or(0);
+
+                let tx_bytes_delta = peer_tx_bytes.saturating_sub(prev_peer_tx);
+                let rx_bytes_delta = peer_rx_bytes.saturating_sub(prev_peer_rx);
+
+                prev_tx.insert("peer".to_string(), CounterSnapshot { bytes: peer_tx_bytes, ..Default::default() });
+                prev_rx.insert("peer".to_string(), CounterSnapshot { bytes: peer_rx_bytes, ..Default::default() });
+
+                if tx_bytes_delta > 0 {
+                    let _ = stats_tx.send(StatReport::Tx { bytes: tx_bytes_delta, nacks: 0, plis: 0 }).await;
+                }
+                if rx_bytes_delta > 0 {
+                    let _ = stats_tx.send(StatReport::Rx { bytes: rx_bytes_delta, packets: 0, packets_lost: 0.0, nacks: 0, plis: 0 }).await;
+                }
+
+                // Per-track NACK/PLI/loss only, no bytes
                 for (_, track_stat) in &stats.tracks {
                     for (rid, egress) in &track_stat.tx_layers {
-                        let key = rid_key(rid);
+                        let key = format!("tx_{}", rid_key(rid));
                         let prev = prev_tx.get(&key).cloned().unwrap_or_default();
 
-                        let bytes = egress.bytes.saturating_sub(prev.bytes);
                         let nacks = egress.nacks.saturating_sub(prev.nacks);
                         let plis  = egress.plis.saturating_sub(prev.plis);
 
                         prev_tx.insert(key, CounterSnapshot {
-                            bytes: egress.bytes, nacks: egress.nacks, plis: egress.plis, ..Default::default()
+                            nacks: egress.nacks, plis: egress.plis, ..Default::default()
                         });
 
-                        if bytes > 0 || nacks > 0 || plis > 0 {
-                            let _ = stats_tx.send(StatReport::Tx { bytes, nacks, plis }).await;
+                        if nacks > 0 || plis > 0 {
+                            let _ = stats_tx.send(StatReport::Tx { bytes: 0, nacks, plis }).await;
                         }
                     }
 
                     for (rid, ingress) in &track_stat.rx_layers {
-                        let key = rid_key(rid);
+                        let key = format!("rx_{}", rid_key(rid));
                         let prev = prev_rx.get(&key).cloned().unwrap_or_default();
 
-                        let bytes   = ingress.bytes.saturating_sub(prev.bytes);
                         let packets = ingress.packets.saturating_sub(prev.packets);
                         let nacks   = ingress.nacks.saturating_sub(prev.nacks);
                         let plis    = ingress.plis.saturating_sub(prev.plis);
-                        let packets_lost = ingress.loss.unwrap_or(0.0);
+                        // loss is fraction 0.0-1.0, multiply by packets for actual count
+                        let packets_lost = ingress.loss.unwrap_or(0.0) * packets as f32;
 
                         prev_rx.insert(key, CounterSnapshot {
-                            bytes: ingress.bytes, packets: ingress.packets,
-                            nacks: ingress.nacks, plis: ingress.plis,
+                            packets: ingress.packets,
+                            nacks: ingress.nacks,
+                            plis: ingress.plis,
+                            ..Default::default()
                         });
 
-                        if bytes > 0 || packets > 0 || packets_lost > 0.0 || nacks > 0 || plis > 0 {
+                        if packets > 0 || packets_lost > 0.0 || nacks > 0 || plis > 0 {
                             let _ = stats_tx.send(StatReport::Rx {
-                                bytes, packets, packets_lost, nacks, plis,
+                                bytes: 0, packets, packets_lost, nacks, plis,
                             }).await;
                         }
                     }

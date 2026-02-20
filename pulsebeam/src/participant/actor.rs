@@ -137,8 +137,14 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
                 // Priority 2: Egress Work
                 // TODO: consolidate pollings in core
-                Some((_, req)) = self.core.upstream.keyframe_request_streams.next(), if !self.core.upstream.keyframe_request_streams.is_empty() => {
-                    self.core.handle_keyframe_request(req);
+                _ = self.core.upstream.notified() => {
+                    let now = Instant::now();
+                    // Collect first to release the borrow on upstream before handle_keyframe_request
+                    // borrows all of core.  Allocations here are rare (~2 Hz) and negligible.
+                    let reqs: Vec<_> = self.core.upstream.drain_keyframe_requests(now).collect();
+                    for req in reqs {
+                        self.core.handle_keyframe_request(req);
+                    }
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);

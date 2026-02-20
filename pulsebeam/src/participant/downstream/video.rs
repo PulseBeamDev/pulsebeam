@@ -9,7 +9,7 @@ use std::task::Waker;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid};
+use str0m::media::{KeyframeRequest, Mid};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -415,7 +415,7 @@ impl VideoAllocator {
             tracing::warn!(?req, "no video slot found for keyframe request");
             return;
         };
-        slot.request_keyframe(req.kind);
+        slot.request_keyframe();
     }
 
     pub fn poll_slow(&mut self, now: Instant) {
@@ -587,7 +587,7 @@ impl Slot {
         // Take ownership of state to move internals
         let old_state = self.state.take().unwrap_or(SlotState::Idle);
         receiver.channel.rewind();
-        receiver.request_keyframe(KeyframeRequestKind::Fir);
+        receiver.request_keyframe();
         self.switching_started_at = Some(Instant::now());
         self.keyframe_retries = 0;
 
@@ -656,17 +656,17 @@ impl Slot {
         self.transition_to(SlotState::Idle);
     }
 
-    fn request_keyframe(&self, kind: KeyframeRequestKind) {
+    fn request_keyframe(&self) {
         match self.state() {
             SlotState::Resuming { staging } => {
-                staging.request_keyframe(kind);
+                staging.request_keyframe();
             }
             // We're not requesting staging stream since we're currently streaming active.
             SlotState::Switching { active, .. } => {
-                active.request_keyframe(kind);
+                active.request_keyframe();
             }
             SlotState::Streaming { active } => {
-                active.request_keyframe(kind);
+                active.request_keyframe();
             }
             SlotState::Paused { .. } | SlotState::Idle => {}
         }
@@ -705,7 +705,7 @@ impl Slot {
                 now.duration_since(started_at)
             );
 
-            receiver.request_keyframe(KeyframeRequestKind::Fir);
+            receiver.request_keyframe();
         }
     }
 
