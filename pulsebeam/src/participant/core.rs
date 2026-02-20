@@ -51,12 +51,17 @@ pub enum CoreEvent {
 }
 
 pub struct ParticipantCore {
-    pub participant_id: entity::ParticipantId,
+    // Hot: touched on every packet
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
-    pub upstream: UpstreamAllocator,
     pub downstream: DownstreamAllocator,
+
+    // Warm: touched per poll cycle
+    pub upstream: UpstreamAllocator,
+    pub participant_id: entity::ParticipantId,
+
+    // Cold: touched rarely
     pub events: Vec<CoreEvent>,
     disconnect_reason: Option<DisconnectReason>,
     signaling: Signaling,
