@@ -480,6 +480,15 @@ enum SlotState {
     },
 }
 
+impl SlotState {
+    fn is_playing(&self) -> bool {
+        matches!(
+            self,
+            Self::Streaming { .. } | Self::Switching { .. } | Self::Resuming { .. }
+        )
+    }
+}
+
 impl Display for SlotState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = match self {
@@ -611,7 +620,7 @@ impl Slot {
                 }
             }
         };
-        tracing::info!(
+        tracing::debug!(
             mid = %self.mid,
             to_rid = ?rid,
             track = track_id,
@@ -688,7 +697,7 @@ impl Slot {
 
         self.keyframe_retries += 1;
         if let Some(receiver) = self.target_receiver() {
-            tracing::warn!(
+            tracing::trace!(
                 receiver = %receiver,
                 "Switch slow. Retrying keyframe request (attempt {}/{}). Elapsed: {:?}",
                 self.keyframe_retries,
@@ -705,6 +714,22 @@ impl Slot {
         if let SlotState::Streaming { .. } = &new_state {
             self.switching_started_at = None;
             self.keyframe_retries = 0;
+        }
+        let was_playing = self.state.as_ref().map(|s| s.is_playing()).unwrap_or(false);
+        let is_playing = new_state.is_playing();
+
+        if was_playing
+            && !is_playing
+            && let Some(receiver) = self.current_receiver()
+        {
+            // Determine the reason based on the new_state or external context
+            match &new_state {
+                SlotState::Idle => tracing::info!(stream_id = %receiver, "stream stopped"),
+                SlotState::Paused { .. } => {
+                    tracing::info!(stream_id = %receiver, "stream paused (congestion or lag)");
+                }
+                _ => {}
+            }
         }
         self.state = Some(new_state);
     }
