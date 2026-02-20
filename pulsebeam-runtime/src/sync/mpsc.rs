@@ -123,9 +123,9 @@ impl<T> Receiver<T> {
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        loop {
-            let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+        let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
 
+        loop {
             if self.next_seq == self.local_head {
                 self.local_head = self.ring.head.load(Ordering::Acquire);
             }
@@ -135,6 +135,13 @@ impl<T> Receiver<T> {
             }
 
             if self.next_seq >= self.local_head {
+                // Skip listener registration entirely if the waker is a no-op.
+                // This avoids heap allocation and lock contention in callers
+                // that only want a non-blocking poll (e.g. try_recv shims).
+                if cx.waker().will_wake(std::task::Waker::noop()) {
+                    return Poll::Pending;
+                }
+
                 match &mut self.listener {
                     Some(l) => {
                         if Pin::new(l).poll(cx).is_pending() {
@@ -163,9 +170,11 @@ impl<T> Receiver<T> {
                     metrics::counter!("mpsc_receive_lag_total").increment(1);
                     return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
                 } else {
-                    if self.listener.is_none() {
+                    // Stale slot, producer hasn't reached here yet
+                    if self.listener.is_none() && !cx.waker().will_wake(std::task::Waker::noop()) {
                         self.listener = Some(self.ring.event.listen());
                     }
+
                     return Poll::Pending;
                 }
             }
