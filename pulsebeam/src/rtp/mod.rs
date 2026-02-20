@@ -38,7 +38,7 @@ pub struct RtpPacket {
     pub playout_time: Instant,
     pub is_keyframe_start: bool,
     pub last_sender_info: Option<SenderInfo>,
-    pub payload: Bytes,
+    pub payload: Vec<u8>,
 }
 
 impl Default for RtpPacket {
@@ -58,7 +58,7 @@ impl Default for RtpPacket {
             playout_time: Instant::now(),
             is_keyframe_start: false,
             last_sender_info: None,
-            payload: Bytes::from_static(&[0u8; 1200]), // 1.2KB payload for test realism
+            payload: vec![0u8; 1200],
         }
     }
 }
@@ -80,7 +80,7 @@ impl RtpPacket {
             playout_time: rtp.timestamp.into(),
             is_keyframe_start,
             last_sender_info: None,
-            payload: Bytes::from(rtp.payload),
+            payload: rtp.payload,
         }
     }
 
