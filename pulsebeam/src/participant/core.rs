@@ -118,7 +118,11 @@ impl ParticipantCore {
         }
     }
 
-    pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch) -> Option<Instant> {
+    pub fn handle_udp_packet_batch(
+        &mut self,
+        batch: net::RecvPacketBatch,
+        now: Instant,
+    ) -> Option<Instant> {
         let transport = match batch.transport {
             Transport::Udp(_) => str0m::net::Protocol::Udp,
             Transport::Tcp => str0m::net::Protocol::Tcp,
@@ -131,9 +135,7 @@ impl ParticipantCore {
                     destination: batch.dst,
                     contents,
                 };
-                let _ = self
-                    .rtc
-                    .handle_input(Input::Receive(Instant::now().into(), recv));
+                let _ = self.rtc.handle_input(Input::Receive(now.into(), recv));
             } else {
                 tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
             }

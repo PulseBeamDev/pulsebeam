@@ -165,10 +165,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
                 // Priority 3: Ingress Work
                 Ok(batch) = gateway_rx.recv() => {
-                    maybe_deadline = self.core.handle_udp_packet_batch(batch);
+                    maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
 
                     while let Some(Ok(batch)) = gateway_rx.recv().now_or_never() {
-                        maybe_deadline = self.core.handle_udp_packet_batch(batch);
+                        maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
                     }
                 },
 
