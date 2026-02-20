@@ -231,13 +231,14 @@ impl ParticipantCore {
     }
 
     pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: RtpPacket) {
-        let pt = match self
-            .rtc
-            .media(mid)
-            .and_then(|m| m.remote_pts().first().copied())
-        {
-            Some(pt) => pt,
-            None => return,
+        let pt = {
+            let Some(media) = self.rtc.media(mid) else {
+                return;
+            };
+            let Some(pt) = media.remote_pts().first() else {
+                return;
+            };
+            *pt
         };
 
         let mut api = self.rtc.direct_api();
@@ -260,7 +261,7 @@ impl ParticipantCore {
             pkt.raw_header.marker,
             pkt.raw_header.ext_vals,
             true,
-            pkt.payload,
+            pkt.payload.to_vec(),
         ) {
             tracing::warn!(%mid, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
