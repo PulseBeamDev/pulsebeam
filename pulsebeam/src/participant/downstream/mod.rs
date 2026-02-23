@@ -9,13 +9,15 @@ use crate::track::TrackReceiver;
 use futures_lite::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use str0m::bwe::Bitrate;
+use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 pub use video::Intent;
 
 pub struct DownstreamAllocator {
+    pub dirty_allocation: bool,
     available_bandwidth: BitrateController,
+    desired_bitrate: BitrateController,
 
     pub audio: AudioAllocator,
     pub video: VideoAllocator,
@@ -25,10 +27,16 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new(manual_sub: bool) -> Self {
         Self {
-            available_bandwidth: BitrateController::default(),
+            available_bandwidth: BitrateController::new(
+                crate::bitrate::BitrateControllerConfig::available_bandwidth(),
+            ),
+            desired_bitrate: BitrateController::new(
+                crate::bitrate::BitrateControllerConfig::desired_bitrate(),
+            ),
             audio: AudioAllocator::new(),
             video: VideoAllocator::new(manual_sub),
             yield_audio: false,
+            dirty_allocation: false,
         }
     }
 
@@ -37,7 +45,7 @@ impl DownstreamAllocator {
             MediaKind::Audio => self.audio.add_track(track),
             MediaKind::Video => self.video.add_track(track),
         }
-        self.update_allocations();
+        self.dirty_allocation = true;
     }
 
     pub fn remove_track(&mut self, track: &TrackReceiver) {
@@ -45,7 +53,7 @@ impl DownstreamAllocator {
             MediaKind::Audio => self.audio.remove_track(&track.meta.id),
             MediaKind::Video => self.video.remove_track(&track.meta.id),
         }
-        self.update_allocations();
+        self.dirty_allocation = true;
     }
 
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
@@ -53,26 +61,34 @@ impl DownstreamAllocator {
             MediaKind::Audio => self.audio.add_slot(mid),
             MediaKind::Video => self.video.add_slot(mid),
         }
-        self.update_allocations();
+        self.dirty_allocation = true;
     }
 
-    /// Handle BWE and compute both current and desired bitrate in one pass.
-    pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) -> Option<(Bitrate, Bitrate)> {
+    pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
         self.available_bandwidth.update(available_bandwidth);
-        self.update_allocations()
+        self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self) -> Option<(Bitrate, Bitrate)> {
-        self.video
+    pub fn update_allocations(&mut self, bwe: &mut Bwe) {
+        self.dirty_allocation = false;
+        let Some((_current_alloc, desired_alloc)) = self
+            .video
             .update_allocations(self.available_bandwidth.current())
+        else {
+            return;
+        };
+
+        let filtered_desired = self.desired_bitrate.update(desired_alloc);
+        bwe.set_desired_bitrate(filtered_desired);
     }
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
         self.video.handle_keyframe_request(req);
     }
 
-    pub fn poll_slow(&mut self, now: Instant) {
+    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe) {
         self.video.poll_slow(now);
+        self.update_allocations(bwe);
     }
 
     pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {

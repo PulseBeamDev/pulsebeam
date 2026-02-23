@@ -165,7 +165,6 @@ impl ParticipantCore {
         // This is used to self-healing state drifting especially when a participant has just
         // reconnected. The viewer won't get a notification, so we have to be proactive.
         self.signaling.reconcile(&mut self.downstream);
-        self.update_desired_bitrate();
     }
 
     pub fn remove_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
@@ -174,12 +173,10 @@ impl ParticipantCore {
         }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        self.update_desired_bitrate();
     }
 
     pub fn poll_slow(&mut self, now: Instant) {
-        self.update_desired_bitrate();
-        self.downstream.poll_slow(now);
+        self.downstream.poll_slow(now, &mut self.rtc.bwe());
         self.upstream.poll_slow(now);
     }
 
@@ -199,6 +196,12 @@ impl ParticipantCore {
             if did_work {
                 // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
                 // We loop back to `poll_rtc` immediately to flush `Output::Transmit`.
+                continue;
+            }
+
+            if self.downstream.dirty_allocation {
+                // Make sure rtc is updated with new allocations
+                self.downstream.update_allocations(&mut self.rtc.bwe());
                 continue;
             }
 
@@ -276,9 +279,7 @@ impl ParticipantCore {
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
             Event::KeyframeRequest(req) => self.downstream.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                if let Some((_current, desired)) = self.downstream.update_bitrate(available) {
-                    self.rtc.bwe().set_desired_bitrate(desired);
-                }
+                self.downstream.update_bitrate(available)
             }
             Event::ChannelOpen(_cid, _label) => {}
             Event::ChannelData(data) => {
@@ -311,11 +312,7 @@ impl ParticipantCore {
         }
     }
 
-    fn update_desired_bitrate(&mut self) {
-        if let Some((_current, desired)) = self.downstream.update_allocations() {
-            self.rtc.bwe().set_desired_bitrate(desired);
-        }
-    }
+    fn update_desired_bitrate(&mut self) {}
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {

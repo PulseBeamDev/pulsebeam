@@ -116,7 +116,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                         None => break,
                     }
                 }
-                Some(msg) = ctx.rx.recv() => self.handle_control_message(msg).await,
+                Some(msg) = ctx.rx.recv() => {
+                    self.handle_control_message(msg).await;
+                    maybe_deadline = self.core.poll();
+                }
                 res = room_handle.tx.reserve_many(batch_size), if !self.core.events.is_empty() => {
                     match res {
                         Ok(permits) => {

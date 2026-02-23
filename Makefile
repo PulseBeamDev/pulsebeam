@@ -60,7 +60,7 @@ stats:
     -e cpu_core/LLC-loads/,cpu_core/LLC-load-misses/ \
     -e dtlb-load-misses,dtlb-store-misses \
     -e instructions,cpu-cycles \
-    -p $(PIDS)
+    -p $(PIDS) -- sleep 30
 
 deps: deps-brew deps-cargo gh-deps
 
