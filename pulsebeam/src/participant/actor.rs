@@ -43,7 +43,10 @@ impl actor::MessageSet for ParticipantMessageSet {
 }
 
 pub struct ParticipantActor {
-    core: ParticipantCore,
+    // Boxed to keep ParticipantCore off the async state machine stack. The actor::run()
+    // future stores `a: ParticipantActor` inline while also holding `a.run()` as __awaitee,
+    // so every unboxed field adds directly to the task's memory footprint.
+    core: Box<ParticipantCore>,
     gateway: GatewayWorkerHandle,
     udp_egress: UnifiedSocketWriter,
     tcp_egress: UnifiedSocketWriter,
@@ -82,8 +85,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
             ))
             .await;
         let mut maybe_deadline = self.core.poll();
-        let sleep = tokio::time::sleep(MIN_QUANTA);
-        tokio::pin!(sleep);
+        // Box the Sleep future so tokio::time::Sleep (~152 bytes) lives on the heap
+        // rather than inline in the select! state machine.
+        let mut sleep = Box::pin(tokio::time::sleep(MIN_QUANTA));
 
         while let Some(deadline) = maybe_deadline {
             let now = Instant::now();
@@ -213,7 +217,7 @@ impl ParticipantActor {
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
-        let core = ParticipantCore::new(manual_sub, participant_id, rtc, udp_batcher, tcp_batcher);
+        let core = Box::new(ParticipantCore::new(manual_sub, participant_id, rtc, udp_batcher, tcp_batcher));
         Self {
             gateway: gateway_handle,
             core,

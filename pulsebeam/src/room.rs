@@ -16,6 +16,7 @@ use crate::{
     participant::{self, ParticipantActor},
     track::{self},
 };
+use futures_util::FutureExt;
 use pulsebeam_runtime::actor;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -158,10 +159,12 @@ impl RoomActor {
             actor::prepare(participant_actor, RunnerConfig::default());
         let participant_id = participant_handle.meta;
 
-        self.participant_tasks.spawn(async move {
-            let (id, status) = participant_task.await;
-            (id, connection_id, status)
-        });
+        // Use .map() instead of an async block to avoid the Rust compiler storing
+        // participant_task twice at the Suspend0 point (once as upvar, once as __awaitee),
+        // which doubles the per-entry size in the JoinSet from ~73KB to ~37KB.
+        self.participant_tasks.spawn(
+            participant_task.map(move |(id, status)| (id, connection_id, status)),
+        );
 
         self.state.participants.insert(
             (participant_id, connection_id),
