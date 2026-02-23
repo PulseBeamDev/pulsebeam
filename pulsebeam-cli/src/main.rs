@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
-    MediaKind, Rid, TransceiverDirection,
+    MediaKind, Rid, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack},
     api::HttpApiClient,
     media::H264Looper,
@@ -509,7 +509,15 @@ async fn spawn_agent(
     let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
 
     if is_pub {
-        builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
+        builder = builder.with_track(
+            MediaKind::Video,
+            TransceiverDirection::SendOnly,
+            Some(vec![
+                SimulcastLayer::new("f"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("q"),
+            ]),
+        );
     }
 
     for _ in 0..users_per_room {

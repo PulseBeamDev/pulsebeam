@@ -359,7 +359,7 @@ struct AgentActor {
     cmd_rx: mpsc::Receiver<AgentCommand>,
     event_tx: mpsc::Sender<AgentEvent>,
 
-    senders: StreamMap<Mid, ReceiverStream<MediaFrame>>,
+    senders: StreamMap<(Mid, Option<Rid>), ReceiverStream<MediaFrame>>,
     pending: PendingState,
     slot_manager: SlotManager,
 
@@ -421,9 +421,12 @@ impl AgentActor {
                 }
 
                 // Data coming from User -> Network
-                Some((mid, frame)) = self.senders.next() => {
-                     if let Some(writer) = self.rtc.writer(mid) {
+                Some(((mid, rid), frame)) = self.senders.next() => {
+                     if let Some(mut writer) = self.rtc.writer(mid) {
                          let pt = writer.payload_params().next().unwrap().pt();
+                         if let Some(rid) = rid {
+                            writer = writer.rid(rid);
+                         }
                          let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                      }
                 }
@@ -518,7 +521,7 @@ impl AgentActor {
                 for rid in rids {
                     // User wants to send. We create a channel: User(tx) -> Actor(rx)
                     let (tx, rx) = mpsc::channel(128);
-                    self.senders.insert(mid, ReceiverStream::new(rx));
+                    self.senders.insert((mid, rid), ReceiverStream::new(rx));
 
                     self.emit(AgentEvent::LocalTrackAdded(LocalTrack { mid, tx, rid }));
                 }
