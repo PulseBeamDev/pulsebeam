@@ -812,7 +812,7 @@ impl Slot {
                     mut active,
                     mut staging,
                 } => {
-                    // 1. Poll Staging (Priority)
+                    // 1. Poll Staging
                     let staging_poll = staging.channel.poll_recv(cx);
                     match staging_poll {
                         Poll::Ready(Ok(pkt)) => {
@@ -821,10 +821,11 @@ impl Slot {
                                 tracing::info!(mid = %self.mid, from = ?active.rid, to = ?staging.rid, "Switch complete");
                                 // Transition: Move staging to active, Drop old active
                                 self.transition_to(SlotState::Streaming { active: staging });
-                            } else {
-                                self.transition_to(SlotState::Switching { active, staging });
+                                continue;
                             }
-                            continue;
+                            // Switch not yet complete — fall through to also drain active.
+                            // Without this, staging is polled in a tight loop and active's ring
+                            // buffer overflows (Lagged) because it is never consumed.
                         }
                         Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
                             tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
@@ -837,7 +838,7 @@ impl Slot {
                             self.transition_to(SlotState::Streaming { active });
                             continue;
                         }
-                        Poll::Pending => { /* Check active next */ }
+                        Poll::Pending => { /* fall through to active */ }
                     }
 
                     // 2. Poll Active

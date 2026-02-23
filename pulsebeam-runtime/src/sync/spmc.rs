@@ -225,8 +225,6 @@ impl<T: Clone> Receiver<T> {
         }
     }
 
-    fn register_listener(&mut self) {}
-
     fn flush_metrics(&mut self) {
         // Use the existing local_head snapshot.
         // This tells us how much is still left in the current "batch".
