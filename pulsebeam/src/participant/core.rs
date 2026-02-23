@@ -175,7 +175,7 @@ impl ParticipantCore {
         self.signaling.mark_assignments_dirty();
     }
 
-    pub fn poll_slow(&mut self, now: Instant) {
+    fn poll_slow(&mut self, now: Instant) {
         self.downstream.poll_slow(now, &mut self.rtc.bwe());
         self.upstream.poll_slow(now);
     }

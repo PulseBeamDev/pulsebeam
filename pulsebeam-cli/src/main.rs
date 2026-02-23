@@ -479,12 +479,19 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
+/// How many consecutive silent ticks before a VBR layer is considered inactive.
+/// At 1-second poll intervals, 3 ticks = 3 s of silence, which is a safe margin
+/// for typical VBR gaps while still catching genuinely dead streams.
+const SILENT_TICKS_THRESHOLD: u32 = 3;
+
 #[derive(Default, Clone)]
 struct CounterSnapshot {
     bytes: u64,
     packets: u64,
     nacks: u64,
     plis: u64,
+    /// Consecutive ticks with zero packet delta. Resets to 0 on any activity.
+    silent_ticks: u32,
 }
 
 async fn spawn_agent(
@@ -556,22 +563,40 @@ async fn spawn_agent(
 
                 // ── Per-track NACK/PLI/loss + stream health ───────────────
                 for (_, track_stat) in &stats.tracks {
-                    // TX layers
+                    // ── TX layers ─────────────────────────────────────────
+                    //
+                    // A layer is "active" when it has ever emitted packets AND
+                    // has not been continuously silent for SILENT_TICKS_THRESHOLD
+                    // consecutive poll intervals. This tolerates VBR gaps (e.g.
+                    // low-motion scenes, keyframe pauses) without mis-reporting
+                    // the stream as dead.
                     let mut tx_active  = false;
                     let mut tx_healthy = true;
 
                     for (rid, egress) in &track_stat.tx_layers {
                         let key = format!("tx_{}", rid_key(rid));
-                        let prev = prev_tx.get(&key).cloned().unwrap_or_default();
+                        let mut prev = prev_tx.get(&key).cloned().unwrap_or_default();
 
                         let packets = egress.packets.saturating_sub(prev.packets);
                         let nacks   = egress.nacks.saturating_sub(prev.nacks);
                         let plis    = egress.plis.saturating_sub(prev.plis);
 
+                        // Update silence counter based on this tick's delta.
+                        prev.silent_ticks = if packets == 0 {
+                            prev.silent_ticks.saturating_add(1)
+                        } else {
+                            0
+                        };
+
+                        // Active = has ever sent packets AND not persistently silent.
+                        let layer_active = egress.packets > 0
+                            && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
+
                         prev_tx.insert(key, CounterSnapshot {
-                            packets: egress.packets,
-                            nacks: egress.nacks,
-                            plis: egress.plis,
+                            packets:      egress.packets,
+                            nacks:        egress.nacks,
+                            plis:         egress.plis,
+                            silent_ticks: prev.silent_ticks,
                             ..Default::default()
                         });
 
@@ -579,31 +604,47 @@ async fn spawn_agent(
                             let _ = stats_tx.try_send(StatReport::Tx { bytes: 0, nacks, plis });
                         }
 
-                        let layer_active = packets > 0;
                         tx_active  |= layer_active;
                         tx_healthy &= layer_active && plis == 0 && nacks < 3;
                     }
 
-                    // TX: healthy implies active
+                    // Healthy implies active.
                     let tx_healthy = tx_active && tx_healthy;
 
-                    // RX layers
+                    // ── RX layers ─────────────────────────────────────────
+                    //
+                    // Same VBR-tolerant liveness logic as TX. Additionally,
+                    // the loss-ratio health check is skipped during silent ticks
+                    // because `packets == 0` would make the ratio trivially pass
+                    // even if the stream is genuinely stalled.
                     let mut rx_active  = false;
                     let mut rx_healthy = true;
 
                     for (rid, ingress) in &track_stat.rx_layers {
                         let key = format!("rx_{}", rid_key(rid));
-                        let prev = prev_rx.get(&key).cloned().unwrap_or_default();
+                        let mut prev = prev_rx.get(&key).cloned().unwrap_or_default();
 
                         let packets      = ingress.packets.saturating_sub(prev.packets);
                         let nacks        = ingress.nacks.saturating_sub(prev.nacks);
                         let plis         = ingress.plis.saturating_sub(prev.plis);
                         let packets_lost = ingress.loss.unwrap_or(0.0) * packets as f32;
 
+                        // Update silence counter based on this tick's delta.
+                        prev.silent_ticks = if packets == 0 {
+                            prev.silent_ticks.saturating_add(1)
+                        } else {
+                            0
+                        };
+
+                        // Active = has ever received packets AND not persistently silent.
+                        let layer_active = ingress.packets > 0
+                            && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
+
                         prev_rx.insert(key, CounterSnapshot {
-                            packets: ingress.packets,
-                            nacks:   ingress.nacks,
-                            plis:    ingress.plis,
+                            packets:      ingress.packets,
+                            nacks:        ingress.nacks,
+                            plis:         ingress.plis,
+                            silent_ticks: prev.silent_ticks,
                             ..Default::default()
                         });
 
@@ -613,14 +654,22 @@ async fn spawn_agent(
                             });
                         }
 
-                        let layer_active = packets > 0;
+                        // Only evaluate loss ratio when the layer is actively
+                        // delivering packets this tick; a zero-packet VBR gap
+                        // should not be mistaken for a healthy stream.
+                        let loss_ok = if packets > 0 {
+                            packets_lost < 0.05 * packets as f32
+                        } else {
+                            // Silent tick — don't penalise, but don't reward either.
+                            // Carry forward whatever the current rx_healthy state is.
+                            rx_healthy
+                        };
+
                         rx_active  |= layer_active;
-                        rx_healthy &= layer_active
-                            && packets_lost < 0.05 * packets as f32
-                            && plis == 0;
+                        rx_healthy &= layer_active && loss_ok && plis == 0;
                     }
 
-                    // RX: healthy implies active
+                    // Healthy implies active.
                     let rx_healthy = rx_active && rx_healthy;
 
                     let _ = stats_tx.try_send(StatReport::StreamHealth {

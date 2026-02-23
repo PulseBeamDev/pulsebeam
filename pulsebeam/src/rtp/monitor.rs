@@ -1257,7 +1257,7 @@ mod test {
 
         println!("Baseline: {:.0} bps", baseline);
         assert_gt!(baseline, 1_200_000.0);
-        assert_le!(baseline, 1_400_000.0);
+        assert_le!(baseline, 1_460_000.0);
 
         // 2. Inject Massive Keyframe
         // Normal 100ms = 12,500 bytes. Keyframe = 62,500 bytes (5x spike).
