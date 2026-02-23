@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
     MediaKind, Rid, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack},
@@ -28,48 +28,26 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Bench {
-        /// Initial rooms to start with
         #[arg(long, default_value_t = 5)]
         rooms: usize,
-
-        /// Users per room
         #[arg(long, default_value_t = 4)]
         users_per_room: usize,
-
-        /// Add this many rooms every ramp interval until degradation
         #[arg(long, default_value_t = 5)]
         ramp_step: usize,
-
-        /// How often to add more rooms (seconds)
         #[arg(long, default_value_t = 20)]
         ramp_interval: u64,
-
-        /// Max rooms before stopping ramp regardless
         #[arg(long, default_value_t = 200)]
         max_rooms: usize,
-
-        /// Average session length in seconds (realistic: 300-600s)
         #[arg(long, default_value_t = 120)]
         session_duration: u64,
-
-        /// Stddev jitter on session length (seconds), simulates natural churn
         #[arg(long, default_value_t = 30)]
         session_jitter: u64,
-
-        /// Seconds to observe after stopping ramp
         #[arg(long, default_value_t = 30)]
         drain_duration: u64,
     },
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-struct ForwardLatencySample {
-    /// One-way estimated from RTCP SR/RR sender report round-trip halved.
-    /// Imprecise but consistent across agents.
-    rtt_half_ms: u128,
-}
 
 #[derive(Debug)]
 enum StatReport {
@@ -88,7 +66,12 @@ enum StatReport {
         nacks: u64,
         plis: u64,
     },
-    /// Emitted by monitor when a degradation threshold is crossed
+    StreamHealth {
+        tx_active: bool,
+        tx_healthy: bool,
+        rx_active: bool,
+        rx_healthy: bool,
+    },
     DegradationDetected {
         reason: String,
     },
@@ -100,6 +83,10 @@ struct SharedState {
     active_rooms: AtomicUsize,
     active_agents: AtomicUsize,
     degraded: AtomicBool,
+    tx_active_streams: AtomicUsize,
+    tx_healthy_streams: AtomicUsize,
+    rx_active_streams: AtomicUsize,
+    rx_healthy_streams: AtomicUsize,
 }
 
 impl SharedState {
@@ -108,16 +95,19 @@ impl SharedState {
             active_rooms: AtomicUsize::new(0),
             active_agents: AtomicUsize::new(0),
             degraded: AtomicBool::new(false),
+            tx_active_streams: AtomicUsize::new(0),
+            tx_healthy_streams: AtomicUsize::new(0),
+            rx_active_streams: AtomicUsize::new(0),
+            rx_healthy_streams: AtomicUsize::new(0),
         })
     }
 }
 
 // ── Latency histogram (lock-free buckets) ─────────────────────────────────────
 
-/// Tracks p50/p99/p999 using a simple power-of-2 bucket histogram.
 #[derive(Default)]
 struct LatencyHistogram {
-    // buckets: [0,1), [1,2), [2,4), [4,8) ... [512,1024), [1024,∞)  ms
+    // buckets: [0,1), [1,2), [2,4), [4,8) ... [512,1024), [1024,∞) ms
     buckets: [u64; 12],
     count: u64,
     sum: u128,
@@ -217,31 +207,29 @@ async fn run_bench(
     let room_counter = Arc::new(AtomicUsize::new(0));
 
     println!(
-        "┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+        "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
     );
     println!(
-        "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                    │"
+        "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                        │"
     );
     println!(
-        "├───────┬───────┬────────┬─────────┬─────────┬──────────┬──────────┬───────┬──────┬──────┬──────┬───────┬────────┤"
+        "├───────┬───────┬────────┬─────────┬─────────┬──────────┬──────────┬───────┬──────┬──────┬──────┬───────┬────────┬──────────────────────┤"
     );
     println!(
-        "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │Tx PLI│ Rx PLI│"
+        "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │Tx PLI │ Rx PLI │  TX streams  RX streams  │"
     );
     println!(
-        "├───────┼───────┼────────┼─────────┼─────────┼──────────┼──────────┼───────┼──────┼──────┼──────┼──────┼────────┤"
+        "│       │       │        │         │         │          │          │       │      │      │      │       │        │ actv/hlth    actv/hlth   │"
+    );
+    println!(
+        "├───────┼───────┼────────┼─────────┼─────────┼──────────┼──────────┼───────┼──────┼──────┼──────┼───────┼────────┼──────────────────────────┤"
     );
 
-    // Spawn stats monitor
     let monitor_state = state.clone();
     let monitor_handle = tokio::spawn(monitor_task(stats_rx, monitor_state));
 
-    let running = Arc::new(AtomicBool::new(true));
-
-    // ── Ramp loop ────────────────────────────────────────────────────────────
     let mut total_rooms = 0usize;
 
-    // seed initial rooms
     for _ in 0..initial_rooms {
         spawn_room(
             &mut join_set,
@@ -258,21 +246,19 @@ async fn run_bench(
     }
 
     let mut ramp_ticker = tokio::time::interval(Duration::from_secs(ramp_interval));
-    ramp_ticker.tick().await; // skip first immediate tick
+    ramp_ticker.tick().await;
 
     loop {
         tokio::select! {
             _ = ramp_ticker.tick() => {
                 if state.degraded.load(Ordering::Relaxed) {
-                    println!("│ ⚠  DEGRADATION DETECTED — stopping ramp                                                                          │");
+                    println!("│ ⚠  DEGRADATION DETECTED — stopping ramp                                                                                              │");
                     break;
                 }
-
                 if total_rooms >= max_rooms {
-                    println!("│ ✓  Max rooms reached ({}) — stopping ramp                                                                        │", max_rooms);
+                    println!("│ ✓  Max rooms reached ({}) — stopping ramp                                                                                           │", max_rooms);
                     break;
                 }
-
                 for _ in 0..ramp_step {
                     if total_rooms >= max_rooms { break; }
                     spawn_room(
@@ -292,20 +278,18 @@ async fn run_bench(
         }
     }
 
-    // ── Drain period: observe behavior at peak load ───────────────────────────
     tokio::time::sleep(Duration::from_secs(drain_duration)).await;
-    running.store(false, Ordering::Relaxed);
 
     println!(
-        "├───────┴───────┴────────┴─────────┴─────────┴──────────┴──────────┴───────┴──────┴──────┴──────┴──────┴────────┤"
+        "├───────┴───────┴────────┴─────────┴─────────┴──────────┴──────────┴───────┴──────┴──────┴──────┴───────┴────────┴──────────────────────────┤"
     );
     println!(
-        "│  Benchmark complete. Peak rooms: {:<5}  Peak agents: {:<6}                                                     │",
+        "│  Benchmark complete. Peak rooms: {:<5}  Peak agents: {:<6}                                                                              │",
         total_rooms,
         state.active_agents.load(Ordering::Relaxed),
     );
     println!(
-        "└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+        "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
     );
 
     join_set.shutdown().await;
@@ -337,10 +321,7 @@ async fn spawn_room(
         let tx = stats_tx.clone();
         let st = state.clone();
 
-        // Stagger joins within a room: realistic join spread of up to 5s
         let join_delay_ms = rand::random_range(0u64..5_000);
-
-        // Session length with gaussian-ish jitter via sum of two uniforms
         let jitter_a = rand::random_range(0u64..session_jitter);
         let jitter_b = rand::random_range(0u64..session_jitter);
         let this_session = session_duration
@@ -355,9 +336,10 @@ async fn spawn_room(
                 room_id * 1000 + user_id,
                 url,
                 r,
-                true, // everyone publishes in a meeting
+                true,
                 Duration::from_secs(this_session),
                 tx,
+                users_per_room,
             )
             .await
             {
@@ -368,7 +350,6 @@ async fn spawn_room(
         });
     }
 
-    // Room expires after session_duration + max jitter + join spread
     let room_state = state.clone();
     let expire_after = Duration::from_secs(session_duration + session_jitter * 2 + 6);
     join_set.spawn(async move {
@@ -391,9 +372,12 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
     let mut tx_plis = 0u64;
     let mut rx_plis = 0u64;
 
-    let mut rtt_hist = LatencyHistogram::default();
+    let mut tx_active_streams = 0usize;
+    let mut tx_healthy_streams = 0usize;
+    let mut rx_active_streams = 0usize;
+    let mut rx_healthy_streams = 0usize;
 
-    // Degradation detection: rolling window of p99 samples
+    let mut rtt_hist = LatencyHistogram::default();
     let mut consecutive_high_p99 = 0u32;
 
     loop {
@@ -406,16 +390,22 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                     StatReport::Tx { bytes, nacks, plis } => {
                         tx_bytes += bytes;
                         tx_nacks += nacks;
-                        tx_plis += plis;
+                        tx_plis  += plis;
                     }
-                    StatReport::Rx { bytes, packets, packets_lost, nacks, plis } => {
+                    StatReport::Rx { bytes, packets: _, packets_lost, nacks, plis } => {
                         rx_bytes += bytes;
-                        rx_loss += packets_lost;
+                        rx_loss  += packets_lost;
                         rx_nacks += nacks;
-                        rx_plis += plis;
+                        rx_plis  += plis;
+                    }
+                    StatReport::StreamHealth { tx_active, tx_healthy, rx_active, rx_healthy } => {
+                        if tx_active  { tx_active_streams  += 1; }
+                        if tx_healthy { tx_healthy_streams += 1; }
+                        if rx_active  { rx_active_streams  += 1; }
+                        if rx_healthy { rx_healthy_streams += 1; }
                     }
                     StatReport::DegradationDetected { reason } => {
-                        println!("│ ⚠  {:<111}│", reason);
+                        println!("│ ⚠  {:<133}│", reason);
                     }
                     _ => {}
                 }
@@ -425,7 +415,7 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                 let elapsed = start.elapsed().as_secs();
                 if elapsed == 0 { continue; }
 
-                let rooms = state.active_rooms.load(Ordering::Relaxed);
+                let rooms  = state.active_rooms.load(Ordering::Relaxed);
                 let agents = state.active_agents.load(Ordering::Relaxed);
 
                 let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
@@ -436,17 +426,24 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                 let p999 = rtt_hist.percentile(99.9);
                 let mean = rtt_hist.mean();
 
+                // Update shared state so degradation checks can see stream health
+                state.tx_active_streams.store(tx_active_streams, Ordering::Relaxed);
+                state.tx_healthy_streams.store(tx_healthy_streams, Ordering::Relaxed);
+                state.rx_active_streams.store(rx_active_streams, Ordering::Relaxed);
+                state.rx_healthy_streams.store(rx_healthy_streams, Ordering::Relaxed);
+
                 println!(
-                    "│ {:>5}s│ {:>5} │ {:>6} │ {:>6.2}  │ {:>6.2}  │ {:>8.1}  │ {:>8}  │ {:>5} │{:>5} │{:>5} │{:>5} │{:>5} │ {:>5}  │",
+                    "│ {:>5}s│ {:>5} │ {:>6} │ {:>6.2}  │ {:>6.2}  │ {:>8.1}  │ {:>8}  │ {:>5} │{:>5} │{:>5} │{:>5} │{:>6} │ {:>5}  │ {:>4}/{:<4}  {:>4}/{:<4} │",
                     elapsed, rooms, agents,
                     tx_mbps, rx_mbps,
                     rx_loss, tx_nacks + rx_nacks,
                     p50, p99, p999, mean,
                     tx_plis, rx_plis,
+                    tx_active_streams, tx_healthy_streams,
+                    rx_active_streams, rx_healthy_streams,
                 );
 
                 // ── Degradation heuristics ────────────────────────────────
-                // 1. p99 RTT > 300ms for 3 consecutive seconds
                 if p99 > 300 {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
@@ -456,17 +453,24 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                     consecutive_high_p99 = 0;
                 }
 
-                // 2. Loss rate spikes hard (> 5% of packets this second)
-                // rx_loss here is cumulative packets_lost fraction from RTCP,
-                // treat >5 as a proxy for sustained loss
                 if rx_loss > 5.0 && agents > 0 {
                     state.degraded.store(true, Ordering::Relaxed);
                 }
 
-                // reset accumulators
+                // If more than 20% of active rx streams are unhealthy, flag it
+                if rx_active_streams > 0 {
+                    let unhealthy = rx_active_streams.saturating_sub(rx_healthy_streams);
+                    if unhealthy * 5 > rx_active_streams {
+                        state.degraded.store(true, Ordering::Relaxed);
+                    }
+                }
+
+                // Reset accumulators
                 tx_bytes = 0; rx_bytes = 0; rx_loss = 0.0;
                 tx_nacks = 0; rx_nacks = 0;
-                tx_plis = 0;  rx_plis = 0;
+                tx_plis  = 0; rx_plis  = 0;
+                tx_active_streams  = 0; tx_healthy_streams = 0;
+                rx_active_streams  = 0; rx_healthy_streams = 0;
                 rtt_hist.reset();
             }
         }
@@ -490,6 +494,7 @@ async fn spawn_agent(
     is_pub: bool,
     session_duration: Duration,
     stats_tx: mpsc::Sender<StatReport>,
+    users_per_room: usize,
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -500,7 +505,7 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
     }
 
-    for _ in 0..4 {
+    for _ in 0..users_per_room {
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
     }
 
@@ -514,10 +519,7 @@ async fn spawn_agent(
 
     loop {
         tokio::select! {
-            // Session lifetime — agent leaves naturally
-            _ = &mut session_end => {
-                break;
-            }
+            _ = &mut session_end => break,
 
             Some(event) = agent.next_event() => {
                 if let AgentEvent::LocalTrackAdded(track) = event {
@@ -528,11 +530,11 @@ async fn spawn_agent(
             _ = stats_interval.tick() => {
                 let Some(stats) = agent.get_stats().await else { continue };
 
+                // ── Peer-level RTT + byte counters ────────────────────────
                 let peer = stats.peer.as_ref();
                 let rtt_ms = peer.and_then(|p| p.rtt).map(|r| r.as_millis());
-                let _ = stats_tx.send(StatReport::Peer { rtt_ms }).await;
+                let _ = stats_tx.try_send(StatReport::Peer { rtt_ms });
 
-                // Bytes at peer/connection level to avoid per-track double counting
                 let peer_tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let peer_rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
@@ -542,57 +544,91 @@ async fn spawn_agent(
                 let tx_bytes_delta = peer_tx_bytes.saturating_sub(prev_peer_tx);
                 let rx_bytes_delta = peer_rx_bytes.saturating_sub(prev_peer_rx);
 
-                prev_tx.insert("peer".to_string(), CounterSnapshot { bytes: peer_tx_bytes, ..Default::default() });
-                prev_rx.insert("peer".to_string(), CounterSnapshot { bytes: peer_rx_bytes, ..Default::default() });
+                prev_tx.insert("peer".into(), CounterSnapshot { bytes: peer_tx_bytes, ..Default::default() });
+                prev_rx.insert("peer".into(), CounterSnapshot { bytes: peer_rx_bytes, ..Default::default() });
 
                 if tx_bytes_delta > 0 {
-                    let _ = stats_tx.send(StatReport::Tx { bytes: tx_bytes_delta, nacks: 0, plis: 0 }).await;
+                    let _ = stats_tx.try_send(StatReport::Tx { bytes: tx_bytes_delta, nacks: 0, plis: 0 });
                 }
                 if rx_bytes_delta > 0 {
-                    let _ = stats_tx.send(StatReport::Rx { bytes: rx_bytes_delta, packets: 0, packets_lost: 0.0, nacks: 0, plis: 0 }).await;
+                    let _ = stats_tx.try_send(StatReport::Rx { bytes: rx_bytes_delta, packets: 0, packets_lost: 0.0, nacks: 0, plis: 0 });
                 }
 
-                // Per-track NACK/PLI/loss only, no bytes
+                // ── Per-track NACK/PLI/loss + stream health ───────────────
                 for (_, track_stat) in &stats.tracks {
+                    // TX layers
+                    let mut tx_active  = false;
+                    let mut tx_healthy = true;
+
                     for (rid, egress) in &track_stat.tx_layers {
                         let key = format!("tx_{}", rid_key(rid));
                         let prev = prev_tx.get(&key).cloned().unwrap_or_default();
 
-                        let nacks = egress.nacks.saturating_sub(prev.nacks);
-                        let plis  = egress.plis.saturating_sub(prev.plis);
+                        let packets = egress.packets.saturating_sub(prev.packets);
+                        let nacks   = egress.nacks.saturating_sub(prev.nacks);
+                        let plis    = egress.plis.saturating_sub(prev.plis);
 
                         prev_tx.insert(key, CounterSnapshot {
-                            nacks: egress.nacks, plis: egress.plis, ..Default::default()
+                            packets: egress.packets,
+                            nacks: egress.nacks,
+                            plis: egress.plis,
+                            ..Default::default()
                         });
 
                         if nacks > 0 || plis > 0 {
-                            let _ = stats_tx.send(StatReport::Tx { bytes: 0, nacks, plis }).await;
+                            let _ = stats_tx.try_send(StatReport::Tx { bytes: 0, nacks, plis });
                         }
+
+                        let layer_active = packets > 0;
+                        tx_active  |= layer_active;
+                        tx_healthy &= layer_active && plis == 0 && nacks < 3;
                     }
+
+                    // TX: healthy implies active
+                    let tx_healthy = tx_active && tx_healthy;
+
+                    // RX layers
+                    let mut rx_active  = false;
+                    let mut rx_healthy = true;
 
                     for (rid, ingress) in &track_stat.rx_layers {
                         let key = format!("rx_{}", rid_key(rid));
                         let prev = prev_rx.get(&key).cloned().unwrap_or_default();
 
-                        let packets = ingress.packets.saturating_sub(prev.packets);
-                        let nacks   = ingress.nacks.saturating_sub(prev.nacks);
-                        let plis    = ingress.plis.saturating_sub(prev.plis);
-                        // loss is fraction 0.0-1.0, multiply by packets for actual count
+                        let packets      = ingress.packets.saturating_sub(prev.packets);
+                        let nacks        = ingress.nacks.saturating_sub(prev.nacks);
+                        let plis         = ingress.plis.saturating_sub(prev.plis);
                         let packets_lost = ingress.loss.unwrap_or(0.0) * packets as f32;
 
                         prev_rx.insert(key, CounterSnapshot {
                             packets: ingress.packets,
-                            nacks: ingress.nacks,
-                            plis: ingress.plis,
+                            nacks:   ingress.nacks,
+                            plis:    ingress.plis,
                             ..Default::default()
                         });
 
                         if packets > 0 || packets_lost > 0.0 || nacks > 0 || plis > 0 {
-                            let _ = stats_tx.send(StatReport::Rx {
+                            let _ = stats_tx.try_send(StatReport::Rx {
                                 bytes: 0, packets, packets_lost, nacks, plis,
-                            }).await;
+                            });
                         }
+
+                        let layer_active = packets > 0;
+                        rx_active  |= layer_active;
+                        rx_healthy &= layer_active
+                            && packets_lost < 0.05 * packets as f32
+                            && plis == 0;
                     }
+
+                    // RX: healthy implies active
+                    let rx_healthy = rx_active && rx_healthy;
+
+                    let _ = stats_tx.try_send(StatReport::StreamHealth {
+                        tx_active,
+                        tx_healthy,
+                        rx_active,
+                        rx_healthy,
+                    });
                 }
             }
         }
