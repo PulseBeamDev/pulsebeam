@@ -44,6 +44,14 @@ enum Commands {
         session_jitter: u64,
         #[arg(long, default_value_t = 30)]
         drain_duration: u64,
+        /// Mean rate at which rooms are created, in rooms per second.
+        /// Room arrival times follow an exponential (Poisson) distribution
+        /// with this mean rate so the load pattern matches real-world
+        /// conferencing traffic.
+        /// Default 2.0 → mean 500 ms between rooms.
+        /// Use 0.0 to disable interarrival delay (original burst behaviour).
+        #[arg(long, default_value_t = 2.0)]
+        room_arrival_rate: f64,
     },
 }
 
@@ -169,6 +177,7 @@ async fn main() -> Result<()> {
             session_duration,
             session_jitter,
             drain_duration,
+            room_arrival_rate,
         } => {
             run_bench(
                 cli.api_url,
@@ -180,6 +189,7 @@ async fn main() -> Result<()> {
                 session_duration,
                 session_jitter,
                 drain_duration,
+                room_arrival_rate,
             )
             .await?
         }
@@ -200,6 +210,7 @@ async fn run_bench(
     session_duration: u64,
     session_jitter: u64,
     drain_duration: u64,
+    room_arrival_rate: f64,
 ) -> Result<()> {
     let (stats_tx, stats_rx) = mpsc::channel::<StatReport>(16_000);
     let state = SharedState::new();
@@ -231,6 +242,7 @@ async fn run_bench(
     let mut total_rooms = 0usize;
 
     for _ in 0..initial_rooms {
+        poisson_arrival_sleep(room_arrival_rate).await;
         spawn_room(
             &mut join_set,
             &api_url,
@@ -261,6 +273,7 @@ async fn run_bench(
                 }
                 for _ in 0..ramp_step {
                     if total_rooms >= max_rooms { break; }
+                    poisson_arrival_sleep(room_arrival_rate).await;
                     spawn_room(
                         &mut join_set,
                         &api_url,
@@ -300,6 +313,19 @@ async fn run_bench(
 }
 
 // ── Room spawner ──────────────────────────────────────────────────────────────
+
+/// Sleeps for an exponentially distributed duration with mean `1/rate` seconds,
+/// modelling Poisson room arrivals.  `rate = 0.0` skips the sleep entirely
+/// (original burst behaviour).  The sample is capped at 30 s to prevent
+/// pathological waits from very small uniform draws near 0.
+async fn poisson_arrival_sleep(rate: f64) {
+    if rate <= 0.0 {
+        return;
+    }
+    let u: f64 = rand::random_range(f64::MIN_POSITIVE..1.0);
+    let delay_secs = (-u.ln() / rate).min(30.0);
+    tokio::time::sleep(Duration::from_secs_f64(delay_secs)).await;
+}
 
 async fn spawn_room(
     join_set: &mut JoinSet<()>,

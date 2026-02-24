@@ -91,5 +91,8 @@ clean:
 chore-release:
 	cargo release -v --execute
 
+stack-sizes:
+	cargo +nightly build --release 2>&1 | grep -E "^print-type-sizes" | sort -t'=' -k2 -rn
+
 unused:
 	cargo machete

@@ -23,7 +23,7 @@ use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 32;
-const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct TrackMapping {
     pub mid: Mid,
@@ -50,22 +50,36 @@ pub enum CoreEvent {
     SpawnTrack(TrackReceiver),
 }
 
+// Align the entire struct to one cache line so the heap allocation from Box::new
+// never straddles a boundary, and so that the first cache-line fetch always
+// brings in the `rtc` header and both batcher structs together.  On x86-64 a
+// cache line is 64 bytes; on Apple Silicon it is 128 bytes — 64-byte alignment
+// is the safe portable choice and satisfies both.
+#[repr(align(64))]
 pub struct ParticipantCore {
-    // Hot: touched on every packet
+    // ── HOT (touched on every packet / every poll_fast call) ────────────────
+    // These fields are referenced in the tight inner loop:
+    //   poll_rtc()            → rtc, udp_batcher, tcp_batcher
+    //   handle_forward_rtp()  → rtc
+    //   handle_udp_packet_batch() → rtc
+    //   poll_fast()           → downstream.dirty_allocation, signaling
+    //   needs_slow_poll()     → last_slow_poll  (every outer loop iteration)
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
+    /// Timestamp of the last slow-poll run.  Sampled on every outer loop
+    /// iteration via `needs_slow_poll()`, so it must live in the hot group.
+    last_slow_poll: Instant,
+
+    // ── WARM (touched per poll cycle, not per packet) ────────────────────────
     pub downstream: DownstreamAllocator,
-
-    // Warm: touched per poll cycle
+    signaling: Signaling,
     pub upstream: UpstreamAllocator,
-    pub participant_id: entity::ParticipantId,
 
-    // Cold: touched rarely
+    // ── COLD (lifecycle; at most twice per participant) ──────────────────────
+    pub participant_id: entity::ParticipantId,
     pub events: Vec<CoreEvent>,
     disconnect_reason: Option<DisconnectReason>,
-    signaling: Signaling,
-    last_slow_poll: Instant,
 }
 
 impl ParticipantCore {
@@ -96,16 +110,19 @@ impl ParticipantCore {
         }
 
         Self {
-            participant_id,
+            // hot group
             rtc,
             udp_batcher,
             tcp_batcher,
-            upstream: UpstreamAllocator::new(),
-            downstream: DownstreamAllocator::new(manual_sub),
-            disconnect_reason: None,
-            events: Vec::with_capacity(32),
-            signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
+            // warm group
+            downstream: DownstreamAllocator::new(manual_sub),
+            signaling: Signaling::new(cid),
+            upstream: UpstreamAllocator::new(),
+            // cold group
+            participant_id,
+            events: Vec::with_capacity(32),
+            disconnect_reason: None,
         }
     }
 
@@ -146,12 +163,15 @@ impl ParticipantCore {
             }
         }
 
-        self.poll()
+        // Use poll_fast: slow poll is handled once per outer actor loop iteration,
+        // not inside this hot-path arm.
+        self.poll_fast()
     }
 
     pub fn handle_tick(&mut self) -> Option<Instant> {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
-        self.poll()
+        // Use poll_fast: the timer arm fires frequently; slow poll runs separately.
+        self.poll_fast()
     }
 
     pub fn handle_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
@@ -182,6 +202,9 @@ impl ParticipantCore {
 
     /// The Main Orchestrator.
     /// Drives the feedback loop between the RTC Engine and the Signaling Logic.
+    ///
+    /// Runs `poll_slow` when the interval has elapsed. Use `poll_fast` in
+    /// hot-path arms where predictable latency is required.
     pub fn poll(&mut self) -> Option<Instant> {
         let now = Instant::now();
 
@@ -190,26 +213,40 @@ impl ParticipantCore {
             self.last_slow_poll = now;
         }
 
+        self.poll_fast()
+    }
+
+    /// Fast variant of `poll`: drives the RTC engine and signaling loop but
+    /// **never** runs `poll_slow`. Call this inside hot drain arms (downstream
+    /// RTP forwarding, UDP ingress) where bounded latency is required.
+    /// `poll` (which includes `poll_slow`) is called once per outer loop
+    /// iteration from the actor, ensuring slow work is never deferred indefinitely.
+    pub fn poll_fast(&mut self) -> Option<Instant> {
         loop {
             let rtc_deadline = self.poll_rtc()?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
-                // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
-                // We loop back to `poll_rtc` immediately to flush `Output::Transmit`.
                 continue;
             }
 
             if self.downstream.dirty_allocation {
-                // Make sure rtc is updated with new allocations
                 self.downstream.update_allocations(&mut self.rtc.bwe());
                 continue;
             }
 
             let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
-
-            // No new work generated. We are synced. Return the RTC deadline.
             return Some(rtc_deadline.min(next_slow_poll));
         }
+    }
+
+    /// Runs the slow poll (BWE, allocation, upstream health) and updates
+    /// `last_slow_poll`. Call this at the top of the outer actor loop, not
+    /// inside a select! drain arm.
+    pub fn run_slow_poll(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        self.poll_slow(now);
+        self.last_slow_poll = now;
+        self.poll_fast()
     }
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
@@ -311,8 +348,6 @@ impl ParticipantCore {
             }
         }
     }
-
-    fn update_desired_bitrate(&mut self) {}
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {

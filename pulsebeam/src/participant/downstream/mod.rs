@@ -14,7 +14,15 @@ use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 pub use video::Intent;
 
+/// `#[repr(align(64))]` guarantees `dirty_allocation` — checked on every
+/// `poll_fast` iteration — sits at offset 0 of a fresh cache line.  Without
+/// this, the compiler may place `dirty_allocation` anywhere in the struct,
+/// potentially sharing a line with cold data from an adjacent struct.
+#[repr(align(64))]
 pub struct DownstreamAllocator {
+    /// Set whenever a track is added/removed or BWE changes; cleared by
+    /// `update_allocations`.  Placed first so the hot-path check
+    /// (`if self.downstream.dirty_allocation`) never fetches a cold line.
     pub dirty_allocation: bool,
     available_bandwidth: BitrateController,
     desired_bitrate: BitrateController,

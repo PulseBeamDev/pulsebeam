@@ -157,37 +157,24 @@ impl GatewayWorkerActor {
     }
 
     async fn read_socket(&mut self) -> io::Result<()> {
-        // ~1,000 yields per second = ~99% CPU for other work
-        const COOP_BUDGET: usize = 256;
-        let mut spent_budget: usize = 0;
-
+        // Yield after every try_recv_batch syscall, regardless of how many batches it returned.
+        // The previous packet-count budget caused up to 32 consecutive syscalls before yielding
+        // (when traffic arrives 1-2 packets at a time), keeping the task busy for ~244µs P99.
+        // One syscall boundary = one yield keeps each poll to a single recvmmsg cost (~7µs).
         loop {
             self.recv_batches.clear();
 
             match self.socket.try_recv_batch(&mut self.recv_batches) {
                 Ok(_) => {
                     for batch in self.recv_batches.drain(..) {
-                        // Calculate logical packets (GRO awareness)
-                        let cost = if batch.stride > 0 {
-                            std::cmp::max(1, batch.len / batch.stride)
-                        } else {
-                            1
-                        };
-
                         let src = batch.src;
                         if !self.demuxer.demux(&mut self.socket, batch) {
                             // In case there's a malicious actor, close immediately as there's no
                             // associated participant.
                             self.socket.close_peer(&src);
                         }
-
-                        spent_budget += cost;
-
-                        if spent_budget >= COOP_BUDGET {
-                            tokio::task::yield_now().await;
-                            spent_budget = 0;
-                        }
                     }
+                    tokio::task::yield_now().await;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) => return Err(err),

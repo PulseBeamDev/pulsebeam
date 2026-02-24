@@ -43,9 +43,9 @@ impl BitrateControllerConfig {
 
     pub fn desired_bitrate() -> Self {
         Self {
-            min_bitrate: Bitrate::kbps(300),
+            min_bitrate: Bitrate::kbps(10000),
             max_bitrate: Bitrate::mbps(10),
-            default_bitrate: Bitrate::kbps(300),
+            default_bitrate: Bitrate::kbps(10000),
             headroom_factor: 0.95,  // leave 5% headroom
             max_decay_factor: 0.95, // max 5% drop per tick
             emergency_drop_threshold: 0.50,

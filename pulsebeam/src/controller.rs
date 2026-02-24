@@ -159,8 +159,17 @@ pub struct ControllerActor {
     node_ctx: node::NodeContext,
 
     id: Arc<String>,
-    rooms: HashMap<RoomId, room::RoomHandle>,
+    /// Each room entry pairs the actor handle with the track-watch sender so that
+    /// new participants can subscribe to the room's authoritative track snapshot
+    /// without any round-trip to the room actor.
+    rooms: HashMap<RoomId, RoomEntry>,
     room_tasks: JoinSet<(RoomId, ActorStatus)>,
+}
+
+/// Bundles a room's actor handle with the write-half of its track watch channel.
+struct RoomEntry {
+    handle: room::RoomHandle,
+    track_watch: room::TrackWatchSender,
 }
 
 impl actor::Actor<ControllerMessageSet> for ControllerActor {
@@ -205,9 +214,10 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
             }
 
             ControllerMessage::DeleteParticipant(m) => {
-                if let Some(room_handle) = self.rooms.get_mut(&m.room_id) {
+                if let Some(entry) = self.rooms.get_mut(&m.room_id) {
                     // if the room has exited, the participants have already cleaned up too.
-                    let _ = room_handle
+                    let _ = entry
+                        .handle
                         .send(room::RemoveParticipant {
                             participant_id: m.participant_id,
                         })
@@ -248,11 +258,22 @@ impl ControllerActor {
     ) -> Result<SdpAnswer, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
+        // Clone the gateway handle before the mutable borrow taken by get_or_create_room.
+        let gateway = self.node_ctx.gateway.clone();
         let sockets = [&udp_egress, &tcp_egress];
 
         let (rtc, answer) = self.create_answer(offer, &sockets)?;
-        let mut room_handle = self.get_or_create_room(&s.room_id);
-        let gateway = self.node_ctx.gateway.clone();
+
+        // Scope the entry borrow so it is released before we need `room_handle` for the send.
+        let (room_handle, tracks_rx) = {
+            let entry = self.get_or_create_room(&s.room_id);
+            // Subscribe before the participant is spawned so it sees the current
+            // track snapshot immediately on first poll — no TracksSnapshot message needed.
+            let tracks_rx = entry.track_watch.subscribe();
+            let room_handle = entry.handle.clone();
+            (room_handle, tracks_rx)
+        };
+
         let participant = ParticipantActor::new(
             gateway,
             room_handle.clone(),
@@ -261,11 +282,13 @@ impl ControllerActor {
             s.participant_id,
             rtc,
             s.manual_sub,
+            tracks_rx,
         );
         // TODO: probably retry? Or, let the client to retry instead?
         // Each room will always have a graceful timeout before closing.
         // But, a data race can still occur nonetheless
         room_handle
+            .tx
             .send(room::RoomMessage::AddParticipant(room::AddParticipant {
                 participant,
                 connection_id: s.connection_id,
@@ -380,23 +403,32 @@ impl ControllerActor {
         Ok((rtc, answer))
     }
 
-    fn get_or_create_room(&mut self, room_id: &RoomId) -> room::RoomHandle {
-        if let Some(handle) = self.rooms.get(room_id) {
-            tracing::info!("get_room: {}", room_id);
-            handle.clone()
-        } else {
+    fn get_or_create_room(&mut self, room_id: &RoomId) -> &mut RoomEntry {
+        if !self.rooms.contains_key(room_id) {
             tracing::info!("create_room: {}", room_id);
-            let room_actor = room::RoomActor::new(self.node_ctx.clone(), room_id.clone());
+            // Create the watch channel upfront so participants can subscribe before
+            // the room actor processes their AddParticipant message.
+            let (watch_tx, _initial_rx) =
+                tokio::sync::watch::channel(std::sync::Arc::new(room::TrackMap::new()));
+            let track_watch = std::sync::Arc::new(watch_tx);
+            let room_actor =
+                room::RoomActor::new(self.node_ctx.clone(), room_id.clone(), track_watch.clone());
             let (room_handle, room_task) = actor::prepare(
                 room_actor,
                 actor::RunnerConfig::default().with_mailbox_cap(1024),
             );
             self.room_tasks.spawn(room_task);
-
-            self.rooms.insert(room_id.clone(), room_handle.clone());
-
-            room_handle
+            self.rooms.insert(
+                room_id.clone(),
+                RoomEntry {
+                    handle: room_handle,
+                    track_watch,
+                },
+            );
+        } else {
+            tracing::info!("get_room: {}", room_id);
         }
+        self.rooms.get_mut(room_id).expect("just inserted")
     }
 
     fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), OfferRejectedReason> {

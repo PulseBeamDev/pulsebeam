@@ -5,6 +5,13 @@ const MAX_GSO_SEGMENTS: usize = 8;
 const MAX_FREE_STATES: usize = 3;
 
 /// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
+///
+/// `#[repr(align(64))]` ensures each `Batcher` occupies its own cache-line group
+/// when two instances (`udp_batcher` + `tcp_batcher`) are adjacent in
+/// `ParticipantCore`.  Without alignment the tail of one batcher and the head of
+/// the next share a cache line, so a write to one invalidates the other on
+/// neighbouring CPU cores (false sharing).
+#[repr(align(64))]
 pub struct Batcher {
     cap: usize,
     active_states: VecDeque<BatcherState>,

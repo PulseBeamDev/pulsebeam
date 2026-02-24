@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::watch;
 
 use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},
@@ -20,6 +21,19 @@ use futures_util::FutureExt;
 use pulsebeam_runtime::actor;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Complete snapshot of all active tracks in the room.
+///
+/// Written by the room actor (once per track-lifecycle event), read by
+/// every participant actor via a `watch::Receiver`. Always reflects the
+/// current authoritative state — no delta messages are sent to participants.
+pub type TrackMap = HashMap<TrackId, track::TrackReceiver>;
+/// The write-half of the room-wide track watch channel. Owned by `RoomActor`
+/// and also held (as `Arc`) by the controller so it can hand a `Receiver` to
+/// each new participant at spawn time.
+pub type TrackWatchSender = Arc<watch::Sender<Arc<TrackMap>>>;
+/// The read-half handed to each `ParticipantActor` at construction.
+pub type TrackWatchReceiver = watch::Receiver<Arc<TrackMap>>;
 
 #[derive(derive_more::From)]
 pub enum RoomMessage {
@@ -58,6 +72,9 @@ pub struct RoomActor {
     room_id: RoomId,
     state: RoomState,
     participant_tasks: JoinSet<(ParticipantId, ConnectionId, ActorStatus)>,
+    /// Write-half of the room-wide track watch channel. One `send_modify` call
+    /// per track event — O(1) regardless of participant count.
+    track_watch: TrackWatchSender,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -93,14 +110,14 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
             select: {
                 Some(Ok((participant_id, connection_id, _))) = self.participant_tasks.join_next() => {
-                    self.handle_participant_left(participant_id, connection_id).await;
+                    self.handle_participant_left(participant_id, connection_id);
                 }
                 _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
                     tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
-                    self.cleanup_old_tombstones().await;
+                    self.cleanup_old_tombstones();
                 }
             }
         );
@@ -121,41 +138,39 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                         m.participant,
                         old_connection_id,
                         m.connection_id,
-                    )
-                    .await;
+                    );
                 } else {
-                    self.handle_participant_joined(ctx, m.participant, m.connection_id)
-                        .await;
+                    self.handle_participant_joined(ctx, m.participant, m.connection_id);
                 }
             }
             RoomMessage::RemoveParticipant(m) => {
-                self.remove_all_participant_connections(m.participant_id)
-                    .await;
+                self.remove_all_participant_connections(m.participant_id);
             }
             RoomMessage::PublishTrack(track_handle) => {
-                self.handle_track_published(track_handle).await;
+                self.handle_track_published(track_handle);
             }
         };
     }
 }
 
 impl RoomActor {
-    pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
+    pub fn new(node_ctx: node::NodeContext, room_id: RoomId, track_watch: TrackWatchSender) -> Self {
         Self {
             node_ctx,
             room_id,
             state: RoomState::default(),
             participant_tasks: JoinSet::new(),
+            track_watch,
         }
     }
 
-    async fn handle_participant_joined(
+    fn handle_participant_joined(
         &mut self,
         _ctx: &mut actor::ActorContext<RoomMessageSet>,
         participant_actor: ParticipantActor,
         connection_id: ConnectionId,
     ) {
-        let (mut participant_handle, participant_task) =
+        let (participant_handle, participant_task) =
             actor::prepare(participant_actor, RunnerConfig::default());
         let participant_id = participant_handle.meta;
 
@@ -169,21 +184,16 @@ impl RoomActor {
         self.state.participants.insert(
             (participant_id, connection_id),
             ParticipantMeta {
-                handle: participant_handle.clone(),
+                handle: participant_handle,
                 tracks: HashMap::new(),
                 connection_id,
             },
         );
-
-        // Send current tracks to new participant
-        let _ = participant_handle
-            .send(participant::ParticipantControlMessage::TracksSnapshot(
-                self.state.tracks.clone(),
-            ))
-            .await;
+        // Track distribution is handled via the watch::Receiver the participant
+        // received at construction time — no TracksSnapshot message needed.
     }
 
-    async fn handle_participant_left(
+    fn handle_participant_left(
         &mut self,
         participant_id: ParticipantId,
         connection_id: ConnectionId,
@@ -200,7 +210,7 @@ impl RoomActor {
             return;
         }
 
-        let Some(mut participant) = self.state.participants.remove(&key) else {
+        let Some(participant) = self.state.participants.remove(&key) else {
             tracing::warn!(
                 ?participant_id,
                 ?connection_id,
@@ -214,18 +224,30 @@ impl RoomActor {
             .tombstoned
             .insert(key, tokio::time::Instant::now());
 
-        // Terminate participant actor
-        let _ = participant.handle.terminate().await;
+        // Signal the participant task to terminate.
+        // try_send is safe here: the sys_tx channel has capacity 1. If it's already
+        // full (e.g. a GetState is in flight), the participant will drain the channel
+        // shortly and then process our next attempt — or it will exit on its own when
+        // its room handle closes. Either way, the task will not leak.
+        let _ = participant
+            .handle
+            .sys_tx
+            .try_send(actor::SystemMsg::Terminate);
 
-        // Remove tracks published by this connection
-        for (track_id, _) in participant.tracks.iter_mut() {
-            self.state.tracks.remove(track_id);
+        // Remove this participant's tracks from the room state and update the watch.
+        let removed_ids: Vec<TrackId> = participant.tracks.keys().copied().collect();
+        if !removed_ids.is_empty() {
+            for id in &removed_ids {
+                self.state.tracks.remove(id);
+            }
+            // O(1) write: all participant watch::Receivers see the new snapshot atomically.
+            self.track_watch.send_modify(|map| {
+                let m = Arc::make_mut(map);
+                for id in &removed_ids {
+                    m.remove(id);
+                }
+            });
         }
-
-        // Broadcast unpublish to other participants
-        let tracks = Arc::new(participant.tracks);
-        let msg = participant::ParticipantControlMessage::TracksUnpublished(tracks);
-        self.broadcast_message(msg).await;
 
         tracing::info!(
             ?participant_id,
@@ -234,7 +256,7 @@ impl RoomActor {
         );
     }
 
-    async fn handle_track_published(&mut self, track_handle: track::TrackReceiver) {
+    fn handle_track_published(&mut self, track_handle: track::TrackReceiver) {
         let origin_participant_id = track_handle.meta.origin_participant;
         let track_id = track_handle.meta.id;
 
@@ -263,15 +285,15 @@ impl RoomActor {
         origin.tracks.insert(track_id, track_handle.clone());
         self.state.tracks.insert(track_id, track_handle.clone());
 
-        // Broadcast new track to all participants
-        let mut new_tracks = HashMap::new();
-        new_tracks.insert(track_id, track_handle.clone());
-        let new_tracks = Arc::new(new_tracks);
-        let msg = participant::ParticipantControlMessage::TracksPublished(new_tracks);
-        self.broadcast_message(msg).await;
+        // O(1) write: all participant watch::Receivers see the new snapshot atomically.
+        // Arc::make_mut performs a clone-on-write only if other Arc handles exist,
+        // which only happens during the brief window a participant is reading it.
+        self.track_watch.send_modify(|map| {
+            Arc::make_mut(map).insert(track_id, track_handle);
+        });
     }
 
-    async fn handle_replace_participant(
+    fn handle_replace_participant(
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
         new_participant: ParticipantActor,
@@ -287,16 +309,11 @@ impl RoomActor {
             "Replacing participant connection"
         );
 
-        // Evict old connection
-        self.handle_participant_left(participant_id, old_connection_id)
-            .await;
-
-        // Add new connection
-        self.handle_participant_joined(ctx, new_participant, new_connection_id)
-            .await;
+        self.handle_participant_left(participant_id, old_connection_id);
+        self.handle_participant_joined(ctx, new_participant, new_connection_id);
     }
 
-    async fn remove_all_participant_connections(&mut self, participant_id: ParticipantId) {
+    fn remove_all_participant_connections(&mut self, participant_id: ParticipantId) {
         let start_bound = (participant_id, ConnectionId::MIN);
         let end_bound = (participant_id, ConnectionId::MAX);
 
@@ -308,22 +325,15 @@ impl RoomActor {
             .collect();
 
         for (_, connection_id) in keys_to_remove {
-            self.handle_participant_left(participant_id, connection_id)
-                .await;
+            self.handle_participant_left(participant_id, connection_id);
         }
     }
 
-    async fn cleanup_old_tombstones(&mut self) {
+    fn cleanup_old_tombstones(&mut self) {
         let cutoff = tokio::time::Instant::now() - Duration::from_secs(3600); // 1 hour
         self.state
             .tombstoned
             .retain(|_, timestamp| *timestamp > cutoff);
-    }
-
-    async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {
-        for participant in self.state.participants.values_mut() {
-            let _ = participant.handle.send(msg.clone()).await;
-        }
     }
 }
 
