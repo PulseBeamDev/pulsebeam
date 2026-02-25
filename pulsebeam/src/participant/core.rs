@@ -22,7 +22,7 @@ use crate::participant::{
 use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
 
-const RESERVED_DATA_CHANNEL_COUNT: u16 = 32;
+const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct TrackMapping {
