@@ -164,6 +164,8 @@ pub struct ControllerActor {
     /// without any round-trip to the room actor.
     rooms: HashMap<RoomId, RoomEntry>,
     room_tasks: JoinSet<(RoomId, ActorStatus)>,
+    /// Monotonic counter for round-robin assignment of rooms to cpu_handles.
+    room_counter: usize,
 }
 
 /// Bundles a room's actor handle with the write-half of its track watch channel.
@@ -411,13 +413,21 @@ impl ControllerActor {
             let (watch_tx, _initial_rx) =
                 tokio::sync::watch::channel(std::sync::Arc::new(room::TrackMap::new()));
             let track_watch = std::sync::Arc::new(watch_tx);
+            // Assign this room to a core round-robin.  All participant tasks
+            // spawned inside the room actor will inherit the same current_thread
+            // runtime (via Handle::current()), so they are permanently pinned to
+            // the same OS thread as their room — zero work-stealing possible.
+            let handle_idx = self.room_counter % self.node_ctx.cpu_handles.len();
+            let assigned_handle = self.node_ctx.cpu_handles[handle_idx].clone();
+            self.room_counter += 1;
+
             let room_actor =
                 room::RoomActor::new(self.node_ctx.clone(), room_id.clone(), track_watch.clone());
             let (room_handle, room_task) = actor::prepare(
                 room_actor,
                 actor::RunnerConfig::default().with_mailbox_cap(1024),
             );
-            self.room_tasks.spawn(room_task);
+            self.room_tasks.spawn_on(room_task, &assigned_handle);
             self.rooms.insert(
                 room_id.clone(),
                 RoomEntry {
@@ -515,6 +525,7 @@ impl ControllerActor {
             node_ctx: system_ctx,
             rooms: HashMap::new(),
             room_tasks: JoinSet::new(),
+            room_counter: 0,
         }
     }
 }

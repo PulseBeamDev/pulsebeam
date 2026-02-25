@@ -103,7 +103,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = pulsebeam_runtime::sync::mpsc::channel(256);
+        // 64 slots × ~128 B/slot × 300 participants = 2.4 MB — fits in L3.
+        // 30 fps video with a 300 ms jitter buffer reaches at most ~54 in-flight
+        // packets, so 64 slots is sufficient headroom.
+        let (gateway_tx, mut gateway_rx) = pulsebeam_runtime::sync::mpsc::channel(64);
 
         let _ = self
             .gateway

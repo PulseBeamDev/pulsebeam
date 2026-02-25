@@ -26,6 +26,9 @@ struct Slot<T> {
 }
 
 #[derive(Debug)]
+// Same alignment rationale as mpsc::Ring: guarantee head+mask start on a fresh
+// cache line so every producer read of head is a single L1 hit.
+#[repr(align(64))]
 struct Ring<T> {
     head: AtomicU64,
     mask: usize,

@@ -2,7 +2,6 @@ use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::system;
 use std::{net::SocketAddr, num::NonZeroUsize};
-use tokio::runtime::LocalOptions;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
@@ -44,32 +43,50 @@ fn main() {
         registry.init();
     }
 
-    let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    // let workers = 1;
-    tracing::info!("using {} worker threads", workers);
+    let total_cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let workers = total_cpus;
 
+    // Build one current_thread runtime per CPU core for room/participant work.
+    // Each runtime has exactly one worker thread (the OS thread that calls
+    // block_on), so tasks spawned onto it can never be work-stolen to another
+    // core.  The room actor and all of its participant actors are pinned to the
+    // same runtime, keeping their ~100 KB of Rtc state warm in that core's
+    // private L1/L2 cache.
+    let cpu_handles: Vec<tokio::runtime::Handle> = (0..workers)
+        .map(|_| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let handle = rt.handle().clone();
+            // Drive the runtime forever from a dedicated OS thread.
+            // The thread exits when the process exits.
+            std::thread::spawn(move || {
+                rt.block_on(std::future::pending::<()>());
+            });
+            handle
+        })
+        .collect();
+
+    // IO runtime: gateway UDP recv, HTTP API, signaling, controller.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(workers)
-        // https://github.com/tokio-rs/tokio/issues/7745
-        // .enable_alt_timer()
         .build()
         .unwrap();
 
-    // let rt = tokio::runtime::Builder::new_current_thread()
-    //     .enable_all()
-    //     // https://github.com/tokio-rs/tokio/issues/7745
-    //     .enable_alt_timer()
-    //     .build_local(LocalOptions::default())
-    //     .unwrap();
-
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers, rtc_port));
+    rt.block_on(run(shutdown.clone(), workers, rtc_port, cpu_handles));
     shutdown.cancel();
 }
 
-pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
+pub async fn run(
+    shutdown: CancellationToken,
+    workers: usize,
+    rtc_port: u16,
+    cpu_handles: Vec<tokio::runtime::Handle>,
+) {
     let external_ip = system::select_host_address();
     let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
@@ -83,6 +100,7 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
         .external_addr(external_addr)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr)
+        .with_cpu_runtimes(cpu_handles)
         .run(shutdown.child_token());
     let node_handle = tokio::spawn(node);
 

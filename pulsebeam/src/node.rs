@@ -37,6 +37,9 @@ pub struct NodeBuilder {
     rng: Option<rand::Rng>,
     udp_mode: UdpMode,
     gateway_handle: Option<gateway::GatewayHandle>,
+    /// Per-core single-threaded runtime handles. Room and participant tasks are
+    /// round-robin assigned so each core owns a disjoint set of participants.
+    cpu_handles: Vec<tokio::runtime::Handle>,
 
     // Services
     http_api: Option<ListenerSource>,
@@ -58,6 +61,7 @@ impl NodeBuilder {
             rng: None,
             udp_mode: UdpMode::Batch,
             gateway_handle: None,
+            cpu_handles: Vec::new(),
             http_api: None,
             internal_metrics: None,
         }
@@ -97,6 +101,16 @@ impl NodeBuilder {
     /// Inject an existing Gateway handle.
     pub fn with_gateway(mut self, gateway: gateway::GatewayHandle) -> Self {
         self.gateway_handle = Some(gateway);
+        self
+    }
+
+    /// Provide per-core single-threaded runtime handles for room/participant actors.
+    ///
+    /// Each handle must belong to a `current_thread` runtime driven by its own
+    /// OS thread.  The controller assigns rooms round-robin so every core owns
+    /// a disjoint set of participants — eliminating work-stealing between them.
+    pub fn with_cpu_runtimes(mut self, handles: Vec<tokio::runtime::Handle>) -> Self {
+        self.cpu_handles = handles;
         self
     }
 
@@ -158,11 +172,18 @@ impl NodeBuilder {
             handle
         };
 
+        let cpu_handles = if self.cpu_handles.is_empty() {
+            Arc::new(vec![tokio::runtime::Handle::current()])
+        } else {
+            Arc::new(self.cpu_handles)
+        };
+
         let node_ctx = NodeContext {
             rng,
             gateway: gateway_handle.clone(),
             udp_sockets: udp_writers,
             tcp_socket: tcp_writer,
+            cpu_handles,
             udp_egress_counter: Arc::new(AtomicUsize::new(0)),
         };
 
@@ -260,6 +281,8 @@ pub struct NodeContext {
     pub gateway: gateway::GatewayHandle,
     pub udp_sockets: Vec<net::UnifiedSocketWriter>,
     pub tcp_socket: net::UnifiedSocketWriter,
+    /// Per-core runtime handles used for round-robin room assignment.
+    pub cpu_handles: Arc<Vec<tokio::runtime::Handle>>,
     udp_egress_counter: Arc<AtomicUsize>,
 }
 

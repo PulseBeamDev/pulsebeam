@@ -24,15 +24,28 @@ struct Slot<T> {
 }
 
 #[derive(Debug)]
+// #[repr(align(64))] guarantees the struct starts at a cache-line boundary so
+// that `head`, `mask`, and `closed` — all three read/written on every
+// try_send / poll_recv — land in the SAME first 64-byte cache line.  Without
+// this the allocator may place the struct anywhere, splitting hot fields
+// across two lines and doubling the cache-miss cost per channel operation.
+// Field order reinforces this: the three hot scalars come first (24 bytes total),
+// then the Vec fat-pointer for `slots` (24 bytes), then `event` — all comfortably
+// within the 64-byte window.  Each of the 300 participant Ring objects is now
+// guaranteed to start fresh, preventing false sharing between adjacent
+// allocations.
+#[repr(align(64))]
 struct Ring<T> {
-    // This is mspc, but we expect very low contention on the producers.
-    // Mutex is generally cheaper than RWLock. So, no reason to pay
-    // RWLock overhead.
-    slots: Vec<Mutex<Slot<T>>>,
-    mask: usize,
+    // ── HOT (accessed on every send AND recv) ──────────────────────────────
+    /// Monotonically increasing write sequence number; producer fetch_add here.
     head: AtomicU64,
-    event: Event,
+    /// Capacity mask (`capacity - 1`); used to compute slot index from seq.
+    mask: usize,
+    /// Set to 1 when the Receiver is dropped; checked by producers first.
     closed: AtomicU64,
+    // ── WARM (fat-pointer; dereffed only after slot index is computed) ──────
+    slots: Vec<Mutex<Slot<T>>>,
+    event: Event,
 }
 
 impl<T> Ring<T> {
@@ -49,11 +62,11 @@ impl<T> Ring<T> {
         }
 
         Arc::new(Self {
-            slots,
-            mask: capacity - 1,
             head: AtomicU64::new(0),
-            event: Event::new(),
+            mask: capacity - 1,
             closed: AtomicU64::new(0),
+            slots,
+            event: Event::new(),
         })
     }
 }
