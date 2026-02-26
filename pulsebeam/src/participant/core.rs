@@ -124,11 +124,16 @@ impl ParticipantCore {
         }
     }
 
-    pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch, now: Instant) {
+    pub fn handle_udp_packet_batch(
+        &mut self,
+        batch: net::RecvPacketBatch,
+        now: Instant,
+    ) -> Option<Instant> {
         let transport = match batch.transport {
             Transport::Udp(_) => str0m::net::Protocol::Udp,
             Transport::Tcp => str0m::net::Protocol::Tcp,
         };
+        let mut maybe_deadline = None;
         for pkt in batch.into_iter() {
             if let Ok(contents) = (*pkt).try_into() {
                 let recv = str0m::net::Receive {
@@ -137,11 +142,18 @@ impl ParticipantCore {
                     destination: batch.dst,
                     contents,
                 };
-                let _ = self.rtc.handle_input(Input::Receive(now.into(), recv));
+                if self
+                    .rtc
+                    .handle_input(Input::Receive(now.into(), recv))
+                    .is_ok()
+                {
+                    maybe_deadline = self.poll();
+                }
             } else {
                 tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
             }
         }
+        maybe_deadline
     }
 
     pub fn handle_tick(&mut self) {

@@ -101,7 +101,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 if self.core.tcp_batcher.len() >= 2 {
                     self.core.tcp_batcher.flush(&self.tcp_egress);
                 }
-                needs_poll = false;
             }
             let now = Instant::now();
             if let Some(deadline) = maybe_deadline {
@@ -155,10 +154,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
                 // Priority 2: Ingress Work
                 Ok(batch) = gateway_rx.recv() => {
-                    self.core.handle_udp_packet_batch(batch, now);
+                    needs_poll = false;
+                    maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
 
                     while let Some(Ok(batch)) = gateway_rx.recv().now_or_never() {
-                        self.core.handle_udp_packet_batch(batch, now);
+                        maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
                     }
                 },
 
