@@ -1,5 +1,7 @@
+pub mod bit_signal;
 pub mod mpsc;
 pub mod spmc;
+pub mod task_group;
 
 #[cfg(not(feature = "loom"))]
 mod primitives {

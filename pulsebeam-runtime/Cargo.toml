@@ -47,3 +47,4 @@ pulsebeam-core = { path = "../pulsebeam-core" }
 criterion = { version = "0.8.1", features = ["async", "async_tokio"] }
 futures-concurrency = "7.6.3"
 async-stream = "0.3.6"
+futures = "0.3.32"
