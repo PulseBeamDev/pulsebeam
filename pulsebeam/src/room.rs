@@ -1,14 +1,15 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
+use futures_buffered::FuturesUnorderedBounded;
 use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},
     prelude::*,
 };
-use tokio::task::JoinSet;
 
 use crate::{
     entity::{ConnectionId, ParticipantId, RoomId, TrackId},
@@ -53,11 +54,13 @@ impl actor::MessageSet for RoomMessageSet {
     type ObservableState = RoomState;
 }
 
+type ParticipantTask =
+    dyn Future<Output = (ParticipantId, ConnectionId, ActorStatus)> + Send + 'static;
 pub struct RoomActor {
     node_ctx: node::NodeContext,
     room_id: RoomId,
     state: RoomState,
-    participant_tasks: JoinSet<(ParticipantId, ConnectionId, ActorStatus)>,
+    participant_tasks: FuturesUnorderedBounded<Pin<Box<ParticipantTask>>>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -92,7 +95,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
             select: {
-                Some(Ok((participant_id, connection_id, _))) = self.participant_tasks.join_next() => {
+                Some((participant_id, connection_id, _)) = self.participant_tasks.next() => {
                     self.handle_participant_left(participant_id, connection_id).await;
                 }
                 _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
@@ -145,7 +148,7 @@ impl RoomActor {
             node_ctx,
             room_id,
             state: RoomState::default(),
-            participant_tasks: JoinSet::new(),
+            participant_tasks: FuturesUnorderedBounded::new(128),
         }
     }
 
@@ -159,11 +162,10 @@ impl RoomActor {
             actor::prepare(participant_actor, RunnerConfig::default());
         let participant_id = participant_handle.meta;
 
-        // Use .map() instead of an async block to avoid the Rust compiler storing
-        // participant_task twice at the Suspend0 point (once as upvar, once as __awaitee),
-        // which doubles the per-entry size in the JoinSet from ~73KB to ~37KB.
-        self.participant_tasks.spawn(
-            participant_task.map(move |(id, status)| (id, connection_id, status)),
+        self.participant_tasks.try_push(
+            participant_task
+                .map(move |(id, status)| (id, connection_id, status))
+                .boxed(),
         );
 
         self.state.participants.insert(

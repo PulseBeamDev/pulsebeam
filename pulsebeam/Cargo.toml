@@ -19,6 +19,7 @@ bytes = { workspace = true }
 clap = { version = "4.5.57", features = ["derive"] }
 console-subscriber = { version = "0.5", optional = true }
 derive_more = { workspace = true }
+futures-buffered = { version = "0.2.13", features = ["tokio-coop"] }
 futures-lite = { workspace = true }
 futures-util = "0.3.32"
 hyper = "1.7.0"
