@@ -49,9 +49,8 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(workers)
-        // .disable_lifo_slot()
         // https://github.com/tokio-rs/tokio/issues/7745
-        // .enable_alt_timer()
+        .enable_alt_timer()
         .build()
         .unwrap();
 
