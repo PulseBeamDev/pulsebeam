@@ -84,31 +84,81 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 gateway_tx,
             ))
             .await;
-        let mut maybe_deadline = self.core.poll();
-        // Box the Sleep future so tokio::time::Sleep (~152 bytes) lives on the heap
-        // rather than inline in the select! state machine.
-        let mut sleep = Box::pin(tokio::time::sleep(MIN_QUANTA));
+        let sleep = tokio::time::sleep(MIN_QUANTA);
+        tokio::pin!(sleep);
 
-        while let Some(deadline) = maybe_deadline {
-            let now = Instant::now();
-            let batch_size = self.core.events.len().min(16);
+        let mut needs_poll = true;
+        let mut maybe_deadline = None;
 
-            // If the deadline is 'now' or in the past, we must not busy-wait.
-            // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
-            let adjusted_deadline = if deadline <= now {
-                now + MIN_QUANTA
-            } else {
-                deadline
-            };
+        loop {
+            if needs_poll {
+                maybe_deadline = self.core.poll();
 
-            if sleep.deadline() != adjusted_deadline {
-                sleep.as_mut().reset(adjusted_deadline);
+                // this indicates the first batch is filled.
+                if self.core.udp_batcher.len() >= 2 {
+                    self.core.udp_batcher.flush(&self.udp_egress);
+                }
+                if self.core.tcp_batcher.len() >= 2 {
+                    self.core.tcp_batcher.flush(&self.tcp_egress);
+                }
+                needs_poll = false;
             }
+            let now = Instant::now();
+            if let Some(deadline) = maybe_deadline {
+                // If the deadline is 'now' or in the past, we must not busy-wait.
+                // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
+                let adjusted_deadline = if deadline <= now {
+                    now + MIN_QUANTA
+                } else {
+                    deadline
+                };
+                if sleep.deadline() != adjusted_deadline {
+                    sleep.as_mut().reset(deadline);
+                }
+            }
+
+            needs_poll = true;
+            let batch_size = self.core.events.len().min(16);
 
             tokio::select! {
                 biased;
-                // Priority 1: Control Messages
+                // Priority 1: Egress Work
+                // TODO: consolidate pollings in core
+                _ = self.core.upstream.notified() => {
+                    let now = Instant::now();
+                    // Collect first to release the borrow on upstream before handle_keyframe_request
+                    // borrows all of core.  Allocations here are rare (~2 Hz) and negligible.
+                    let reqs: Vec<_> = self.core.upstream.drain_keyframe_requests(now).collect();
+                    for req in reqs {
+                        self.core.handle_keyframe_request(req);
+                    }
+                }
+                Some((meta, pkt)) = self.core.downstream.next() => {
+                    self.core.handle_forward_rtp(meta, pkt);
+
+                    while let Some(Some((meta, pkt))) = self.core.downstream.next().now_or_never() {
+                        self.core.handle_forward_rtp(meta, pkt);
+                    }
+                },
+                Ok(_) = self.udp_egress.writable(), if !self.core.udp_batcher.is_empty() => {
+                    self.core.udp_batcher.flush(&self.udp_egress);
+                },
+                Ok(_) = self.tcp_egress.writable(), if !self.core.tcp_batcher.is_empty() => {
+                    self.core.tcp_batcher.flush(&self.tcp_egress);
+                },
+
+                // Priority 2: Ingress Work
+                Ok(batch) = gateway_rx.recv() => {
+                    self.core.handle_udp_packet_batch(batch, now);
+
+                    while let Some(Ok(batch)) = gateway_rx.recv().now_or_never() {
+                        self.core.handle_udp_packet_batch(batch, now);
+                    }
+                },
+
+                // Priority 3: Control Messages
                 res = ctx.sys_rx.recv() => {
+                    needs_poll = false;
                     match res {
                         Some(msg) => match msg {
                             actor::SystemMsg::GetState(responder) => {
@@ -122,9 +172,9 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 Some(msg) = ctx.rx.recv() => {
                     self.handle_control_message(msg).await;
-                    maybe_deadline = self.core.poll();
                 }
                 res = room_handle.tx.reserve_many(batch_size), if !self.core.events.is_empty() => {
+                    needs_poll = false;
                     match res {
                         Ok(permits) => {
                             for (event, permit) in self.core.events.drain(..batch_size).zip(permits) {
@@ -142,52 +192,10 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     }
                 }
 
-                // Priority 2: Egress Work
-                // TODO: consolidate pollings in core
-                _ = self.core.upstream.notified() => {
-                    let now = Instant::now();
-                    // Collect first to release the borrow on upstream before handle_keyframe_request
-                    // borrows all of core.  Allocations here are rare (~2 Hz) and negligible.
-                    let reqs: Vec<_> = self.core.upstream.drain_keyframe_requests(now).collect();
-                    for req in reqs {
-                        self.core.handle_keyframe_request(req);
-                    }
-                }
-                Some((meta, pkt)) = self.core.downstream.next() => {
-                    self.core.handle_forward_rtp(meta, pkt);
-
-                    while let Some(Some((meta, pkt))) = self.core.downstream.next().now_or_never() {
-                        self.core.handle_forward_rtp(meta, pkt);
-                    }
-
-                    maybe_deadline = self.core.poll();
-                    // this indicates the first batch is filled.
-                    if self.core.udp_batcher.len() >= 2 {
-                        self.core.udp_batcher.flush(&self.udp_egress);
-                    }
-                    if self.core.tcp_batcher.len() >= 2 {
-                        self.core.tcp_batcher.flush(&self.tcp_egress);
-                    }
-                },
-                Ok(_) = self.udp_egress.writable(), if !self.core.udp_batcher.is_empty() => {
-                    self.core.udp_batcher.flush(&self.udp_egress);
-                },
-                Ok(_) = self.tcp_egress.writable(), if !self.core.tcp_batcher.is_empty() => {
-                    self.core.tcp_batcher.flush(&self.tcp_egress);
-                },
-
-                // Priority 3: Ingress Work
-                Ok(batch) = gateway_rx.recv() => {
-                    maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
-
-                    while let Some(Ok(batch)) = gateway_rx.recv().now_or_never() {
-                        maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
-                    }
-                },
 
                 // Priority 4: Background tasks
                 _ = &mut sleep => {
-                    maybe_deadline = self.core.handle_tick();
+                    self.core.handle_tick();
                 },
             }
         }
@@ -217,7 +225,13 @@ impl ParticipantActor {
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
-        let core = Box::new(ParticipantCore::new(manual_sub, participant_id, rtc, udp_batcher, tcp_batcher));
+        let core = Box::new(ParticipantCore::new(
+            manual_sub,
+            participant_id,
+            rtc,
+            udp_batcher,
+            tcp_batcher,
+        ));
         Self {
             gateway: gateway_handle,
             core,

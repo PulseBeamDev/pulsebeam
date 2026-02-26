@@ -1,4 +1,5 @@
 use super::signaling::Signaling;
+use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
 use std::collections::HashMap;
@@ -123,11 +124,7 @@ impl ParticipantCore {
         }
     }
 
-    pub fn handle_udp_packet_batch(
-        &mut self,
-        batch: net::RecvPacketBatch,
-        now: Instant,
-    ) -> Option<Instant> {
+    pub fn handle_udp_packet_batch(&mut self, batch: net::RecvPacketBatch, now: Instant) {
         let transport = match batch.transport {
             Transport::Udp(_) => str0m::net::Protocol::Udp,
             Transport::Tcp => str0m::net::Protocol::Tcp,
@@ -145,13 +142,10 @@ impl ParticipantCore {
                 tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
             }
         }
-
-        self.poll()
     }
 
-    pub fn handle_tick(&mut self) -> Option<Instant> {
+    pub fn handle_tick(&mut self) {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
-        self.poll()
     }
 
     pub fn handle_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
@@ -215,22 +209,56 @@ impl ParticipantCore {
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
     fn poll_rtc(&mut self) -> Option<Instant> {
-        while self.rtc.is_alive() {
+        // Count of useful outputs (Transmit / Event) processed in this call.
+        let mut work_items: u64 = 0;
+        let mut timeouts = 0;
+        let mut transmits = 0;
+        let mut events = 0;
+        let mut errors = 0;
+
+        let result = loop {
+            if !self.rtc.is_alive() {
+                break None;
+            }
             match self.rtc.poll_output() {
-                Ok(Output::Timeout(deadline)) => return Some(deadline.into()),
-                Ok(Output::Transmit(tx)) => match tx.proto {
-                    Protocol::Udp => self.udp_batcher.push_back(tx.destination, &tx.contents),
-                    Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
-                    _ => {}
-                },
-                Ok(Output::Event(event)) => self.handle_event(event),
+                Ok(Output::Timeout(deadline)) => {
+                    timeouts += 1;
+                    break Some(deadline.into());
+                }
+                Ok(Output::Transmit(tx)) => {
+                    transmits += 1;
+                    work_items += 1;
+                    match tx.proto {
+                        Protocol::Udp => self.udp_batcher.push_back(tx.destination, &tx.contents),
+                        Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
+                        _ => {}
+                    }
+                }
+                Ok(Output::Event(event)) => {
+                    events += 1;
+                    work_items += 1;
+                    self.handle_event(event);
+                }
                 Err(e) => {
+                    errors += 1;
                     self.disconnect(e.into());
-                    return None;
+                    break None;
                 }
             }
+        };
+
+        #[cfg(feature = "deep-metrics")]
+        {
+            // Record how many useful outputs were processed per poll_rtc invocation.
+            // A value of 0 means the first poll_output was already a Timeout (idle call).
+            histogram!("poll_rtc_work_items_per_call").record(work_items as f64);
+            counter!("poll_rtc_outputs_total", "kind" => "timeout").increment(timeouts);
+            counter!("poll_rtc_outputs_total", "kind" => "transmit").increment(transmits);
+            counter!("poll_rtc_outputs_total", "kind" => "event").increment(events);
+            counter!("poll_rtc_outputs_total", "kind" => "error").increment(errors);
         }
-        None
+
+        result
     }
 
     pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: RtpPacket) {

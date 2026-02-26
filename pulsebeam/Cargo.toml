@@ -74,4 +74,5 @@ str0m = { workspace = true, features = ["wincrypto"] }
 
 [features]
 default = []
+deep-metrics = []
 tokio-console = ["console-subscriber", "tokio/tracing"]

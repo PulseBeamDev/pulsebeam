@@ -520,7 +520,7 @@ async fn spawn_agent(
         );
     }
 
-    for _ in 0..users_per_room {
+    for _ in 0..6 {
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
     }
 
