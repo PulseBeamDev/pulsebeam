@@ -113,10 +113,12 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     deadline
                 };
                 if sleep.deadline() != adjusted_deadline {
-                    sleep.as_mut().reset(deadline);
+                    sleep.as_mut().reset(adjusted_deadline);
                 }
             }
 
+            // Default: assume any wakeup needs an RTC poll.
+            // Branches that only do egress I/O (no new RTC input) clear this flag themselves.
             needs_poll = true;
             let batch_size = self.core.events.len().min(16);
 
@@ -141,9 +143,13 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     }
                 },
                 Ok(_) = self.udp_egress.writable(), if !self.core.udp_batcher.is_empty() => {
+                    // Pure egress flush: no new input to the RTC engine, no need to re-poll.
+                    needs_poll = false;
                     self.core.udp_batcher.flush(&self.udp_egress);
                 },
                 Ok(_) = self.tcp_egress.writable(), if !self.core.tcp_batcher.is_empty() => {
+                    // Pure egress flush: no new input to the RTC engine, no need to re-poll.
+                    needs_poll = false;
                     self.core.tcp_batcher.flush(&self.tcp_egress);
                 },
 
