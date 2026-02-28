@@ -2,6 +2,7 @@
 pub mod macros;
 pub mod actor;
 pub mod collections;
+pub mod detector;
 pub mod mailbox;
 pub mod net;
 pub mod prelude;

@@ -1,6 +1,8 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::system;
+use std::sync::Arc;
+use std::time::Duration;
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -46,13 +48,21 @@ fn main() {
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let (ltrd, mut builder) =
+        pulsebeam_runtime::detector::LongRunningTaskDetector::new_multi_threaded(
+            Duration::from_secs(1),
+            Duration::from_micros(100),
+        );
+    let rt = builder
         .enable_all()
         .worker_threads(workers)
         // https://github.com/tokio-rs/tokio/issues/7745
         .enable_alt_timer()
         .build()
         .unwrap();
+
+    let rt = Arc::new(rt);
+    ltrd.start(rt.clone());
 
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
