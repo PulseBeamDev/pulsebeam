@@ -2767,6 +2767,7 @@ version = "0.3.2"
 dependencies = [
  "async-channel",
  "async-stream",
+ "backtrace",
  "bytes",
  "criterion",
  "crossbeam-utils",

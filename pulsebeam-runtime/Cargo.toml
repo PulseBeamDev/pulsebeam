@@ -43,6 +43,7 @@ tokio-util = "0.7.17"
 systemstat = "0.2.5"
 pulsebeam-core = { path = "../pulsebeam-core" } 
 libc = "0.2.182"
+backtrace = "0.3.76"
 
 [dev-dependencies]
 criterion = { version = "0.8.1", features = ["async", "async_tokio"] }

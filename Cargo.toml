@@ -48,11 +48,12 @@ turmoil = "0.7.1"
 
 [profile.release]
 opt-level = 3
-debug = 1
+debug = true
 strip = false  # Retain symbols for profiling
 debug-assertions = false
 lto = "thin"
 panic = "unwind"
+force-frame-pointers = true
 
 # We want to crash during simulation
 [profile.test]
