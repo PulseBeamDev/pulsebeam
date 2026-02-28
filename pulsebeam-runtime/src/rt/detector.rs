@@ -75,6 +75,7 @@
 //! which will help you easily identify the blocking operation(s).
 //! ```
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
@@ -367,12 +368,24 @@ impl LongRunningTaskDetector {
 
     /// Starts the monitoring thread with default action handlers (that write details to std err).
     pub fn start(&self, runtime: Arc<Runtime>) {
-        self.start_with_custom_action(runtime, Arc::new(StdErrBlockingActionHandler))
+        let handler = {
+            #[cfg(unix)]
+            {
+                unix::install_default_stack_trace_handler();
+                Arc::new(unix::DetailedCaptureBlockingActionHandler::new())
+            }
+            #[cfg(not(unix))]
+            {
+                Arc::new(StdErrBlockingActionHandler)
+            }
+        };
+
+        self.start_with_custom_action(runtime, handler);
     }
 
     /// Starts the monitoring process with custom action handlers that
     /// allow you to customize what happens when blocking is detected.
-    pub fn start_with_custom_action(
+    fn start_with_custom_action(
         &self,
         runtime: Arc<Runtime>,
         action: Arc<dyn BlockingActionHandler>,
@@ -405,5 +418,130 @@ impl LongRunningTaskDetector {
 impl Drop for LongRunningTaskDetector {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(unix)]
+pub mod unix {
+    use std::backtrace::Backtrace;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+
+    fn get_thread_id() -> libc::pthread_t {
+        unsafe { libc::pthread_self() }
+    }
+
+    static SIGNAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    static THREAD_DUMPS: Mutex<Option<HashMap<libc::pthread_t, String>>> = Mutex::new(None);
+
+    extern "C" fn signal_handler(_: i32) {
+        // not signal safe, this needs to be rewritten to avoid mem allocations and use a pre-allocated buffer.
+        let backtrace = Backtrace::force_capture();
+        let name = thread::current()
+            .name()
+            .map(|n| format!(" for thread \"{}\"", n))
+            .unwrap_or_else(|| "".to_owned());
+        let tid = get_thread_id();
+        let detail = format!("Stack trace{}:{}\n{}", name, tid, backtrace);
+        let mut omap = THREAD_DUMPS.lock().unwrap();
+        let map = omap.as_mut().unwrap();
+        (*map).insert(tid, detail);
+        SIGNAL_COUNTER.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn install_default_stack_trace_handler() {
+        install_thread_stack_stace_handler(libc::SIGUSR1);
+    }
+
+    fn install_thread_stack_stace_handler(signal: libc::c_int) {
+        unsafe {
+            libc::signal(signal, signal_handler as libc::sighandler_t);
+        }
+    }
+
+    static GTI_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// A naive stack trace capture implementation for threads for DEMO/TEST only purposes.
+    fn get_thread_info(
+        signal: libc::c_int,
+        targets: &[ThreadInfo],
+    ) -> HashMap<libc::pthread_t, String> {
+        let _lock = GTI_MUTEX.lock();
+        {
+            let mut omap = THREAD_DUMPS.lock().unwrap();
+            *omap = Some(HashMap::new());
+            SIGNAL_COUNTER.store(targets.len(), Ordering::SeqCst);
+        }
+        for thread_info in targets {
+            let result = unsafe { libc::pthread_kill(*thread_info.pthread_id(), signal) };
+            if result != 0 {
+                eprintln!("Error sending signal: {:?}", result);
+            }
+        }
+        let time_limit = Duration::from_secs(1);
+        let start_time = Instant::now();
+        loop {
+            let signal_count = SIGNAL_COUNTER.load(Ordering::SeqCst);
+            if signal_count == 0 {
+                break;
+            }
+            if Instant::now() - start_time >= time_limit {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
+        }
+        {
+            let omap = THREAD_DUMPS.lock().unwrap();
+            omap.clone().unwrap()
+        }
+    }
+
+    pub struct DetailedCaptureBlockingActionHandler {
+        inner: Mutex<Option<HashMap<libc::pthread_t, String>>>,
+    }
+
+    impl DetailedCaptureBlockingActionHandler {
+        pub fn new() -> Self {
+            DetailedCaptureBlockingActionHandler {
+                inner: Mutex::new(None),
+            }
+        }
+
+        fn contains_symbol(&self, symbol_name: &str) -> bool {
+            // Iterate over the frames in the backtrace
+            let omap = self.inner.lock().unwrap();
+            match omap.as_ref() {
+                Some(map) => {
+                    if map.is_empty() {
+                        false
+                    } else {
+                        let bt_str = map.values().next().unwrap();
+                        bt_str.contains(symbol_name)
+                    }
+                }
+                None => false,
+            }
+        }
+    }
+
+    impl BlockingActionHandler for DetailedCaptureBlockingActionHandler {
+        fn blocking_detected(&self, workers: &[ThreadInfo]) {
+            let mut map = self.inner.lock().unwrap();
+            let tinfo = get_thread_info(libc::SIGUSR1, workers);
+            for (tid, trace) in &tinfo {
+                eprintln!("=== Blocking detected in thread {} ===", tid);
+                eprintln!("{}", trace); // {} instead of {:?} respects the \n characters
+                eprintln!("======================================");
+            }
+            *map = Some(tinfo);
+        }
     }
 }

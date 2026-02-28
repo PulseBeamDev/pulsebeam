@@ -33,7 +33,7 @@ serde = { version = "1", features = ["derive"] }
 # str0m = { path = "../str0m" }
 str0m = { version = "0.16.2" }
 thiserror = "2.0"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 tokio-util = "0.7.17"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 turmoil = "0.7.1"

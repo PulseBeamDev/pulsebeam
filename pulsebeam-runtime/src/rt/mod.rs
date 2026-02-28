@@ -2,6 +2,8 @@ use std::time::Duration;
 
 pub use tokio::runtime::Handle;
 pub use tokio::task::JoinSet;
+mod detector;
+pub use detector::LongRunningTaskDetector as Builder;
 
 pub type Runtime = tokio::runtime::Runtime;
 

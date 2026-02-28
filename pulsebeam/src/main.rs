@@ -1,6 +1,5 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
-use pulsebeam_runtime::system;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{net::SocketAddr, num::NonZeroUsize};
@@ -48,12 +47,11 @@ fn main() {
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
-    let (ltrd, mut builder) =
-        pulsebeam_runtime::detector::LongRunningTaskDetector::new_multi_threaded(
-            Duration::from_secs(1),
-            Duration::from_micros(100),
-        );
-    let rt = builder
+    let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
+        Duration::from_secs(1),
+        Duration::from_micros(100),
+    );
+    let rt = rt_builder
         .enable_all()
         .worker_threads(workers)
         // https://github.com/tokio-rs/tokio/issues/7745
@@ -71,7 +69,7 @@ fn main() {
 }
 
 pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
-    let external_ip = system::select_host_address();
+    let external_ip = pulsebeam_runtime::system::select_host_address();
     let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
     let http_api_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
@@ -93,7 +91,7 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
         Err(err) = node_handle => {
             tracing::warn!("node exited with error: {err}");
         }
-        _ = system::wait_for_signal() => {
+        _ = pulsebeam_runtime::system::wait_for_signal() => {
             tracing::info!("shutting down gracefully...");
             shutdown.cancel();
         }
