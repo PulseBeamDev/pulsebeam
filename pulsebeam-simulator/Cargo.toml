@@ -12,19 +12,19 @@ publish = false
 [dev-dependencies]
 anyhow.workspace = true
 bytes = "1"
-futures = "0.3.31"
+futures = "0.3.32"
 http = "1.4.0"
 http-body-util = "0.1"  # Crucial for .collect().await
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
-pin-project-lite = "0.2.16"
-proptest = "1.9.0"
+pin-project-lite = "0.2.17"
+proptest = "1.10.0"
 pulsebeam = { path = "../pulsebeam" }
 pulsebeam-agent = { path = "../pulsebeam-agent" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
-reqwest = "0.13.1"
+reqwest = "0.13.2"
 tokio.workspace = true
 tokio-util.workspace = true
 tower = { version = "0.5.2", features = ["util"] }

@@ -26,7 +26,7 @@ bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"
-rand = "0.9"
+rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/tcptype"}
 # str0m = { git = "https://github.com/algesten/str0m.git",  rev = "a236b94be5d3cf7a56f596fc8a4da252bb8fa93b"  }
