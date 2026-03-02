@@ -272,7 +272,7 @@ impl TrackReceiver {
 }
 
 pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
-    const BASE_CAP: usize = 32;
+    const BASE_CAP: usize = 128;
 
     let mut simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
         rids.iter().map(|rid| Some(*rid)).collect()

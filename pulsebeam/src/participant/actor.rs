@@ -5,7 +5,6 @@ use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, room, track};
-use futures_util::FutureExt;
 use pulsebeam_runtime::actor::ActorKind;
 use pulsebeam_runtime::actor::{self, SystemMsg};
 use pulsebeam_runtime::net::UnifiedSocketWriter;
@@ -75,7 +74,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
         let (gateway_tx, mut gateway_rx) = pulsebeam_runtime::sync::mpsc::channel(256);
-        let room_handle = self.room_handle.clone();
 
         let _ = self
             .gateway
@@ -89,8 +87,14 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
         let mut needs_poll = true;
         let mut maybe_deadline = None;
+        let mut budget = 32;
 
         loop {
+            if budget <= 0 {
+                tokio::task::yield_now().await;
+                budget = 32;
+            }
+
             if !self.core.events.is_empty() {
                 self.handle_control_message_tx().await;
             }
@@ -151,9 +155,6 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 // Priority 4: Background tasks
                 _ = &mut sleep => {
                     self.core.handle_tick();
-                    // Retry any batcher flush that stalled on WouldBlock.
-                    self.core.udp_batcher.flush(&self.udp_egress);
-                    self.core.tcp_batcher.flush(&self.tcp_egress);
                 },
             }
         }
