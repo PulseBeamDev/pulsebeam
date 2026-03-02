@@ -44,6 +44,10 @@ pub enum DisconnectReason {
     InvalidMediaDirection,
     #[error("Exceeded maximum upstream tracks: only 1 video and 1 audio allowed")]
     TooManyUpstreamTracks,
+    #[error("Room closed")]
+    RoomClosed,
+    #[error("System terminated")]
+    SystemTerminated,
 }
 
 #[derive(Debug)]
@@ -401,7 +405,7 @@ impl ParticipantCore {
         self.upstream.handle_incoming_rtp(mid, rid.as_ref(), rtp);
     }
 
-    fn disconnect(&mut self, reason: DisconnectReason) {
+    pub fn disconnect(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_some() {
             return;
         }

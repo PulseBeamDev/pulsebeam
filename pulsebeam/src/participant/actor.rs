@@ -6,8 +6,8 @@ use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{entity, gateway, room, track};
 use futures_util::FutureExt;
-use pulsebeam_runtime::actor;
 use pulsebeam_runtime::actor::ActorKind;
+use pulsebeam_runtime::actor::{self, SystemMsg};
 use pulsebeam_runtime::net::UnifiedSocketWriter;
 use pulsebeam_runtime::prelude::*;
 use str0m::{Rtc, RtcError, error::SdpError};
@@ -91,16 +91,14 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         let mut maybe_deadline = None;
 
         loop {
+            if !self.core.events.is_empty() {
+                self.handle_control_message_tx().await;
+            }
+
             if needs_poll {
                 maybe_deadline = self.core.poll();
-
-                // this indicates the first batch is filled.
-                if self.core.udp_batcher.len() >= 2 {
-                    self.core.udp_batcher.flush(&self.udp_egress);
-                }
-                if self.core.tcp_batcher.len() >= 2 {
-                    self.core.tcp_batcher.flush(&self.tcp_egress);
-                }
+                self.core.udp_batcher.flush(&self.udp_egress);
+                self.core.tcp_batcher.flush(&self.tcp_egress);
             }
             let now = Instant::now();
             if let Some(deadline) = maybe_deadline {
@@ -114,13 +112,11 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 if sleep.deadline() != adjusted_deadline {
                     sleep.as_mut().reset(adjusted_deadline);
                 }
+            } else {
+                break;
             }
 
-            // Default: assume any wakeup needs an RTC poll.
-            // Branches that only do egress I/O (no new RTC input) clear this flag themselves.
             needs_poll = true;
-            let batch_size = self.core.events.len().min(16);
-
             tokio::select! {
                 biased;
                 // Priority 1: Egress Work
@@ -136,72 +132,28 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 }
                 Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
-
-                    while let Some(Some((meta, pkt))) = self.core.downstream.next().now_or_never() {
-                        self.core.handle_forward_rtp(meta, pkt);
-                    }
-                },
-                Ok(_) = self.udp_egress.writable(), if !self.core.udp_batcher.is_empty() => {
-                    // Pure egress flush: no new input to the RTC engine, no need to re-poll.
-                    needs_poll = false;
-                    self.core.udp_batcher.flush(&self.udp_egress);
-                },
-                Ok(_) = self.tcp_egress.writable(), if !self.core.tcp_batcher.is_empty() => {
-                    // Pure egress flush: no new input to the RTC engine, no need to re-poll.
-                    needs_poll = false;
-                    self.core.tcp_batcher.flush(&self.tcp_egress);
                 },
 
                 // Priority 2: Ingress Work
                 Ok(batch) = gateway_rx.recv() => {
                     needs_poll = false;
                     maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
-
-                    while let Some(Ok(batch)) = gateway_rx.recv().now_or_never() {
-                        maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
-                    }
                 },
 
                 // Priority 3: Control Messages
-                res = ctx.sys_rx.recv() => {
-                    needs_poll = false;
-                    match res {
-                        Some(msg) => match msg {
-                            actor::SystemMsg::GetState(responder) => {
-                                let _: () = self.get_observable_state();
-                                responder.send(());
-                            }
-                            actor::SystemMsg::Terminate => break,
-                        },
-                        None => break,
-                    }
+                Some(msg) = ctx.sys_rx.recv() => {
+                    self.handle_system_message_rx(msg);
                 }
                 Some(msg) = ctx.rx.recv() => {
-                    self.handle_control_message(msg).await;
+                    self.handle_control_message_rx(msg);
                 }
-                res = room_handle.tx.reserve_many(batch_size), if !self.core.events.is_empty() => {
-                    needs_poll = false;
-                    match res {
-                        Ok(permits) => {
-                            for (event, permit) in self.core.events.drain(..batch_size).zip(permits) {
-                                match event {
-                                    CoreEvent::SpawnTrack(rx) => {
-                                        permit.send(room::RoomMessage::PublishTrack(rx));
-                                    }
-                                }
-                            }
-                        }
-                        Err(_e) => {
-                            tracing::error!("Room handle closed, shutting down participant actor");
-                            break; // Stop the actor so it doesn't spin forever
-                        }
-                    }
-                }
-
 
                 // Priority 4: Background tasks
                 _ = &mut sleep => {
                     self.core.handle_tick();
+                    // Retry any batcher flush that stalled on WouldBlock.
+                    self.core.udp_batcher.flush(&self.udp_egress);
+                    self.core.tcp_batcher.flush(&self.tcp_egress);
                 },
             }
         }
@@ -247,7 +199,20 @@ impl ParticipantActor {
         }
     }
 
-    async fn handle_control_message(&mut self, msg: ParticipantControlMessage) {
+    fn handle_system_message_rx(&mut self, msg: SystemMsg<()>) {
+        match msg {
+            actor::SystemMsg::GetState(responder) => {
+                let _: () = self.get_observable_state();
+                let _ = responder.send(());
+            }
+            actor::SystemMsg::Terminate => {
+                self.core
+                    .disconnect(super::core::DisconnectReason::SystemTerminated);
+            }
+        }
+    }
+
+    fn handle_control_message_rx(&mut self, msg: ParticipantControlMessage) {
         match msg {
             ParticipantControlMessage::TracksSnapshot(tracks) => {
                 self.core.handle_available_tracks(&tracks)
@@ -260,6 +225,33 @@ impl ParticipantActor {
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {}
         };
+    }
+
+    async fn handle_control_message_tx(&mut self) {
+        let batch_size = self.core.events.len().min(16);
+        let mut room_closed = false;
+
+        for event in self.core.events.drain(..batch_size) {
+            match event {
+                CoreEvent::SpawnTrack(rx) => {
+                    let res = self
+                        .room_handle
+                        .send(room::RoomMessage::PublishTrack(rx))
+                        .await;
+
+                    if res.is_err() {
+                        room_closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if room_closed {
+            tracing::warn!("room is closed, exiting");
+            self.core
+                .disconnect(crate::participant::core::DisconnectReason::RoomClosed);
+        }
     }
 }
 
