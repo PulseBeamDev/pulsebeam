@@ -47,10 +47,12 @@ fn main() {
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
-    let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
-        Duration::from_secs(1),
-        Duration::from_micros(100),
-    );
+    // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
+    //     Duration::from_secs(1),
+    //     Duration::from_micros(100),
+    // );
+
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     let rt = rt_builder
         .enable_all()
         .worker_threads(workers)
@@ -59,8 +61,8 @@ fn main() {
         .build()
         .unwrap();
 
-    let rt = Arc::new(rt);
-    ltrd.start(rt.clone());
+    // let rt = Arc::new(rt);
+    // ltrd.start(rt.clone());
 
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
