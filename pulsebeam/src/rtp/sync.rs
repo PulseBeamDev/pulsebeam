@@ -72,8 +72,8 @@ impl Synchronizer {
             });
         }
 
-        let playout_time = self.calculate_playout_time(packet.rtp_ts, packet.arrival_ts);
-        packet.playout_time = self.validate_playout_time(playout_time, packet.arrival_ts);
+        packet.playout_time = self.calculate_playout_time(packet.rtp_ts, packet.arrival_ts);
+        // packet.playout_time = self.validate_playout_time(playout_time, packet.arrival_ts);
 
         packet
     }

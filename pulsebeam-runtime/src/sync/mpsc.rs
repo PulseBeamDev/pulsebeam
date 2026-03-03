@@ -31,6 +31,10 @@ struct Ring<T> {
     slots: Vec<Mutex<Slot<T>>>,
     mask: usize,
     head: AtomicU64,
+    /// Tracks how many items the receiver has consumed (its next_seq).
+    /// Updated by the Receiver on each successful read so that Senders can
+    /// compute fill pressure without coordinating with the Receiver directly.
+    tail: AtomicU64,
     event: Event,
     closed: AtomicU64,
 }
@@ -52,6 +56,7 @@ impl<T> Ring<T> {
             slots,
             mask: capacity - 1,
             head: AtomicU64::new(0),
+            tail: AtomicU64::new(0),
             event: Event::new(),
             closed: AtomicU64::new(0),
         })
@@ -85,6 +90,25 @@ impl<T> Sender<T> {
 
         self.ring.event.notify(1);
         Ok(())
+    }
+}
+
+impl<T> Sender<T> {
+    /// Number of items currently in the ring that have not yet been consumed.
+    /// This is an instantaneous snapshot: head - tail.
+    pub fn pending(&self) -> u64 {
+        let head = self.ring.head.load(Ordering::Relaxed);
+        let tail = self.ring.tail.load(Ordering::Relaxed);
+        head.saturating_sub(tail)
+    }
+
+    /// Fill ratio in [0.0, 1.0]: 0.0 = empty, 1.0 = receiver is fully behind.
+    /// Values approaching 1.0 indicate the receiver cannot keep up and lag
+    /// (packet loss) is imminent. Senders can use this to decide whether to
+    /// yield before pushing more data.
+    pub fn fill_ratio(&self) -> f64 {
+        let capacity = (self.ring.mask + 1) as f64;
+        self.pending() as f64 / capacity
     }
 }
 
@@ -182,6 +206,8 @@ impl<T> Receiver<T> {
             if let Some(val) = slot.val.take() {
                 coop.made_progress();
                 self.next_seq += 1;
+                // Publish the consumed position so Senders can observe fill pressure.
+                self.ring.tail.store(self.next_seq, Ordering::Relaxed);
                 self.pkts_received += 1;
 
                 if (self.pkts_received & Self::METRIC_FLUSH_MASK) == 0 {

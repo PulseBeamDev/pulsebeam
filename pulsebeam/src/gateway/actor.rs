@@ -157,12 +157,26 @@ impl GatewayWorkerActor {
     }
 
     async fn read_socket(&mut self) -> io::Result<()> {
-        // ~1,000 yields per second = ~99% CPU for other work
+        // Maximum logical packets to dispatch before yielding for fairness.
+        // A yield every ~64 packets keeps latency low for other Tokio tasks.
         const COOP_BUDGET: usize = 64;
+
+        // When the highest observed participant queue fill ratio exceeds this,
+        // yield immediately regardless of how much budget remains. This gives
+        // participant actors a chance to drain before we push more data in and
+        // cause lag (packet loss inside the ring buffer).
+        const HIGH_WATER: f64 = 0.5;
+
+        // After a pressure-triggered yield, give participants up to this many
+        // additional scheduler turns to drain before resuming socket reads.
+        // Each extra yield is only taken while pressure remains above HIGH_WATER.
+        const MAX_PRESSURE_YIELDS: usize = 3;
+
         let mut spent_budget: usize = 0;
 
         loop {
             self.recv_batches.clear();
+            self.demuxer.reset_pressure();
 
             match self.socket.try_recv_batch(&mut self.recv_batches) {
                 Ok(_) => {
@@ -182,10 +196,27 @@ impl GatewayWorkerActor {
                         }
 
                         spent_budget += cost;
+                    }
 
-                        if spent_budget >= COOP_BUDGET {
+                    // Check downstream health after dispatching the whole batch.
+                    // Yield outside the drain loop so we don't split a batch mid-way,
+                    // and so we can make a calmer, informed decision.
+                    let pressure = self.demuxer.pressure();
+                    let should_yield = pressure > HIGH_WATER || spent_budget >= COOP_BUDGET;
+
+                    if should_yield {
+                        spent_budget = 0;
+                        tokio::task::yield_now().await;
+
+                        // If participants are still congested after the first yield,
+                        // give them more scheduler turns before pulling more packets.
+                        // We re-read live fill ratios (not the cached max_pressure) so
+                        // we accurately reflect how much they've drained since we yielded.
+                        for _ in 0..MAX_PRESSURE_YIELDS {
+                            if self.demuxer.current_pressure() <= HIGH_WATER {
+                                break;
+                            }
                             tokio::task::yield_now().await;
-                            spent_budget = 0;
                         }
                     }
                 }

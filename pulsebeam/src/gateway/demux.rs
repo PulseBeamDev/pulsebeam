@@ -26,6 +26,9 @@ pub struct Demuxer {
     ufrag_addrs: HashMap<Box<[u8]>, Vec<SocketAddr>>,
     /// A reverse map from a socket addr to ufrag, for cleanup.
     addr_to_ufrag: HashMap<SocketAddr, Box<[u8]>>,
+    /// High-water fill ratio seen across all participant channels since the last
+    /// `reset_pressure()` call. 0.0 = all queues empty, 1.0 = a queue is full.
+    max_pressure: f64,
 }
 
 impl Demuxer {
@@ -35,6 +38,7 @@ impl Demuxer {
             addr_map: HashMap::new(),
             ufrag_addrs: HashMap::new(),
             addr_to_ufrag: HashMap::new(),
+            max_pressure: 0.0,
         }
     }
 
@@ -88,7 +92,37 @@ impl Demuxer {
             return false;
         }
 
+        // Track downstream fill pressure so the gateway read loop can decide
+        // whether to yield and give participants time to drain their queues.
+        let fill = handle.fill_ratio();
+        if fill > self.max_pressure {
+            self.max_pressure = fill;
+        }
+
         true
+    }
+
+    /// Returns the highest fill ratio observed across all participant channels
+    /// since the last `reset_pressure()` call.
+    pub fn pressure(&self) -> f64 {
+        self.max_pressure
+    }
+
+    /// Computes the current live fill ratio across all registered participant
+    /// channels by reading their head/tail atomics directly. Use this after
+    /// yielding to check whether participants have had enough time to drain
+    /// before pulling more data from the socket.
+    pub fn current_pressure(&self) -> f64 {
+        self.ufrag_map
+            .values()
+            .map(|h| h.fill_ratio())
+            .fold(0.0f64, f64::max)
+    }
+
+    /// Resets the high-water pressure mark. Call this at the start of each
+    /// gateway read cycle so the next batch of sends gets a fresh measurement.
+    pub fn reset_pressure(&mut self) {
+        self.max_pressure = 0.0;
     }
 }
 
