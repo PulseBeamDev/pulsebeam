@@ -570,7 +570,7 @@ async fn spawn_agent(
                 }
 
                 // ── Per-track NACK/PLI/loss + stream health ───────────────
-                for (_, track_stat) in &stats.tracks {
+                for (mid, track_stat) in &stats.tracks {
                     // ── TX layers ─────────────────────────────────────────
                     //
                     // A layer is "active" when it has ever emitted packets AND
@@ -582,7 +582,7 @@ async fn spawn_agent(
                     let mut tx_healthy = true;
 
                     for (rid, egress) in &track_stat.tx_layers {
-                        let key = format!("tx_{}", rid_key(rid));
+                        let key = format!("tx_{}_{}", mid, rid_key(rid));
                         let mut prev = prev_tx.get(&key).cloned().unwrap_or_default();
 
                         let packets = egress.packets.saturating_sub(prev.packets);
@@ -629,7 +629,7 @@ async fn spawn_agent(
                     let mut rx_healthy = true;
 
                     for (rid, ingress) in &track_stat.rx_layers {
-                        let key = format!("rx_{}", rid_key(rid));
+                        let key = format!("rx_{}_{}", mid, rid_key(rid));
                         let mut prev = prev_rx.get(&key).cloned().unwrap_or_default();
 
                         let packets      = ingress.packets.saturating_sub(prev.packets);

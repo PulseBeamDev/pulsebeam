@@ -35,23 +35,29 @@ impl H264Looper {
 
     /// creates a task that pumps frames into the provided sender
     pub async fn run(mut self, sender: LocalTrack) {
-        let clock_rate = 90_000;
+        let clock_rate = 90_000u64;
         let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
 
-        let start_time = Instant::now();
+        let mut interval = tokio::time::interval(frame_interval);
+        // Skip missed ticks instead of bursting them. Under benchmark load the
+        // task may wake up late; Burst (the default) would fire all missed ticks
+        // back-to-back with stale capture_times, causing "Far past playout_time"
+        // warnings on the server. Skip simply resumes at the next scheduled
+        // boundary, producing an honest freeze on the receiver side instead.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut frame_count: u64 = 0;
 
         loop {
-            let target_time = start_time + (frame_interval.mul_f64(frame_count as f64));
-            tokio::time::sleep_until(target_time).await;
+            let tick_time = interval.tick().await;
 
             let frame_data = self.next();
-            let next_ts = (frame_count * clock_rate as u64) / self.fps as u64;
+            let next_ts = (frame_count * clock_rate) / self.fps as u64;
 
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz(next_ts),
                 data: frame_data,
-                capture_time: target_time,
+                capture_time: tick_time,
             };
 
             sender.try_send(frame);
