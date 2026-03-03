@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::error;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -150,13 +151,18 @@ impl LatencyHistogram {
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .init();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_ansi(true);
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+    registry.init();
 
     let cli = Cli::parse();
     match cli.command {

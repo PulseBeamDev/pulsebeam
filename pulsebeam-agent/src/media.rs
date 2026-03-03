@@ -2,29 +2,80 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use str0m::media::MediaTime;
-use tokio::time::Instant;
+use tokio::sync::watch;
 
 use crate::{MediaFrame, actor::LocalTrack};
+
+pub struct KeyframeNotifier(watch::Sender<u64>);
+
+#[derive(Debug)]
+pub struct KeyframeReceiver(watch::Receiver<u64>);
+
+impl KeyframeNotifier {
+    pub(crate) fn pair() -> (Self, KeyframeReceiver) {
+        let (tx, rx) = watch::channel(0u64);
+        (KeyframeNotifier(tx), KeyframeReceiver(rx))
+    }
+
+    pub fn notify(&self) {
+        self.0.send_modify(|v| *v = v.wrapping_add(1));
+    }
+}
+
+impl KeyframeReceiver {
+    pub fn is_requested(&mut self) -> bool {
+        if self.0.has_changed().unwrap_or(false) {
+            let _ = self.0.borrow_and_update();
+            true
+        } else {
+            false
+        }
+    }
+}
 
 pub struct H264Looper {
     frames: Vec<Bytes>,
     index: usize,
     fps: u32,
+    // Index of the first IDR frame; seek here on keyframe reset.
+    first_idr: usize,
 }
 
 impl H264Looper {
     pub fn new(data: &[u8], fps: u32) -> Self {
         let slicer = H264FrameSlicer::new(data);
         let frames: Vec<Bytes> = slicer.map(Bytes::copy_from_slice).collect();
-        tracing::info!(
-            "H264Looper: found {} complete frames (Access Units)",
-            frames.len()
-        );
-        Self {
-            frames,
-            index: 0,
-            fps,
+        let first_idr = Self::find_first_idr(&frames);
+        tracing::info!(frames = frames.len(), first_idr, "H264Looper ready");
+        Self { frames, index: 0, fps, first_idr }
+    }
+
+    fn find_first_idr(frames: &[Bytes]) -> usize {
+        frames.iter().position(|f| Self::frame_has_idr(f)).unwrap_or(0)
+    }
+
+    /// Returns `true` when the Annex-B buffer contains at least one IDR NALU (type 5).
+    fn frame_has_idr(frame: &[u8]) -> bool {
+        let mut i = 0usize;
+        while i + 3 < frame.len() {
+            if frame[i] == 0 && frame[i + 1] == 0 {
+                let header_pos = if frame[i + 2] == 1 {
+                    i + 3
+                } else if i + 4 < frame.len() && frame[i + 2] == 0 && frame[i + 3] == 1 {
+                    i + 4
+                } else {
+                    i += 1;
+                    continue;
+                };
+                if header_pos < frame.len() && (frame[header_pos] & 0x1F) == 5 {
+                    return true;
+                }
+                i = header_pos;
+            } else {
+                i += 1;
+            }
         }
+        false
     }
 
     fn next(&mut self) -> Bytes {
@@ -33,23 +84,24 @@ impl H264Looper {
         frame.clone()
     }
 
-    /// creates a task that pumps frames into the provided sender
     pub async fn run(mut self, sender: LocalTrack) {
         let clock_rate = 90_000u64;
         let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
+        let LocalTrack { mid, rid, tx, mut keyframe_rx } = sender;
 
         let mut interval = tokio::time::interval(frame_interval);
-        // Skip missed ticks instead of bursting them. Under benchmark load the
-        // task may wake up late; Burst (the default) would fire all missed ticks
-        // back-to-back with stale capture_times, causing "Far past playout_time"
-        // warnings on the server. Skip simply resumes at the next scheduled
-        // boundary, producing an honest freeze on the receiver side instead.
+        // Skip missed ticks to avoid stale timestamp bursts under load.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut frame_count: u64 = 0;
 
         loop {
             let tick_time = interval.tick().await;
+
+            if keyframe_rx.is_requested() {
+                tracing::debug!(?mid, ?rid, first_idr = self.first_idr, "keyframe reset");
+                self.index = self.first_idr;
+            }
 
             let frame_data = self.next();
             let next_ts = (frame_count * clock_rate) / self.fps as u64;
@@ -60,7 +112,7 @@ impl H264Looper {
                 capture_time: tick_time,
             };
 
-            sender.try_send(frame);
+            let _ = tx.try_send(frame);
             frame_count += 1;
         }
     }

@@ -1,4 +1,5 @@
 use crate::api::{ApiError, CreateParticipantRequest, HttpApiClient};
+use crate::media::{KeyframeNotifier, KeyframeReceiver};
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
 use http::Uri;
@@ -11,6 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelData, ChannelId};
 use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
@@ -25,6 +27,321 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
+const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
+// Upgrade gate: require this much headroom above candidate cost before resuming.
+// 1.25× provides headroom against short-term VBR spikes once a layer is resumed.
+const UPGRADE_HYSTERESIS: f64 = 1.25;
+// Number of consecutive BWE ticks the upgrade condition must hold before we commit.
+// Each tick is BWE_SLOW_INTERVAL (200 ms), so 4 ticks = 2 s of confirmed headroom.
+// A single transient BWE over-estimate resets the counter, preventing premature upgrades.
+// Once bandwidth is genuinely stable at the required level the upgrade fires promptly.
+const UPGRADE_STABLE_TICKS: u32 = 4;
+// Sliding-window bitrate estimator: 20 buckets × 200 ms = 10 s window.
+// A keyframe occupies at most 1 bucket out of 20, so it shifts the estimate by ≤5%.
+const BITRATE_BUCKETS: usize = 20;
+const BITRATE_WINDOW_SECS: f64 = BITRATE_BUCKETS as f64 * 0.5; // 10 s
+// Used as last_active_bps for paused layers with no prior measurement so the
+// upgrade gate sees a realistic cost from the very first tick.
+fn layer_seed_bps(rid: Option<Rid>) -> f64 {
+    match rid_quality_rank(rid) {
+        0 => 300_000.0,
+        1 => 900_000.0,
+        2 => 1_400_000.0,
+        _ => 300_000.0,
+    }
+}
+
+fn rid_quality_rank(rid: Option<Rid>) -> u8 {
+    match rid.as_ref().map(|r| r.as_ref()) {
+        Some("q") => 0,
+        Some("h") => 1,
+        Some("f") => 2,
+        _ => 255,
+    }
+}
+
+// Manages which simulcast send-layers are active based on TWCC bandwidth estimates.
+// Pauses from highest quality first; resumes from lowest quality first.
+struct LayerController {
+    available_bps: f64,
+    // Sorted ascending by quality: index 0 = lowest (q), last = highest (f).
+    order: Vec<(Mid, Option<Rid>)>,
+    states: HashMap<(Mid, Option<Rid>), LayerState>,
+    notifiers: HashMap<(Mid, Option<Rid>), KeyframeNotifier>,
+    /// The paused layer currently being evaluated for upgrade, and how many
+    /// consecutive ticks its upgrade condition (hysteresis gate) has been met.
+    /// Resets whenever the candidate changes or the condition is no longer satisfied.
+    /// When the count reaches UPGRADE_STABLE_TICKS the layer is actually resumed.
+    upgrade_candidate: Option<(Mid, Option<Rid>)>,
+    upgrade_candidate_ticks: u32,
+}
+
+struct LayerState {
+    /// Bitrate estimate derived from a sliding ring-buffer window.
+    /// Each bucket holds the raw bytes received in one BWE_SLOW_INTERVAL period.
+    /// bps = sum(byte_buckets) * 8 / BITRATE_WINDOW_SECS.
+    /// Stable across keyframe bursts: a single IDR occupies ≤1 bucket out of 20.
+    bps: f64,
+    paused: bool,
+    /// Bytes accumulated from incoming frames in the current bucket interval.
+    frame_bytes_acc: u64,
+    /// Ring buffer of per-bucket byte counts (one bucket per BWE_SLOW_INTERVAL).
+    byte_buckets: [u64; BITRATE_BUCKETS],
+    /// Index of the next bucket to write.
+    bucket_pos: usize,
+}
+
+impl LayerController {
+    fn new() -> Self {
+        Self {
+            available_bps: f64::MAX,
+            order: Vec::new(),
+            states: HashMap::new(),
+            notifiers: HashMap::new(),
+            upgrade_candidate: None,
+            upgrade_candidate_ticks: 0,
+        }
+    }
+
+    fn has_layers(&self) -> bool {
+        !self.order.is_empty()
+    }
+
+    fn register(&mut self, mid: Mid, rid: Option<Rid>, notifier: KeyframeNotifier) {
+        let key = (mid, rid);
+        // Only named simulcast layers above q (rank > 0) start paused.
+        // The base layer (q / rank 0) and non-simulcast (None) tracks start active
+        // immediately. Higher layers (h, f) are upgraded by tick() once BWE confirms
+        // headroom, preventing the initial burst that inflates last_active_bps.
+        let paused = rid.is_some() && rid_quality_rank(rid) > 0;
+        self.order.push(key);
+        self.order.sort_by_key(|(_, rid)| rid_quality_rank(*rid));
+        // Pre-fill the ring buffer with the seed bitrate so the upgrade gate sees a
+        // realistic cost before the first full 10 s window of real measurements fills in.
+        let seed_bytes = (layer_seed_bps(rid) * 0.5 / 8.0) as u64;
+        self.states.insert(
+            key,
+            LayerState {
+                bps: layer_seed_bps(rid),
+                paused,
+                frame_bytes_acc: 0,
+                byte_buckets: [seed_bytes; BITRATE_BUCKETS],
+                bucket_pos: 0,
+            },
+        );
+        self.notifiers.insert(key, notifier);
+    }
+
+    fn update_available(&mut self, bw: Bitrate) {
+        self.available_bps = bw.as_f64();
+    }
+
+    /// Called for every incoming frame regardless of whether the layer is currently paused.
+    /// This gives us a true picture of what the encoder is producing.
+    fn record_frame(&mut self, mid: Mid, rid: Option<Rid>, byte_len: usize, _now: Instant) {
+        let key = (mid, rid);
+        let Some(s) = self.states.get_mut(&key) else {
+            return;
+        };
+        s.frame_bytes_acc += byte_len as u64;
+        // tick() drains the accumulator; this just fills it.
+    }
+
+    /// Rotate the bitrate ring buffer and recompute bps.
+    /// Called once per BWE_SLOW_INTERVAL tick, before allocation decisions.
+    ///
+    /// Each call stores this interval's frame bytes into the oldest bucket slot
+    /// and computes bps = total_bytes_in_window * 8 / BITRATE_WINDOW_SECS.
+    /// Because the window spans 20 intervals (10 s), a single IDR frame burst
+    /// occupies at most one bucket and shifts the estimate by ≤5% — keyframes
+    /// are effectively invisible to the allocation logic.
+    fn flush_frame_bitrates(&mut self, _now: Instant) {
+        for s in self.states.values_mut() {
+            // Overwrite the oldest bucket with this interval's byte count.
+            s.byte_buckets[s.bucket_pos] = s.frame_bytes_acc;
+            s.bucket_pos = (s.bucket_pos + 1) % BITRATE_BUCKETS;
+            s.frame_bytes_acc = 0;
+
+            let total_bytes: u64 = s.byte_buckets.iter().sum();
+            s.bps = (total_bytes as f64 * 8.0) / BITRATE_WINDOW_SECS;
+        }
+    }
+
+    fn is_paused(&self, mid: Mid, rid: Option<Rid>) -> bool {
+        self.states.get(&(mid, rid)).map_or(false, |s| s.paused)
+    }
+
+    fn request_keyframe(&self, mid: Mid, rid: Option<Rid>) {
+        if let Some(n) = self.notifiers.get(&(mid, rid)) {
+            n.notify();
+        }
+    }
+
+    fn tick(&mut self, now: Instant) -> f64 {
+        if self.order.is_empty() {
+            return 0.0;
+        }
+
+        // Compute per-layer bps from frames accumulated since last tick.
+        self.flush_frame_bitrates(now);
+
+        for k in &self.order {
+            if let Some(s) = self.states.get(k) {
+                tracing::debug!(
+                    rid = ?k.1,
+                    bps = %Bitrate::from(s.bps),
+                    paused = s.paused,
+                    available = %Bitrate::from(self.available_bps),
+                    "bwe: layer state"
+                );
+            }
+        }
+
+        // Cost is always the smoothed inline-measured bps — valid for both active
+        // and paused layers since we measure frames before the pause gate.
+        let cost = |s: &LayerState| s.bps;
+
+        let mut current_allocated: f64 = self
+            .order
+            .iter()
+            .filter_map(|k| self.states.get(k))
+            .filter(|s| !s.paused)
+            .map(cost)
+            .sum();
+
+        // Don't upgrade or downgrade until the first real BWE estimate has arrived.
+        // available_bps starts at f64::MAX as a sentinel meaning "no data yet".
+        if self.available_bps == f64::MAX {
+            return current_allocated; // Initial budget simply maps to initially active layers
+        }
+
+        const DOWNGRADE_TOLERANCE: f64 = 0.25;
+
+        // Step 1: Downgrade Phase
+        // If the active layers cost more than the available BWE budget + tolerance,
+        // we must pause the highest active simulcast layer. Loop until it fits.
+        // Hold-down is intentionally NOT checked here: when bandwidth truly drops we
+        // must shed the highest-cost layer regardless of how recently it was resumed.
+        // Skipping a protected layer would leave a higher quality layer active while
+        // a lower quality layer is paused — an incoherent ordering that causes
+        // oscillation. The ring buffer already absorbs keyframe bursts (≤5% impact).
+        let tolerance = self.available_bps * DOWNGRADE_TOLERANCE;
+        while current_allocated > self.available_bps + tolerance {
+            if let Some(key) = self
+                .order
+                .iter()
+                .rev()
+                .find(|k| {
+                    self.states.get(*k).map_or(false, |s| !s.paused)
+                        && k.1.is_some()
+                        && rid_quality_rank(k.1) > 0
+                })
+                .cloned()
+            {
+                if let Some(s) = self.states.get_mut(&key) {
+                    s.paused = true;
+                    current_allocated -= cost(s);
+                }
+                tracing::info!(
+                    mid = ?key.0,
+                    rid = ?key.1,
+                    available = %Bitrate::from(self.available_bps),
+                    allocated = %Bitrate::from(current_allocated),
+                    "bwe: pause layer"
+                );
+                // A downgrade invalidates any pending upgrade streak.
+                self.upgrade_candidate = None;
+                self.upgrade_candidate_ticks = 0;
+            } else {
+                break; // Only base layer left, or nothing can be paused
+            }
+        }
+
+        // Step 2: Upgrade Phase
+        // Find the lowest-quality paused layer whose upgrade gate is satisfied.
+        // Rather than upgrading immediately on the first qualifying tick (which would
+        // react to transient BWE over-estimates), we require the condition to hold for
+        // UPGRADE_STABLE_TICKS consecutive ticks. The counter resets if the candidate
+        // changes or the gate is no longer met, so genuine sustained headroom upgrades
+        // promptly (4 × 200 ms = 2 s) while single-tick spikes are rejected.
+        //
+        // Strict ordering is maintained: we only evaluate the *lowest* paused layer.
+        // f is never considered while h is paused.
+        let next_paused = self
+            .order
+            .iter()
+            .find(|k| self.states.get(*k).map_or(false, |s| s.paused))
+            .cloned();
+
+        if let Some(key) = next_paused {
+            let state = self.states.get(&key).unwrap();
+            let candidate_cost = cost(state);
+            let needed_budget = current_allocated + (candidate_cost * UPGRADE_HYSTERESIS);
+            let gate_met = candidate_cost > 0.0 && needed_budget <= self.available_bps;
+
+            // If this is a different candidate than last tick, reset the counter.
+            if self.upgrade_candidate.as_ref() != Some(&key) {
+                self.upgrade_candidate = Some(key);
+                self.upgrade_candidate_ticks = 0;
+            }
+
+            if gate_met {
+                self.upgrade_candidate_ticks += 1;
+                tracing::debug!(
+                    rid = ?key.1,
+                    ticks = self.upgrade_candidate_ticks,
+                    needed = %Bitrate::from(needed_budget),
+                    available = %Bitrate::from(self.available_bps),
+                    "bwe: upgrade gate tick"
+                );
+                if self.upgrade_candidate_ticks >= UPGRADE_STABLE_TICKS {
+                    if let Some(s) = self.states.get_mut(&key) {
+                        s.paused = false;
+                    }
+                    current_allocated += candidate_cost;
+                    // Reset so the next candidate starts fresh.
+                    self.upgrade_candidate = None;
+                    self.upgrade_candidate_ticks = 0;
+                    tracing::info!(
+                        mid = ?key.0,
+                        rid = ?key.1,
+                        available = %Bitrate::from(self.available_bps),
+                        candidate_cost = %Bitrate::from(candidate_cost),
+                        surplus = %Bitrate::from(self.available_bps - current_allocated),
+                        "bwe: resume layer"
+                    );
+                    if let Some(n) = self.notifiers.get(&key) {
+                        n.notify();
+                    }
+                }
+            } else {
+                // Gate not met this tick — reset counter so we require a fresh streak.
+                self.upgrade_candidate_ticks = 0;
+            }
+        } else {
+            // No paused layers — clear any stale candidate state.
+            self.upgrade_candidate = None;
+            self.upgrade_candidate_ticks = 0;
+        }
+
+        // Step 3: Desired-bitrate Projection
+        // Tell BWE the total we'd use if all layers were active, plus a headroom
+        // factor. Without headroom the probe target equals exactly the measured sum,
+        // so BWE stops probing right at the edge and our upgrade gate
+        // (current + candidate * UPGRADE_HYSTERESIS) can never clear. With headroom
+        // BWE continues probing past the sum, giving the gate the surplus it needs.
+        const DESIRED_HEADROOM: f64 = 1.2; // probe 20% above measured full-simulcast sum
+        let total_desired: f64 = self
+            .order
+            .iter()
+            .filter_map(|k| self.states.get(k))
+            .map(cost)
+            .sum::<f64>()
+            * DESIRED_HEADROOM;
+
+        total_desired
+    }
+}
 
 pub type TrackId = String;
 pub type ParticipantId = String;
@@ -45,7 +362,8 @@ pub struct TrackStats {
 pub struct LocalTrack {
     pub mid: Mid,
     pub rid: Option<Rid>,
-    tx: mpsc::Sender<MediaFrame>,
+    pub(crate) tx: mpsc::Sender<MediaFrame>,
+    pub keyframe_rx: KeyframeReceiver,
 }
 
 impl LocalTrack {
@@ -169,7 +487,7 @@ impl AgentBuilder {
 
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            // .enable_bwe(Some(Bitrate::kbps(2000)))
+            .enable_bwe(Some(Bitrate::kbps(300)))
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
@@ -275,6 +593,7 @@ impl AgentBuilder {
             slot_manager: SlotManager::new(),
             disconnected_reason: None,
             signaling_cid,
+            layer_ctrl: LayerController::new(),
         };
 
         tokio::spawn(async move {
@@ -367,6 +686,10 @@ struct AgentActor {
     signaling_cid: ChannelId,
     resource_uri: Uri,
     disconnected_reason: Option<String>,
+
+    /// Egress-side BWE layer controller: pauses/resumes simulcast layers
+    /// based on TWCC bandwidth estimates.
+    layer_ctrl: LayerController,
 }
 
 impl AgentActor {
@@ -379,12 +702,11 @@ impl AgentActor {
         tokio::pin!(debounce_timer);
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
+        // Periodic BWE reallocation tick (handles upgrade/recovery paths).
+        let mut bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
 
         while let Some(deadline) = self.poll_rtc().await {
             let now = Instant::now();
-
-            // If the deadline is 'now' or in the past, we must not busy-wait.
-            // We enforce a minimum 1ms "quanta" to prevent CPU starvation.
             let adjusted_deadline = if deadline <= now {
                 now + MIN_QUANTA
             } else {
@@ -420,15 +742,31 @@ impl AgentActor {
                     }
                 }
 
-                // Data coming from User -> Network
+                // Drain paused layers so the looper task never blocks.
                 Some(((mid, rid), frame)) = self.senders.next() => {
-                     if let Some(mut writer) = self.rtc.writer(mid) {
-                         let pt = writer.payload_params().next().unwrap().pt();
-                         if let Some(rid) = rid {
-                            writer = writer.rid(rid);
-                         }
-                         let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
-                     }
+                    // Measure the encoder output bitrate BEFORE the pause gate.
+                    // This ensures we always know what the encoder *would* cost
+                    // even when the layer is suppressed.
+                    self.layer_ctrl.record_frame(mid, rid, frame.data.len(), Instant::now());
+
+                    if !self.layer_ctrl.is_paused(mid, rid) {
+                        if let Some(mut writer) = self.rtc.writer(mid) {
+                            let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
+                                continue;
+                            };
+                            if let Some(rid) = rid {
+                                writer = writer.rid(rid);
+                            }
+                            let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
+                        }
+                    }
+                }
+
+                _ = bwe_slow_timer.tick(), if self.layer_ctrl.has_layers() => {
+                    let desired_bps = self.layer_ctrl.tick(Instant::now());
+                    let desired = Bitrate::bps(desired_bps as u64);
+                    tracing::debug!("desired bitrate: {}", desired);
+                    self.rtc.bwe().set_desired_bitrate(desired);
                 }
 
                  _ = &mut sleep => {
@@ -451,51 +789,55 @@ impl AgentActor {
                 Ok(Output::Transmit(tx)) => {
                     let _ = self.socket.send_to(&tx.contents, tx.destination).await;
                 }
-                Ok(Output::Event(e)) => {
-                    match e {
-                        Event::ChannelOpen(_cid, _label) => {}
-                        Event::ChannelData(data) => {
-                            self.handle_signaling_data(data);
-                        }
-                        Event::MediaAdded(media) => self.handle_media_added(media),
+                Ok(Output::Event(e)) => match e {
+                    Event::ChannelOpen(_cid, _label) => {}
+                    Event::ChannelData(data) => {
+                        self.handle_signaling_data(data);
+                    }
+                    Event::MediaAdded(media) => self.handle_media_added(media),
 
-                        Event::MediaData(data) => {
-                            // Network -> User
-                            if let Some(tx) = self.slot_manager.get_sender(&data.mid) {
-                                tx.try_send(data.into());
-                            }
-                        }
-
-                        Event::IceConnectionStateChange(state) => {
-                            tracing::info!("connection state changed: {:?}", state);
-                            if state == IceConnectionState::Disconnected {
-                                let reason = self
-                                    .disconnected_reason
-                                    .clone()
-                                    .unwrap_or("unknown reason".to_string());
-                                self.emit(AgentEvent::Disconnected(reason));
-                                return None;
-                            }
-                        }
-                        Event::Connected => {
-                            self.emit(AgentEvent::Connected);
-                        }
-                        Event::PeerStats(stats) => {
-                            self.stats.peer = Some(stats);
-                        }
-                        Event::MediaIngressStats(stats) => {
-                            let track_stats = self.stats.tracks.entry(stats.mid).or_default();
-                            track_stats.rx_layers.insert(stats.rid, stats);
-                        }
-                        Event::MediaEgressStats(stats) => {
-                            let track_stats = self.stats.tracks.entry(stats.mid).or_default();
-                            track_stats.tx_layers.insert(stats.rid, stats);
-                        }
-                        e => {
-                            tracing::trace!("unhandled event: {:?}", e);
+                    Event::MediaData(data) => {
+                        if let Some(tx) = self.slot_manager.get_sender(&data.mid) {
+                            tx.try_send(data.into());
                         }
                     }
-                }
+
+                    Event::IceConnectionStateChange(state) => {
+                        tracing::info!("connection state changed: {:?}", state);
+                        if state == IceConnectionState::Disconnected {
+                            let reason = self
+                                .disconnected_reason
+                                .clone()
+                                .unwrap_or("unknown reason".to_string());
+                            self.emit(AgentEvent::Disconnected(reason));
+                            return None;
+                        }
+                    }
+                    Event::Connected => {
+                        self.emit(AgentEvent::Connected);
+                    }
+                    Event::PeerStats(stats) => {
+                        self.stats.peer = Some(stats);
+                    }
+                    Event::MediaIngressStats(stats) => {
+                        let track_stats = self.stats.tracks.entry(stats.mid).or_default();
+                        track_stats.rx_layers.insert(stats.rid, stats);
+                    }
+                    Event::MediaEgressStats(stats) => {
+                        let track_stats = self.stats.tracks.entry(stats.mid).or_default();
+                        track_stats.tx_layers.insert(stats.rid, stats);
+                    }
+                    Event::KeyframeRequest(req) => {
+                        tracing::debug!(mid = ?req.mid, rid = ?req.rid, kind = ?req.kind, "keyframe request");
+                        self.layer_ctrl.request_keyframe(req.mid, req.rid);
+                    }
+                    Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
+                        self.layer_ctrl.update_available(available);
+                    }
+                    e => {
+                        tracing::trace!("unhandled event: {:?}", e);
+                    }
+                },
                 Ok(Output::Timeout(t)) => {
                     return Some(t.into());
                 }
@@ -521,9 +863,19 @@ impl AgentActor {
                 for rid in rids {
                     // User wants to send. We create a channel: User(tx) -> Actor(rx)
                     let (tx, rx) = mpsc::channel(128);
+                    // Create a keyframe notification channel: Actor(notifier) -> Looper(rx).
+                    // The actor signals the looper to seek to the nearest IDR whenever
+                    // BWE un-pauses this layer.
+                    let (kf_notifier, kf_rx) = KeyframeNotifier::pair();
+                    self.layer_ctrl.register(mid, rid, kf_notifier);
                     self.senders.insert((mid, rid), ReceiverStream::new(rx));
 
-                    self.emit(AgentEvent::LocalTrackAdded(LocalTrack { mid, tx, rid }));
+                    self.emit(AgentEvent::LocalTrackAdded(LocalTrack {
+                        mid,
+                        tx,
+                        rid,
+                        keyframe_rx: kf_rx,
+                    }));
                 }
             }
             Direction::RecvOnly => {
