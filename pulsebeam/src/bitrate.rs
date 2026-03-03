@@ -46,7 +46,10 @@ impl BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(300),
             max_bitrate: Bitrate::mbps(10),
             default_bitrate: Bitrate::kbps(300),
-            headroom_factor: 0.95,  // leave 5% headroom
+            // No headroom shave: the probe signal in video.rs is already set above the upgrade
+            // gate (UPGRADE_HYSTERESIS_FACTOR). Applying a <1.0 factor here makes the BWE
+            // converge *below* the gate threshold, so the upgrade never fires.
+            headroom_factor: 1.0,
             max_decay_factor: 0.95, // max 5% drop per tick
             emergency_drop_threshold: 0.50,
             required_up_samples: 1,

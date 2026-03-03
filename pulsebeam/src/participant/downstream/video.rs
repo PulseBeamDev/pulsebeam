@@ -187,6 +187,7 @@ impl VideoAllocator {
         available_bandwidth: Bitrate,
     ) -> Option<(Bitrate, Bitrate)> {
         const DOWNGRADE_TOLERANCE: f64 = 0.25;
+        // Gate: only commit the switch when there is this much headroom above the next layer.
         const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.15;
         const MIN_BANDWIDTH: f64 = 300_000.0;
 
@@ -354,7 +355,7 @@ impl VideoAllocator {
 
                 // We check if the budget can cover the Cost + The Safety Buffer
                 if (upgrade_cost + hysteresis_overhead) > budget {
-                    plan.desired_bitrate = desired_bitrate;
+                    plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
                     continue;
                 }
 

@@ -158,7 +158,7 @@ impl GatewayWorkerActor {
 
     async fn read_socket(&mut self) -> io::Result<()> {
         // ~1,000 yields per second = ~99% CPU for other work
-        const COOP_BUDGET: usize = 256;
+        const COOP_BUDGET: usize = 64;
         let mut spent_budget: usize = 0;
 
         loop {
