@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use str0m::media::Frequency;
@@ -18,7 +19,7 @@ pub struct Switcher {
 
     /// A high-priority slot for a packet from the *current* stream.
     /// This allows draining the last few packets of the old stream during a switch.
-    pending: Option<RtpPacket>,
+    pending: VecDeque<RtpPacket>,
 
     /// The state for the *new* stream we are switching to.
     /// This is `Some` only when a switch is in progress.
@@ -31,7 +32,7 @@ impl Switcher {
     pub fn new(clock_rate: Frequency) -> Self {
         Self {
             timeline: Timeline::new(clock_rate),
-            pending: None,
+            pending: VecDeque::new(),
             staging: None,
             latest_playout: Instant::now(),
         }
@@ -40,7 +41,7 @@ impl Switcher {
     /// Pushes a packet from the **old/current** stream.
     /// This is typically used to forward the stream that is already playing out.
     pub fn push(&mut self, pkt: RtpPacket) {
-        self.pending.replace(pkt);
+        self.pending.push_back(pkt);
     }
 
     /// Pushes a packet for the **new** stream we are preparing to switch to.
@@ -61,19 +62,25 @@ impl Switcher {
             return false;
         };
 
-        let target = self.latest_playout
+        let target = self
+            .latest_playout
             .checked_sub(PLAYOUT_JITTER_TOLERANCE)
             .unwrap_or(self.latest_playout);
-            
+
         let ready = staging.is_ready(target);
-        tracing::trace!("ready_to_stream: {} (target={:?}, latest_playout={:?})", ready, target, self.latest_playout);
+        tracing::trace!(
+            "ready_to_stream: {} (target={:?}, latest_playout={:?})",
+            ready,
+            target,
+            self.latest_playout
+        );
         ready
     }
 
     /// Pops the next available packet, prioritizing the old stream to ensure a smooth drain.
     pub fn pop(&mut self) -> Option<RtpPacket> {
         // 1. Drain the pending packet from the OLD stream.
-        if let Some(pending_pkt) = self.pending.take() {
+        if let Some(pending_pkt) = self.pending.pop_front() {
             if pending_pkt.playout_time > self.latest_playout {
                 self.latest_playout = pending_pkt.playout_time;
             }
