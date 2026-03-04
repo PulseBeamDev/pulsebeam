@@ -101,7 +101,7 @@ pub struct ParticipantSlot {
     pub connection_id: ConnectionId,
     /// ICE ufrag -- needed to register/deregister with the gateway worker.
     pub ufrag: String,
-    pub core: Box<ParticipantCore>,
+    pub core: ParticipantCore,
     pub udp_egress: UnifiedSocketWriter,
     pub tcp_egress: UnifiedSocketWriter,
     /// Current room tracks delivered on join.
@@ -115,7 +115,7 @@ impl ParticipantSlot {
         participant_id: ParticipantId,
         connection_id: ConnectionId,
         ufrag: String,
-        core: Box<ParticipantCore>,
+        core: ParticipantCore,
         udp_egress: UnifiedSocketWriter,
         tcp_egress: UnifiedSocketWriter,
         initial_tracks: HashMap<TrackId, TrackReceiver>,
@@ -149,13 +149,13 @@ impl ParticipantSlot {
         let ufrag = rtc.direct_api().local_ice_credentials().ufrag.clone();
         let udp_batcher = super::batcher::Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = super::batcher::Batcher::with_capacity(tcp_egress.max_gso_segments());
-        let core = Box::new(ParticipantCore::new(
+        let core = ParticipantCore::new(
             manual_sub,
             participant_id,
             rtc,
             udp_batcher,
             tcp_batcher,
-        ));
+        );
         Self {
             participant_id,
             connection_id,
@@ -177,7 +177,7 @@ struct LiveSlot {
     participant_id: ParticipantId,
     connection_id: ConnectionId,
     ufrag: String,
-    core: Box<ParticipantCore>,
+    core: ParticipantCore,
     udp_egress: UnifiedSocketWriter,
     tcp_egress: UnifiedSocketWriter,
     deadline: Option<Instant>,
