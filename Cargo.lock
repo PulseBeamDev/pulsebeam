@@ -2780,7 +2780,6 @@ dependencies = [
  "loom",
  "metrics",
  "once_cell",
- "parking_lot",
  "pulsebeam-core",
  "quinn-udp",
  "rand",

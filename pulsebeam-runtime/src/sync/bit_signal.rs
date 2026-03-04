@@ -1,5 +1,5 @@
-use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Waker};
 
@@ -28,7 +28,7 @@ impl BitSignal {
 
         // Notify the group executor.
         // We use a simplified lock-check to avoid waking if no waker is set.
-        if let Some(waker) = self.group_waker.lock().as_ref() {
+        if let Some(waker) = self.group_waker.lock().unwrap().as_ref() {
             waker.wake_by_ref();
         }
     }
@@ -36,7 +36,7 @@ impl BitSignal {
     /// Registers the executor's waker.
     /// Used by the Consumer (TaskGroup) inside its poll loop.
     pub fn register(&self, cx: &mut Context<'_>) {
-        let mut lock = self.group_waker.lock();
+        let mut lock = self.group_waker.lock().unwrap();
         if lock.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
             *lock = Some(cx.waker().clone());
         }

@@ -1,10 +1,10 @@
 use crossbeam_utils::CachePadded;
 use event_listener::{Event, EventListener};
 use futures_lite::Stream;
-use parking_lot::RwLock;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 
@@ -76,7 +76,7 @@ impl<T> Sender<T> {
         let idx = (self.local_head as usize) & self.ring.mask;
 
         {
-            let mut slot = self.ring.slots[idx].write();
+            let mut slot = self.ring.slots[idx].write().unwrap();
             slot.val = Some(val);
             slot.seq = self.local_head;
         }
@@ -179,7 +179,7 @@ impl<T: Clone> Receiver<T> {
 
             // Read slot for next_seq
             let idx = (self.next_seq as usize) & self.ring.mask;
-            let slot = self.ring.slots[idx].read();
+            let slot = self.ring.slots[idx].read().unwrap();
             let slot_seq = slot.seq;
 
             // Seq mismatch — producer overwrote after head snapshot
