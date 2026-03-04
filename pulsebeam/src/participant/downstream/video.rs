@@ -4,8 +4,6 @@ use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::Arc;
-use std::task::Waker;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
@@ -15,59 +13,51 @@ use tokio::time::Instant;
 use crate::entity::TrackId;
 use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
-pub struct SlotAssignment {
-    pub mid: Mid,
-    pub track: Arc<TrackMeta>,
-}
-
-pub struct Intent {
-    pub track_id: TrackId,
-    pub max_height: u32,
-}
-
-#[derive(Default)]
 pub struct VideoAllocator {
     manual_sub: bool,
     tracks: HashMap<TrackId, TrackState>,
-    slots: Vec<Slot>,
-
+    drivers: Vec<SlotDriver>,
     ticks: u32,
-    rr_cursor: usize,
-    waker: Option<Waker>,
+    last_polled: usize,
 }
 
 impl VideoAllocator {
     pub fn new(manual_sub: bool) -> Self {
         Self {
             manual_sub,
-            ..Default::default()
+            tracks: HashMap::new(),
+            drivers: Vec::new(),
+            ticks: 0,
+            last_polled: 0,
         }
     }
 
     pub fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.drivers.len()
     }
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
         let tracks = &mut self.tracks;
-        for slot in &mut self.slots {
-            if let Some(intent) = intents.get(&slot.mid) {
-                Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id));
+        // Collect mids to avoid borrow issues.
+        let mids: Vec<Mid> = self.drivers.iter().map(|d| d.mid).collect();
+        for mid in mids {
+            let driver = self.drivers.iter_mut().find(|d| d.mid == mid).unwrap();
+            if let Some(intent) = intents.get(&mid) {
+                Self::configure_slot(tracks, driver, intent.max_height, Some(&intent.track_id));
             } else {
-                Self::configure_slot(tracks, slot, 0, None);
+                Self::configure_slot(tracks, driver, 0, None);
             }
         }
     }
 
     fn configure_slot(
         tracks: &mut HashMap<TrackId, TrackState>,
-        slot: &mut Slot,
+        driver: &mut SlotDriver,
         max_height: u32,
         track_id: Option<&TrackId>,
     ) {
-        // If we are switching A->B, 'B' is the one holding the assignment,
-        // so we must clear B if we are about to change our mind.
-        if let Some(target) = slot.target_receiver()
+        // Clear any previous assignment on the target track.
+        if let Some(target) = driver.slot.target()
             && let Some(state) = tracks.get_mut(&target.meta.id)
         {
             state.assigned_mid = None;
@@ -80,20 +70,21 @@ impl VideoAllocator {
                 return;
             };
 
-            let layer = if let Some(target) = slot.target_receiver()
+            let layer = if let Some(target) = driver.slot.target()
                 && target.meta.id == track_state.track.meta.id
             {
-                target
+                target.clone()
             } else {
-                track_state.track.lowest_quality()
+                track_state.track.lowest_quality().clone()
             };
-            slot.switch_to(layer.clone(), false);
-            track_state.assigned_mid = Some(slot.mid);
+
+            driver.switch_to(layer, false);
+            track_state.assigned_mid = Some(driver.mid);
         } else {
-            slot.stop();
+            driver.stop();
         }
 
-        slot.max_height = max_height;
+        driver.max_height = max_height;
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
@@ -101,10 +92,10 @@ impl VideoAllocator {
     }
 
     pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> {
-        self.slots.iter().filter_map(|s| {
+        self.drivers.iter().filter_map(|d| {
             Some(SlotAssignment {
-                mid: s.mid,
-                track: s.current_receiver()?.meta.clone(),
+                mid: d.mid,
+                track: d.slot.current()?.meta.clone(),
             })
         })
     }
@@ -113,11 +104,7 @@ impl VideoAllocator {
         if self.tracks.contains_key(&track.meta.id) {
             return;
         }
-
-        tracing::info!(
-            track = %track.meta.id,
-            "video track added"
-        );
+        tracing::info!(track = %track.meta.id, "video track added");
         self.tracks.insert(
             track.meta.id,
             TrackState {
@@ -130,31 +117,20 @@ impl VideoAllocator {
 
     pub fn remove_track(&mut self, track_id: &TrackId) {
         if let Some(track) = self.tracks.remove(track_id) {
-            tracing::info!(
-                track = %track_id,
-                "video track removed"
-            );
-
+            tracing::info!(track = %track_id, "video track removed");
             let Some(assigned_mid) = track.assigned_mid else {
                 return;
             };
-
-            let Some(slot) = self.slots.iter_mut().find(|s| s.mid == assigned_mid) else {
-                return;
-            };
-
-            slot.stop();
+            if let Some(driver) = self.drivers.iter_mut().find(|d| d.mid == assigned_mid) {
+                driver.stop();
+            }
             self.rebalance();
         }
     }
 
     pub fn add_slot(&mut self, mid: Mid) {
-        self.slots.push(Slot::new(mid));
+        self.drivers.push(SlotDriver::new(mid));
         self.rebalance();
-
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
     }
 
     fn rebalance(&mut self) {
@@ -162,22 +138,28 @@ impl VideoAllocator {
             return;
         }
 
-        let mut unassigned_tracks = self.tracks.iter_mut().filter(|(_, state)| {
-            assert!(state.track.meta.kind.is_video());
-            state.assigned_mid.is_none()
-        });
+        let unassigned: Vec<TrackId> = self
+            .tracks
+            .iter()
+            .filter(|(_, s)| {
+                assert!(s.track.meta.kind.is_video());
+                s.assigned_mid.is_none()
+            })
+            .map(|(id, _)| *id)
+            .collect();
 
-        for slot in &mut self.slots {
-            if !slot.is_idle() {
+        let mut ui = 0;
+        for driver in &mut self.drivers {
+            if !driver.slot.state.is_idle() {
                 continue;
             }
-
-            let Some(next_track) = unassigned_tracks.next() else {
+            let Some(track_id) = unassigned.get(ui).copied() else {
                 break;
             };
-
-            next_track.1.assigned_mid.replace(slot.mid);
-            slot.assign_to(next_track.1.track.lowest_quality().clone());
+            ui += 1;
+            let state = self.tracks.get_mut(&track_id).unwrap();
+            state.assigned_mid = Some(driver.mid);
+            driver.assign_to(state.track.lowest_quality().clone());
         }
     }
 
@@ -187,11 +169,11 @@ impl VideoAllocator {
         available_bandwidth: Bitrate,
     ) -> Option<(Bitrate, Bitrate)> {
         const DOWNGRADE_TOLERANCE: f64 = 0.25;
-        // Gate: only commit the switch when there is this much headroom above the next layer.
         const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.15;
         const MIN_BANDWIDTH: f64 = 300_000.0;
 
         struct SlotPlan<'a> {
+            driver_idx: usize,
             current_receiver: &'a SimulcastReceiver,
             target_receiver: &'a SimulcastReceiver,
             current_bitrate: f64,
@@ -201,40 +183,35 @@ impl VideoAllocator {
         }
 
         struct CommittedSlotPlan {
+            driver_idx: usize,
             receiver: SimulcastReceiver,
             paused: bool,
         }
 
-        if self.slots.is_empty() {
+        if self.drivers.is_empty() {
             return None;
         }
 
-        self.slots.sort_by_key(|s| std::cmp::Reverse(s.max_height));
+        self.drivers
+            .sort_by_key(|d| std::cmp::Reverse(d.max_height));
         let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
+        let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.drivers.len());
 
         // Step 1: Optimistic Initialization
-        let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.slots.len());
-
-        for slot in &self.slots {
-            let Some(current_receiver) = slot.current_receiver() else {
+        for (idx, driver) in self.drivers.iter().enumerate() {
+            let Some(current_receiver) = driver.slot.current() else {
                 continue;
             };
-
             let Some(state) = self.tracks.get(&current_receiver.meta.id) else {
                 continue;
             };
 
-            // If the slot is paused OR the layer we are currently watching has died (is_inactive),
-            // we do NOT give up. Instead, we reset our target to the "Lowest" layer (`q`).
-            // This forces the allocator to try and maintain at least the base layer.
             let (target_receiver, cost) =
-                if slot.is_paused() || !current_receiver.state.is_healthy() {
+                if driver.slot.state.is_paused() || !current_receiver.state.is_healthy() {
                     let lowest = state.track.lowest_quality();
-
-                    // If even the lowest layer is dead, THEN we truly pause.
-                    // It's okay if the quality is not great. At least, we're trying to stream.
                     if lowest.state.is_inactive() {
                         slot_plans.push(SlotPlan {
+                            driver_idx: idx,
                             current_receiver,
                             target_receiver: current_receiver,
                             current_bitrate: 0.0,
@@ -244,71 +221,61 @@ impl VideoAllocator {
                         });
                         continue;
                     }
-
                     (lowest, lowest.state.bitrate_bps())
                 } else {
-                    // Current layer is healthy, try to keep it.
-                    (current_receiver, current_receiver.state.bitrate_bps())
+                    let cost = current_receiver.state.bitrate_bps();
+                    (current_receiver, cost)
                 };
 
             budget -= cost;
-
             slot_plans.push(SlotPlan {
+                driver_idx: idx,
                 current_receiver,
                 target_receiver,
                 current_bitrate: cost,
                 desired_bitrate: cost,
-                paused: false, // Optimistically active
+                paused: false,
                 committed: false,
             });
         }
 
         // Step 2: Resolve Congestion (Downgrade Phase)
         let tolerance = available_bandwidth.as_f64() * DOWNGRADE_TOLERANCE;
-
         while budget < -tolerance {
-            let mut resolved_some_debt = false;
-
+            let mut resolved = false;
             for plan in slot_plans.iter_mut().rev() {
                 if plan.paused || plan.committed {
                     continue;
                 }
-
                 let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
                     continue;
                 };
-
                 if let Some(lower) = state.track.lower_quality(plan.target_receiver.quality) {
                     let savings =
                         plan.target_receiver.state.bitrate_bps() - lower.state.bitrate_bps();
-
                     if savings > 0.0 {
                         plan.target_receiver = lower;
                         plan.current_bitrate = lower.state.bitrate_bps();
                         plan.desired_bitrate = lower.state.bitrate_bps();
                         budget += savings;
-                        resolved_some_debt = true;
-
+                        resolved = true;
                         if budget >= -tolerance {
                             break;
                         }
                     }
                 } else {
-                    // Must pause
                     let cost = plan.target_receiver.state.bitrate_bps();
                     plan.paused = true;
                     plan.committed = true;
                     plan.current_bitrate = 0.0;
                     budget += cost;
-                    resolved_some_debt = true;
-
+                    resolved = true;
                     if budget >= -tolerance {
                         break;
                     }
                 }
             }
-
-            if !resolved_some_debt {
+            if !resolved {
                 break;
             }
         }
@@ -317,18 +284,14 @@ impl VideoAllocator {
         let mut made_progress = true;
         while made_progress {
             made_progress = false;
-
             for plan in &mut slot_plans {
                 if plan.committed {
                     continue;
                 }
-                plan.committed = true; // Mark as visited for this iteration
-
+                plan.committed = true;
                 let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
                     continue;
                 };
-
-                // Find the next higher quality layer
                 let Some(desired_receiver) = state
                     .track
                     .higher_quality(plan.target_receiver.quality)
@@ -341,11 +304,7 @@ impl VideoAllocator {
                 };
 
                 let desired_bitrate = desired_receiver.state.bitrate_bps();
-                let current_bitrate = plan.current_bitrate;
-                let upgrade_cost = desired_bitrate - current_bitrate;
-
-                // If we are actually moving to a higher quality than what is LIVE,
-                // we demand a buffer.
+                let upgrade_cost = desired_bitrate - plan.current_bitrate;
                 let hysteresis_overhead =
                     if desired_receiver.quality > plan.current_receiver.quality {
                         desired_bitrate * (UPGRADE_HYSTERESIS_FACTOR - 1.0)
@@ -353,16 +312,13 @@ impl VideoAllocator {
                         0.0
                     };
 
-                // We check if the budget can cover the Cost + The Safety Buffer
                 if (upgrade_cost + hysteresis_overhead) > budget {
                     plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
                     continue;
                 }
 
-                // We only subtract the ACTUAL cost, not the hysteresis overhead.
                 budget -= upgrade_cost;
-
-                plan.committed = false; // Allow further upgrades for this track in the next while-loop pass
+                plan.committed = false;
                 plan.target_receiver = desired_receiver;
                 plan.current_bitrate = desired_bitrate;
                 plan.desired_bitrate = desired_bitrate;
@@ -371,7 +327,7 @@ impl VideoAllocator {
         }
 
         // Step 4: Apply allocations
-        let mut committed = Vec::with_capacity(self.slots.len());
+        let mut committed = Vec::with_capacity(slot_plans.len());
         let mut total_allocated = 0.0;
         let mut total_desired = 0.0;
 
@@ -379,17 +335,18 @@ impl VideoAllocator {
             total_allocated += plan.current_bitrate;
             total_desired += plan.desired_bitrate;
             committed.push(CommittedSlotPlan {
+                driver_idx: plan.driver_idx,
                 receiver: plan.target_receiver.clone(),
                 paused: plan.paused,
             });
         }
 
-        for (idx, plan) in committed.drain(..).enumerate() {
-            let slot = &mut self.slots[idx];
+        for plan in committed {
+            let driver = &mut self.drivers[plan.driver_idx];
             if plan.paused {
-                slot.assign_to(plan.receiver);
+                driver.assign_to(plan.receiver);
             } else {
-                slot.switch_to(plan.receiver, false);
+                driver.switch_to(plan.receiver, false);
             }
         }
 
@@ -412,49 +369,37 @@ impl VideoAllocator {
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
-        let Some(slot) = self.slots.iter().find(|e| e.mid == req.mid) else {
+        let Some(driver) = self.drivers.iter().find(|d| d.mid == req.mid) else {
             tracing::warn!(?req, "no video slot found for keyframe request");
             return;
         };
-        slot.request_keyframe();
+        driver.request_keyframe();
     }
 
     pub fn poll_slow(&mut self, now: Instant) {
-        for slot in &mut self.slots {
-            slot.poll_slow(now);
+        for driver in &mut self.drivers {
+            driver.poll_slow(now);
         }
     }
 
-    pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
-        if self.slots.is_empty() {
-            self.waker.replace(cx.waker().clone());
-            return Poll::Pending;
-        }
-
-        let mut checked_count = 0;
-        while checked_count < self.slots.len() {
-            if self.rr_cursor >= self.slots.len() {
-                self.rr_cursor = 0;
+    pub async fn next(&mut self) -> (Mid, RtpPacket) {
+        std::future::poll_fn(|cx| {
+            let len = self.drivers.len();
+            if len == 0 {
+                return Poll::Pending;
             }
 
-            let slot = &mut self.slots[self.rr_cursor];
-            match slot.poll_fast(cx) {
-                Poll::Ready(Some(pkt)) => {
-                    // ensure each frame to be flushed before moving to another stream,
-                    // allows related contexts to stay in L1/L2 caches longer.
-                    return Poll::Ready(Some((slot.mid, pkt)));
-                }
-                Poll::Ready(None) => {
-                    self.rr_cursor += 1;
-                    checked_count += 1;
-                }
-                Poll::Pending => {
-                    self.rr_cursor += 1;
-                    checked_count += 1;
+            for i in 0..len {
+                let idx = (self.last_polled + i) % len;
+                if let Poll::Ready(item) = self.drivers[idx].poll_packet(cx) {
+                    self.last_polled = (idx + 1) % len;
+                    return Poll::Ready(item);
                 }
             }
-        }
-        Poll::Pending
+
+            Poll::Pending
+        })
+        .await
     }
 }
 
@@ -464,24 +409,42 @@ struct TrackState {
     assigned_mid: Option<Mid>,
 }
 
+pub struct SlotAssignment {
+    pub mid: Mid,
+    pub track: std::sync::Arc<TrackMeta>,
+}
+
+pub struct Intent {
+    pub track_id: TrackId,
+    pub max_height: u32,
+}
+
+#[derive(Copy, Clone, Debug)]
 enum SlotState {
     Idle,
-    Paused {
-        active: SimulcastReceiver,
-    },
-    Resuming {
-        staging: SimulcastReceiver,
-    },
-    Streaming {
-        active: SimulcastReceiver,
-    },
-    Switching {
-        active: SimulcastReceiver,
-        staging: SimulcastReceiver,
-    },
+    Paused,
+    Resuming,
+    Streaming,
+    Switching,
 }
 
 impl SlotState {
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused { .. })
+    }
+
+    fn is_paused_or_idle(&self) -> bool {
+        matches!(self, Self::Idle | Self::Paused { .. })
+    }
+
+    fn is_switching(&self) -> bool {
+        matches!(self, Self::Resuming { .. } | Self::Switching { .. })
+    }
+
     fn is_playing(&self) -> bool {
         matches!(
             self,
@@ -492,194 +455,123 @@ impl SlotState {
 
 impl Display for SlotState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = match self {
+        f.write_str(match self {
             Self::Idle => "idle",
             Self::Paused { .. } => "paused",
             Self::Resuming { .. } => "resuming",
             Self::Streaming { .. } => "streaming",
             Self::Switching { .. } => "switching",
-        };
-
-        f.write_str(state)
+        })
     }
 }
 
 struct Slot {
-    mid: Mid,
-    max_height: u32,
-    switcher: Switcher,
-    state: Option<SlotState>,
-    switching_started_at: Option<Instant>,
-    keyframe_retries: usize,
-    waker: Option<Waker>,
+    state: SlotState,
+    active: Option<SimulcastReceiver>,
+    staging: Option<SimulcastReceiver>,
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            state: SlotState::Idle,
+            active: None,
+            staging: None,
+        }
+    }
 }
 
 impl Slot {
+    fn current(&self) -> Option<&SimulcastReceiver> {
+        match self.state {
+            SlotState::Streaming | SlotState::Switching => self.active.as_ref(),
+            SlotState::Resuming | SlotState::Paused => self.staging.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn target(&self) -> Option<&SimulcastReceiver> {
+        match self.state {
+            SlotState::Resuming | SlotState::Switching | SlotState::Paused => self.staging.as_ref(),
+            SlotState::Streaming => self.active.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.state.fmt(f)
+    }
+}
+
+struct SlotDriver {
+    mid: Mid,
+    pub max_height: u32,
+    slot: Slot,
+    switcher: Switcher,
+    switching_started_at: Option<Instant>,
+    keyframe_retries: usize,
+}
+
+impl SlotDriver {
     fn new(mid: Mid) -> Self {
         Self {
             mid,
             max_height: 0,
+            slot: Slot::default(),
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
-            state: Some(SlotState::Idle),
             switching_started_at: None,
             keyframe_retries: 0,
-            waker: None,
         }
     }
 
-    fn state(&self) -> &SlotState {
-        self.state.as_ref().expect("State invalid outside poll")
-    }
-
-    fn current_receiver(&self) -> Option<&SimulcastReceiver> {
-        match self.state() {
-            SlotState::Resuming { staging } => Some(staging),
-            SlotState::Switching { active, .. } => Some(active),
-            SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
-            SlotState::Idle => None,
+    pub fn request_keyframe(&self) {
+        if let Some(active) = &self.slot.active {
+            active.request_keyframe();
         }
-    }
-
-    fn target_receiver(&self) -> Option<&SimulcastReceiver> {
-        match self.state() {
-            SlotState::Resuming { staging } | SlotState::Switching { staging, .. } => Some(staging),
-            SlotState::Streaming { active } | SlotState::Paused { active } => Some(active),
-            SlotState::Idle => None,
-        }
-    }
-
-    // similar to switch_to but it will start as paused
-    pub fn assign_to(&mut self, receiver: SimulcastReceiver) {
-        self.transition_to(SlotState::Paused {
-            active: receiver.clone(),
-        });
     }
 
     pub fn is_switchable(&mut self, receiver: &SimulcastReceiver) -> bool {
-        if let Some(current) = self.target_receiver() {
-            // Case 1: nothing change, do nothing.
-            if current.rid == receiver.rid && current.meta.id == receiver.meta.id {
-                // if we're paused currently, we're resuming with same receiver.
-                if !self.is_paused() {
+        if let Some(target) = self.slot.target() {
+            if target.rid == receiver.rid && target.meta.id == receiver.meta.id {
+                if !self.slot.state.is_paused_or_idle() {
                     return false;
                 }
-            // Case 2: Block rapid upgrades while already switching
-            } else if current.meta.id == receiver.meta.id
-                && receiver.quality >= current.quality
-                && self.is_switching()
+            } else if target.meta.id == receiver.meta.id
+                && receiver.quality >= target.quality
+                && self.slot.state.is_switching()
             {
                 return false;
             }
         }
 
-        // there are buffered packets, we must flush them first before dropping packets
-        if !self.switcher.ready_to_switch() {
-            return false;
-        }
-
-        true
+        self.switcher.ready_to_switch()
     }
 
-    pub fn switch_to(&mut self, mut receiver: SimulcastReceiver, force: bool) {
-        if force || !self.is_switchable(&receiver) {
+    pub fn switch_to(&mut self, receiver: SimulcastReceiver, force: bool) {
+        if !force && !self.is_switchable(&receiver) {
             return;
         }
-
-        // Take ownership of state to move internals
-        let old_state = self.state.take().unwrap_or(SlotState::Idle);
-        receiver.channel.rewind();
-        receiver.request_keyframe();
-        self.switching_started_at = Some(Instant::now());
         self.keyframe_retries = 0;
-
-        let old_state_str = old_state.to_string();
-        let track_id = receiver.meta.id.as_str();
-        let rid = receiver.rid;
-
-        let new_state = match old_state {
-            SlotState::Idle | SlotState::Paused { .. } => SlotState::Resuming { staging: receiver },
-
-            SlotState::Streaming { active } => SlotState::Switching {
-                active,
-                staging: receiver,
-            },
-
-            SlotState::Resuming { .. } => SlotState::Resuming { staging: receiver },
-
-            SlotState::Switching {
-                active,
-                staging: _old_staging,
-            } => {
-                if active.rid == receiver.rid && active.meta.id == receiver.meta.id {
-                    tracing::info!("Cancelling switch, reverting to active stream");
-                    SlotState::Streaming { active }
-                } else {
-                    SlotState::Switching {
-                        active,
-                        staging: receiver,
-                    }
-                }
-            }
-        };
-        tracing::debug!(
-            mid = %self.mid,
-            to_rid = ?rid,
-            track = track_id,
-            old_state = old_state_str,
-            new_state = %new_state,
-            "switch_to: initiating switch"
-        );
-
-        self.transition_to(new_state);
-        self.switcher.clear();
-
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
+        self.do_switch_to(receiver, false);
     }
 
-    pub fn is_paused(&self) -> bool {
-        matches!(self.state(), SlotState::Idle | SlotState::Paused { .. })
-    }
-
-    pub fn is_idle(&self) -> bool {
-        matches!(self.state(), SlotState::Idle)
-    }
-
-    pub fn is_switching(&self) -> bool {
-        matches!(
-            self.state(),
-            SlotState::Resuming { .. } | SlotState::Switching { .. }
-        )
+    pub fn assign_to(&mut self, receiver: SimulcastReceiver) {
+        self.keyframe_retries = 0;
+        self.transition_to(SlotState::Paused, None, Some(receiver));
     }
 
     pub fn stop(&mut self) {
-        self.transition_to(SlotState::Idle);
+        self.keyframe_retries = 0;
+        self.transition_to(SlotState::Idle, None, None);
     }
 
-    fn request_keyframe(&self) {
-        match self.state() {
-            SlotState::Resuming { staging } => {
-                staging.request_keyframe();
-            }
-            // We're not requesting staging stream since we're currently streaming active.
-            SlotState::Switching { active, .. } => {
-                active.request_keyframe();
-            }
-            SlotState::Streaming { active } => {
-                active.request_keyframe();
-            }
-            SlotState::Paused { .. } | SlotState::Idle => {}
-        }
-    }
-
-    fn poll_slow(&mut self, now: Instant) {
+    pub fn poll_slow(&mut self, now: Instant) {
         const KEYFRAME_RETRY_DELAYS_MS: [u64; 4] = [500, 1000, 2000, 4000];
 
-        // Chrome shares keyframe request throttling for all simulcast streams &
-        // Our keyframe request might get lost in the middle. Retry some to at least
-        // reduce the probability to miss the keyframe.
         let Some(started_at) = self.switching_started_at else {
+            self.keyframe_retries = 0;
             return;
         };
 
@@ -687,183 +579,302 @@ impl Slot {
             return;
         }
 
-        let current_cumulative_delay: u64 = KEYFRAME_RETRY_DELAYS_MS
+        let cumulative: u64 = KEYFRAME_RETRY_DELAYS_MS
             .iter()
             .take(self.keyframe_retries + 1)
             .sum();
-        let deadline = started_at + Duration::from_millis(current_cumulative_delay);
-        if deadline > now {
+        if started_at + Duration::from_millis(cumulative) > now {
             return;
         }
 
         self.keyframe_retries += 1;
-        if let Some(receiver) = self.target_receiver() {
+        if let Some(target) = self.slot.target() {
             tracing::trace!(
-                receiver = %receiver,
+                mid = %self.mid,
+                rid = ?target.rid,
                 "Switch slow. Retrying keyframe request (attempt {}/{}). Elapsed: {:?}",
                 self.keyframe_retries,
                 KEYFRAME_RETRY_DELAYS_MS.len(),
                 now.duration_since(started_at)
             );
-
-            receiver.request_keyframe();
+            target.request_keyframe();
         }
     }
 
-    #[inline]
-    fn transition_to(&mut self, new_state: SlotState) {
-        if let SlotState::Streaming { .. } = &new_state {
-            self.switching_started_at = None;
-            self.keyframe_retries = 0;
-        }
-        let was_playing = self.state.as_ref().map(|s| s.is_playing()).unwrap_or(false);
-        let is_playing = new_state.is_playing();
-
-        if was_playing
-            && !is_playing
-            && let Some(receiver) = self.current_receiver()
-        {
-            // Determine the reason based on the new_state or external context
-            match &new_state {
-                SlotState::Idle => tracing::info!(stream_id = %receiver, "stream stopped"),
-                SlotState::Paused { .. } => {
-                    tracing::info!(stream_id = %receiver, "stream paused (congestion or lag)");
-                }
-                _ => {}
-            }
-        }
-        self.state = Some(new_state);
-    }
-
-    fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<RtpPacket>> {
+    /// Try to produce the next outbound packet without suspending.
+    ///
+    /// Hot path: calls `spmc::Receiver::try_recv` first — a bare ring read with
+    /// zero coop/listener/mutex overhead.  `poll_recv` (which registers an
+    /// event-listener) is called only once when the ring is genuinely empty, so
+    /// the waker cost is paid once per "dry spell", not once per packet.
+    pub fn poll_packet(&mut self, cx: &mut Context<'_>) -> Poll<(Mid, RtpPacket)> {
         loop {
+            // Drain the switcher output first — always cheap.
             if let Some(pkt) = self.switcher.pop() {
-                return Poll::Ready(Some(pkt));
+                return Poll::Ready((self.mid, pkt));
             }
 
-            // Take the state to perform transitions by move
-            let state = self.state.take().unwrap();
-
-            match state {
-                SlotState::Idle => {
-                    self.waker.replace(cx.waker().clone());
-                    self.switcher.clear();
-                    self.transition_to(SlotState::Idle);
+            match (
+                self.slot.state,
+                self.slot.active.as_mut(),
+                self.slot.staging.as_mut(),
+            ) {
+                (SlotState::Idle, _, _) => {
                     return Poll::Pending;
                 }
 
-                SlotState::Paused { active } => {
-                    self.waker.replace(cx.waker().clone());
-                    self.switcher.clear();
-                    self.transition_to(SlotState::Paused { active });
+                (SlotState::Paused, _, _) => {
                     return Poll::Pending;
                 }
 
-                SlotState::Resuming { mut staging } => {
-                    match staging.channel.poll_recv(cx) {
-                        Poll::Ready(Ok(pkt)) => {
+                (SlotState::Resuming, _, Some(staging)) => {
+                    match std::task::ready!(staging.channel.poll_recv(cx)) {
+                        Ok(pkt) => {
                             self.switcher.stage(pkt);
                             if self.switcher.ready_to_stream() {
                                 tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
-                                // Transition: Move staging to active
-                                self.transition_to(SlotState::Streaming { active: staging });
-                            } else {
-                                // Stay
-                                self.transition_to(SlotState::Resuming { staging });
+                                let staging = staging.clone();
+                                self.transition_to(SlotState::Streaming, Some(staging), None);
                             }
-                            // Continue loop to drain switcher or process more
                         }
-                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
-                            // We're still resuming, it is okay to continue since we haven't sent
-                            // any packet yet to downstream
+                        Err(spmc::RecvError::Lagged(n)) => {
                             tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, keep going");
-                            self.transition_to(SlotState::Resuming { staging });
                         }
-                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
+                        Err(spmc::RecvError::Closed) => {
                             tracing::warn!(mid = %self.mid, "Resuming closed");
-                            self.transition_to(SlotState::Idle);
-                        }
-                        Poll::Pending => {
-                            self.transition_to(SlotState::Resuming { staging });
+                            self.transition_to(SlotState::Idle, None, None);
                             return Poll::Pending;
                         }
                     }
                 }
 
-                SlotState::Streaming { mut active } => match active.channel.poll_recv(cx) {
-                    Poll::Ready(Ok(pkt)) => {
-                        self.switcher.push(pkt);
-                        self.transition_to(SlotState::Streaming { active });
-                    }
-                    Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
-                        tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
-                        self.transition_to(SlotState::Paused { active });
-                    }
-                    Poll::Ready(Err(spmc::RecvError::Closed)) => {
-                        tracing::info!(mid = %self.mid, "Streaming closed");
-                        self.transition_to(SlotState::Idle);
-                    }
-                    Poll::Pending => {
-                        self.transition_to(SlotState::Streaming { active });
-                        return Poll::Pending;
-                    }
-                },
-
-                SlotState::Switching {
-                    mut active,
-                    mut staging,
-                } => {
-                    // 1. Poll Staging
-                    let staging_poll = staging.channel.poll_recv(cx);
-                    match staging_poll {
-                        Poll::Ready(Ok(pkt)) => {
-                            self.switcher.stage(pkt);
-                            if self.switcher.ready_to_stream() {
-                                tracing::info!(mid = %self.mid, from = ?active.rid, to = ?staging.rid, "Switch complete");
-                                // Transition: Move staging to active, Drop old active
-                                self.transition_to(SlotState::Streaming { active: staging });
-                                continue;
-                            }
-                            // Switch not yet complete — fall through to also drain active.
-                            // Without this, staging is polled in a tight loop and active's ring
-                            // buffer overflows (Lagged) because it is never consumed.
-                        }
-                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
-                            tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
-                            self.transition_to(SlotState::Paused { active: staging });
-                            continue;
-                        }
-                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
-                            tracing::warn!(mid = %self.mid, "Staging closed during switch");
-                            // Revert to streaming active
-                            self.transition_to(SlotState::Streaming { active });
-                            continue;
-                        }
-                        Poll::Pending => { /* fall through to active */ }
-                    }
-
-                    // 2. Poll Active
-                    match active.channel.poll_recv(cx) {
-                        Poll::Ready(Ok(pkt)) => {
+                (SlotState::Streaming, Some(active), _) => {
+                    match std::task::ready!(active.channel.poll_recv(cx)) {
+                        Ok(pkt) => {
                             self.switcher.push(pkt);
-                            self.transition_to(SlotState::Switching { active, staging });
                         }
-                        Poll::Ready(Err(spmc::RecvError::Lagged(n))) => {
-                            tracing::warn!(mid = %self.mid, skipped = n, "Active lagged during switch, pausing");
-                            self.transition_to(SlotState::Paused { active });
+                        Err(spmc::RecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
+                            let active = active.clone();
+                            self.transition_to(SlotState::Paused, None, Some(active));
+                            return Poll::Pending;
                         }
-                        Poll::Ready(Err(spmc::RecvError::Closed)) => {
-                            tracing::warn!(mid = %self.mid, "Active closed, forcing resume");
-                            self.transition_to(SlotState::Resuming { staging });
-                        }
-                        Poll::Pending => {
-                            // Both are pending, restore state and return
-                            self.transition_to(SlotState::Switching { active, staging });
+                        Err(spmc::RecvError::Closed) => {
+                            tracing::info!(mid = %self.mid, "Streaming closed");
+                            self.transition_to(SlotState::Idle, None, None);
                             return Poll::Pending;
                         }
                     }
+                }
+
+                (SlotState::Switching, Some(active), Some(staging)) => {
+                    // Try staging first (looking for keyframe to complete switch).
+                    let res = staging.channel.poll_recv(cx);
+                    match res {
+                        Poll::Ready(ready) => match ready {
+                            Ok(pkt) => {
+                                self.switcher.stage(pkt);
+                                if self.switcher.ready_to_stream() {
+                                    tracing::info!(
+                                        mid = %self.mid,
+                                        from = ?active.rid,
+                                        to = ?staging.rid,
+                                        "Switch complete"
+                                    );
+                                    let staging = staging.clone();
+                                    self.transition_to(SlotState::Streaming, Some(staging), None);
+                                }
+                                continue;
+                            }
+                            Err(spmc::RecvError::Lagged(n)) => {
+                                tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
+                                let staging = staging.clone();
+                                self.transition_to(SlotState::Paused, None, Some(staging));
+                                return Poll::Pending;
+                            }
+                            Err(spmc::RecvError::Closed) => {
+                                tracing::warn!(mid = %self.mid, "Staging closed during switch");
+                                let active = active.clone();
+                                self.transition_to(SlotState::Streaming, Some(active), None);
+                                continue;
+                            }
+                        },
+                        Poll::Pending => {}
+                    }
+
+                    // Staging empty — also drain active to prevent ring overflow.
+                    match std::task::ready!(active.channel.poll_recv(cx)) {
+                        Ok(pkt) => {
+                            self.switcher.push(pkt);
+                            continue;
+                        }
+                        Err(spmc::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                mid = %self.mid, skipped = n,
+                                "Active lagged during switch, pausing"
+                            );
+                            let active = active.clone();
+                            self.transition_to(SlotState::Paused, None, Some(active));
+                            return Poll::Pending;
+                        }
+                        Err(spmc::RecvError::Closed) => {
+                            tracing::warn!(mid = %self.mid, "Active closed, forcing resume");
+                            let staging = staging.clone();
+                            self.transition_to(SlotState::Resuming, None, Some(staging));
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                state => unreachable!("unexpected state transition: {:?}", state),
+            }
+        }
+    }
+
+    fn do_switch_to(&mut self, mut receiver: SimulcastReceiver, force: bool) {
+        if !force && !self.is_switchable(&receiver) {
+            return;
+        }
+
+        let old_state = self.slot.state;
+        receiver.channel.rewind();
+        receiver.request_keyframe();
+        self.switching_started_at = Some(Instant::now());
+
+        match old_state {
+            SlotState::Idle | SlotState::Paused => {
+                self.transition_to(SlotState::Resuming, None, Some(receiver))
+            }
+            SlotState::Streaming => {
+                let active = self.slot.active.take();
+                self.transition_to(SlotState::Switching, active, Some(receiver))
+            }
+            SlotState::Resuming => self.transition_to(SlotState::Resuming, None, Some(receiver)),
+            SlotState::Switching => {
+                let active = self
+                    .slot
+                    .active
+                    .take()
+                    .expect("active to be defined on switching");
+                if active.rid == receiver.rid && active.meta.id == receiver.meta.id {
+                    tracing::info!("Cancelling switch, reverting to active stream");
+                    self.transition_to(SlotState::Streaming, Some(active), None);
+                } else {
+                    self.transition_to(SlotState::Switching, Some(active), Some(receiver));
+                }
+            }
+        };
+        self.switcher.clear();
+    }
+
+    fn transition_to(
+        &mut self,
+        new_state: SlotState,
+        active: Option<SimulcastReceiver>,
+        staging: Option<SimulcastReceiver>,
+    ) {
+        if let SlotState::Streaming = &new_state {
+            self.switching_started_at = None;
+        }
+
+        let was_playing = self.slot.state.is_playing();
+        let is_playing = new_state.is_playing();
+
+        if was_playing && !is_playing {
+            let current = self.slot.current();
+            if let Some(receiver) = current {
+                match &new_state {
+                    SlotState::Idle => tracing::info!(stream_id = %receiver, "stream stopped"),
+                    SlotState::Paused => {
+                        tracing::info!(stream_id = %receiver, "stream paused (congestion or lag)");
+                    }
+                    _ => {}
                 }
             }
         }
+
+        // Validate state transition is legal.
+        debug_assert!(
+            matches!(
+                (&self.slot.state, &new_state),
+                // Any state may stop or be paused.
+                (_, SlotState::Idle)
+                    | (_, SlotState::Paused)
+                    // Resuming: entered from idle, paused, or replaced while already
+                    // resuming/switching (active closed).
+                    | (
+                        SlotState::Idle
+                            | SlotState::Paused
+                            | SlotState::Resuming
+                            | SlotState::Switching,
+                        SlotState::Resuming,
+                    )
+                    // Streaming: switch or resume completed.
+                    | (SlotState::Resuming | SlotState::Switching, SlotState::Streaming)
+                    // Switching: new target while streaming or updating target while
+                    // already switching.
+                    | (SlotState::Streaming | SlotState::Switching, SlotState::Switching)
+            ),
+            "invalid state transition: {} → {}",
+            self.slot.state,
+            new_state
+        );
+
+        // Validate data invariants for the incoming state.
+        match &new_state {
+            SlotState::Idle => {
+                debug_assert!(
+                    active.is_none(),
+                    "Idle state must have no active receiver, got Some"
+                );
+                debug_assert!(
+                    staging.is_none(),
+                    "Idle state must have no staging receiver, got Some"
+                );
+            }
+            SlotState::Paused => {
+                debug_assert!(
+                    active.is_none(),
+                    "Paused state must have no active receiver, got Some"
+                );
+                debug_assert!(
+                    staging.is_some(),
+                    "Paused state must have a staging receiver, got None"
+                );
+            }
+            SlotState::Resuming => {
+                debug_assert!(
+                    active.is_none(),
+                    "Resuming state must have no active receiver, got Some"
+                );
+                debug_assert!(
+                    staging.is_some(),
+                    "Resuming state must have a staging receiver, got None"
+                );
+            }
+            SlotState::Streaming => {
+                debug_assert!(
+                    active.is_some(),
+                    "Streaming state must have an active receiver, got None"
+                );
+                debug_assert!(
+                    staging.is_none(),
+                    "Streaming state must have no staging receiver, got Some"
+                );
+            }
+            SlotState::Switching => {
+                debug_assert!(
+                    active.is_some(),
+                    "Switching state must have an active receiver, got None"
+                );
+                debug_assert!(
+                    staging.is_some(),
+                    "Switching state must have a staging receiver, got None"
+                );
+            }
+        }
+
+        self.slot.state = new_state;
+        self.slot.active = active;
+        self.slot.staging = staging;
     }
 }

@@ -6,9 +6,6 @@ use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
 use crate::track::TrackReceiver;
-use futures_lite::Stream;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
@@ -91,39 +88,21 @@ impl DownstreamAllocator {
         self.update_allocations(bwe);
     }
 
-    pub fn poll_fast(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
+    /// Await the next outbound RTP packet, fairly alternating between audio and video.
+    pub async fn next(&mut self) -> (Mid, RtpPacket) {
+        // Alternate priority each call so neither stream starves the other.
         if self.yield_audio {
-            // Try video first
-            if let Poll::Ready(res) = self.video.poll_fast(cx) {
-                self.yield_audio = false;
-                return Poll::Ready(res);
-            }
-            // Fallback to audio if video is pending
-            if let Poll::Ready(res) = self.audio.poll_next(cx) {
-                self.yield_audio = true;
-                return Poll::Ready(res);
+            tokio::select! {
+                biased;
+                pkt = self.video.next() => { self.yield_audio = false; pkt }
+                pkt = self.audio.next() => { self.yield_audio = true;  pkt }
             }
         } else {
-            // Try audio first
-            if let Poll::Ready(res) = self.audio.poll_next(cx) {
-                self.yield_audio = true;
-                return Poll::Ready(res);
-            }
-            // Fallback to video if audio is pending
-            if let Poll::Ready(res) = self.video.poll_fast(cx) {
-                self.yield_audio = false;
-                return Poll::Ready(res);
+            tokio::select! {
+                biased;
+                pkt = self.audio.next() => { self.yield_audio = true;  pkt }
+                pkt = self.video.next() => { self.yield_audio = false; pkt }
             }
         }
-
-        Poll::Pending
-    }
-}
-
-impl Stream for DownstreamAllocator {
-    type Item = (Mid, RtpPacket);
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().poll_fast(cx)
     }
 }

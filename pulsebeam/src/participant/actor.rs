@@ -122,29 +122,29 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
             needs_poll = true;
             tokio::select! {
-                biased;
-                // Priority 1: Egress Work
-                // TODO: consolidate pollings in core
+                // Priority 1: Keyframe requests from upstream
                 _ = self.core.upstream.notified() => {
                     let now = Instant::now();
-                    // Collect first to release the borrow on upstream before handle_keyframe_request
-                    // borrows all of core.  Allocations here are rare (~2 Hz) and negligible.
                     let reqs: Vec<_> = self.core.upstream.drain_keyframe_requests(now).collect();
                     for req in reqs {
                         self.core.handle_keyframe_request(req);
                     }
                 }
-                Some((meta, pkt)) = self.core.downstream.next() => {
-                    self.core.handle_forward_rtp(meta, pkt);
-                },
 
-                // Priority 2: Ingress Work
+                // Priority 2: Ingress — incoming network packets drive the RTC state machine.
+                // Must be above egress; otherwise a fully-loaded downstream starves the
+                // ingress path and the RTC engine never processes NACKs / ICE / DTLS.
                 Ok(batch) = gateway_rx.recv() => {
                     needs_poll = false;
                     maybe_deadline = self.core.handle_udp_packet_batch(batch, now);
                 },
 
-                // Priority 3: Control Messages
+                // Priority 3: Egress — only forward downstream RTP when ingress is empty.
+                (meta, pkt) = self.core.downstream.next() => {
+                    self.core.handle_forward_rtp(meta, pkt);
+                },
+
+                // Priority 4: Control Messages
                 Some(msg) = ctx.sys_rx.recv() => {
                     self.handle_system_message_rx(msg);
                 }
@@ -152,7 +152,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                     self.handle_control_message_rx(msg);
                 }
 
-                // Priority 4: Background tasks
+                // Priority 5: Background tasks
                 _ = &mut sleep => {
                     self.core.handle_tick();
                 },
