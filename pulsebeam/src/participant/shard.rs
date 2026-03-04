@@ -16,7 +16,8 @@
 //! packet the O(1) atomic OR sets the subscriber's slot bit and wakes the
 //! shard waker exactly once regardless of how many packets are buffered.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -204,6 +205,10 @@ pub struct RoomShard {
     slots: Box<[Option<LiveSlot>; 64]>,
     /// Bitmask of occupied slots (bit i <=> slots[i].is_some()).
     occupied: u64,
+    /// Min-heap of participant deadlines encoded as Reverse(max-heap tuple).
+    deadline_heap: BinaryHeap<Reverse<(Instant, u8, u64)>>,
+    /// Per-slot generation used to invalidate stale heap entries.
+    deadline_generation: [u64; 64],
     room_handle: room::RoomHandle,
 }
 
@@ -223,9 +228,51 @@ impl RoomShard {
             rx,
             slots: Box::new(std::array::from_fn(|_| None)),
             occupied: 0,
+            deadline_heap: BinaryHeap::new(),
+            deadline_generation: [0; 64],
             room_handle,
         };
         (shard, handle)
+    }
+
+    fn schedule_deadline(&mut self, idx: u8, deadline: Instant) {
+        let i = idx as usize;
+        self.deadline_generation[i] = self.deadline_generation[i].wrapping_add(1);
+        let generation = self.deadline_generation[i];
+        self.deadline_heap
+            .push(Reverse((deadline, idx, generation)));
+    }
+
+    fn schedule_soon(&mut self, idx: u8) {
+        self.schedule_deadline(idx, Instant::now() + MIN_QUANTA);
+    }
+
+    fn next_valid_deadline(&mut self) -> Option<Instant> {
+        loop {
+            let Reverse((deadline, idx, generation)) = *self.deadline_heap.peek()?;
+            let i = idx as usize;
+            let occupied = (self.occupied & (1u64 << i)) != 0;
+            if !occupied || self.deadline_generation[i] != generation {
+                self.deadline_heap.pop();
+                continue;
+            }
+            return Some(deadline);
+        }
+    }
+
+    fn collect_due_slots(&mut self, now: Instant, out: &mut Vec<u8>) {
+        while let Some(Reverse((deadline, idx, generation))) = self.deadline_heap.peek().copied() {
+            if deadline > now {
+                break;
+            }
+            self.deadline_heap.pop();
+            let i = idx as usize;
+            let occupied = (self.occupied & (1u64 << i)) != 0;
+            if !occupied || self.deadline_generation[i] != generation {
+                continue;
+            }
+            out.push(idx);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -258,6 +305,7 @@ impl RoomShard {
             deadline: Some(Instant::now() + MIN_QUANTA),
             gateway: slot.gateway,
         });
+        self.schedule_soon(idx as u8);
         Some(idx as u8)
     }
 
@@ -265,6 +313,7 @@ impl RoomShard {
         let i = idx as usize;
         if let Some(mut slot) = self.slots[i].take() {
             self.occupied &= !(1u64 << i);
+            self.deadline_generation[i] = self.deadline_generation[i].wrapping_add(1);
             let ufrag = std::mem::take(&mut slot.ufrag);
             let mut gateway = slot.gateway.clone();
             let mut room = self.room_handle.clone();
@@ -334,6 +383,7 @@ impl RoomShard {
                 while ready_bits != 0 {
                     let idx = ready_bits.trailing_zeros() as usize;
                     ready_bits &= ready_bits - 1;
+                    let mut reschedule_soon = false;
                     if let Some(slot) = &mut self.slots[idx] {
                         let mut produced = false;
                         while let Some((mid, pkt)) = slot.core.downstream.try_next() {
@@ -347,24 +397,29 @@ impl RoomShard {
                             // active).  Force an immediate allocation re-check so the slot
                             // transitions Paused → Resuming without waiting for poll_slow.
                             slot.core.downstream.dirty_allocation = true;
+                            reschedule_soon = true;
                         }
                         slot.flush_egress();
+                    }
+                    if reschedule_soon {
+                        self.schedule_soon(idx as u8);
                     }
                 }
             }
 
             // ---- Phase 3: Timer phase ----
             let now = Instant::now();
-            let mut next_deadline: Option<Instant> = None;
+            let mut due_slots = Vec::new();
+            self.collect_due_slots(now, &mut due_slots);
             let mut to_free: Vec<u8> = Vec::new();
 
-            for i in 0..Self::MAX_PARTICIPANTS {
-                if self.occupied & (1u64 << i) == 0 {
-                    continue;
-                }
+            for idx in due_slots {
+                let i = idx as usize;
                 let Some(slot) = &mut self.slots[i] else {
                     continue;
                 };
+                let mut next_deadline_for_slot: Option<Instant> = None;
+                let mut should_free = false;
 
                 // Drain keyframe requests. `take_pending` is O(1) (atomic load)
                 // when nothing is pending so this is always cheap.
@@ -396,16 +451,19 @@ impl RoomShard {
 
                 match deadline {
                     None => {
-                        to_free.push(i as u8);
+                        should_free = true;
                     }
                     Some(d) => {
                         let adjusted = d.max(now + MIN_QUANTA);
                         slot.deadline = Some(adjusted);
-                        next_deadline = Some(match next_deadline {
-                            None => adjusted,
-                            Some(cur) => cur.min(adjusted),
-                        });
+                        next_deadline_for_slot = Some(adjusted);
                     }
+                }
+
+                if should_free {
+                    to_free.push(idx);
+                } else if let Some(adjusted) = next_deadline_for_slot {
+                    self.schedule_deadline(idx, adjusted);
                 }
             }
 
@@ -414,7 +472,9 @@ impl RoomShard {
             }
 
             // ---- Phase 4: Sleep until next event ----
-            let sleep_until = next_deadline.unwrap_or(now + Duration::from_secs(30));
+            let sleep_until = self
+                .next_valid_deadline()
+                .unwrap_or(now + Duration::from_secs(30));
 
             tokio::select! {
                 biased;
@@ -442,12 +502,18 @@ impl RoomShard {
         match msg {
             ShardMessage::IngressBatch(slot_idx, batch) => {
                 let i = slot_idx as usize;
+                let mut new_deadline = None;
                 if let Some(slot) = &mut self.slots[i] {
                     let now = Instant::now();
                     if let Some(d) = slot.core.handle_udp_packet_batch(batch, now) {
-                        slot.deadline = Some(d);
+                        let adjusted = d.max(now + MIN_QUANTA);
+                        slot.deadline = Some(adjusted);
+                        new_deadline = Some(adjusted);
                     }
                     slot.flush_egress();
+                }
+                if let Some(deadline) = new_deadline {
+                    self.schedule_deadline(slot_idx, deadline);
                 }
             }
             ShardMessage::AddParticipant(slot) => {
@@ -497,12 +563,17 @@ impl RoomShard {
     where
         F: FnMut(&mut ParticipantCore),
     {
+        let mut touched = Vec::new();
         for i in 0..Self::MAX_PARTICIPANTS {
             if self.occupied & (1u64 << i) != 0 {
                 if let Some(slot) = &mut self.slots[i] {
                     f(&mut slot.core);
+                    touched.push(i as u8);
                 }
             }
+        }
+        for idx in touched {
+            self.schedule_soon(idx);
         }
     }
 }

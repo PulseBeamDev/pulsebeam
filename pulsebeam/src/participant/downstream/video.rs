@@ -676,10 +676,8 @@ impl SlotDriver {
 
     /// Try to produce the next outbound packet without suspending.
     ///
-    /// Hot path: calls `spmc::Receiver::try_recv` first — a bare ring read with
-    /// zero coop/listener/mutex overhead.  `poll_recv` (which registers an
-    /// event-listener) is called only once when the ring is genuinely empty, so
-    /// the waker cost is paid once per "dry spell", not once per packet.
+    /// Hot path: uses `spmc::Receiver::try_recv` only — bare ring reads with
+    /// zero listener/waker registration while channels are empty.
     pub fn poll_packet(&mut self) -> Poll<(Mid, RtpPacket)> {
         loop {
             // Drain the switcher output first — always cheap.
@@ -701,8 +699,8 @@ impl SlotDriver {
                 }
 
                 (SlotState::Resuming, _, Some(staging)) => {
-                    match std::task::ready!(staging.channel.poll_recv()) {
-                        Ok(pkt) => {
+                    match staging.channel.try_recv() {
+                        Some(Ok(pkt)) => {
                             self.switcher.stage(pkt);
                             if self.switcher.ready_to_stream() {
                                 tracing::info!(mid = %self.mid, rid = ?staging.rid, "Resuming complete");
@@ -710,78 +708,77 @@ impl SlotDriver {
                                 self.transition_to(SlotState::Streaming, Some(staging), None);
                             }
                         }
-                        Err(spmc::RecvError::Lagged(n)) => {
+                        Some(Err(spmc::RecvError::Lagged(n))) => {
                             tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, keep going");
                         }
-                        Err(spmc::RecvError::Closed) => {
+                        Some(Err(spmc::RecvError::Closed)) => {
                             tracing::warn!(mid = %self.mid, "Resuming closed");
                             self.transition_to(SlotState::Idle, None, None);
                             return Poll::Pending;
                         }
+                        None => return Poll::Pending,
                     }
                 }
 
                 (SlotState::Streaming, Some(active), _) => {
-                    match std::task::ready!(active.channel.poll_recv()) {
-                        Ok(pkt) => {
+                    match active.channel.try_recv() {
+                        Some(Ok(pkt)) => {
                             self.switcher.push(pkt);
                         }
-                        Err(spmc::RecvError::Lagged(n)) => {
+                        Some(Err(spmc::RecvError::Lagged(n))) => {
                             tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
                             let active = active.clone();
                             self.transition_to(SlotState::Paused, None, Some(active));
                             return Poll::Pending;
                         }
-                        Err(spmc::RecvError::Closed) => {
+                        Some(Err(spmc::RecvError::Closed)) => {
                             tracing::info!(mid = %self.mid, "Streaming closed");
                             self.transition_to(SlotState::Idle, None, None);
                             return Poll::Pending;
                         }
+                        None => return Poll::Pending,
                     }
                 }
 
                 (SlotState::Switching, Some(active), Some(staging)) => {
                     // Try staging first (looking for keyframe to complete switch).
-                    let res = staging.channel.poll_recv();
-                    match res {
-                        Poll::Ready(ready) => match ready {
-                            Ok(pkt) => {
-                                self.switcher.stage(pkt);
-                                if self.switcher.ready_to_stream() {
-                                    tracing::info!(
-                                        mid = %self.mid,
-                                        from = ?active.rid,
-                                        to = ?staging.rid,
-                                        "Switch complete"
-                                    );
-                                    let staging = staging.clone();
-                                    self.transition_to(SlotState::Streaming, Some(staging), None);
-                                }
-                                continue;
-                            }
-                            Err(spmc::RecvError::Lagged(n)) => {
-                                tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
+                    match staging.channel.try_recv() {
+                        Some(Ok(pkt)) => {
+                            self.switcher.stage(pkt);
+                            if self.switcher.ready_to_stream() {
+                                tracing::info!(
+                                    mid = %self.mid,
+                                    from = ?active.rid,
+                                    to = ?staging.rid,
+                                    "Switch complete"
+                                );
                                 let staging = staging.clone();
-                                self.transition_to(SlotState::Paused, None, Some(staging));
-                                return Poll::Pending;
+                                self.transition_to(SlotState::Streaming, Some(staging), None);
                             }
-                            Err(spmc::RecvError::Closed) => {
-                                tracing::warn!(mid = %self.mid, "Staging closed during switch");
-                                let active = active.clone();
-                                self.transition_to(SlotState::Streaming, Some(active), None);
-                                continue;
-                            }
-                        },
-                        Poll::Pending => {}
+                            continue;
+                        }
+                        Some(Err(spmc::RecvError::Lagged(n))) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
+                            let staging = staging.clone();
+                            self.transition_to(SlotState::Paused, None, Some(staging));
+                            return Poll::Pending;
+                        }
+                        Some(Err(spmc::RecvError::Closed)) => {
+                            tracing::warn!(mid = %self.mid, "Staging closed during switch");
+                            let active = active.clone();
+                            self.transition_to(SlotState::Streaming, Some(active), None);
+                            continue;
+                        }
+                        None => {}
                     }
 
                     // Staging empty — also drain active to prevent ring overflow.
-                    match std::task::ready!(active.channel.poll_recv()) {
-                        Ok(pkt) => {
+                    match active.channel.try_recv() {
+                        Some(Ok(pkt)) => {
                             self.switcher.push(pkt);
                             continue;
                         }
-                        Err(spmc::RecvError::Lagged(n)) => {
+                        Some(Err(spmc::RecvError::Lagged(n))) => {
                             tracing::warn!(
                                 mid = %self.mid, skipped = n,
                                 "Active lagged during switch, pausing"
@@ -790,12 +787,13 @@ impl SlotDriver {
                             self.transition_to(SlotState::Paused, None, Some(active));
                             return Poll::Pending;
                         }
-                        Err(spmc::RecvError::Closed) => {
+                        Some(Err(spmc::RecvError::Closed)) => {
                             tracing::warn!(mid = %self.mid, "Active closed, forcing resume");
                             let staging = staging.clone();
                             self.transition_to(SlotState::Resuming, None, Some(staging));
                             return Poll::Pending;
                         }
+                        None => return Poll::Pending,
                     }
                 }
                 state => unreachable!("unexpected state transition: {:?}", state),

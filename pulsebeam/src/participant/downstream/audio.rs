@@ -50,7 +50,6 @@ impl AudioAllocator {
         if self.inputs.is_empty() || self.slots.is_empty() {
             return None;
         }
-        let now = Instant::now();
         let len = self.inputs.len();
         for i in 0..len {
             let idx = (self.last_polled + i) % len;
@@ -58,7 +57,7 @@ impl AudioAllocator {
                 Some(Ok(packet)) => {
                     let track_id = self.inputs[idx].track_id;
                     self.last_polled = (idx + 1) % len;
-                    return self.dispatch(track_id, packet, now);
+                    return self.dispatch(track_id, packet);
                 }
                 Some(Err(spmc::RecvError::Lagged(n))) => {
                     tracing::warn!(track_id = %self.inputs[idx].track_id, skipped = n, "audio stream lagging");
@@ -103,13 +102,14 @@ impl AudioAllocator {
         self.slots.push(AudioSlot::new(mid));
     }
 
-    fn dispatch(&mut self, track_id: TrackId, packet: RtpPacket, now: Instant) -> Option<(Mid, RtpPacket)> {
+    fn dispatch(&mut self, track_id: TrackId, packet: RtpPacket) -> Option<(Mid, RtpPacket)> {
         if let Some(slot) = self.slots.iter_mut().find(|s| s.current_track_id.as_ref() == Some(&track_id)) {
             return Some(slot.process(&track_id, packet));
         }
         if let Some(slot) = self.slots.iter_mut().find(|s| s.current_track_id.is_none()) {
             return Some(slot.process(&track_id, packet));
         }
+        let now = Instant::now();
         if let Some(slot) = self.slots.iter_mut().find(|s| s.can_evict(now)) {
             return Some(slot.process(&track_id, packet));
         }
