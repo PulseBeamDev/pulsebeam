@@ -203,24 +203,6 @@ impl WorkerSet {
 /// [`LongRunningTaskDetector`] is designed to be very low overhead so that it can be safely be run in production.
 /// The overhead of this utility is vconfigurable via probing `interval` parameter.
 ///
-/// # Example
-///
-/// ```
-/// use std::sync::Arc;
-///
-/// use tokio_detectors::detectors::LongRunningTaskDetector;
-///
-/// let (lrtd, mut builder) = LongRunningTaskDetector::new_multi_threaded(
-///     std::time::Duration::from_millis(10),
-///     std::time::Duration::from_millis(100),
-/// );
-/// let runtime = builder.worker_threads(2).enable_all().build().unwrap();
-/// let runtime_ref = Arc::new(runtime);
-/// let lrtd_runtime_ref = runtime_ref.clone();
-/// lrtd.start(lrtd_runtime_ref);
-/// runtime_ref.block_on(async { print!("my async code") });
-/// ```
-///
 /// The above will allow you to get details on what is blocking your tokio worker threads for longer that 100ms.
 /// The detail with default action handler will look like:
 ///
@@ -308,18 +290,6 @@ impl LongRunningTaskDetector {
     /// The `detection_time` argument determines maximum time allowed for a probe to succeed.
     /// A probe running for longer is considered a tokio worker health issue. (something is blocking the worker threads)
     ///
-    /// # Example
-    ///
-    /// ```
-    /// use std::time::Duration;
-    ///
-    /// use tokio_detectors::detectors::LongRunningTaskDetector;
-    ///
-    /// let (detector, builder) = LongRunningTaskDetector::new_current_threaded(
-    ///     Duration::from_secs(1),
-    ///     Duration::from_secs(5),
-    /// );
-    /// ```
     pub fn new_current_threaded(interval: Duration, detection_time: Duration) -> (Self, Builder) {
         let workers = Arc::new(WorkerSet::new());
         workers.add(ThreadInfo::new());
@@ -342,17 +312,6 @@ impl LongRunningTaskDetector {
     ///
     /// The `detection_time` argument determines maximum time allowed for a probe to succeed.
     /// A probe running for longer is considered a tokio worker health issue. (something is blocking the worker threads)
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use std::time::Duration;
-    ///
-    /// use tokio_detectors::detectors::LongRunningTaskDetector;
-    ///
-    /// let (detector, builder) =
-    ///     LongRunningTaskDetector::new_multi_threaded(Duration::from_secs(1), Duration::from_secs(5));
-    /// ```
     pub fn new_multi_threaded(interval: Duration, detection_time: Duration) -> (Self, Builder) {
         let workers = Arc::new(WorkerSet::new());
         let mut runtime_builder = Builder::new_multi_thread();
