@@ -42,10 +42,7 @@ impl actor::MessageSet for ParticipantMessageSet {
 }
 
 pub struct ParticipantActor {
-    // Boxed to keep ParticipantCore off the async state machine stack. The actor::run()
-    // future stores `a: ParticipantActor` inline while also holding `a.run()` as __awaitee,
-    // so every unboxed field adds directly to the task's memory footprint.
-    core: Box<ParticipantCore>,
+    core: ParticipantCore,
     gateway: GatewayWorkerHandle,
     udp_egress: UnifiedSocketWriter,
     tcp_egress: UnifiedSocketWriter,
@@ -184,13 +181,13 @@ impl ParticipantActor {
     ) -> Self {
         let udp_batcher = Batcher::with_capacity(udp_egress.max_gso_segments());
         let tcp_batcher = Batcher::with_capacity(tcp_egress.max_gso_segments());
-        let core = Box::new(ParticipantCore::new(
+        let core = ParticipantCore::new(
             manual_sub,
             participant_id,
             rtc,
             udp_batcher,
             tcp_batcher,
-        ));
+        );
         Self {
             gateway: gateway_handle,
             core,
