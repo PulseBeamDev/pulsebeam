@@ -550,10 +550,6 @@ mod internal {
                 controller::ControllerActor::monitor().intervals(),
             ),
             ("room", room::RoomActor::monitor().intervals()),
-            (
-                "participant",
-                participant::ParticipantActor::monitor().intervals(),
-            ),
         ];
 
         let mut interval = tokio::time::interval(Duration::from_secs(5));

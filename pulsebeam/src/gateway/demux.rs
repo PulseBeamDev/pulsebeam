@@ -1,3 +1,4 @@
+use crate::participant::ShardRouteHandle;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UnifiedSocketReader;
 
@@ -5,7 +6,7 @@ use crate::gateway::ice;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-pub type ParticipantHandle = pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>;
+pub type ParticipantHandle = ShardRouteHandle;
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///
@@ -43,7 +44,7 @@ impl Demuxer {
     }
 
     /// Registers a participant with their ICE username fragment.
-    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_handle: ParticipantHandle) {
+    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_handle: ShardRouteHandle) {
         let boxed_ufrag = ufrag.to_vec().into_boxed_slice();
         self.ufrag_map.insert(boxed_ufrag, participant_handle);
     }
@@ -83,7 +84,7 @@ impl Demuxer {
             return false;
         };
 
-        if let Err(_) = handle.try_send(batch) {
+        if handle.try_send(batch).is_err() {
             // Handle is closed! Clean up everything related to this participant.
             if let Some(ufrag) = self.addr_to_ufrag.get(&src).cloned() {
                 tracing::info!("Participant handle closed, cleaning up ufrag: {:?}", ufrag);

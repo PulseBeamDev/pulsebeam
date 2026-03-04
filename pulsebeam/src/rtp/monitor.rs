@@ -149,6 +149,15 @@ impl StreamMonitor {
         self.last_packet_at = packet.arrival_ts;
         self.bwe.record(size_bytes);
 
+        // Eagerly clear the inactive flag on the first (or any) incoming packet
+        // so that downstream allocation logic can react immediately without
+        // waiting up to 200 ms for the next poll_slow / monitor.poll() call.
+        // poll() will re-evaluate the flag periodically and may set it back to
+        // true if the stream stops sending.
+        self.shared_state
+            .inactive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
         self.delta_delta.update(packet);
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             let ext = &packet.raw_header.ext_vals;

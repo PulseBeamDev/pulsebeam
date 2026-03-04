@@ -7,10 +7,7 @@ use tokio::task::JoinSet;
 
 #[derive(Clone)]
 pub enum GatewayControlMessage {
-    AddParticipant(
-        String,
-        pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>,
-    ),
+    AddParticipant(String, crate::participant::ShardRouteHandle),
     RemoveParticipant(String),
 }
 

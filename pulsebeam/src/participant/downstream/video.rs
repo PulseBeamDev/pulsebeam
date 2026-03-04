@@ -1,10 +1,12 @@
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
+use pulsebeam_runtime::sync::bit_signal::BitSignal;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, Mid};
@@ -19,6 +21,7 @@ pub struct VideoAllocator {
     drivers: Vec<SlotDriver>,
     ticks: u32,
     last_polled: usize,
+    shard_signal: Option<(Arc<BitSignal>, u64)>,
 }
 
 impl VideoAllocator {
@@ -29,7 +32,34 @@ impl VideoAllocator {
             drivers: Vec::new(),
             ticks: 0,
             last_polled: 0,
+            shard_signal: None,
         }
+    }
+
+    /// Register a shard's BitSignal on every current and future slot driver so
+    /// the shard task is woken only when a slot can actually produce packets.
+    pub fn attach_shard_signal(&mut self, signal: Arc<BitSignal>, bits: u64) {
+        for driver in &mut self.drivers {
+            driver.set_shard_signal(signal.clone(), bits);
+        }
+        self.shard_signal = Some((signal, bits));
+    }
+
+    /// Non-blocking round-robin drain across all slot drivers.
+    /// Returns the first ready packet, advancing `last_polled` for fairness.
+    pub fn try_next(&mut self) -> Option<(Mid, RtpPacket)> {
+        let len = self.drivers.len();
+        if len == 0 {
+            return None;
+        }
+        for i in 0..len {
+            let idx = (self.last_polled + i) % len;
+            if let Some(item) = self.drivers[idx].try_packet() {
+                self.last_polled = (idx + 1) % len;
+                return Some(item);
+            }
+        }
+        None
     }
 
     pub fn slot_count(&self) -> usize {
@@ -129,7 +159,11 @@ impl VideoAllocator {
     }
 
     pub fn add_slot(&mut self, mid: Mid) {
-        self.drivers.push(SlotDriver::new(mid));
+        let mut driver = SlotDriver::new(mid);
+        if let Some((signal, bits)) = &self.shard_signal {
+            driver.set_shard_signal(signal.clone(), *bits);
+        }
+        self.drivers.push(driver);
         self.rebalance();
     }
 
@@ -264,15 +298,13 @@ impl VideoAllocator {
                         }
                     }
                 } else {
-                    let cost = plan.target_receiver.state.bitrate_bps();
-                    plan.paused = true;
+                    // No lower quality layer exists for this stream.
+                    // Pausing would require a full keyframe round-trip to recover, and
+                    // single-layer streams should rely on TWCC/BWE rather than SFU-side
+                    // pausing to handle transient bitrate spikes (e.g. keyframe bursts).
+                    // Commit the plan without pausing and accept the temporary budget overrun.
                     plan.committed = true;
-                    plan.current_bitrate = 0.0;
-                    budget += cost;
                     resolved = true;
-                    if budget >= -tolerance {
-                        break;
-                    }
                 }
             }
             if !resolved {
@@ -382,25 +414,6 @@ impl VideoAllocator {
         }
     }
 
-    pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        std::future::poll_fn(|cx| {
-            let len = self.drivers.len();
-            if len == 0 {
-                return Poll::Pending;
-            }
-
-            for i in 0..len {
-                let idx = (self.last_polled + i) % len;
-                if let Poll::Ready(item) = self.drivers[idx].poll_packet(cx) {
-                    self.last_polled = (idx + 1) % len;
-                    return Poll::Ready(item);
-                }
-            }
-
-            Poll::Pending
-        })
-        .await
-    }
 }
 
 #[derive(Debug)]
@@ -512,6 +525,7 @@ struct SlotDriver {
     switcher: Switcher,
     switching_started_at: Option<Instant>,
     keyframe_retries: usize,
+    shard_signal: Option<(Arc<BitSignal>, u64)>,
 }
 
 impl SlotDriver {
@@ -523,6 +537,65 @@ impl SlotDriver {
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             switching_started_at: None,
             keyframe_retries: 0,
+            shard_signal: None,
+        }
+    }
+
+    /// Attach/replace the shard signal. Detaches from any previously-attached
+    /// receivers before re-attaching to the currently active ones.
+    pub fn set_shard_signal(&mut self, signal: Arc<BitSignal>, bits: u64) {
+        // Detach old signal from current receivers.
+        if let Some((old_signal, old_bits)) = &self.shard_signal {
+            if let Some(r) = &self.slot.active {
+                r.channel.detach_signal(old_signal, *old_bits);
+            }
+            if let Some(r) = &self.slot.staging {
+                r.channel.detach_signal(old_signal, *old_bits);
+            }
+        }
+        self.shard_signal = Some((signal, bits));
+        // Attach to receivers that can produce packets in the current state.
+        if let Some((signal, bits)) = &self.shard_signal {
+            match self.slot.state {
+                SlotState::Resuming => {
+                    if let Some(r) = &self.slot.staging {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                SlotState::Streaming => {
+                    if let Some(r) = &self.slot.active {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                SlotState::Switching => {
+                    if let Some(r) = &self.slot.active {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                    if let Some(r) = &self.slot.staging {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                // Paused: attach to staging so the shard wakes as soon as the
+                // upstream stream's first packet lands in the ring.  The wake is
+                // "spurious" in that try_packet returns None, but it lets us
+                // call update_allocations immediately instead of waiting 200 ms
+                // for poll_slow to notice the stream has become active.
+                SlotState::Paused => {
+                    if let Some(r) = &self.slot.staging {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                // Idle: no receiver to attach.
+                SlotState::Idle => {}
+            }
+        }
+    }
+
+    /// Non-blocking packet poll.
+    pub fn try_packet(&mut self) -> Option<(Mid, RtpPacket)> {
+        match self.poll_packet() {
+            Poll::Ready(item) => Some(item),
+            Poll::Pending => None,
         }
     }
 
@@ -607,7 +680,7 @@ impl SlotDriver {
     /// zero coop/listener/mutex overhead.  `poll_recv` (which registers an
     /// event-listener) is called only once when the ring is genuinely empty, so
     /// the waker cost is paid once per "dry spell", not once per packet.
-    pub fn poll_packet(&mut self, cx: &mut Context<'_>) -> Poll<(Mid, RtpPacket)> {
+    pub fn poll_packet(&mut self) -> Poll<(Mid, RtpPacket)> {
         loop {
             // Drain the switcher output first — always cheap.
             if let Some(pkt) = self.switcher.pop() {
@@ -628,7 +701,7 @@ impl SlotDriver {
                 }
 
                 (SlotState::Resuming, _, Some(staging)) => {
-                    match std::task::ready!(staging.channel.poll_recv(cx)) {
+                    match std::task::ready!(staging.channel.poll_recv()) {
                         Ok(pkt) => {
                             self.switcher.stage(pkt);
                             if self.switcher.ready_to_stream() {
@@ -649,7 +722,7 @@ impl SlotDriver {
                 }
 
                 (SlotState::Streaming, Some(active), _) => {
-                    match std::task::ready!(active.channel.poll_recv(cx)) {
+                    match std::task::ready!(active.channel.poll_recv()) {
                         Ok(pkt) => {
                             self.switcher.push(pkt);
                         }
@@ -669,7 +742,7 @@ impl SlotDriver {
 
                 (SlotState::Switching, Some(active), Some(staging)) => {
                     // Try staging first (looking for keyframe to complete switch).
-                    let res = staging.channel.poll_recv(cx);
+                    let res = staging.channel.poll_recv();
                     match res {
                         Poll::Ready(ready) => match ready {
                             Ok(pkt) => {
@@ -703,7 +776,7 @@ impl SlotDriver {
                     }
 
                     // Staging empty — also drain active to prevent ring overflow.
-                    match std::task::ready!(active.channel.poll_recv(cx)) {
+                    match std::task::ready!(active.channel.poll_recv()) {
                         Ok(pkt) => {
                             self.switcher.push(pkt);
                             continue;
@@ -873,8 +946,54 @@ impl SlotDriver {
             }
         }
 
+        // Detach signal from receivers about to be replaced.
+        if let Some((signal, bits)) = &self.shard_signal {
+            if let Some(r) = &self.slot.active {
+                r.channel.detach_signal(signal, *bits);
+            }
+            if let Some(r) = &self.slot.staging {
+                r.channel.detach_signal(signal, *bits);
+            }
+        }
+
         self.slot.state = new_state;
         self.slot.active = active;
         self.slot.staging = staging;
+
+        // Attach signal to new receivers only for states that produce packets.
+        if let Some((signal, bits)) = &self.shard_signal {
+            match new_state {
+                SlotState::Resuming => {
+                    if let Some(r) = &self.slot.staging {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                SlotState::Streaming => {
+                    if let Some(r) = &self.slot.active {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                SlotState::Switching => {
+                    if let Some(r) = &self.slot.active {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                    if let Some(r) = &self.slot.staging {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                // Paused: attach to staging so the shard wakes as soon as the
+                // upstream stream's first packet lands in the ring.  The wake is
+                // "spurious" in that try_packet returns None, but it lets us
+                // call update_allocations immediately instead of waiting 200 ms
+                // for poll_slow to notice the stream has become active.
+                SlotState::Paused => {
+                    if let Some(r) = &self.slot.staging {
+                        r.channel.attach_signal(signal, *bits);
+                    }
+                }
+                // Idle: no receiver to attach.
+                SlotState::Idle => {}
+            }
+        }
     }
 }

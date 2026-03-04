@@ -315,7 +315,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
         // Shared atomic signal: receiver writes, poll-side reads.
         let signal = Arc::new(AtomicBool::new(false));
 
-        let stream_state = StreamState::new(true, bitrate);
+        let stream_state = StreamState::new(true, 0);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
 

@@ -6,6 +6,8 @@ use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
 use crate::track::TrackReceiver;
+use pulsebeam_runtime::sync::bit_signal::BitSignal;
+use std::sync::Arc;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
@@ -88,21 +90,37 @@ impl DownstreamAllocator {
         self.update_allocations(bwe);
     }
 
-    /// Await the next outbound RTP packet, fairly alternating between audio and video.
-    pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        // Alternate priority each call so neither stream starves the other.
+    /// Register a shard's BitSignal on all audio and video inputs/slots so
+    /// the shard task is woken as soon as any packet is ready to forward.
+    pub fn attach_shard_signal(&mut self, signal: Arc<BitSignal>, bits: u64) {
+        self.audio.attach_shard_signal(signal.clone(), bits);
+        self.video.attach_shard_signal(signal, bits);
+    }
+
+    /// Non-blocking drain: returns the first ready RTP packet across audio and
+    /// video without registering any wakers or allocating an EventListener.
+    /// Alternates priority via `yield_audio` for fairness.
+    pub fn try_next(&mut self) -> Option<(Mid, RtpPacket)> {
         if self.yield_audio {
-            tokio::select! {
-                biased;
-                pkt = self.video.next() => { self.yield_audio = false; pkt }
-                pkt = self.audio.next() => { self.yield_audio = true;  pkt }
+            if let Some(pkt) = self.video.try_next() {
+                self.yield_audio = false;
+                return Some(pkt);
+            }
+            if let Some(pkt) = self.audio.try_next() {
+                self.yield_audio = true;
+                return Some(pkt);
             }
         } else {
-            tokio::select! {
-                biased;
-                pkt = self.audio.next() => { self.yield_audio = true;  pkt }
-                pkt = self.video.next() => { self.yield_audio = false; pkt }
+            if let Some(pkt) = self.audio.try_next() {
+                self.yield_audio = true;
+                return Some(pkt);
+            }
+            if let Some(pkt) = self.video.try_next() {
+                self.yield_audio = false;
+                return Some(pkt);
             }
         }
+        None
     }
+
 }

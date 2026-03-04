@@ -18,7 +18,7 @@
 //! ```
 //! use std::sync::Arc;
 //!
-//! use tokio_detectors::detectors::LongRunningTaskDetector;
+//! use pulsebeam_runtime::rt::LongRunningTaskDetector;
 //!
 //! let (lrtd, mut builder) = LongRunningTaskDetector::new_multi_threaded(
 //!     std::time::Duration::from_millis(10),
