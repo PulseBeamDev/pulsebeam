@@ -383,26 +383,66 @@ impl RoomShard {
                 while ready_bits != 0 {
                     let idx = ready_bits.trailing_zeros() as usize;
                     ready_bits &= ready_bits - 1;
-                    let mut reschedule_soon = false;
+
+                    // Collect results outside the slot borrow so we can call
+                    // schedule_deadline / free_slot without a second mutable borrow.
+                    let mut produced = false;
+                    let mut poll_deadline: Option<Option<Instant>> = None; // None = didn't poll, Some(None) = dead
+                    let mut spawned_events: Vec<CoreEvent> = Vec::new();
+
                     if let Some(slot) = &mut self.slots[idx] {
-                        let mut produced = false;
                         while let Some((mid, pkt)) = slot.core.downstream.try_next() {
                             slot.core.handle_forward_rtp(mid, pkt);
                             did_work = true;
                             produced = true;
                         }
-                        if !produced {
+
+                        if produced {
+                            // Immediately pump the RTC engine so str0m's internal
+                            // write_rtp queue is drained to Output::Transmit right now,
+                            // instead of waiting up to 30 s for the next timer tick.
+                            let now = Instant::now();
+                            let deadline = slot.core.poll();
+                            if let Some(d) = deadline {
+                                let adjusted = d.max(now + MIN_QUANTA);
+                                slot.deadline = Some(adjusted);
+                                poll_deadline = Some(Some(adjusted));
+                            } else {
+                                poll_deadline = Some(None); // slot is dead
+                            }
+                            spawned_events.extend(slot.core.events.drain(..));
+                        } else {
                             // Signaled but no packet produced.  This happens when a Paused
                             // slot's upstream ring gets its first packet (stream became
                             // active).  Force an immediate allocation re-check so the slot
                             // transitions Paused → Resuming without waiting for poll_slow.
                             slot.core.downstream.dirty_allocation = true;
-                            reschedule_soon = true;
                         }
                         slot.flush_egress();
                     }
-                    if reschedule_soon {
-                        self.schedule_soon(idx as u8);
+
+                    // Propagate room events produced by the immediate poll above.
+                    for event in spawned_events {
+                        match event {
+                            CoreEvent::SpawnTrack(rx) => {
+                                let _ = self.room_handle.try_send(room::RoomMessage::PublishTrack(rx));
+                            }
+                        }
+                    }
+
+                    match poll_deadline {
+                        Some(Some(adjusted)) => {
+                            // Slot is alive; refresh its heap entry with the new deadline.
+                            self.schedule_deadline(idx as u8, adjusted);
+                        }
+                        Some(None) => {
+                            // Slot signalled its own death during the poll.
+                            self.free_slot(idx as u8);
+                        }
+                        None => {
+                            // No poll was run (no packets produced); kick allocation recheck.
+                            self.schedule_soon(idx as u8);
+                        }
                     }
                 }
             }
