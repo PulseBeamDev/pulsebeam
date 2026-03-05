@@ -1,49 +1,72 @@
+use diatomic_waker::{WakeSink, WakeSource};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Waker};
 
-/// A zero-allocation signaling primitive for up to 64 concurrent consumers.
+/// A lock-free signaling primitive for up to 64 concurrent slots in a [`TaskGroup`].
+///
+/// # Design
+///
+/// Producers call [`notify`] / [`notify_mask`] to set bits and wake the group task.
+/// The group task owns the paired [`WakeSink`] (created via [`new_pair`]) and uses it
+/// to register its waker without any mutex or spinlock.
+///
+/// [`diatomic_waker`] replaces the old `Mutex<Option<Waker>>`: registration and
+/// notification are now a pure lock-free state-machine, eliminating the lock on the
+/// hot waker path.
+///
+/// [`notify`]: BitSignal::notify
+/// [`notify_mask`]: BitSignal::notify_mask
+/// [`new_pair`]: BitSignal::new_pair
 pub struct BitSignal {
-    /// Bitset where each bit represents a task index that needs polling.
+    /// Bitset: bit `i` means slot `i` has pending work.
     pending: AtomicU64,
-    /// Shared waker for the group executor.
-    group_waker: Mutex<Option<Waker>>,
+    /// Lock-free waker notification — replaces `Mutex<Option<Waker>>`.
+    wake_src: WakeSource,
 }
 
 impl BitSignal {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            pending: AtomicU64::new(0),
-            group_waker: Mutex::new(None),
-        })
+    /// Creates a `BitSignal` (cloned into producers) and the paired `WakeSink`
+    /// (owned exclusively by the [`TaskGroup`] consumer).
+    pub fn new_pair() -> (Arc<Self>, WakeSink) {
+        let wake_sink = WakeSink::new();
+        let wake_src = wake_sink.source();
+        (
+            Arc::new(Self {
+                pending: AtomicU64::new(0),
+                wake_src,
+            }),
+            wake_sink,
+        )
     }
 
-    /// Mark a specific task index as ready for polling.
-    /// Used by the Producer (e.g., UDP socket handler).
+    /// Mark slot `index` as ready and wake the group task once.
+    ///
+    /// Called by producers (SPMC senders, event dispatchers, …).
     #[inline]
     pub fn notify(&self, index: u8) {
-        let bit = 1 << (index % 64);
-        self.pending.fetch_or(bit, Ordering::Release);
-
-        // Notify the group executor.
-        // We use a simplified lock-check to avoid waking if no waker is set.
-        if let Some(waker) = self.group_waker.lock().unwrap().as_ref() {
-            waker.wake_by_ref();
-        }
+        self.pending.fetch_or(1u64 << (index & 63), Ordering::Release);
+        self.wake_src.notify();
     }
 
-    /// Registers the executor's waker.
-    /// Used by the Consumer (TaskGroup) inside its poll loop.
-    pub fn register(&self, cx: &mut Context<'_>) {
-        let mut lock = self.group_waker.lock().unwrap();
-        if lock.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
-            *lock = Some(cx.waker().clone());
+    /// Mark a bitmask of slots as ready and wake the group task once.
+    ///
+    /// More efficient than calling [`notify`] N times when multiple slots
+    /// become ready simultaneously (e.g. a track packet forwarded to N
+    /// participants in the same shard).
+    ///
+    /// [`notify`]: BitSignal::notify
+    #[inline]
+    pub fn notify_mask(&self, bits: u64) {
+        if bits == 0 {
+            return;
         }
+        self.pending.fetch_or(bits, Ordering::Release);
+        self.wake_src.notify();
     }
 
-    /// Atomically swaps the pending bitset with 0 and returns the previous value.
-    /// Used by the Consumer (TaskGroup) to acquire all work in one go.
+    /// Atomically take all pending bits, clearing them to zero.
+    ///
+    /// Called by the [`TaskGroup`] consumer inside its poll loop.
     #[inline]
     pub fn take(&self) -> u64 {
         self.pending.swap(0, Ordering::Acquire)

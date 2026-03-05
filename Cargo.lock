@@ -938,6 +938,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "diatomic-waker"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab03c107fafeb3ee9f5925686dbb7a73bc76e3932abb0d2b365cb64b169cf04c"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2772,6 +2778,7 @@ dependencies = [
  "criterion",
  "crossbeam-utils",
  "dashmap",
+ "diatomic-waker",
  "event-listener",
  "futures",
  "futures-concurrency",
