@@ -117,6 +117,11 @@ impl<T> Receiver<T> {
             tokio::sync::mpsc::error::TryRecvError::Disconnected => TryRecvError::Disconnected,
         })
     }
+
+    /// Unwraps the underlying `tokio::sync::mpsc::Receiver`, consuming `self`.
+    pub fn into_inner(self) -> tokio::sync::mpsc::Receiver<T> {
+        self.receiver
+    }
 }
 
 /// Creates a new mailbox and a corresponding sender handle.
