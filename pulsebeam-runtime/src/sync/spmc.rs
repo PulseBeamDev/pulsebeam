@@ -1,7 +1,6 @@
 use crossbeam_utils::CachePadded;
 use event_listener::{Event, EventListener};
 use futures_lite::Stream;
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -136,7 +135,7 @@ impl<T: Clone> Receiver<T> {
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+        let mut rechecked = false;
 
         loop {
             // Snapshot producer head. This allows batching efficiency without a batching API.
@@ -155,26 +154,15 @@ impl<T: Clone> Receiver<T> {
 
             // No new items — wait
             if self.next_seq >= self.local_head {
-                // Skip listener registration entirely if the waker is a no-op.
-                // This avoids heap allocation and lock contention in callers
-                // that only want a non-blocking poll (e.g. try_recv shims).
-                if cx.waker().will_wake(std::task::Waker::noop()) {
+                self.register_waker();
+
+                if rechecked {
                     return Poll::Pending;
                 }
 
-                match &mut self.listener {
-                    Some(l) => {
-                        if Pin::new(l).poll(cx).is_pending() {
-                            return Poll::Pending;
-                        }
-                        self.listener = None;
-                        continue;
-                    }
-                    None => {
-                        self.listener = Some(self.ring.event.listen());
-                        continue;
-                    }
-                }
+                // Slow Path: make sure we don't miss a notification by rechecking.
+                rechecked = true;
+                continue;
             }
 
             // Read slot for next_seq
@@ -193,14 +181,20 @@ impl<T: Clone> Receiver<T> {
                     metrics::counter!("spmc_receive_lag_total").increment(1);
                     return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
                 } else {
-                    // Stale slot, producer hasn't reached here yet
-                    if self.listener.is_none() && !cx.waker().will_wake(std::task::Waker::noop()) {
-                        self.listener = Some(self.ring.event.listen());
-                    }
-
+                    // Paranoid: this can only happen if the seq is wrapped around.
+                    // But, u64 is so large that this shouldn't happen.
+                    debug_assert!(
+                        false,
+                        "slot seq {} is behind expected seq {} despite head confirming availability; \
+                        indicates a memory ordering bug or single-producer invariant violation",
+                        slot_seq, self.next_seq
+                    );
+                    self.register_waker();
                     return Poll::Pending;
                 }
             }
+
+            let coop = ready!(tokio::task::coop::poll_proceed(cx));
 
             // Valid message
             if let Some(v) = &slot.val {
@@ -222,6 +216,12 @@ impl<T: Clone> Receiver<T> {
             self.next_seq = self.local_head;
             metrics::counter!("spmc_receive_lag_total").increment(1);
             return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+        }
+    }
+
+    fn register_waker(&mut self) {
+        if self.listener.is_none() {
+            self.listener = Some(self.ring.event.listen());
         }
     }
 
