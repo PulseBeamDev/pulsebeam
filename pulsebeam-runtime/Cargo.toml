@@ -32,16 +32,16 @@ pulsebeam-core = { path = "../pulsebeam-core" }
 quinn-udp = "0.5.14"
 rand = { workspace = true }
 socket2 = "0.6.1"
-systemstat = "0.2.5"
+systemstat = "0.2.6"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration"] }
+tokio-metrics = { version = "0.4.9", features = ["metrics-rs-integration"] }
 tokio-util = "0.7.17"
 tracing = { workspace = true }
 
 [dev-dependencies]
 async-stream = "0.3.6"
-criterion = { version = "0.8.1", features = ["async", "async_tokio"] }
+criterion = { version = "0.8.2", features = ["async", "async_tokio"] }
 futures = "0.3.32"
 futures-concurrency = "7.6.3"
 
