@@ -382,6 +382,17 @@ impl VideoAllocator {
         }
     }
 
+    /// Synchronous non-blocking drain for the co-located shard loop.
+    /// Pulls all currently-available packets from every slot driver and appends
+    /// them to `out`.  Does not register any waker.
+    pub fn try_drain(&mut self, out: &mut Vec<(Mid, RtpPacket)>) {
+        let len = self.drivers.len();
+        for i in 0..len {
+            let idx = (self.last_polled + i) % len;
+            self.drivers[idx].try_drain_packets(out);
+        }
+    }
+
     pub async fn next(&mut self) -> (Mid, RtpPacket) {
         std::future::poll_fn(|cx| {
             let len = self.drivers.len();
@@ -726,6 +737,122 @@ impl SlotDriver {
                     }
                 }
                 state => unreachable!("unexpected state transition: {:?}", state),
+            }
+        }
+    }
+
+    /// Synchronous non-blocking packet drain.  Mirrors `poll_packet` but uses
+    /// `try_recv` so it is safe to call without an async context.
+    pub fn try_drain_packets(&mut self, out: &mut Vec<(Mid, RtpPacket)>) {
+        loop {
+            // Flush the switcher output first.
+            while let Some(pkt) = self.switcher.pop() {
+                out.push((self.mid, pkt));
+            }
+
+            match (
+                self.slot.state,
+                self.slot.active.is_some(),
+                self.slot.staging.is_some(),
+            ) {
+                (SlotState::Idle, _, _) | (SlotState::Paused, _, _) => return,
+
+                (SlotState::Resuming, _, true) => {
+                    let staging = self.slot.staging.as_mut().unwrap();
+                    match staging.channel.try_recv() {
+                        Ok(pkt) => {
+                            self.switcher.stage(pkt);
+                            if self.switcher.ready_to_stream() {
+                                tracing::info!(mid = %self.mid, rid = ?self.slot.staging.as_ref().map(|s| s.rid), "Resuming complete (try_drain)");
+                                let staging = self.slot.staging.clone().unwrap();
+                                self.transition_to(SlotState::Streaming, Some(staging), None);
+                            }
+                        }
+                        Err(spmc::TryRecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged (try_drain)");
+                        }
+                        Err(spmc::TryRecvError::Closed) => {
+                            tracing::warn!(mid = %self.mid, "Resuming closed (try_drain)");
+                            self.transition_to(SlotState::Idle, None, None);
+                            return;
+                        }
+                        Err(spmc::TryRecvError::Empty) => return,
+                    }
+                }
+
+                (SlotState::Streaming, true, _) => {
+                    let active = self.slot.active.as_mut().unwrap();
+                    match active.channel.try_recv() {
+                        Ok(pkt) => {
+                            self.switcher.push(pkt);
+                        }
+                        Err(spmc::TryRecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing (try_drain)");
+                            let active = self.slot.active.clone().unwrap();
+                            self.transition_to(SlotState::Paused, None, Some(active));
+                            return;
+                        }
+                        Err(spmc::TryRecvError::Closed) => {
+                            tracing::info!(mid = %self.mid, "Streaming closed (try_drain)");
+                            self.transition_to(SlotState::Idle, None, None);
+                            return;
+                        }
+                        Err(spmc::TryRecvError::Empty) => return,
+                    }
+                }
+
+                (SlotState::Switching, true, true) => {
+                    // Try staging first.
+                    let staging_result = self.slot.staging.as_mut().unwrap().channel.try_recv();
+                    match staging_result {
+                        Ok(pkt) => {
+                            self.switcher.stage(pkt);
+                            if self.switcher.ready_to_stream() {
+                                tracing::info!(mid = %self.mid, from = ?self.slot.active.as_ref().map(|a| a.rid), to = ?self.slot.staging.as_ref().map(|s| s.rid), "Switch complete (try_drain)");
+                                let staging = self.slot.staging.clone().unwrap();
+                                self.transition_to(SlotState::Streaming, Some(staging), None);
+                            }
+                            continue;
+                        }
+                        Err(spmc::TryRecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing (try_drain)");
+                            let staging = self.slot.staging.clone().unwrap();
+                            self.transition_to(SlotState::Paused, None, Some(staging));
+                            return;
+                        }
+                        Err(spmc::TryRecvError::Closed) => {
+                            tracing::warn!(mid = %self.mid, "Staging closed during switch (try_drain)");
+                            let active = self.slot.active.clone().unwrap();
+                            self.transition_to(SlotState::Streaming, Some(active), None);
+                            continue;
+                        }
+                        Err(spmc::TryRecvError::Empty) => {}
+                    }
+
+                    // Drain active to prevent ring overflow while waiting for keyframe.
+                    let active_result = self.slot.active.as_mut().unwrap().channel.try_recv();
+                    match active_result {
+                        Ok(pkt) => {
+                            self.switcher.push(pkt);
+                            continue;
+                        }
+                        Err(spmc::TryRecvError::Lagged(n)) => {
+                            tracing::warn!(mid = %self.mid, skipped = n, "Active lagged during switch (try_drain)");
+                            let active = self.slot.active.clone().unwrap();
+                            self.transition_to(SlotState::Paused, None, Some(active));
+                            return;
+                        }
+                        Err(spmc::TryRecvError::Closed) => {
+                            tracing::warn!(mid = %self.mid, "Active closed, forcing resume (try_drain)");
+                            let staging = self.slot.staging.clone().unwrap();
+                            self.transition_to(SlotState::Resuming, None, Some(staging));
+                            return;
+                        }
+                        Err(spmc::TryRecvError::Empty) => return,
+                    }
+                }
+
+                state => unreachable!("unexpected state in try_drain: {:?}", state),
             }
         }
     }

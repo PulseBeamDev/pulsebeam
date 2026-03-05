@@ -314,6 +314,22 @@ impl ParticipantCore {
         }
     }
 
+    /// Synchronous egress drain used by the co-located shard loop.
+    ///
+    /// Pulls all currently-available downstream packets from the allocators
+    /// without suspending and immediately hands them to str0m for encoding
+    /// and queuing in the transmit batcher.
+    ///
+    /// The caller must call [`poll`] (or at least flush the batchers) after
+    /// this to actually send the queued transmits.
+    pub fn try_drain_egress(&mut self, scratch: &mut Vec<(Mid, RtpPacket)>) {
+        let now = Instant::now();
+        self.downstream.try_drain(scratch, now);
+        for (mid, pkt) in scratch.drain(..) {
+            self.handle_forward_rtp(mid, pkt);
+        }
+    }
+
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {

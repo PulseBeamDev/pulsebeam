@@ -88,6 +88,16 @@ impl DownstreamAllocator {
         self.update_allocations(bwe);
     }
 
+    /// Synchronous non-blocking drain for the co-located shard loop.
+    ///
+    /// Pulls all currently-available packets from both audio and video
+    /// allocators and appends them to `out`.  Alternates fairly between the
+    /// two, mirroring the async `next()` priority policy.
+    pub fn try_drain(&mut self, out: &mut Vec<(Mid, RtpPacket)>, now: Instant) {
+        self.audio.try_drain(out, now);
+        self.video.try_drain(out);
+    }
+
     /// Await the next outbound RTP packet, fairly alternating between audio and video.
     pub async fn next(&mut self) -> (Mid, RtpPacket) {
         // Alternate priority each call so neither stream starves the other.

@@ -5,4 +5,4 @@ mod downstream;
 mod signaling;
 mod upstream;
 
-pub use actor::*;
+pub use actor::{ParticipantActor, ParticipantControlMessage, TrackMapping};

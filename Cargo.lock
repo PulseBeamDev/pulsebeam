@@ -2674,6 +2674,7 @@ dependencies = [
  "clap",
  "console-subscriber",
  "derive_more",
+ "futures-concurrency",
  "futures-lite",
  "futures-util",
  "hex",

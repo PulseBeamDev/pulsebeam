@@ -4,26 +4,24 @@ use std::{
     time::Duration,
 };
 
-use pulsebeam_runtime::{
-    actor::{ActorKind, ActorStatus, RunnerConfig},
-    prelude::*,
-};
-use tokio::task::JoinSet;
+use pulsebeam_runtime::prelude::*;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::{
     entity::{ConnectionId, ParticipantId, RoomId, TrackId},
     node,
     participant::{self, ParticipantActor},
-    track::{self},
+    shard::{self, ShardControlMessage, ShardHandle, ShardToRoomMessage},
+    track,
 };
-use futures_util::FutureExt;
 use pulsebeam_runtime::actor;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
+// ─── Room messages (external API) ────────────────────────────────────────────
+
 #[derive(derive_more::From)]
 pub enum RoomMessage {
-    PublishTrack(track::TrackReceiver),
     AddParticipant(AddParticipant),
     RemoveParticipant(RemoveParticipant),
 }
@@ -38,10 +36,12 @@ pub struct RemoveParticipant {
     pub participant_id: ParticipantId,
 }
 
+// ─── Room state ───────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
-    handle: participant::ParticipantHandle,
-    tracks: HashMap<TrackId, track::TrackReceiver>,
+    /// Which shard this participant lives in.
+    shard_idx: usize,
     connection_id: ConnectionId,
 }
 
@@ -57,16 +57,24 @@ pub struct RoomActor {
     node_ctx: node::NodeContext,
     room_id: RoomId,
     state: RoomState,
-    participant_tasks: JoinSet<(ParticipantId, ConnectionId, ActorStatus)>,
+    /// All shards managed by this room.
+    shards: Vec<ShardHandle>,
+    /// Next shard ID counter.
+    next_shard_id: usize,
+    /// Receives events from all shards (track published, participant exited).
+    shard_rx: tokio_mpsc::Receiver<ShardToRoomMessage>,
+    /// Cloned and given to each new shard so it can send back to the room.
+    shard_tx: tokio_mpsc::Sender<ShardToRoomMessage>,
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
     participants: BTreeMap<(ParticipantId, ConnectionId), ParticipantMeta>,
     tracks: HashMap<TrackId, track::TrackReceiver>,
-
     tombstoned: HashMap<(ParticipantId, ConnectionId), tokio::time::Instant>,
 }
+
+// ─── Actor impl ───────────────────────────────────────────────────────────────
 
 impl actor::Actor<RoomMessageSet> for RoomActor {
     fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
@@ -74,7 +82,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         MONITOR.clone()
     }
 
-    fn kind() -> ActorKind {
+    fn kind() -> actor::ActorKind {
         "room"
     }
 
@@ -90,20 +98,29 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
     ) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
+        pulsebeam_runtime::actor_loop!(self, ctx,
+            pre_select: {},
             select: {
-                Some(Ok((participant_id, connection_id, _))) = self.participant_tasks.join_next() => {
-                    self.handle_participant_left(participant_id, connection_id).await;
+                // Shard → Room events: track publications and participant exits.
+                Some(shard_msg) = self.shard_rx.recv() => {
+                    self.handle_shard_message(shard_msg).await;
                 }
+                // Idle room timeout.
                 _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
-                    tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
+                    tracing::info!("room has been empty for {EMPTY_ROOM_TIMEOUT:?}, exiting");
                     break;
                 }
+                // Periodic tombstone cleanup.
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
-                    self.cleanup_old_tombstones().await;
+                    self.cleanup_old_tombstones();
                 }
             }
         );
+
+        // Shut down all shards gracefully.
+        for shard in &self.shards {
+            shard.send(ShardControlMessage::Shutdown).await;
+        }
 
         Ok(())
     }
@@ -112,75 +129,96 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
         msg: RoomMessage,
-    ) -> () {
+    ) {
         match msg {
             RoomMessage::AddParticipant(m) => {
                 if let Some(old_connection_id) = m.old_connection_id {
-                    self.handle_replace_participant(
-                        ctx,
-                        m.participant,
-                        old_connection_id,
-                        m.connection_id,
-                    )
-                    .await;
-                } else {
-                    self.handle_participant_joined(ctx, m.participant, m.connection_id)
+                    self.handle_replace_participant(ctx, m.participant, old_connection_id, m.connection_id)
                         .await;
+                } else {
+                    self.handle_participant_joined(m.participant, m.connection_id).await;
                 }
             }
             RoomMessage::RemoveParticipant(m) => {
-                self.remove_all_participant_connections(m.participant_id)
-                    .await;
+                self.remove_all_participant_connections(m.participant_id).await;
             }
-            RoomMessage::PublishTrack(track_handle) => {
-                self.handle_track_published(track_handle).await;
-            }
-        };
+        }
     }
 }
 
+// ─── RoomActor methods ────────────────────────────────────────────────────────
+
 impl RoomActor {
     pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
+        let (shard_tx, shard_rx) = tokio_mpsc::channel(256);
         Self {
             node_ctx,
             room_id,
             state: RoomState::default(),
-            participant_tasks: JoinSet::new(),
+            shards: Vec::new(),
+            next_shard_id: 0,
+            shard_rx,
+            shard_tx,
         }
+    }
+
+    /// Pick the shard with the fewest participants, or spawn a new one if all
+    /// are full or none exist yet.
+    fn get_or_create_shard(&mut self) -> (usize, &ShardHandle) {
+        // Find the shard with minimum load that is not yet full.
+        let best = self
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.participant_count() < shard::MAX_PARTICIPANTS_PER_SHARD)
+            .min_by_key(|(_, s)| s.participant_count())
+            .map(|(i, _)| i);
+
+        if let Some(idx) = best {
+            return (idx, &self.shards[idx]);
+        }
+
+        // All shards full (or none exist) — spawn a new one.
+        let id = self.next_shard_id;
+        self.next_shard_id += 1;
+        let handle = shard::spawn(id, self.node_ctx.gateway.clone(), self.shard_tx.clone());
+        self.shards.push(handle);
+        let idx = self.shards.len() - 1;
+        tracing::info!(room_id = %self.room_id, shard_id = id, "Spawned new shard");
+        (idx, &self.shards[idx])
     }
 
     async fn handle_participant_joined(
         &mut self,
-        _ctx: &mut actor::ActorContext<RoomMessageSet>,
-        participant_actor: ParticipantActor,
+        participant: ParticipantActor,
         connection_id: ConnectionId,
     ) {
-        let (mut participant_handle, participant_task) =
-            actor::prepare(participant_actor, RunnerConfig::default());
-        let participant_id = participant_handle.meta;
+        let participant_id = participant.meta();
+        let (shard_idx, shard) = self.get_or_create_shard();
 
-        // Use .map() instead of an async block to avoid the Rust compiler storing
-        // participant_task twice at the Suspend0 point (once as upvar, once as __awaitee),
-        // which doubles the per-entry size in the JoinSet from ~73KB to ~37KB.
-        self.participant_tasks.spawn(
-            participant_task.map(move |(id, status)| (id, connection_id, status)),
-        );
+        shard
+            .send(ShardControlMessage::AddParticipant {
+                actor: participant,
+                connection_id,
+                current_tracks: self.state.tracks.clone(),
+            })
+            .await;
 
         self.state.participants.insert(
             (participant_id, connection_id),
             ParticipantMeta {
-                handle: participant_handle.clone(),
-                tracks: HashMap::new(),
+                shard_idx,
                 connection_id,
             },
         );
 
-        // Send current tracks to new participant
-        let _ = participant_handle
-            .send(participant::ParticipantControlMessage::TracksSnapshot(
-                self.state.tracks.clone(),
-            ))
-            .await;
+        tracing::info!(
+            room_id = %self.room_id,
+            ?participant_id,
+            ?connection_id,
+            shard_idx,
+            "Participant joined shard"
+        );
     }
 
     async fn handle_participant_left(
@@ -190,141 +228,146 @@ impl RoomActor {
     ) {
         let key = (participant_id, connection_id);
 
-        // Check if already tombstoned (eventual consistency - duplicate eviction)
         if self.state.tombstoned.contains_key(&key) {
-            tracing::debug!(
-                ?participant_id,
-                ?connection_id,
-                "Connection already tombstoned"
-            );
+            tracing::debug!(?participant_id, ?connection_id, "Connection already tombstoned");
             return;
         }
 
-        let Some(mut participant) = self.state.participants.remove(&key) else {
-            tracing::warn!(
-                ?participant_id,
-                ?connection_id,
-                "Participant connection not found"
-            );
+        let Some(meta) = self.state.participants.remove(&key) else {
+            tracing::warn!(?participant_id, ?connection_id, "Participant not found for removal");
             return;
         };
 
-        // Mark as tombstoned for eventual consistency
-        self.state
-            .tombstoned
-            .insert(key, tokio::time::Instant::now());
+        self.state.tombstoned.insert(key, tokio::time::Instant::now());
 
-        // Terminate participant actor
-        let _ = participant.handle.terminate().await;
-
-        // Remove tracks published by this connection
-        for (track_id, _) in participant.tracks.iter_mut() {
-            self.state.tracks.remove(track_id);
+        // Tell the shard to evict the participant.
+        if let Some(shard) = self.shards.get(meta.shard_idx) {
+            shard
+                .send(ShardControlMessage::RemoveParticipant {
+                    participant_id,
+                    connection_id,
+                })
+                .await;
         }
 
-        // Broadcast unpublish to other participants
-        let tracks = Arc::new(participant.tracks);
-        let msg = participant::ParticipantControlMessage::TracksUnpublished(tracks);
-        self.broadcast_message(msg).await;
+        // Remove tracks published by this participant.
+        let removed_tracks: HashMap<TrackId, track::TrackReceiver> = self
+            .state
+            .tracks
+            .extract_if(|_, v| v.meta.origin_participant == participant_id)
+            .collect();
+
+        if !removed_tracks.is_empty() {
+            let removed = Arc::new(removed_tracks);
+            self.broadcast_to_shards(|| ShardControlMessage::TracksUnpublished(removed.clone())).await;
+            // Also remove from our own state (already done by extract_if above).
+            let _ = removed;
+        }
 
         tracing::info!(
+            room_id = %self.room_id,
             ?participant_id,
             ?connection_id,
-            "Participant connection removed"
+            "Participant left"
         );
     }
 
-    async fn handle_track_published(&mut self, track_handle: track::TrackReceiver) {
-        let origin_participant_id = track_handle.meta.origin_participant;
-        let track_id = track_handle.meta.id;
+    /// Handle a message arriving from a shard.
+    async fn handle_shard_message(&mut self, msg: ShardToRoomMessage) {
+        match msg {
+            ShardToRoomMessage::TrackPublished {
+                participant_id,
+                connection_id,
+                rx,
+            } => {
+                self.handle_track_published(participant_id, connection_id, rx).await;
+            }
+            ShardToRoomMessage::ParticipantExited {
+                participant_id,
+                connection_id,
+            } => {
+                // Participant disconnected within its shard — clean up room state.
+                self.handle_participant_left(participant_id, connection_id).await;
+            }
+        }
+    }
 
-        let participant_entry = self
-            .state
-            .participants
-            .iter_mut()
-            .find(|((pid, _), _)| *pid == origin_participant_id);
-
-        let Some(((_id, connection_id), origin)) = participant_entry else {
-            tracing::warn!(
-                ?track_id,
-                ?origin_participant_id,
-                "Participant not found, ignoring track"
-            );
-            return;
-        };
+    async fn handle_track_published(
+        &mut self,
+        origin_participant_id: ParticipantId,
+        _connection_id: ConnectionId,
+        rx: track::TrackReceiver,
+    ) {
+        let track_id = rx.meta.id;
 
         tracing::info!(
+            room_id = %self.room_id,
             ?origin_participant_id,
-            ?connection_id,
             ?track_id,
             "Track published"
         );
 
-        origin.tracks.insert(track_id, track_handle.clone());
-        self.state.tracks.insert(track_id, track_handle.clone());
+        self.state.tracks.insert(track_id, rx.clone());
 
-        // Broadcast new track to all participants
         let mut new_tracks = HashMap::new();
-        new_tracks.insert(track_id, track_handle.clone());
+        new_tracks.insert(track_id, rx);
         let new_tracks = Arc::new(new_tracks);
-        let msg = participant::ParticipantControlMessage::TracksPublished(new_tracks);
-        self.broadcast_message(msg).await;
+
+        self.broadcast_to_shards(|| ShardControlMessage::TracksPublished(new_tracks.clone())).await;
     }
 
     async fn handle_replace_participant(
         &mut self,
-        ctx: &mut actor::ActorContext<RoomMessageSet>,
+        _ctx: &mut actor::ActorContext<RoomMessageSet>,
         new_participant: ParticipantActor,
         old_connection_id: ConnectionId,
         new_connection_id: ConnectionId,
     ) {
         let participant_id = new_participant.meta();
-
         tracing::info!(
             ?participant_id,
             ?old_connection_id,
             ?new_connection_id,
             "Replacing participant connection"
         );
-
-        // Evict old connection
-        self.handle_participant_left(participant_id, old_connection_id)
-            .await;
-
-        // Add new connection
-        self.handle_participant_joined(ctx, new_participant, new_connection_id)
-            .await;
+        self.handle_participant_left(participant_id, old_connection_id).await;
+        self.handle_participant_joined(new_participant, new_connection_id).await;
     }
 
     async fn remove_all_participant_connections(&mut self, participant_id: ParticipantId) {
-        let start_bound = (participant_id, ConnectionId::MIN);
-        let end_bound = (participant_id, ConnectionId::MAX);
-
-        let keys_to_remove: Vec<_> = self
+        let start = (participant_id, ConnectionId::MIN);
+        let end = (participant_id, ConnectionId::MAX);
+        let keys: Vec<_> = self
             .state
             .participants
-            .range(start_bound..=end_bound)
-            .map(|(key, _)| *key)
+            .range(start..=end)
+            .map(|(k, _)| *k)
             .collect();
-
-        for (_, connection_id) in keys_to_remove {
-            self.handle_participant_left(participant_id, connection_id)
-                .await;
+        for (_, connection_id) in keys {
+            self.handle_participant_left(participant_id, connection_id).await;
         }
     }
 
-    async fn cleanup_old_tombstones(&mut self) {
-        let cutoff = tokio::time::Instant::now() - Duration::from_secs(3600); // 1 hour
-        self.state
-            .tombstoned
-            .retain(|_, timestamp| *timestamp > cutoff);
+    /// Send a message to every active shard.
+    ///
+    /// Accept a closure so callers can construct each `ShardControlMessage`
+    /// independently (avoiding a `Clone` bound on the enum, which can't be
+    /// satisfied for variants that carry non-Clone data like `AddParticipant`).
+    async fn broadcast_to_shards<F>(&self, make_msg: F)
+    where
+        F: Fn() -> ShardControlMessage,
+    {
+        for shard in &self.shards {
+            shard.send(make_msg()).await;
+        }
     }
 
-    async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {
-        for participant in self.state.participants.values_mut() {
-            let _ = participant.handle.send(msg.clone()).await;
-        }
+    fn cleanup_old_tombstones(&mut self) {
+        let cutoff = tokio::time::Instant::now() - Duration::from_secs(3600);
+        self.state.tombstoned.retain(|_, ts| *ts > cutoff);
     }
 }
 
 pub type RoomHandle = actor::ActorHandle<RoomMessageSet>;
+
+

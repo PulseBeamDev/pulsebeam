@@ -146,6 +146,32 @@ impl<T> Receiver<T> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
+    /// Non-blocking receive.  Returns `None` if no message is available;
+    /// does not register any waker or listener.
+    pub fn try_recv(&mut self) -> Option<T> {
+        if self.next_seq == self.local_head {
+            self.local_head = self.ring.head.load(Ordering::Acquire);
+        }
+        if self.next_seq >= self.local_head {
+            return None;
+        }
+        let idx = (self.next_seq as usize) & self.ring.mask;
+        let mut slot = self.ring.slots[idx].lock().unwrap();
+        if slot.seq != self.next_seq {
+            // Lagged or not yet written; drop on lag, return None either way.
+            if slot.seq > self.next_seq {
+                self.next_seq = self.local_head;
+            }
+            return None;
+        }
+        if let Some(val) = slot.val.take() {
+            self.next_seq += 1;
+            self.ring.tail.store(self.next_seq, Ordering::Relaxed);
+            return Some(val);
+        }
+        None
+    }
+
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
         let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
 

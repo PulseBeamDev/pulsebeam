@@ -66,6 +66,38 @@ impl AudioAllocator {
         std::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 
+    /// Synchronous, non-blocking drain used by the co-located shard loop.
+    ///
+    /// Pulls all currently available packets from every input receiver and
+    /// routes them through the slot dispatcher.  Does not register any waker,
+    /// so it is safe to call outside an async context.
+    pub fn try_drain(&mut self, out: &mut Vec<(Mid, RtpPacket)>, now: Instant) {
+        if self.inputs.is_empty() || self.slots.is_empty() {
+            return;
+        }
+        for i in 0..self.inputs.len() {
+            loop {
+                let pkt = match self.inputs[i].receiver.try_recv() {
+                    Ok(pkt) => pkt,
+                    Err(pulsebeam_runtime::sync::spmc::TryRecvError::Empty) => break,
+                    Err(pulsebeam_runtime::sync::spmc::TryRecvError::Closed) => break,
+                    Err(pulsebeam_runtime::sync::spmc::TryRecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            track_id = %self.inputs[i].track_id,
+                            skipped = n,
+                            "audio stream lagging (try_drain)"
+                        );
+                        continue;
+                    }
+                };
+                let track_id = self.inputs[i].track_id;
+                if let Some(result) = self.dispatch(track_id, pkt, now) {
+                    out.push(result);
+                }
+            }
+        }
+    }
+
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<(Mid, RtpPacket)> {
         if self.inputs.is_empty() || self.slots.is_empty() {
             return Poll::Pending;

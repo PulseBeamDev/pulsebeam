@@ -18,6 +18,19 @@ pub enum StreamRecvError {
     Lagged(u64),
 }
 
+/// Non-blocking receive error, returned by [`Receiver::try_recv`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// No new item available yet.
+    Empty,
+    /// Receiver fell behind the producer; the receiver's position has been
+    /// advanced to the current head. The caller should treat in-flight state
+    /// as lost and resync (e.g. request a keyframe).
+    Lagged(u64),
+    /// The sender has been dropped and the ring is fully drained.
+    Closed,
+}
+
 #[derive(Debug)]
 struct Slot<T> {
     seq: u64,
@@ -217,6 +230,56 @@ impl<T: Clone> Receiver<T> {
             metrics::counter!("spmc_receive_lag_total").increment(1);
             return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
         }
+    }
+
+    /// Non-blocking receive.  Zero waker overhead — safe to call in a tight
+    /// synchronous loop from within a co-located shard, where no async executor
+    /// context is available.
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        // Refresh the cached head snapshot.
+        if self.next_seq == self.local_head {
+            self.local_head = self.ring.head.load(Ordering::Acquire);
+        }
+
+        // Closed and drained.
+        if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= self.local_head {
+            return Err(TryRecvError::Closed);
+        }
+
+        // Nothing new.
+        if self.next_seq >= self.local_head {
+            return Err(TryRecvError::Empty);
+        }
+
+        let idx = (self.next_seq as usize) & self.ring.mask;
+        let slot = self.ring.slots[idx].read().unwrap();
+        let slot_seq = slot.seq;
+
+        if slot_seq != self.next_seq {
+            let lagged = slot.seq > self.next_seq;
+            drop(slot);
+            if lagged {
+                let head = self.local_head;
+                self.next_seq = head;
+                metrics::counter!("spmc_receive_lag_total").increment(1);
+                return Err(TryRecvError::Lagged(head));
+            }
+            // Seq behind our position: producer hasn't written this slot yet
+            // (shouldn't happen given head check, but be defensive).
+            return Err(TryRecvError::Empty);
+        }
+
+        if let Some(v) = &slot.val {
+            let out = v.clone();
+            self.next_seq += 1;
+            return Ok(out);
+        }
+
+        // Seq matched but val is None — treat as lag.
+        let head = self.local_head;
+        self.next_seq = head;
+        metrics::counter!("spmc_receive_lag_total").increment(1);
+        Err(TryRecvError::Lagged(head))
     }
 
     fn register_waker(&mut self) {

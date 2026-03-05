@@ -252,10 +252,7 @@ impl ControllerActor {
 
         let (rtc, answer) = self.create_answer(offer, &sockets)?;
         let mut room_handle = self.get_or_create_room(&s.room_id);
-        let gateway = self.node_ctx.gateway.clone();
         let participant = ParticipantActor::new(
-            gateway,
-            room_handle.clone(),
             udp_egress,
             tcp_egress,
             s.participant_id,
