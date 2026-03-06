@@ -1,24 +1,49 @@
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
+use pulsebeam_runtime::collections::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, Mid};
+use str0m::media::{Frequency, KeyframeRequest, Mid};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
 
+/// Per-slot construction parameters.  Pass one of these to [`VideoAllocator::add_slot`].
+#[derive(Clone, Debug)]
+pub struct SlotConfig {
+    /// RTP clock rate forwarded to the [`Switcher`].
+    pub clock_rate: Frequency,
+}
+
+impl Default for SlotConfig {
+    fn default() -> Self {
+        Self {
+            clock_rate: rtp::VIDEO_FREQUENCY,
+        }
+    }
+}
+
+/// Maximum number of video slots per participant.  Bounded at 25 (well within
+/// the 64-slot limit of [`SlotGroup`]).
+const VIDEO_MAX_SLOTS: usize = 25;
+
 pub struct VideoAllocator {
     manual_sub: bool,
     tracks: HashMap<TrackId, TrackState>,
-    drivers: Vec<SlotDriver>,
+    /// Inline, contiguous storage of all slot drivers.  The hot path polls this
+    /// directly via `Stream::poll_next`; the cold path reaches individual drivers
+    /// through `get_mut` / `iter_mut` — no extra indirection.
+    slots: SlotGroup<SlotDriver>,
+    /// Reverse map from `Mid` to slot index for O(1) cold-path lookup.
+    mid_to_idx: HashMap<Mid, usize>,
     ticks: u32,
-    last_polled: usize,
 }
 
 impl VideoAllocator {
@@ -26,36 +51,45 @@ impl VideoAllocator {
         Self {
             manual_sub,
             tracks: HashMap::new(),
-            drivers: Vec::new(),
+            slots: SlotGroup::with_capacity(VIDEO_MAX_SLOTS),
+            mid_to_idx: HashMap::new(),
             ticks: 0,
-            last_polled: 0,
         }
     }
 
     pub fn slot_count(&self) -> usize {
-        self.drivers.len()
+        self.slots.len()
     }
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
-        let tracks = &mut self.tracks;
-        // Collect mids to avoid borrow issues.
-        let mids: Vec<Mid> = self.drivers.iter().map(|d| d.mid).collect();
+        let mids: Vec<Mid> = self.mid_to_idx.keys().copied().collect();
         for mid in mids {
-            let driver = self.drivers.iter_mut().find(|d| d.mid == mid).unwrap();
-            if let Some(intent) = intents.get(&mid) {
-                Self::configure_slot(tracks, driver, intent.max_height, Some(&intent.track_id));
+            let idx = self.mid_to_idx[&mid];
+            let driver = self.slots.get_mut(idx).unwrap();
+            let tracks = &mut self.tracks;
+            let switched = if let Some(intent) = intents.get(&mid) {
+                Self::configure_slot(tracks, driver, intent.max_height, Some(&intent.track_id))
             } else {
-                Self::configure_slot(tracks, driver, 0, None);
+                Self::configure_slot(tracks, driver, 0, None)
+            };
+            // Only poke when the slot entered Resuming/Switching — those states
+            // need to be polled once to register their waker with the spmc channel.
+            // Paused/Idle return Poll::Pending immediately; poking them only causes
+            // spurious wake-ups.
+            if switched {
+                self.slots.poke(idx);
             }
         }
     }
 
+    /// Returns `true` if the slot transitioned into an active-polling state
+    /// (Resuming or Switching), meaning the caller should `poke` it.
     fn configure_slot(
         tracks: &mut HashMap<TrackId, TrackState>,
         driver: &mut SlotDriver,
         max_height: u32,
         track_id: Option<&TrackId>,
-    ) {
+    ) -> bool {
         // Clear any previous assignment on the target track.
         if let Some(target) = driver.slot.target()
             && let Some(state) = tracks.get_mut(&target.meta.id)
@@ -63,11 +97,11 @@ impl VideoAllocator {
             state.assigned_mid = None;
         }
 
-        if let Some(track_id) = track_id
+        let switched = if let Some(track_id) = track_id
             && max_height > 0
         {
             let Some(track_state) = tracks.get_mut(track_id) else {
-                return;
+                return false;
             };
 
             let layer = if let Some(target) = driver.slot.target()
@@ -80,19 +114,22 @@ impl VideoAllocator {
 
             driver.switch_to(layer, false);
             track_state.assigned_mid = Some(driver.mid);
+            driver.slot.state.is_playing()
         } else {
             driver.stop();
-        }
+            false
+        };
 
         driver.max_height = max_height;
+        switched
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
         self.tracks.values().map(|s| &*s.track.meta)
     }
 
-    pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> {
-        self.drivers.iter().filter_map(|d| {
+    pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> + '_ {
+        self.slots.iter().filter_map(|(_, d)| {
             Some(SlotAssignment {
                 mid: d.mid,
                 track: d.slot.current()?.meta.clone(),
@@ -121,15 +158,18 @@ impl VideoAllocator {
             let Some(assigned_mid) = track.assigned_mid else {
                 return;
             };
-            if let Some(driver) = self.drivers.iter_mut().find(|d| d.mid == assigned_mid) {
-                driver.stop();
+            if let Some(&idx) = self.mid_to_idx.get(&assigned_mid) {
+                if let Some(driver) = self.slots.get_mut(idx) {
+                    driver.stop();
+                }
             }
             self.rebalance();
         }
     }
 
-    pub fn add_slot(&mut self, mid: Mid) {
-        self.drivers.push(SlotDriver::new(mid));
+    pub fn add_slot(&mut self, mid: Mid, config: SlotConfig) {
+        let idx = self.slots.insert(SlotDriver::new(mid, config));
+        self.mid_to_idx.insert(mid, idx);
         self.rebalance();
     }
 
@@ -148,18 +188,24 @@ impl VideoAllocator {
             .map(|(id, _)| *id)
             .collect();
 
-        let mut ui = 0;
-        for driver in &mut self.drivers {
-            if !driver.slot.state.is_idle() {
-                continue;
-            }
+        // Two-phase: collect idle indices first (immutable), then assign (mutable).
+        let idle_indices: Vec<usize> = self
+            .slots
+            .iter()
+            .filter(|(_, d)| d.slot.state.is_idle())
+            .map(|(i, _)| i)
+            .collect();
+
+        for (ui, idx) in idle_indices.into_iter().enumerate() {
             let Some(track_id) = unassigned.get(ui).copied() else {
                 break;
             };
-            ui += 1;
+            let driver_mid = self.slots.get(idx).unwrap().mid;
             let state = self.tracks.get_mut(&track_id).unwrap();
-            state.assigned_mid = Some(driver.mid);
-            driver.assign_to(state.track.lowest_quality().clone());
+            state.assigned_mid = Some(driver_mid);
+            let receiver = state.track.lowest_quality().clone();
+            self.slots.get_mut(idx).unwrap().assign_to(receiver);
+            // assign_to → Paused: no poke needed, Paused returns Poll::Pending immediately.
         }
     }
 
@@ -188,17 +234,20 @@ impl VideoAllocator {
             paused: bool,
         }
 
-        if self.drivers.is_empty() {
+        if self.slots.is_empty() {
             return None;
         }
 
-        self.drivers
-            .sort_by_key(|d| std::cmp::Reverse(d.max_height));
+        // Sort slot indices by max_height descending (greedy highest-priority first).
+        let mut sorted_indices: Vec<usize> = self.slots.iter().map(|(i, _)| i).collect();
+        sorted_indices.sort_by_key(|&i| std::cmp::Reverse(self.slots.get(i).unwrap().max_height));
+
         let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
-        let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(self.drivers.len());
+        let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(sorted_indices.len());
 
         // Step 1: Optimistic Initialization
-        for (idx, driver) in self.drivers.iter().enumerate() {
+        for &idx in &sorted_indices {
+            let driver = self.slots.get(idx).unwrap();
             let Some(current_receiver) = driver.slot.current() else {
                 continue;
             };
@@ -342,11 +391,18 @@ impl VideoAllocator {
         }
 
         for plan in committed {
-            let driver = &mut self.drivers[plan.driver_idx];
+            let idx = plan.driver_idx;
+            let driver = self.slots.get_mut(idx).unwrap();
             if plan.paused {
+                // assign_to → Paused: no poke, returns Poll::Pending immediately.
                 driver.assign_to(plan.receiver);
             } else {
                 driver.switch_to(plan.receiver, false);
+                // switch_to may transition to Resuming or Switching — poke so the
+                // slot is polled once to register its waker with the spmc channel.
+                if driver.slot.state.is_playing() {
+                    self.slots.poke(idx);
+                }
             }
         }
 
@@ -369,35 +425,28 @@ impl VideoAllocator {
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
-        let Some(driver) = self.drivers.iter().find(|d| d.mid == req.mid) else {
+        let Some(&idx) = self.mid_to_idx.get(&req.mid) else {
             tracing::warn!(?req, "no video slot found for keyframe request");
             return;
         };
-        driver.request_keyframe();
+        if let Some(driver) = self.slots.get(idx) {
+            driver.request_keyframe();
+        }
     }
 
     pub fn poll_slow(&mut self, now: Instant) {
-        for driver in &mut self.drivers {
+        for (_, driver) in self.slots.iter_mut() {
             driver.poll_slow(now);
         }
     }
 
     pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        std::future::poll_fn(|cx| {
-            let len = self.drivers.len();
-            if len == 0 {
-                return Poll::Pending;
-            }
-
-            for i in 0..len {
-                let idx = (self.last_polled + i) % len;
-                if let Poll::Ready(item) = self.drivers[idx].poll_packet(cx) {
-                    self.last_polled = (idx + 1) % len;
-                    return Poll::Ready(item);
-                }
-            }
-
-            Poll::Pending
+        // Hot path: SlotGroup polls only woken slots using a u64 readiness bitmask.
+        // No synchronisation beyond the single atomic swap inside BitSignal::take.
+        use futures_lite::stream::Stream as _;
+        std::future::poll_fn(|cx| match Pin::new(&mut self.slots).poll_next(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(item),
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
         })
         .await
     }
@@ -514,13 +563,22 @@ struct SlotDriver {
     keyframe_retries: usize,
 }
 
+impl futures_lite::stream::Stream for SlotDriver {
+    type Item = (Mid, RtpPacket);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // SlotDriver is Unpin (all fields are Unpin), so get_mut is always safe.
+        self.get_mut().poll_packet(cx).map(Some)
+    }
+}
+
 impl SlotDriver {
-    fn new(mid: Mid) -> Self {
+    fn new(mid: Mid, config: SlotConfig) -> Self {
         Self {
             mid,
             max_height: 0,
             slot: Slot::default(),
-            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
+            switcher: Switcher::new(config.clock_rate),
             switching_started_at: None,
             keyframe_retries: 0,
         }

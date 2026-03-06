@@ -135,8 +135,6 @@ impl<T: Clone> Receiver<T> {
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        let mut rechecked = false;
-
         loop {
             // Snapshot producer head. This allows batching efficiency without a batching API.
             // It creates a fast-path for a slightly behind receiver to catchup the producer
@@ -152,17 +150,14 @@ impl<T: Clone> Receiver<T> {
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
-            // No new items — wait
+            // No new items — register our waker via the event listener and park.
             if self.next_seq >= self.local_head {
-                self.register_waker();
-
-                if rechecked {
-                    return Poll::Pending;
+                if self.register_waker(cx) {
+                    // Listener was already notified before we polled it —
+                    // an item may have arrived; re-read head and retry.
+                    continue;
                 }
-
-                // Slow Path: make sure we don't miss a notification by rechecking.
-                rechecked = true;
-                continue;
+                return Poll::Pending;
             }
 
             // Read slot for next_seq
@@ -189,7 +184,7 @@ impl<T: Clone> Receiver<T> {
                         indicates a memory ordering bug or single-producer invariant violation",
                         slot_seq, self.next_seq
                     );
-                    self.register_waker();
+                    self.register_waker(cx);
                     return Poll::Pending;
                 }
             }
@@ -219,9 +214,26 @@ impl<T: Clone> Receiver<T> {
         }
     }
 
-    fn register_waker(&mut self) {
-        if self.listener.is_none() {
-            self.listener = Some(self.ring.event.listen());
+    /// Register `cx.waker()` with the underlying event so the task is re-woken
+    /// when the sender writes a new item.
+    ///
+    /// Returns `true` if the listener was **already notified** before we could
+    /// register the waker — the caller should re-check the ring and retry
+    /// rather than parking.  Returns `false` if the waker is now registered
+    /// and the caller should return `Poll::Pending`.
+    ///
+    /// In event-listener v5, `EventListener` is `Unpin` (backed by a `Box`),
+    /// so we can poll it via `Pin::new` without unsafe code.
+    fn register_waker(&mut self, cx: &mut Context<'_>) -> bool {
+        let listener = self.listener.get_or_insert_with(|| self.ring.event.listen());
+        match std::pin::Pin::new(listener).poll(cx) {
+            Poll::Ready(()) => {
+                // The event fired before or exactly when we polled — discard
+                // this listener so a fresh one is created on the next call.
+                self.listener = None;
+                true
+            }
+            Poll::Pending => false,
         }
     }
 

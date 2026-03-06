@@ -10,7 +10,7 @@ rustflags = [
   #  "-C",
   #  "link-arg=-Wl,--allow-multiple-definition"
 ]
-rustc-wrapper = "/usr/bin/sccache"
+# rustc-wrapper = "/usr/bin/sccache"
 
 # [unstable]
 # codegen-backend = true

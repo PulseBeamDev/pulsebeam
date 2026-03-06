@@ -3,7 +3,7 @@ mod video;
 
 use crate::bitrate::BitrateController;
 use crate::participant::downstream::audio::AudioAllocator;
-use crate::participant::downstream::video::VideoAllocator;
+use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
 use crate::rtp::RtpPacket;
 use crate::track::TrackReceiver;
 use str0m::bwe::{Bitrate, Bwe};
@@ -56,7 +56,7 @@ impl DownstreamAllocator {
     pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
         match kind {
             MediaKind::Audio => self.audio.add_slot(mid),
-            MediaKind::Video => self.video.add_slot(mid),
+            MediaKind::Video => self.video.add_slot(mid, SlotConfig::default()),
         }
         self.dirty_allocation = true;
     }

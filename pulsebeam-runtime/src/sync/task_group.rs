@@ -55,7 +55,7 @@ const fn slot_vtable() -> &'static RawWakerVTable {
     &RawWakerVTable::new(clone_slot, wake_slot, wake_by_ref_slot, drop_slot)
 }
 
-fn make_slot_waker(signal: Arc<BitSignal>, index: u8) -> Waker {
+pub(crate) fn make_slot_waker(signal: Arc<BitSignal>, index: u8) -> Waker {
     let data = Arc::new(SlotWakerData { signal, index });
     let raw = RawWaker::new(Arc::into_raw(data) as *const (), slot_vtable());
     // SAFETY: vtable functions are correct and data lifetime is Arc-managed.
