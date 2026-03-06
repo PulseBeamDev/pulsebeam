@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
-use str0m::media::{KeyframeRequest, MediaKind, Mid};
+use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
 use str0m::net::Protocol;
+use str0m::rtp::Ssrc;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
@@ -61,6 +62,9 @@ pub struct ParticipantCore {
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
+    /// (Pt, Ssrc) cached per downstream `Mid` at `MediaAdded(SendOnly)` time.
+    /// Eliminates per-packet `rtc.media()` + `stream_tx_by_mid()` lookups.
+    slot_meta: HashMap<Mid, (Pt, Ssrc)>,
 
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
@@ -107,6 +111,7 @@ impl ParticipantCore {
             tcp_batcher,
             upstream: UpstreamAllocator::new(),
             downstream: DownstreamAllocator::new(manual_sub),
+            slot_meta: HashMap::new(),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
             signaling: Signaling::new(cid),
@@ -278,19 +283,14 @@ impl ParticipantCore {
     }
 
     pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: RtpPacket) {
-        let pt = {
-            let Some(media) = self.rtc.media(mid) else {
-                return;
-            };
-            let Some(pt) = media.remote_pts().first() else {
-                return;
-            };
-            *pt
+        let Some(&(pt, ssrc)) = self.slot_meta.get(&mid) else {
+            tracing::warn!(%mid, "Dropping RTP: mid not in slot_meta (slot not yet negotiated)");
+            return;
         };
 
         let mut api = self.rtc.direct_api();
-        let Some(writer) = api.stream_tx_by_mid(mid, None) else {
-            tracing::warn!(%mid, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid stream mid");
+        let Some(writer) = api.stream_tx(&ssrc) else {
+            tracing::warn!(%mid, %ssrc, "Dropping RTP for invalid stream mid");
             return;
         };
 
@@ -305,12 +305,12 @@ impl ParticipantCore {
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
             pkt.playout_time.into(),
-            pkt.raw_header.marker,
-            pkt.raw_header.ext_vals,
+            pkt.marker,
+            pkt.ext_vals,
             true,
             pkt.payload.to_vec(),
         ) {
-            tracing::warn!(%mid, ssrc = %pkt.raw_header.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+            tracing::warn!(%mid, %ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
     }
 
@@ -381,6 +381,16 @@ impl ParticipantCore {
                 self.downstream.add_slot(media.mid, media.kind);
                 self.signaling
                     .set_slot_count(self.downstream.video.slot_count());
+                // Cache (Pt, Ssrc) so handle_forward_rtp avoids per-packet lookups.
+                // Both are stable for the session lifetime after SDP negotiation.
+                if let Some(m) = self.rtc.media(media.mid) {
+                    if let Some(&pt) = m.remote_pts().first() {
+                        let mut api = self.rtc.direct_api();
+                        if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
+                            self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
+                        }
+                    }
+                }
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
@@ -398,11 +408,12 @@ impl ParticipantCore {
             return;
         };
 
-        let rtp = match media.kind() {
+        let (rtp, sr) = match media.kind() {
             MediaKind::Audio => RtpPacket::from_str0m(rtp, crate::rtp::Codec::Opus),
             MediaKind::Video => RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264),
         };
-        self.upstream.handle_incoming_rtp(mid, rid.as_ref(), rtp);
+        self.upstream
+            .handle_incoming_rtp(mid, rid.as_ref(), rtp, sr);
     }
 
     pub fn disconnect(&mut self, reason: DisconnectReason) {

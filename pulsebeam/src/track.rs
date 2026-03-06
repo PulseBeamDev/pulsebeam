@@ -12,6 +12,7 @@ use crate::rtp::{
     monitor::{StreamMonitor, StreamState},
     sync::Synchronizer,
 };
+use str0m::rtp::rtcp::SenderInfo;
 
 /// Leading-edge debounce interval for keyframe requests forwarded upstream.
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -150,12 +151,13 @@ impl SimulcastSender {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    pub fn forward(&mut self, pkt: RtpPacket) {
-        // RTP Pipeline
-        let pkt = self.synchronizer.process(pkt);
+    pub fn forward(&mut self, mut pkt: RtpPacket, sr: Option<SenderInfo>) {
+        // Synchronizer stamps playout_time in-place — no move-in/move-out round trip.
+        self.synchronizer.process(&mut pkt, sr);
         self.monitor
-            .process_packet(&pkt, pkt.payload.len() + pkt.raw_header.header_len);
+            .process_packet(&pkt, pkt.payload.len() + pkt.header_len);
         if (self.filter)(&pkt) {
+            // Move packet into the broadcast ring — zero copies, zero arc bumps.
             self.channel.send(pkt);
         }
     }
@@ -179,13 +181,13 @@ impl PartialEq for TrackSender {
 impl Eq for TrackSender {}
 
 impl TrackSender {
-    pub fn forward(&mut self, rid: Option<&Rid>, packet: RtpPacket) {
+    pub fn forward(&mut self, rid: Option<&Rid>, packet: RtpPacket, sr: Option<SenderInfo>) {
         let sender = self
             .simulcast
             .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available");
-        sender.forward(packet);
+        sender.forward(packet, sr);
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut SimulcastSender> {
@@ -382,7 +384,7 @@ pub fn should_forward_audio(packet: &RtpPacket) -> bool {
         return true;
     }
 
-    let ext = &packet.raw_header.ext_vals;
+    let ext = &packet.ext_vals;
 
     // 2. Strict VAD Check (Priority)
     // If the V bit is present, trust it explicitly.

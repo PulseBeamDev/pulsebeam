@@ -139,7 +139,7 @@ mod test {
             }
 
             let pkt = packet.clone();
-            let current_ssrc = pkt.raw_header.ssrc;
+            let current_ssrc = pkt.ssrc;
 
             if active_ssrc == Some(current_ssrc) {
                 // State: Streaming / Active
@@ -246,9 +246,9 @@ mod test {
                 continue;
             };
 
-            if b.raw_header.ssrc != c.raw_header.ssrc {
+            if b.ssrc != c.ssrc {
                 assert_ne!(
-                    a.raw_header.ssrc, c.raw_header.ssrc,
+                    a.ssrc, c.ssrc,
                     "Interleaved SSRCs detected"
                 );
             }
@@ -300,11 +300,11 @@ mod test {
             if current_header.is_keyframe_start {
                 flags.push('K');
             }
-            if current_header.raw_header.marker {
+            if current_header.marker {
                 flags.push('M');
             }
 
-            let ssrc = format!("{}", current_header.raw_header.ssrc);
+            let ssrc = format!("{}", current_header.ssrc);
             let seq = format!("{}", current_header.seq_no);
             let ts = format!("{}", current_header.rtp_ts.numer());
 

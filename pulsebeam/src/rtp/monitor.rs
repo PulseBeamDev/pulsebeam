@@ -151,7 +151,7 @@ impl StreamMonitor {
 
         self.delta_delta.update(packet);
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
-            let ext = &packet.raw_header.ext_vals;
+            let ext = &packet.ext_vals;
             audio_monitor.process_packet(
                 packet.arrival_ts,
                 ext.voice_activity.unwrap_or_default(),

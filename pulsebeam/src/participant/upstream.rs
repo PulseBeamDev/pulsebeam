@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use str0m::rtp::rtcp::SenderInfo;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -109,10 +110,11 @@ impl UpstreamAllocator {
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
         mut rtp: RtpPacket,
+        sr: Option<SenderInfo>,
     ) {
         if let Some(slot) = self.published_tracks.iter_mut().find(|t| t.mid == mid) {
-            rtp.raw_header.ext_vals.rid = rid.cloned();
-            slot.track.forward(rid, rtp);
+            rtp.ext_vals.rid = rid.cloned();
+            slot.track.forward(rid, rtp, sr);
         } else {
             tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }
