@@ -66,7 +66,7 @@ impl AudioAllocator {
         std::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<(Mid, RtpPacket)> {
+    pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<(Mid, RtpPacket)> {
         if self.inputs.is_empty() || self.slots.is_empty() {
             return Poll::Pending;
         }

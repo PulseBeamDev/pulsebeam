@@ -35,6 +35,10 @@ pub struct SlotGroup<S> {
     pending_bits: u64,
     /// Bitset tracking which slot indices are currently occupied.
     occupied: u64,
+    /// Cached outer waker — compared via `will_wake` so `wake_sink.register`
+    /// (which does an atomic store even on a no-op path) is skipped in the
+    /// common case where the task waker hasn't changed between polls.
+    cached_waker: Option<Waker>,
     /// Inline storage — one element per slot, `None` for free/vacant slots.
     slots: Vec<Option<S>>,
     /// Pre-built per-slot wakers.  Created once on [`insert`](SlotGroup::insert),
@@ -64,6 +68,7 @@ impl<S> SlotGroup<S> {
             wake_sink,
             pending_bits: 0,
             occupied: 0,
+            cached_waker: None,
             slots,
             slot_wakers,
         }
@@ -177,8 +182,14 @@ impl<S: Stream + Unpin> Stream for SlotGroup<S> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Register the outer waker so any slot waker can reschedule this task.
-        this.wake_sink.register(cx.waker());
+        // Register the outer waker only if it changed.  `will_wake` is a cheap
+        // pointer comparison; `wake_sink.register` has an unconditional atomic
+        // store even when the waker is identical, so we gate it here.
+        let waker = cx.waker();
+        if !this.cached_waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            this.wake_sink.register(waker);
+            this.cached_waker = Some(waker.clone());
+        }
 
         // Merge newly-signalled bits into the local cache — one atomic per call.
         this.pending_bits |= this.signal.take() & this.occupied;

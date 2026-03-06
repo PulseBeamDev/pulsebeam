@@ -6,6 +6,7 @@ use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
 use crate::rtp::RtpPacket;
 use crate::track::TrackReceiver;
+use std::task::Poll;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
@@ -90,19 +91,31 @@ impl DownstreamAllocator {
 
     /// Await the next outbound RTP packet, fairly alternating between audio and video.
     pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        // Alternate priority each call so neither stream starves the other.
-        if self.yield_audio {
-            tokio::select! {
-                biased;
-                pkt = self.video.next() => { self.yield_audio = false; pkt }
-                pkt = self.audio.next() => { self.yield_audio = true;  pkt }
+        std::future::poll_fn(|cx| {
+            // Alternate which stream gets priority each call so neither starves.
+            // Both arms are polled every call — no `tokio::select!` future is
+            // constructed, no extra waker registrations, no heap allocation.
+            if self.yield_audio {
+                if let Poll::Ready(pkt) = self.video.poll_next(cx) {
+                    self.yield_audio = false;
+                    return Poll::Ready(pkt);
+                }
+                if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
+                    self.yield_audio = true;
+                    return Poll::Ready(pkt);
+                }
+            } else {
+                if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
+                    self.yield_audio = true;
+                    return Poll::Ready(pkt);
+                }
+                if let Poll::Ready(pkt) = self.video.poll_next(cx) {
+                    self.yield_audio = false;
+                    return Poll::Ready(pkt);
+                }
             }
-        } else {
-            tokio::select! {
-                biased;
-                pkt = self.audio.next() => { self.yield_audio = true;  pkt }
-                pkt = self.video.next() => { self.yield_audio = false; pkt }
-            }
-        }
+            Poll::Pending
+        })
+        .await
     }
 }

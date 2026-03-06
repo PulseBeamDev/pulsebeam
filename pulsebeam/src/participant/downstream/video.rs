@@ -441,14 +441,18 @@ impl VideoAllocator {
     }
 
     pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        // Hot path: SlotGroup polls only woken slots using a u64 readiness bitmask.
-        // No synchronisation beyond the single atomic swap inside BitSignal::take.
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// Inline hot path — called directly from `DownstreamAllocator::poll_next`
+    /// to avoid constructing a `tokio::select!` future per packet.
+    #[inline]
+    pub(super) fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> Poll<(Mid, RtpPacket)> {
         use futures_lite::stream::Stream as _;
-        std::future::poll_fn(|cx| match Pin::new(&mut self.slots).poll_next(cx) {
+        match Pin::new(&mut self.slots).poll_next(cx) {
             Poll::Ready(Some(item)) => Poll::Ready(item),
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
-        })
-        .await
+        }
     }
 }
 
