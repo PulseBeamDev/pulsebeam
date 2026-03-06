@@ -1,6 +1,6 @@
 use super::common;
 use proptest::prelude::*;
-use pulsebeam_agent::{MediaKind, TransceiverDirection};
+use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -27,8 +27,16 @@ proptest! {
             async |server_ip: IpAddr, ip: IpAddr, barrier: std::sync::Arc<tokio::sync::Barrier>| {
                 let mut client = common::client::SimClientBuilder::bind(ip, server_ip)
                     .await?
-                    .with_track(MediaKind::Video, TransceiverDirection::SendOnly)
-                    .with_track(MediaKind::Video, TransceiverDirection::RecvOnly)
+                    .with_track(
+                        MediaKind::Video,
+                        TransceiverDirection::SendOnly,
+                        Some(vec![
+                            SimulcastLayer::new("f"),
+                            SimulcastLayer::new("h"),
+                            SimulcastLayer::new("q"),
+                        ]),
+                    )
+                    .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
                     .connect("room1")
                     .await?;
 

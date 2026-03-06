@@ -4,7 +4,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent::actor::{Agent, AgentBuilder, AgentEvent, AgentStats};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
-use pulsebeam_agent::{MediaKind, TransceiverDirection};
+use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::net::IpAddr;
@@ -30,8 +30,13 @@ impl SimClientBuilder {
         })
     }
 
-    pub fn with_track(mut self, kind: MediaKind, dir: TransceiverDirection) -> Self {
-        self.agent_builder = self.agent_builder.with_track(kind, dir, None);
+    pub fn with_track(
+        mut self,
+        kind: MediaKind,
+        dir: TransceiverDirection,
+        simulcast_layers: Option<Vec<SimulcastLayer>>,
+    ) -> Self {
+        self.agent_builder = self.agent_builder.with_track(kind, dir, simulcast_layers);
         self
     }
 
@@ -74,8 +79,8 @@ impl SimClient {
                 Some(event) = self.agent.next_event() => {
                     match event {
                         AgentEvent::LocalTrackAdded(sender) => {
-                            tracing::info!("{} starting publisher for mid: {:?}", self.ip, sender.mid);
-                            let looper = create_h264_looper(30);
+                            tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
+                            let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
                             self.join_set.spawn(looper.run(sender));
                         }
                         AgentEvent::RemoteTrackAdded(recv) => {
@@ -101,8 +106,13 @@ pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
     Box::new(client)
 }
 
-pub fn create_h264_looper(fps: u32) -> H264Looper {
-    H264Looper::new(pulsebeam_testdata::RAW_H264_QUARTER, fps)
+pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
+    let data = match rid {
+        Some("f") => pulsebeam_testdata::RAW_H264_FULL,
+        Some("h") => pulsebeam_testdata::RAW_H264_HALF,
+        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER,
+    };
+    H264Looper::new(data, 30)
 }
 
 pub struct HyperClientWrapper<C>(pub Client<C, Full<Bytes>>);

@@ -15,22 +15,6 @@
 //!
 //! ### [`LongRunningTaskDetector`] Example:
 //!
-//! ```
-//! use std::sync::Arc;
-//!
-//! use tokio_detectors::detectors::LongRunningTaskDetector;
-//!
-//! let (lrtd, mut builder) = LongRunningTaskDetector::new_multi_threaded(
-//!     std::time::Duration::from_millis(10),
-//!     std::time::Duration::from_millis(100),
-//! );
-//! let runtime = builder.worker_threads(2).enable_all().build().unwrap();
-//! let runtime_ref = Arc::new(runtime);
-//! let lrtd_runtime_ref = runtime_ref.clone();
-//! lrtd.start(lrtd_runtime_ref);
-//! runtime_ref.block_on(async { print!("my async code") });
-//! ```
-//!
 //! The above will allow you to get details on what is blocking your tokio worker threads for longer that 100ms.
 //! The detail with default action handler will look like:
 //!
