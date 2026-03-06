@@ -28,18 +28,24 @@ use tokio_stream::wrappers::ReceiverStream;
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
 const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
-// Upgrade gate: require this much headroom above candidate cost before resuming.
-// 1.25× provides headroom against short-term VBR spikes once a layer is resumed.
-const UPGRADE_HYSTERESIS: f64 = 1.25;
-// Number of consecutive BWE ticks the upgrade condition must hold before we commit.
-// Each tick is BWE_SLOW_INTERVAL (200 ms), so 4 ticks = 2 s of confirmed headroom.
-// A single transient BWE over-estimate resets the counter, preventing premature upgrades.
-// Once bandwidth is genuinely stable at the required level the upgrade fires promptly.
-const UPGRADE_STABLE_TICKS: u32 = 4;
 // Sliding-window bitrate estimator: 20 buckets × 200 ms = 10 s window.
 // A keyframe occupies at most 1 bucket out of 20, so it shifts the estimate by ≤5%.
 const BITRATE_BUCKETS: usize = 20;
 const BITRATE_WINDOW_SECS: f64 = BITRATE_BUCKETS as f64 * 0.5; // 10 s
+
+// Debt thresholds (measured in ticks; one tick = BWE_SLOW_INTERVAL = 200 ms).
+// Debt = allocated_bps − available_bps.
+//
+// • DEBT_LINGER_THRESHOLD  – fraction of available bandwidth above which debt is
+//   non-trivial and starts counting toward DEBT_LINGER_MAX_TICKS.
+// • DEBT_LINGER_MAX_TICKS  – consecutive ticks of sustained linger-level debt that
+//   trigger a layer shed even when debt never hit the immediate threshold.
+//   5 × 200 ms = 1 s of lingering excess triggers a drop.
+// • DEBT_IMMEDIATE_THRESHOLD – fraction of available bandwidth at which debt is
+//   large enough to shed a layer right away without waiting.
+const DEBT_LINGER_THRESHOLD: f64 = 0.10;
+const DEBT_LINGER_MAX_TICKS: u32 = 5;
+const DEBT_IMMEDIATE_THRESHOLD: f64 = 0.50;
 // Used as last_active_bps for paused layers with no prior measurement so the
 // upgrade gate sees a realistic cost from the very first tick.
 fn layer_seed_bps(rid: Option<Rid>) -> f64 {
@@ -61,19 +67,19 @@ fn rid_quality_rank(rid: Option<Rid>) -> u8 {
 }
 
 // Manages which simulcast send-layers are active based on TWCC bandwidth estimates.
-// Pauses from highest quality first; resumes from lowest quality first.
+// Layers are ordered by priority: q (highest) → h → f (lowest).
+// The only control concept is *debt*: debt = allocated_bps − available_bps.
+// Heavy or lingering debt causes the lowest-priority active layer to be shed.
+// Once debt is gone, the next highest-priority paused layer is resumed if it fits.
 struct LayerController {
     available_bps: f64,
-    // Sorted ascending by quality: index 0 = lowest (q), last = highest (f).
+    // Sorted by priority: index 0 = q (highest), last = f (lowest).
     order: Vec<(Mid, Option<Rid>)>,
     states: HashMap<(Mid, Option<Rid>), LayerState>,
     notifiers: HashMap<(Mid, Option<Rid>), KeyframeNotifier>,
-    /// The paused layer currently being evaluated for upgrade, and how many
-    /// consecutive ticks its upgrade condition (hysteresis gate) has been met.
-    /// Resets whenever the candidate changes or the condition is no longer satisfied.
-    /// When the count reaches UPGRADE_STABLE_TICKS the layer is actually resumed.
-    upgrade_candidate: Option<(Mid, Option<Rid>)>,
-    upgrade_candidate_ticks: u32,
+    /// Consecutive ticks where debt exceeded DEBT_LINGER_THRESHOLD.
+    /// Resets to 0 whenever debt falls below the threshold or a layer is shed.
+    debt_ticks: u32,
 }
 
 struct LayerState {
@@ -98,8 +104,7 @@ impl LayerController {
             order: Vec::new(),
             states: HashMap::new(),
             notifiers: HashMap::new(),
-            upgrade_candidate: None,
-            upgrade_candidate_ticks: 0,
+            debt_ticks: 0,
         }
     }
 
@@ -109,12 +114,11 @@ impl LayerController {
 
     fn register(&mut self, mid: Mid, rid: Option<Rid>, notifier: KeyframeNotifier) {
         let key = (mid, rid);
-        // Only named simulcast layers above q (rank > 0) start paused.
-        // The base layer (q / rank 0) and non-simulcast (None) tracks start active
-        // immediately. Higher layers (h, f) are upgraded by tick() once BWE confirms
-        // headroom, preventing the initial burst that inflates last_active_bps.
+        // q (rank 0) and non-simulcast tracks start active immediately.
+        // h and f start paused; debt-free ticks resume them once BWE confirms budget.
         let paused = rid.is_some() && rid_quality_rank(rid) > 0;
         self.order.push(key);
+        // Sort so index 0 = highest priority (q), last = lowest priority (f).
         self.order.sort_by_key(|(_, rid)| rid_quality_rank(*rid));
         // Pre-fill the ring buffer with the seed bitrate so the upgrade gate sees a
         // realistic cost before the first full 10 s window of real measurements fills in.
@@ -182,7 +186,7 @@ impl LayerController {
             return 0.0;
         }
 
-        // Compute per-layer bps from frames accumulated since last tick.
+        // Advance per-layer bps estimates from frames accumulated since last tick.
         self.flush_frame_bitrates(now);
 
         for k in &self.order {
@@ -197,36 +201,43 @@ impl LayerController {
             }
         }
 
-        // Cost is always the smoothed inline-measured bps — valid for both active
-        // and paused layers since we measure frames before the pause gate.
-        let cost = |s: &LayerState| s.bps;
+        // Desired = sum of ALL layers regardless of paused state.
+        // This keeps BWE probing toward the full simulcast bandwidth.
+        let desired: f64 = self
+            .order
+            .iter()
+            .filter_map(|k| self.states.get(k))
+            .map(|s| s.bps)
+            .sum();
 
-        let mut current_allocated: f64 = self
+        // No BWE estimate yet — return the desired target but don't touch layers.
+        if self.available_bps == f64::MAX {
+            return desired;
+        }
+
+        let allocated: f64 = self
             .order
             .iter()
             .filter_map(|k| self.states.get(k))
             .filter(|s| !s.paused)
-            .map(cost)
+            .map(|s| s.bps)
             .sum();
 
-        // Don't upgrade or downgrade until the first real BWE estimate has arrived.
-        // available_bps starts at f64::MAX as a sentinel meaning "no data yet".
-        if self.available_bps == f64::MAX {
-            return current_allocated; // Initial budget simply maps to initially active layers
+        // Debt = how far active layers exceed available bandwidth (negative = surplus).
+        let debt = allocated - self.available_bps;
+
+        // Track consecutive ticks where debt is non-trivial.
+        if debt > self.available_bps * DEBT_LINGER_THRESHOLD {
+            self.debt_ticks += 1;
+        } else {
+            self.debt_ticks = 0;
         }
 
-        const DOWNGRADE_TOLERANCE: f64 = 0.25;
+        let must_shed = debt > self.available_bps * DEBT_IMMEDIATE_THRESHOLD
+            || self.debt_ticks >= DEBT_LINGER_MAX_TICKS;
 
-        // Step 1: Downgrade Phase
-        // If the active layers cost more than the available BWE budget + tolerance,
-        // we must pause the highest active simulcast layer. Loop until it fits.
-        // Hold-down is intentionally NOT checked here: when bandwidth truly drops we
-        // must shed the highest-cost layer regardless of how recently it was resumed.
-        // Skipping a protected layer would leave a higher quality layer active while
-        // a lower quality layer is paused — an incoherent ordering that causes
-        // oscillation. The ring buffer already absorbs keyframe bursts (≤5% impact).
-        let tolerance = self.available_bps * DOWNGRADE_TOLERANCE;
-        while current_allocated > self.available_bps + tolerance {
+        if must_shed {
+            // Shed the lowest-priority active simulcast layer (f first, then h; never q).
             if let Some(key) = self
                 .order
                 .iter()
@@ -240,106 +251,48 @@ impl LayerController {
             {
                 if let Some(s) = self.states.get_mut(&key) {
                     s.paused = true;
-                    current_allocated -= cost(s);
                 }
+                self.debt_ticks = 0;
                 tracing::info!(
                     mid = ?key.0,
                     rid = ?key.1,
+                    debt = %Bitrate::from(debt.max(0.0)),
                     available = %Bitrate::from(self.available_bps),
-                    allocated = %Bitrate::from(current_allocated),
                     "bwe: pause layer"
                 );
-                // A downgrade invalidates any pending upgrade streak.
-                self.upgrade_candidate = None;
-                self.upgrade_candidate_ticks = 0;
-            } else {
-                break; // Only base layer left, or nothing can be paused
             }
-        }
-
-        // Step 2: Upgrade Phase
-        // Find the lowest-quality paused layer whose upgrade gate is satisfied.
-        // Rather than upgrading immediately on the first qualifying tick (which would
-        // react to transient BWE over-estimates), we require the condition to hold for
-        // UPGRADE_STABLE_TICKS consecutive ticks. The counter resets if the candidate
-        // changes or the gate is no longer met, so genuine sustained headroom upgrades
-        // promptly (4 × 200 ms = 2 s) while single-tick spikes are rejected.
-        //
-        // Strict ordering is maintained: we only evaluate the *lowest* paused layer.
-        // f is never considered while h is paused.
-        let next_paused = self
-            .order
-            .iter()
-            .find(|k| self.states.get(*k).map_or(false, |s| s.paused))
-            .cloned();
-
-        if let Some(key) = next_paused {
-            let state = self.states.get(&key).unwrap();
-            let candidate_cost = cost(state);
-            let needed_budget = current_allocated + (candidate_cost * UPGRADE_HYSTERESIS);
-            let gate_met = candidate_cost > 0.0 && needed_budget <= self.available_bps;
-
-            // If this is a different candidate than last tick, reset the counter.
-            if self.upgrade_candidate.as_ref() != Some(&key) {
-                self.upgrade_candidate = Some(key);
-                self.upgrade_candidate_ticks = 0;
-            }
-
-            if gate_met {
-                self.upgrade_candidate_ticks += 1;
-                tracing::debug!(
-                    rid = ?key.1,
-                    ticks = self.upgrade_candidate_ticks,
-                    needed = %Bitrate::from(needed_budget),
-                    available = %Bitrate::from(self.available_bps),
-                    "bwe: upgrade gate tick"
-                );
-                if self.upgrade_candidate_ticks >= UPGRADE_STABLE_TICKS {
+        } else if debt <= 0.0 {
+            // No debt — try to resume the highest-priority paused layer if it fits.
+            // order is q→h→f so the first paused entry is the most important to restore.
+            if let Some(key) = self
+                .order
+                .iter()
+                .find(|k| self.states.get(*k).map_or(false, |s| s.paused))
+                .cloned()
+            {
+                let candidate_bps = self.states.get(&key).map_or(0.0, |s| s.bps);
+                let surplus = -debt; // available - allocated
+                if candidate_bps > 0.0 && candidate_bps <= surplus {
                     if let Some(s) = self.states.get_mut(&key) {
                         s.paused = false;
                     }
-                    current_allocated += candidate_cost;
-                    // Reset so the next candidate starts fresh.
-                    self.upgrade_candidate = None;
-                    self.upgrade_candidate_ticks = 0;
                     tracing::info!(
                         mid = ?key.0,
                         rid = ?key.1,
                         available = %Bitrate::from(self.available_bps),
-                        candidate_cost = %Bitrate::from(candidate_cost),
-                        surplus = %Bitrate::from(self.available_bps - current_allocated),
+                        candidate = %Bitrate::from(candidate_bps),
+                        surplus = %Bitrate::from(surplus),
                         "bwe: resume layer"
                     );
                     if let Some(n) = self.notifiers.get(&key) {
                         n.notify();
                     }
                 }
-            } else {
-                // Gate not met this tick — reset counter so we require a fresh streak.
-                self.upgrade_candidate_ticks = 0;
             }
-        } else {
-            // No paused layers — clear any stale candidate state.
-            self.upgrade_candidate = None;
-            self.upgrade_candidate_ticks = 0;
         }
+        // else: debt is small but positive — acceptable, do nothing this tick.
 
-        // Step 3: Desired-bitrate Projection
-        // Tell BWE the total we'd use if all layers were active, plus a headroom
-        // factor. Without headroom the probe target equals exactly the measured sum,
-        // so BWE stops probing right at the edge and our upgrade gate
-        // (current + candidate * UPGRADE_HYSTERESIS) can never clear. With headroom
-        // BWE continues probing past the sum, giving the gate the surplus it needs.
-        const DESIRED_HEADROOM: f64 = 1.2; // probe 20% above measured full-simulcast sum
-        let total_desired: f64 = self
-            .order
-            .iter()
-            .filter_map(|k| self.states.get(k))
-            .map(cost)
-            .sum::<f64>()
-            * DESIRED_HEADROOM;
-
-        total_desired
+        desired
     }
 }
 
