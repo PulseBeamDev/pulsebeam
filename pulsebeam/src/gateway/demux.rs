@@ -2,7 +2,7 @@ use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UnifiedSocketReader;
 
 use crate::gateway::ice;
-use std::collections::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::net::SocketAddr;
 
 pub type ParticipantHandle = pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>;

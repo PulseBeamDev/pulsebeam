@@ -1,8 +1,8 @@
 use super::signaling::Signaling;
+use ahash::{HashMap, HashMapExt};
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use str0m::bwe::BweKind;

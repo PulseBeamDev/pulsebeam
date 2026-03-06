@@ -1,6 +1,7 @@
+use ahash::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
 
 use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;

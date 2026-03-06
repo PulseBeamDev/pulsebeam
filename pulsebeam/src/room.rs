@@ -1,8 +1,5 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-    time::Duration,
-};
+use ahash::{HashMap, HashMapExt};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},
@@ -162,9 +159,8 @@ impl RoomActor {
         // Use .map() instead of an async block to avoid the Rust compiler storing
         // participant_task twice at the Suspend0 point (once as upvar, once as __awaitee),
         // which doubles the per-entry size in the JoinSet from ~73KB to ~37KB.
-        self.participant_tasks.spawn(
-            participant_task.map(move |(id, status)| (id, connection_id, status)),
-        );
+        self.participant_tasks
+            .spawn(participant_task.map(move |(id, status)| (id, connection_id, status)));
 
         self.state.participants.insert(
             (participant_id, connection_id),
