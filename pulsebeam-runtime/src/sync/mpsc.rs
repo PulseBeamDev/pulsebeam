@@ -44,7 +44,13 @@ impl<T> Ring<T> {
         if capacity == 0 {
             capacity = 1;
         } else if !capacity.is_power_of_two() {
+            let old_cap = capacity;
             capacity = capacity.next_power_of_two();
+            tracing::warn!(
+                "Capacity should be power of 2, use nearest: {} -> {}",
+                old_cap,
+                capacity
+            );
         }
 
         let mut slots = Vec::with_capacity(capacity);
@@ -147,38 +153,29 @@ impl<T> Receiver<T> {
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
-
         loop {
+            // Snapshot producer head. This allows batching efficiency without a batching API.
+            // Creates a fast-path for a slightly behind receiver to catch up without
+            // spending an atomic load on every iteration.
+            //
+            // Safety: head is strictly monotonically increasing
             if self.next_seq == self.local_head {
                 self.local_head = self.ring.head.load(Ordering::Acquire);
             }
 
+            // Closed and nothing left
             if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= self.local_head {
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
+            // No new items — register our waker via the event listener and park.
             if self.next_seq >= self.local_head {
-                // Skip listener registration entirely if the waker is a no-op.
-                // This avoids heap allocation and lock contention in callers
-                // that only want a non-blocking poll (e.g. try_recv shims).
-                if cx.waker().will_wake(std::task::Waker::noop()) {
-                    return Poll::Pending;
+                if self.register_waker(cx) {
+                    // Listener was already notified before we polled it —
+                    // an item may have arrived; re-read head and retry.
+                    continue;
                 }
-
-                match &mut self.listener {
-                    Some(l) => {
-                        if Pin::new(l).poll(cx).is_pending() {
-                            return Poll::Pending;
-                        }
-                        self.listener = None;
-                        continue;
-                    }
-                    None => {
-                        self.listener = Some(self.ring.event.listen());
-                        continue;
-                    }
-                }
+                return Poll::Pending;
             }
 
             let idx = (self.next_seq as usize) & self.ring.mask;
@@ -194,14 +191,16 @@ impl<T> Receiver<T> {
                     metrics::counter!("mpsc_receive_lag_total").increment(1);
                     return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
                 } else {
-                    // Stale slot, producer hasn't reached here yet
-                    if self.listener.is_none() && !cx.waker().will_wake(std::task::Waker::noop()) {
-                        self.listener = Some(self.ring.event.listen());
+                    // Stale slot — a producer claimed this seq but hasn't written yet.
+                    // Register the waker and wait for the write to complete.
+                    if self.register_waker(cx) {
+                        continue;
                     }
-
                     return Poll::Pending;
                 }
             }
+
+            let coop = ready!(tokio::task::coop::poll_proceed(cx));
 
             if let Some(val) = slot.val.take() {
                 coop.made_progress();
@@ -217,9 +216,36 @@ impl<T> Receiver<T> {
                 return Poll::Ready(Ok(val));
             }
 
+            // This shouldn't ever happen, but just in case..
+            // Seq was correct but value missing — treat as lag
             self.next_seq = self.local_head;
             metrics::counter!("mpsc_receive_lag_total").increment(1);
             return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+        }
+    }
+
+    /// Register `cx.waker()` with the underlying event so the task is re-woken
+    /// when a sender writes a new item.
+    ///
+    /// Returns `true` if the listener was **already notified** before we could
+    /// register the waker — the caller should re-check the ring and retry
+    /// rather than parking.  Returns `false` if the waker is now registered
+    /// and the caller should return `Poll::Pending`.
+    ///
+    /// In event-listener v5, `EventListener` is `Unpin` (backed by a `Box`),
+    /// so we can poll it via `Pin::new` without unsafe code.
+    fn register_waker(&mut self, cx: &mut Context<'_>) -> bool {
+        let listener = self
+            .listener
+            .get_or_insert_with(|| self.ring.event.listen());
+        match std::pin::Pin::new(listener).poll(cx) {
+            Poll::Ready(()) => {
+                // The event fired before or exactly when we polled — discard
+                // this listener so a fresh one is created on the next call.
+                self.listener = None;
+                true
+            }
+            Poll::Pending => false,
         }
     }
 
@@ -281,6 +307,7 @@ pub fn channel<T: Send + Sync + 'static>(capacity: usize) -> (Sender<T>, Receive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn basic_send_recv() {
@@ -328,5 +355,57 @@ mod tests {
         assert_eq!(rx.recv().await, Ok(3));
         assert_eq!(rx.recv().await, Ok(4));
         assert_eq!(rx.recv().await, Ok(5));
+    }
+
+    #[tokio::test]
+    async fn receiver_detects_overwrite_during_read() {
+        let (tx, mut rx) = channel::<u64>(2); // Small cap to force collisions
+
+        tx.try_send(0).unwrap();
+        assert_eq!(rx.recv().await, Ok(0));
+
+        // Rx expects seq 1. Overwrite slot 1 before rx reads it.
+        tx.try_send(1).unwrap(); // Slot 1
+        tx.try_send(2).unwrap(); // Slot 0 (overwrites 0)
+        tx.try_send(3).unwrap(); // Slot 1 (overwrites 1) -> rx expecting 1 is now LAGGED
+
+        // Head is 4. Earliest valid is 4-2=2. Rx expects 1. 1 < 2.
+        // Should return Lagged(4).
+        match rx.recv().await {
+            Err(RecvError::Lagged(s)) => assert_eq!(s, 4),
+            Ok(v) => panic!("Should have lagged, got {}", v),
+            Err(e) => panic!("Unexpected error {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_rejects_sends() {
+        let (tx, rx) = channel::<u64>(4);
+
+        tx.try_send(1).unwrap();
+        drop(rx); // Receiver closed
+
+        match tx.try_send(2) {
+            Err(TrySendError::Closed(_)) => {}
+            Ok(()) => panic!("Expected closed error after receiver drop"),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_waker_notification() {
+        let (tx, mut rx) = channel::<u64>(4);
+
+        let h = tokio::spawn(async move {
+            // This should block until the sender sends
+            rx.recv().await
+        });
+
+        // Ensure the task has likely polled and parked
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        tx.try_send(99).unwrap();
+
+        let result = h.await.unwrap();
+        assert_eq!(result, Ok(99));
     }
 }
