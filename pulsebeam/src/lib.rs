@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audio_selector;
 mod bitrate;
 pub mod controller;
 pub mod entity;

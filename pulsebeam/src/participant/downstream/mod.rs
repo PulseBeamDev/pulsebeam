@@ -1,6 +1,7 @@
 mod audio;
 mod video;
 
+use crate::audio_selector::AudioSelectorSubscription;
 use crate::bitrate::BitrateController;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
@@ -38,9 +39,20 @@ impl DownstreamAllocator {
         }
     }
 
+    /// Replace the audio allocator's input receivers with those from the
+    /// room-level audio selector subscription.
+    ///
+    /// Must be called once after the room hands the subscription to this
+    /// participant (via `ParticipantControlMessage::AudioSubscription`).
+    pub fn set_audio_subscription(&mut self, sub: AudioSelectorSubscription) {
+        self.audio.set_subscription(sub);
+    }
+
     pub fn add_track(&mut self, track: TrackReceiver) {
         match track.meta.kind {
-            MediaKind::Audio => self.audio.add_track(track),
+            // Audio is now managed by the room-level TopNAudioSelector;
+            // individual audio TrackReceivers are not added here.
+            MediaKind::Audio => {}
             MediaKind::Video => self.video.add_track(track),
         }
         self.dirty_allocation = true;
@@ -48,7 +60,8 @@ impl DownstreamAllocator {
 
     pub fn remove_track(&mut self, track: &TrackReceiver) {
         match track.meta.kind {
-            MediaKind::Audio => self.audio.remove_track(&track.meta.id),
+            // Removal of audio tracks is handled by the room-level selector.
+            MediaKind::Audio => {}
             MediaKind::Video => self.video.remove_track(&track.meta.id),
         }
         self.dirty_allocation = true;

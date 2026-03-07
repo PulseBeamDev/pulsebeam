@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::gateway::GatewayWorkerHandle;
 use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
-use crate::{entity, gateway, room, track};
+use crate::{audio_selector::AudioSelectorSubscription, entity, gateway, room, track};
 use futures_util::stream::SelectAll;
 use futures_util::{Stream, StreamExt};
 use pulsebeam_runtime::actor::ActorKind;
@@ -47,6 +47,10 @@ pub enum ParticipantControlMessage {
     TracksPublished(Arc<HashMap<entity::TrackId, track::TrackReceiver>>),
     TracksUnpublished(Arc<HashMap<entity::TrackId, track::TrackReceiver>>),
     TrackPublishRejected(track::TrackReceiver),
+    /// Initial audio subscription from the room-level Top-N selector.
+    /// The participant's `AudioAllocator` uses this to receive the pre-ranked
+    /// audio streams without any per-participant Top-N logic.
+    AudioSubscription(AudioSelectorSubscription),
 }
 
 pub struct ParticipantMessageSet;
@@ -275,6 +279,9 @@ impl ParticipantActor {
                 self.core.remove_available_tracks(&tracks)
             }
             ParticipantControlMessage::TrackPublishRejected(_) => {}
+            ParticipantControlMessage::AudioSubscription(sub) => {
+                self.core.downstream.set_audio_subscription(sub);
+            }
         };
     }
 

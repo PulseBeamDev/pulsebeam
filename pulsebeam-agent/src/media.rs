@@ -47,11 +47,19 @@ impl H264Looper {
         let frames: Vec<Bytes> = slicer.map(Bytes::copy_from_slice).collect();
         let first_idr = Self::find_first_idr(&frames);
         tracing::info!(frames = frames.len(), first_idr, "H264Looper ready");
-        Self { frames, index: 0, fps, first_idr }
+        Self {
+            frames,
+            index: 0,
+            fps,
+            first_idr,
+        }
     }
 
     fn find_first_idr(frames: &[Bytes]) -> usize {
-        frames.iter().position(|f| Self::frame_has_idr(f)).unwrap_or(0)
+        frames
+            .iter()
+            .position(|f| Self::frame_has_idr(f))
+            .unwrap_or(0)
     }
 
     /// Returns `true` when the Annex-B buffer contains at least one IDR NALU (type 5).
@@ -87,7 +95,13 @@ impl H264Looper {
     pub async fn run(mut self, sender: LocalTrack) {
         let clock_rate = 90_000u64;
         let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
-        let LocalTrack { mid, rid, tx, mut keyframe_rx } = sender;
+        let LocalTrack {
+            mid,
+            rid,
+            tx,
+            mut keyframe_rx,
+            ..
+        } = sender;
 
         let mut interval = tokio::time::interval(frame_interval);
         // Skip missed ticks to avoid stale timestamp bursts under load.

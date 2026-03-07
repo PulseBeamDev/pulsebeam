@@ -313,6 +313,7 @@ pub struct TrackStats {
 
 #[derive(Debug)]
 pub struct LocalTrack {
+    pub kind: MediaKind,
     pub mid: Mid,
     pub rid: Option<Rid>,
     pub(crate) tx: mpsc::Sender<MediaFrame>,
@@ -824,6 +825,7 @@ impl AgentActor {
                     self.senders.insert((mid, rid), ReceiverStream::new(rx));
 
                     self.emit(AgentEvent::LocalTrackAdded(LocalTrack {
+                        kind: media.kind,
                         mid,
                         tx,
                         rid,

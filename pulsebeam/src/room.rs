@@ -8,6 +8,7 @@ use pulsebeam_runtime::{
 use tokio::task::JoinSet;
 
 use crate::{
+    audio_selector::{self, AudioSelectorHandle},
     entity::{ConnectionId, ParticipantId, RoomId, TrackId},
     node,
     participant::{self, ParticipantActor},
@@ -15,6 +16,7 @@ use crate::{
 };
 use futures_util::FutureExt;
 use pulsebeam_runtime::actor;
+use str0m::media::MediaKind;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -55,6 +57,9 @@ pub struct RoomActor {
     room_id: RoomId,
     state: RoomState,
     participant_tasks: JoinSet<(ParticipantId, ConnectionId, ActorStatus)>,
+    /// Room-level Top-N audio selector.  Holds the command sender; dropping
+    /// this field shuts down the background selector task.
+    audio_selector: AudioSelectorHandle,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -138,11 +143,14 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 
 impl RoomActor {
     pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
+        let (audio_selector, selector_task) = audio_selector::create(64);
+        tokio::spawn(selector_task);
         Self {
             node_ctx,
             room_id,
             state: RoomState::default(),
             participant_tasks: JoinSet::new(),
+            audio_selector,
         }
     }
 
@@ -156,9 +164,6 @@ impl RoomActor {
             actor::prepare(participant_actor, RunnerConfig::default());
         let participant_id = participant_handle.meta;
 
-        // Use .map() instead of an async block to avoid the Rust compiler storing
-        // participant_task twice at the Suspend0 point (once as upvar, once as __awaitee),
-        // which doubles the per-entry size in the JoinSet from ~73KB to ~37KB.
         self.participant_tasks
             .spawn(participant_task.map(move |(id, status)| (id, connection_id, status)));
 
@@ -171,10 +176,19 @@ impl RoomActor {
             },
         );
 
-        // Send current tracks to new participant
+        // Send current tracks to new participant.
         let _ = participant_handle
             .send(participant::ParticipantControlMessage::TracksSnapshot(
                 self.state.tracks.clone(),
+            ))
+            .await;
+
+        // Hand the participant its audio subscription so it can receive
+        // the Top-N pre-selected audio streams from the room selector.
+        let sub = self.audio_selector.subscribe();
+        let _ = participant_handle
+            .send(participant::ParticipantControlMessage::AudioSubscription(
+                sub,
             ))
             .await;
     }
@@ -213,9 +227,16 @@ impl RoomActor {
         // Terminate participant actor
         let _ = participant.handle.terminate().await;
 
-        // Remove tracks published by this connection
-        for (track_id, _) in participant.tracks.iter_mut() {
+        // Remove tracks published by this connection.
+        for (track_id, track) in participant.tracks.iter() {
             self.state.tracks.remove(track_id);
+            // Notify the audio selector to remove audio tracks.
+            if track.meta.kind == MediaKind::Audio {
+                let _ = self
+                    .audio_selector
+                    .cmd_tx
+                    .try_send(audio_selector::AudioSelectorCmd::RemoveTrack(*track_id));
+            }
         }
 
         // Broadcast unpublish to other participants
@@ -259,7 +280,17 @@ impl RoomActor {
         origin.tracks.insert(track_id, track_handle.clone());
         self.state.tracks.insert(track_id, track_handle.clone());
 
-        // Broadcast new track to all participants
+        // Forward audio tracks to the room-level selector.
+        if track_handle.meta.kind == MediaKind::Audio {
+            let _ =
+                self.audio_selector
+                    .cmd_tx
+                    .try_send(audio_selector::AudioSelectorCmd::AddTrack(
+                        track_handle.clone(),
+                    ));
+        }
+
+        // Broadcast new track to all participants.
         let mut new_tracks = HashMap::new();
         new_tracks.insert(track_id, track_handle.clone());
         let new_tracks = Arc::new(new_tracks);

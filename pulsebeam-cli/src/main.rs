@@ -524,10 +524,15 @@ async fn spawn_agent(
                 SimulcastLayer::new("q"),
             ]),
         );
+        builder = builder.with_track(MediaKind::Audio, TransceiverDirection::SendOnly, None);
     }
 
     for _ in 0..16 {
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
+    }
+
+    for _ in 0..9 {
+        builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
     let mut agent = builder.connect(&room).await?;
@@ -707,6 +712,10 @@ fn rid_key(rid: &Option<Rid>) -> String {
 }
 
 async fn handle_local_track(track: LocalTrack) {
+    if track.kind.is_audio() {
+        return;
+    }
+
     let rid_str = track.rid.as_ref().map(|r| r.as_ref());
     let data = match rid_str {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL,
