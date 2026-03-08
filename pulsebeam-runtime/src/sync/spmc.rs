@@ -1,11 +1,11 @@
 use crossbeam_utils::CachePadded;
-use event_listener::{Event, EventListener};
 use futures_lite::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, ready};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker, ready};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
@@ -29,7 +29,25 @@ struct Ring<T> {
     head: AtomicU64,
     mask: usize,
     slots: Vec<CachePadded<RwLock<Slot<T>>>>,
-    event: Event,
+    /// Fast-path gate: `true` iff at least one receiver is currently parked.
+    ///
+    /// The sender loads this with `Acquire` before touching `waiters`.  When
+    /// `false` (the common case — active receivers keep up with the sender)
+    /// the sender does **zero** additional work: no lock, no atomic RMW beyond
+    /// storing `head`.  This is strictly cheaper than both `event-listener`
+    /// and `tokio::Notify`, which always acquire an internal mutex on every
+    /// `notify` call regardless of waiter presence.
+    has_waiters: AtomicBool,
+    /// Per-receiver waker table, keyed by stable receiver ID.
+    ///
+    /// Only accessed when `has_waiters` is `true`.  Using (id, Waker) pairs
+    /// rather than a plain `Vec<Waker>` prevents waker accumulation: repeated
+    /// calls to `register_waker` from the same receiver find and update the
+    /// existing slot instead of pushing a new one.
+    waiters: Mutex<Vec<(u64, Waker)>>,
+    /// Monotonically increasing counter; each `Receiver::clone()` grabs a
+    /// unique ID so it can update its own waker slot in `waiters`.
+    next_receiver_id: AtomicU64,
     closed: AtomicU64,
 }
 
@@ -54,7 +72,9 @@ impl<T> Ring<T> {
             head: AtomicU64::new(0),
             mask: capacity - 1,
             slots,
-            event: Event::new(),
+            has_waiters: AtomicBool::new(false),
+            waiters: Mutex::new(Vec::new()),
+            next_receiver_id: AtomicU64::new(1), // 0 reserved for initial receiver
             closed: AtomicU64::new(0),
         })
     }
@@ -82,34 +102,83 @@ impl<T> Sender<T> {
 
         self.ring.head.store(self.local_head + 1, Ordering::Release);
         self.local_head += 1;
-        self.ring.event.notify(usize::MAX);
+        // Fast path: single Acquire load.  If no receivers are parked, we do
+        // no further work — no mutex, no CAS, nothing.
+        self.wake_parked();
+    }
+}
+
+impl<T> Sender<T> {
+    /// Wake all currently-parked receivers.  Extracted so both `send` and
+    /// `Drop` share the same logic.
+    fn wake_parked(&self) {
+        if !self.ring.has_waiters.load(Ordering::Acquire) {
+            return;
+        }
+        // Take the whole Vec out under lock (O(1)), release the lock, then
+        // call each waker outside the lock to avoid lock-order issues and
+        // allow receivers to re-register while we are waking others.
+        let to_wake = {
+            let mut w = self.ring.waiters.lock().unwrap();
+            self.ring.has_waiters.store(false, Ordering::Relaxed);
+            std::mem::take(&mut *w)
+        };
+        for (_, waker) in to_wake {
+            waker.wake();
+        }
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.ring.closed.store(1, Ordering::Release);
-        self.ring.event.notify(usize::MAX);
+        self.wake_parked();
     }
 }
 
-#[derive(Debug)]
 pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
     local_head: u64,
-    listener: Option<EventListener>,
+    /// Stable receiver identity used to address this receiver's waker slot
+    /// inside `ring.waiters`.  Assigned at construction / clone; freed on drop.
+    id: u64,
     pkts_received: u64,
 }
 
-impl<T: Clone> Receiver<T> {
+impl<T> std::fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver")
+            .field("id", &self.id)
+            .field("next_seq", &self.next_seq)
+            .field("local_head", &self.local_head)
+            .field("pkts_received", &self.pkts_received)
+            .finish()
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        // Remove our waker slot from the waiters Vec so stale wakers do not
+        // accumulate after a receiver is dropped (e.g. after a track switch).
+        if self.ring.has_waiters.load(Ordering::Relaxed) {
+            if let Ok(mut w) = self.ring.waiters.lock() {
+                w.retain(|(id, _)| *id != self.id);
+                if w.is_empty() {
+                    self.ring.has_waiters.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync> Receiver<T> {
     const METRIC_FLUSH_MASK: u64 = 1023;
 
     /// Jump to the producer's current position (Audio/Low-latency).
     pub fn sync(&mut self) {
         self.local_head = self.ring.head.load(Ordering::Acquire);
         self.next_seq = self.local_head;
-        self.listener = None;
     }
 
     /// Jump back halfway to provide a processing window (Video/Burst).
@@ -150,11 +219,11 @@ impl<T: Clone> Receiver<T> {
                 return Poll::Ready(Err(RecvError::Closed));
             }
 
-            // No new items — register our waker via the event listener and park.
+            // No new items — register our waker and park.
             if self.next_seq >= self.local_head {
                 if self.register_waker(cx) {
-                    // Listener was already notified before we polled it —
-                    // an item may have arrived; re-read head and retry.
+                    // Head advanced between our empty-check and waker
+                    // registration — re-read head and retry.
                     continue;
                 }
                 return Poll::Pending;
@@ -214,27 +283,43 @@ impl<T: Clone> Receiver<T> {
         }
     }
 
-    /// Register `cx.waker()` with the underlying event so the task is re-woken
-    /// when the sender writes a new item.
+    /// Register `cx.waker()` for this receiver and park until the sender
+    /// calls `send()` or drops.
     ///
-    /// Returns `true` if the listener was **already notified** before we could
-    /// register the waker — the caller should re-check the ring and retry
-    /// rather than parking.  Returns `false` if the waker is now registered
-    /// and the caller should return `Poll::Pending`.
+    /// Uses a stable `id` slot in `ring.waiters` so repeated calls from the
+    /// same receiver find-and-update rather than accumulate.
     ///
-    /// In event-listener v5, `EventListener` is `Unpin` (backed by a `Box`),
-    /// so we can poll it via `Pin::new` without unsafe code.
+    /// Returns `true` if the ring head advanced between our prior empty-check
+    /// and the waker registration — the sender already committed data but
+    /// may not have seen `has_waiters == true` in time.  The caller should
+    /// re-enter the poll loop.  Returns `false` when the waker is registered
+    /// and the task should return `Poll::Pending`.
     fn register_waker(&mut self, cx: &mut Context<'_>) -> bool {
-        let listener = self.listener.get_or_insert_with(|| self.ring.event.listen());
-        match std::pin::Pin::new(listener).poll(cx) {
-            Poll::Ready(()) => {
-                // The event fired before or exactly when we polled — discard
-                // this listener so a fresh one is created on the next call.
-                self.listener = None;
-                true
+        {
+            let mut w = self.ring.waiters.lock().unwrap();
+            // Find-or-insert: update existing slot to avoid waker accumulation
+            // across repeated polls from the same receiver.
+            if let Some(entry) = w.iter_mut().find(|(id, _)| *id == self.id) {
+                // Lazy: only clone if the waker actually changed.
+                if !entry.1.will_wake(cx.waker()) {
+                    entry.1 = cx.waker().clone();
+                }
+            } else {
+                w.push((self.id, cx.waker().clone()));
             }
-            Poll::Pending => false,
+            // Release ordering ensures the Vec write is visible to the sender's
+            // subsequent Acquire load of has_waiters.
+            self.ring.has_waiters.store(true, Ordering::Release);
         }
+        // Re-check head with Acquire to detect if the sender advanced head
+        // after our empty-check but before we registered the waker.  In that
+        // window the sender saw has_waiters == false and did not wake us.
+        // Returning true causes the caller to retry; our waker remains in the
+        // Vec and will be harmlessly drained on the next send.
+        if self.ring.head.load(Ordering::Acquire) > self.next_seq {
+            return true;
+        }
+        false
     }
 
     fn flush_metrics(&mut self) {
@@ -249,7 +334,7 @@ impl<T: Clone> Receiver<T> {
     }
 }
 
-impl<T: Clone> Stream for Receiver<T> {
+impl<T: Clone + Send + Sync> Stream for Receiver<T> {
     type Item = Result<T, StreamRecvError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -270,7 +355,9 @@ impl<T: Clone> Clone for Receiver<T> {
             ring: self.ring.clone(),
             next_seq: self.next_seq,
             local_head: self.local_head,
-            listener: None,
+            // Assign a fresh stable ID so this clone has its own slot in
+            // ring.waiters and doesn't collide with the original.
+            id: self.ring.next_receiver_id.fetch_add(1, Ordering::Relaxed),
             pkts_received: 0,
         }
     }
@@ -304,7 +391,7 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
             ring: ring.clone(),
             next_seq: 0,
             local_head: 0,
-            listener: None,
+            id: 0,
             pkts_received: 0,
         },
     )

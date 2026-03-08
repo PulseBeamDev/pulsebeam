@@ -1,4 +1,4 @@
-use event_listener::{Event, EventListener};
+use diatomic_waker::{WakeSink, WakeSource};
 use futures_lite::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ struct Slot<T> {
 
 #[derive(Debug)]
 struct Ring<T> {
-    // This is mspc, but we expect very low contention on the producers.
+    // This is mpsc, but we expect very low contention on the producers.
     // Mutex is generally cheaper than RWLock. So, no reason to pay
     // RWLock overhead.
     slots: Vec<Mutex<Slot<T>>>,
@@ -35,12 +35,19 @@ struct Ring<T> {
     /// Updated by the Receiver on each successful read so that Senders can
     /// compute fill pressure without coordinating with the Receiver directly.
     tail: AtomicU64,
-    event: Event,
+    /// Lock-free waker notification via `diatomic_waker`.
+    ///
+    /// `WakeSource::notify()` is a pure CAS state machine — no mutex, no heap
+    /// allocation on the sender hot path.  The matching `WakeSink` lives
+    /// inline in `Receiver<T>`; it caches the last registered `Waker` and
+    /// only re-clones it when the task context changes, so repeated calls
+    /// from the same `select!` branch are nearly free.
+    wake_src: WakeSource,
     closed: AtomicU64,
 }
 
 impl<T> Ring<T> {
-    fn new(mut capacity: usize) -> Arc<Self> {
+    fn new(mut capacity: usize, wake_src: WakeSource) -> Arc<Self> {
         if capacity == 0 {
             capacity = 1;
         } else if !capacity.is_power_of_two() {
@@ -63,7 +70,7 @@ impl<T> Ring<T> {
             mask: capacity - 1,
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
-            event: Event::new(),
+            wake_src,
             closed: AtomicU64::new(0),
         })
     }
@@ -94,7 +101,8 @@ impl<T> Sender<T> {
             slot.seq = seq;
         }
 
-        self.ring.event.notify(1);
+        // Fully lockless CAS: no mutex, no alloc on sender hot path.
+        self.ring.wake_src.notify();
         Ok(())
     }
 }
@@ -130,12 +138,21 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {}
 }
 
-#[derive(Debug)]
 pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
     local_head: u64,
-    listener: Option<EventListener>,
+    /// Inline lock-free waker sink.
+    ///
+    /// `WakeSink` stores two `Waker` slots internally (the DiatomicWaker
+    /// two-slot design) and is entirely allocation-free after `channel()` —
+    /// the single `Arc<DiatomicWaker>` is created once at channel-creation
+    /// time and shared with the `WakeSource` in `Ring<T>`.
+    ///
+    /// Registration is lazy: `register()` only re-clones the waker when the
+    /// task context actually changes, so polling the same future in a tight
+    /// loop is essentially free.
+    wake_sink: WakeSink,
     pkts_received: u64,
 }
 
@@ -145,7 +162,7 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-impl<T> Receiver<T> {
+impl<T: Send> Receiver<T> {
     const METRIC_FLUSH_MASK: u64 = 1023;
 
     pub async fn recv(&mut self) -> Result<T, RecvError> {
@@ -224,29 +241,29 @@ impl<T> Receiver<T> {
         }
     }
 
-    /// Register `cx.waker()` with the underlying event so the task is re-woken
-    /// when a sender writes a new item.
+    /// Register `cx.waker()` with the `WakeSink` and park until a sender
+    /// calls `WakeSource::notify()`.
     ///
-    /// Returns `true` if the listener was **already notified** before we could
-    /// register the waker — the caller should re-check the ring and retry
-    /// rather than parking.  Returns `false` if the waker is now registered
-    /// and the caller should return `Poll::Pending`.
-    ///
-    /// In event-listener v5, `EventListener` is `Unpin` (backed by a `Box`),
-    /// so we can poll it via `Pin::new` without unsafe code.
+    /// Returns `true` if the ring head advanced between the empty-check that
+    /// preceded this call and the registration: the sender may have already
+    /// fired `notify()` before we registered, so we unregister immediately
+    /// and tell the caller to retry.  Returns `false` when the waker is
+    /// registered and the task should return `Poll::Pending`.
     fn register_waker(&mut self, cx: &mut Context<'_>) -> bool {
-        let listener = self
-            .listener
-            .get_or_insert_with(|| self.ring.event.listen());
-        match std::pin::Pin::new(listener).poll(cx) {
-            Poll::Ready(()) => {
-                // The event fired before or exactly when we polled — discard
-                // this listener so a fresh one is created on the next call.
-                self.listener = None;
-                true
-            }
-            Poll::Pending => false,
+        // Lazy: DiatomicWaker only re-clones the Waker if the task context
+        // actually changed since the last registration — essentially free when
+        // called from the same future on repeated polls.
+        self.wake_sink.register(cx.waker());
+
+        // Re-check head with Acquire ordering.  If the sender bumped head
+        // after our empty-check but before we registered, we must not park:
+        // the sender called notify() on the old (empty) state and won't fire
+        // again for this item.  Unregister to keep the sink clean.
+        if self.ring.head.load(Ordering::Acquire) > self.next_seq {
+            self.wake_sink.unregister();
+            return true;
         }
+        false
     }
 
     fn flush_metrics(&mut self) {
@@ -259,7 +276,7 @@ impl<T> Receiver<T> {
     }
 }
 
-impl<T> Stream for Receiver<T> {
+impl<T: Send> Stream for Receiver<T> {
     type Item = Result<T, StreamRecvError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -291,14 +308,16 @@ pub fn channel<T: Send + Sync + 'static>(capacity: usize) -> (Sender<T>, Receive
         the producer, resulting in dropped data."
     );
 
-    let ring = Ring::new(capacity);
+    let wake_sink = WakeSink::new();
+    let wake_src = wake_sink.source();
+    let ring = Ring::new(capacity, wake_src);
     (
         Sender { ring: ring.clone() },
         Receiver {
             ring,
             next_seq: 0,
             local_head: 0,
-            listener: None,
+            wake_sink,
             pkts_received: 0,
         },
     )

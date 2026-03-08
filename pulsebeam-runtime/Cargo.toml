@@ -22,7 +22,6 @@ bytes = { workspace = true }
 crossbeam-utils = "0.8.21"
 dashmap = "6.1.0"
 diatomic-waker = "0.2"
-event-listener = "5.4.1"
 futures-lite = { workspace = true }
 libc = "0.2.182"
 loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true }
