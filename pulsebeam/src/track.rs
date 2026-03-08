@@ -300,13 +300,13 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000, 1),
             (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000, 4),
             (MediaKind::Video, Some(r)) if r.starts_with('f') => {
-                (SimulcastQuality::High, 800_000, 4)
+                (SimulcastQuality::High, 500_000, 4)
             }
             (MediaKind::Video, Some(r)) if r.starts_with('h') => {
-                (SimulcastQuality::Medium, 300_000, 2)
+                (SimulcastQuality::Medium, 150_000, 2)
             }
             (MediaKind::Video, Some(r)) if r.starts_with('q') => {
-                (SimulcastQuality::Low, 150_000, 1)
+                (SimulcastQuality::Low, 30_000, 1)
             }
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");

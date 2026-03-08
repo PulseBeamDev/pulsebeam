@@ -50,10 +50,10 @@ const DEBT_IMMEDIATE_THRESHOLD: f64 = 0.50;
 // upgrade gate sees a realistic cost from the very first tick.
 fn layer_seed_bps(rid: Option<Rid>) -> f64 {
     match rid_quality_rank(rid) {
-        0 => 300_000.0,
+        0 => 30_000.0,
         1 => 900_000.0,
         2 => 1_400_000.0,
-        _ => 300_000.0,
+        _ => 30_000.0,
     }
 }
 
@@ -237,7 +237,7 @@ impl LayerController {
             || self.debt_ticks >= DEBT_LINGER_MAX_TICKS;
 
         if must_shed {
-            // Shed the lowest-priority active simulcast layer (f first, then h; never q).
+            // Shed the lowest-priority active simulcast layer (f first, then h, then q).
             if let Some(key) = self
                 .order
                 .iter()
@@ -245,7 +245,6 @@ impl LayerController {
                 .find(|k| {
                     self.states.get(*k).map_or(false, |s| !s.paused)
                         && k.1.is_some()
-                        && rid_quality_rank(k.1) > 0
                 })
                 .cloned()
             {
@@ -441,7 +440,7 @@ impl AgentBuilder {
 
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            .enable_bwe(Some(Bitrate::kbps(300)))
+            .enable_bwe(Some(Bitrate::kbps(30)))
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);

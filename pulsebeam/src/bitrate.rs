@@ -28,9 +28,9 @@ impl Default for BitrateControllerConfig {
 impl BitrateControllerConfig {
     pub fn available_bandwidth() -> Self {
         Self {
-            min_bitrate: Bitrate::kbps(300),
+            min_bitrate: Bitrate::kbps(30),
             max_bitrate: Bitrate::mbps(10),
-            default_bitrate: Bitrate::kbps(300),
+            default_bitrate: Bitrate::kbps(30),
             headroom_factor: 1.0,
             max_decay_factor: 1.0, // allowed to drop instantly to target, EMA does the smoothing
             emergency_drop_threshold: 0.25, // only extreme drops
@@ -43,9 +43,9 @@ impl BitrateControllerConfig {
 
     pub fn desired_bitrate() -> Self {
         Self {
-            min_bitrate: Bitrate::kbps(300),
+            min_bitrate: Bitrate::kbps(30),
             max_bitrate: Bitrate::mbps(10),
-            default_bitrate: Bitrate::kbps(300),
+            default_bitrate: Bitrate::kbps(30),
             // No headroom shave: the probe signal in video.rs is already set above the upgrade
             // gate (UPGRADE_HYSTERESIS_FACTOR). Applying a <1.0 factor here makes the BWE
             // converge *below* the gate threshold, so the upgrade never fires.
@@ -201,9 +201,9 @@ mod tests {
     // A configuration matching the original test assumptions.
     fn test_config() -> BitrateControllerConfig {
         BitrateControllerConfig {
-            min_bitrate: Bitrate::kbps(300),
+            min_bitrate: Bitrate::kbps(30),
             max_bitrate: Bitrate::mbps(5),
-            default_bitrate: Bitrate::kbps(300),
+            default_bitrate: Bitrate::kbps(30),
             headroom_factor: 1.0,
             max_decay_factor: 0.95,
             emergency_drop_threshold: 0.50,
@@ -287,15 +287,15 @@ mod tests {
         config.required_up_samples = 3;
         let mut ctrl = BitrateController::new(config);
 
-        // Start 300
-        ctrl.update(Bitrate::kbps(300));
+        // Start 30
+        ctrl.update(Bitrate::kbps(30));
 
         // Jump to 500
         ctrl.update(Bitrate::kbps(500)); // Tick 1 (Pending)
-        assert_eq!(ctrl.current().as_f64(), 300_000.0);
+        assert_eq!(ctrl.current().as_f64(), 30_000.0);
 
         ctrl.update(Bitrate::kbps(500)); // Tick 2
-        assert_eq!(ctrl.current().as_f64(), 300_000.0);
+        assert_eq!(ctrl.current().as_f64(), 30_000.0);
 
         ctrl.update(Bitrate::kbps(500)); // Tick 3 (Commit)
         assert_eq!(ctrl.current().as_f64(), 500_000.0);
