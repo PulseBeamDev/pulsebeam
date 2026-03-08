@@ -1,8 +1,8 @@
 use crate::sync::Arc;
 use futures_lite::Stream;
 use std::pin::Pin;
-use std::sync::Mutex;
-use std::sync::RwLock;
+use crate::sync::Mutex;
+use crate::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker, ready};
 
@@ -94,7 +94,7 @@ impl<T> Sender<T> {
         let idx = (self.local_head as usize) & self.ring.mask;
 
         {
-            let mut slot = self.ring.slots[idx].write().unwrap();
+            let mut slot = self.ring.slots[idx].write();
             slot.val = Some(val);
             slot.seq = self.local_head;
         }
@@ -118,7 +118,7 @@ impl<T> Sender<T> {
         // call each waker outside the lock to avoid lock-order issues and
         // allow receivers to re-register while we are waking others.
         let to_wake = {
-            let mut w = self.ring.waiters.lock().unwrap();
+            let mut w = self.ring.waiters.lock();
             self.ring.has_waiters.store(false, Ordering::Relaxed);
             std::mem::take(&mut *w)
         };
@@ -165,11 +165,10 @@ impl<T> Drop for Receiver<T> {
         // Remove our waker slot from the waiters Vec so stale wakers do not
         // accumulate after a receiver is dropped (e.g. after a track switch).
         if self.ring.has_waiters.load(Ordering::Relaxed) {
-            if let Ok(mut w) = self.ring.waiters.lock() {
-                w.retain(|(id, _)| *id != self.id);
-                if w.is_empty() {
-                    self.ring.has_waiters.store(false, Ordering::Relaxed);
-                }
+            let mut w = self.ring.waiters.lock();
+            w.retain(|(id, _)| *id != self.id);
+            if w.is_empty() {
+                self.ring.has_waiters.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -234,7 +233,7 @@ impl<T: Clone + Send + Sync> Receiver<T> {
 
             // Read slot for next_seq
             let idx = (self.next_seq as usize) & self.ring.mask;
-            let slot = self.ring.slots[idx].read().unwrap();
+            let slot = self.ring.slots[idx].read();
             let slot_seq = slot.seq;
 
             // Seq mismatch — producer overwrote after head snapshot
@@ -299,7 +298,7 @@ impl<T: Clone + Send + Sync> Receiver<T> {
     /// and the task should return `Poll::Pending`.
     fn register_waker(&mut self, cx: &mut Context<'_>) -> bool {
         {
-            let mut w = self.ring.waiters.lock().unwrap();
+            let mut w = self.ring.waiters.lock();
             // Find-or-insert: update existing slot to avoid waker accumulation
             // across repeated polls from the same receiver.
             if let Some(entry) = w.iter_mut().find(|(id, _)| *id == self.id) {

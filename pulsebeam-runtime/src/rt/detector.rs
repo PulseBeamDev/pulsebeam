@@ -52,7 +52,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
-use std::sync::Mutex;
+use crate::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::thread::ThreadId;
@@ -162,17 +162,17 @@ impl WorkerSet {
     }
 
     fn add(&self, pid: ThreadInfo) {
-        let mut set = self.inner.lock().unwrap();
+        let mut set = self.inner.lock();
         set.insert(pid);
     }
 
     fn remove(&self, pid: ThreadInfo) {
-        let mut set = self.inner.lock().unwrap();
+        let mut set = self.inner.lock();
         set.remove(&pid);
     }
 
     fn get_all(&self) -> Vec<ThreadInfo> {
-        let set = self.inner.lock().unwrap();
+        let set = self.inner.lock();
         set.iter().cloned().collect()
     }
 }
@@ -358,14 +358,14 @@ impl LongRunningTaskDetector {
         runtime: Arc<Runtime>,
         action: Arc<dyn BlockingActionHandler>,
     ) {
-        *self.stop_flag.lock().unwrap() = false;
+        *self.stop_flag.lock() = false;
         let stop_flag = Arc::clone(&self.stop_flag);
         let detection_time = self.detection_time;
         let interval = self.interval;
         let workers = Arc::clone(&self.workers);
         thread::spawn(move || {
             let mut rng = rng();
-            while !*stop_flag.lock().unwrap() {
+            while !*stop_flag.lock() {
                 probe(&runtime, detection_time, &workers, &action);
                 thread::sleep(Duration::from_micros(
                     rng.random_range(10..=interval.as_micros().try_into().unwrap()),
@@ -376,7 +376,7 @@ impl LongRunningTaskDetector {
 
     /// Stops the monitoring thread. Does nothing if monitoring thread is already stopped.
     pub fn stop(&self) {
-        let mut sf = self.stop_flag.lock().unwrap();
+        let mut sf = self.stop_flag.lock();
         if !(*sf) {
             *sf = true;
         }

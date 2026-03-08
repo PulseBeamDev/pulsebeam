@@ -2,7 +2,7 @@ use diatomic_waker::{WakeSink, WakeSource};
 use futures_lite::Stream;
 use std::pin::Pin;
 use crate::sync::Arc;
-use std::sync::Mutex;
+use crate::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 
@@ -96,7 +96,7 @@ impl<T> Sender<T> {
         let idx = (seq as usize) & self.ring.mask;
 
         {
-            let mut slot = self.ring.slots[idx].lock().unwrap();
+            let mut slot = self.ring.slots[idx].lock();
             slot.val = Some(val);
             slot.seq = seq;
         }
@@ -201,7 +201,7 @@ impl<T: Send> Receiver<T> {
             }
 
             let idx = (self.next_seq as usize) & self.ring.mask;
-            let mut slot = self.ring.slots[idx].lock().unwrap();
+            let mut slot = self.ring.slots[idx].lock();
             let slot_seq = slot.seq;
 
             if slot_seq != self.next_seq {
