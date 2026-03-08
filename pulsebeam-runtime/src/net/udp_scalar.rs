@@ -1,10 +1,10 @@
 use crate::sync::Arc;
+use crate::sync::pool_buf::net_recv_pool;
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
 };
 
-use bytes::Bytes;
 use pulsebeam_core::net::UdpSocket;
 
 use crate::net::{RecvPacketBatch, SendPacketBatch, Transport, UdpMode};
@@ -50,23 +50,25 @@ impl UdpTransportReader {
 
     #[inline]
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
-        let mut buf = vec![0u8; 1500];
-        match self.sock.try_recv_from(&mut buf) {
+        // Checkout an uninitialised pool slot and hand its storage directly
+        // to the kernel via recv_from.  Zero intermediate Vec, zero extra copy.
+        let mut slot = net_recv_pool().checkout_uninit();
+        match self.sock.try_recv_from(slot.as_uninit_slice()) {
             Ok((n, source)) => {
-                // Truncate then convert: zero-copy move of the Vec allocation
-                // into Bytes without any extra atomic slice operation.
-                buf.truncate(n);
                 out.push(RecvPacketBatch {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: Bytes::from(buf),
+                    buf: slot.freeze(n),
                     offset: 0,
                     stride: n,
                     len: n,
                 });
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // slot drops here — returns silently to pool.
+                return Err(err);
+            }
         }
 
         Ok(())

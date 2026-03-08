@@ -1,6 +1,7 @@
 use super::{BATCH_SIZE, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
 use crate::sync::Arc;
+use crate::sync::pool_buf::net_recv_pool;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use pulsebeam_core::net::{TcpListener, TcpStream};
@@ -265,13 +266,17 @@ fn handle_new_connection(
                         if recv_buf.len() < 2 + len { break; }
 
                         recv_buf.advance(2);
-                        let data = recv_buf.split_to(len).freeze();
+                        let data = recv_buf.split_to(len);
+
+                        // Copy from BytesMut staging buffer into a pool slot.
+                        // One memcpy, zero jemalloc after warmup.
+                        let buf = net_recv_pool().checkout(&data);
 
                         // Use try_send to prevent reader task from blocking if SFU logic lags
                         if let Err(_) = packet_tx.try_send(RecvPacketBatch {
                             src: peer_addr,
                             dst: local_addr,
-                            buf: data,
+                            buf,
                             offset: 0,
                             stride: len,
                             len,
@@ -383,14 +388,10 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (_reader, writer) = bind(addr, None).await.unwrap();
 
-        // Connect two separate clients
         let _c1 = TcpStream::connect(writer.local_addr()).await.unwrap();
         let _c2 = TcpStream::connect(writer.local_addr()).await.unwrap();
 
-        // Small sleep to let the background listener task process the accepts
         tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Accessing internal 'conns' map (permitted in internal test module)
         assert_eq!(writer.conns.len(), 2);
     }
 
@@ -399,13 +400,11 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (_reader, writer) = bind(addr, None).await.unwrap();
 
-        // Verify writer can be cloned and moved to another task
         let writer_clone = writer.clone();
         let handle = tokio::spawn(async move {
             let _ = writer_clone.local_addr();
-            // In a real test we'd perform a send here
         });
-
         handle.await.unwrap();
     }
 }
+

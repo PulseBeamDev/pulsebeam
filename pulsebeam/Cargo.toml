@@ -76,5 +76,5 @@ str0m = { workspace = true, features = ["wincrypto"] }
 
 [features]
 default = []
-deep-metrics = []
+deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 tokio-console = ["console-subscriber", "tokio/tracing"]

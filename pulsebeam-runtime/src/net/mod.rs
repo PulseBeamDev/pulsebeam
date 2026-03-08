@@ -2,8 +2,9 @@ pub mod tcp;
 pub mod udp;
 pub mod udp_scalar;
 
-use bytes::Bytes;
 use std::{io, net::SocketAddr};
+
+use crate::sync::pool_buf::PoolBuf;
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 pub const CHUNK_SIZE: usize = 64 * 1024;
@@ -26,10 +27,9 @@ pub enum Transport {
 pub struct RecvPacketBatch {
     pub src: SocketAddr,
     pub dst: SocketAddr,
-    /// Backing buffer.  May span more bytes than this packet when a single
-    /// recvmmsg call fills many slots.  Always access via `data()` or the
-    /// iterator rather than indexing `buf` directly.
-    pub buf: Bytes,
+    /// Backing buffer for this packet's bytes (pool-backed, refcounted).
+    /// Always index via `data()` — `offset` addresses within it.
+    pub buf: PoolBuf,
     /// Byte offset into `buf` where this packet's data begins.
     pub offset: usize,
     pub stride: usize,

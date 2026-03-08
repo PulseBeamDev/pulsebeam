@@ -1,7 +1,5 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
-use pulsebeam_runtime::sync::Arc;
-use std::time::Duration;
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -77,6 +75,10 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
     let http_api_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
+
+    // Eagerly warm the RTP payload pool so the first packets don't hit jemalloc.
+    pulsebeam_runtime::sync::pool_buf::describe_metrics();
+    let _ = pulsebeam::rtp::rtp_payload_pool();
 
     tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
     let node = NodeBuilder::new()

@@ -1,8 +1,8 @@
 use crate::net::{Transport, UdpMode};
 use crate::sync::Arc;
+use crate::sync::pool_buf::net_recv_pool;
 
 use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
-use bytes::Bytes;
 use quinn_udp::RecvMeta;
 use std::{
     io::{self, ErrorKind, IoSliceMut},
@@ -119,36 +119,33 @@ impl UdpTransportReader {
 
             match res {
                 Ok(count) => {
-                    // `Bytes::from(Vec)` is zero-copy: the Vec allocation is
-                    // moved directly into the Bytes without any memcpy.
-                    let new_buffer = Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE);
-                    let filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
-                    let master_bytes = Bytes::from(filled_buffer);
-
                     for i in 0..count {
                         let m = &self.meta[i];
+                        let base = i * CHUNK_SIZE;
 
-                        let start = i * CHUNK_SIZE;
-                        let end = start + m.len;
+                        // stride == 0 means a single non-GRO datagram.
+                        let stride = if m.stride == 0 { m.len } else { m.stride };
+                        if stride == 0 { continue; }
 
-                        // Safety: Ensure we don't slice past the buffer (e.g., if kernel lied about len)
-                        if end > master_bytes.len() {
-                            continue;
+                        // Iterate GRO segments: each becomes one pool slot + RecvPacketBatch.
+                        // One memcpy per segment is unavoidable when de-bundling GRO;
+                        // the batch_buffer itself is reused across calls (no allocation).
+                        let mut seg_off = 0;
+                        while seg_off < m.len {
+                            let seg_len = stride.min(m.len - seg_off);
+                            let src = &self.batch_buffer[base + seg_off..base + seg_off + seg_len];
+                            let buf = net_recv_pool().checkout(src);
+                            out.push(RecvPacketBatch {
+                                src: m.addr,
+                                dst: self.local_addr,
+                                buf,
+                                offset: 0,
+                                stride: seg_len,
+                                len: seg_len,
+                                transport: Transport::Udp(UdpMode::Batch),
+                            });
+                            seg_off += stride;
                         }
-
-                        // Clone bumps the Bytes refcount once (one atomic op).
-                        // The actual byte range is communicated via `offset` so
-                        // the iterator can yield `&[u8]` slices with zero extra
-                        // atomic ops — no Bytes::slice() call on the hot iteration path.
-                        out.push(RecvPacketBatch {
-                            src: m.addr,
-                            dst: self.local_addr,
-                            buf: master_bytes.clone(),
-                            offset: start,
-                            stride: m.stride,
-                            len: m.len,
-                            transport: Transport::Udp(UdpMode::Batch),
-                        });
                     }
                     Ok(())
                 }

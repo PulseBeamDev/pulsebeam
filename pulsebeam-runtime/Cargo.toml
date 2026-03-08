@@ -20,6 +20,7 @@ async-channel = "2.5.0"
 backtrace = "0.3.76"
 bytes = { workspace = true }
 triomphe = { workspace = true }
+crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 dashmap = "6.1.0"
 diatomic-waker = "0.2"
@@ -48,3 +49,4 @@ futures-concurrency = "7.6.3"
 [features]
 default = []
 loom = ["dep:loom"]
+deep-metrics = []
