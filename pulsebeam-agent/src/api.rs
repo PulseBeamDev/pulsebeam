@@ -39,6 +39,33 @@ pub struct CreateParticipantResponse {
     pub resource_uri: Uri,
 }
 
+pub struct UpdateParticipantRequest {
+    pub offer: SdpOffer,
+}
+
+pub struct UpdateParticipantResponse {
+    pub answer: SdpAnswer,
+}
+
+impl TryFrom<Response<Vec<u8>>> for UpdateParticipantResponse {
+    type Error = ApiError;
+
+    fn try_from(resp: Response<Vec<u8>>) -> Result<Self, Self::Error> {
+        if !resp.status().is_success() {
+            return Err(ApiError::Protocol(format!(
+                "Server rejected update: {}",
+                resp.status()
+            )));
+        }
+        let body_str = std::str::from_utf8(resp.body())
+            .map_err(|_| ApiError::Protocol("Body is not valid UTF-8".to_string()))?;
+
+        let answer = SdpAnswer::from_sdp_string(body_str)?;
+
+        Ok(UpdateParticipantResponse { answer })
+    }
+}
+
 impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
     type Error = ApiError;
 
@@ -101,6 +128,24 @@ impl HttpApiClient {
         req.headers_mut()
             .insert("Content-Type", "application/sdp".parse().unwrap());
         *req.method_mut() = Method::POST;
+
+        let res = self.http_client.execute(req).await?;
+        res.try_into()
+    }
+
+    pub async fn update_participant(
+        &self,
+        uri: Uri,
+        req: UpdateParticipantRequest,
+    ) -> Result<UpdateParticipantResponse, ApiError> {
+        tracing::info!(%uri, "Sending SDP Offer (Update)");
+
+        let raw_body = req.offer.to_sdp_string().into_bytes();
+        let mut req = HttpRequest::new(raw_body);
+        *req.uri_mut() = uri;
+        req.headers_mut()
+            .insert("Content-Type", "application/sdp".parse().unwrap());
+        *req.method_mut() = Method::PATCH;
 
         let res = self.http_client.execute(req).await?;
         res.try_into()

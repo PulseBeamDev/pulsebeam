@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
+use crate::manager::{Subscription, SubscriptionManager};
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -304,10 +305,50 @@ pub struct AgentStats {
     pub tracks: HashMap<Mid, TrackStats>,
 }
 
+impl AgentStats {
+    pub fn total_rx_bytes(&self) -> u64 {
+        self.tracks
+            .values()
+            .flat_map(|t| t.rx_layers.values())
+            .map(|s| s.bytes)
+            .sum()
+    }
+
+    pub fn total_tx_bytes(&self) -> u64 {
+        self.tracks
+            .values()
+            .flat_map(|t| t.tx_layers.values())
+            .map(|s| s.bytes)
+            .sum()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct TrackStats {
     pub rx_layers: HashMap<Option<Rid>, str0m::stats::MediaIngressStats>,
     pub tx_layers: HashMap<Option<Rid>, str0m::stats::MediaEgressStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoPreset {
+    Camera,
+    Screen,
+}
+
+impl VideoPreset {
+    pub fn base_bitrate(&self) -> u64 {
+        match self {
+            Self::Camera => 1_250_000,
+            Self::Screen => 2_500_000,
+        }
+    }
+
+    pub fn content_hint(&self) -> &str {
+        match self {
+            Self::Camera => "motion",
+            Self::Screen => "text",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -378,6 +419,8 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
     #[error("Comand Error: {0}")]
     Command(#[from] mpsc::error::SendError<AgentCommand>),
+    #[error("Protocol Error: {0}")]
+    Protocol(String),
     #[error("No valid network candidates found")]
     NoCandidates,
 }
@@ -547,6 +590,17 @@ impl AgentBuilder {
             disconnected_reason: None,
             signaling_cid,
             layer_ctrl: LayerController::new(),
+            sub_manager: SubscriptionManager::new(
+                medias
+                    .iter()
+                    .filter(|m| m.direction == Direction::RecvOnly)
+                    .map(|m| m.mid)
+                    .collect(),
+            ),
+            preset: VideoPreset::Camera,
+            retry_count: 0,
+            is_reconnecting: false,
+            reconnect_deadline: None,
         };
 
         tokio::spawn(async move {
@@ -583,6 +637,12 @@ pub enum AgentCommand {
     Unsubscribe {
         track_id: String,
     },
+
+    /// Declarative subscription state update.
+    SetSubscriptions(Vec<Subscription>),
+
+    /// Set video encoding preset for outgoing media.
+    SetPreset(VideoPreset),
 }
 
 #[derive(Debug)]
@@ -620,6 +680,16 @@ impl Agent {
 
         Ok(())
     }
+
+    pub async fn set_subscriptions(&self, subs: Vec<Subscription>) -> Result<(), AgentError> {
+        self.cmd_tx.send(AgentCommand::SetSubscriptions(subs)).await?;
+        Ok(())
+    }
+
+    pub async fn set_preset(&self, preset: VideoPreset) -> Result<(), AgentError> {
+        self.cmd_tx.send(AgentCommand::SetPreset(preset)).await?;
+        Ok(())
+    }
 }
 
 struct AgentActor {
@@ -643,6 +713,13 @@ struct AgentActor {
     /// Egress-side BWE layer controller: pauses/resumes simulcast layers
     /// based on TWCC bandwidth estimates.
     layer_ctrl: LayerController,
+
+    sub_manager: SubscriptionManager,
+    preset: VideoPreset,
+
+    retry_count: u32,
+    is_reconnecting: bool,
+    reconnect_deadline: Option<Instant>,
 }
 
 impl AgentActor {
@@ -657,6 +734,8 @@ impl AgentActor {
         tokio::pin!(sleep);
         // Periodic BWE reallocation tick (handles upgrade/recovery paths).
         let mut bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
+        let reconnect_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(reconnect_timer);
 
         while let Some(deadline) = self.poll_rtc().await {
             let now = Instant::now();
@@ -668,6 +747,12 @@ impl AgentActor {
 
             if sleep.deadline() != adjusted_deadline {
                 sleep.as_mut().reset(adjusted_deadline);
+            }
+
+            if let Some(reconnect_at) = self.reconnect_deadline {
+                if reconnect_timer.deadline() != reconnect_at {
+                    reconnect_timer.as_mut().reset(reconnect_at);
+                }
             }
 
             tokio::select! {
@@ -727,6 +812,10 @@ impl AgentActor {
                          self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                     }
                 }
+
+                _ = &mut reconnect_timer, if self.reconnect_deadline.is_some() => {
+                    self.perform_reconnect().await;
+                }
             }
         }
 
@@ -758,12 +847,7 @@ impl AgentActor {
                     Event::IceConnectionStateChange(state) => {
                         tracing::info!("connection state changed: {:?}", state);
                         if state == IceConnectionState::Disconnected {
-                            let reason = self
-                                .disconnected_reason
-                                .clone()
-                                .unwrap_or("unknown reason".to_string());
-                            self.emit(AgentEvent::Disconnected(reason));
-                            return None;
+                            self.schedule_reconnect(Instant::now());
                         }
                     }
                     Event::Connected => {
@@ -848,13 +932,17 @@ impl AgentActor {
             AgentCommand::GetStats(stats_tx) => {
                 let _ = stats_tx.send(self.stats.clone());
             }
-            AgentCommand::Subscribe { track_id, height } => {
-                self.pending.assign(&self.slot_manager, track_id, height);
+            AgentCommand::Subscribe { .. } | AgentCommand::Unsubscribe { .. } => {
+                tracing::warn!("Manual subscribe/unsubscribe is deprecated, use SetSubscriptions");
+            }
+            AgentCommand::SetSubscriptions(subs) => {
+                self.sub_manager.set_desired(subs);
                 self.pending.deadline.replace(now + STATE_DEBOUNCE);
             }
-            AgentCommand::Unsubscribe { track_id } => {
-                self.pending.unassign(&self.slot_manager, track_id);
-                self.pending.deadline.replace(now + STATE_DEBOUNCE);
+            AgentCommand::SetPreset(preset) => {
+                self.preset = preset;
+                // In a more complete implementation, we would update RTCPeerConnection parameters here
+                // if the underlying WebRTC implementation supports it.
             }
         }
     }
@@ -892,12 +980,81 @@ impl AgentActor {
             return;
         };
 
-        let requests = self.pending.take();
+        let requests = self.sub_manager.reconcile();
+        if requests.is_empty() {
+            return;
+        }
+
         let msg = signaling::ClientIntent { requests };
         let encoded = msg.encode_to_vec();
         if let Err(err) = ch.write(true, encoded.as_slice()) {
             tracing::warn!("failed to send signaling: {:?}", err);
         }
+    }
+
+    fn schedule_reconnect(&mut self, now: Instant) {
+        if self.is_reconnecting {
+            return;
+        }
+
+        let delay = match self.retry_count {
+            0 => Duration::ZERO,
+            1 => Duration::from_millis(500),
+            n => Duration::from_millis(500 * 2u64.pow(n.min(10) - 1)).min(Duration::from_secs(5)),
+        };
+
+        self.retry_count += 1;
+        self.reconnect_deadline = Some(now + delay);
+        tracing::info!(
+            "scheduling reconnect in {:?} (attempt {})",
+            delay,
+            self.retry_count
+        );
+    }
+
+    async fn perform_reconnect(&mut self) {
+        self.is_reconnecting = true;
+        self.reconnect_deadline = None;
+
+        tracing::info!("performing reconnect (attempt {})", self.retry_count);
+
+        match self.try_reconnect().await {
+            Ok(_) => {
+                tracing::info!("reconnect successful");
+                self.is_reconnecting = false;
+                self.retry_count = 0;
+                self.emit(AgentEvent::Connected);
+            }
+            Err(err) => {
+                tracing::warn!("reconnect failed: {:?}", err);
+                self.is_reconnecting = false;
+                self.schedule_reconnect(Instant::now());
+            }
+        }
+    }
+
+    async fn try_reconnect(&mut self) -> Result<(), AgentError> {
+        let (offer, pending) = {
+            let mut sdp_api = self.rtc.sdp_api();
+            sdp_api.apply().ok_or_else(|| {
+                AgentError::Protocol("Nothing to negotiate during reconnect".to_string())
+            })?
+        };
+
+        let resp = self
+            .api
+            .update_participant(
+                self.resource_uri.clone(),
+                crate::api::UpdateParticipantRequest { offer },
+            )
+            .await?;
+
+        self.rtc
+            .sdp_api()
+            .accept_answer(pending, resp.answer)
+            .map_err(AgentError::Rtc)?;
+
+        Ok(())
     }
 }
 

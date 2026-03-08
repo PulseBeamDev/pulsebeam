@@ -6,6 +6,7 @@ use tokio::time::Instant;
 
 pub mod actor;
 pub mod api;
+pub mod manager;
 pub mod media;
 
 pub struct MediaFrame {
