@@ -1,0 +1,60 @@
+use super::common;
+use pulsebeam_agent::{MediaKind, TransceiverDirection};
+use std::net::IpAddr;
+use std::time::Duration;
+
+#[test]
+fn churn_test() {
+    common::setup_tracing();
+
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(120))
+        .tick_duration(Duration::from_micros(100))
+        .build();
+
+    let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
+    sim.host(server_ip, move || async move {
+        common::start_sfu_node(server_ip)
+            .await
+            .map_err(|e| e.into())
+    });
+
+    let participant1_ip: IpAddr = "192.168.1.1".parse().unwrap();
+    let participant2_ip: IpAddr = "192.168.2.1".parse().unwrap();
+
+    // Participant 1: Stays in the room
+    sim.client(participant1_ip, async move {
+        let mut client = common::client::SimClientBuilder::bind(participant1_ip, server_ip)
+            .await?
+            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+            .connect("room1")
+            .await?;
+
+        client.drive_until(Duration::from_secs(60), |_| false).await.ok();
+        Ok(())
+    });
+
+    // Participant 2: Joins and leaves multiple times
+    sim.client(participant2_ip, async move {
+        for i in 1..=3 {
+            tracing::info!("Participant 2 joining, attempt {}", i);
+            let mut client = common::client::SimClientBuilder::bind(participant2_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("room1")
+                .await?;
+
+            client.drive_until(Duration::from_secs(10), |stats| {
+                let Some(peer) = &stats.peer else { return false; };
+                peer.bytes_rx > 50_000
+            }).await?;
+
+            tracing::info!("Participant 2 leaving, attempt {}", i);
+            client.agent.disconnect().await?;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        Ok(())
+    });
+
+    sim.run().expect("Simulation failed");
+}

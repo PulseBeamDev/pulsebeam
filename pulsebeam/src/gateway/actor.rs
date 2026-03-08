@@ -6,7 +6,7 @@ use pulsebeam_runtime::{actor, net};
 use std::io;
 use tokio::task::JoinSet;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum GatewayControlMessage {
     AddParticipant(
         String,
