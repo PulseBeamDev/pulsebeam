@@ -137,7 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_and_recv_single_message() {
-        let (mut sender, mut mailbox) = mailbox::new(10);
+        let (sender, mut mailbox) = mailbox::new(10);
         let message = "hello".to_string();
 
         sender.send(message.clone()).await.unwrap();
@@ -148,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_none_when_all_senders_are_dropped() {
-        let (mut sender, mut mailbox) = mailbox::new::<i32>(10);
+        let (sender, mut mailbox) = mailbox::new::<i32>(10);
         sender.send(1).await.unwrap();
         sender.send(2).await.unwrap();
 
@@ -165,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_send_fails_when_receiver_is_dropped() {
-        let (mut sender, mailbox) = mailbox::new::<String>(10);
+        let (sender, mailbox) = mailbox::new::<String>(10);
 
         // Drop the mailbox immediately
         drop(mailbox);
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn try_send_fails_when_receiver_is_dropped() {
-        let (mut sender, mailbox) = mailbox::new::<i32>(1);
+        let (sender, mailbox) = mailbox::new::<i32>(1);
 
         // Drop the receiver
         drop(mailbox);
@@ -224,14 +224,14 @@ mod tests {
 
     #[tokio::test]
     async fn async_send_waits_when_full() {
-        let (mut sender, mut mailbox) = mailbox::new::<i32>(1);
+        let (sender, mut mailbox) = mailbox::new::<i32>(1);
 
         // Fill the buffer
         sender.send(1).await.unwrap();
 
         // This send should wait. We spawn it in a separate task.
         let send_task = tokio::spawn({
-            let mut sender = sender.clone();
+            let sender = sender.clone();
             async move {
                 sender.send(2).await.unwrap();
             }
@@ -255,8 +255,8 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_sender_works_and_channel_stays_open() {
-        let (mut sender1, mut mailbox) = mailbox::new::<i32>(10);
-        let mut sender2 = sender1.clone();
+        let (sender1, mut mailbox) = mailbox::new::<i32>(10);
+        let sender2 = sender1.clone();
 
         sender1.send(1).await.unwrap();
         sender2.send(2).await.unwrap();

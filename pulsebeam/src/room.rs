@@ -42,7 +42,7 @@ pub struct RemoveParticipant {
 pub struct ParticipantMeta {
     handle: participant::ParticipantHandle,
     tracks: HashMap<TrackId, track::TrackReceiver>,
-    connection_id: ConnectionId,
+    _connection_id: ConnectionId,
 }
 
 pub struct RoomMessageSet;
@@ -54,7 +54,7 @@ impl actor::MessageSet for RoomMessageSet {
 }
 
 pub struct RoomActor {
-    node_ctx: node::NodeContext,
+    _node_ctx: node::NodeContext,
     room_id: RoomId,
     state: RoomState,
     participant_tasks: JoinSet<(ParticipantId, ConnectionId, ActorStatus)>,
@@ -147,7 +147,7 @@ impl RoomActor {
         let (audio_selector, selector_task) = audio_selector::create(64);
         tokio::spawn(selector_task);
         Self {
-            node_ctx,
+            _node_ctx: node_ctx,
             room_id,
             state: RoomState::default(),
             participant_tasks: JoinSet::new(),
@@ -173,7 +173,7 @@ impl RoomActor {
             ParticipantMeta {
                 handle: participant_handle.clone(),
                 tracks: HashMap::new(),
-                connection_id,
+                _connection_id: connection_id,
             },
         );
 

@@ -7,12 +7,10 @@ use str0m::{
     rtp::rtcp::SenderInfo,
 };
 use tokio::time::Instant;
-use tracing::warn;
 
 const SR_HISTORY_CAPACITY: usize = 5;
 const MIN_SR_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 // const MAX_PLAYOUT_FUTURE: Duration = Duration::from_millis(1000);
-const MAX_PLAYOUT_PAST: Duration = Duration::from_millis(500);
 const CLOCK_SMEAR_DURATION: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
@@ -234,26 +232,6 @@ impl Synchronizer {
         playout_time
     }
 
-    fn validate_playout_time(&self, playout_time: Instant, now: Instant) -> Instant {
-        // if playout_time > now + MAX_PLAYOUT_FUTURE {
-        //     warn!(
-        //         "Far future playout_time: {:?}. Limiting to {:?}.",
-        //         playout_time,
-        //         now + MAX_PLAYOUT_FUTURE
-        //     );
-        //     return now + MAX_PLAYOUT_FUTURE;
-        // }
-        if let Some(past_limit) = now.checked_sub(MAX_PLAYOUT_PAST)
-            && playout_time < past_limit
-        {
-            warn!(
-                "Far past playout_time: {:?}. Limiting to {:?}.",
-                playout_time, past_limit
-            );
-            return past_limit;
-        }
-        playout_time
-    }
 
     pub fn is_synchronized(&self) -> bool {
         !self.is_provisional && self.correction.is_none()

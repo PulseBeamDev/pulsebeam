@@ -1,9 +1,9 @@
 use crate::gateway::demux::Demuxer;
 use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
 use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::{actor, net};
 use std::io;
-use pulsebeam_runtime::sync::Arc;
 use tokio::task::JoinSet;
 
 #[derive(Clone)]
@@ -74,7 +74,11 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         msg: GatewayControlMessage,
     ) -> () {
         for worker in &mut self.workers {
-            worker.tx.send(msg.clone()).await;
+            worker
+                .tx
+                .send(msg.clone())
+                .await
+                .expect("worker is alive until the controller has drained");
         }
     }
 }
@@ -122,7 +126,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
         select: {
             _ = self.socket.readable() => {
-                self.read_socket().await;
+                let _ = self.read_socket().await;
             }
         });
 

@@ -68,6 +68,7 @@ impl AudioAllocator {
     /// Useful when a participant wants to always show a particular speaker
     /// regardless of the Top-N ranking.  Returns `false` if `slot_index` has
     /// not yet been registered via [`add_slot`].
+    #[allow(unused)]
     pub fn pin_slot(&mut self, slot_index: usize, receiver: spmc::Receiver<RtpPacket>) -> bool {
         let Some(stream) = self.slots.get_mut(slot_index) else {
             return false;
@@ -79,6 +80,7 @@ impl AudioAllocator {
 
     /// Remove a slot pin, restoring the room-level selector receiver for that
     /// slot.  Requires the original subscription to restore from.
+    #[allow(unused)]
     pub fn unpin_slot(&mut self, slot_index: usize, sub: &AudioSelectorSubscription) -> bool {
         if slot_index >= sub.receivers.len() {
             return false;
@@ -100,19 +102,14 @@ impl AudioAllocator {
     /// a second subscription message.
     pub fn add_slot(&mut self, mid: Mid) {
         let idx = self.slots.insert(AudioInputStream::new(mid));
-        if let Some(sub) = &self.pending_sub {
-            if let Some(receiver) = sub.receivers.get(idx) {
-                if let Some(stream) = self.slots.get_mut(idx) {
-                    stream.set_receiver(receiver.clone());
-                }
-                self.slots.poke(idx);
+        if let Some(sub) = &self.pending_sub
+            && let Some(receiver) = sub.receivers.get(idx)
+        {
+            if let Some(stream) = self.slots.get_mut(idx) {
+                stream.set_receiver(receiver.clone());
             }
+            self.slots.poke(idx);
         }
-    }
-
-    /// Await the next outbound audio packet.
-    pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        std::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 
     /// Inline hot path — called directly from `DownstreamAllocator::poll_next`.

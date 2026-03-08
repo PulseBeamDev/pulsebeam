@@ -1,5 +1,6 @@
 use super::signaling::Signaling;
 use ahash::{HashMap, HashMapExt};
+#[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
@@ -231,10 +232,15 @@ impl ParticipantCore {
     /// Handles Transmits (UDP/TCP) and Events (Logic).
     fn poll_rtc(&mut self) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
+        #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
+        #[cfg(feature = "deep-metrics")]
         let mut timeouts = 0;
+        #[cfg(feature = "deep-metrics")]
         let mut transmits = 0;
+        #[cfg(feature = "deep-metrics")]
         let mut events = 0;
+        #[cfg(feature = "deep-metrics")]
         let mut errors = 0;
 
         let result = loop {
@@ -243,12 +249,18 @@ impl ParticipantCore {
             }
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(deadline)) => {
-                    timeouts += 1;
+                    #[cfg(feature = "deep-metrics")]
+                    {
+                        timeouts += 1;
+                    }
                     break Some(deadline.into());
                 }
                 Ok(Output::Transmit(tx)) => {
-                    transmits += 1;
-                    work_items += 1;
+                    #[cfg(feature = "deep-metrics")]
+                    {
+                        transmits += 1;
+                        work_items += 1;
+                    }
                     match tx.proto {
                         Protocol::Udp => self.udp_batcher.push_back(tx.destination, &tx.contents),
                         Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
@@ -256,12 +268,18 @@ impl ParticipantCore {
                     }
                 }
                 Ok(Output::Event(event)) => {
-                    events += 1;
-                    work_items += 1;
+                    #[cfg(feature = "deep-metrics")]
+                    {
+                        events += 1;
+                        work_items += 1;
+                    }
                     self.handle_event(event);
                 }
                 Err(e) => {
-                    errors += 1;
+                    #[cfg(feature = "deep-metrics")]
+                    {
+                        errors += 1;
+                    }
                     self.disconnect(e.into());
                     break None;
                 }
@@ -356,7 +374,6 @@ impl ParticipantCore {
         }
     }
 
-    fn update_desired_bitrate(&mut self) {}
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {

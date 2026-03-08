@@ -81,16 +81,6 @@ impl UpstreamAllocator {
         true
     }
 
-    /// Await a keyframe notification.
-    ///
-    /// Returns immediately (via `std::future::pending`) when no video track is
-    /// registered, so this can be used unconditionally in a `select!` branch.
-    pub async fn notified(&self) {
-        match &self.keyframe_notify {
-            Some(n) => n.notified().await,
-            None => std::future::pending().await,
-        }
-    }
 
     /// Drain all pending keyframe requests, applying per-layer leading-edge debounce.
     ///

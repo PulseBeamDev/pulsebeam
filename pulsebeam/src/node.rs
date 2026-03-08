@@ -312,11 +312,6 @@ async fn bind_udp_workers(
     Ok((readers, writers))
 }
 
-fn unzip_transports(
-    pairs: Vec<TransportPair>,
-) -> (Vec<net::UnifiedSocketReader>, Vec<net::UnifiedSocketWriter>) {
-    pairs.into_iter().unzip()
-}
 
 pub async fn ignore<T>(fut: impl Future<Output = T>) {
     let _ = fut.await;
@@ -339,11 +334,9 @@ mod internal {
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::ProfilerGuard;
     use pprof::protos::Message;
-    use pulsebeam_runtime::actor::Actor;
     use serde::Deserialize;
     use tokio::runtime::Handle;
 
-    use crate::{controller, gateway, participant, room};
 
     #[derive(Deserialize)]
     pub struct ProfileParams {
@@ -538,60 +531,6 @@ mod internal {
         }
     }
 
-    async fn actor_background_monitor(prometheus_handle: PrometheusHandle) {
-        let mut monitors = [
-            ("gateway", gateway::GatewayActor::monitor().intervals()),
-            (
-                "gateway_worker",
-                gateway::GatewayWorkerActor::monitor().intervals(),
-            ),
-            (
-                "controller",
-                controller::ControllerActor::monitor().intervals(),
-            ),
-            ("room", room::RoomActor::monitor().intervals()),
-            (
-                "participant",
-                participant::ParticipantActor::monitor().intervals(),
-            ),
-        ];
-
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-
-        loop {
-            interval.tick().await;
-
-            // Keep memory usage and CPU usage bounded per prometheus interval.
-            prometheus_handle.run_upkeep();
-
-            for (actor_name, monitor) in &mut monitors {
-                let Some(snapshot) = monitor.next() else {
-                    continue;
-                };
-
-                let labels = [("actor", *actor_name)];
-
-                metrics::gauge!("actor_long_delay_ratio", &labels).set(snapshot.long_delay_ratio());
-                metrics::gauge!("actor_slow_poll_ratio", &labels).set(snapshot.slow_poll_ratio());
-                metrics::gauge!("actor_mean_first_poll_delay_us", &labels)
-                    .set(snapshot.mean_first_poll_delay().as_micros() as f64);
-                metrics::gauge!("actor_mean_idle_duration_us", &labels)
-                    .set(snapshot.mean_idle_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_scheduled_duration_us", &labels)
-                    .set(snapshot.mean_scheduled_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_poll_duration_us", &labels)
-                    .set(snapshot.mean_poll_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_fast_poll_duration_us", &labels)
-                    .set(snapshot.mean_fast_poll_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_slow_poll_duration_us", &labels)
-                    .set(snapshot.mean_slow_poll_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_short_delay_duration_us", &labels)
-                    .set(snapshot.mean_short_delay_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_long_delay_duration_us", &labels)
-                    .set(snapshot.mean_long_delay_duration().as_micros() as f64);
-            }
-        }
-    }
 
     pub async fn heap_profile(
         Query(params): Query<ProfileParams>,

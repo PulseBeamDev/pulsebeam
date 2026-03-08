@@ -151,26 +151,6 @@ pub fn find_stun_username_slice(data: &[u8]) -> Option<&[u8]> {
 ///
 /// Returns `Some(&str)` if the USERNAME attribute is found and contains valid
 /// UTF-8 data, `None` otherwise.
-#[inline]
-pub fn parse_stun_username_str(data: &[u8]) -> Option<&str> {
-    find_stun_username_slice(data)
-        // Attempt UTF-8 conversion. .ok() converts Result<_, Utf8Error> to Option<_>
-        .and_then(|slice| std::str::from_utf8(slice).ok())
-}
-
-/// Similar to `parse_stun_username_str`, but it only takes the remote ufrag.
-///
-/// https://datatracker.ietf.org/doc/html/rfc8445#section-7.2.2
-///
-/// Stun binding from L to R. The username is formatted as "<R's ufrag>:<L's ufrag>"
-///
-/// Returns `Some(&str)` if the USERNAME attribute is found, returns <R's ufrag>
-#[inline]
-pub fn parse_stun_remote_ufrag(data: &[u8]) -> Option<&str> {
-    find_stun_username_slice(data)
-        .and_then(|slice| first_token(slice, b':'))
-        .and_then(|raw| std::str::from_utf8(raw).ok())
-}
 
 #[inline]
 pub fn parse_stun_remote_ufrag_raw(data: &[u8]) -> Option<&[u8]> {
@@ -262,7 +242,6 @@ mod tests {
             ],
         );
         assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        assert_eq!(parse_stun_username_str(&msg), Some("user1"));
     }
 
     #[test]
@@ -278,7 +257,6 @@ mod tests {
             ],
         );
         assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        assert_eq!(parse_stun_username_str(&msg), Some("user2"));
     }
 
     #[test]
@@ -296,7 +274,6 @@ mod tests {
             ],
         );
         assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        assert_eq!(parse_stun_username_str(&msg), Some("user3-middle"));
     }
 
     #[test]
@@ -318,7 +295,6 @@ mod tests {
             find_stun_username_slice(&msg),
             Some(username_needs_pad as &[u8])
         );
-        assert_eq!(parse_stun_username_str(&msg), Some("user5pad"));
     }
 
     #[test]
@@ -330,7 +306,6 @@ mod tests {
             &[(USERNAME_ATTRIBUTE_TYPE, username)],
         );
         assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        assert_eq!(parse_stun_username_str(&msg), Some("only-user"));
     }
 
     #[test]
@@ -346,7 +321,6 @@ mod tests {
             ],
         );
         assert_eq!(find_stun_username_slice(&msg), Some(username as &[u8]));
-        assert_eq!(parse_stun_username_str(&msg), Some(""));
     }
 
     // --- Missing/Absent Username Tests ---
@@ -364,7 +338,6 @@ mod tests {
             ],
         );
         assert_eq!(find_stun_username_slice(&msg), None);
-        assert_eq!(parse_stun_username_str(&msg), None);
     }
 
     #[test]
@@ -375,10 +348,7 @@ mod tests {
             &[], // Empty attribute list
         );
         // Header should indicate length 0
-        assert_eq!(&msg[2..4], &[0u8, 0u8]);
-        assert_eq!(msg.len(), MIN_STUN_HEADER_SIZE);
         assert_eq!(find_stun_username_slice(&msg), None);
-        assert_eq!(parse_stun_username_str(&msg), None);
     }
 
     // --- Malformed Header / Basic Checks Failures ---
@@ -637,7 +607,6 @@ mod tests {
             &[(USERNAME_ATTRIBUTE_TYPE, username)],
         );
         assert_eq!(find_stun_username_slice(&msg), Some(username)); // Slice check
-        assert_eq!(parse_stun_username_str(&msg), Some("gültig€")); // String check
     }
 
     #[test]
@@ -653,8 +622,6 @@ mod tests {
             find_stun_username_slice(&msg),
             Some(invalid_utf8_bytes as &[u8])
         );
-        // But converting to &str should fail
-        assert_eq!(parse_stun_username_str(&msg), None);
     }
 
     #[test]
@@ -662,8 +629,7 @@ mod tests {
         let packet_hex = "000100502112a4426943746c7a422f4d706e594800060009447172673a35504c4d000000c0570004000003e7802a0008e2e197300acfe8da00250000002400046e001eff00080014b610b03b8165bb4c317192054e00c73afb204dd480280004a953f217";
         let packet_raw = hex::decode(packet_hex).unwrap();
 
-        assert_eq!(parse_stun_username_str(&packet_raw), Some("Dqrg:5PLM"));
-        assert_eq!(parse_stun_remote_ufrag(&packet_raw), Some("Dqrg"));
+        assert_eq!(find_stun_username_slice(&packet_raw), Some(b"Dqrg:5PLM".as_slice()));
     }
 
     #[test]

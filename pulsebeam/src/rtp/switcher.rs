@@ -370,9 +370,6 @@ mod test {
     pub fn simple_stream() -> Vec<ScenarioStep> {
         vec![keyframe(), next_seq(), marker(), next_frame(), marker()]
     }
-    pub fn loss_scenario() -> Vec<ScenarioStep> {
-        vec![keyframe(), next_seq(), next_seq(), marker()]
-    }
 
     // --- Tests ---
     #[test]

@@ -539,7 +539,6 @@ fn sigmoid(value: f64, range_max: f64, k: f64, midpoint: f64) -> f64 {
 
 #[derive(Debug, Clone, Copy)]
 struct PacketGroup {
-    first_arrival: Instant,
     last_arrival: Instant,
     rtp_ts: MediaTime,
 }
@@ -836,7 +835,6 @@ impl DeltaDeltaState {
 
                 // Start new group
                 PacketGroup {
-                    first_arrival: pkt.arrival,
                     last_arrival: pkt.arrival,
                     rtp_ts: pkt.rtp_ts,
                 }
@@ -844,7 +842,6 @@ impl DeltaDeltaState {
         } else {
             // No pending group, start one
             PacketGroup {
-                first_arrival: pkt.arrival,
                 last_arrival: pkt.arrival,
                 rtp_ts: pkt.rtp_ts,
             }
@@ -855,8 +852,8 @@ impl DeltaDeltaState {
     fn as_index(&self, seq: SeqNo) -> usize {
         (*seq % self.buffer.len() as u64) as usize
     }
-
-    fn packet(&mut self, seq: SeqNo) -> &Option<PacketStatus> {
+    #[cfg(test)]
+    fn packet(&self, seq: SeqNo) -> &Option<PacketStatus> {
         let index = self.as_index(seq);
         &self.buffer[index]
     }
@@ -989,7 +986,7 @@ impl AudioMonitor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use more_asserts::{assert_gt, assert_le, assert_lt};
+    use more_asserts::{assert_gt, assert_le};
     use std::time::Duration;
     use tokio::time::Instant;
 

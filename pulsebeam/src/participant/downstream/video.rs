@@ -440,9 +440,6 @@ impl VideoAllocator {
         }
     }
 
-    pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        std::future::poll_fn(|cx| self.poll_next(cx)).await
-    }
 
     /// Inline hot path — called directly from `DownstreamAllocator::poll_next`
     /// to avoid constructing a `tokio::select!` future per packet.
