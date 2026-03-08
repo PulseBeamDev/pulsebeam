@@ -1,6 +1,6 @@
 use ahash::HashMap;
-use std::pin::Pin;
 use pulsebeam_runtime::sync::Arc;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::gateway::GatewayWorkerHandle;
@@ -132,6 +132,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 tokio::task::yield_now().await;
                 budget = 32;
             }
+            budget -= 1;
 
             if !self.core.events.is_empty() {
                 self.handle_control_message_tx().await;
