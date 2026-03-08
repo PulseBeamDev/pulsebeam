@@ -1,7 +1,6 @@
-use crossbeam_utils::CachePadded;
+use crate::sync::Arc;
 use futures_lite::Stream;
 use std::pin::Pin;
-use crate::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,7 +27,7 @@ struct Slot<T> {
 struct Ring<T> {
     head: AtomicU64,
     mask: usize,
-    slots: Vec<CachePadded<RwLock<Slot<T>>>>,
+    slots: Vec<RwLock<Slot<T>>>,
     /// Fast-path gate: `true` iff at least one receiver is currently parked.
     ///
     /// The sender loads this with `Acquire` before touching `waiters`.  When
@@ -65,7 +64,7 @@ impl<T> Ring<T> {
 
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            slots.push(CachePadded::new(RwLock::new(Slot { seq: 0, val: None })));
+            slots.push(RwLock::new(Slot { seq: 0, val: None }));
         }
 
         Arc::new(Self {
