@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::Arc;
+use crate::sync::Arc;
 use thiserror::Error;
 use tokio_metrics::TaskMonitor;
 

@@ -464,7 +464,7 @@ struct TrackState {
 
 pub struct SlotAssignment {
     pub mid: Mid,
-    pub track: std::sync::Arc<TrackMeta>,
+    pub track: pulsebeam_runtime::sync::Arc<TrackMeta>,
 }
 
 pub struct Intent {

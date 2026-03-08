@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
+use pulsebeam_runtime::sync::Arc;
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};

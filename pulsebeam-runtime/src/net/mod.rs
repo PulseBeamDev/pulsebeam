@@ -26,13 +26,24 @@ pub enum Transport {
 pub struct RecvPacketBatch {
     pub src: SocketAddr,
     pub dst: SocketAddr,
+    /// Backing buffer.  May span more bytes than this packet when a single
+    /// recvmmsg call fills many slots.  Always access via `data()` or the
+    /// iterator rather than indexing `buf` directly.
     pub buf: Bytes,
+    /// Byte offset into `buf` where this packet's data begins.
+    pub offset: usize,
     pub stride: usize,
     pub len: usize,
     pub transport: Transport,
 }
 
 impl RecvPacketBatch {
+    /// Returns the exact byte slice for this packet (accounts for `offset`).
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.buf[self.offset..self.offset + self.len]
+    }
+
     pub fn iter(&self) -> RecvPacketBatchIter<'_> {
         RecvPacketBatchIter {
             batch: self,
@@ -42,7 +53,7 @@ impl RecvPacketBatch {
 }
 
 impl<'a> IntoIterator for &'a RecvPacketBatch {
-    type Item = Bytes;
+    type Item = &'a [u8];
     type IntoIter = RecvPacketBatchIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -56,20 +67,29 @@ pub struct RecvPacketBatchIter<'a> {
 }
 
 impl<'a> Iterator for RecvPacketBatchIter<'a> {
-    type Item = Bytes;
+    // Zero-copy: yields borrowed slices directly into the shared Bytes buffer.
+    // No atomic operations — the refcount on `batch.buf` is already held by
+    // the RecvPacketBatch owner for the duration of the iteration.
+    type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset >= self.batch.len {
             return None;
         }
         let remaining = self.batch.len - self.offset;
-        let seg_len = std::cmp::min(self.batch.stride, remaining);
+        // stride == 0 means a single non-GRO datagram: treat as one segment.
+        let stride = if self.batch.stride == 0 {
+            self.batch.len
+        } else {
+            self.batch.stride
+        };
+        let seg_len = std::cmp::min(stride, remaining);
         if seg_len == 0 {
             return None;
         }
-        let packet_buf = self.batch.buf.slice(self.offset..self.offset + seg_len);
+        let abs_start = self.batch.offset + self.offset;
         self.offset += seg_len;
-        Some(packet_buf)
+        Some(&self.batch.buf[abs_start..abs_start + seg_len])
     }
 }
 

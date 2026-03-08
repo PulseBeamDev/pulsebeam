@@ -1,9 +1,10 @@
 use super::{BATCH_SIZE, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
+use crate::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use pulsebeam_core::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::Arc as StdArc;
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -33,7 +34,7 @@ pub async fn bind(
 
     let readable_notifier = Arc::new(tokio::sync::Notify::new());
     let writable_notifier = Arc::new(tokio::sync::Notify::new());
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let conn_semaphore = StdArc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let conns_clone = conns.clone();
     let r_notify = readable_notifier.clone();
@@ -271,6 +272,7 @@ fn handle_new_connection(
                             src: peer_addr,
                             dst: local_addr,
                             buf: data,
+                            offset: 0,
                             stride: len,
                             len,
                             transport: Transport::Tcp,

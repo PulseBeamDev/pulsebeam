@@ -1,7 +1,7 @@
 use crossbeam_utils::CachePadded;
 use futures_lite::Stream;
 use std::pin::Pin;
-use std::sync::Arc;
+use crate::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -145,6 +145,10 @@ pub struct Receiver<T> {
     id: u64,
     pkts_received: u64,
 }
+
+// triomphe::Arc<Ring<T>> carries PhantomData<T> making Arc !Unpin when T: !Unpin.
+// Ring<T> itself is always Unpin, so Receiver is safe to mark Unpin unconditionally.
+impl<T> Unpin for Receiver<T> {}
 
 impl<T> std::fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

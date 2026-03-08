@@ -3,7 +3,7 @@ use diatomic_waker::WakeSink;
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
-use std::sync::Arc;
+use crate::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 type BoxFuture<O> = Pin<Box<dyn Future<Output = O> + Send + 'static>>;

@@ -1,7 +1,7 @@
 use diatomic_waker::{WakeSink, WakeSource};
 use futures_lite::Stream;
 use std::pin::Pin;
-use std::sync::Arc;
+use crate::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
@@ -155,6 +155,11 @@ pub struct Receiver<T> {
     wake_sink: WakeSink,
     pkts_received: u64,
 }
+
+// triomphe::Arc<Ring<T>> carries PhantomData<T> making Arc !Unpin when T: !Unpin.
+// Ring<T> itself is always Unpin (it uses Vec/Mutex/AtomicU64), so Receiver
+// is safe to mark Unpin unconditionally.
+impl<T> Unpin for Receiver<T> {}
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {

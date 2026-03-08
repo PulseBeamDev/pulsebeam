@@ -1,7 +1,7 @@
+use crate::sync::Arc;
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
-    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -50,14 +50,18 @@ impl UdpTransportReader {
 
     #[inline]
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
-        let mut buf = vec![0; 1500];
+        let mut buf = vec![0u8; 1500];
         match self.sock.try_recv_from(&mut buf) {
             Ok((n, source)) => {
+                // Truncate then convert: zero-copy move of the Vec allocation
+                // into Bytes without any extra atomic slice operation.
+                buf.truncate(n);
                 out.push(RecvPacketBatch {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: Bytes::from(buf).slice(..n),
+                    buf: Bytes::from(buf),
+                    offset: 0,
                     stride: n,
                     len: n,
                 });

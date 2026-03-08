@@ -2,7 +2,8 @@ use crate::gateway::demux::Demuxer;
 use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net};
-use std::{io, sync::Arc};
+use std::io;
+use pulsebeam_runtime::sync::Arc;
 use tokio::task::JoinSet;
 
 #[derive(Clone)]

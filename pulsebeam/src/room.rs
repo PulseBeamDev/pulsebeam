@@ -1,5 +1,6 @@
 use ahash::{HashMap, HashMapExt};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
+use pulsebeam_runtime::sync::Arc;
 
 use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},

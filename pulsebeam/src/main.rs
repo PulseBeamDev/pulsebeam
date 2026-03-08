@@ -1,6 +1,6 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
-use std::sync::Arc;
+use pulsebeam_runtime::sync::Arc;
 use std::time::Duration;
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio_util::sync::CancellationToken;

@@ -7,7 +7,7 @@ use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::{actor, net, rand};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use pulsebeam_runtime::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::task::JoinSet;

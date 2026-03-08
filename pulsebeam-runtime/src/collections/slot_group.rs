@@ -20,7 +20,7 @@ use crate::sync::task_group::make_slot_waker;
 use diatomic_waker::WakeSink;
 use futures_lite::stream::Stream;
 use std::pin::Pin;
-use std::sync::Arc;
+use crate::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 /// See [module docs](self).

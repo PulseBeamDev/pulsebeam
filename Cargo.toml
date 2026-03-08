@@ -23,6 +23,7 @@ license = "AGPL-3.0"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1.11.1"
+triomphe = "0.1.15"
 derive_more = { version = "2.1.1", features = ["full"] }
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"

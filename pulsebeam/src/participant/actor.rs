@@ -1,6 +1,6 @@
 use ahash::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use pulsebeam_runtime::sync::Arc;
 use std::time::Duration;
 
 use crate::gateway::GatewayWorkerHandle;

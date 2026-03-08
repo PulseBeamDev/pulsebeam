@@ -1,5 +1,5 @@
 use diatomic_waker::{WakeSink, WakeSource};
-use std::sync::Arc;
+use crate::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A lock-free signaling primitive for up to 64 concurrent slots in a [`TaskGroup`].

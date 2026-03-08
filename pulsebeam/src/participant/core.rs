@@ -3,7 +3,7 @@ use ahash::{HashMap, HashMapExt};
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
-use std::sync::Arc;
+use pulsebeam_runtime::sync::Arc;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;

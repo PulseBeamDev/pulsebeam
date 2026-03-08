@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use pulsebeam_runtime::sync::Arc;
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::sync::Notify;
 use tokio::time::Instant;

@@ -19,6 +19,7 @@ name = "sync"
 async-channel = "2.5.0"
 backtrace = "0.3.76"
 bytes = { workspace = true }
+triomphe = { workspace = true }
 crossbeam-utils = "0.8.21"
 dashmap = "6.1.0"
 diatomic-waker = "0.2"

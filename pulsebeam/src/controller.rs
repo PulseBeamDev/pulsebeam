@@ -1,4 +1,5 @@
-use std::{collections::HashMap, io, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
+use pulsebeam_runtime::sync::Arc;
 
 use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},

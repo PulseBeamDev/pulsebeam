@@ -66,7 +66,7 @@ impl Demuxer {
 
         let handle = if let Some(h) = self.addr_map.get_mut(&src) {
             h
-        } else if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(&batch.buf) {
+        } else if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(batch.data()) {
             if let Some(h) = self.ufrag_map.get_mut(ufrag_raw) {
                 let boxed_ufrag = ufrag_raw.to_vec().into_boxed_slice();
 

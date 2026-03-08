@@ -1,4 +1,5 @@
 use crate::net::{Transport, UdpMode};
+use crate::sync::Arc;
 
 use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
 use bytes::Bytes;
@@ -6,7 +7,6 @@ use quinn_udp::RecvMeta;
 use std::{
     io::{self, ErrorKind, IoSliceMut},
     net::SocketAddr,
-    sync::Arc,
 };
 
 // Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
@@ -114,11 +114,13 @@ impl UdpTransportReader {
 
             let res = self
                 .state
-                .recv((&self.sock).into(), &mut slices, &mut self.meta);
+                .recv((&*self.sock).into(), &mut slices, &mut self.meta);
             let _ = slices; // slices is no longer safe to use
 
             match res {
                 Ok(count) => {
+                    // `Bytes::from(Vec)` is zero-copy: the Vec allocation is
+                    // moved directly into the Bytes without any memcpy.
                     let new_buffer = Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE);
                     let filled_buffer = std::mem::replace(&mut self.batch_buffer, new_buffer);
                     let master_bytes = Bytes::from(filled_buffer);
@@ -134,12 +136,15 @@ impl UdpTransportReader {
                             continue;
                         }
 
-                        let buf = master_bytes.slice(start..end);
-
+                        // Clone bumps the Bytes refcount once (one atomic op).
+                        // The actual byte range is communicated via `offset` so
+                        // the iterator can yield `&[u8]` slices with zero extra
+                        // atomic ops — no Bytes::slice() call on the hot iteration path.
                         out.push(RecvPacketBatch {
                             src: m.addr,
                             dst: self.local_addr,
-                            buf,
+                            buf: master_bytes.clone(),
+                            offset: start,
                             stride: m.stride,
                             len: m.len,
                             transport: Transport::Udp(UdpMode::Batch),
@@ -186,7 +191,7 @@ impl UdpTransportWriter {
             src_ip: None,
         };
         let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
-            self.state.try_send((&self.sock).into(), &transmit)
+            self.state.try_send((&*self.sock).into(), &transmit)
         });
 
         match res {
