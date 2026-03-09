@@ -2,7 +2,6 @@ mod audio;
 mod video;
 
 use crate::audio_selector::AudioSelectorSubscription;
-use crate::bitrate::BitrateController;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
 use crate::rtp::RtpPacket;
@@ -15,8 +14,7 @@ pub use video::Intent;
 
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
-    available_bandwidth: BitrateController,
-    desired_bitrate: BitrateController,
+    available_bandwidth: Bitrate,
 
     pub audio: AudioAllocator,
     pub video: VideoAllocator,
@@ -26,12 +24,7 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new(manual_sub: bool) -> Self {
         Self {
-            available_bandwidth: BitrateController::new(
-                crate::bitrate::BitrateControllerConfig::available_bandwidth(),
-            ),
-            desired_bitrate: BitrateController::new(
-                crate::bitrate::BitrateControllerConfig::desired_bitrate(),
-            ),
+            available_bandwidth: Bitrate::kbps(300),
             audio: AudioAllocator::new(),
             video: VideoAllocator::new(manual_sub),
             yield_audio: false,
@@ -76,21 +69,14 @@ impl DownstreamAllocator {
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
-        self.available_bandwidth.update(available_bandwidth);
+        self.available_bandwidth = available_bandwidth;
         self.dirty_allocation = true;
     }
 
     pub fn update_allocations(&mut self, bwe: &mut Bwe) {
         self.dirty_allocation = false;
-        let Some((_current_alloc, desired_alloc)) = self
-            .video
-            .update_allocations(self.available_bandwidth.current())
-        else {
-            return;
-        };
-
-        let filtered_desired = self.desired_bitrate.update(desired_alloc);
-        bwe.set_desired_bitrate(filtered_desired);
+        let desired = self.video.update_allocations(self.available_bandwidth);
+        bwe.set_desired_bitrate(desired);
     }
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
