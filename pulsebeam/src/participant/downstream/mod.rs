@@ -69,7 +69,7 @@ impl DownstreamAllocator {
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
-        self.available_bandwidth = available_bandwidth;
+        self.available_bandwidth = available_bandwidth.max(Bitrate::kbps(300));
         self.dirty_allocation = true;
     }
 
