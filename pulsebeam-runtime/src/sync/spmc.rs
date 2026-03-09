@@ -133,102 +133,97 @@ impl<T: Clone> Receiver<T> {
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        let mut rechecked = false;
-
         loop {
-            // Snapshot producer head. This allows batching efficiency without a batching API.
-            // It creates a fast-path for a slightly behind receiver to catchup the producer
-            // without spending atomic load on every iteration.
-            //
-            // Safety: head is strictly monotonically increasing
-            if self.next_seq == self.local_head {
+            // Refresh head snapshot only when we've caught up to our last snapshot.
+            if self.next_seq >= self.local_head {
                 self.local_head = self.ring.head.load(Ordering::Acquire);
             }
 
-            // Closed and nothing left
-            if self.ring.closed.load(Ordering::Acquire) == 1 && self.next_seq >= self.local_head {
-                return Poll::Ready(Err(RecvError::Closed));
-            }
-
-            // No new items — wait
+            // Still no new items — park.
             if self.next_seq >= self.local_head {
-                self.register_waker();
-
-                if rechecked {
-                    return Poll::Pending;
+                // Register listener before the closed check to avoid a race where
+                // the sender closes and notifies between our head load and listen().
+                if self.listener.is_none() {
+                    self.listener = Some(self.ring.event.listen());
                 }
 
-                // Slow Path: make sure we don't miss a notification by rechecking.
-                rechecked = true;
-                continue;
+                // Re-check head after listener registration to close the TOCTOU window.
+                self.local_head = self.ring.head.load(Ordering::Acquire);
+                if self.next_seq < self.local_head {
+                    // New data arrived between the first check and listener registration;
+                    // discard the listener and fall through.
+                    self.listener = None;
+                    continue;
+                }
+
+                // Closed and drained.
+                if self.ring.closed.load(Ordering::Acquire) == 1 {
+                    return Poll::Ready(Err(RecvError::Closed));
+                }
+
+                // Poll the listener so the waker is registered with the event.
+                // SAFETY: we hold a pinned &mut via the Option — pin it on the stack.
+                let listener = self.listener.as_mut().unwrap();
+                // event_listener::EventListener implements Future; poll it.
+                let pinned = Pin::new(listener);
+                match pinned.poll(cx) {
+                    Poll::Ready(_) => {
+                        // Woken — clear listener and retry.
+                        self.listener = None;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
             }
 
-            // Read slot for next_seq
+            // We have at least one item available. Clear stale listener.
+            self.listener = None;
+
+            // Read slot for next_seq — clone value under the lock, then release.
             let idx = (self.next_seq as usize) & self.ring.mask;
-            let slot = self.ring.slots[idx].read();
-            let slot_seq = slot.seq;
+            let (slot_seq, maybe_val) = {
+                let slot = self.ring.slots[idx].read();
+                (slot.seq, slot.val.clone())
+            };
 
-            // Seq mismatch — producer overwrote after head snapshot
+            // Seq mismatch means producer overwrote this slot while we lagged.
             if slot_seq != self.next_seq {
-                // Sanity check: seq should be ahead of us if we lagged
-                let lagged = slot.seq > self.next_seq;
-                drop(slot);
-
-                if lagged {
-                    self.next_seq = self.local_head;
-                    metrics::counter!("spmc_receive_lag_total").increment(1);
-                    return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
-                } else {
-                    // Paranoid: this can only happen if the seq is wrapped around.
-                    // But, u64 is so large that this shouldn't happen.
-                    debug_assert!(
-                        false,
-                        "slot seq {} is behind expected seq {} despite head confirming availability; \
-                        indicates a memory ordering bug or single-producer invariant violation",
-                        slot_seq, self.next_seq
-                    );
-                    self.register_waker();
-                    return Poll::Pending;
-                }
+                // Reload head for an accurate lag report.
+                self.local_head = self.ring.head.load(Ordering::Acquire);
+                self.next_seq = self.local_head;
+                metrics::counter!("spmc_receive_lag_total").increment(1);
+                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
             }
 
-            let coop = ready!(tokio::task::coop::poll_proceed(cx));
+            // Coop yield point — no locks held here.
+            let coop = ready!(crate::sync::coop::poll_proceed(cx));
 
-            // Valid message
-            if let Some(v) = &slot.val {
-                let out = v.clone();
-                coop.made_progress();
+            let Some(out) = maybe_val else {
+                // seq matched but val is None — should be impossible, but treat as lag.
+                debug_assert!(
+                    false,
+                    "slot seq matched but val was None — ring invariant violated"
+                );
+                self.local_head = self.ring.head.load(Ordering::Acquire);
+                self.next_seq = self.local_head;
+                metrics::counter!("spmc_receive_lag_total").increment(1);
+                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+            };
 
-                self.pkts_received += 1;
-                self.next_seq += 1;
+            coop.made_progress();
+            self.next_seq += 1;
+            self.pkts_received += 1;
 
-                if (self.pkts_received & Self::METRIC_FLUSH_MASK) == 0 {
-                    drop(slot);
-                    self.flush_metrics();
-                }
-                return Poll::Ready(Ok(out));
+            if (self.pkts_received & Self::METRIC_FLUSH_MASK) == 0 {
+                self.flush_metrics();
             }
-
-            // This shouldn't ever happen, but just in case..
-            // Seq was correct but value missing — treat as lag
-            self.next_seq = self.local_head;
-            metrics::counter!("spmc_receive_lag_total").increment(1);
-            return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
-        }
-    }
-
-    fn register_waker(&mut self) {
-        if self.listener.is_none() {
-            self.listener = Some(self.ring.event.listen());
+            return Poll::Ready(Ok(out));
         }
     }
 
     fn flush_metrics(&mut self) {
-        // Use the existing local_head snapshot.
-        // This tells us how much is still left in the current "batch".
         let current_drift = self.local_head.saturating_sub(self.next_seq);
         let capacity = (self.ring.mask + 1) as f64;
-
         metrics::histogram!("spmc_receive_drift_ratio").record(current_drift as f64 / capacity);
         metrics::counter!("spmc_receive_throughput_total").increment(self.pkts_received);
         self.pkts_received = 0;
@@ -269,17 +264,16 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
         at the moment of processing. A value of 1.0 indicates the receiver is \
         about to be overwritten (lagged)."
     );
-
     metrics::describe_counter!(
         "spmc_receive_throughput_total",
         "The total number of packets successfully delivered across all SPMC channels."
     );
-
     metrics::describe_counter!(
         "spmc_receive_lag_total",
         "The total number of times a receiver was too slow and was overwritten by \
         the producer, resulting in dropped data."
     );
+
     let ring = Ring::new(capacity);
     (
         Sender {

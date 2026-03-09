@@ -4,7 +4,7 @@ pub mod pool_buf;
 pub mod spmc;
 pub mod task_group;
 
-pub use pool_buf::{BufPool, PoolBuf, PoolBufMut, MAX_PAYLOAD as POOL_MAX_PAYLOAD};
+pub use pool_buf::{BufPool, MAX_PAYLOAD as POOL_MAX_PAYLOAD, PoolBuf, PoolBufMut};
 
 #[cfg(not(feature = "loom"))]
 mod primitives {
@@ -116,6 +116,10 @@ mod primitives {
     pub mod atomic {
         pub use std::sync::atomic::*;
     }
+
+    pub mod coop {
+        pub use tokio::task::coop::poll_proceed;
+    }
 }
 
 #[cfg(feature = "loom")]
@@ -159,6 +163,20 @@ mod primitives {
 
     pub mod atomic {
         pub use loom::sync::atomic::*;
+    }
+
+    pub mod coop {
+        use std::task::{Context, Poll};
+
+        pub struct CoopToken;
+
+        impl CoopToken {
+            pub fn made_progress(self) {}
+        }
+
+        pub fn poll_proceed(_cx: &mut Context<'_>) -> Poll<CoopToken> {
+            Poll::Ready(CoopToken)
+        }
     }
 }
 
