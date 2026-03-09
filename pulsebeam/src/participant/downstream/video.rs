@@ -210,7 +210,7 @@ impl VideoAllocator {
         }
     }
 
-    pub fn update_desired_bitrate(&self) -> Bitrate {
+    fn update_desired_bitrate(&self) -> Bitrate {
         let mut desired = 0f64;
         for (i, _) in self.slots.iter().enumerate() {
             let Some(driver) = self.slots.get(i) else {
@@ -241,6 +241,7 @@ impl VideoAllocator {
             current_receiver: &'a SimulcastReceiver,
             target_receiver: &'a SimulcastReceiver,
             current_bitrate: f64,
+            desired_bitrate: f64,
             paused: bool,
             committed: bool,
         }
@@ -277,6 +278,7 @@ impl VideoAllocator {
                             current_receiver,
                             target_receiver: current_receiver,
                             current_bitrate: 0.0,
+                            desired_bitrate: 0.0,
                             paused: true,
                             committed: true,
                         });
@@ -294,6 +296,7 @@ impl VideoAllocator {
                 current_receiver,
                 target_receiver,
                 current_bitrate: cost,
+                desired_bitrate: cost,
                 paused: false,
                 committed: false,
             });
@@ -316,6 +319,7 @@ impl VideoAllocator {
                     if savings > 0.0 {
                         plan.target_receiver = lower;
                         plan.current_bitrate = lower.state.bitrate_bps();
+                        plan.desired_bitrate = lower.state.bitrate_bps();
                         budget += savings;
                         resolved = true;
                         if budget >= -tolerance {
@@ -372,6 +376,7 @@ impl VideoAllocator {
                     };
 
                 if (upgrade_cost + hysteresis_overhead) > budget {
+                    plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
                     continue;
                 }
 
@@ -379,6 +384,7 @@ impl VideoAllocator {
                 plan.committed = false;
                 plan.target_receiver = desired_receiver;
                 plan.current_bitrate = desired_bitrate;
+                plan.desired_bitrate = desired_bitrate;
                 made_progress = true;
             }
         }
@@ -386,9 +392,11 @@ impl VideoAllocator {
         // Step 4: Apply allocations
         let mut committed = Vec::with_capacity(slot_plans.len());
         let mut total_allocated = 0.0;
+        let mut total_desired = 0.0;
 
         for plan in slot_plans.drain(..) {
             total_allocated += plan.current_bitrate;
+            total_desired += plan.desired_bitrate;
             committed.push(CommittedSlotPlan {
                 driver_idx: plan.driver_idx,
                 receiver: plan.target_receiver.clone(),
@@ -413,7 +421,7 @@ impl VideoAllocator {
         }
 
         let total_allocated = Bitrate::from(total_allocated);
-        let total_desired = self.update_desired_bitrate();
+        let total_desired = Bitrate::from(total_desired);
 
         if self.ticks >= 30 {
             tracing::debug!(
