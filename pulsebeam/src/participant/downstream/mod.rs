@@ -6,7 +6,9 @@ use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
 use crate::rtp::RtpPacket;
 use crate::track::TrackReceiver;
-use std::task::Poll;
+use futures_util::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
@@ -21,7 +23,9 @@ pub struct DownstreamAllocator {
 
     pub audio: AudioAllocator,
     pub video: VideoAllocator,
-    yield_audio: bool,
+
+    pending_audio: Option<(Mid, RtpPacket)>,
+    pending_video: Option<(Mid, RtpPacket)>,
 }
 
 impl DownstreamAllocator {
@@ -30,8 +34,10 @@ impl DownstreamAllocator {
             available_bandwidth: MIN_BANDWIDTH,
             audio: AudioAllocator::new(),
             video: VideoAllocator::new(manual_sub),
-            yield_audio: false,
             dirty_allocation: false,
+
+            pending_audio: None,
+            pending_video: None,
         }
     }
 
@@ -90,34 +96,31 @@ impl DownstreamAllocator {
         self.video.poll_slow(now);
         self.update_allocations(bwe);
     }
+}
 
-    /// Await the next outbound RTP packet, fairly alternating between audio and video.
-    pub async fn next(&mut self) -> (Mid, RtpPacket) {
-        std::future::poll_fn(|cx| {
-            // Alternate which stream gets priority each call so neither starves.
-            // Both arms are polled every call — no `tokio::select!` future is
-            // constructed, no extra waker registrations, no heap allocation.
-            if self.yield_audio {
-                if let Poll::Ready(pkt) = self.video.poll_next(cx) {
-                    self.yield_audio = false;
-                    return Poll::Ready(pkt);
-                }
-                if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
-                    self.yield_audio = true;
-                    return Poll::Ready(pkt);
-                }
-            } else {
-                if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
-                    self.yield_audio = true;
-                    return Poll::Ready(pkt);
-                }
-                if let Poll::Ready(pkt) = self.video.poll_next(cx) {
-                    self.yield_audio = false;
-                    return Poll::Ready(pkt);
-                }
+impl Stream for DownstreamAllocator {
+    type Item = (Mid, RtpPacket);
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Always poll both — waker always fresh, no stale waker risk
+        if self.pending_audio.is_none() {
+            if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
+                self.pending_audio = Some(pkt);
             }
-            Poll::Pending
-        })
-        .await
+        }
+        if self.pending_video.is_none() {
+            if let Poll::Ready(pkt) = self.video.poll_next(cx) {
+                self.pending_video = Some(pkt);
+            }
+        }
+
+        if let Some(pkt) = self.pending_audio.take() {
+            return Poll::Ready(Some(pkt));
+        }
+        if let Some(pkt) = self.pending_video.take() {
+            return Poll::Ready(Some(pkt));
+        }
+
+        Poll::Pending
     }
 }

@@ -188,7 +188,7 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
                 },
 
                 // Priority 2: Egress — only forward downstream RTP when ingress is empty.
-                (meta, pkt) = self.core.downstream.next() => {
+                Some((meta, pkt)) = self.core.downstream.next() => {
                     self.core.handle_forward_rtp(meta, pkt);
                 },
 

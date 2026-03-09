@@ -53,11 +53,9 @@ impl AudioAllocator {
     /// been closed/pending and the new ring head is unknown to the bitmask.
     pub fn set_subscription(&mut self, sub: AudioSelectorSubscription) {
         for (i, receiver) in sub.receivers.iter().enumerate() {
-            if let Some(stream) = self.slots.get_mut(i) {
+            if let Some(mut stream) = self.slots.get_mut(i) {
                 stream.set_receiver(receiver.clone());
             }
-            // poke takes &self — the mutable borrow above is already dropped.
-            self.slots.poke(i);
         }
         self.pending_sub = Some(sub);
     }
@@ -70,11 +68,10 @@ impl AudioAllocator {
     /// not yet been registered via [`add_slot`].
     #[allow(unused)]
     pub fn pin_slot(&mut self, slot_index: usize, receiver: spmc::Receiver<RtpPacket>) -> bool {
-        let Some(stream) = self.slots.get_mut(slot_index) else {
+        let Some(mut stream) = self.slots.get_mut(slot_index) else {
             return false;
         };
         stream.set_receiver(receiver);
-        self.slots.poke(slot_index);
         true
     }
 
@@ -85,11 +82,10 @@ impl AudioAllocator {
         if slot_index >= sub.receivers.len() {
             return false;
         }
-        let Some(stream) = self.slots.get_mut(slot_index) else {
+        let Some(mut stream) = self.slots.get_mut(slot_index) else {
             return false;
         };
         stream.set_receiver(sub.receivers[slot_index].clone());
-        self.slots.poke(slot_index);
         true
     }
 
@@ -104,11 +100,9 @@ impl AudioAllocator {
         let idx = self.slots.insert(AudioInputStream::new(mid));
         if let Some(sub) = &self.pending_sub
             && let Some(receiver) = sub.receivers.get(idx)
+            && let Some(mut stream) = self.slots.get_mut(idx)
         {
-            if let Some(stream) = self.slots.get_mut(idx) {
-                stream.set_receiver(receiver.clone());
-            }
-            self.slots.poke(idx);
+            stream.set_receiver(receiver.clone());
         }
     }
 

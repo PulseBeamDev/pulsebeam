@@ -5,6 +5,7 @@ use pulsebeam_runtime::collections::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -65,19 +66,21 @@ impl VideoAllocator {
         let mids: Vec<Mid> = self.mid_to_idx.keys().copied().collect();
         for mid in mids {
             let idx = self.mid_to_idx[&mid];
-            let driver = self.slots.get_mut(idx).unwrap();
+            let mut driver = self.slots.get_mut(idx).unwrap();
             let tracks = &mut self.tracks;
             if let Some(intent) = intents.get(&mid) {
-                Self::configure_slot(tracks, driver, intent.max_height, Some(&intent.track_id))
+                Self::configure_slot(
+                    tracks,
+                    &mut driver,
+                    intent.max_height,
+                    Some(&intent.track_id),
+                )
             } else {
-                Self::configure_slot(tracks, driver, 0, None)
+                Self::configure_slot(tracks, &mut driver, 0, None)
             };
-            self.slots.poke(idx);
         }
     }
 
-    /// Returns `true` if the slot transitioned into an active-polling state
-    /// (Resuming or Switching), meaning the caller should `poke` it.
     fn configure_slot(
         tracks: &mut HashMap<TrackId, TrackState>,
         driver: &mut SlotDriver,
@@ -153,7 +156,7 @@ impl VideoAllocator {
                 return;
             };
             if let Some(&idx) = self.mid_to_idx.get(&assigned_mid) {
-                if let Some(driver) = self.slots.get_mut(idx) {
+                if let Some(mut driver) = self.slots.get_mut(idx) {
                     driver.stop();
                 }
             }
@@ -199,7 +202,6 @@ impl VideoAllocator {
             state.assigned_mid = Some(driver_mid);
             let receiver = state.track.lowest_quality().clone();
             self.slots.get_mut(idx).unwrap().assign_to(receiver);
-            // assign_to → Paused: no poke needed, Paused returns Poll::Pending immediately.
         }
     }
 
@@ -399,17 +401,11 @@ impl VideoAllocator {
 
         for plan in committed {
             let idx = plan.driver_idx;
-            let driver = self.slots.get_mut(idx).unwrap();
+            let mut driver = self.slots.get_mut(idx).unwrap();
             if plan.paused {
-                // assign_to → Paused: no poke, returns Poll::Pending immediately.
                 driver.assign_to(plan.receiver);
             } else {
                 driver.switch_to(plan.receiver, false);
-                // switch_to may transition to Resuming or Switching — poke so the
-                // slot is polled once to register its waker with the spmc channel.
-                if driver.slot.state.is_playing() {
-                    self.slots.poke(idx);
-                }
             }
         }
 
@@ -442,7 +438,7 @@ impl VideoAllocator {
     }
 
     pub fn poll_slow(&mut self, now: Instant) {
-        for (_, driver) in self.slots.iter_mut() {
+        for (_, mut driver) in self.slots.iter_mut() {
             driver.poll_slow(now);
         }
     }
@@ -703,7 +699,9 @@ impl SlotDriver {
                             }
                         }
                         Err(spmc::RecvError::Lagged(n)) => {
-                            tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, keep going");
+                            tracing::warn!(mid = %self.mid, skipped = n, "Resuming lagged, requesting keyframe");
+                            staging.request_keyframe();
+                            // Loop continues naturally, SPMC already auto-recovered to head.
                         }
                         Err(spmc::RecvError::Closed) => {
                             tracing::warn!(mid = %self.mid, "Resuming closed");
@@ -719,10 +717,10 @@ impl SlotDriver {
                             self.switcher.push(pkt);
                         }
                         Err(spmc::RecvError::Lagged(n)) => {
-                            tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, pausing");
-                            let active = active.clone();
-                            self.transition_to(SlotState::Paused, None, Some(active));
-                            return Poll::Pending;
+                            tracing::warn!(mid = %self.mid, skipped = n, "Streaming lagged, requesting keyframe");
+                            // Do NOT pause. Request a keyframe to fix the decoder and keep streaming.
+                            active.request_keyframe();
+                            continue;
                         }
                         Err(spmc::RecvError::Closed) => {
                             tracing::info!(mid = %self.mid, "Streaming closed");
@@ -752,10 +750,10 @@ impl SlotDriver {
                                 continue;
                             }
                             Err(spmc::RecvError::Lagged(n)) => {
-                                tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, pausing");
-                                let staging = staging.clone();
-                                self.transition_to(SlotState::Paused, None, Some(staging));
-                                return Poll::Pending;
+                                tracing::warn!(mid = %self.mid, skipped = n, "Staging lagged, requesting keyframe");
+                                staging.request_keyframe();
+                                // Do NOT pause. Just wait for the new keyframe to arrive.
+                                continue;
                             }
                             Err(spmc::RecvError::Closed) => {
                                 tracing::warn!(mid = %self.mid, "Staging closed during switch");
@@ -776,17 +774,18 @@ impl SlotDriver {
                         Err(spmc::RecvError::Lagged(n)) => {
                             tracing::warn!(
                                 mid = %self.mid, skipped = n,
-                                "Active lagged during switch, pausing"
+                                "Active lagged during switch, requesting keyframe"
                             );
-                            let active = active.clone();
-                            self.transition_to(SlotState::Paused, None, Some(active));
-                            return Poll::Pending;
+                            // Do NOT overwrite the switch intent by pausing. Keep active stream alive.
+                            active.request_keyframe();
+                            continue;
                         }
                         Err(spmc::RecvError::Closed) => {
                             tracing::warn!(mid = %self.mid, "Active closed, forcing resume");
                             let staging = staging.clone();
                             self.transition_to(SlotState::Resuming, None, Some(staging));
-                            return Poll::Pending;
+                            // Evaluate the new Resuming state immediately to prevent artificial latency
+                            continue;
                         }
                     }
                 }

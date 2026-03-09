@@ -9,6 +9,7 @@ use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::net::IpAddr;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 pub struct SimClientBuilder {
@@ -56,7 +57,6 @@ pub struct SimClient {
     pub ip: IpAddr,
     pub agent: Agent,
     pub remote_tracks: Vec<pulsebeam_agent::str0m::media::Mid>,
-    pub(crate) track_rx: mpsc::UnboundedReceiver<pulsebeam_agent::str0m::media::Mid>,
     join_set: JoinSet<()>,
 }
 
