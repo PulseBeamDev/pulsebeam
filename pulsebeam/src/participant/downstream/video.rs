@@ -1,7 +1,6 @@
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
-use futures_lite::StreamExt;
 use pulsebeam_runtime::collections::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;

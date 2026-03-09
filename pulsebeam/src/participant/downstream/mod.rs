@@ -12,6 +12,9 @@ use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 pub use video::Intent;
 
+const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
+
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
     available_bandwidth: Bitrate,
@@ -24,7 +27,7 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new(manual_sub: bool) -> Self {
         Self {
-            available_bandwidth: Bitrate::kbps(300),
+            available_bandwidth: MIN_BANDWIDTH,
             audio: AudioAllocator::new(),
             video: VideoAllocator::new(manual_sub),
             yield_audio: false,
@@ -69,7 +72,7 @@ impl DownstreamAllocator {
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
-        self.available_bandwidth = available_bandwidth.max(Bitrate::kbps(300));
+        self.available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         self.dirty_allocation = true;
     }
 
