@@ -67,18 +67,12 @@ impl VideoAllocator {
             let idx = self.mid_to_idx[&mid];
             let driver = self.slots.get_mut(idx).unwrap();
             let tracks = &mut self.tracks;
-            let switched = if let Some(intent) = intents.get(&mid) {
+            if let Some(intent) = intents.get(&mid) {
                 Self::configure_slot(tracks, driver, intent.max_height, Some(&intent.track_id))
             } else {
                 Self::configure_slot(tracks, driver, 0, None)
             };
-            // Only poke when the slot entered Resuming/Switching — those states
-            // need to be polled once to register their waker with the spmc channel.
-            // Paused/Idle return Poll::Pending immediately; poking them only causes
-            // spurious wake-ups.
-            if switched {
-                self.slots.poke(idx);
-            }
+            self.slots.poke(idx);
         }
     }
 

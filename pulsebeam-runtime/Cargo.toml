@@ -40,6 +40,7 @@ tokio = { workspace = true }
 tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration"] }
 tokio-util = "0.7.17"
 tracing = { workspace = true }
+event-listener = "5.4.1"
 
 [dev-dependencies]
 async-stream = "0.3.6"

@@ -2794,6 +2794,7 @@ dependencies = [
  "crossbeam-utils",
  "dashmap",
  "diatomic-waker",
+ "event-listener",
  "futures",
  "futures-concurrency",
  "futures-lite",
