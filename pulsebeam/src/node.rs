@@ -359,7 +359,19 @@ mod internal {
         // Try to install the Prometheus recorder.
         // In simulation or test environments running multiple nodes in one process,
         // this might fail if already installed. We proceed gracefully.
-        let prometheus_handle = PrometheusBuilder::new().install_recorder()?;
+        static GLOBAL_PROMETHEUS_HANDLE: once_cell::sync::OnceCell<PrometheusHandle> =
+            once_cell::sync::OnceCell::new();
+
+        let prometheus_handle = match PrometheusBuilder::new().install_recorder() {
+            Ok(handle) => {
+                let _ = GLOBAL_PROMETHEUS_HANDLE.set(handle.clone());
+                handle
+            }
+            Err(_) => GLOBAL_PROMETHEUS_HANDLE
+                .get()
+                .cloned()
+                .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
+        };
 
         const INDEX_HTML: &str = r#"
 <ul>
