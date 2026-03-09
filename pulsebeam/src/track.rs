@@ -1,7 +1,7 @@
+use pulsebeam_runtime::sync::Arc;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use pulsebeam_runtime::sync::Arc;
 
 use pulsebeam_runtime::sync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
@@ -305,9 +305,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             (MediaKind::Video, Some(r)) if r.starts_with('h') => {
                 (SimulcastQuality::Medium, 150_000, 2)
             }
-            (MediaKind::Video, Some(r)) if r.starts_with('q') => {
-                (SimulcastQuality::Low, 30_000, 1)
-            }
+            (MediaKind::Video, Some(r)) if r.starts_with('q') => (SimulcastQuality::Low, 30_000, 1),
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");
                 (SimulcastQuality::Undefined, 500_000, 2)

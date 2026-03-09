@@ -46,6 +46,7 @@ impl SimClientBuilder {
         Ok(SimClient {
             ip: self.ip,
             agent,
+            remote_tracks: Vec::new(),
             join_set: JoinSet::new(),
         })
     }
@@ -54,6 +55,8 @@ impl SimClientBuilder {
 pub struct SimClient {
     pub ip: IpAddr,
     pub agent: Agent,
+    pub remote_tracks: Vec<pulsebeam_agent::str0m::media::Mid>,
+    pub(crate) track_rx: mpsc::UnboundedReceiver<pulsebeam_agent::str0m::media::Mid>,
     join_set: JoinSet<()>,
 }
 
@@ -85,6 +88,7 @@ impl SimClient {
                         }
                         AgentEvent::RemoteTrackAdded(recv) => {
                             tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
+                            self.remote_tracks.push(recv.mid);
                         }
                         _ => {}
                     }

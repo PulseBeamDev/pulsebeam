@@ -1,3 +1,4 @@
+pub use str0m;
 pub use bytes::Bytes;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;

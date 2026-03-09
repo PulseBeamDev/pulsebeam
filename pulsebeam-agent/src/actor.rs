@@ -370,13 +370,13 @@ impl LocalTrack {
     }
 }
 
-fn new_remote_track(track: Arc<Track>) -> (RemoteTrackTx, RemoteTrackRx) {
+fn new_remote_track(mid: Mid, track: Arc<Track>) -> (RemoteTrackTx, RemoteTrackRx) {
     let (ch_tx, ch_rx) = mpsc::channel(128);
     let tx = RemoteTrackTx {
         track: track.clone(),
         tx: ch_tx,
     };
-    let rx = RemoteTrackRx { track, rx: ch_rx };
+    let rx = RemoteTrackRx { mid, track, rx: ch_rx };
 
     (tx, rx)
 }
@@ -399,6 +399,7 @@ impl RemoteTrackTx {
 
 #[derive(Debug)]
 pub struct RemoteTrackRx {
+    pub mid: Mid,
     pub track: Arc<Track>,
     rx: mpsc::Receiver<MediaFrame>,
 }
@@ -960,7 +961,12 @@ impl AgentActor {
 
         match payload {
             signaling::server_message::Payload::Update(update) => {
-                self.slot_manager.sync(update);
+                tracing::info!("Received signaling update: {:?}", update);
+                let new_tracks = self.slot_manager.sync(update);
+                for rx in new_tracks {
+                    tracing::info!("Emitting RemoteTrackAdded for MID: {:?}", rx.mid);
+                    self.emit(AgentEvent::RemoteTrackAdded(rx));
+                }
             }
             signaling::server_message::Payload::Error(err) => {
                 tracing::warn!("signaling error: {}", err);
@@ -1161,6 +1167,9 @@ struct ReceiverSlot {
 }
 
 struct SlotManager {
+    // Tracks discovered in the room but not yet assigned to a slot.
+    pending_tracks: HashMap<TrackId, Arc<Track>>,
+    // Active track transmitters.
     remote_tracks: HashMap<TrackId, RemoteTrackTx>,
     // The fixed set of Receive Transceivers (MIDs) available to this Agent.
     slots: Vec<ReceiverSlot>,
@@ -1169,6 +1178,7 @@ struct SlotManager {
 impl SlotManager {
     fn new() -> Self {
         Self {
+            pending_tracks: HashMap::new(),
             slots: Vec::new(),
             remote_tracks: HashMap::new(),
         }
@@ -1190,50 +1200,53 @@ impl SlotManager {
     }
 
     fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> Vec<RemoteTrackRx> {
+        tracing::info!("Syncing SlotManager state with update: {:?}", update);
         let mut new_remote_tracks = Vec::new();
 
+        // 1. Handle track removals
         for t in update.tracks_remove {
+            self.pending_tracks.remove(&t);
             self.remote_tracks.remove(&t);
         }
 
+        // 2. Handle new tracks (store as pending if not already active or pending)
         for t in update.tracks_upsert {
             if self.remote_tracks.contains_key(&t.id) {
-                tracing::warn!("detected a track entry duplicate: {}", t.id);
+                // Already active, maybe update track metadata? 
+                // For now just keep it.
                 continue;
             }
-
-            let t = Arc::new(t);
-            let (tx, rx) = new_remote_track(t.clone());
-            self.remote_tracks.insert(t.id.clone(), tx);
-            new_remote_tracks.push(rx);
+            self.pending_tracks.insert(t.id.clone(), Arc::new(t));
         }
 
+        // 3. Handle assignment removals
         for a in update.assignments_remove {
-            let Some(idx) = self
-                .slots
-                .iter()
-                .position(|s| s.mid.as_bytes() == a.as_bytes())
-            else {
+            if let Some(s) = self.slots.iter_mut().find(|s| s.mid.as_bytes() == a.as_bytes()) {
+                s.track_id = None;
+            }
+        }
+
+        // 4. Handle assignment updates
+        for a in update.assignments_upsert {
+            let Some(s) = self.slots.iter_mut().find(|s| s.mid.as_bytes() == a.mid.as_bytes()) else {
                 continue;
             };
 
-            self.slots.remove(idx);
-        }
-
-        for a in update.assignments_upsert {
-            if !self.remote_tracks.contains_key(&a.track_id) {
-                tracing::warn!(
-                    "remote_track doesn't exist, ignore assignment update: {}",
-                    a.track_id
-                );
+            if s.track_id.as_deref() == Some(&a.track_id) {
+                // Already assigned to this track.
                 continue;
             }
 
-            for s in &mut self.slots {
-                if s.mid.as_bytes() == a.mid.as_bytes() {
-                    s.track_id.replace(a.track_id);
-                    break;
-                }
+            s.track_id = Some(a.track_id.clone());
+
+            // If we have bitstream for this track and it's in pending_tracks, promote it.
+            if let Some(track) = self.pending_tracks.remove(&a.track_id) {
+                tracing::info!("Promoting track {} to active on MID {:?}", a.track_id, s.mid);
+                let (tx, rx) = new_remote_track(s.mid, track);
+                self.remote_tracks.insert(a.track_id, tx);
+                new_remote_tracks.push(rx);
+            } else {
+                tracing::debug!("Track {} already active or not found in pending", a.track_id);
             }
         }
 
