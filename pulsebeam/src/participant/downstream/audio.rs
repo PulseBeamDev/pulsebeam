@@ -111,10 +111,10 @@ impl AudioAllocator {
     /// Delegates entirely to `SlotGroup::poll_next`, which uses an atomic
     /// readiness bitmask to visit only slots that have pending data.
     #[inline]
-    pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<(Mid, RtpPacket)> {
+    pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
         use futures_lite::stream::Stream as _;
         match Pin::new(&mut self.slots).poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(item),
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
     }

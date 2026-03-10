@@ -23,9 +23,6 @@ pub struct DownstreamAllocator {
 
     pub audio: AudioAllocator,
     pub video: VideoAllocator,
-
-    pending_audio: Option<(Mid, RtpPacket)>,
-    pending_video: Option<(Mid, RtpPacket)>,
 }
 
 impl DownstreamAllocator {
@@ -35,9 +32,6 @@ impl DownstreamAllocator {
             audio: AudioAllocator::new(),
             video: VideoAllocator::new(manual_sub),
             dirty_allocation: false,
-
-            pending_audio: None,
-            pending_video: None,
         }
     }
 
@@ -102,25 +96,13 @@ impl Stream for DownstreamAllocator {
     type Item = (Mid, RtpPacket);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Always poll both — waker always fresh, no stale waker risk
-        if self.pending_audio.is_none() {
-            if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
-                self.pending_audio = Some(pkt);
-            }
-        }
-        if self.pending_video.is_none() {
-            if let Poll::Ready(pkt) = self.video.poll_next(cx) {
-                self.pending_video = Some(pkt);
-            }
+        if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
+            return Poll::Ready(pkt);
         }
 
-        if let Some(pkt) = self.pending_audio.take() {
-            return Poll::Ready(Some(pkt));
-        }
-        if let Some(pkt) = self.pending_video.take() {
-            return Poll::Ready(Some(pkt));
-        }
-
-        Poll::Pending
+        // Video slots won't register wakers until audio goes pending.
+        // This is okay because the invariant is that the executor has to poll
+        // this again whenever it is ready.
+        self.video.poll_next(cx)
     }
 }

@@ -5,7 +5,6 @@ use pulsebeam_runtime::collections::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -443,13 +442,14 @@ impl VideoAllocator {
         }
     }
 
-    /// Inline hot path — called directly from `DownstreamAllocator::poll_next`
-    /// to avoid constructing a `tokio::select!` future per packet.
     #[inline]
-    pub(super) fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> Poll<(Mid, RtpPacket)> {
+    pub(super) fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<(Mid, RtpPacket)>> {
         use futures_lite::stream::Stream as _;
         match Pin::new(&mut self.slots).poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(item),
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
     }
