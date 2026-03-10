@@ -1,4 +1,3 @@
-pub mod bit_signal;
 pub mod mpsc;
 pub mod pool_buf;
 pub mod slot_group;
@@ -120,6 +119,8 @@ mod primitives {
     pub mod coop {
         pub use tokio::task::coop::poll_proceed;
     }
+
+    pub use futures::task::AtomicWaker;
 }
 
 #[cfg(feature = "loom")]
@@ -261,6 +262,28 @@ mod primitives {
 
         pub fn poll_proceed(_cx: &mut Context<'_>) -> Poll<CoopToken> {
             Poll::Ready(CoopToken)
+        }
+    }
+
+    pub struct AtomicWaker(loom::future::AtomicWaker);
+
+    impl AtomicWaker {
+        pub fn new() -> Self {
+            Self(loom::future::AtomicWaker::new())
+        }
+
+        pub fn register(&self, waker: &std::task::Waker) {
+            self.0.register_by_ref(waker); // loom uses register_by_ref
+        }
+
+        pub fn wake(&self) {
+            self.0.wake();
+        }
+    }
+
+    impl Default for AtomicWaker {
+        fn default() -> Self {
+            Self::new()
         }
     }
 }

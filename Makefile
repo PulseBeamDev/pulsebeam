@@ -23,7 +23,7 @@ profile:
 test: test-unit test-loom test-sim
 
 test-unit:
-	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator
+	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator -- --skip loom_
 
 test-sim:
 	$(CARGO_CMD) test -p pulsebeam-simulator -- --no-capture

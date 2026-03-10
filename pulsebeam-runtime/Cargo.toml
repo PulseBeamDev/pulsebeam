@@ -24,6 +24,7 @@ crossbeam-utils = "0.8.21"
 dashmap = "6.1.0"
 diatomic-waker = "0.2"
 event-listener = "5.4.1"
+futures = "0.3.32"
 futures-lite = { workspace = true }
 libc = "0.2.182"
 loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true }
@@ -45,7 +46,6 @@ triomphe = { workspace = true }
 [dev-dependencies]
 async-stream = "0.3.6"
 criterion = { version = "0.8.1", features = ["async", "async_tokio"] }
-futures = "0.3.32"
 futures-concurrency = "7.6.3"
 futures-test = "0.3.32"
 
