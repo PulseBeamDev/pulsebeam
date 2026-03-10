@@ -20,13 +20,16 @@ release:
 profile:
 	$(CARGO_CMD) build --profile profiling -p pulsebeam
 
-test: test-unit test-sim
+test: test-unit test-loom test-sim
 
 test-unit:
-	cargo test --workspace --exclude pulsebeam-simulator
+	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator
 
 test-sim:
-	cargo test -p pulsebeam-simulator -- --no-capture
+	$(CARGO_CMD) test -p pulsebeam-simulator -- --no-capture
+
+test-loom:
+	LOOM_MAX_PREEMPTIONS=2 $(CARGO_CMD) test --workspace --features loom loom_
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty

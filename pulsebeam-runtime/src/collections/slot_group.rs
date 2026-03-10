@@ -381,35 +381,44 @@ impl<S: Stream + Unpin> Stream for SlotGroup<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use futures_lite::StreamExt;
-    use std::sync::Arc as StdArc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::Context;
+    use super::super::*;
 
-    // ── TestStream — a single enum that covers all test behaviours ────────────
-    //
-    // SlotGroup<S> requires a single concrete S. Rather than boxing, we unify
-    // all test stream variants into one enum so every SlotGroup in the tests is
-    // homogeneous: `SlotGroup<TestStream>`.
+    use futures::Stream;
+    use futures_lite::StreamExt as _;
+    use futures_test::task::{new_count_waker, noop_waker, panic_waker};
+    use std::pin::Pin;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Unified test stream (same pattern as original tests, extended)
+    // ─────────────────────────────────────────────────────────────────────────
 
     enum TestStream {
-        /// Emits `val` forever.
+        /// Emits `val` on every poll.
         AlwaysReady(i32),
-        /// Emits `val` exactly `remaining` times, then terminates.
+        /// Emits `val` exactly `remaining` more times, then returns `Ready(None)`.
         Finite { val: i32, remaining: usize },
-        /// Pending until `ready` is set to `true`, then emits `val` forever.
-        Gated { val: i32, ready: bool },
-        /// Always pending; increments `poll_count` on every poll.
+        /// Returns `Pending` until `ready` is `true`, then emits `val` forever.
+        Gated { val: i32, ready: StdArc<AtomicBool> },
+        /// Always pending; increments `poll_count` on every `poll_next`.
         CountedPending(StdArc<AtomicUsize>),
+        /// Records every waker it receives so callers can fire them externally.
+        WakerCapture {
+            val: i32,
+            armed: bool,
+            captured: StdArc<std::sync::Mutex<Option<std::task::Waker>>>,
+        },
     }
 
     impl Stream for TestStream {
         type Item = i32;
 
-        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<i32>> {
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<i32>> {
             match self.get_mut() {
                 TestStream::AlwaysReady(v) => Poll::Ready(Some(*v)),
+
                 TestStream::Finite { val, remaining } => {
                     if *remaining == 0 {
                         Poll::Ready(None)
@@ -418,384 +427,729 @@ mod tests {
                         Poll::Ready(Some(*val))
                     }
                 }
+
                 TestStream::Gated { val, ready } => {
-                    if *ready {
+                    if ready.load(Ordering::Acquire) {
+                        Poll::Ready(Some(*val))
+                    } else {
+                        // Re-register waker on every Pending — standard contract.
+                        let _ = cx.waker().clone(); // touch waker to satisfy linters
+                        Poll::Pending
+                    }
+                }
+
+                TestStream::CountedPending(c) => {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    Poll::Pending
+                }
+
+                TestStream::WakerCapture {
+                    val,
+                    armed,
+                    captured,
+                } => {
+                    *captured.lock().unwrap() = Some(cx.waker().clone());
+                    if *armed {
                         Poll::Ready(Some(*val))
                     } else {
                         Poll::Pending
                     }
                 }
-                TestStream::CountedPending(c) => {
-                    c.fetch_add(1, Ordering::Relaxed);
-                    Poll::Pending
-                }
             }
         }
     }
 
-    // Convenience constructors
-    fn always(val: i32) -> TestStream {
-        TestStream::AlwaysReady(val)
+    // ── Convenience constructors ──────────────────────────────────────────────
+
+    fn always(v: i32) -> TestStream {
+        TestStream::AlwaysReady(v)
     }
-    fn finite(val: i32, n: usize) -> TestStream {
-        TestStream::Finite { val, remaining: n }
+    fn finite(v: i32, n: usize) -> TestStream {
+        TestStream::Finite {
+            val: v,
+            remaining: n,
+        }
     }
-    fn gated(val: i32) -> TestStream {
-        TestStream::Gated { val, ready: false }
+
+    fn gated(v: i32) -> (TestStream, StdArc<AtomicBool>) {
+        let flag = StdArc::new(AtomicBool::new(false));
+        (
+            TestStream::Gated {
+                val: v,
+                ready: flag.clone(),
+            },
+            flag,
+        )
     }
+
     fn counted_pending(c: &StdArc<AtomicUsize>) -> TestStream {
         TestStream::CountedPending(c.clone())
     }
 
-    // Helper: open the gate on a Gated slot. The SlotGuard auto-pokes on drop.
-    fn open_gate(g: &mut SlotGroup<TestStream>, idx: usize) {
-        if let Some(mut guard) = g.get_mut(idx) {
-            if let TestStream::Gated { ready, .. } = &mut *guard {
-                *ready = true;
-            }
-        } // guard drops here → automatic poke
+    fn waker_capture(
+        v: i32,
+    ) -> (
+        TestStream,
+        StdArc<std::sync::Mutex<Option<std::task::Waker>>>,
+    ) {
+        let cap = StdArc::new(std::sync::Mutex::new(None));
+        (
+            TestStream::WakerCapture {
+                val: v,
+                armed: false,
+                captured: cap.clone(),
+            },
+            cap,
+        )
     }
 
-    // ── Basic functionality ───────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn single_stream_emits() {
-        let mut g = SlotGroup::with_capacity(4);
-        g.insert(always(42));
-        assert_eq!(g.next().await, Some(42));
+    /// Poll helper: one `poll_next` with a given `Context`.
+    fn poll_once(g: &mut SlotGroup<TestStream>, cx: &mut Context<'_>) -> Poll<Option<i32>> {
+        Pin::new(g).poll_next(cx)
     }
 
-    #[tokio::test]
-    async fn multiple_streams_all_emit() {
-        let mut g = SlotGroup::with_capacity(4);
-        g.insert(finite(1, 1));
-        g.insert(finite(2, 1));
-        g.insert(finite(3, 1));
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. Basic correctness
+    // ─────────────────────────────────────────────────────────────────────────
 
-        let mut results = vec![
-            g.next().await.unwrap(),
-            g.next().await.unwrap(),
-            g.next().await.unwrap(),
-        ];
-        results.sort();
-        assert_eq!(results, vec![1, 2, 3]);
+    #[test]
+    fn empty_group_is_pending_not_none() {
+        // An empty SlotGroup has no streams to terminate — it should park the
+        // task (Pending), not signal end-of-stream (Ready(None)).
+        let mut g: SlotGroup<TestStream> = SlotGroup::with_capacity(4);
+        let (waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+        // No spurious wakes should have been scheduled.
+        assert_eq!(count.get(), 0);
     }
 
     #[test]
-    fn empty_group_reports_empty() {
-        let g: SlotGroup<TestStream> = SlotGroup::with_capacity(4);
-        assert!(g.is_empty());
-        assert_eq!(g.len(), 0);
+    fn single_always_ready_stream() {
+        let mut g = SlotGroup::with_capacity(4);
+        g.insert(always(7));
+        let waker = panic_waker(); // must NOT be called — stream is always ready
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(7)));
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(7)));
     }
 
-    // ── Round-robin fairness ──────────────────────────────────────────────────
+    #[test]
+    fn finite_stream_terminates_and_slot_is_evicted() {
+        let mut g = SlotGroup::with_capacity(4);
+        g.insert(finite(3, 2));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
 
-    #[tokio::test]
-    async fn round_robin_three_slots() {
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(3)));
+        assert_eq!(g.len(), 1);
+
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(3)));
+
+        // The stream is now exhausted — next poll drives eviction.
+        let _ = poll_once(&mut g, &mut cx);
+        assert_eq!(g.len(), 0, "slot must be evicted after Ready(None)");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. Round-robin fairness
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn round_robin_order_three_always_ready() {
         let mut g = SlotGroup::with_capacity(4);
         g.insert(always(1));
         g.insert(always(2));
         g.insert(always(3));
 
-        assert_eq!(g.next().await, Some(1));
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First pass: slots 0 → 1 → 2
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(1)));
         assert_eq!(g.last_index, 0);
-
-        assert_eq!(g.next().await, Some(2));
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(2)));
         assert_eq!(g.last_index, 1);
-
-        assert_eq!(g.next().await, Some(3));
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(3)));
         assert_eq!(g.last_index, 2);
 
-        // Wraps back to slot 0.
-        assert_eq!(g.next().await, Some(1));
+        // Second pass wraps around to slot 0.
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(1)));
         assert_eq!(g.last_index, 0);
     }
 
-    #[tokio::test]
-    async fn round_robin_skips_pending_slots() {
+    #[test]
+    fn round_robin_skips_pending_slot_in_rotation() {
         let mut g = SlotGroup::with_capacity(4);
-        g.insert(always(1)); // slot 0 — always ready
-        g.insert(gated(2)); // slot 1 — pending
-        g.insert(always(3)); // slot 2 — always ready
+        g.insert(always(10)); // slot 0
+        let (gs, _flag) = gated(20);
+        g.insert(gs); // slot 1 — pending
+        g.insert(always(30)); // slot 2
 
-        assert_eq!(g.next().await, Some(1));
-        assert_eq!(g.next().await, Some(3));
-        assert_eq!(g.next().await, Some(1));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Drain insert-poke for slot 1 (it returns Pending immediately).
+        // We need to do enough polls to clear slot 1's initial poke.
+        // Poll until we get slot 0, then slot 2, then slot 0 again — no 20.
+        let mut seen: Vec<i32> = Vec::new();
+        for _ in 0..6 {
+            if let Poll::Ready(Some(v)) = poll_once(&mut g, &mut cx) {
+                seen.push(v);
+            }
+        }
+        assert!(
+            !seen.contains(&20),
+            "pending slot should never emit: got {seen:?}"
+        );
+        assert!(seen.contains(&10) && seen.contains(&30));
     }
 
-    // ── Poke / waker notification ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. Waker registration — correctness and no-redundant-store optimisation
+    // ─────────────────────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn poke_wakes_pending_slot() {
+    /// The outer waker must be registered BEFORE `signal.take()` so that a
+    /// notification racing between take() and Pending return is not lost.
+    ///
+    /// We simulate this by using a `WakerCapture` stream: after we confirm the
+    /// group went Pending, we fire the captured *slot* waker and verify that the
+    /// outer `count_waker` is woken — meaning the outer waker was registered
+    /// before the slot's notification arrived.
+    #[test]
+    fn outer_waker_registered_before_signal_take() {
         let mut g = SlotGroup::with_capacity(4);
-        let idx = g.insert(gated(99));
+        let (stream, cap) = waker_capture(42);
+        let idx = g.insert(stream);
 
+        let (outer_waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+
+        // First poll: stream returns Pending, captures the slot waker.
+        // The group's insert-time poke fires the slot once, stream → Pending.
+        let result = poll_once(&mut g, &mut cx);
+        assert_eq!(result, Poll::Pending);
+
+        // The slot waker was captured inside the stream during its poll.
+        let slot_waker = cap.lock().unwrap().clone().expect("waker must be captured");
+
+        // Arm the stream so next poll returns Ready.
         {
-            let mut fut = g.next();
-            tokio::select! {
-                _ = &mut fut => panic!("should be pending"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            let mut guard = g.get_mut(idx).unwrap();
+            if let TestStream::WakerCapture { armed, .. } = &mut *guard {
+                *armed = true;
             }
         }
 
-        open_gate(&mut g, idx);
-        // No manual poke needed — open_gate drops a SlotGuard which pokes automatically.
+        // Fire the slot waker (simulates async notification from another task).
+        slot_waker.wake();
 
-        assert_eq!(g.next().await, Some(99));
-    }
-
-    #[test]
-    fn get_mut_on_unoccupied_slot_returns_none() {
-        let mut g: SlotGroup<TestStream> = SlotGroup::with_capacity(4);
-        // get_mut on a free slot must return None, not panic.
-        assert!(g.get_mut(0).is_none());
-        assert!(g.get_mut(63).is_none());
-        assert!(g.get_mut(100).is_none());
-    }
-
-    // ── Stream termination (Ready(None)) ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn terminated_stream_is_evicted() {
-        let mut g = SlotGroup::with_capacity(4);
-        g.insert(finite(7, 1));
-        g.insert(always(8));
-
-        let first = g.next().await.unwrap();
-
-        // Drive once more so the terminated slot's eviction is processed.
-        let _second = g.next().await.unwrap();
-        assert_eq!(g.len(), 1);
-
-        assert_eq!(g.next().await, Some(8));
-        assert_eq!(first, 7);
-    }
-
-    #[tokio::test]
-    async fn all_streams_terminate_evicts_all() {
-        let mut g = SlotGroup::with_capacity(4);
-        g.insert(finite(1, 1));
-        g.insert(finite(2, 1));
-
-        let a = g.next().await.unwrap();
-        let b = g.next().await.unwrap();
-        let mut got = vec![a, b];
-        got.sort();
-        assert_eq!(got, vec![1, 2]);
-
-        // Flush evictions with manual polls.
-        for _ in 0..5 {
-            let waker = noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let _ = Pin::new(&mut g).poll_next(&mut cx);
-        }
-        assert_eq!(g.len(), 0);
-    }
-
-    // ── Remove ────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn remove_frees_slot() {
-        let mut g = SlotGroup::with_capacity(4);
-        let idx = g.insert(always(5));
-        assert_eq!(g.len(), 1);
-
-        assert!(g.remove(idx).is_some());
-        assert_eq!(g.len(), 0);
-
-        // Slot is free — insert should reuse it.
-        let new_idx = g.insert(always(6));
-        assert_eq!(new_idx, idx);
-        assert_eq!(g.next().await, Some(6));
-    }
-
-    #[tokio::test]
-    async fn remove_clears_pending_bits() {
-        let mut g = SlotGroup::with_capacity(4);
-        let idx = g.insert(always(5));
-        // Touch via get_mut to trigger a poke, ensuring pending_bits is set.
-        let _ = g.get_mut(idx); // guard drops immediately, poking the slot
-        g.remove(idx);
-        assert_eq!(g.pending_bits & (1u64 << idx), 0);
-        assert_eq!(g.occupied & (1u64 << idx), 0);
-    }
-
-    #[test]
-    fn remove_on_free_slot_returns_none() {
-        let mut g: SlotGroup<TestStream> = SlotGroup::with_capacity(4);
-        assert!(g.remove(0).is_none());
-        assert!(g.remove(63).is_none());
-    }
-
-    // ── Slot reuse waker isolation ────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn reused_slot_gets_fresh_waker() {
-        let mut g = SlotGroup::with_capacity(4);
-
-        let idx = g.insert(finite(1, 1));
-        let _ = g.next().await; // drain + evict
-
-        g.remove(idx); // no-op if already evicted
-
-        let idx2 = g.insert(gated(42));
-        assert_eq!(idx2, idx, "slot should be reused");
-
-        open_gate(&mut g, idx2);
-        // open_gate drops the SlotGuard which pokes automatically.
-
-        assert_eq!(g.next().await, Some(42));
-    }
-
-    // ── Capacity limits ───────────────────────────────────────────────────────
-
-    #[test]
-    #[should_panic(expected = "SlotGroup capacity must be ≤ 64")]
-    fn capacity_over_64_panics() {
-        let _: SlotGroup<TestStream> = SlotGroup::with_capacity(65);
-    }
-
-    #[test]
-    #[should_panic(expected = "SlotGroup is full")]
-    fn insert_when_full_panics() {
-        let mut g = SlotGroup::with_capacity(2);
-        g.insert(always(1));
-        g.insert(always(2));
-        g.insert(always(3)); // should panic
-    }
-
-    #[tokio::test]
-    async fn capacity_1_works() {
-        let mut g = SlotGroup::with_capacity(1);
-        g.insert(always(77));
-        assert_eq!(g.next().await, Some(77));
-        assert_eq!(g.next().await, Some(77));
-    }
-
-    // ── No missed wakeups ─────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn no_missed_wakeup_after_pending() {
-        let mut g = SlotGroup::with_capacity(4);
-        let idx = g.insert(gated(1));
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            let _ = tx.send(());
-        });
-
-        let _ = rx.await;
-        open_gate(&mut g, idx);
-        // open_gate's SlotGuard drop auto-pokes — no manual poke needed.
-
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), g.next())
-            .await
-            .expect("timed out — wakeup was lost");
-
-        assert_eq!(result, Some(1));
-    }
-
-    // ── Hot-path poll count ───────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn pending_slot_not_re_polled_without_notification() {
-        let counter = StdArc::new(AtomicUsize::new(0));
-        let mut g = SlotGroup::with_capacity(4);
-
-        g.insert(counted_pending(&counter)); // slot 0 — always pending
-        g.insert(always(1)); // slot 1 — keeps group alive
-
-        g.next().await;
-        g.next().await;
-
-        let polls = counter.load(Ordering::Relaxed);
+        // The outer count_waker must have been woken.
         assert!(
-            polls <= 2,
-            "pending slot was polled {polls} times — should be ≤ 2"
+            wake_count.get() >= 1,
+            "outer waker not notified — waker was registered after signal.take()"
         );
     }
 
-    // ── SlotGuard auto-poke ───────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn guard_drop_pokes_without_explicit_call() {
+    /// Verifies `will_wake` short-circuit: same waker across polls must NOT cause
+    /// redundant `wake_sink.register` calls.  We can't observe atomic stores
+    /// directly, but we can verify that re-using the same waker object doesn't
+    /// corrupt the wake path (the waker is still invoked exactly once).
+    #[test]
+    fn same_outer_waker_reused_across_polls_still_works() {
         let mut g = SlotGroup::with_capacity(4);
-        let idx = g.insert(gated(55));
+        let (stream, flag) = gated(5);
+        g.insert(stream);
 
-        // Drain the insert-time poke so the slot goes dark.
+        let (waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll goes Pending.
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+        // Second poll with the SAME waker — exercises the `will_wake` fast path.
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+
+        // Open gate; the slot's own waker should wake the outer task.
+        flag.store(true, Ordering::Release);
+        {
+            let mut guard = g.get_mut(0).unwrap();
+            drop(guard); // auto-poke
+        }
+
+        assert!(count.get() >= 1, "outer waker must be invoked after poke");
+    }
+
+    /// When the outer waker changes between polls, the new waker must be used —
+    /// we must not be stuck on a stale cached waker.
+    #[test]
+    fn changed_outer_waker_is_re_registered() {
+        let mut g = SlotGroup::with_capacity(4);
+        let (stream, flag) = gated(9);
+        g.insert(stream);
+
+        let (waker1, count1) = new_count_waker();
+        {
+            let mut cx = Context::from_waker(&waker1);
+            assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+        }
+
+        // Switch to a new waker.
+        let (waker2, count2) = new_count_waker();
+        {
+            let mut cx = Context::from_waker(&waker2);
+            assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+        }
+
+        // Open gate and poke — should wake waker2, not waker1.
+        flag.store(true, Ordering::Release);
+        g.get_mut(0); // auto-poke on drop
+
+        // Give the signal a moment to propagate (it's synchronous in this path).
+        assert_eq!(count1.get(), 0, "stale waker1 must not be woken");
+        assert!(count2.get() >= 1, "current waker2 must be woken");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. `pending_bits` accounting
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pending_slot_clears_its_bit() {
+        let mut g = SlotGroup::with_capacity(4);
+        let (stream, _flag) = gated(1);
+        g.insert(stream);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        poll_once(&mut g, &mut cx); // insert poke fires → slot returns Pending → bit cleared
+        assert_eq!(
+            g.pending_bits & 1,
+            0,
+            "pending_bits bit 0 must be clear after Pending"
+        );
+    }
+
+    #[test]
+    fn remove_clears_both_occupied_and_pending_bits() {
+        let mut g = SlotGroup::with_capacity(4);
+        let idx = g.insert(always(1));
+
+        // Poke via get_mut so pending_bits is definitely non-zero.
+        drop(g.get_mut(idx));
+
+        g.remove(idx);
+
+        assert_eq!(
+            g.pending_bits & (1u64 << idx),
+            0,
+            "pending_bits must be clear after remove"
+        );
+        assert_eq!(
+            g.occupied & (1u64 << idx),
+            0,
+            "occupied must be clear after remove"
+        );
+    }
+
+    #[test]
+    fn pending_bits_not_set_for_evicted_slot_that_fires_late() {
+        // If a stream signals after being removed, its bit must be masked out
+        // by `& this.occupied` inside poll_next.
+        let mut g = SlotGroup::with_capacity(4);
+        let idx = g.insert(always(1));
+        g.remove(idx);
+
+        // Manually fire the (now-dead) signal bit to simulate a late wake.
+        g.signal.notify(idx as u8);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let r = poll_once(&mut g, &mut cx);
+
+        // Group is empty — must be Pending, not a spurious Ready.
+        assert_eq!(r, Poll::Pending);
+        assert_eq!(g.occupied, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. Hot-path poll economy
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A Pending slot must NOT be re-polled unless its waker is invoked.
+    #[test]
+    fn pending_slot_polled_at_most_once_per_notification() {
+        let counter = StdArc::new(AtomicUsize::new(0));
+        let mut g = SlotGroup::with_capacity(4);
+
+        g.insert(counted_pending(&counter)); // slot 0 — never ready
+        g.insert(always(1)); // slot 1 — keeps group alive
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Each outer poll should poll slot 0 at most once (the insert-time poke).
+        for _ in 0..5 {
+            let _ = poll_once(&mut g, &mut cx);
+        }
+
+        let polls = counter.load(Ordering::Relaxed);
+        assert!(
+            polls <= 1,
+            "pending slot polled {polls} times — must be ≤ 1 (insert poke only)"
+        );
+    }
+
+    /// When a slot returns `Ready(Some(_))`, its bit is left set so it is
+    /// revisited on the *next* outer poll — preventing starvation of a lone
+    /// always-ready slot while also not blocking other slots.
+    #[test]
+    fn always_ready_slot_bit_stays_set_after_ready() {
+        let mut g = SlotGroup::with_capacity(4);
+        g.insert(always(99));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let r1 = poll_once(&mut g, &mut cx);
+        assert_eq!(r1, Poll::Ready(Some(99)));
+
+        // pending_bits for slot 0 must still be set after a Ready return.
+        assert_ne!(
+            g.pending_bits & 1,
+            0,
+            "bit must remain set after Ready(Some) so slot isn't starved"
+        );
+
+        let r2 = poll_once(&mut g, &mut cx);
+        assert_eq!(r2, Poll::Ready(Some(99)));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6. SlotGuard auto-poke contract
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_mut_guard_drop_pokes_slot() {
+        let mut g = SlotGroup::with_capacity(4);
+        let idx = g.insert(always(3));
+
+        // Drain the insert-time poke so pending_bits goes dark.
         {
             let waker = noop_waker();
             let mut cx = Context::from_waker(&waker);
-            let _ = Pin::new(&mut g).poll_next(&mut cx); // slot returns Pending, bit cleared
+            let _ = poll_once(&mut g, &mut cx);
         }
 
-        // Mutate via guard — no manual poke.
-        {
-            let mut guard = g.get_mut(idx).unwrap();
-            if let TestStream::Gated { ready, .. } = &mut *guard {
-                *ready = true;
-            }
-        } // guard drops here → automatic poke
+        // After draining, pending_bits must be set (Ready(Some) leaves bit set).
+        // Clear it manually to simulate a fully-dark slot for the poke test.
+        g.pending_bits &= !(1u64 << idx);
 
-        assert_eq!(g.next().await, Some(55));
+        // Now obtain a guard and drop it — the auto-poke should re-set the bit.
+        drop(g.get_mut(idx));
+
+        // The signal is async (atomic notify) but since we're single-threaded
+        // we need to run a poll to merge the signal into pending_bits.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let r = poll_once(&mut g, &mut cx);
+        assert_eq!(r, Poll::Ready(Some(3)), "auto-poke must wake the slot");
     }
 
-    #[tokio::test]
-    async fn iter_mut_guard_pokes_each_slot() {
+    #[test]
+    fn iter_mut_guard_pokes_every_slot() {
         let mut g = SlotGroup::with_capacity(4);
-        g.insert(gated(1));
-        g.insert(gated(2));
+        let (s0, flag0) = gated(10);
+        let (s1, flag1) = gated(20);
+        g.insert(s0);
+        g.insert(s1);
 
         // Drain insert-time pokes.
         {
             let waker = noop_waker();
             let mut cx = Context::from_waker(&waker);
-            let _ = Pin::new(&mut g).poll_next(&mut cx);
-            let _ = Pin::new(&mut g).poll_next(&mut cx);
-        }
-
-        // Open all gates via iter_mut — guards auto-poke on drop.
-        for (_, mut guard) in g.iter_mut() {
-            if let TestStream::Gated { ready, .. } = &mut *guard {
-                *ready = true;
+            for _ in 0..4 {
+                let _ = poll_once(&mut g, &mut cx);
             }
         }
 
-        let mut results = vec![g.next().await.unwrap(), g.next().await.unwrap()];
+        // Open both gates via iter_mut — guards auto-poke on drop.
+        for (_, mut guard) in g.iter_mut() {
+            if let TestStream::Gated { ready, .. } = &mut *guard {
+                ready.store(true, Ordering::Release);
+            }
+        }
+
+        // Both slots should now be reachable.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut results = Vec::new();
+        for _ in 0..4 {
+            if let Poll::Ready(Some(v)) = poll_once(&mut g, &mut cx) {
+                results.push(v);
+            }
+        }
         results.sort();
-        assert_eq!(results, vec![1, 2]);
+        assert!(results.contains(&10), "slot 0 must emit after gate opened");
+        assert!(results.contains(&20), "slot 1 must emit after gate opened");
+
+        // Silence unused-variable warnings for flags (they're used for control
+        // via the AtomicBool stored inside the stream).
+        let _ = (flag0, flag1);
     }
 
     #[test]
-    fn iter_returns_occupied_slots_only() {
+    fn get_mut_on_free_slot_returns_none() {
+        let mut g: SlotGroup<TestStream> = SlotGroup::with_capacity(8);
+        assert!(g.get_mut(0).is_none());
+        assert!(g.get_mut(7).is_none());
+        assert!(g.get_mut(100).is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 7. Slot reuse and waker isolation
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// After a stream terminates and its slot is reused, the new occupant must
+    /// get a brand-new slot waker — not inherit the old one.  Stale waker
+    /// caching via `will_wake` in the *inner* stream would otherwise silently
+    /// skip re-registration after the first Pending, leaving the slot dark.
+    #[test]
+    fn reused_slot_has_fresh_slot_waker() {
         let mut g = SlotGroup::with_capacity(4);
+
+        // First occupant: emits once then terminates.
+        let idx = g.insert(finite(1, 1));
+
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            // Drain the value and the termination.
+            let _ = poll_once(&mut g, &mut cx);
+            let _ = poll_once(&mut g, &mut cx);
+        }
+
+        // Force eviction cleanup.
+        g.remove(idx);
+
+        // Second occupant in the same slot.
+        let (stream2, flag2) = gated(99);
+        let idx2 = g.insert(stream2);
+        assert_eq!(idx2, idx, "slot should be reused");
+
+        // Open the gate and use get_mut to auto-poke.
+        flag2.store(true, Ordering::Release);
+        drop(g.get_mut(idx2)); // auto-poke
+
+        // Must emit — if the waker was stale the slot would stay dark.
+        let result = futures_lite::future::block_on(g.next());
+        assert_eq!(result, Some(99));
+    }
+
+    /// When two slots occupy a group and one is removed mid-stream, the
+    /// remaining slot's waker must not be disturbed.
+    #[test]
+    fn remove_does_not_disturb_other_slot_waker() {
+        let mut g = SlotGroup::with_capacity(4);
+        let idx0 = g.insert(always(1));
+        let idx1 = g.insert(always(2));
+
+        g.remove(idx0);
+
+        let waker = panic_waker(); // must not be called — stream is always ready
+        let mut cx = Context::from_waker(&waker);
+        let r = poll_once(&mut g, &mut cx);
+        assert_eq!(r, Poll::Ready(Some(2)));
+        let _ = idx1;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 8. Capacity limits
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "SlotGroup capacity must be ≤ 64")]
+    fn capacity_65_panics() {
+        let _: SlotGroup<TestStream> = SlotGroup::with_capacity(65);
+    }
+
+    #[test]
+    #[should_panic(expected = "SlotGroup is full")]
+    fn insert_into_full_group_panics() {
+        let mut g = SlotGroup::with_capacity(2);
         g.insert(always(1));
         g.insert(always(2));
-        assert_eq!(g.iter().count(), 2);
+        g.insert(always(3));
+    }
+
+    #[test]
+    fn capacity_1_round_trips() {
+        let mut g = SlotGroup::with_capacity(1);
+        g.insert(always(42));
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(42)));
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(42)));
+    }
+
+    #[test]
+    fn capacity_64_insert_and_remove_all() {
+        let mut g = SlotGroup::with_capacity(64);
+        for i in 0..64 {
+            g.insert(always(i as i32));
+        }
+        assert_eq!(g.len(), 64);
+        for i in 0..64 {
+            assert!(g.remove(i).is_some());
+        }
+        assert_eq!(g.len(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 9. No missed wakeup — cross-thread race simulation
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Regression: notification must not be lost if it arrives between
+    /// `signal.take()` and the `Poll::Pending` return.
+    ///
+    /// We use a real OS thread to fire the slot waker concurrently while the
+    /// group is mid-poll, then verify the outer count_waker is eventually woken.
+    #[test]
+    fn no_missed_wakeup_cross_thread() {
+        use std::time::Duration;
+
+        let mut g = SlotGroup::with_capacity(4);
+        let (stream, cap) = waker_capture(7);
+        let idx = g.insert(stream);
+
+        let (outer_waker, wake_count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+
+        // First poll — stream captures slot waker, returns Pending.
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+        let slot_waker = cap.lock().unwrap().clone().expect("must capture waker");
+
+        // Arm the stream so next poll yields Ready.
+        {
+            let mut guard = g.get_mut(idx).unwrap();
+            if let TestStream::WakerCapture { armed, .. } = &mut *guard {
+                *armed = true;
+            }
+        }
+
+        // Fire slot waker from another thread with a tiny delay.
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            slot_waker.wake();
+        });
+        handle.join().unwrap();
+
+        // Outer waker must have been triggered (directly or via wake_sink chain).
+        let count = wake_count.get();
+        assert!(
+            count >= 1,
+            "outer waker never woken — potential missed wakeup (count={count})"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 10. `iter` / `get` immutable accessors
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn iter_yields_only_occupied_slots() {
+        let mut g = SlotGroup::with_capacity(8);
+        g.insert(always(1));
+        g.insert(always(2));
+        g.insert(always(3));
+        g.remove(1);
+
+        let indices: Vec<usize> = g.iter().map(|(i, _)| i).collect();
+        assert_eq!(indices, vec![0, 2]);
     }
 
     #[test]
     fn get_returns_none_for_free_slot() {
         let g: SlotGroup<TestStream> = SlotGroup::with_capacity(4);
         assert!(g.get(0).is_none());
-        assert!(g.get(63).is_none());
+        assert!(g.get(3).is_none());
         assert!(g.get(100).is_none());
     }
 
     #[test]
-    fn get_mut_returns_some_for_occupied_slot() {
+    fn get_returns_some_for_occupied_slot() {
         let mut g = SlotGroup::with_capacity(4);
         let idx = g.insert(always(5));
-        assert!(g.get_mut(idx).is_some());
+        assert!(g.get(idx).is_some());
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // 11. Integration: block_on end-to-end
+    // ─────────────────────────────────────────────────────────────────────────
 
-    fn noop_waker() -> Waker {
-        use std::task::{RawWaker, RawWakerVTable};
-        const VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    #[test]
+    fn block_on_drains_three_finite_streams() {
+        futures_lite::future::block_on(async {
+            let mut g = SlotGroup::with_capacity(8);
+            g.insert(finite(1, 2));
+            g.insert(finite(2, 2));
+            g.insert(finite(3, 2));
+
+            let mut results = Vec::new();
+            for _ in 0..6 {
+                if let Some(v) = g.next().await {
+                    results.push(v);
+                }
+            }
+            results.sort();
+            assert_eq!(results, vec![1, 1, 2, 2, 3, 3]);
+            // All streams terminated — group should be empty.
+            assert_eq!(g.len(), 0);
+        });
+    }
+
+    #[test]
+    fn block_on_gated_stream_woken_by_poke() {
+        futures_lite::future::block_on(async {
+            let mut g = SlotGroup::with_capacity(4);
+            let (stream, flag) = gated(55);
+            let idx = g.insert(stream);
+
+            // Open gate externally, then poke via get_mut guard.
+            flag.store(true, Ordering::Release);
+            drop(g.get_mut(idx)); // auto-poke
+
+            let result = g.next().await;
+            assert_eq!(result, Some(55));
+        });
+    }
+
+    /// Verifies that a stream which alternates between Pending and Ready
+    /// (simulated by counting polls) never drops a value and is always polled
+    /// the correct number of times when driven to completion.
+    #[test]
+    fn block_on_interleaved_ready_and_pending() {
+        futures_lite::future::block_on(async {
+            // Two always-ready streams side by side — total items collected
+            // must be exactly N each with round-robin ordering.
+            let n = 10usize;
+            let mut g = SlotGroup::with_capacity(4);
+            g.insert(finite(1, n));
+            g.insert(finite(2, n));
+
+            let mut ones = 0usize;
+            let mut twos = 0usize;
+
+            while let Some(v) = g.next().await {
+                match v {
+                    1 => ones += 1,
+                    2 => twos += 1,
+                    _ => panic!("unexpected value {v}"),
+                }
+            }
+
+            assert_eq!(ones, n, "stream 1 must emit exactly {n} items");
+            assert_eq!(twos, n, "stream 2 must emit exactly {n} items");
+        });
     }
 }

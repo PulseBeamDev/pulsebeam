@@ -111,7 +111,7 @@ mod primitives {
     /// the matching atomic acquire on every `clone()`.  This is the canonical
     /// `Arc` for all internal SFU code; import via `crate::sync::Arc` (runtime)
     /// or `pulsebeam_runtime::sync::Arc` (other crates).
-    pub use triomphe::Arc;
+    pub use std::sync::Arc;
 
     pub mod atomic {
         pub use std::sync::atomic::*;
@@ -159,7 +159,92 @@ mod primitives {
     }
 
     pub use inner::*;
-    pub use std::sync::Arc;
+    #[derive(Debug)]
+    pub struct Arc<T: ?Sized>(loom::sync::Arc<T>);
+
+    impl<T> Arc<T> {
+        pub fn new(data: T) -> Self {
+            Self(loom::sync::Arc::new(data))
+        }
+    }
+
+    impl<T: ?Sized> Clone for Arc<T> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl<T: ?Sized> std::ops::Deref for Arc<T> {
+        type Target = T;
+        fn deref(&self) -> &Self::Target {
+            self.0.deref()
+        }
+    }
+
+    impl<T: ?Sized + PartialEq> PartialEq for Arc<T> {
+        fn eq(&self, other: &Self) -> bool {
+            **self == **other
+        }
+    }
+
+    impl<T: ?Sized + Eq> Eq for Arc<T> {}
+
+    impl<T: ?Sized + PartialOrd> PartialOrd for Arc<T> {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            (**self).partial_cmp(&**other)
+        }
+    }
+
+    impl<T: ?Sized + Ord> Ord for Arc<T> {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            (**self).cmp(&**other)
+        }
+    }
+
+    impl<T: ?Sized + std::hash::Hash> std::hash::Hash for Arc<T> {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            (**self).hash(state)
+        }
+    }
+
+    impl<T: Default> Default for Arc<T> {
+        fn default() -> Self {
+            Self::new(T::default())
+        }
+    }
+
+    impl<T: ?Sized + std::fmt::Display> std::fmt::Display for Arc<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&**self, f)
+        }
+    }
+
+    impl<T: ?Sized> Arc<T> {
+        pub fn as_ptr(this: &Self) -> *const T {
+            &*this.0 as *const T
+        }
+
+        pub fn into_raw(this: Self) -> *const T {
+            loom::sync::Arc::into_raw(this.0)
+        }
+
+        pub unsafe fn from_raw(ptr: *const T) -> Self {
+            Self(loom::sync::Arc::from_raw(ptr))
+        }
+
+        pub unsafe fn increment_strong_count(ptr: *const T) {
+            loom::sync::Arc::increment_strong_count(ptr)
+        }
+
+        pub unsafe fn decrement_strong_count(ptr: *const T) {
+            loom::sync::Arc::decrement_strong_count(ptr)
+        }
+
+        pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+            loom::sync::Arc::get_mut(&mut this.0.clone()).is_none() && // This is a hack, loom doesn't have ptr_eq directly sometimes
+            Arc::as_ptr(this) == Arc::as_ptr(other)
+        }
+    }
 
     pub mod atomic {
         pub use loom::sync::atomic::*;

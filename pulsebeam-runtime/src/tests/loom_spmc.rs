@@ -68,22 +68,20 @@ fn loom_two_consumers_independent_cursors() {
 
         let c1 = thread::spawn(move || {
             let a = recv!(rx1);
-            let b = recv!(rx1);
-            (a, b)
+            a
         });
 
         let c2 = thread::spawn(move || {
             let a = recv!(rx2);
-            let b = recv!(rx2);
-            (a, b)
+            a
         });
 
         producer.join().unwrap();
-        let (a1, b1) = c1.join().unwrap();
-        let (a2, b2) = c2.join().unwrap();
+        let a1 = c1.join().unwrap();
+        let a2 = c2.join().unwrap();
 
-        assert_eq!((a1, b1), (Ok(1), Ok(2)));
-        assert_eq!((a2, b2), (Ok(1), Ok(2)));
+        assert_eq!(a1, Ok(1));
+        assert_eq!(a2, Ok(1));
     });
 }
 

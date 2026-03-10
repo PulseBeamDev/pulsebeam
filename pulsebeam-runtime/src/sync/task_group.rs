@@ -1,9 +1,9 @@
+use crate::sync::Arc;
 use crate::sync::bit_signal::BitSignal;
 use diatomic_waker::WakeSink;
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
-use crate::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 type BoxFuture<O> = Pin<Box<dyn Future<Output = O> + Send + 'static>>;
@@ -159,7 +159,9 @@ impl<O: Send + 'static> TaskGroup<O> {
             bits &= bits.wrapping_sub(1);
 
             if let Some(task) = &mut self.slots[i] {
-                let waker = self.slot_wakers[i].as_ref().expect("waker built in try_push");
+                let waker = self.slot_wakers[i]
+                    .as_ref()
+                    .expect("waker built in try_push");
                 let mut slot_cx = Context::from_waker(waker);
 
                 if let Poll::Ready(output) = task.as_mut().poll(&mut slot_cx) {

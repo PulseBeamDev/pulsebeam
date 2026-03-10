@@ -1,5 +1,5 @@
-use diatomic_waker::{WakeSink, WakeSource};
 use crate::sync::Arc;
+use diatomic_waker::{WakeSink, WakeSource};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A lock-free signaling primitive for up to 64 concurrent slots in a [`TaskGroup`].
@@ -44,7 +44,8 @@ impl BitSignal {
     /// Called by producers (SPMC senders, event dispatchers, …).
     #[inline]
     pub fn notify(&self, index: u8) {
-        self.pending.fetch_or(1u64 << (index & 63), Ordering::Release);
+        self.pending
+            .fetch_or(1u64 << (index & 63), Ordering::Release);
         self.wake_src.notify();
     }
 
