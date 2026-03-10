@@ -8,6 +8,8 @@ use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+#[cfg(test)]
+use crate::entity::ParticipantId;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
@@ -272,6 +274,29 @@ impl TrackReceiver {
             .max_by_key(|s| s.quality)
             .expect("no highest quality, there must be at least 1 layer for TrackReceiver to exist")
     }
+}
+
+#[cfg(test)]
+pub fn new_test_track(
+    participant_id: ParticipantId,
+    kind: MediaKind,
+    mid: Mid,
+    simulcast: bool,
+) -> (TrackSender, TrackReceiver) {
+    let track_id = participant_id.derive_track_id(kind, &mid);
+    let rids = if simulcast {
+        Some(vec!["f".into(), "h".into(), "q".into()])
+    } else {
+        None
+    };
+    let meta = Arc::new(TrackMeta {
+        id: track_id,
+        origin_participant: participant_id,
+        kind,
+        simulcast_rids: rids,
+    });
+
+    crate::track::new(mid, meta)
 }
 
 pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {

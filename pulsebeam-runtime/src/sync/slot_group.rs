@@ -528,8 +528,6 @@ impl<S: Stream + Unpin> Stream for SlotGroup<S> {
 mod tests {
     use crate::sync::slot_group::SlotGroup;
 
-    use super::*;
-
     use futures::Stream;
     use futures_lite::StreamExt as _;
     use futures_test::task::{new_count_waker, noop_waker, panic_waker};
@@ -1204,6 +1202,1054 @@ mod tests {
             }
             assert_eq!(ones, n);
             assert_eq!(twos, n);
+        });
+    }
+}
+
+#[cfg(test)]
+mod spmc_tests {
+    use super::*;
+
+    use crate::sync::spmc;
+    use futures_lite::stream::Stream;
+    use futures_test::task::{new_count_waker, noop_waker, panic_waker};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    // ── SpmcStream ────────────────────────────────────────────────────────────
+    //
+    // Wraps `spmc::Receiver<i32>` as a `Stream<Item = i32>`.
+    //
+    // Behaviour mirrors SlotDriver::poll_packet in video.rs:
+    //
+    //   Ok(v)              → Ready(Some(v))   packet forwarded downstream
+    //   Err(Lagged(_))     → Ready(Some(-1))  observable sentinel; slot stays live
+    //   Err(Closed)        → Ready(None)      channel gone; SlotGroup auto-evicts
+
+    struct SpmcStream(spmc::Receiver<i32>);
+
+    impl Stream for SpmcStream {
+        type Item = i32;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<i32>> {
+            match self.get_mut().0.poll_recv(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(v)) => Poll::Ready(Some(v)),
+                Poll::Ready(Err(spmc::RecvError::Lagged(_))) => Poll::Ready(Some(-1)),
+                Poll::Ready(Err(spmc::RecvError::Closed)) => Poll::Ready(None),
+            }
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn spmc_pair(cap: usize) -> (spmc::Sender<i32>, SpmcStream) {
+        let (tx, rx) = spmc::channel(cap);
+        (tx, SpmcStream(rx))
+    }
+
+    fn poll_group(g: &mut SlotGroup<SpmcStream>, cx: &mut Context<'_>) -> Poll<Option<i32>> {
+        Pin::new(g).poll_next(cx)
+    }
+
+    /// Close all channels by dropping the provided senders, then drive the
+    /// group to empty so no `EventListener` is registered at drop time.
+    ///
+    /// Must be called before the `SlotGroup` goes out of scope in any test
+    /// that leaves live slots in the group, to prevent `panic_waker` or
+    /// `event-listener` from panicking during teardown.
+    fn drain_group(g: &mut SlotGroup<SpmcStream>, txs: Vec<spmc::Sender<i32>>) {
+        drop(txs); // close all channels → Ready(None) on next poll
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        // Drive until all slots are evicted.  Each slot needs at least one
+        // poll to see Closed → Ready(None) → eviction, but spmc may require
+        // more than one poll per slot (e.g. if the listener wasn't registered
+        // yet when the sender dropped).  Loop unconditionally until empty.
+        while !g.is_empty() {
+            let _ = poll_group(g, &mut cx);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section A — insert / add_slot
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn insert_returns_stable_indices_in_order() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(25);
+        let mut txs = Vec::new();
+        for i in 0..25usize {
+            let (tx, stream) = spmc_pair(4);
+            let idx = g.insert(stream);
+            assert_eq!(idx, i, "slot {i}: expected stable index {i}, got {idx}");
+            txs.push(tx);
+        }
+        assert_eq!(g.len(), 25);
+        drain_group(&mut g, txs);
+    }
+
+    #[test]
+    fn insert_auto_pokes_so_first_poll_visits_slot() {
+        // Ring is pre-filled with one item, so the first poll is guaranteed Ready.
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(4);
+        g.insert(stream);
+        tx.send(42);
+
+        // Safe to use panic_waker: one item in ring, one poll, guaranteed Ready.
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(
+            poll_group(&mut g, &mut cx),
+            Poll::Ready(Some(42)),
+            "freshly inserted slot must be visited on the first poll_next"
+        );
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn insert_after_remove_reuses_freed_slot_index() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx0, s0) = spmc_pair(4);
+        let (mut tx1, s1) = spmc_pair(4);
+        let idx0 = g.insert(s0);
+        let idx1 = g.insert(s1);
+        // Evict slot 0 cleanly before removing.
+        drop(tx0);
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            for _ in 0..4 {
+                let _ = poll_group(&mut g, &mut cx);
+            }
+        }
+        g.remove(idx0);
+
+        let (mut tx2, s2) = spmc_pair(4);
+        let idx2 = g.insert(s2);
+        assert_eq!(idx2, idx0, "freed slot must be reused");
+        assert_ne!(idx2, idx1, "occupied slot must not be overwritten");
+
+        tx1.send(2);
+        tx2.send(99);
+
+        // Both slots have exactly one item; noop_waker is safe here since we
+        // collect at most 4 times and both items will appear within that window.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            if let Poll::Ready(Some(v)) = poll_group(&mut g, &mut cx) {
+                seen.insert(v);
+            }
+        }
+        assert!(
+            seen.contains(&99),
+            "reused slot must emit its new channel's data"
+        );
+        assert!(seen.contains(&2), "original slot must still emit");
+
+        drain_group(&mut g, vec![tx1, tx2]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section B — get / get_mut / SlotGuard
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn get_returns_none_for_vacant_slot() {
+        let g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        assert!(g.get(0).is_none());
+        assert!(g.get(7).is_none());
+        assert!(g.get(100).is_none());
+    }
+
+    #[test]
+    fn get_returns_some_for_occupied_slot() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+        assert!(g.get(idx).is_some());
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn get_mut_returns_none_for_vacant_slot() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        assert!(g.get_mut(0).is_none());
+        assert!(g.get_mut(100).is_none());
+    }
+
+    #[test]
+    fn get_mut_returns_guard_for_occupied_slot() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+        assert!(g.get_mut(idx).is_some());
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn get_mut_on_freed_slot_returns_none() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (_tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+        g.remove(idx);
+        assert!(g.get_mut(idx).is_none());
+        // Group is already empty; no drain needed.
+    }
+
+    #[test]
+    fn slot_guard_auto_poke_reschedules_slot_after_mutation() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+
+        // Drain insert poke — slot parks on empty ring.
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let _ = poll_group(&mut g, &mut cx);
+        }
+        assert_eq!(
+            g.pending_bits & (1u64 << idx),
+            0,
+            "bit must be clear after Pending"
+        );
+
+        tx.send(55);
+        drop(g.get_mut(idx).unwrap()); // guard drop auto-pokes
+
+        // Ring has one item; poll is guaranteed Ready.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(
+            poll_group(&mut g, &mut cx),
+            Poll::Ready(Some(55)),
+            "auto-poke must make the slot visible immediately after mutation"
+        );
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn slot_guard_drop_without_mutation_still_pokes() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let _ = poll_group(&mut g, &mut cx);
+        }
+        g.pending_bits = 0;
+
+        drop(g.get_mut(idx).unwrap()); // no mutation, guard dropped
+
+        tx.send(7);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(
+            poll_group(&mut g, &mut cx),
+            Poll::Ready(Some(7)),
+            "auto-poke must fire even without inner mutation"
+        );
+        drain_group(&mut g, vec![tx]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section C — iter (immutable scan)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn iter_yields_only_occupied_slots_with_correct_indices() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        let (tx0, s0) = spmc_pair(4);
+        let (tx1, s1) = spmc_pair(4);
+        let (tx2, s2) = spmc_pair(4);
+        g.insert(s0); // idx 0
+        g.insert(s1); // idx 1
+        g.insert(s2); // idx 2
+        g.remove(1);
+
+        let indices: Vec<usize> = g.iter().map(|(i, _)| i).collect();
+        assert_eq!(indices, vec![0, 2], "iter must skip the freed slot");
+
+        drain_group(&mut g, vec![tx0, tx1, tx2]);
+    }
+
+    #[test]
+    fn iter_on_empty_group_yields_nothing() {
+        let g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        assert_eq!(g.iter().count(), 0);
+    }
+
+    #[test]
+    fn iter_count_matches_len() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        let mut txs = Vec::new();
+        for _ in 0..5 {
+            let (tx, s) = spmc_pair(4);
+            g.insert(s);
+            txs.push(tx);
+        }
+        g.remove(1);
+        g.remove(3);
+        assert_eq!(g.iter().count(), g.len());
+        drain_group(&mut g, txs);
+    }
+
+    #[test]
+    fn iter_indices_are_valid_for_get() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        let mut txs = Vec::new();
+        for _ in 0..4 {
+            let (tx, s) = spmc_pair(4);
+            g.insert(s);
+            txs.push(tx);
+        }
+        g.remove(1);
+
+        for (i, _) in g.iter() {
+            assert!(
+                g.get(i).is_some(),
+                "index {i} from iter must be valid for get()"
+            );
+        }
+        drain_group(&mut g, txs);
+    }
+
+    #[test]
+    fn sorted_indices_from_iter_are_valid_for_get_and_get_mut() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        let mut txs = Vec::new();
+        for _ in 0..5 {
+            let (tx, s) = spmc_pair(4);
+            g.insert(s);
+            txs.push(tx);
+        }
+        g.remove(1);
+        g.remove(3);
+
+        let mut sorted: Vec<usize> = g.iter().map(|(i, _)| i).collect();
+        sorted.sort_by(|a, b| b.cmp(a)); // descending, like max_height sort
+
+        for &idx in &sorted {
+            assert!(g.get(idx).is_some(), "get({idx}) must succeed after sort");
+        }
+        for idx in sorted {
+            let guard = g.get_mut(idx);
+            assert!(guard.is_some(), "get_mut({idx}) must succeed after sort");
+            drop(guard);
+        }
+        drain_group(&mut g, txs);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section D — iter_mut (poll_slow)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn iter_mut_visits_all_occupied_slots_in_index_order() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        let mut txs = Vec::new();
+        for _ in 0..3 {
+            let (tx, s) = spmc_pair(4);
+            g.insert(s);
+            txs.push(tx);
+        }
+        g.remove(1);
+
+        let visited: Vec<usize> = g.iter_mut().map(|(i, _)| i).collect();
+        assert_eq!(visited, vec![0, 2], "iter_mut must skip the freed slot");
+
+        drain_group(&mut g, txs);
+    }
+
+    #[test]
+    fn iter_mut_on_empty_group_is_noop() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        assert_eq!(g.iter_mut().count(), 0);
+    }
+
+    #[test]
+    fn iter_mut_auto_pokes_all_visited_slots() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx0, s0) = spmc_pair(8);
+        let (mut tx1, s1) = spmc_pair(8);
+        g.insert(s0);
+        g.insert(s1);
+
+        // Drain insert pokes — both slots park.
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            for _ in 0..4 {
+                let _ = poll_group(&mut g, &mut cx);
+            }
+        }
+        g.pending_bits = 0;
+
+        tx0.send(10);
+        tx1.send(20);
+        for (_, _guard) in g.iter_mut() { /* guard drop auto-pokes */ }
+
+        // Verify the auto-poke worked by observing that both slots emit.
+        // (pending_bits is only updated inside poll_group via signal.take(),
+        // so checking it directly before polling would see 0 even when the
+        // pokes are correctly sitting in signal.pending.)
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut results = Vec::new();
+        for _ in 0..4 {
+            if let Poll::Ready(Some(v)) = poll_group(&mut g, &mut cx) {
+                results.push(v);
+            }
+        }
+        results.sort();
+        assert_eq!(
+            results,
+            vec![10, 20],
+            "both slots must emit after iter_mut poke"
+        );
+
+        drain_group(&mut g, vec![tx0, tx1]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section E — remove / slot eviction
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn remove_frees_slot_and_updates_len() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (_tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+        assert_eq!(g.len(), 1);
+        assert!(g.remove(idx).is_some());
+        assert_eq!(g.len(), 0);
+        // Group is empty; no drain needed.
+    }
+
+    #[test]
+    fn remove_clears_pending_and_occupied_bits() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (_tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+        g.signal.notify(idx as u8);
+        g.remove(idx);
+        assert_eq!(
+            g.pending_bits & (1u64 << idx),
+            0,
+            "pending_bits must be clear after remove"
+        );
+        assert_eq!(
+            g.occupied & (1u64 << idx),
+            0,
+            "occupied must be clear after remove"
+        );
+    }
+
+    #[test]
+    fn remove_nonexistent_slot_returns_none() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        assert!(g.remove(0).is_none());
+        assert!(g.remove(100).is_none());
+    }
+
+    #[test]
+    fn closed_sender_causes_ready_none_and_auto_evicts_slot() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(4);
+        g.insert(stream);
+
+        tx.send(1);
+        drop(tx);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(poll_group(&mut g, &mut cx), Poll::Ready(Some(1)));
+        assert_eq!(g.len(), 1, "slot still present before the eviction poll");
+
+        let _ = poll_group(&mut g, &mut cx); // triggers Ready(None) → eviction
+        assert_eq!(g.len(), 0, "slot must be auto-evicted after channel closes");
+    }
+
+    #[test]
+    fn late_signal_from_removed_slot_is_masked_out() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (_tx, stream) = spmc_pair(4);
+        let idx = g.insert(stream);
+        g.remove(idx);
+
+        g.signal.notify(idx as u8);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(poll_group(&mut g, &mut cx), Poll::Pending);
+        assert_eq!(g.occupied, 0);
+    }
+
+    #[test]
+    fn remove_one_slot_does_not_disturb_adjacent_slots() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx0, s0) = spmc_pair(8);
+        let (tx1, s1) = spmc_pair(8);
+        let (mut tx2, s2) = spmc_pair(8);
+        let idx0 = g.insert(s0);
+        let idx1 = g.insert(s1);
+        let idx2 = g.insert(s2);
+        g.remove(idx1);
+
+        tx0.send(1);
+        tx2.send(3);
+
+        // Both remaining slots have one item each; noop_waker for safety.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            if let Poll::Ready(Some(v)) = poll_group(&mut g, &mut cx) {
+                seen.insert(v);
+            }
+        }
+        assert!(!seen.contains(&0), "removed slot must not emit");
+        assert!(
+            seen.contains(&1) && seen.contains(&3),
+            "adjacent slots must still emit"
+        );
+        let _ = (idx0, idx2);
+
+        drain_group(&mut g, vec![tx0, tx1, tx2]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section F — poll_next / VideoAllocator::poll_next hot path
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn empty_group_returns_pending_not_none() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(25);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(poll_group(&mut g, &mut cx), Poll::Pending);
+    }
+
+    #[test]
+    fn slot_with_empty_ring_parks_not_panics() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx, stream) = spmc_pair(4);
+        g.insert(stream);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = poll_group(&mut g, &mut cx); // drain insert poke
+        assert_eq!(poll_group(&mut g, &mut cx), Poll::Pending);
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn round_robin_across_video_max_slots() {
+        // Each slot has 64 items; we poll N×2 = 50 times, well within capacity.
+        // No slot will run dry, so every poll is guaranteed Ready — noop_waker is
+        // still correct here because panic_waker would fire if round-robin ever
+        // tries a second poll on a slot mid-batch and that slot happened to park.
+        const N: usize = 25;
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(N);
+        let mut txs = Vec::with_capacity(N);
+        for i in 0..N {
+            let (mut tx, stream) = spmc_pair(64);
+            for _ in 0..64 {
+                tx.send(i as i32);
+            }
+            g.insert(stream);
+            txs.push(tx);
+        }
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut counts = vec![0u32; N];
+        for _ in 0..(N * 2) {
+            if let Poll::Ready(Some(v)) = poll_group(&mut g, &mut cx) {
+                if v >= 0 {
+                    counts[v as usize] += 1;
+                }
+            }
+        }
+        for (i, &c) in counts.iter().enumerate() {
+            assert!(
+                c >= 1,
+                "slot {i} must be visited at least once in {N}×2 polls"
+            );
+        }
+
+        drain_group(&mut g, txs);
+    }
+
+    #[test]
+    fn pending_slot_bit_cleared_and_not_repolled_speculatively() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx_empty, s_empty) = spmc_pair(4); // ring never written
+        let (mut tx_ready, s_ready) = spmc_pair(64);
+        for _ in 0..64 {
+            tx_ready.send(99);
+        }
+        let idx_empty = g.insert(s_empty);
+        g.insert(s_ready);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..10 {
+            let _ = poll_group(&mut g, &mut cx);
+        }
+
+        assert_eq!(
+            g.pending_bits & (1u64 << idx_empty),
+            0,
+            "empty slot's bit must be clear — must not be re-polled speculatively"
+        );
+
+        drain_group(&mut g, vec![tx_empty, tx_ready]);
+    }
+
+    #[test]
+    fn lagged_slot_emits_sentinel_and_is_not_evicted() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(4);
+        g.insert(stream);
+
+        for i in 0..8 {
+            tx.send(i);
+        }
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let first = poll_group(&mut g, &mut cx);
+        assert!(
+            matches!(first, Poll::Ready(Some(_))),
+            "first poll must be Ready(Some(_)), got {first:?}"
+        );
+        assert_eq!(g.len(), 1, "slot must NOT be evicted on lag");
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section G — waker lifecycle
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn outer_waker_fired_when_spmc_sender_writes_data() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(8);
+        g.insert(stream);
+
+        let (outer_waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+
+        // Drain insert poke so slot parks on the empty ring.
+        let _ = poll_group(&mut g, &mut cx);
+        assert_eq!(count.get(), 0, "no wake before send");
+
+        tx.send(42);
+        assert!(count.get() >= 1, "outer waker must fire after send");
+
+        // One item in ring — guaranteed Ready.
+        let waker = noop_waker();
+        let mut cx2 = Context::from_waker(&waker);
+        assert_eq!(poll_group(&mut g, &mut cx2), Poll::Ready(Some(42)));
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn outer_waker_fired_when_slot_poked_via_get_mut() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(8);
+        let idx = g.insert(stream);
+
+        let (outer_waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+        let _ = poll_group(&mut g, &mut cx); // drain insert poke, park
+
+        tx.send(7);
+        drop(g.get_mut(idx).unwrap()); // auto-poke
+
+        assert!(
+            count.get() >= 1,
+            "outer waker must be notified by the auto-poke"
+        );
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn outer_waker_fired_via_iter_mut_poke() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(8);
+        g.insert(stream);
+
+        let (outer_waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+        let _ = poll_group(&mut g, &mut cx); // drain insert poke, park
+
+        tx.send(5);
+        for (_, _guard) in g.iter_mut() { /* guard drop auto-pokes */ }
+
+        assert!(
+            count.get() >= 1,
+            "outer waker must be notified via iter_mut auto-poke"
+        );
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn outer_waker_replacement_on_task_migration() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx, stream) = spmc_pair(8);
+        g.insert(stream);
+
+        let (waker1, count1) = new_count_waker();
+        {
+            let mut cx = Context::from_waker(&waker1);
+            let _ = poll_group(&mut g, &mut cx);
+        }
+
+        let (waker2, count2) = new_count_waker();
+        {
+            let mut cx = Context::from_waker(&waker2);
+            let _ = poll_group(&mut g, &mut cx);
+        }
+
+        tx.send(99);
+
+        assert_eq!(
+            count1.get(),
+            0,
+            "stale waker1 must NOT fire after task migration"
+        );
+        assert!(count2.get() >= 1, "current waker2 MUST fire");
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    #[test]
+    fn outer_waker_fired_on_channel_close() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx, stream) = spmc_pair(8);
+        g.insert(stream);
+
+        let (outer_waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+        let _ = poll_group(&mut g, &mut cx); // drain insert poke, park
+
+        drop(tx); // closes channel → spmc event → slot waker → outer waker
+        assert!(
+            count.get() >= 1,
+            "outer waker must fire when the channel closes"
+        );
+
+        // Channel is closed; drive to evict the slot cleanly.
+        drain_group(&mut g, vec![]);
+    }
+
+    #[test]
+    fn cross_thread_send_wakes_outer_task() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (tx, stream) = spmc_pair(8);
+        g.insert(stream);
+
+        let (outer_waker, count) = new_count_waker();
+        let mut cx = Context::from_waker(&outer_waker);
+        let _ = poll_group(&mut g, &mut cx); // park
+
+        let handle = std::thread::spawn(move || {
+            let mut tx = tx;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            tx.send(77);
+            tx // return so caller can drain
+        });
+        let tx = handle.join().unwrap();
+
+        assert!(
+            count.get() >= 1,
+            "outer waker must be fired from the sender thread (no missed wakeup)"
+        );
+
+        drain_group(&mut g, vec![tx]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section H — slot reuse and waker isolation
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn reused_slot_gets_fresh_waker_and_receives_from_new_channel() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx0, s0) = spmc_pair(4);
+        let idx = g.insert(s0);
+
+        tx0.send(1);
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let _ = poll_group(&mut g, &mut cx); // consume item
+        }
+        drop(tx0); // close
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let _ = poll_group(&mut g, &mut cx); // Ready(None) → eviction
+        }
+        assert_eq!(g.len(), 0);
+
+        let (mut tx1, s1) = spmc_pair(8);
+        let idx1 = g.insert(s1);
+        assert_eq!(idx1, idx, "slot must be reused at the same index");
+
+        tx1.send(200);
+
+        let result = futures_lite::future::block_on(futures_lite::StreamExt::next(&mut g));
+        assert_eq!(
+            result,
+            Some(200),
+            "reused slot must deliver from its new channel"
+        );
+
+        drain_group(&mut g, vec![tx1]);
+    }
+
+    #[test]
+    fn dead_slot_waker_firing_after_remove_does_not_affect_live_slots() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (_tx0, s0) = spmc_pair(4);
+        let (mut tx1, s1) = spmc_pair(8);
+        let idx0 = g.insert(s0);
+        g.insert(s1);
+
+        let dead_waker = g.slot_wakers[idx0].clone().unwrap();
+        g.remove(idx0);
+
+        dead_waker.wake_by_ref();
+
+        tx1.send(2);
+
+        // One item guaranteed in slot 1; noop_waker.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let item = poll_group(&mut g, &mut cx);
+        assert_eq!(
+            item,
+            Poll::Ready(Some(2)),
+            "live slot must still deliver its item"
+        );
+
+        drain_group(&mut g, vec![tx1]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section I — len / is_empty / slot_count
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn len_and_is_empty_track_inserts_and_removes() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(8);
+        assert!(g.is_empty());
+        assert_eq!(g.len(), 0);
+
+        let (tx0, s0) = spmc_pair(4);
+        let (tx1, s1) = spmc_pair(4);
+        let i0 = g.insert(s0);
+        let i1 = g.insert(s1);
+        assert_eq!(g.len(), 2);
+        assert!(!g.is_empty());
+
+        g.remove(i0);
+        assert_eq!(g.len(), 1);
+
+        g.remove(i1);
+        assert!(g.is_empty());
+        assert_eq!(g.len(), 0);
+
+        // Group is empty; senders dropped to satisfy lint.
+        drop((tx0, tx1));
+    }
+
+    #[test]
+    fn len_reflects_auto_eviction() {
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+        let (mut tx0, s0) = spmc_pair(4);
+        let (tx1, s1) = spmc_pair(4);
+        g.insert(s0);
+        g.insert(s1);
+
+        tx0.send(1);
+        drop(tx0);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..6 {
+            let _ = poll_group(&mut g, &mut cx);
+        }
+
+        assert_eq!(
+            g.len(),
+            1,
+            "closed slot must be auto-evicted; one slot remains"
+        );
+
+        drain_group(&mut g, vec![tx1]);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section J — capacity limits (VIDEO_MAX_SLOTS = 25)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn video_max_slots_capacity_fills_and_drains_correctly() {
+        const VIDEO_MAX_SLOTS: usize = 25;
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(VIDEO_MAX_SLOTS);
+        let mut txs = Vec::with_capacity(VIDEO_MAX_SLOTS);
+        let mut indices = Vec::with_capacity(VIDEO_MAX_SLOTS);
+
+        for i in 0..VIDEO_MAX_SLOTS {
+            let (mut tx, stream) = spmc_pair(8);
+            tx.send(i as i32);
+            indices.push(g.insert(stream));
+            txs.push(tx);
+        }
+        assert_eq!(g.len(), VIDEO_MAX_SLOTS);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..(VIDEO_MAX_SLOTS * 2) {
+            if let Poll::Ready(Some(v)) = poll_group(&mut g, &mut cx) {
+                if v >= 0 {
+                    seen.insert(v);
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            VIDEO_MAX_SLOTS,
+            "all 25 slots must be reachable"
+        );
+
+        for idx in indices {
+            assert!(g.remove(idx).is_some());
+        }
+        assert!(g.is_empty());
+        // Group is empty; close senders.
+        drop(txs);
+    }
+
+    #[test]
+    #[should_panic(expected = "SlotGroup is full")]
+    fn inserting_beyond_video_max_slots_panics() {
+        const VIDEO_MAX_SLOTS: usize = 25;
+        let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(VIDEO_MAX_SLOTS);
+        let mut txs = Vec::new();
+        for _ in 0..=VIDEO_MAX_SLOTS {
+            let (tx, stream) = spmc_pair(4);
+            g.insert(stream); // panics on the 26th insert
+            txs.push(tx);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Section K — end-to-end integration (block_on)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn end_to_end_add_remove_rebalance_with_real_channels() {
+        futures_lite::future::block_on(async {
+            let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(4);
+
+            let (mut tx0, s0) = spmc_pair(8);
+            let (mut tx1, s1) = spmc_pair(8);
+            let idx0 = g.insert(s0);
+            let _idx1 = g.insert(s1);
+
+            tx0.send(100);
+            tx1.send(200);
+
+            let mut results = Vec::new();
+            while results.len() < 2 {
+                results.push(futures_lite::StreamExt::next(&mut g).await.unwrap());
+            }
+            results.sort();
+            assert_eq!(results, vec![100, 200]);
+
+            // Simulate remove_track: close channel, let group evict.
+            drop(tx0);
+            {
+                let waker = noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                for _ in 0..4 {
+                    let _ = poll_group(&mut g, &mut cx);
+                }
+            }
+
+            let (mut tx2, s2) = spmc_pair(8);
+            let idx2 = g.insert(s2);
+            assert_eq!(idx2, idx0, "rebalance must reuse the freed slot");
+
+            for (_, _guard) in g.iter_mut() { /* simulate poll_slow auto-poke */ }
+
+            tx2.send(300);
+            tx1.send(400);
+
+            let mut new_results = Vec::new();
+            while new_results.len() < 2 {
+                new_results.push(futures_lite::StreamExt::next(&mut g).await.unwrap());
+            }
+            new_results.sort();
+            assert_eq!(new_results, vec![300, 400]);
+
+            drain_group(&mut g, vec![tx1, tx2]);
+        });
+    }
+
+    #[test]
+    fn end_to_end_25_slots_round_robin_then_close_all() {
+        futures_lite::future::block_on(async {
+            const N: usize = 25;
+            let mut g: SlotGroup<SpmcStream> = SlotGroup::with_capacity(N);
+            let mut txs = Vec::with_capacity(N);
+
+            for i in 0..N {
+                let (mut tx, stream) = spmc_pair(64);
+                for _ in 0..64 {
+                    tx.send(i as i32);
+                }
+                g.insert(stream);
+                txs.push(tx);
+            }
+
+            let mut counts = vec![0u32; N];
+            for _ in 0..(N * 3) {
+                if let Some(v) = futures_lite::StreamExt::next(&mut g).await {
+                    if v >= 0 {
+                        counts[v as usize] += 1;
+                    }
+                }
+            }
+            for (i, &c) in counts.iter().enumerate() {
+                assert!(c >= 1, "slot {i} must be visited at least once");
+            }
+
+            drain_group(&mut g, txs);
+            assert!(
+                g.is_empty(),
+                "all slots must be evicted after channels close"
+            );
         });
     }
 }
