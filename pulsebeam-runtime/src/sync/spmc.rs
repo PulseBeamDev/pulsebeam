@@ -141,17 +141,23 @@ impl<T: Clone> Receiver<T> {
 
             // Still no new items — park.
             if self.next_seq >= self.local_head {
-                // Register listener before the closed check to avoid a race where
-                // the sender closes and notifies between our head load and listen().
+                // Ensure we have a listener and that it is registered with the event.
                 if self.listener.is_none() {
-                    self.listener = Some(self.ring.event.listen());
+                    let mut listener = self.ring.event.listen();
+
+                    // Poll once so the waker is registered.
+                    if Pin::new(&mut listener).poll(cx).is_ready() {
+                        // Notification already fired; retry the loop.
+                        continue;
+                    }
+
+                    self.listener = Some(listener);
                 }
 
-                // Re-check head after listener registration to close the TOCTOU window.
+                // Re-check head after listener registration to close the race window.
                 self.local_head = self.ring.head.load(Ordering::Acquire);
                 if self.next_seq < self.local_head {
-                    // New data arrived between the first check and listener registration;
-                    // discard the listener and fall through.
+                    // Data arrived after we installed the listener.
                     self.listener = None;
                     continue;
                 }
@@ -161,14 +167,10 @@ impl<T: Clone> Receiver<T> {
                     return Poll::Ready(Err(RecvError::Closed));
                 }
 
-                // Poll the listener so the waker is registered with the event.
-                // SAFETY: we hold a pinned &mut via the Option — pin it on the stack.
+                // Park until notified.
                 let listener = self.listener.as_mut().unwrap();
-                // event_listener::EventListener implements Future; poll it.
-                let pinned = Pin::new(listener);
-                match pinned.poll(cx) {
+                match Pin::new(listener).poll(cx) {
                     Poll::Ready(_) => {
-                        // Woken — clear listener and retry.
                         self.listener = None;
                         continue;
                     }
