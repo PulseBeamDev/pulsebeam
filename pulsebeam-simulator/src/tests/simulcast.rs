@@ -4,25 +4,28 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 #[test]
-fn simulcast_adaptation_test() {
+fn simulcast_stream_stability_test() {
     common::setup_tracing();
 
+    const TICK: Duration = Duration::from_millis(1);
+    const WARMUP: Duration = Duration::from_secs(5);
+    const SOAK: Duration = Duration::from_secs(55);
+    const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+    const MIN_BYTES_PER_INTERVAL: u64 = 50_000; // must make forward progress each window
+
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(120))
-        .tick_duration(Duration::from_micros(100))
+        .simulation_duration(WARMUP + SOAK + Duration::from_secs(5)) // headroom
+        .tick_duration(TICK)
         .build();
 
     let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
-    sim.host(server_ip, move || async move {
-        common::start_sfu_node(server_ip)
-            .await
-            .map_err(|e| e.into())
-    });
-
     let sender_ip: IpAddr = "192.168.1.1".parse().unwrap();
     let receiver_ip: IpAddr = "192.168.2.1".parse().unwrap();
 
-    // SENDER: Sends 3 layers (f, h, q)
+    sim.host(server_ip, move || async move {
+        common::start_sfu_node(server_ip).await.map_err(Into::into)
+    });
+
     sim.client(sender_ip, async move {
         let mut client = common::client::SimClientBuilder::bind(sender_ip, server_ip)
             .await?
@@ -30,20 +33,18 @@ fn simulcast_adaptation_test() {
                 MediaKind::Video,
                 TransceiverDirection::SendOnly,
                 Some(vec![
-                    SimulcastLayer::new("f"), // Highest quality
-                    SimulcastLayer::new("h"), // Medium
-                    SimulcastLayer::new("q"), // Lowest
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
                 ]),
             )
             .connect("room1")
             .await?;
 
-        // Just drive the client to keep sending
-        client.drive_until(Duration::from_secs(60), |_| false).await.ok();
+        client.drive_until(WARMUP + SOAK, |_| false).await.unwrap();
         Ok(())
     });
 
-    // RECEIVER: Has restricted bandwidth
     sim.client(receiver_ip, async move {
         let mut client = common::client::SimClientBuilder::bind(receiver_ip, server_ip)
             .await?
@@ -51,28 +52,45 @@ fn simulcast_adaptation_test() {
             .connect("room1")
             .await?;
 
-        // 1. Initially established bidirectional flow
-        tracing::info!("Waiting for initial flow...");
-        client.drive_until(Duration::from_secs(10), |stats| {
-            let Some(peer) = &stats.peer else { return false; };
-            peer.bytes_rx > 100_000
-        }).await?;
+        // Phase 1: wait for initial flow to establish
+        tracing::info!("waiting for initial flow...");
+        client
+            .drive_until(WARMUP, |stats| {
+                stats.peer.as_ref().is_none_or(|p| p.bytes_rx > 10_000)
+            })
+            .await
+            .expect("stream did not establish within warmup window");
 
-        // 2. Restrict bandwidth to force layer shedding
-        // We'll use turmoil's network controls if possible, but for now we expect 
-        // the LayerController to react to BWE.
-        // In a real turmoil test, we would do: turmoil::network::partition(sender_ip, receiver_ip);
-        // or use a link with bandwidth limit.
-        
-        // Assert that we eventually see some layers being paused or bitrate dropping 
-        // if we could control the link. 
-        
-        // For now, let's at least assert that we are receiving media.
-        let stats = client.agent.get_stats().await.unwrap();
-        assert!(stats.peer.unwrap().bytes_rx > 0);
+        tracing::info!("stream established, entering soak...");
 
+        // Phase 2: soak — assert stream is still making progress every interval
+        let num_intervals = SOAK.as_secs() / HEALTH_INTERVAL.as_secs();
+        let mut last_bytes_rx: u64 = 0;
+
+        for i in 0..num_intervals {
+            client
+                .drive_until(HEALTH_INTERVAL, |_| false)
+                .await
+                .unwrap();
+
+            let stats = client.agent.get_stats().await.unwrap();
+            let bytes_rx = stats.peer.as_ref().map_or(0, |p| p.bytes_rx);
+            let delta = bytes_rx.saturating_sub(last_bytes_rx);
+
+            tracing::info!(interval = i, bytes_rx, delta, "health check");
+
+            assert!(
+                delta >= MIN_BYTES_PER_INTERVAL,
+                "stream stalled at interval {i}: only {delta} bytes received \
+                 in the last {HEALTH_INTERVAL:?} (total: {bytes_rx})"
+            );
+
+            last_bytes_rx = bytes_rx;
+        }
+
+        tracing::info!("soak complete, stream remained stable");
         Ok(())
     });
 
-    sim.run().expect("Simulation failed");
+    sim.run().expect("simulation failed");
 }
