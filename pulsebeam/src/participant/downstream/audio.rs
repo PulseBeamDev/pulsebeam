@@ -1,4 +1,4 @@
-use pulsebeam_runtime::collections::SlotGroup;
+use pulsebeam_runtime::sync::slot_group::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::pin::Pin;
 use std::task::{Context, Poll};

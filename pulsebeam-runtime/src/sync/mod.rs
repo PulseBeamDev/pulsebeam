@@ -1,8 +1,8 @@
 pub mod bit_signal;
 pub mod mpsc;
 pub mod pool_buf;
+pub mod slot_group;
 pub mod spmc;
-pub mod task_group;
 
 pub use pool_buf::{BufPool, MAX_PAYLOAD as POOL_MAX_PAYLOAD, PoolBuf, PoolBufMut};
 

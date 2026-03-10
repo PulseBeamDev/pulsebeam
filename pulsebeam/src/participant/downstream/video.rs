@@ -1,7 +1,7 @@
 use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
-use pulsebeam_runtime::collections::SlotGroup;
+use pulsebeam_runtime::sync::slot_group::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::HashMap;
 use std::fmt::Display;

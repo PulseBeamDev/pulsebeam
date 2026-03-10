@@ -33,12 +33,48 @@
 
 use crate::sync::Arc;
 use crate::sync::bit_signal::BitSignal;
-use crate::sync::task_group::make_slot_waker;
 use diatomic_waker::WakeSink;
 use futures_lite::stream::Stream;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+struct SlotWakerData {
+    signal: Arc<BitSignal>,
+    index: u8,
+}
+
+unsafe fn clone_slot(ptr: *const ()) -> RawWaker {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const SlotWakerData) });
+    let cloned = Arc::clone(&arc);
+    RawWaker::new(Arc::into_raw(cloned) as *const (), slot_vtable())
+}
+
+unsafe fn wake_slot(ptr: *const ()) {
+    let arc = unsafe { Arc::from_raw(ptr as *const SlotWakerData) };
+    arc.signal.notify(arc.index);
+}
+
+unsafe fn wake_by_ref_slot(ptr: *const ()) {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const SlotWakerData) });
+    arc.signal.notify(arc.index);
+}
+
+unsafe fn drop_slot(ptr: *const ()) {
+    drop(unsafe { Arc::from_raw(ptr as *const SlotWakerData) });
+}
+
+const fn slot_vtable() -> &'static RawWakerVTable {
+    &RawWakerVTable::new(clone_slot, wake_slot, wake_by_ref_slot, drop_slot)
+}
+
+pub(crate) fn make_slot_waker(signal: Arc<BitSignal>, index: u8) -> Waker {
+    let data = Arc::new(SlotWakerData { signal, index });
+    let raw = RawWaker::new(Arc::into_raw(data) as *const (), slot_vtable());
+    // SAFETY: vtable functions are correct and data lifetime is Arc-managed.
+    unsafe { Waker::from_raw(raw) }
+}
 
 /// RAII guard returned by [`SlotGroup::get_mut`] and [`SlotGroup::iter_mut`].
 ///
@@ -381,6 +417,8 @@ impl<S: Stream + Unpin> Stream for SlotGroup<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::sync::slot_group::SlotGroup;
+
     use super::super::*;
 
     use futures::Stream;
