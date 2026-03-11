@@ -230,10 +230,6 @@ pub struct SlotGroup<S> {
     pending_bits: u64,
     /// Bitset tracking which slot indices are currently occupied.
     occupied: u64,
-    /// Cached outer waker — compared via `will_wake` so `signal.register`
-    /// (which calls `AtomicWaker::register`, itself doing an atomic store) is
-    /// skipped in the common case where the task waker hasn't changed.
-    cached_waker: Option<Waker>,
     /// Inline storage — one element per slot, `None` for free/vacant slots.
     slots: Vec<Option<S>>,
     /// Pre-built per-slot wakers. Created once on [`insert`](SlotGroup::insert),
@@ -264,7 +260,6 @@ impl<S> SlotGroup<S> {
             signal,
             pending_bits: 0,
             occupied: 0,
-            cached_waker: None,
             slots,
             slot_wakers,
             // Start at 63 so the first rotation lands on slot 0.
@@ -417,20 +412,7 @@ impl<S: Stream + Unpin> Stream for SlotGroup<S> {
         // Ordering matters: if we took bits first and a new notification arrived
         // between take() and register(), the AtomicWaker would fire with a stale
         // (or absent) waker and the task would never be re-scheduled.
-        //
-        // `will_wake` is a cheap pointer comparison; `AtomicWaker::register` has
-        // an unconditional atomic store even when the waker is identical, so we
-        // gate it behind the cached_waker check to avoid that cost on the common
-        // re-poll path.
-        let waker = cx.waker();
-        if !this
-            .cached_waker
-            .as_ref()
-            .is_some_and(|w| w.will_wake(waker))
-        {
-            this.signal.register(waker);
-            this.cached_waker = Some(waker.clone());
-        }
+        this.signal.register(cx.waker());
 
         // Merge newly-signalled bits — one atomic swap per outer poll call.
         // AND with occupied so evicted-but-re-signalled slots are ignored.
