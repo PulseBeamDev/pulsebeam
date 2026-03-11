@@ -77,8 +77,8 @@ net-apply: net-clear net-verify
 net-good-home-wifi:
 	@$(MAKE) net-apply \
 		TARGET_RTT="40ms" \
-		UPLOAD_RATE="25mbit" \
-		DOWNLOAD_RATE="100mbit" \
+		UPLOAD_RATE="1000mbit" \
+		DOWNLOAD_RATE="1000mbit" \
 		UPLOAD_JITTER="10ms" \
 		DOWNLOAD_JITTER="10ms" \
 		UPLOAD_PACKET_LOSS="0%" \

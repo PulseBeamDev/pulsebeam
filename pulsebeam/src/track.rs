@@ -27,6 +27,8 @@ pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub struct KeyframeRequester {
     signal: Arc<AtomicBool>,
     notify: Arc<Notify>,
+    #[cfg(test)]
+    pub request_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl KeyframeRequester {
@@ -34,6 +36,10 @@ impl KeyframeRequester {
     pub fn request(&self) {
         self.signal.store(true, Ordering::Relaxed);
         self.notify.notify_one();
+        #[cfg(test)]
+        {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -356,6 +362,8 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             keyframe_requester: KeyframeRequester {
                 signal,
                 notify: keyframe_notify.clone(),
+                #[cfg(test)]
+                request_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
             state: stream_state,
         });

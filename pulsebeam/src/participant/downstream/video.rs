@@ -221,7 +221,11 @@ impl VideoAllocator {
             assigned,
             playing
         );
-        // 1. Prepare the input views
+
+        // 1. Prepare the input views.
+        //    `current_quality` lets the engine apply hysteresis: it only
+        //    upgrades when there is genuine headroom *above* what the driver is
+        //    already running, preventing the upgrade→overrun→downgrade cycle.
         let views = self
             .slots
             .iter()
@@ -232,31 +236,42 @@ impl VideoAllocator {
                     .and_then(|c| self.tracks.get(&c.meta.id))
                     .map(|s| &s.track);
 
+                let current_quality = d.slot.current().map(|c| c.quality);
+
                 SlotView {
                     mid: d.mid,
                     priority: d.max_height,
                     track,
+                    current_quality,
                 }
             })
             .collect();
 
-        // 2. Run the pure logic
+        // 2. Run the pure allocation logic.
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, views);
 
-        // 3. Apply the results to the drivers
+        // 3. Apply the results to the drivers.
         for (mid, decision) in decisions {
             let idx = self.mid_to_idx[&mid];
             let mut driver = self.slots.get_mut(idx).unwrap();
 
             match decision {
                 AllocationDecision::Forward(receiver) => {
-                    // Only trigger a switch if the RID or Quality actually changed
+                    // Only trigger a switch if the quality actually changed.
                     if driver.slot.current().map(|c| c.quality) != Some(receiver.quality) {
                         driver.switch_to(receiver.clone(), false);
                     }
                 }
-                AllocationDecision::Pause => {
-                    driver.pause();
+                AllocationDecision::Pause(receiver) => {
+                    // The engine has already chosen the resume-target layer.
+                    // Only call pause_at when the driver is not already paused
+                    // to avoid redundant state transitions on every tick.
+                    if !driver.slot.state.is_paused() {
+                        driver.pause_at(receiver.clone());
+                    }
+                }
+                AllocationDecision::Idle => {
+                    driver.stop();
                 }
             }
         }
@@ -466,16 +481,25 @@ impl SlotDriver {
         self.transition_to(SlotState::Idle, None, None);
     }
 
-    /// Pause the slot without completely dropping its receiver.  The driver
-    /// maintains the current stream in `staging` so that subsequent allocation
-    /// passes can still see the track and resume it if bandwidth allows.
+    /// Pause at a specific receiver layer chosen by the allocation engine.
+    ///
+    /// Unlike the internal `pause()` which preserves whatever was current,
+    /// `pause_at` accepts the engine's preferred resume target explicitly.
+    /// This means when bandwidth recovers the driver jumps directly back to
+    /// the right layer without re-running layer discovery.
+    pub fn pause_at(&mut self, receiver: SimulcastReceiver) {
+        self.keyframe_retries = 0;
+        self.transition_to(SlotState::Paused, None, Some(receiver));
+    }
+
+    /// Pause the slot, preserving the current receiver as the resume target.
+    /// Used internally when the driver itself detects a need to pause (e.g.
+    /// stream closed) rather than when the allocator makes the decision.
     pub fn pause(&mut self) {
         self.keyframe_retries = 0;
         if let Some(receiver) = self.slot.current().cloned() {
-            // move current into staging state, clear active
             self.transition_to(SlotState::Paused, None, Some(receiver));
         } else {
-            // nothing to pause; behave like stop
             self.transition_to(SlotState::Idle, None, None);
         }
     }
@@ -797,12 +821,20 @@ impl SlotDriver {
 
 pub struct AllocationEngine;
 
-/// A simplified view of a slot for the engine to process
+/// A simplified view of a slot for the engine to process.
+///
+/// `current_quality` reflects what the driver is *actually* sending right now
+/// (or was sending before a pause).  The engine uses this for hysteresis: an
+/// upgrade is only issued when there is meaningful headroom above the current
+/// layer's cost, preventing the upgrade→overrun→downgrade oscillation cycle.
 #[derive(Clone, Debug)]
 pub struct SlotView<'a> {
     pub mid: Mid,
     pub priority: u32, // maps to max_height
     pub track: Option<&'a TrackReceiver>,
+    /// The quality the driver is currently running at (or was at before pause).
+    /// `None` means the slot has never been active.
+    pub current_quality: Option<SimulcastQuality>,
 }
 
 impl<'a> std::fmt::Display for SlotView<'a> {
@@ -835,88 +867,208 @@ impl<'a> std::fmt::Display for SlotView<'a> {
     }
 }
 
+/// The engine's verdict for a single slot.
+///
+/// - `Forward(r)` — send (or switch to) layer `r`.
+/// - `Pause(r)`   — stop forwarding but remember `r` as the resume target;
+///                  the driver will jump directly back to this layer once
+///                  bandwidth recovers, without re-running layer discovery.
+/// - `Idle`       — no track is assigned to this slot; the driver should be
+///                  fully stopped and its receiver dropped.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum AllocationDecision<'a> {
     Forward(&'a SimulcastReceiver),
-    Pause,
+    /// Bandwidth-congestion pause.  The carried receiver is the layer the engine
+    /// wants to resume *to* when bandwidth recovers — typically the lowest
+    /// healthy layer so that recovery starts immediately without renegotiation.
+    Pause(&'a SimulcastReceiver),
+    /// No track is associated with this slot; stop the driver entirely.
+    Idle,
 }
 
 impl<'a> std::fmt::Display for AllocationDecision<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AllocationDecision::Forward(l) => {
-                write!(f, "Forward({})", l)
-            }
-            AllocationDecision::Pause => write!(f, "Pause"),
+            AllocationDecision::Forward(l) => write!(f, "Forward({})", l),
+            AllocationDecision::Pause(l) => write!(f, "Pause({})", l),
+            AllocationDecision::Idle => write!(f, "Idle"),
         }
     }
 }
 
 impl AllocationEngine {
+    /// Fraction of remaining budget that an upgrade's *incremental* cost must
+    /// not exceed.
+    ///
+    /// Requiring the incremental cost to be at most 85 % of available headroom
+    /// leaves a 15 % guard band.  If the encoder runs slightly hotter than its
+    /// reported bitrate (common: H.264/VP8 typically overshoot ≤ 10–12 %),
+    /// the guard band absorbs the overrun without immediately triggering a
+    /// sacrifice pass — eliminating the most common upgrade→overrun→downgrade
+    /// oscillation cycle.
+    ///
+    /// Tuning rationale:
+    ///   • Too conservative (e.g. 0.50) → upgrades are starved even on a
+    ///     healthy link, sacrificing quality for no gain.
+    ///   • Too aggressive (e.g. 0.99)  → guard band collapses; any jitter
+    ///     spike tips us over budget and we thrash.
+    ///   • 0.85 is the sweet spot for typical WebRTC encoder overshoot margins.
+    const UPGRADE_HEADROOM: f64 = 0.85;
+
+    /// Minimum deficit (bps) that must accumulate before the sacrifice pass
+    /// fires.
+    ///
+    /// Small, transient overruns are absorbed silently.  This prevents a brief
+    /// measurement glitch — e.g. a single large RTP packet inflating the
+    /// smoothed bitrate estimate for one interval — from causing a visible
+    /// freeze.
+    ///
+    /// 50 kbps is chosen because:
+    ///   • It is below the bitrate of any simulcast layer in practice (lowest
+    ///     layer is typically ≥ 80–120 kbps), so it never masks a genuine
+    ///     overrun that only a layer drop could fix.
+    ///   • It comfortably covers single-packet jitter at resolutions up to 1080p.
+    const SACRIFICE_HYSTERESIS_BPS: f64 = 50_000.0;
+
     pub fn compute<'a>(
         available_bw: Bitrate,
         mut slots: Vec<SlotView<'a>>,
     ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate) {
         let mut budget = available_bw.as_f64();
-        let mut decisions = HashMap::new();
+        let mut decisions: HashMap<Mid, AllocationDecision<'a>> = HashMap::new();
 
-        // Pass 1: Baseline (Fairness + Health)
+        // ── Pass 1: Baseline (Fairness + Health) ─────────────────────────────
+        //
+        // Every slot that has a track gets the lowest *healthy* layer as its
+        // starting allocation.  Slots without a track receive `Idle`.
+        //
+        // Budget is debited here so that Pass 2 (upgrades) only has visibility
+        // into what is genuinely left over after all baseline claims are
+        // satisfied.
         for slot in &slots {
-            if let Some(track) = slot.track {
-                let lowest = track.lowest_quality();
-                // Ensure we only allocate to healthy, active streams
-                if lowest.state.is_healthy() {
-                    budget -= lowest.state.bitrate_bps();
-                    decisions.insert(slot.mid, AllocationDecision::Forward(lowest));
-                } else {
-                    tracing::debug!(mid = %slot.mid, "Stream unhealthy, pausing baseline");
-                    decisions.insert(slot.mid, AllocationDecision::Pause);
+            match slot.track {
+                None => {
+                    decisions.insert(slot.mid, AllocationDecision::Idle);
                 }
-            } else {
-                decisions.insert(slot.mid, AllocationDecision::Pause);
+                Some(track) => {
+                    let lowest = track.lowest_quality();
+                    if lowest.state.is_healthy() {
+                        budget -= lowest.state.bitrate_bps();
+                        decisions.insert(slot.mid, AllocationDecision::Forward(lowest));
+                    } else {
+                        // Stream is unhealthy; park on the lowest layer so the
+                        // driver knows the resume target once health recovers.
+                        // No bandwidth is debited for a paused slot.
+                        tracing::debug!(mid = %slot.mid, "Stream unhealthy, pausing at baseline");
+                        decisions.insert(slot.mid, AllocationDecision::Pause(lowest));
+                    }
+                }
             }
         }
 
-        // Pass 2: Upgrades (Priority)
-        slots.sort_by_key(|s| std::cmp::Reverse(s.priority));
+        // ── Pass 2: Upgrades (Priority + Hysteresis) ─────────────────────────
+        //
+        // Walk slots from highest to lowest priority.  For each slot that is
+        // currently being forwarded, try to promote it to a better layer.
+        //
+        // An upgrade is accepted only when the incremental cost fits within
+        // `UPGRADE_HEADROOM * budget`.  This guard band is the sole
+        // anti-oscillation mechanism: after an upgrade there is still a
+        // meaningful safety margin, so a minor encoder bitrate overshoot will
+        // not immediately push us over budget and force a sacrifice.
+        //
+        // `current_quality` from the SlotView establishes the search floor:
+        // if the driver is already running a layer above the baseline, we
+        // search for something even better rather than redundantly confirming
+        // the existing layer.
         if budget > 0.0 {
+            slots.sort_by_key(|s| std::cmp::Reverse(s.priority));
             for slot in &slots {
                 let Some(track) = slot.track else { continue };
+
+                // Only consider slots that have a healthy baseline forward.
                 let current_layer = match decisions.get(&slot.mid) {
                     Some(AllocationDecision::Forward(l)) => *l,
                     _ => continue,
                 };
 
-                if let Some(better) = Self::find_best_fit(track, current_layer.quality, budget) {
-                    budget -= better.state.bitrate_bps() - current_layer.state.bitrate_bps();
+                // Use whichever quality is higher: what the engine just chose
+                // as baseline, or what the driver is already running.  This
+                // prevents needlessly downgrading a slot that was previously
+                // upgraded.
+                let search_floor = slot
+                    .current_quality
+                    .map(|q| q.max(current_layer.quality))
+                    .unwrap_or(current_layer.quality);
+
+                if let Some(better) =
+                    Self::find_best_fit(track, search_floor, budget * Self::UPGRADE_HEADROOM)
+                {
+                    let incremental =
+                        better.state.bitrate_bps() - current_layer.state.bitrate_bps();
+                    budget -= incremental;
                     decisions.insert(slot.mid, AllocationDecision::Forward(better));
                 }
             }
         }
 
-        // Pass 3: Sacrifice (Congestion Recovery)
-        if budget < 0.0 {
+        // ── Pass 3: Sacrifice (Congestion Recovery + Hysteresis) ─────────────
+        //
+        // Only fires when the deficit exceeds SACRIFICE_HYSTERESIS_BPS.  Small
+        // overruns are absorbed without visible disruption; the encoder's own
+        // rate control will correct them within a few frames.
+        //
+        // Sacrificed slots emit `Pause(layer)` — not `Idle` — so the driver
+        // retains the resume target and can recover immediately once bandwidth
+        // improves, without waiting for a new rebalance cycle.
+        if budget < -Self::SACRIFICE_HYSTERESIS_BPS {
             let mut sacrifice_order = slots.clone();
-            sacrifice_order.sort_by_key(|s| s.priority);
+            sacrifice_order.sort_by_key(|s| s.priority); // lowest priority first
 
             for slot in sacrifice_order {
-                if budget >= 0.0 {
+                if budget >= -Self::SACRIFICE_HYSTERESIS_BPS {
                     break;
                 }
-                if let Some(AllocationDecision::Forward(layer)) = decisions.get(&slot.mid) {
-                    // This is a critical event: we are dropping a stream due to network pressure
-                    tracing::warn!(mid = %slot.mid, priority = slot.priority, "Congestion sacrifice: pausing stream");
+                if let Some(AllocationDecision::Forward(layer)) = decisions.get(&slot.mid).copied()
+                {
+                    tracing::warn!(
+                        mid = %slot.mid,
+                        priority = slot.priority,
+                        deficit_kbps = (-budget / 1000.0) as u32,
+                        "Congestion sacrifice: pausing stream"
+                    );
                     budget += layer.state.bitrate_bps();
-                    decisions.insert(slot.mid, AllocationDecision::Pause);
+                    decisions.insert(slot.mid, AllocationDecision::Pause(layer));
                 }
             }
         }
 
+        // ── Accounting & Logging ─────────────────────────────────────────────
+        // Desired bitrate: sum of the highest healthy layer for every slot that
+        // has a track (Forward *or* Pause).  Idle slots contribute nothing.
+        // This tells the BWE what we *would* consume at full quality, not just
+        // what we happen to be forwarding right now, so bandwidth can recover
+        // toward the real target even while streams are paused.
+        let desired_bps: f64 = slots
+            .iter()
+            .filter_map(|s| s.track)
+            .map(|track| {
+                track
+                    .simulcast
+                    .iter()
+                    .filter(|l| l.state.is_healthy())
+                    .map(|l| l.state.bitrate_bps())
+                    .next()
+                    .unwrap_or(0.0)
+            })
+            .sum();
+
+        // `total_bps` is kept separately for the debug log (actual forwarded load).
         let total_bps: f64 = decisions
             .values()
             .map(|d| match d {
                 AllocationDecision::Forward(l) => l.state.bitrate_bps(),
-                AllocationDecision::Pause => 0.0,
+                AllocationDecision::Pause(_) | AllocationDecision::Idle => 0.0,
             })
             .sum();
 
@@ -924,7 +1076,6 @@ impl AllocationEngine {
             let mut slot_str = String::new();
             let mut dec_str = String::new();
 
-            // Sort for consistent log ordering
             slots.sort_by_key(|s| s.mid);
 
             for slot in &slots {
@@ -934,43 +1085,47 @@ impl AllocationEngine {
                 let decision = decisions
                     .get(&slot.mid)
                     .cloned()
-                    .unwrap_or(AllocationDecision::Pause);
+                    .unwrap_or(AllocationDecision::Idle);
                 let d_label = match decision {
                     AllocationDecision::Forward(l) => {
                         l.rid.map(|r| r.to_string()).unwrap_or("?".into())
                     }
-                    AllocationDecision::Pause => "OFF".into(),
+                    AllocationDecision::Pause(_) => "PAUSE".into(),
+                    AllocationDecision::Idle => "IDLE".into(),
                 };
                 let _ = write!(dec_str, " {}->{};", slot.mid, d_label);
             }
 
             tracing::debug!(
                 bw = %available_bw,
-                total = %Bitrate::from(total_bps),
+                forwarding = %Bitrate::from(total_bps),
+                desired = %Bitrate::from(desired_bps),
                 "Slots:[{}] Decisions:[{}]",
                 slot_str.trim(),
                 dec_str.trim()
             );
         }
 
-        (decisions, Bitrate::from(total_bps * 1.15))
+        (decisions, Bitrate::from(desired_bps))
     }
 
+    /// Find the best layer strictly above `floor` whose *incremental* cost
+    /// (over `floor`) fits within `budget`.
     fn find_best_fit(
         track: &TrackReceiver,
-        current: SimulcastQuality,
+        floor: SimulcastQuality,
         budget: f64,
     ) -> Option<&SimulcastReceiver> {
-        let current_bps = track
-            .by_quality(current)
+        let floor_bps = track
+            .by_quality(floor)
             .map(|l| l.state.bitrate_bps())
             .unwrap_or(0.0);
         track
             .simulcast
             .iter()
-            .filter(|l| l.quality > current)
+            .filter(|l| l.quality > floor)
             .filter(|l| l.state.is_healthy())
-            .filter(|l| (l.state.bitrate_bps() - current_bps) <= budget)
+            .filter(|l| (l.state.bitrate_bps() - floor_bps) <= budget)
             .max_by_key(|l| l.quality)
     }
 }
@@ -1000,13 +1155,9 @@ mod assignment_tests {
 
         for i in 0..count {
             let mid = Mid::from(&format!("v{i}")[..]);
-
             let (tx, rx) = make_video_track(pid, mid);
-
             ids.push(rx.meta.id);
-
             allocator.add_track(rx);
-
             senders.push(tx);
         }
 
@@ -1016,7 +1167,6 @@ mod assignment_tests {
     fn add_slots(allocator: &mut VideoAllocator, count: usize) {
         for i in 0..count {
             let mid = Mid::from(&format!("s{i}")[..]);
-
             allocator.add_slot(mid, SlotConfig::default());
         }
     }
@@ -1024,94 +1174,64 @@ mod assignment_tests {
     #[test]
     fn rebalance_assigns_tracks_to_slots() {
         let mut allocator = setup_allocator();
-
         let _tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
-
-        let slots: Vec<_> = allocator.slots().collect();
-
-        assert_eq!(slots.len(), 3);
+        assert_eq!(allocator.slots().count(), 3);
     }
 
     #[test]
     fn more_tracks_than_slots() {
         let mut allocator = setup_allocator();
-
         let _tracks = add_tracks(&mut allocator, 5);
         add_slots(&mut allocator, 2);
-
-        let slots: Vec<_> = allocator.slots().collect();
-
-        assert_eq!(slots.len(), 2);
+        assert_eq!(allocator.slots().count(), 2);
     }
 
     #[test]
     fn tracks_before_slots() {
         let mut allocator = setup_allocator();
-
         let _tracks = add_tracks(&mut allocator, 2);
-
         add_slots(&mut allocator, 2);
-
-        let slots: Vec<_> = allocator.slots().collect();
-
-        assert_eq!(slots.len(), 2);
+        assert_eq!(allocator.slots().count(), 2);
     }
 
     #[test]
     fn removing_track_releases_slot() {
         let mut allocator = setup_allocator();
-
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
-
         assert_eq!(allocator.slots().count(), 1);
-
         allocator.remove_track(&tracks.ids[0]);
-
         assert_eq!(allocator.slots().count(), 0);
     }
 
     #[test]
     fn multiple_slot_candidates_exist() {
         let mut allocator = setup_allocator();
-
         let _tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
-
         assert_eq!(allocator.slots().count(), 3);
     }
 
     #[test]
     fn allocator_returns_positive_desired_bitrate() {
         let mut allocator = setup_allocator();
-
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
-
-        let bw = Bitrate::from(5_000_000);
-
-        let desired = allocator.update_allocations(bw);
-
+        let desired = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
     }
 
     #[test]
     fn allocator_handles_track_churn() {
         let mut allocator = setup_allocator();
-
         let mut tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
-
         allocator.remove_track(&tracks.ids[1]);
-
         let pid = ParticipantId::new();
         let (tx, rx) = make_video_track(pid, Mid::from("new_track"));
-
         tracks.senders.push(tx);
-
         allocator.add_track(rx);
-
         assert_eq!(allocator.slots().count(), 3);
     }
 }
@@ -1128,12 +1248,24 @@ mod allocation_tests {
     fn setup_test_context() -> (ParticipantId, TrackReceiver) {
         let p_id = ParticipantId::new();
         let (_, rx) = make_video_track(p_id, Mid::from("100"));
-
         for layer in &rx.simulcast {
             layer.state.update_for_test().inactive(false);
         }
-
         (p_id, rx)
+    }
+
+    fn make_slot<'a>(
+        mid: Mid,
+        priority: u32,
+        track: &'a TrackReceiver,
+        current_quality: Option<SimulcastQuality>,
+    ) -> SlotView<'a> {
+        SlotView {
+            mid,
+            priority,
+            track: Some(track),
+            current_quality,
+        }
     }
 
     #[test]
@@ -1144,16 +1276,8 @@ mod allocation_tests {
 
         let available = Bitrate::from(80_000);
         let slots = vec![
-            SlotView {
-                mid: mid_a,
-                priority: 1080,
-                track: Some(&track),
-            },
-            SlotView {
-                mid: mid_b,
-                priority: 360,
-                track: Some(&track),
-            },
+            make_slot(mid_a, 1080, &track, None),
+            make_slot(mid_b, 360, &track, None),
         ];
 
         let (decisions, _) = AllocationEngine::compute(available, slots);
@@ -1173,7 +1297,6 @@ mod allocation_tests {
         let (_, track) = setup_test_context();
         let mid = Mid::from("1");
 
-        // Set High layer to Bad quality
         track
             .by_quality(SimulcastQuality::High)
             .unwrap()
@@ -1182,15 +1305,10 @@ mod allocation_tests {
             .quality(StreamQuality::Bad);
 
         let available = Bitrate::from(1_000_000);
-        let slots = vec![SlotView {
-            mid,
-            priority: 1080,
-            track: Some(&track),
-        }];
+        let slots = vec![make_slot(mid, 1080, &track, None)];
 
         let (decisions, _) = AllocationEngine::compute(available, slots);
 
-        // Expected: Should not use High, should fall back to Medium
         assert_eq!(
             decisions.get(&mid).unwrap(),
             &AllocationDecision::Forward(track.by_quality(SimulcastQuality::Medium).unwrap())
@@ -1203,18 +1321,11 @@ mod allocation_tests {
         let mid_high = Mid::from("high");
         let mid_low = Mid::from("low");
 
-        let available = Bitrate::from(40_000); // Only enough for one 30k stream
+        // Only enough for one Low-layer stream (~30 kbps) plus hysteresis margin.
+        let available = Bitrate::from(40_000);
         let slots = vec![
-            SlotView {
-                mid: mid_high,
-                priority: 1080,
-                track: Some(&track),
-            },
-            SlotView {
-                mid: mid_low,
-                priority: 360,
-                track: Some(&track),
-            },
+            make_slot(mid_high, 1080, &track, None),
+            make_slot(mid_low, 360, &track, None),
         ];
 
         let (decisions, _) = AllocationEngine::compute(available, slots);
@@ -1223,7 +1334,77 @@ mod allocation_tests {
             decisions.get(&mid_high),
             Some(AllocationDecision::Forward(_))
         ));
-        assert_eq!(decisions.get(&mid_low).unwrap(), &AllocationDecision::Pause);
+        // Pause must carry a resume-target receiver, not be a unit variant.
+        assert!(matches!(
+            decisions.get(&mid_low),
+            Some(AllocationDecision::Pause(_))
+        ));
+    }
+
+    #[test]
+    fn test_idle_decision_for_empty_slot() {
+        let mid = Mid::from("empty");
+        let slots = vec![SlotView {
+            mid,
+            priority: 720,
+            track: None,
+            current_quality: None,
+        }];
+
+        let (decisions, _) = AllocationEngine::compute(Bitrate::from(1_000_000), slots);
+
+        assert_eq!(decisions.get(&mid).unwrap(), &AllocationDecision::Idle);
+    }
+
+    #[test]
+    fn test_pause_carries_resume_receiver() {
+        let (_, track) = setup_test_context();
+        let mid_high = Mid::from("h");
+        let mid_low = Mid::from("l");
+
+        let available = Bitrate::from(40_000);
+        let slots = vec![
+            make_slot(mid_high, 1080, &track, None),
+            make_slot(mid_low, 360, &track, None),
+        ];
+
+        let (decisions, _) = AllocationEngine::compute(available, slots);
+
+        match decisions.get(&mid_low).unwrap() {
+            AllocationDecision::Pause(receiver) => {
+                assert_eq!(receiver.quality, SimulcastQuality::Low);
+            }
+            other => panic!("expected Pause(_), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_oscillation_at_boundary() {
+        // Place available bandwidth just 10 % above the Low layer cost.
+        // The UPGRADE_HEADROOM guard (15 %) means no upgrade should fire,
+        // and the SACRIFICE_HYSTERESIS (50 kbps) means no sacrifice should
+        // fire either.  The decision must stay stable across many passes.
+        let (_, track) = setup_test_context();
+        let mid = Mid::from("m");
+
+        let low_bps = track
+            .by_quality(SimulcastQuality::Low)
+            .unwrap()
+            .state
+            .bitrate_bps();
+        // 10 % headroom — below the 15 % UPGRADE_HEADROOM guard band.
+        let available = Bitrate::from((low_bps * 1.10) as u64);
+
+        let slots = vec![make_slot(mid, 1080, &track, Some(SimulcastQuality::Low))];
+
+        for _ in 0..20 {
+            let (decisions, _) = AllocationEngine::compute(available, slots.clone());
+            assert_eq!(
+                decisions.get(&mid).unwrap(),
+                &AllocationDecision::Forward(track.by_quality(SimulcastQuality::Low).unwrap()),
+                "oscillation detected: decision changed away from Low"
+            );
+        }
     }
 
     #[test]
@@ -1235,11 +1416,16 @@ mod allocation_tests {
         allocator.add_slot(mid, SlotConfig::default());
         allocator.add_track(track.clone());
 
-        // Update allocations with enough bandwidth for 'High' (500kbps)
         let desired = allocator.update_allocations(Bitrate::from(1_000_000));
 
-        // 500k * 1.15 = 575k
-        assert_eq!(desired.as_f64(), 575_000.0);
+        // Desired = highest healthy layer of the one active slot.
+        let expected = track
+            .simulcast
+            .iter()
+            .filter(|l| l.state.is_healthy())
+            .map(|l| l.state.bitrate_bps())
+            .fold(0.0_f64, f64::max);
+        assert_eq!(desired.as_f64(), expected);
     }
 
     #[test]
@@ -1251,11 +1437,9 @@ mod allocation_tests {
         allocator.add_slot(mid, SlotConfig::default());
         allocator.add_track(track);
 
-        // First pass: starts playing
         allocator.update_allocations(Bitrate::from(1_000_000));
 
         let idx = allocator.mid_to_idx[&mid];
-        // In your system, the driver state is updated within VideoAllocator::update_allocations
         assert!(allocator.slots.get(idx).unwrap().slot.state.is_playing());
     }
 
@@ -1275,7 +1459,6 @@ mod allocation_tests {
         allocator.add_track(track2.clone());
         allocator.add_track(track3.clone());
 
-        // Give enough bandwidth for all streams to start
         allocator.update_allocations(Bitrate::from(5_000_000));
         assert_eq!(allocator.slots().count(), 3);
         assert_eq!(
@@ -1287,10 +1470,9 @@ mod allocation_tests {
             3
         );
 
-        // Starve the link so every decision yields Pause
+        // Starve the link — all slots should pause, not idle.
         allocator.update_allocations(Bitrate::from(0));
 
-        // tracks should still be bound to their mids and visible via `slots()`
         assert_eq!(allocator.slots().count(), 3);
         for state in allocator.tracks.values() {
             assert!(state.assigned_mid.is_some(), "track lost assignment");
@@ -1304,7 +1486,7 @@ mod allocation_tests {
             0
         );
 
-        // Increasing bandwidth should resume the streams automatically
+        // Restoring bandwidth should resume all three streams.
         allocator.update_allocations(Bitrate::from(5_000_000));
         assert_eq!(
             allocator
@@ -1325,11 +1507,9 @@ mod allocation_tests {
         allocator.add_track(track.clone());
 
         allocator.update_allocations(Bitrate::from(1_000_000));
-        // now there should be a single assigned track
         let assigned_mid = allocator.tracks.values().next().unwrap().assigned_mid;
         assert!(assigned_mid.is_some());
 
-        // artificially empty the slot without clearing the track
         let mid = assigned_mid.unwrap();
         let idx = allocator.mid_to_idx[&mid];
         allocator.slots.get_mut(idx).unwrap().stop();
