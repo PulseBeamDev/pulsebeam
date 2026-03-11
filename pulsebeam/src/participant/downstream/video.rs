@@ -204,6 +204,23 @@ impl VideoAllocator {
     }
 
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> Bitrate {
+        let total = self.tracks.len();
+        let assigned = self
+            .tracks
+            .values()
+            .filter(|t| t.assigned_mid.is_some())
+            .count();
+        let playing = self
+            .slots
+            .iter()
+            .filter(|(_, d)| d.slot.state.is_playing())
+            .count();
+        tracing::debug!(
+            "Allocator State: {} tracks total, {} assigned to slots, {} playing",
+            total,
+            assigned,
+            playing
+        );
         // 1. Prepare the input views
         let views = self
             .slots
@@ -239,7 +256,7 @@ impl VideoAllocator {
                     }
                 }
                 AllocationDecision::Pause => {
-                    driver.stop();
+                    driver.pause();
                 }
             }
         }
@@ -447,6 +464,20 @@ impl SlotDriver {
     pub fn stop(&mut self) {
         self.keyframe_retries = 0;
         self.transition_to(SlotState::Idle, None, None);
+    }
+
+    /// Pause the slot without completely dropping its receiver.  The driver
+    /// maintains the current stream in `staging` so that subsequent allocation
+    /// passes can still see the track and resume it if bandwidth allows.
+    pub fn pause(&mut self) {
+        self.keyframe_retries = 0;
+        if let Some(receiver) = self.slot.current().cloned() {
+            // move current into staging state, clear active
+            self.transition_to(SlotState::Paused, None, Some(receiver));
+        } else {
+            // nothing to pause; behave like stop
+            self.transition_to(SlotState::Idle, None, None);
+        }
     }
 
     pub fn poll_slow(&mut self, now: Instant) {
@@ -949,6 +980,7 @@ mod assignment_tests {
     use super::*;
     use crate::entity::{ParticipantId, TrackId};
     use crate::track::{TrackSender, test_utils::make_video_track};
+    use str0m::bwe::Bitrate;
     use str0m::media::Mid;
 
     struct TestTracks {
@@ -1225,5 +1257,82 @@ mod allocation_tests {
         let idx = allocator.mid_to_idx[&mid];
         // In your system, the driver state is updated within VideoAllocator::update_allocations
         assert!(allocator.slots.get(idx).unwrap().slot.state.is_playing());
+    }
+
+    #[test]
+    fn test_pause_preserves_assignment_and_resumes() {
+        let mut allocator = VideoAllocator::new(false);
+
+        let (_, track1) = setup_test_context();
+        let (_, track2) = setup_test_context();
+        let (_, track3) = setup_test_context();
+
+        allocator.add_slot(Mid::from("s1"), SlotConfig::default());
+        allocator.add_slot(Mid::from("s2"), SlotConfig::default());
+        allocator.add_slot(Mid::from("s3"), SlotConfig::default());
+
+        allocator.add_track(track1.clone());
+        allocator.add_track(track2.clone());
+        allocator.add_track(track3.clone());
+
+        // Give enough bandwidth for all streams to start
+        allocator.update_allocations(Bitrate::from(5_000_000));
+        assert_eq!(allocator.slots().count(), 3);
+        assert_eq!(
+            allocator
+                .slots
+                .iter()
+                .filter(|(_, d)| d.slot.state.is_playing())
+                .count(),
+            3
+        );
+
+        // Starve the link so every decision yields Pause
+        allocator.update_allocations(Bitrate::from(0));
+
+        // tracks should still be bound to their mids and visible via `slots()`
+        assert_eq!(allocator.slots().count(), 3);
+        for state in allocator.tracks.values() {
+            assert!(state.assigned_mid.is_some(), "track lost assignment");
+        }
+        assert_eq!(
+            allocator
+                .slots
+                .iter()
+                .filter(|(_, d)| d.slot.state.is_playing())
+                .count(),
+            0
+        );
+
+        // Increasing bandwidth should resume the streams automatically
+        allocator.update_allocations(Bitrate::from(5_000_000));
+        assert_eq!(
+            allocator
+                .slots
+                .iter()
+                .filter(|(_, d)| d.slot.state.is_playing())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_pause_on_empty_slot_clears_assignment() {
+        let mut allocator = VideoAllocator::new(false);
+        let (_, track) = setup_test_context();
+
+        allocator.add_slot(Mid::from("s1"), SlotConfig::default());
+        allocator.add_track(track.clone());
+
+        allocator.update_allocations(Bitrate::from(1_000_000));
+        // now there should be a single assigned track
+        let assigned_mid = allocator.tracks.values().next().unwrap().assigned_mid;
+        assert!(assigned_mid.is_some());
+
+        // artificially empty the slot without clearing the track
+        let mid = assigned_mid.unwrap();
+        let idx = allocator.mid_to_idx[&mid];
+        allocator.slots.get_mut(idx).unwrap().stop();
+        assert!(allocator.slots.get(idx).unwrap().slot.state.is_idle());
     }
 }
