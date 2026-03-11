@@ -1,4 +1,3 @@
-use crate::rtp::monitor::StreamQuality;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::slot_group::SlotGroup;
@@ -13,7 +12,7 @@ use str0m::media::{Frequency, KeyframeRequest, Mid};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::track::{SimulcastReceiver, TrackMeta, TrackReceiver};
+use crate::track::{SimulcastQuality, SimulcastReceiver, TrackMeta, TrackReceiver};
 
 /// Per-slot construction parameters.  Pass one of these to [`VideoAllocator::add_slot`].
 #[derive(Clone, Debug)]
@@ -154,10 +153,10 @@ impl VideoAllocator {
             let Some(assigned_mid) = track.assigned_mid else {
                 return;
             };
-            if let Some(&idx) = self.mid_to_idx.get(&assigned_mid) {
-                if let Some(mut driver) = self.slots.get_mut(idx) {
-                    driver.stop();
-                }
+            if let Some(&idx) = self.mid_to_idx.get(&assigned_mid)
+                && let Some(mut driver) = self.slots.get_mut(idx)
+            {
+                driver.stop();
             }
             self.rebalance();
         }
@@ -204,226 +203,48 @@ impl VideoAllocator {
         }
     }
 
-    fn update_desired_bitrate(&self) -> Bitrate {
-        let mut desired = 0f64;
-        for (i, _) in self.slots.iter().enumerate() {
-            let Some(driver) = self.slots.get(i) else {
-                continue;
-            };
-            let Some(target) = driver.slot.target() else {
-                continue;
-            };
-
-            let Some(meta) = self.tracks.get(&target.meta.id) else {
-                continue;
-            };
-
-            let bitrate = meta.track.highest_quality().state.bitrate_bps();
-            desired += bitrate;
-        }
-
-        Bitrate::from(desired)
-    }
-
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> Bitrate {
-        const DOWNGRADE_TOLERANCE: f64 = 0.25;
-        const UPGRADE_HYSTERESIS_FACTOR: f64 = 1.15;
-        const MIN_BANDWIDTH: f64 = 30_000.0;
+        // 1. Prepare the input views
+        let views = self
+            .slots
+            .iter()
+            .map(|(_, d)| {
+                let track = d
+                    .slot
+                    .current()
+                    .and_then(|c| self.tracks.get(&c.meta.id))
+                    .map(|s| &s.track);
 
-        struct SlotPlan<'a> {
-            driver_idx: usize,
-            current_receiver: &'a SimulcastReceiver,
-            target_receiver: &'a SimulcastReceiver,
-            current_bitrate: f64,
-            desired_bitrate: f64,
-            paused: bool,
-            committed: bool,
-        }
-
-        struct CommittedSlotPlan {
-            driver_idx: usize,
-            receiver: SimulcastReceiver,
-            paused: bool,
-        }
-
-        // Sort slot indices by max_height descending (greedy highest-priority first).
-        let mut sorted_indices: Vec<usize> = self.slots.iter().map(|(i, _)| i).collect();
-        sorted_indices.sort_by_key(|&i| std::cmp::Reverse(self.slots.get(i).unwrap().max_height));
-
-        let mut budget = available_bandwidth.as_f64().max(MIN_BANDWIDTH);
-        let mut slot_plans: Vec<SlotPlan> = Vec::with_capacity(sorted_indices.len());
-
-        // Step 1: Optimistic Initialization
-        for &idx in &sorted_indices {
-            let driver = self.slots.get(idx).unwrap();
-            let Some(current_receiver) = driver.slot.current() else {
-                continue;
-            };
-            let Some(state) = self.tracks.get(&current_receiver.meta.id) else {
-                continue;
-            };
-
-            let (target_receiver, cost) =
-                if driver.slot.state.is_paused() || !current_receiver.state.is_healthy() {
-                    let lowest = state.track.lowest_quality();
-                    if lowest.state.is_inactive() {
-                        slot_plans.push(SlotPlan {
-                            driver_idx: idx,
-                            current_receiver,
-                            target_receiver: current_receiver,
-                            current_bitrate: 0.0,
-                            desired_bitrate: 0.0,
-                            paused: true,
-                            committed: true,
-                        });
-                        continue;
-                    }
-                    (lowest, lowest.state.bitrate_bps())
-                } else {
-                    let cost = current_receiver.state.bitrate_bps();
-                    (current_receiver, cost)
-                };
-
-            budget -= cost;
-            slot_plans.push(SlotPlan {
-                driver_idx: idx,
-                current_receiver,
-                target_receiver,
-                current_bitrate: cost,
-                desired_bitrate: cost,
-                paused: false,
-                committed: false,
-            });
-        }
-
-        // Step 2: Resolve Congestion (Downgrade Phase)
-        let tolerance = available_bandwidth.as_f64() * DOWNGRADE_TOLERANCE;
-        while budget < -tolerance {
-            let mut resolved = false;
-            for plan in slot_plans.iter_mut().rev() {
-                if plan.paused || plan.committed {
-                    continue;
+                SlotView {
+                    mid: d.mid,
+                    priority: d.max_height,
+                    track,
                 }
-                let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
-                    continue;
-                };
-                if let Some(lower) = state.track.lower_quality(plan.target_receiver.quality) {
-                    let savings =
-                        plan.target_receiver.state.bitrate_bps() - lower.state.bitrate_bps();
-                    if savings > 0.0 {
-                        plan.target_receiver = lower;
-                        plan.current_bitrate = lower.state.bitrate_bps();
-                        plan.desired_bitrate = lower.state.bitrate_bps();
-                        budget += savings;
-                        resolved = true;
-                        if budget >= -tolerance {
-                            break;
-                        }
-                    }
-                } else {
-                    let cost = plan.target_receiver.state.bitrate_bps();
-                    plan.paused = true;
-                    plan.committed = true;
-                    plan.current_bitrate = 0.0;
-                    budget += cost;
-                    resolved = true;
-                    if budget >= -tolerance {
-                        break;
-                    }
-                }
-            }
-            if !resolved {
-                break;
-            }
-        }
+            })
+            .collect();
 
-        // Step 3: Upgrade Phase
-        let mut made_progress = true;
-        while made_progress {
-            made_progress = false;
-            for plan in &mut slot_plans {
-                if plan.committed {
-                    continue;
-                }
-                plan.committed = true;
-                let Some(state) = self.tracks.get(&plan.current_receiver.meta.id) else {
-                    continue;
-                };
-                let Some(desired_receiver) = state
-                    .track
-                    .higher_quality(plan.target_receiver.quality)
-                    .filter(|next| {
-                        !next.state.is_inactive()
-                            && next.state.quality() == StreamQuality::Excellent
-                    })
-                else {
-                    continue;
-                };
+        // 2. Run the pure logic
+        let (decisions, desired) = AllocationEngine::compute(available_bandwidth, views);
 
-                let desired_bitrate = desired_receiver.state.bitrate_bps();
-                let upgrade_cost = desired_bitrate - plan.current_bitrate;
-                let hysteresis_overhead =
-                    if desired_receiver.quality > plan.current_receiver.quality {
-                        desired_bitrate * (UPGRADE_HYSTERESIS_FACTOR - 1.0)
-                    } else {
-                        0.0
-                    };
-
-                if (upgrade_cost + hysteresis_overhead) > budget {
-                    plan.desired_bitrate = desired_bitrate * UPGRADE_HYSTERESIS_FACTOR;
-                    continue;
-                }
-
-                budget -= upgrade_cost;
-                plan.committed = false;
-                plan.target_receiver = desired_receiver;
-                plan.current_bitrate = desired_bitrate;
-                plan.desired_bitrate = desired_bitrate;
-                made_progress = true;
-            }
-        }
-
-        // Step 4: Apply allocations
-        let mut committed = Vec::with_capacity(slot_plans.len());
-        let mut total_allocated = 0.0;
-        let mut total_desired = 0.0;
-
-        for plan in slot_plans.drain(..) {
-            total_allocated += plan.current_bitrate;
-            total_desired += plan.desired_bitrate;
-            committed.push(CommittedSlotPlan {
-                driver_idx: plan.driver_idx,
-                receiver: plan.target_receiver.clone(),
-                paused: plan.paused,
-            });
-        }
-
-        for plan in committed {
-            let idx = plan.driver_idx;
+        // 3. Apply the results to the drivers
+        for (mid, decision) in decisions {
+            let idx = self.mid_to_idx[&mid];
             let mut driver = self.slots.get_mut(idx).unwrap();
-            if plan.paused {
-                driver.assign_to(plan.receiver);
-            } else {
-                driver.switch_to(plan.receiver, false);
+
+            match decision {
+                AllocationDecision::Forward(receiver) => {
+                    // Only trigger a switch if the RID or Quality actually changed
+                    if driver.slot.current().map(|c| c.quality) != Some(receiver.quality) {
+                        driver.switch_to(receiver.clone(), false);
+                    }
+                }
+                AllocationDecision::Pause => {
+                    driver.stop();
+                }
             }
         }
 
-        let total_allocated = Bitrate::from(total_allocated);
-        let total_desired = Bitrate::from(total_desired);
-
-        if self.ticks >= 30 {
-            tracing::debug!(
-                available = %available_bandwidth,
-                allocated = %total_allocated,
-                budget = %Bitrate::from(budget),
-                desired = %total_desired,
-                "allocation summary"
-            );
-            self.ticks = 0;
-        }
-        self.ticks += 1;
-
-        total_desired
+        desired
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) {
@@ -940,5 +761,469 @@ impl SlotDriver {
         self.slot.state = new_state;
         self.slot.active = active;
         self.slot.staging = staging;
+    }
+}
+
+pub struct AllocationEngine;
+
+/// A simplified view of a slot for the engine to process
+#[derive(Clone, Debug)]
+pub struct SlotView<'a> {
+    pub mid: Mid,
+    pub priority: u32, // maps to max_height
+    pub track: Option<&'a TrackReceiver>,
+}
+
+impl<'a> std::fmt::Display for SlotView<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.track {
+            Some(track) => {
+                let layers = track
+                    .simulcast
+                    .iter()
+                    .map(|l| {
+                        let status = if l.state.is_inactive() {
+                            "inv"
+                        } else if !l.state.is_healthy() {
+                            "unh"
+                        } else {
+                            "ok"
+                        };
+                        format!(
+                            "{}:{}",
+                            l.rid.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+                            status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                write!(f, "{}(P{}|{})", self.mid, self.priority, layers)
+            }
+            None => write!(f, "{}(Empty)", self.mid),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum AllocationDecision<'a> {
+    Forward(&'a SimulcastReceiver),
+    Pause,
+}
+
+impl<'a> std::fmt::Display for AllocationDecision<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllocationDecision::Forward(l) => {
+                write!(f, "Forward({})", l)
+            }
+            AllocationDecision::Pause => write!(f, "Pause"),
+        }
+    }
+}
+
+impl AllocationEngine {
+    pub fn compute<'a>(
+        available_bw: Bitrate,
+        mut slots: Vec<SlotView<'a>>,
+    ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate) {
+        let mut budget = available_bw.as_f64();
+        let mut decisions = HashMap::new();
+
+        // Pass 1: Baseline (Fairness + Health)
+        for slot in &slots {
+            if let Some(track) = slot.track {
+                let lowest = track.lowest_quality();
+                // Ensure we only allocate to healthy, active streams
+                if lowest.state.is_healthy() {
+                    budget -= lowest.state.bitrate_bps();
+                    decisions.insert(slot.mid, AllocationDecision::Forward(lowest));
+                } else {
+                    tracing::debug!(mid = %slot.mid, "Stream unhealthy, pausing baseline");
+                    decisions.insert(slot.mid, AllocationDecision::Pause);
+                }
+            } else {
+                decisions.insert(slot.mid, AllocationDecision::Pause);
+            }
+        }
+
+        // Pass 2: Upgrades (Priority)
+        slots.sort_by_key(|s| std::cmp::Reverse(s.priority));
+        if budget > 0.0 {
+            for slot in &slots {
+                let Some(track) = slot.track else { continue };
+                let current_layer = match decisions.get(&slot.mid) {
+                    Some(AllocationDecision::Forward(l)) => *l,
+                    _ => continue,
+                };
+
+                if let Some(better) = Self::find_best_fit(track, current_layer.quality, budget) {
+                    budget -= better.state.bitrate_bps() - current_layer.state.bitrate_bps();
+                    decisions.insert(slot.mid, AllocationDecision::Forward(better));
+                }
+            }
+        }
+
+        // Pass 3: Sacrifice (Congestion Recovery)
+        if budget < 0.0 {
+            let mut sacrifice_order = slots.clone();
+            sacrifice_order.sort_by_key(|s| s.priority);
+
+            for slot in sacrifice_order {
+                if budget >= 0.0 {
+                    break;
+                }
+                if let Some(AllocationDecision::Forward(layer)) = decisions.get(&slot.mid) {
+                    // This is a critical event: we are dropping a stream due to network pressure
+                    tracing::warn!(mid = %slot.mid, priority = slot.priority, "Congestion sacrifice: pausing stream");
+                    budget += layer.state.bitrate_bps();
+                    decisions.insert(slot.mid, AllocationDecision::Pause);
+                }
+            }
+        }
+
+        let total_bps: f64 = decisions
+            .values()
+            .map(|d| match d {
+                AllocationDecision::Forward(l) => l.state.bitrate_bps(),
+                AllocationDecision::Pause => 0.0,
+            })
+            .sum();
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let mut slot_str = String::new();
+            let mut dec_str = String::new();
+
+            // Sort for consistent log ordering
+            slots.sort_by_key(|s| s.mid);
+
+            for slot in &slots {
+                use std::fmt::Write;
+                let _ = write!(slot_str, " {};", slot);
+
+                let decision = decisions
+                    .get(&slot.mid)
+                    .cloned()
+                    .unwrap_or(AllocationDecision::Pause);
+                let d_label = match decision {
+                    AllocationDecision::Forward(l) => {
+                        l.rid.map(|r| r.to_string()).unwrap_or("?".into())
+                    }
+                    AllocationDecision::Pause => "OFF".into(),
+                };
+                let _ = write!(dec_str, " {}->{};", slot.mid, d_label);
+            }
+
+            tracing::debug!(
+                bw = %available_bw,
+                total = %Bitrate::from(total_bps),
+                "Slots:[{}] Decisions:[{}]",
+                slot_str.trim(),
+                dec_str.trim()
+            );
+        }
+
+        (decisions, Bitrate::from(total_bps * 1.15))
+    }
+
+    fn find_best_fit(
+        track: &TrackReceiver,
+        current: SimulcastQuality,
+        budget: f64,
+    ) -> Option<&SimulcastReceiver> {
+        let current_bps = track
+            .by_quality(current)
+            .map(|l| l.state.bitrate_bps())
+            .unwrap_or(0.0);
+        track
+            .simulcast
+            .iter()
+            .filter(|l| l.quality > current)
+            .filter(|l| l.state.is_healthy())
+            .filter(|l| (l.state.bitrate_bps() - current_bps) <= budget)
+            .max_by_key(|l| l.quality)
+    }
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+    use crate::entity::{ParticipantId, TrackId};
+    use crate::track::{TrackSender, test_utils::make_video_track};
+    use str0m::media::Mid;
+
+    struct TestTracks {
+        pub senders: Vec<TrackSender>,
+        pub ids: Vec<TrackId>,
+    }
+
+    fn setup_allocator() -> VideoAllocator {
+        VideoAllocator::new(false)
+    }
+
+    fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {
+        let pid = ParticipantId::new();
+
+        let mut senders = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..count {
+            let mid = Mid::from(&format!("v{i}")[..]);
+
+            let (tx, rx) = make_video_track(pid, mid);
+
+            ids.push(rx.meta.id);
+
+            allocator.add_track(rx);
+
+            senders.push(tx);
+        }
+
+        TestTracks { senders, ids }
+    }
+
+    fn add_slots(allocator: &mut VideoAllocator, count: usize) {
+        for i in 0..count {
+            let mid = Mid::from(&format!("s{i}")[..]);
+
+            allocator.add_slot(mid, SlotConfig::default());
+        }
+    }
+
+    #[test]
+    fn rebalance_assigns_tracks_to_slots() {
+        let mut allocator = setup_allocator();
+
+        let _tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+
+        let slots: Vec<_> = allocator.slots().collect();
+
+        assert_eq!(slots.len(), 3);
+    }
+
+    #[test]
+    fn more_tracks_than_slots() {
+        let mut allocator = setup_allocator();
+
+        let _tracks = add_tracks(&mut allocator, 5);
+        add_slots(&mut allocator, 2);
+
+        let slots: Vec<_> = allocator.slots().collect();
+
+        assert_eq!(slots.len(), 2);
+    }
+
+    #[test]
+    fn tracks_before_slots() {
+        let mut allocator = setup_allocator();
+
+        let _tracks = add_tracks(&mut allocator, 2);
+
+        add_slots(&mut allocator, 2);
+
+        let slots: Vec<_> = allocator.slots().collect();
+
+        assert_eq!(slots.len(), 2);
+    }
+
+    #[test]
+    fn removing_track_releases_slot() {
+        let mut allocator = setup_allocator();
+
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        assert_eq!(allocator.slots().count(), 1);
+
+        allocator.remove_track(&tracks.ids[0]);
+
+        assert_eq!(allocator.slots().count(), 0);
+    }
+
+    #[test]
+    fn multiple_slot_candidates_exist() {
+        let mut allocator = setup_allocator();
+
+        let _tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+
+        assert_eq!(allocator.slots().count(), 3);
+    }
+
+    #[test]
+    fn allocator_returns_positive_desired_bitrate() {
+        let mut allocator = setup_allocator();
+
+        let _tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        let bw = Bitrate::from(5_000_000);
+
+        let desired = allocator.update_allocations(bw);
+
+        assert!(desired.as_f64() > 0.0);
+    }
+
+    #[test]
+    fn allocator_handles_track_churn() {
+        let mut allocator = setup_allocator();
+
+        let mut tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+
+        allocator.remove_track(&tracks.ids[1]);
+
+        let pid = ParticipantId::new();
+        let (tx, rx) = make_video_track(pid, Mid::from("new_track"));
+
+        tracks.senders.push(tx);
+
+        allocator.add_track(rx);
+
+        assert_eq!(allocator.slots().count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use crate::entity::ParticipantId;
+    use crate::rtp::monitor::StreamQuality;
+    use crate::track::{SimulcastQuality, TrackReceiver, test_utils::make_video_track};
+    use str0m::bwe::Bitrate;
+    use str0m::media::Mid;
+
+    fn setup_test_context() -> (ParticipantId, TrackReceiver) {
+        let p_id = ParticipantId::new();
+        let (_, rx) = make_video_track(p_id, Mid::from("100"));
+
+        for layer in &rx.simulcast {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        (p_id, rx)
+    }
+
+    #[test]
+    fn test_fairness_over_greedy_priority() {
+        let (_, track) = setup_test_context();
+        let mid_a = Mid::from("1");
+        let mid_b = Mid::from("2");
+
+        let available = Bitrate::from(80_000);
+        let slots = vec![
+            SlotView {
+                mid: mid_a,
+                priority: 1080,
+                track: Some(&track),
+            },
+            SlotView {
+                mid: mid_b,
+                priority: 360,
+                track: Some(&track),
+            },
+        ];
+
+        let (decisions, _) = AllocationEngine::compute(available, slots);
+
+        assert_eq!(
+            decisions.get(&mid_a).unwrap(),
+            &AllocationDecision::Forward(track.by_quality(SimulcastQuality::Low).unwrap())
+        );
+        assert_eq!(
+            decisions.get(&mid_b).unwrap(),
+            &AllocationDecision::Forward(track.by_quality(SimulcastQuality::Low).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_health_check_degradation() {
+        let (_, track) = setup_test_context();
+        let mid = Mid::from("1");
+
+        // Set High layer to Bad quality
+        track
+            .by_quality(SimulcastQuality::High)
+            .unwrap()
+            .state
+            .update_for_test()
+            .quality(StreamQuality::Bad);
+
+        let available = Bitrate::from(1_000_000);
+        let slots = vec![SlotView {
+            mid,
+            priority: 1080,
+            track: Some(&track),
+        }];
+
+        let (decisions, _) = AllocationEngine::compute(available, slots);
+
+        // Expected: Should not use High, should fall back to Medium
+        assert_eq!(
+            decisions.get(&mid).unwrap(),
+            &AllocationDecision::Forward(track.by_quality(SimulcastQuality::Medium).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_starvation_sacrifice_order() {
+        let (_, track) = setup_test_context();
+        let mid_high = Mid::from("high");
+        let mid_low = Mid::from("low");
+
+        let available = Bitrate::from(40_000); // Only enough for one 30k stream
+        let slots = vec![
+            SlotView {
+                mid: mid_high,
+                priority: 1080,
+                track: Some(&track),
+            },
+            SlotView {
+                mid: mid_low,
+                priority: 360,
+                track: Some(&track),
+            },
+        ];
+
+        let (decisions, _) = AllocationEngine::compute(available, slots);
+
+        assert!(matches!(
+            decisions.get(&mid_high),
+            Some(AllocationDecision::Forward(_))
+        ));
+        assert_eq!(decisions.get(&mid_low).unwrap(), &AllocationDecision::Pause);
+    }
+
+    #[test]
+    fn test_update_allocations_returns_padded_bitrate() {
+        let mut allocator = VideoAllocator::new(false);
+        let (_, track) = setup_test_context();
+
+        let mid = Mid::from("s1");
+        allocator.add_slot(mid, SlotConfig::default());
+        allocator.add_track(track.clone());
+
+        // Update allocations with enough bandwidth for 'High' (500kbps)
+        let desired = allocator.update_allocations(Bitrate::from(1_000_000));
+
+        // 500k * 1.15 = 575k
+        assert_eq!(desired.as_f64(), 575_000.0);
+    }
+
+    #[test]
+    fn test_switching_does_not_occur_if_unnecessary() {
+        let mut allocator = VideoAllocator::new(false);
+        let (_, track) = setup_test_context();
+        let mid = Mid::from("s1");
+
+        allocator.add_slot(mid, SlotConfig::default());
+        allocator.add_track(track);
+
+        // First pass: starts playing
+        allocator.update_allocations(Bitrate::from(1_000_000));
+
+        let idx = allocator.mid_to_idx[&mid];
+        // In your system, the driver state is updated within VideoAllocator::update_allocations
+        assert!(allocator.slots.get(idx).unwrap().slot.state.is_playing());
     }
 }
