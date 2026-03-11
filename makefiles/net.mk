@@ -79,8 +79,8 @@ net-good-home-wifi:
 		TARGET_RTT="40ms" \
 		UPLOAD_RATE="1000mbit" \
 		DOWNLOAD_RATE="1000mbit" \
-		UPLOAD_JITTER="10ms" \
-		DOWNLOAD_JITTER="10ms" \
+		UPLOAD_JITTER="5ms" \
+		DOWNLOAD_JITTER="5ms" \
 		UPLOAD_PACKET_LOSS="0%" \
 		DOWNLOAD_PACKET_LOSS="0%"
 

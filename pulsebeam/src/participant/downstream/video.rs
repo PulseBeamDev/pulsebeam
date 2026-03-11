@@ -1106,7 +1106,7 @@ impl AllocationEngine {
             );
         }
 
-        (decisions, Bitrate::from(desired_bps))
+        (decisions, Bitrate::from(desired_bps * 1.5))
     }
 
     /// Find the best layer strictly above `floor` whose *incremental* cost

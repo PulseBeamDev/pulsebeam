@@ -15,7 +15,7 @@ use tokio::time::Instant;
 pub use video::Intent;
 
 const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
-const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
+const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(10);
 
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,

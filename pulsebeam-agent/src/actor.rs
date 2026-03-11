@@ -1,4 +1,5 @@
 use crate::api::{ApiError, CreateParticipantRequest, HttpApiClient};
+use crate::manager::{Subscription, SubscriptionManager};
 use crate::media::{KeyframeNotifier, KeyframeReceiver};
 use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
@@ -24,7 +25,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::manager::{Subscription, SubscriptionManager};
 
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -243,10 +243,7 @@ impl LayerController {
                 .order
                 .iter()
                 .rev()
-                .find(|k| {
-                    self.states.get(*k).map_or(false, |s| !s.paused)
-                        && k.1.is_some()
-                })
+                .find(|k| self.states.get(*k).map_or(false, |s| !s.paused) && k.1.is_some())
                 .cloned()
             {
                 if let Some(s) = self.states.get_mut(&key) {
@@ -376,7 +373,11 @@ fn new_remote_track(mid: Mid, track: Arc<Track>) -> (RemoteTrackTx, RemoteTrackR
         track: track.clone(),
         tx: ch_tx,
     };
-    let rx = RemoteTrackRx { mid, track, rx: ch_rx };
+    let rx = RemoteTrackRx {
+        mid,
+        track,
+        rx: ch_rx,
+    };
 
     (tx, rx)
 }
@@ -683,7 +684,9 @@ impl Agent {
     }
 
     pub async fn set_subscriptions(&self, subs: Vec<Subscription>) -> Result<(), AgentError> {
-        self.cmd_tx.send(AgentCommand::SetSubscriptions(subs)).await?;
+        self.cmd_tx
+            .send(AgentCommand::SetSubscriptions(subs))
+            .await?;
         Ok(())
     }
 
@@ -803,7 +806,7 @@ impl AgentActor {
 
                 _ = bwe_slow_timer.tick(), if self.layer_ctrl.has_layers() => {
                     let desired_bps = self.layer_ctrl.tick(Instant::now());
-                    let desired = Bitrate::bps(desired_bps as u64);
+                    let desired = Bitrate::bps((desired_bps * 1.5) as u64);
                     tracing::debug!("desired bitrate: {}", desired);
                     self.rtc.bwe().set_desired_bitrate(desired);
                 }
@@ -1212,7 +1215,7 @@ impl SlotManager {
         // 2. Handle new tracks (store as pending if not already active or pending)
         for t in update.tracks_upsert {
             if self.remote_tracks.contains_key(&t.id) {
-                // Already active, maybe update track metadata? 
+                // Already active, maybe update track metadata?
                 // For now just keep it.
                 continue;
             }
@@ -1221,14 +1224,22 @@ impl SlotManager {
 
         // 3. Handle assignment removals
         for a in update.assignments_remove {
-            if let Some(s) = self.slots.iter_mut().find(|s| s.mid.as_bytes() == a.as_bytes()) {
+            if let Some(s) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.mid.as_bytes() == a.as_bytes())
+            {
                 s.track_id = None;
             }
         }
 
         // 4. Handle assignment updates
         for a in update.assignments_upsert {
-            let Some(s) = self.slots.iter_mut().find(|s| s.mid.as_bytes() == a.mid.as_bytes()) else {
+            let Some(s) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.mid.as_bytes() == a.mid.as_bytes())
+            else {
                 continue;
             };
 
@@ -1241,12 +1252,19 @@ impl SlotManager {
 
             // If we have bitstream for this track and it's in pending_tracks, promote it.
             if let Some(track) = self.pending_tracks.remove(&a.track_id) {
-                tracing::info!("Promoting track {} to active on MID {:?}", a.track_id, s.mid);
+                tracing::info!(
+                    "Promoting track {} to active on MID {:?}",
+                    a.track_id,
+                    s.mid
+                );
                 let (tx, rx) = new_remote_track(s.mid, track);
                 self.remote_tracks.insert(a.track_id, tx);
                 new_remote_tracks.push(rx);
             } else {
-                tracing::debug!("Track {} already active or not found in pending", a.track_id);
+                tracing::debug!(
+                    "Track {} already active or not found in pending",
+                    a.track_id
+                );
             }
         }
 

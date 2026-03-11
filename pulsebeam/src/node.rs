@@ -4,10 +4,10 @@ use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor::RunnerConfig;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::prelude::*;
+use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::{actor, net, rand};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use pulsebeam_runtime::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -312,7 +312,6 @@ async fn bind_udp_workers(
     Ok((readers, writers))
 }
 
-
 pub async fn ignore<T>(fut: impl Future<Output = T>) {
     let _ = fut.await;
 }
@@ -336,7 +335,6 @@ mod internal {
     use pprof::protos::Message;
     use serde::Deserialize;
     use tokio::runtime::Handle;
-
 
     #[derive(Deserialize)]
     pub struct ProfileParams {
@@ -542,7 +540,6 @@ mod internal {
             prometheus_handle.run_upkeep();
         }
     }
-
 
     pub async fn heap_profile(
         Query(params): Query<ProfileParams>,

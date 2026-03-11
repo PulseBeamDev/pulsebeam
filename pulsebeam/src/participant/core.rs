@@ -26,7 +26,7 @@ use crate::rtp::RtpPacket;
 use crate::track::{self, TrackReceiver};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
-const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct TrackMapping {
     pub mid: Mid,
@@ -373,7 +373,6 @@ impl ParticipantCore {
             }
         }
     }
-
 
     fn handle_media_added(&mut self, media: MediaAdded) {
         match media.direction {
