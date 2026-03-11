@@ -33,6 +33,11 @@ impl StreamState {
     pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
         Self(Arc::new(StreamStateInner::new(inactive, bitrate_bps)))
     }
+
+    #[cfg(test)]
+    pub fn update_for_test(&self) -> StreamStateUpdater<'_> {
+        StreamStateUpdater { state: &self.0 }
+    }
 }
 
 impl Deref for StreamState {
@@ -102,6 +107,27 @@ impl StreamStateInner {
             2 => StreamQuality::Excellent,
             _ => StreamQuality::Good,
         }
+    }
+}
+
+#[cfg(test)]
+pub struct StreamStateUpdater<'a> {
+    state: &'a StreamStateInner,
+}
+
+#[cfg(test)]
+impl<'a> StreamStateUpdater<'a> {
+    pub fn bitrate(self, bps: u64) -> Self {
+        self.state.bitrate_bps.store(bps, Ordering::Relaxed);
+        self
+    }
+    pub fn quality(self, q: StreamQuality) -> Self {
+        self.state.quality.store(q as u8, Ordering::Relaxed);
+        self
+    }
+    pub fn inactive(self, val: bool) -> Self {
+        self.state.inactive.store(val, Ordering::Relaxed);
+        self
     }
 }
 

@@ -114,6 +114,12 @@ pub struct SimulcastReceiver {
     pub state: StreamState,
 }
 
+impl PartialEq for SimulcastReceiver {
+    fn eq(&self, other: &Self) -> bool {
+        other.meta == self.meta && other.rid == self.rid && other.quality == self.quality
+    }
+}
+
 impl Display for SimulcastReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
@@ -276,29 +282,6 @@ impl TrackReceiver {
     }
 }
 
-#[cfg(test)]
-pub fn new_test_track(
-    participant_id: ParticipantId,
-    kind: MediaKind,
-    mid: Mid,
-    simulcast: bool,
-) -> (TrackSender, TrackReceiver) {
-    let track_id = participant_id.derive_track_id(kind, &mid);
-    let rids = if simulcast {
-        Some(vec!["f".into(), "h".into(), "q".into()])
-    } else {
-        None
-    };
-    let meta = Arc::new(TrackMeta {
-        id: track_id,
-        origin_participant: participant_id,
-        kind,
-        simulcast_rids: rids,
-    });
-
-    crate::track::new(mid, meta)
-}
-
 pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
     const BASE_CAP: usize = 128;
 
@@ -429,6 +412,47 @@ pub fn should_forward_audio(packet: &RtpPacket) -> bool {
 #[inline]
 fn should_forward_noop(_: &RtpPacket) -> bool {
     true
+}
+
+#[cfg(test)]
+pub mod test_utils {
+    use super::*;
+
+    pub fn make_track(
+        participant_id: ParticipantId,
+        kind: MediaKind,
+        mid: Mid,
+        rids: Option<Vec<Rid>>,
+    ) -> (TrackSender, TrackReceiver) {
+        let track_id = participant_id.derive_track_id(kind, &mid);
+        let meta = Arc::new(TrackMeta {
+            id: track_id,
+            origin_participant: participant_id,
+            kind,
+            simulcast_rids: rids,
+        });
+
+        crate::track::new(mid, meta)
+    }
+
+    pub fn make_video_track(
+        participant_id: ParticipantId,
+        mid: Mid,
+    ) -> (TrackSender, TrackReceiver) {
+        make_track(
+            participant_id,
+            MediaKind::Video,
+            mid,
+            Some(vec!["f".into(), "h".into(), "q".into()]),
+        )
+    }
+
+    pub fn make_audio_track(
+        participant_id: ParticipantId,
+        mid: Mid,
+    ) -> (TrackSender, TrackReceiver) {
+        make_track(participant_id, MediaKind::Audio, mid, None)
+    }
 }
 
 #[cfg(test)]

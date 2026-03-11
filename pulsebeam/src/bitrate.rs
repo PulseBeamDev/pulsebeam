@@ -58,6 +58,18 @@ impl BitrateControllerConfig {
             ema_alpha: 1.0, // no EMA for desired bitrate, we output sharp target steps
         }
     }
+
+    pub fn build(self) -> BitrateController {
+        BitrateController {
+            config: self,
+            smoothed_input: self.default_bitrate.as_f64(),
+            current_bitrate: self.default_bitrate.as_f64(),
+            pending_up_target: None,
+            up_stability_counter: 0,
+            pending_down_target: None,
+            down_stability_counter: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -75,15 +87,7 @@ pub struct BitrateController {
 
 impl BitrateController {
     pub fn new(config: BitrateControllerConfig) -> Self {
-        Self {
-            config,
-            smoothed_input: config.default_bitrate.as_f64(),
-            current_bitrate: config.default_bitrate.as_f64(),
-            pending_up_target: None,
-            up_stability_counter: 0,
-            pending_down_target: None,
-            down_stability_counter: 0,
-        }
+        config.build()
     }
 
     pub fn update(&mut self, available_bandwidth: Bitrate) -> Bitrate {
