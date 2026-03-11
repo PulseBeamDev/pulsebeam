@@ -2,6 +2,7 @@ use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock};
 use event_listener::{Event, EventListener};
 use futures_lite::Stream;
+use std::fmt::Debug;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
@@ -22,7 +23,6 @@ struct Slot<T> {
     val: Option<T>,
 }
 
-#[derive(Debug)]
 struct Ring<T> {
     head: AtomicU64,
     mask: usize,
@@ -31,9 +31,18 @@ struct Ring<T> {
     closed: AtomicU64,
 }
 
+impl<T> Debug for Ring<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ring")
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
 impl<T> Ring<T> {
     fn new(mut capacity: usize) -> Arc<Self> {
-        if capacity > 0 && !capacity.is_power_of_two() {
+        assert!(capacity > 0, "capacity must be > 0");
+        if !capacity.is_power_of_two() {
             let old_cap = capacity;
             capacity = capacity.next_power_of_two();
             tracing::warn!(
@@ -56,6 +65,10 @@ impl<T> Ring<T> {
             closed: AtomicU64::new(0),
         })
     }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) == 1
+    }
 }
 
 #[derive(Debug)]
@@ -66,20 +79,19 @@ pub struct Sender<T> {
 
 impl<T> Sender<T> {
     pub fn send(&mut self, val: T) {
-        if self.ring.closed.load(Ordering::Relaxed) == 1 {
+        if self.ring.is_closed() {
             return;
         }
 
         let idx = (self.local_head as usize) & self.ring.mask;
-
         {
             let mut slot = self.ring.slots[idx].write();
             slot.val = Some(val);
             slot.seq = self.local_head;
         }
 
-        self.ring.head.store(self.local_head + 1, Ordering::Release);
         self.local_head += 1;
+        self.ring.head.store(self.local_head, Ordering::Release);
         self.ring.event.notify(usize::MAX);
     }
 }
@@ -251,7 +263,6 @@ impl<T: Clone + std::marker::Unpin> Stream for Receiver<T> {
         Poll::Ready(res)
     }
 }
-
 
 impl<T: Clone> Clone for Receiver<T> {
     fn clone(&self) -> Self {
@@ -480,7 +491,9 @@ mod tests {
     #[test]
     fn send_after_close_is_a_noop() {
         let (mut tx, mut rx) = channel::<u64>(4);
-        tx.ring.closed.store(1, std::sync::atomic::Ordering::Release);
+        tx.ring
+            .closed
+            .store(1, std::sync::atomic::Ordering::Release);
         tx.send(99); // must not panic
 
         let waker = panic_waker();
@@ -883,7 +896,7 @@ mod tests {
         let (mut tx, rx) = channel::<u64>(1024);
         let num_receivers = 4;
         let items_per_receiver = 10_000;
-        
+
         let mut handles = vec![];
         for _ in 0..num_receivers {
             let mut rx = rx.clone();
@@ -892,7 +905,7 @@ mod tests {
                 while count < items_per_receiver {
                     match futures_lite::future::block_on(rx.recv()) {
                         Ok(_) => count += 1,
-                        Err(RecvError::Lagged(_)) => {}, // ignore lags
+                        Err(RecvError::Lagged(_)) => {} // ignore lags
                         Err(RecvError::Closed) => break,
                     }
                 }
