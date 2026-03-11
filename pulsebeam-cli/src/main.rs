@@ -16,6 +16,11 @@ use tokio::task::JoinSet;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
