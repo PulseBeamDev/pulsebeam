@@ -317,6 +317,8 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
 }
 
 mod internal {
+    use crate::{participant, room};
+
     use super::*;
     use anyhow::Result;
     use axum::{
@@ -426,6 +428,23 @@ mod internal {
     async fn rt_background_monitor(prometheus_handle: PrometheusHandle) {
         let metrics = Handle::current().metrics();
 
+        let mut actor_monitors = [
+            ("gateway", gateway::GatewayActor::monitor().intervals()),
+            (
+                "gateway_worker",
+                gateway::GatewayWorkerActor::monitor().intervals(),
+            ),
+            (
+                "controller",
+                controller::ControllerActor::monitor().intervals(),
+            ),
+            ("room", room::RoomActor::monitor().intervals()),
+            (
+                "participant",
+                participant::ParticipantActor::monitor().intervals(),
+            ),
+        ];
+
         describe_gauge!(
             "tokio_active_tasks",
             Unit::Count,
@@ -534,6 +553,33 @@ mod internal {
 
                 gauge!("tokio_worker_mean_poll_time_us", &labels)
                     .set(metrics.worker_mean_poll_time(i).as_micros() as f64);
+            }
+
+            for (actor_name, monitor) in &mut actor_monitors {
+                let Some(snapshot) = monitor.next() else {
+                    continue;
+                };
+
+                let labels = [("actor", *actor_name)];
+
+                metrics::gauge!("actor_long_delay_ratio", &labels).set(snapshot.long_delay_ratio());
+                metrics::gauge!("actor_slow_poll_ratio", &labels).set(snapshot.slow_poll_ratio());
+                metrics::gauge!("actor_mean_first_poll_delay_us", &labels)
+                    .set(snapshot.mean_first_poll_delay().as_micros() as f64);
+                metrics::gauge!("actor_mean_idle_duration_us", &labels)
+                    .set(snapshot.mean_idle_duration().as_micros() as f64);
+                metrics::gauge!("actor_mean_scheduled_duration_us", &labels)
+                    .set(snapshot.mean_scheduled_duration().as_micros() as f64);
+                metrics::gauge!("actor_mean_poll_duration_us", &labels)
+                    .set(snapshot.mean_poll_duration().as_micros() as f64);
+                metrics::gauge!("actor_mean_fast_poll_duration_us", &labels)
+                    .set(snapshot.mean_fast_poll_duration().as_micros() as f64);
+                metrics::gauge!("actor_mean_slow_poll_duration_us", &labels)
+                    .set(snapshot.mean_slow_poll_duration().as_micros() as f64);
+                metrics::gauge!("actor_mean_short_delay_duration_us", &labels)
+                    .set(snapshot.mean_short_delay_duration().as_micros() as f64);
+                metrics::gauge!("actor_mean_long_delay_duration_us", &labels)
+                    .set(snapshot.mean_long_delay_duration().as_micros() as f64);
             }
 
             // Keep memory usage and CPU usage bounded per prometheus interval.

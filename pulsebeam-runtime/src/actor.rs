@@ -1,4 +1,5 @@
 use crate::actor_loop;
+use crate::sync::Arc;
 use futures_lite::FutureExt;
 use std::any::Any;
 use std::cell::RefCell;
@@ -8,7 +9,6 @@ use std::future::Future;
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use crate::sync::Arc;
 use thiserror::Error;
 use tokio_metrics::TaskMonitor;
 
@@ -254,7 +254,7 @@ where
 
     // Wrap the actor's run in instrumentation and unwind safety
     let runnable = CURRENT_SCOPE.scope(RefCell::new(scope_for_child), run(a, ctx));
-    // let runnable = A::monitor().instrument(runnable);
+    let runnable = A::monitor().instrument(runnable);
     let runnable = tracing::Instrument::instrument(runnable, span);
 
     let actor_id = handle.meta.clone();
