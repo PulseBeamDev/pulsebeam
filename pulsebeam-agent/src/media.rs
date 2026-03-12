@@ -126,7 +126,14 @@ impl H264Looper {
                 capture_time: tick_time,
             };
 
-            let _ = tx.try_send(frame);
+            // backpressure: await the channel rather than drop frames
+            // if the actor can't keep up. this prevents the source from
+            // endlessly flooding the RTC send queue and allows pacing to
+            // naturally throttle the encoder.
+            if tx.send(frame).await.is_err() {
+                // actor dropped the receiver, we're shutting down
+                break;
+            }
             frame_count += 1;
         }
     }

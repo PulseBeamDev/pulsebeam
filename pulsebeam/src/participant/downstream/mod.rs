@@ -72,6 +72,7 @@ impl DownstreamAllocator {
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
+        tracing::warn!("update_bitrate={}", available_bandwidth);
         self.available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         self.dirty_allocation = true;
     }

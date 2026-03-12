@@ -157,6 +157,20 @@ net-unusable:
 		UPLOAD_PACKET_LOSS="5%" \
 		DOWNLOAD_PACKET_LOSS="6%"
 
+net-cloud:
+	# start fresh
+	sudo tc qdisc del dev lo root 2>/dev/null || true
+
+	# add a 5 Gbit/s token‑bucket limiter as the root qdisc
+	sudo tc qdisc add dev lo root handle 1: tbf \
+			rate 5gbit burst 32k latency 50ms
+
+	# put a netem child under it to emulate cloud-like delay/impairments
+	sudo tc qdisc add dev lo parent 1:1 handle 10: netem \
+			delay 30ms 5ms distribution normal
+
+	# verify
+	tc -s qdisc show dev lo
 
 # --- Control and Status ---
 
