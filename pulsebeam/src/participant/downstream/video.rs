@@ -229,21 +229,17 @@ impl VideoAllocator {
         let views = self
             .slots
             .iter()
-            .map(|(_, d)| {
-                let track = d
-                    .slot
-                    .current()
-                    .and_then(|c| self.tracks.get(&c.meta.id))
-                    .map(|s| &s.track);
+            .filter_map(|(_, d)| {
+                let current = d.slot.current()?;
+                let track = self.tracks.get(&current.meta.id).map(|s| &s.track)?;
+                let current_quality = current.quality;
 
-                let current_quality = d.slot.current().map(|c| c.quality);
-
-                SlotView {
+                Some(SlotView {
                     mid: d.mid,
                     priority: d.max_height,
                     track,
                     current_quality,
-                }
+                })
             })
             .collect();
 
@@ -821,60 +817,39 @@ impl SlotDriver {
 
 pub struct AllocationEngine;
 
-/// A simplified view of a slot for the engine to process.
-///
-/// `current_quality` reflects what the driver is *actually* sending right now
-/// (or was sending before a pause).  The engine uses this for hysteresis: an
-/// upgrade is only issued when there is meaningful headroom above the current
-/// layer's cost, preventing the upgrade→overrun→downgrade oscillation cycle.
 #[derive(Clone, Debug)]
 pub struct SlotView<'a> {
     pub mid: Mid,
     pub priority: u32, // maps to max_height
-    pub track: Option<&'a TrackReceiver>,
-    /// The quality the driver is currently running at (or was at before pause).
-    /// `None` means the slot has never been active.
-    pub current_quality: Option<SimulcastQuality>,
+    pub track: &'a TrackReceiver,
+    pub current_quality: SimulcastQuality,
 }
 
 impl<'a> std::fmt::Display for SlotView<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.track {
-            Some(track) => {
-                let layers = track
-                    .simulcast
-                    .iter()
-                    .map(|l| {
-                        let status = if l.state.is_inactive() {
-                            "inv"
-                        } else if !l.state.is_healthy() {
-                            "unh"
-                        } else {
-                            "ok"
-                        };
-                        format!(
-                            "{}:{}",
-                            l.rid.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
-                            status
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("|");
-                write!(f, "{}(P{}|{})", self.mid, self.priority, layers)
-            }
-            None => write!(f, "{}(Empty)", self.mid),
-        }
+        let layers = self
+            .track
+            .simulcast
+            .iter()
+            .map(|l| {
+                let status = if l.state.is_inactive() {
+                    "inv"
+                } else if !l.state.is_healthy() {
+                    "unh"
+                } else {
+                    "ok"
+                };
+                format!(
+                    "{}:{}",
+                    l.rid.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+                    status
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        write!(f, "{}(P{}|{})", self.mid, self.priority, layers)
     }
 }
-
-/// The engine's verdict for a single slot.
-///
-/// - `Forward(r)` — send (or switch to) layer `r`.
-/// - `Pause(r)`   — stop forwarding but remember `r` as the resume target;
-///                  the driver will jump directly back to this layer once
-///                  bandwidth recovers, without re-running layer discovery.
-/// - `Idle`       — no track is assigned to this slot; the driver should be
-///                  fully stopped and its receiver dropped.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum AllocationDecision<'a> {
     Forward(&'a SimulcastReceiver),
@@ -897,236 +872,116 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
 }
 
 impl AllocationEngine {
-    /// Fraction of remaining budget that an upgrade's *incremental* cost must
-    /// not exceed.
-    ///
-    /// Requiring the incremental cost to be at most 85 % of available headroom
-    /// leaves a 15 % guard band.  If the encoder runs slightly hotter than its
-    /// reported bitrate (common: H.264/VP8 typically overshoot ≤ 10–12 %),
-    /// the guard band absorbs the overrun without immediately triggering a
-    /// sacrifice pass — eliminating the most common upgrade→overrun→downgrade
-    /// oscillation cycle.
-    ///
-    /// Tuning rationale:
-    ///   • Too conservative (e.g. 0.50) → upgrades are starved even on a
-    ///     healthy link, sacrificing quality for no gain.
-    ///   • Too aggressive (e.g. 0.99)  → guard band collapses; any jitter
-    ///     spike tips us over budget and we thrash.
-    ///   • 0.85 is the sweet spot for typical WebRTC encoder overshoot margins.
-    const UPGRADE_HEADROOM: f64 = 0.85;
-
-    /// Minimum deficit (bps) that must accumulate before the sacrifice pass
-    /// fires.
-    ///
-    /// Small, transient overruns are absorbed silently.  This prevents a brief
-    /// measurement glitch — e.g. a single large RTP packet inflating the
-    /// smoothed bitrate estimate for one interval — from causing a visible
-    /// freeze.
-    ///
-    /// 50 kbps is chosen because:
-    ///   • It is below the bitrate of any simulcast layer in practice (lowest
-    ///     layer is typically ≥ 80–120 kbps), so it never masks a genuine
-    ///     overrun that only a layer drop could fix.
-    ///   • It comfortably covers single-packet jitter at resolutions up to 1080p.
-    const SACRIFICE_HYSTERESIS_BPS: f64 = 50_000.0;
+    /// Upgrade hysteresis: Require 30% surplus to absorb the Keyframe/PLI burst.
+    const UPGRADE_FACTOR: f64 = 1.3;
+    /// Downgrade hysteresis: Ignore 10% BWE noise; only drop if truly over budget.
+    const DOWNGRADE_FACTOR: f64 = 0.9;
+    /// Serializes upgrades to prevent simultaneous Keyframe Storms.
+    const MAX_UPGRADES_PER_TICK: usize = 1;
 
     pub fn compute<'a>(
         available_bw: Bitrate,
-        mut slots: Vec<SlotView<'a>>,
+        slots: Vec<SlotView<'a>>,
     ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate) {
-        let mut budget = available_bw.as_f64();
+        // Assert pre-sorted by priority descending (highest first)
+        debug_assert!(
+            slots.windows(2).all(|w| w[0].priority >= w[1].priority),
+            "Slots must be pre-sorted by priority descending"
+        );
+
         let mut decisions: HashMap<Mid, AllocationDecision<'a>> = HashMap::new();
+        let mut remaining_bps = available_bw.as_f64();
 
-        // ── Pass 1: Baseline (Fairness + Health) ─────────────────────────────
-        //
-        // Every slot that has a track gets the lowest *healthy* layer as its
-        // starting allocation.  Slots without a track receive `Idle`.
-        //
-        // Budget is debited here so that Pass 2 (upgrades) only has visibility
-        // into what is genuinely left over after all baseline claims are
-        // satisfied.
+        // 1. Maintain or Downgrade
         for slot in &slots {
-            match slot.track {
-                None => {
-                    decisions.insert(slot.mid, AllocationDecision::Idle);
-                }
-                Some(track) => {
-                    let lowest = track.lowest_quality();
-                    if lowest.state.is_healthy() {
-                        budget -= lowest.state.bitrate_bps();
-                        decisions.insert(slot.mid, AllocationDecision::Forward(lowest));
-                    } else {
-                        // Stream is unhealthy; park on the lowest layer so the
-                        // driver knows the resume target once health recovers.
-                        // No bandwidth is debited for a paused slot.
-                        tracing::debug!(mid = %slot.mid, "Stream unhealthy, pausing at baseline");
-                        decisions.insert(slot.mid, AllocationDecision::Pause(lowest));
-                    }
-                }
+            let current = slot.track.by_quality(slot.current_quality);
+
+            // Can we afford to keep doing what we're doing?
+            let stay_layer = current.filter(|l| {
+                l.state.is_healthy()
+                    && (l.state.bitrate_bps() * Self::DOWNGRADE_FACTOR) <= remaining_bps
+            });
+
+            let final_layer = stay_layer.or_else(|| {
+                slot.track
+                    .lower_quality(slot.current_quality)
+                    .filter(|l| l.state.is_healthy() && l.state.bitrate_bps() <= remaining_bps)
+            });
+
+            if let Some(layer) = final_layer {
+                remaining_bps -= layer.state.bitrate_bps();
+                decisions.insert(slot.mid, AllocationDecision::Forward(layer));
+            } else {
+                // Paused: We carry the lowest quality as the "Target" for the driver to watch.
+                decisions.insert(
+                    slot.mid,
+                    AllocationDecision::Pause(slot.track.lowest_quality()),
+                );
             }
         }
 
-        // ── Pass 2: Upgrades (Priority + Hysteresis) ─────────────────────────
-        //
-        // Walk slots from highest to lowest priority.  For each slot that is
-        // currently being forwarded, try to promote it to a better layer.
-        //
-        // An upgrade is accepted only when the incremental cost fits within
-        // `UPGRADE_HEADROOM * budget`.  This guard band is the sole
-        // anti-oscillation mechanism: after an upgrade there is still a
-        // meaningful safety margin, so a minor encoder bitrate overshoot will
-        // not immediately push us over budget and force a sacrifice.
-        //
-        // `current_quality` from the SlotView establishes the search floor:
-        // if the driver is already running a layer above the baseline, we
-        // search for something even better rather than redundantly confirming
-        // the existing layer.
-        if budget > 0.0 {
-            slots.sort_by_key(|s| std::cmp::Reverse(s.priority));
+        // 2. Upgrade
+        let mut upgrades_performed = 0;
+
+        // Try to upgrade levels (Low->Med, Med->High)
+        for tier in [
+            SimulcastQuality::Low,
+            SimulcastQuality::Medium,
+            SimulcastQuality::High,
+        ] {
+            if upgrades_performed >= Self::MAX_UPGRADES_PER_TICK {
+                break;
+            }
+
             for slot in &slots {
-                let Some(track) = slot.track else { continue };
-
-                // Only consider slots that have a healthy baseline forward.
-                let current_layer = match decisions.get(&slot.mid) {
-                    Some(AllocationDecision::Forward(l)) => *l,
-                    _ => continue,
-                };
-
-                // Use whichever quality is higher: what the engine just chose
-                // as baseline, or what the driver is already running.  This
-                // prevents needlessly downgrading a slot that was previously
-                // upgraded.
-                let search_floor = slot
-                    .current_quality
-                    .map(|q| q.max(current_layer.quality))
-                    .unwrap_or(current_layer.quality);
-
-                if let Some(better) =
-                    Self::find_best_fit(track, search_floor, budget * Self::UPGRADE_HEADROOM)
-                {
-                    let incremental =
-                        better.state.bitrate_bps() - current_layer.state.bitrate_bps();
-                    budget -= incremental;
-                    decisions.insert(slot.mid, AllocationDecision::Forward(better));
-                }
-            }
-        }
-
-        // ── Pass 3: Sacrifice (Congestion Recovery + Hysteresis) ─────────────
-        //
-        // Only fires when the deficit exceeds SACRIFICE_HYSTERESIS_BPS.  Small
-        // overruns are absorbed without visible disruption; the encoder's own
-        // rate control will correct them within a few frames.
-        //
-        // Sacrificed slots emit `Pause(layer)` — not `Idle` — so the driver
-        // retains the resume target and can recover immediately once bandwidth
-        // improves, without waiting for a new rebalance cycle.
-        if budget < -Self::SACRIFICE_HYSTERESIS_BPS {
-            let mut sacrifice_order = slots.clone();
-            sacrifice_order.sort_by_key(|s| s.priority); // lowest priority first
-
-            for slot in sacrifice_order {
-                if budget >= -Self::SACRIFICE_HYSTERESIS_BPS {
+                if upgrades_performed >= Self::MAX_UPGRADES_PER_TICK {
                     break;
                 }
-                if let Some(AllocationDecision::Forward(layer)) = decisions.get(&slot.mid).copied()
-                {
-                    tracing::warn!(
-                        mid = %slot.mid,
-                        priority = slot.priority,
-                        deficit_kbps = (-budget / 1000.0) as u32,
-                        "Congestion sacrifice: pausing stream"
-                    );
-                    budget += layer.state.bitrate_bps();
-                    decisions.insert(slot.mid, AllocationDecision::Pause(layer));
+
+                let decision = decisions.get(&slot.mid).copied();
+                let Some(AllocationDecision::Forward(current)) = decision else {
+                    continue;
+                };
+
+                if current.quality >= tier {
+                    continue;
+                }
+
+                let Some(target) = slot.track.by_quality(tier) else {
+                    continue;
+                };
+
+                if !target.state.is_healthy() {
+                    continue;
+                }
+
+                let incremental_cost = target.state.bitrate_bps() - current.state.bitrate_bps();
+
+                // Must have the upgrade headroom of the incremental jump
+                if remaining_bps >= (incremental_cost * Self::UPGRADE_FACTOR) {
+                    remaining_bps -= incremental_cost;
+                    decisions.insert(slot.mid, AllocationDecision::Forward(target));
+                    upgrades_performed += 1;
                 }
             }
         }
 
-        // ── Accounting & Logging ─────────────────────────────────────────────
-        // Desired bitrate: sum of the highest healthy layer for every slot that
-        // has a track (Forward *or* Pause).  Idle slots contribute nothing.
-        // This tells the BWE what we *would* consume at full quality, not just
-        // what we happen to be forwarding right now, so bandwidth can recover
-        // toward the real target even while streams are paused.
-        let desired_bps: f64 = slots
+        let total_desired_bps: f64 = slots
             .iter()
-            .filter_map(|s| s.track)
-            .map(|track| {
-                track
+            .map(|slot| {
+                // Find the highest layer that is currently marked healthy.
+                // If none are healthy, we count it as 0.
+                slot.track
                     .simulcast
                     .iter()
                     .filter(|l| l.state.is_healthy())
                     .map(|l| l.state.bitrate_bps())
-                    .next()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .unwrap_or(0.0)
             })
             .sum();
 
-        // `total_bps` is kept separately for the debug log (actual forwarded load).
-        let total_bps: f64 = decisions
-            .values()
-            .map(|d| match d {
-                AllocationDecision::Forward(l) => l.state.bitrate_bps(),
-                AllocationDecision::Pause(_) | AllocationDecision::Idle => 0.0,
-            })
-            .sum();
-
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let mut slot_str = String::new();
-            let mut dec_str = String::new();
-
-            slots.sort_by_key(|s| s.mid);
-
-            for slot in &slots {
-                use std::fmt::Write;
-                let _ = write!(slot_str, " {};", slot);
-
-                let decision = decisions
-                    .get(&slot.mid)
-                    .cloned()
-                    .unwrap_or(AllocationDecision::Idle);
-                let d_label = match decision {
-                    AllocationDecision::Forward(l) => {
-                        l.rid.map(|r| r.to_string()).unwrap_or("?".into())
-                    }
-                    AllocationDecision::Pause(_) => "PAUSE".into(),
-                    AllocationDecision::Idle => "IDLE".into(),
-                };
-                let _ = write!(dec_str, " {}->{};", slot.mid, d_label);
-            }
-
-            tracing::debug!(
-                bw = %available_bw,
-                forwarding = %Bitrate::from(total_bps),
-                desired = %Bitrate::from(desired_bps),
-                "Slots:[{}] Decisions:[{}]",
-                slot_str.trim(),
-                dec_str.trim()
-            );
-        }
-
-        (decisions, Bitrate::from(desired_bps * 1.5))
-    }
-
-    /// Find the best layer strictly above `floor` whose *incremental* cost
-    /// (over `floor`) fits within `budget`.
-    fn find_best_fit(
-        track: &TrackReceiver,
-        floor: SimulcastQuality,
-        budget: f64,
-    ) -> Option<&SimulcastReceiver> {
-        let floor_bps = track
-            .by_quality(floor)
-            .map(|l| l.state.bitrate_bps())
-            .unwrap_or(0.0);
-        track
-            .simulcast
-            .iter()
-            .filter(|l| l.quality > floor)
-            .filter(|l| l.state.is_healthy())
-            .filter(|l| (l.state.bitrate_bps() - floor_bps) <= budget)
-            .max_by_key(|l| l.quality)
+        (decisions, Bitrate::from(total_desired_bps))
     }
 }
 
