@@ -246,7 +246,11 @@ impl VideoAllocator {
         views.sort_by_key(|v| cmp::Reverse(v.priority));
 
         // 2. Run the pure allocation logic.
-        let (decisions, desired) = AllocationEngine::compute(available_bandwidth, views);
+        let (decisions, desired, changed) = AllocationEngine::compute(available_bandwidth, views);
+
+        if !changed {
+            return desired;
+        }
 
         // 3. Apply the results to the drivers.
         for (mid, decision) in decisions {
@@ -254,7 +258,7 @@ impl VideoAllocator {
             let mut driver = self.slots.get_mut(idx).unwrap();
 
             match decision {
-                AllocationDecision::Forward(receiver) => {
+                AllocationDecision::Forward(receiver, _) => {
                     // Only trigger a switch if the quality actually changed.
                     if driver.slot.current().map(|c| c.quality) != Some(receiver.quality) {
                         driver.switch_to(receiver.clone(), false);
@@ -301,6 +305,43 @@ impl VideoAllocator {
             Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
     }
+}
+
+pub fn log_allocation(
+    bwe: Bitrate,
+    desired: Bitrate,
+    decisions: &HashMap<Mid, AllocationDecision>,
+    slots: &[SlotView],
+) {
+    let mut reports = Vec::with_capacity(slots.len());
+    let mut total_used_bps = 0.0;
+
+    for slot in slots {
+        let entry = match decisions.get(&slot.mid) {
+            Some(AllocationDecision::Forward(l, bw)) => {
+                total_used_bps += bw.as_f64();
+                let q = match l.quality {
+                    SimulcastQuality::High => "H",
+                    SimulcastQuality::Medium => "M",
+                    SimulcastQuality::Low => "L",
+                    _ => "?",
+                };
+                format!("{}:{}({})", slot.mid, q, bw)
+            }
+            Some(AllocationDecision::Pause(_)) => format!("{}:PAUSE", slot.mid),
+            _ => format!("{}:IDLE", slot.mid),
+        };
+        reports.push(entry);
+    }
+
+    tracing::info!(
+        target: "alloc",
+        %bwe,
+        used = %Bitrate::from(total_used_bps as u64),
+        want = %desired,
+        streams = %reports.join(" "),
+        "⚖️"
+    );
 }
 
 #[derive(Debug)]
@@ -851,7 +892,7 @@ impl<'a> std::fmt::Display for SlotView<'a> {
 }
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum AllocationDecision<'a> {
-    Forward(&'a SimulcastReceiver),
+    Forward(&'a SimulcastReceiver, Bitrate),
     /// Bandwidth-congestion pause.  The carried receiver is the layer the engine
     /// wants to resume *to* when bandwidth recovers — typically the lowest
     /// healthy layer so that recovery starts immediately without renegotiation.
@@ -861,8 +902,14 @@ pub enum AllocationDecision<'a> {
 impl<'a> std::fmt::Display for AllocationDecision<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AllocationDecision::Forward(l) => write!(f, "Forward({})", l),
-            AllocationDecision::Pause(l) => write!(f, "Pause({})", l),
+            // e.g., "Forward(v1:H @ 1.2M)"
+            AllocationDecision::Forward(layer, bitrate) => {
+                write!(f, "Forward({} @ {})", layer, bitrate)
+            }
+            // e.g., "Pause(v1:L)"
+            AllocationDecision::Pause(layer) => {
+                write!(f, "Pause({})", layer)
+            }
         }
     }
 }
@@ -878,21 +925,15 @@ impl AllocationEngine {
     pub fn compute<'a>(
         available_bw: Bitrate,
         slots: Vec<SlotView<'a>>,
-    ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate) {
-        // Assert pre-sorted by priority descending (highest first)
-        debug_assert!(
-            slots.windows(2).all(|w| w[0].priority >= w[1].priority),
-            "Slots must be pre-sorted by priority descending"
-        );
-
+    ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate, bool) {
         let mut decisions: HashMap<Mid, AllocationDecision<'a>> = HashMap::new();
         let mut remaining_bps = available_bw.as_f64();
+        let mut changed = false;
 
         // 1. Maintain or Downgrade
         for slot in &slots {
             let current = slot.track.by_quality(slot.current_quality);
 
-            // Can we afford to keep doing what we're doing?
             let stay_layer = current.filter(|l| {
                 l.state.is_healthy()
                     && (l.state.bitrate_bps() * Self::DOWNGRADE_FACTOR) <= remaining_bps
@@ -905,10 +946,21 @@ impl AllocationEngine {
             });
 
             if let Some(layer) = final_layer {
-                remaining_bps -= layer.state.bitrate_bps();
-                decisions.insert(slot.mid, AllocationDecision::Forward(layer));
+                // Snapshot the bitrate immediately
+                let layer_bitrate = Bitrate::from(layer.state.bitrate_bps());
+                let bps = layer_bitrate.as_f64();
+
+                if layer.quality != slot.current_quality {
+                    changed = true;
+                }
+
+                remaining_bps -= bps;
+                decisions.insert(slot.mid, AllocationDecision::Forward(layer, layer_bitrate));
             } else {
-                // Paused: We carry the lowest quality as the "Target" for the driver to watch.
+                // If we were forwarding and now we aren't, that's a change
+                if slot.current_quality != SimulcastQuality::Undefined {
+                    changed = true;
+                }
                 decisions.insert(
                     slot.mid,
                     AllocationDecision::Pause(slot.track.lowest_quality()),
@@ -918,8 +970,6 @@ impl AllocationEngine {
 
         // 2. Upgrade
         let mut upgrades_performed = 0;
-
-        // Try to upgrade levels (Low->Med, Med->High)
         for tier in [
             SimulcastQuality::Low,
             SimulcastQuality::Medium,
@@ -934,50 +984,50 @@ impl AllocationEngine {
                     break;
                 }
 
-                let decision = decisions.get(&slot.mid).copied();
-                let Some(AllocationDecision::Forward(current)) = decision else {
+                let Some(AllocationDecision::Forward(current_layer, current_bw)) =
+                    decisions.get(&slot.mid).copied()
+                else {
                     continue;
                 };
 
-                if current.quality >= tier {
+                if current_layer.quality >= tier {
                     continue;
                 }
-
                 let Some(target) = slot.track.by_quality(tier) else {
                     continue;
                 };
-
                 if !target.state.is_healthy() {
                     continue;
                 }
 
-                let incremental_cost = target.state.bitrate_bps() - current.state.bitrate_bps();
+                let target_bw = Bitrate::from(target.state.bitrate_bps());
+                let incremental_cost = target_bw.as_f64() - current_bw.as_f64();
 
-                // Must have the upgrade headroom of the incremental jump
+                // Check against the 30% upgrade headroom (UPGRADE_FACTOR = 1.3)
                 if remaining_bps >= (incremental_cost * Self::UPGRADE_FACTOR) {
                     remaining_bps -= incremental_cost;
-                    decisions.insert(slot.mid, AllocationDecision::Forward(target));
+                    decisions.insert(slot.mid, AllocationDecision::Forward(target, target_bw));
                     upgrades_performed += 1;
+                    changed = true;
                 }
             }
         }
 
+        // 3. Demand Calculation (The "Want" Bitrate)
         let total_desired_bps: f64 = slots
             .iter()
-            .map(|slot| {
-                // Find the highest layer that is currently marked healthy.
-                // If none are healthy, we count it as 0.
-                slot.track
+            .map(|s| {
+                s.track
                     .simulcast
                     .iter()
                     .filter(|l| l.state.is_healthy())
                     .map(|l| l.state.bitrate_bps())
-                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0)
             })
             .sum();
 
-        (decisions, Bitrate::from(total_desired_bps))
+        (decisions, Bitrate::from(total_desired_bps as u64), changed)
     }
 }
 
