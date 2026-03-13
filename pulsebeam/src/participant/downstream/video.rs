@@ -2,6 +2,7 @@ use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::slot_group::SlotGroup;
 use pulsebeam_runtime::sync::spmc;
+use std::cmp;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::pin::Pin;
@@ -226,7 +227,7 @@ impl VideoAllocator {
         //    `current_quality` lets the engine apply hysteresis: it only
         //    upgrades when there is genuine headroom *above* what the driver is
         //    already running, preventing the upgrade→overrun→downgrade cycle.
-        let views = self
+        let mut views: Vec<SlotView> = self
             .slots
             .iter()
             .filter_map(|(_, d)| {
@@ -242,6 +243,7 @@ impl VideoAllocator {
                 })
             })
             .collect();
+        views.sort_by_key(|v| cmp::Reverse(v.priority));
 
         // 2. Run the pure allocation logic.
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, views);
@@ -265,9 +267,6 @@ impl VideoAllocator {
                     if !driver.slot.state.is_paused() {
                         driver.pause_at(receiver.clone());
                     }
-                }
-                AllocationDecision::Idle => {
-                    driver.stop();
                 }
             }
         }
@@ -857,8 +856,6 @@ pub enum AllocationDecision<'a> {
     /// wants to resume *to* when bandwidth recovers — typically the lowest
     /// healthy layer so that recovery starts immediately without renegotiation.
     Pause(&'a SimulcastReceiver),
-    /// No track is associated with this slot; stop the driver entirely.
-    Idle,
 }
 
 impl<'a> std::fmt::Display for AllocationDecision<'a> {
@@ -866,7 +863,6 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
         match self {
             AllocationDecision::Forward(l) => write!(f, "Forward({})", l),
             AllocationDecision::Pause(l) => write!(f, "Pause({})", l),
-            AllocationDecision::Idle => write!(f, "Idle"),
         }
     }
 }
