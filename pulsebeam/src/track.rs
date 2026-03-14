@@ -84,7 +84,6 @@ impl KeyframePoll {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum SimulcastQuality {
-    Undefined = 0,
     Low = 1,
     Medium = 2,
     High = 3,
@@ -93,7 +92,6 @@ pub enum SimulcastQuality {
 impl std::fmt::Debug for SimulcastQuality {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let txt = match self {
-            Self::Undefined => "undefined",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -246,7 +244,6 @@ impl TrackReceiver {
 
     pub fn higher_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
         let next_quality = match current {
-            SimulcastQuality::Undefined => Some(SimulcastQuality::Low),
             SimulcastQuality::Low => Some(SimulcastQuality::Medium),
             SimulcastQuality::Medium => Some(SimulcastQuality::High),
             SimulcastQuality::High => None,
@@ -262,8 +259,7 @@ impl TrackReceiver {
         let prev_quality = match current {
             SimulcastQuality::High => Some(SimulcastQuality::Medium),
             SimulcastQuality::Medium => Some(SimulcastQuality::Low),
-            SimulcastQuality::Low => Some(SimulcastQuality::Undefined),
-            SimulcastQuality::Undefined => None,
+            SimulcastQuality::Low => None,
         };
 
         if let Some(prev) = prev_quality {
@@ -311,8 +307,8 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             MediaKind::Video => (rtp::VIDEO_FREQUENCY, should_forward_noop as PacketFilter),
         };
         let (quality, bitrate, cap_tier) = match (meta.kind, rid) {
-            (MediaKind::Audio, _) => (SimulcastQuality::Undefined, 64_000, 1),
-            (MediaKind::Video, None) => (SimulcastQuality::Undefined, 500_000, 4),
+            (MediaKind::Audio, _) => (SimulcastQuality::Low, 64_000, 1),
+            (MediaKind::Video, None) => (SimulcastQuality::Low, 500_000, 4),
             (MediaKind::Video, Some(r)) if r.starts_with('f') => {
                 (SimulcastQuality::High, 500_000, 4)
             }
@@ -322,7 +318,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             (MediaKind::Video, Some(r)) if r.starts_with('q') => (SimulcastQuality::Low, 30_000, 1),
             (MediaKind::Video, Some(rid)) => {
                 tracing::warn!("use default bitrate due to unsupported rid: {rid}");
-                (SimulcastQuality::Undefined, 500_000, 2)
+                (SimulcastQuality::Low, 500_000, 2)
             }
         };
 

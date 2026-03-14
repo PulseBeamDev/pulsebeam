@@ -205,24 +205,6 @@ impl VideoAllocator {
     }
 
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> Bitrate {
-        let total = self.tracks.len();
-        let assigned = self
-            .tracks
-            .values()
-            .filter(|t| t.assigned_mid.is_some())
-            .count();
-        let playing = self
-            .slots
-            .iter()
-            .filter(|(_, d)| d.slot.state.is_playing())
-            .count();
-        tracing::debug!(
-            "Allocator State: {} tracks total, {} assigned to slots, {} playing",
-            total,
-            assigned,
-            playing
-        );
-
         // 1. Prepare the input views.
         //    `current_quality` lets the engine apply hysteresis: it only
         //    upgrades when there is genuine headroom *above* what the driver is
@@ -231,7 +213,7 @@ impl VideoAllocator {
             .slots
             .iter()
             .filter_map(|(_, d)| {
-                let current = d.slot.current()?;
+                let current = d.slot.target()?;
                 let track = self.tracks.get(&current.meta.id).map(|s| &s.track)?;
                 let current_quality = current.quality;
 
@@ -240,19 +222,21 @@ impl VideoAllocator {
                     priority: d.max_height,
                     track,
                     current_quality,
+                    is_paused: d.slot.state.is_paused(),
                 })
             })
             .collect();
         views.sort_by_key(|v| cmp::Reverse(v.priority));
 
         // 2. Run the pure allocation logic.
-        let (decisions, desired, changed) = AllocationEngine::compute(available_bandwidth, views);
+        let (decisions, desired, changed) = AllocationEngine::compute(available_bandwidth, &views);
 
         if !changed {
             return desired;
         }
 
         // 3. Apply the results to the drivers.
+        log_allocation(available_bandwidth, desired, &decisions, &views);
         for (mid, decision) in decisions {
             let idx = self.mid_to_idx[&mid];
             let mut driver = self.slots.get_mut(idx).unwrap();
@@ -335,7 +319,6 @@ pub fn log_allocation(
     }
 
     tracing::info!(
-        target: "alloc",
         %bwe,
         used = %Bitrate::from(total_used_bps as u64),
         want = %desired,
@@ -863,6 +846,7 @@ pub struct SlotView<'a> {
     pub priority: u32, // maps to max_height
     pub track: &'a TrackReceiver,
     pub current_quality: SimulcastQuality,
+    pub is_paused: bool,
 }
 
 impl<'a> std::fmt::Display for SlotView<'a> {
@@ -924,14 +908,14 @@ impl AllocationEngine {
 
     pub fn compute<'a>(
         available_bw: Bitrate,
-        slots: Vec<SlotView<'a>>,
+        slots: &[SlotView<'a>],
     ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate, bool) {
         let mut decisions: HashMap<Mid, AllocationDecision<'a>> = HashMap::new();
         let mut remaining_bps = available_bw.as_f64();
         let mut changed = false;
 
         // 1. Maintain or Downgrade
-        for slot in &slots {
+        for slot in slots {
             let current = slot.track.by_quality(slot.current_quality);
 
             let stay_layer = current.filter(|l| {
@@ -950,17 +934,11 @@ impl AllocationEngine {
                 let layer_bitrate = Bitrate::from(layer.state.bitrate_bps());
                 let bps = layer_bitrate.as_f64();
 
-                if layer.quality != slot.current_quality {
-                    changed = true;
-                }
-
+                changed |= layer.quality != slot.current_quality;
                 remaining_bps -= bps;
                 decisions.insert(slot.mid, AllocationDecision::Forward(layer, layer_bitrate));
             } else {
-                // If we were forwarding and now we aren't, that's a change
-                if slot.current_quality != SimulcastQuality::Undefined {
-                    changed = true;
-                }
+                changed |= !slot.is_paused;
                 decisions.insert(
                     slot.mid,
                     AllocationDecision::Pause(slot.track.lowest_quality()),
@@ -979,7 +957,7 @@ impl AllocationEngine {
                 break;
             }
 
-            for slot in &slots {
+            for slot in slots {
                 if upgrades_performed >= Self::MAX_UPGRADES_PER_TICK {
                     break;
                 }
@@ -1008,7 +986,7 @@ impl AllocationEngine {
                     remaining_bps -= incremental_cost;
                     decisions.insert(slot.mid, AllocationDecision::Forward(target, target_bw));
                     upgrades_performed += 1;
-                    changed = true;
+                    changed |= true;
                 }
             }
         }
