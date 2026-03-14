@@ -1,6 +1,7 @@
 use ahash::{HashMap, HashMapExt};
-use std::{collections::BTreeMap, time::Duration};
 use pulsebeam_runtime::sync::Arc;
+use std::pin::Pin;
+use std::{collections::BTreeMap, time::Duration};
 
 use pulsebeam_runtime::{
     actor::{ActorKind, ActorStatus, RunnerConfig},
@@ -53,11 +54,14 @@ impl actor::MessageSet for RoomMessageSet {
     type ObservableState = RoomState;
 }
 
+type ParticipantTaskResult = (ParticipantId, ConnectionId, ActorStatus);
+type PinnedParticipantTask = Pin<Box<dyn Future<Output = ParticipantTaskResult> + Send + 'static>>;
+
 pub struct RoomActor {
     _node_ctx: node::NodeContext,
     room_id: RoomId,
     state: RoomState,
-    participant_tasks: JoinSet<(ParticipantId, ConnectionId, ActorStatus)>,
+    participant_tasks: JoinSet<ParticipantTaskResult>,
     /// Room-level Top-N audio selector.  Holds the command sender; dropping
     /// this field shuts down the background selector task.
     audio_selector: AudioSelectorHandle,
