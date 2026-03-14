@@ -229,34 +229,32 @@ impl VideoAllocator {
         views.sort_by_key(|v| cmp::Reverse(v.priority));
 
         // 2. Run the pure allocation logic.
-        let (decisions, desired, changed) = AllocationEngine::compute(available_bandwidth, &views);
-
-        if !changed {
-            return desired;
-        }
+        let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
 
         // 3. Apply the results to the drivers.
-        log_allocation(available_bandwidth, desired, &decisions, &views);
-        for (mid, decision) in decisions {
-            let idx = self.mid_to_idx[&mid];
+        let mut changed = false;
+        for (mid, decision) in &decisions {
+            let idx = self.mid_to_idx[mid];
             let mut driver = self.slots.get_mut(idx).unwrap();
 
             match decision {
                 AllocationDecision::Forward(receiver, _) => {
-                    // Only trigger a switch if the quality actually changed.
-                    if driver.slot.current().map(|c| c.quality) != Some(receiver.quality) {
-                        driver.switch_to(receiver.clone(), false);
-                    }
+                    changed |= driver.switch_to((*receiver).clone(), false);
                 }
                 AllocationDecision::Pause(receiver) => {
                     // The engine has already chosen the resume-target layer.
                     // Only call pause_at when the driver is not already paused
                     // to avoid redundant state transitions on every tick.
                     if !driver.slot.state.is_paused() {
-                        driver.pause_at(receiver.clone());
+                        driver.pause_at((*receiver).clone());
+                        changed |= true;
                     }
                 }
             }
+        }
+
+        if changed {
+            log_allocation(available_bandwidth, desired, &decisions, &views);
         }
 
         desired
@@ -308,7 +306,6 @@ pub fn log_allocation(
                     SimulcastQuality::High => "H",
                     SimulcastQuality::Medium => "M",
                     SimulcastQuality::Low => "L",
-                    _ => "?",
                 };
                 format!("{}:{}({})", slot.mid, q, bw)
             }
@@ -323,7 +320,7 @@ pub fn log_allocation(
         used = %Bitrate::from(total_used_bps as u64),
         want = %desired,
         streams = %reports.join(" "),
-        "⚖️"
+        "downstream"
     );
 }
 
@@ -482,12 +479,13 @@ impl SlotDriver {
         self.switcher.ready_to_switch()
     }
 
-    pub fn switch_to(&mut self, receiver: SimulcastReceiver, force: bool) {
+    pub fn switch_to(&mut self, receiver: SimulcastReceiver, force: bool) -> bool {
         if !force && !self.is_switchable(&receiver) {
-            return;
+            return false;
         }
         self.keyframe_retries = 0;
-        self.do_switch_to(receiver, false);
+        self.do_switch_to(receiver);
+        true
     }
 
     pub fn assign_to(&mut self, receiver: SimulcastReceiver) {
@@ -689,11 +687,7 @@ impl SlotDriver {
         }
     }
 
-    fn do_switch_to(&mut self, mut receiver: SimulcastReceiver, force: bool) {
-        if !force && !self.is_switchable(&receiver) {
-            return;
-        }
-
+    fn do_switch_to(&mut self, mut receiver: SimulcastReceiver) {
         let old_state = self.slot.state;
         receiver.channel.rewind();
         receiver.request_keyframe();
@@ -849,31 +843,6 @@ pub struct SlotView<'a> {
     pub is_paused: bool,
 }
 
-impl<'a> std::fmt::Display for SlotView<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let layers = self
-            .track
-            .simulcast
-            .iter()
-            .map(|l| {
-                let status = if l.state.is_inactive() {
-                    "inv"
-                } else if !l.state.is_healthy() {
-                    "unh"
-                } else {
-                    "ok"
-                };
-                format!(
-                    "{}:{}",
-                    l.rid.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
-                    status
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("|");
-        write!(f, "{}(P{}|{})", self.mid, self.priority, layers)
-    }
-}
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum AllocationDecision<'a> {
     Forward(&'a SimulcastReceiver, Bitrate),
@@ -909,10 +878,9 @@ impl AllocationEngine {
     pub fn compute<'a>(
         available_bw: Bitrate,
         slots: &[SlotView<'a>],
-    ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate, bool) {
+    ) -> (HashMap<Mid, AllocationDecision<'a>>, Bitrate) {
         let mut decisions: HashMap<Mid, AllocationDecision<'a>> = HashMap::new();
         let mut remaining_bps = available_bw.as_f64();
-        let mut changed = false;
 
         // 1. Maintain or Downgrade
         for slot in slots {
@@ -934,11 +902,9 @@ impl AllocationEngine {
                 let layer_bitrate = Bitrate::from(layer.state.bitrate_bps());
                 let bps = layer_bitrate.as_f64();
 
-                changed |= layer.quality != slot.current_quality;
                 remaining_bps -= bps;
                 decisions.insert(slot.mid, AllocationDecision::Forward(layer, layer_bitrate));
             } else {
-                changed |= !slot.is_paused;
                 decisions.insert(
                     slot.mid,
                     AllocationDecision::Pause(slot.track.lowest_quality()),
@@ -986,7 +952,6 @@ impl AllocationEngine {
                     remaining_bps -= incremental_cost;
                     decisions.insert(slot.mid, AllocationDecision::Forward(target, target_bw));
                     upgrades_performed += 1;
-                    changed |= true;
                 }
             }
         }
@@ -1005,7 +970,7 @@ impl AllocationEngine {
             })
             .sum();
 
-        (decisions, Bitrate::from(total_desired_bps as u64), changed)
+        (decisions, Bitrate::from(total_desired_bps as u64))
     }
 }
 

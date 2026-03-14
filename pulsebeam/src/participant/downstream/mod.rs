@@ -15,7 +15,7 @@ use tokio::time::Instant;
 pub use video::Intent;
 
 const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
-const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(10);
+const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
@@ -72,7 +72,6 @@ impl DownstreamAllocator {
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
-        tracing::warn!("update_bitrate={}", available_bandwidth);
         self.available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         self.dirty_allocation = true;
     }
