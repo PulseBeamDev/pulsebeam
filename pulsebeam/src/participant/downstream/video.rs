@@ -223,6 +223,7 @@ impl VideoAllocator {
                 })
             })
             .collect();
+
         views.sort_by_key(|v| cmp::Reverse(v.priority));
 
         // 2. Run the pure allocation logic.
@@ -828,6 +829,13 @@ impl SlotDriver {
         self.slot.state = new_state;
         self.slot.active = active;
         self.slot.staging = staging;
+
+        // If the slot is stopped/paused, clear any previously buffered staging
+        // packets so future resume/switch attempts can proceed without being
+        // blocked by stale data.
+        if matches!(self.slot.state, SlotState::Idle | SlotState::Paused) {
+            self.switcher.clear();
+        }
     }
 }
 
@@ -998,6 +1006,12 @@ mod assignment_tests {
         for i in 0..count {
             let mid = Mid::from(&format!("v{i}")[..]);
             let (tx, rx) = make_video_track(pid, mid);
+
+            // Ensure tracks are considered "healthy" for allocation tests.
+            for layer in &rx.simulcast {
+                layer.state.update_for_test().inactive(false);
+            }
+
             ids.push(rx.meta.id);
             allocator.add_track(rx);
             senders.push(tx);
@@ -1018,6 +1032,44 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
+        assert_eq!(allocator.slots().count(), 3);
+    }
+
+    #[test]
+    fn configure_all_slots_after_idle() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+
+        // Empty intent should idle all slots.
+        allocator.configure(&HashMap::new());
+        assert_eq!(allocator.slots().count(), 0);
+
+        // Re-activate all slots.
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id: tracks.ids[0],
+                max_height: 720,
+            },
+        );
+        intents.insert(
+            Mid::from("s1"),
+            Intent {
+                track_id: tracks.ids[1],
+                max_height: 720,
+            },
+        );
+        intents.insert(
+            Mid::from("s2"),
+            Intent {
+                track_id: tracks.ids[2],
+                max_height: 720,
+            },
+        );
+
+        allocator.configure(&intents);
         assert_eq!(allocator.slots().count(), 3);
     }
 
@@ -1060,6 +1112,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
+
         let desired = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
     }

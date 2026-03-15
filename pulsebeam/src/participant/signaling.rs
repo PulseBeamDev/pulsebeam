@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::entity::TrackId;
 use crate::participant::downstream::{DownstreamAllocator, Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
@@ -107,13 +108,16 @@ impl Signaling {
     ) {
         let mut intents = HashMap::with_capacity(intent.requests.len());
         for req in intent.requests {
-            if req.mid.len() > 16 {
-                continue;
-            }
-            let Ok(track_id) = req.track_id.try_into() else {
-                continue;
+            let track_id_str = req.track_id.clone();
+            let track_id = match TrackId::try_from(track_id_str.clone()) {
+                Ok(id) => id,
+                Err(_) => {
+                    tracing::warn!(track_id = %track_id_str, "invalid track_id in client intent");
+                    continue;
+                }
             };
 
+            // `Mid` is a fixed-size (16-byte) identifier and will truncate longer strings.
             let mid = Mid::from(req.mid.as_str());
 
             if req.height == 0 {
