@@ -1,5 +1,5 @@
 use pulsebeam_runtime::sync::Arc;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -108,7 +108,7 @@ pub struct TrackMeta {
     pub simulcast_rids: Option<Vec<Rid>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SimulcastReceiver {
     pub meta: Arc<TrackMeta>,
     pub rid: Option<Rid>,
@@ -121,6 +121,12 @@ pub struct SimulcastReceiver {
 impl PartialEq for SimulcastReceiver {
     fn eq(&self, other: &Self) -> bool {
         other.meta == self.meta && other.rid == self.rid && other.quality == self.quality
+    }
+}
+
+impl Debug for SimulcastReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self, f)
     }
 }
 
@@ -234,92 +240,75 @@ pub struct TrackReceiver {
 }
 
 impl TrackReceiver {
-    pub fn by_rid(&self, rid: &Option<Rid>) -> Option<&SimulcastReceiver> {
-        self.simulcast.iter().find(|s| s.rid == *rid)
-    }
-
     pub fn by_quality(&self, quality: SimulcastQuality) -> Option<&SimulcastReceiver> {
         self.simulcast.iter().find(|s| s.quality == quality)
     }
 
     pub fn higher_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
-        let next_quality = match current {
-            SimulcastQuality::Low => Some(SimulcastQuality::Medium),
-            SimulcastQuality::Medium => Some(SimulcastQuality::High),
-            SimulcastQuality::High => None,
-        };
-        if let Some(next) = next_quality {
-            self.simulcast.iter().find(|s| s.quality == next)
-        } else {
-            None
-        }
+        self.simulcast
+            .iter()
+            // Find layers strictly greater than current
+            .filter(|s| s.quality > current)
+            // Pick the smallest one that is still better than current
+            // (e.g., if you are at Low and have Med/High available, pick Med)
+            .min_by_key(|s| s.quality)
     }
 
     pub fn lower_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
-        let prev_quality = match current {
-            SimulcastQuality::High => Some(SimulcastQuality::Medium),
-            SimulcastQuality::Medium => Some(SimulcastQuality::Low),
-            SimulcastQuality::Low => None,
-        };
-
-        if let Some(prev) = prev_quality {
-            self.simulcast.iter().find(|s| s.quality == prev)
-        } else {
-            None
-        }
+        self.simulcast
+            .iter()
+            // Find layers strictly less than current
+            .filter(|s| s.quality < current)
+            // Pick the largest one that is still below current
+            .max_by_key(|s| s.quality)
     }
 
     pub fn lowest_quality(&self) -> &SimulcastReceiver {
         self.simulcast
             .iter()
             .min_by_key(|s| s.quality)
-            .expect("no lowest quality, there must be at least 1 layer for TrackReceiver to exist")
+            .expect("TrackReceiver must have at least one layer")
     }
 
     pub fn highest_quality(&self) -> &SimulcastReceiver {
         self.simulcast
             .iter()
             .max_by_key(|s| s.quality)
-            .expect("no highest quality, there must be at least 1 layer for TrackReceiver to exist")
+            .expect("TrackReceiver must have at least one layer")
     }
 }
 
 pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
     const BASE_CAP: usize = 128;
 
-    let mut simulcast_rids = if let Some(rids) = &meta.simulcast_rids {
+    let simulcast_rids: Vec<_> = if let Some(rids) = &meta.simulcast_rids {
         rids.iter().map(|rid| Some(*rid)).collect()
     } else {
         vec![None]
     };
-
-    simulcast_rids.sort_by_key(|rid| rid.unwrap_or_default().to_string());
 
     let keyframe_notify = Arc::new(Notify::new());
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
     let mut keyframe_polls = Vec::new();
 
-    for rid in simulcast_rids {
+    for (index, &rid) in simulcast_rids.iter().enumerate() {
         // TODO: get this from SDP instead
         let (clock_rate, filter) = match meta.kind {
             MediaKind::Audio => (rtp::AUDIO_FREQUENCY, should_forward_audio as PacketFilter),
             MediaKind::Video => (rtp::VIDEO_FREQUENCY, should_forward_noop as PacketFilter),
         };
-        let (quality, bitrate, cap_tier) = match (meta.kind, rid) {
-            (MediaKind::Audio, _) => (SimulcastQuality::Low, 64_000, 1),
-            (MediaKind::Video, None) => (SimulcastQuality::Low, 500_000, 4),
-            (MediaKind::Video, Some(r)) if r.starts_with('f') => {
-                (SimulcastQuality::High, 500_000, 4)
-            }
-            (MediaKind::Video, Some(r)) if r.starts_with('h') => {
-                (SimulcastQuality::Medium, 150_000, 2)
-            }
-            (MediaKind::Video, Some(r)) if r.starts_with('q') => (SimulcastQuality::Low, 30_000, 1),
-            (MediaKind::Video, Some(rid)) => {
-                tracing::warn!("use default bitrate due to unsupported rid: {rid}");
-                (SimulcastQuality::Low, 500_000, 2)
-            }
+
+        let (quality, bitrate, cap_tier) = match (meta.kind, rid, index) {
+            (MediaKind::Audio, _, _) => (SimulcastQuality::Low, 64_000, 1),
+            (MediaKind::Video, None, _) => (SimulcastQuality::Low, 500_000, 4),
+
+            // Ordering here determines the highest quality first.
+            // https://datatracker.ietf.org/doc/html/rfc8853#section-5.2
+            // https://github.com/obsproject/obs-studio/pull/10885
+            (MediaKind::Video, Some(_), 0) => (SimulcastQuality::High, 2_500_000, 4),
+            (MediaKind::Video, Some(_), 1) => (SimulcastQuality::Medium, 750_000, 2),
+            (MediaKind::Video, Some(_), _) => (SimulcastQuality::Low, 150_000, 1),
         };
 
         let (tx, rx) = spmc::channel(BASE_CAP * cap_tier);
@@ -366,6 +355,8 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
     }
     senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
     receivers.sort_by_key(|e| std::cmp::Reverse(e.quality));
+
+    tracing::info!("discovered simulcast mapping: {:?}", receivers);
 
     (
         TrackSender {
