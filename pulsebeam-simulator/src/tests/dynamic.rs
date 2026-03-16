@@ -2,6 +2,7 @@ use super::common;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
 use std::net::IpAddr;
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 #[test]
 fn churn_test() {
@@ -9,7 +10,6 @@ fn churn_test() {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(120))
-        .tick_duration(Duration::from_micros(100))
         .build();
 
     let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
@@ -21,6 +21,7 @@ fn churn_test() {
 
     let participant1_ip: IpAddr = "192.168.1.1".parse().unwrap();
     let participant2_ip: IpAddr = "192.168.2.1".parse().unwrap();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
 
     // Participant 1: Stays in the room
     sim.client(participant1_ip, async move {
@@ -30,7 +31,10 @@ fn churn_test() {
             .connect("room1")
             .await?;
 
-        client.drive_until(Duration::from_secs(60), |_| false).await.ok();
+        client
+            .drive_until(Duration::from_secs(30), |_| done_tx.is_closed())
+            .await
+            .ok();
         Ok(())
     });
 
@@ -44,15 +48,20 @@ fn churn_test() {
                 .connect("room1")
                 .await?;
 
-            client.drive_until(Duration::from_secs(10), |stats| {
-                let Some(peer) = &stats.peer else { return false; };
-                peer.bytes_rx > 50_000
-            }).await?;
+            client
+                .drive_until(Duration::from_secs(10), |stats| {
+                    let Some(peer) = &stats.peer else {
+                        return false;
+                    };
+                    peer.bytes_rx > 50_000
+                })
+                .await?;
 
             tracing::info!("Participant 2 leaving, attempt {}", i);
             client.agent.disconnect().await?;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+        drop(done_rx);
         Ok(())
     });
 

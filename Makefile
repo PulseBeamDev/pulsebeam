@@ -4,6 +4,7 @@ SCCACHE := $(shell which sccache)
 CARGO_CMD = RUSTC_WRAPPER=$(SCCACHE) cargo
 TARGET_DIR = target/profiling
 BINARY = $(TARGET_DIR)/pulsebeam
+SIM := sim
 
 .PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean
 all: build
@@ -26,7 +27,7 @@ test-unit:
 	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator -- --skip loom_
 
 test-sim:
-	$(CARGO_CMD) test --profile sim -p pulsebeam-simulator -- --no-capture
+	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture
 
 test-loom:
 	LOOM_MAX_PREEMPTIONS=2 $(CARGO_CMD) test --workspace --features loom loom_

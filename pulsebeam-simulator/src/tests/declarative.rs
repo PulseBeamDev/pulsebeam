@@ -2,7 +2,6 @@ use crate::tests::common::{client::SimClientBuilder, run_sim_or_timeout, setup_t
 use pulsebeam_agent::MediaKind;
 use pulsebeam_agent::TransceiverDirection;
 use pulsebeam_agent::manager::Subscription;
-use std::str::FromStr;
 use std::time::Duration;
 
 #[test]
@@ -56,8 +55,12 @@ fn declarative_subscription_test() -> turmoil::Result {
                 .await
                 .ok();
         }
-        
-        let track_id = client.discovered_tracks.get(0).cloned().expect("No remote tracks discovered");
+
+        let track_id = client
+            .discovered_tracks
+            .first()
+            .cloned()
+            .expect("No remote tracks discovered");
 
         // 2. Set declarative subscriptions
         client
