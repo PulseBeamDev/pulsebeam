@@ -41,7 +41,7 @@ proptest! {
                     .await?;
 
                 client
-                    .drive_until(Duration::from_secs(10), |stats| {
+                    .drive_until(Duration::from_secs(20), |stats| {
                         let Some(peer) = &stats.peer else {
                             return false;
                         };

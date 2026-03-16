@@ -1,6 +1,6 @@
+use pulsebeam_proto::signaling::VideoRequest;
 use std::collections::{HashMap, HashSet};
 use str0m::media::Mid;
-use pulsebeam_proto::signaling::VideoRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
@@ -31,19 +31,27 @@ impl SubscriptionManager {
     /// Reconciles desired state with available slots.
     /// Implements "Sticky Assignments" algorithm.
     pub fn reconcile(&mut self) -> Vec<VideoRequest> {
+        tracing::debug!(
+            "reconcile: slots={:?}, desired={:?}, active={:?}",
+            self.slots,
+            self.desired,
+            self.active_assignments
+        );
         let mut next_assignments = HashMap::new();
         let mut used_mids = HashSet::new();
-        
+
         let mut still_desired = self.desired.clone();
 
         // Pass 1: Sticky Assignments (preserve existing mappings if track is still desired)
         for &mid in &self.slots {
-            if let Some(active) = self.active_assignments.get(&mid) {
-                if let Some(pos) = still_desired.iter().position(|d| d.track_id == active.track_id) {
-                    let sub = still_desired.remove(pos);
-                    next_assignments.insert(mid, sub);
-                    used_mids.insert(mid);
-                }
+            if let Some(active) = self.active_assignments.get(&mid)
+                && let Some(pos) = still_desired
+                    .iter()
+                    .position(|d| d.track_id == active.track_id)
+            {
+                let sub = still_desired.remove(pos);
+                next_assignments.insert(mid, sub);
+                used_mids.insert(mid);
             }
         }
 
@@ -59,29 +67,22 @@ impl SubscriptionManager {
 
         // Pass 3: Construct VideoRequests and update active state
         let mut requests = Vec::new();
-        
+
         // We only care about slots that changed or were cleared
         for &mid in &self.slots {
             let next = next_assignments.get(&mid);
             let current = self.active_assignments.get(&mid);
 
-            if next != current {
-                match next {
-                    Some(sub) => {
-                        requests.push(VideoRequest {
-                            mid: mid.to_string(),
-                            track_id: sub.track_id.clone(),
-                            height: sub.height,
-                        });
-                    }
-                    None => {
-                        // JS SDK might send height: 0 to pause, but if we want to 
-                        // completely unsubscribe from a slot, we might need a 
-                        // specific signal if the SFU protocol requires it. 
-                        // For now, mirroring JS "Sticky" logic.
-                    }
-                }
+            if next == current {
+                continue;
             }
+
+            let Some(sub) = next else { continue };
+            requests.push(VideoRequest {
+                mid: mid.to_string(),
+                track_id: sub.track_id.clone(),
+                height: sub.height,
+            });
         }
 
         self.active_assignments = next_assignments;
@@ -89,6 +90,8 @@ impl SubscriptionManager {
     }
 
     pub fn get_track_for_mid(&self, mid: Mid) -> Option<String> {
-        self.active_assignments.get(&mid).map(|s| s.track_id.clone())
+        self.active_assignments
+            .get(&mid)
+            .map(|s| s.track_id.clone())
     }
 }

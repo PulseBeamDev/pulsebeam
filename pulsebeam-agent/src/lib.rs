@@ -26,6 +26,7 @@ impl From<MediaData> for MediaFrame {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransceiverDirection {
     SendOnly,
     RecvOnly,

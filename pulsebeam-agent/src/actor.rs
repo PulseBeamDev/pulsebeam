@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
-use str0m::channel::{ChannelData, ChannelId};
+use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
@@ -446,6 +446,7 @@ pub enum AgentError {
     NoCandidates,
 }
 
+#[derive(Debug, Clone)]
 struct TrackRequest {
     kind: MediaKind,
     direction: TransceiverDirection,
@@ -550,9 +551,29 @@ impl AgentBuilder {
             return Err(AgentError::NoCandidates);
         };
 
+        let signaling_cid = rtc.direct_api().create_data_channel(ChannelConfig {
+            label: namespace::Signaling::Reliable.as_str().to_string(),
+            ordered: true,
+            reliability: Reliability::Reliable,
+            negotiated: Some(0),
+            protocol: "v1".to_string(),
+        });
+
+        // matching SFU's reserved channel
+        rtc.direct_api().create_data_channel(ChannelConfig {
+            label: "".to_string(),
+            ordered: true,
+            reliability: Reliability::Reliable,
+            negotiated: Some(1),
+            protocol: "v1".to_string(),
+        });
+
         let mut sdp = rtc.sdp_api();
+        // Add a dummy channel to ensure the SDP offer contains an m=application section.
+        // This is necessary for SCTP to be enabled.
+        sdp.add_channel("sctp-enable".to_string());
         let mut medias = Vec::new();
-        for track in self.tracks {
+        for track in self.tracks.clone() {
             let (dir, simulcast) = match track.direction {
                 TransceiverDirection::SendOnly => (
                     Direction::SendOnly,
@@ -578,9 +599,8 @@ impl AgentBuilder {
                 simulcast,
             });
         }
-
-        let signaling_cid = sdp.add_channel(namespace::Signaling::Reliable.as_str().to_string());
         let (offer, pending) = sdp.apply().expect("offer is required");
+        tracing::debug!("Generated SDP Offer:\n{}", offer);
         let resp = self
             .api
             .create_participant(CreateParticipantRequest {
@@ -606,6 +626,7 @@ impl AgentBuilder {
             cmd_rx,
             event_tx,
             resource_uri: resp.resource_uri,
+            participant_id: resp.participant_id.clone(),
             senders: StreamMap::new(),
             pending: PendingState::new(),
             slot_manager: SlotManager::new(),
@@ -631,6 +652,7 @@ impl AgentBuilder {
 
         Ok(Agent {
             room_id: room_id.to_string(),
+            participant_id: resp.participant_id,
             cmd_tx,
             event_rx,
         })
@@ -670,6 +692,9 @@ pub enum AgentCommand {
 #[derive(Debug)]
 pub enum AgentEvent {
     LocalTrackAdded(LocalTrack),
+    /// The server announced a remote track (metadata only) even if the client
+    /// has not yet subscribed to it.
+    RemoteTrackDiscovered(pulsebeam_proto::signaling::Track),
     RemoteTrackAdded(RemoteTrackRx),
     Connected,
     Disconnected(String),
@@ -677,11 +702,16 @@ pub enum AgentEvent {
 
 pub struct Agent {
     room_id: String,
+    participant_id: String,
     cmd_tx: mpsc::Sender<AgentCommand>,
     event_rx: mpsc::Receiver<AgentEvent>,
 }
 
 impl Agent {
+    pub fn participant_id(&self) -> &str {
+        &self.participant_id
+    }
+
     pub async fn next_event(&mut self) -> Option<AgentEvent> {
         self.event_rx.recv().await
     }
@@ -732,6 +762,7 @@ struct AgentActor {
     api: HttpApiClient,
     signaling_cid: ChannelId,
     resource_uri: Uri,
+    participant_id: String,
     disconnected_reason: Option<String>,
 
     /// Egress-side BWE layer controller: pauses/resumes simulcast layers
@@ -779,15 +810,20 @@ impl AgentActor {
                 }
             }
 
+            if let Some(deadline) = self.pending.deadline {
+                if debounce_timer.deadline() != deadline {
+                    debounce_timer.as_mut().reset(deadline);
+                }
+            }
+
             tokio::select! {
                 biased;
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd, now);
-                    if let Some(deadline) = self.pending.deadline {
-                        debounce_timer.as_mut().reset(deadline);
-                    }
                 }
-                _ = &mut debounce_timer, if self.pending.is_dirty() => {
+                // If we have a pending state update (for subscription changes),
+                // flush it when the debounce timer fires.
+                _ = &mut debounce_timer, if self.pending.deadline.is_some() => {
                     self.flush_pending_state(now);
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
@@ -806,20 +842,24 @@ impl AgentActor {
 
                 // Drain paused layers so the looper task never blocks.
                 Some(((mid, rid), frame)) = self.senders.next() => {
+                    let paused = self.layer_ctrl.is_paused(mid, rid);
                     // Measure the encoder output bitrate BEFORE the pause gate.
                     // This ensures we always know what the encoder *would* cost
                     // even when the layer is suppressed.
                     self.layer_ctrl.record_frame(mid, rid, frame.data.len(), Instant::now());
 
-                    if !self.layer_ctrl.is_paused(mid, rid) {
+                    if !paused {
                         if let Some(mut writer) = self.rtc.writer(mid) {
                             let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
+                                tracing::warn!(?mid, "no payload params found for writer");
                                 continue;
                             };
                             if let Some(rid) = rid {
                                 writer = writer.rid(rid);
                             }
                             let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
+                        } else {
+                            tracing::warn!(?mid, "no writer found for mid");
                         }
                     }
                 }
@@ -856,7 +896,19 @@ impl AgentActor {
                     let _ = self.socket.send_to(&tx.contents, tx.destination).await;
                 }
                 Ok(Output::Event(e)) => match e {
-                    Event::ChannelOpen(_cid, _label) => {}
+                    Event::ChannelOpen(cid, label) => {
+                        tracing::info!(
+                            "channel open: CID={:?}, Label={:?}, Target Signaling CID={:?}",
+                            cid,
+                            label,
+                            self.signaling_cid
+                        );
+                        if label == namespace::Signaling::Reliable.as_str() {
+                            tracing::info!("signaling channel is now open, CID={:?}", cid);
+                            self.signaling_cid = cid;
+                            self.pending.deadline.replace(Instant::now());
+                        }
+                    }
                     Event::ChannelData(data) => {
                         self.handle_signaling_data(data);
                     }
@@ -903,8 +955,10 @@ impl AgentActor {
                     return Some(t.into());
                 }
                 Err(e) => {
+                    tracing::error!("RTC Error: {:?}", e);
                     self.disconnected_reason = Some(format!("RTC Error: {:?}", e));
                     self.rtc.disconnect();
+                    return None;
                 }
             }
         }
@@ -960,8 +1014,11 @@ impl AgentActor {
                 tracing::warn!("Manual subscribe/unsubscribe is deprecated, use SetSubscriptions");
             }
             AgentCommand::SetSubscriptions(subs) => {
+                tracing::debug!("processing SetSubscriptions: {:?}", subs);
                 self.sub_manager.set_desired(subs);
                 self.pending.deadline.replace(now + STATE_DEBOUNCE);
+                // Make sure we attempt to send the new desired state immediately.
+                self.flush_pending_state(now);
             }
             AgentCommand::SetPreset(preset) => {
                 self.preset = preset;
@@ -985,8 +1042,11 @@ impl AgentActor {
         match payload {
             signaling::server_message::Payload::Update(update) => {
                 tracing::info!("Received signaling update: {:?}", update);
-                let new_tracks = self.slot_manager.sync(update);
-                for rx in new_tracks {
+                let (new_remote_tracks, new_discovered_tracks) = self.slot_manager.sync(update);
+                for track in new_discovered_tracks {
+                    self.emit(AgentEvent::RemoteTrackDiscovered(track));
+                }
+                for rx in new_remote_tracks {
                     tracing::info!("Emitting RemoteTrackAdded for MID: {:?}", rx.mid);
                     self.emit(AgentEvent::RemoteTrackAdded(rx));
                 }
@@ -1002,22 +1062,44 @@ impl AgentActor {
     }
 
     fn flush_pending_state(&mut self, now: Instant) {
-        // if channel is not ready, schedule for a retry
-        self.pending.deadline.replace(now + STATE_DEBOUNCE);
+        let channel_exists = self.rtc.channel(self.signaling_cid).is_some();
+        tracing::debug!(
+            "flush_pending_state: signaling_cid={:?}, exists={}",
+            self.signaling_cid,
+            channel_exists
+        );
 
         let Some(mut ch) = self.rtc.channel(self.signaling_cid) else {
+            tracing::debug!("signaling channel not ready yet, will retry later");
+            // Keep retrying in the future
+            self.pending.deadline.replace(now + STATE_DEBOUNCE);
             return;
         };
 
         let requests = self.sub_manager.reconcile();
+        tracing::debug!(
+            "subscription reconcile produced {} requests",
+            requests.len()
+        );
         if requests.is_empty() {
+            tracing::debug!("no subscription requests to send");
+            self.pending.deadline = None;
             return;
         }
 
-        let msg = signaling::ClientIntent { requests };
+        tracing::debug!("sending subscription requests: {:?}", requests);
+        let msg = signaling::ClientMessage {
+            payload: Some(signaling::client_message::Payload::Intent(
+                signaling::ClientIntent { requests },
+            )),
+        };
         let encoded = msg.encode_to_vec();
         if let Err(err) = ch.write(true, encoded.as_slice()) {
             tracing::warn!("failed to send signaling: {:?}", err);
+            // Retry later
+            self.pending.deadline.replace(now + STATE_DEBOUNCE);
+        } else {
+            self.pending.deadline = None;
         }
     }
 
@@ -1064,10 +1146,16 @@ impl AgentActor {
 
     async fn try_reconnect(&mut self) -> Result<(), AgentError> {
         let (offer, pending) = {
-            let mut sdp_api = self.rtc.sdp_api();
-            sdp_api.apply().ok_or_else(|| {
-                AgentError::Protocol("Nothing to negotiate during reconnect".to_string())
-            })?
+            let sdp_api = self.rtc.sdp_api();
+            match sdp_api.apply() {
+                Some(pair) => pair,
+                None => {
+                    tracing::info!(
+                        "Nothing to negotiate during reconnect; assuming connection is already up"
+                    );
+                    return Ok(());
+                }
+            }
         };
 
         let resp = self
@@ -1209,6 +1297,7 @@ impl SlotManager {
 
     /// Registers a permanent receiver slot (called during Agent init).
     fn register(&mut self, mid: Mid) {
+        tracing::debug!(mid = ?mid, "Registering receiver slot");
         self.slots.push(ReceiverSlot {
             mid,
             track_id: None,
@@ -1222,9 +1311,13 @@ impl SlotManager {
             .and_then(|s| s.track_id.as_deref())
     }
 
-    fn sync(&mut self, update: pulsebeam_proto::signaling::StateUpdate) -> Vec<RemoteTrackRx> {
+    fn sync(
+        &mut self,
+        update: pulsebeam_proto::signaling::StateUpdate,
+    ) -> (Vec<RemoteTrackRx>, Vec<pulsebeam_proto::signaling::Track>) {
         tracing::info!("Syncing SlotManager state with update: {:?}", update);
         let mut new_remote_tracks = Vec::new();
+        let mut newly_discovered_tracks = Vec::new();
 
         // 1. Handle track removals
         for t in update.tracks_remove {
@@ -1239,6 +1332,11 @@ impl SlotManager {
                 // For now just keep it.
                 continue;
             }
+            if self.pending_tracks.contains_key(&t.id) {
+                continue;
+            }
+
+            newly_discovered_tracks.push(t.clone());
             self.pending_tracks.insert(t.id.clone(), Arc::new(t));
         }
 
@@ -1270,7 +1368,7 @@ impl SlotManager {
 
             s.track_id = Some(a.track_id.clone());
 
-            // If we have bitstream for this track and it's in pending_tracks, promote it.
+            // Try to promote the track if we already have its bitstream buffered.
             if let Some(track) = self.pending_tracks.remove(&a.track_id) {
                 tracing::info!(
                     "Promoting track {} to active on MID {:?}",
@@ -1288,7 +1386,33 @@ impl SlotManager {
             }
         }
 
-        new_remote_tracks
+        // 5. Handle cases where the assignment arrived before the track metadata.
+        // If we already know about the track (in pending_tracks) and it is assigned,
+        // ensure we create a RemoteTrack for it.
+        for slot in &self.slots {
+            let Some(track_id) = &slot.track_id else {
+                continue;
+            };
+
+            if self.remote_tracks.contains_key(track_id) {
+                continue;
+            }
+
+            let Some(track) = self.pending_tracks.remove(track_id) else {
+                continue;
+            };
+
+            tracing::info!(
+                "Promoting previously discovered track {} to active on MID {:?}",
+                track_id,
+                slot.mid
+            );
+            let (tx, rx) = new_remote_track(slot.mid, track);
+            self.remote_tracks.insert(track_id.clone(), tx);
+            new_remote_tracks.push(rx);
+        }
+
+        (new_remote_tracks, newly_discovered_tracks)
     }
 
     fn get_sender(&self, mid: &Mid) -> Option<&RemoteTrackTx> {

@@ -37,6 +37,7 @@ pub struct CreateParticipantRequest {
 pub struct CreateParticipantResponse {
     pub answer: SdpAnswer,
     pub resource_uri: Uri,
+    pub participant_id: String,
 }
 
 pub struct UpdateParticipantRequest {
@@ -89,9 +90,25 @@ impl TryFrom<Response<Vec<u8>>> for CreateParticipantResponse {
 
         let answer = SdpAnswer::from_sdp_string(body_str)?;
 
+        let participant_id = resp
+            .headers()
+            .get(HeaderExt::ParticipantId.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            // Fall back to parsing from the Location header if the header is missing.
+            .or_else(|| {
+                resource_uri
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
         Ok(CreateParticipantResponse {
             answer,
             resource_uri,
+            participant_id,
         })
     }
 }
