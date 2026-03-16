@@ -61,6 +61,7 @@ uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
 [dev-dependencies]
 hex = "0.4.3"
 more-asserts = { workspace = true }
+proptest = "1.10.0"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemalloc_pprof = { version = "0.8.1", features = ["flamegraph", "symbolize"] }
