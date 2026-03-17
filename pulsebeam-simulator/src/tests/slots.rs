@@ -50,7 +50,7 @@ fn slots_layout_update_test() -> turmoil::Result {
                     break;
                 }
                 // Advance the simulation a bit.
-                client.drive_until(Duration::from_millis(50), |_| false).await.ok();
+                client.drive_for(Duration::from_millis(50)).await.ok();
             }
 
             // Store participant_id + mid for subscriber to use when subscribing.
@@ -59,10 +59,7 @@ fn slots_layout_update_test() -> turmoil::Result {
                 *pub1_info.lock().await = Some((pid, mid.to_string()));
             }
 
-            client
-                .drive_until(Duration::from_secs(40), |_| false)
-                .await
-                .ok();
+            client.drive_for(Duration::from_secs(40)).await.ok();
 
             Ok(())
         });
@@ -241,7 +238,10 @@ fn slots_prioritization_test() -> turmoil::Result {
                 if !client.local_mids.is_empty() {
                     break;
                 }
-                client.drive_until(Duration::from_millis(50), |_| false).await.ok();
+                client
+                    .drive_until(Duration::from_millis(50), |_| false)
+                    .await
+                    .ok();
             }
 
             // Store participant_id + mid for subscriber to use when subscribing.
@@ -282,7 +282,10 @@ fn slots_prioritization_test() -> turmoil::Result {
                 if !client.local_mids.is_empty() {
                     break;
                 }
-                client.drive_until(Duration::from_millis(50), |_| false).await.ok();
+                client
+                    .drive_until(Duration::from_millis(50), |_| false)
+                    .await
+                    .ok();
             }
 
             // Store participant_id + mid for subscriber to use when subscribing.

@@ -76,6 +76,35 @@ impl SimClient {
         self.drive_until_cancelled(token, |_| false).await
     }
 
+    pub async fn drive_for(&mut self, timeout: Duration) -> anyhow::Result<AgentStats> {
+        self.drive_until(timeout, |_| false).await
+    }
+
+    pub async fn drive_until<F>(
+        &mut self,
+        timeout: Duration,
+        predicate: F,
+    ) -> anyhow::Result<AgentStats>
+    where
+        F: FnMut(&AgentStats) -> bool,
+    {
+        let token = CancellationToken::new();
+        let _guard = token.clone().drop_guard();
+        tokio::select! {
+            _ = tokio::time::sleep(timeout) => {
+                let stats = self.agent.get_stats().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
+                    self.ip,
+                    stats,
+                    self.discovered_tracks,
+                    self.remote_tracks
+                );
+            }
+            result = self.drive_until_cancelled(token, predicate) => result
+        }
+    }
+
     pub async fn drive_until_cancelled<F>(
         &mut self,
         token: CancellationToken,
@@ -118,31 +147,6 @@ impl SimClient {
                     }
                 }
             }
-        }
-    }
-
-    pub async fn drive_until<F>(
-        &mut self,
-        timeout: Duration,
-        predicate: F,
-    ) -> anyhow::Result<AgentStats>
-    where
-        F: FnMut(&AgentStats) -> bool,
-    {
-        let token = CancellationToken::new();
-        let _guard = token.clone().drop_guard();
-        tokio::select! {
-            _ = tokio::time::sleep(timeout) => {
-                let stats = self.agent.get_stats().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
-                    self.ip,
-                    stats,
-                    self.discovered_tracks,
-                    self.remote_tracks
-                );
-            }
-            result = self.drive_until_cancelled(token, predicate) => result
         }
     }
 

@@ -3,6 +3,7 @@ use pulsebeam_agent::MediaKind;
 use pulsebeam_agent::TransceiverDirection;
 use pulsebeam_agent::manager::Subscription;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn declarative_subscription_test() -> turmoil::Result {
@@ -18,24 +19,26 @@ fn declarative_subscription_test() -> turmoil::Result {
             .map_err(|e| e.into())
     });
 
-    sim.client("client1", async move {
-        let sfu_ip = turmoil::lookup("sfu");
-        let client1_ip = turmoil::lookup("client1");
-        let mut client = SimClientBuilder::bind(client1_ip, sfu_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-            .connect("room1")
-            .await?;
+    let done = CancellationToken::new();
+    sim.client("client1", {
+        let done = done.clone();
+        async move {
+            let sfu_ip = turmoil::lookup("sfu");
+            let client1_ip = turmoil::lookup("client1");
+            let mut client = SimClientBuilder::bind(client1_ip, sfu_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+                .connect("room1")
+                .await?;
 
-        client
-            .drive_until(Duration::from_secs(10), |_| false)
-            .await
-            .ok();
+            client.drive(done).await.ok();
 
-        Ok(())
+            Ok(())
+        }
     });
 
     sim.client("client2", async move {
+        let _done = done.drop_guard();
         let sfu_ip = turmoil::lookup("sfu");
         let client2_ip = turmoil::lookup("client2");
         let mut client = SimClientBuilder::bind(client2_ip, sfu_ip)
