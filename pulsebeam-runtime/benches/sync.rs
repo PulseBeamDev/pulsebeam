@@ -1,11 +1,12 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures_concurrency::stream::Merge;
 use futures_lite::StreamExt;
-use rand::seq::index;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task;
 use tokio::{runtime::Runtime, task::JoinSet};
+
+use pulsebeam_runtime::rand;
 
 // Use the specified import path for the SPMC channel implementation.
 use pulsebeam_runtime::sync::spmc::{RecvError, Sender, channel};
@@ -46,7 +47,7 @@ fn bench_interactive_room_mesh_mpsc_fanout(c: &mut Criterion) {
 }
 
 async fn run_interactive_room_mesh_mpsc_fanout_test() {
-    let mut rng = rand::rng();
+    let mut rng = rand::os_rng();
 
     // Create the communication channels between publishers, fanout tasks, and subscribers
     let mut fanout_targets: Vec<Vec<mpsc::Sender<(usize, Instant)>>> = vec![vec![]; NUM_PUBLISHERS];
@@ -60,7 +61,7 @@ async fn run_interactive_room_mesh_mpsc_fanout_test() {
 
     for s_idx in 0..NUM_SUBSCRIBERS {
         let publisher_indices =
-            index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+            rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
         for p_idx in publisher_indices.iter() {
             let (tx, rx) = mpsc::channel(256);
             fanout_targets[p_idx].push(tx);
@@ -159,12 +160,12 @@ async fn run_interactive_room_mesh_spawn_test() {
 
     let mut subscriber_tasks = Vec::with_capacity(NUM_PUBLISHERS);
     // Create the random number generator once, outside the loop for efficiency.
-    let mut rng = rand::rng();
+    let mut rng = rand::os_rng();
 
     for _ in 0..NUM_SUBSCRIBERS {
         // --- CHANGE 2: Select 15 random receivers for this specific subscriber. ---
         // First, sample 15 unique random indices from the full range of publishers.
-        let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+        let random_indices = rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         // Then, create the list of receivers by cloning only the ones at the random indices.
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
@@ -258,11 +259,11 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
         initial_receivers.push(rx);
     }
 
-    let mut rng = rand::rng();
+    let mut rng = rand::os_rng();
 
     let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
     for _ in 0..NUM_SUBSCRIBERS {
-        let random_indices = index::sample(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+        let random_indices = rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
         for i in random_indices.iter() {

@@ -1,5 +1,6 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
+use pulsebeam_runtime::rand;
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -81,10 +82,12 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let _ = pulsebeam::rtp::rtp_payload_pool();
 
     tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
+    let mut rng = rand::os_rng();
     let node = NodeBuilder::new()
         .workers(workers)
         .local_addr(local_addr)
         .external_addr(external_addr)
+        .rng(rng)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr)
         .run(shutdown.child_token());

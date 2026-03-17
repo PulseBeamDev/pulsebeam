@@ -114,9 +114,12 @@ impl Stage for StartSfuStage {
     fn apply(&self, sim: &mut Sim<'_>, ctx: &mut ScenarioCtx) -> TurmoilResult<()> {
         let server_ip = ctx.server_ip;
         sim.host(server_ip, move || async move {
-            crate::tests::common::start_sfu_node(server_ip)
-                .await
-                .map_err(|e| e.into())
+            crate::tests::common::start_sfu_node(
+                server_ip,
+                pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+            )
+            .await
+            .map_err(|e| e.into())
         });
         Ok(())
     }

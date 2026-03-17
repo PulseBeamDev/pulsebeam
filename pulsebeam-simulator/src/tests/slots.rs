@@ -24,9 +24,12 @@ fn slots_layout_update_test() -> turmoil::Result {
     let sub1_ip = common::subnet_ip(subnet, 4);
 
     sim.host(server_ip, move || async move {
-        common::start_sfu_node(server_ip)
-            .await
-            .map_err(|e| e.into())
+        common::start_sfu_node(
+            server_ip,
+            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+        )
+        .await
+        .map_err(|e| e.into())
     });
 
     // Share publisher track identity (participant_id + mid) with the subscriber.
@@ -204,9 +207,12 @@ fn slots_prioritization_test() -> turmoil::Result {
 
     let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
     sim.host(server_ip, move || async move {
-        common::start_sfu_node(server_ip)
-            .await
-            .map_err(|e| e.into())
+        common::start_sfu_node(
+            server_ip,
+            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+        )
+        .await
+        .map_err(|e| e.into())
     });
 
     let pub1_ip: IpAddr = "192.168.1.1".parse().unwrap();
@@ -364,10 +370,15 @@ fn slots_prioritization_test() -> turmoil::Result {
             .wait_for_remote_tracks(2, Duration::from_secs(20))
             .await?;
 
-        // Wait for flow
+        // Wait for flow on both received tracks.
+        // This is more robust than relying on a hard byte threshold.
         client
-            .drive_until(Duration::from_secs(30), |stats| {
-                stats.tracks.len() >= 2 && stats.total_rx_bytes() > 50_000
+            .drive_until(Duration::from_secs(60), |stats| {
+                stats.tracks.len() >= 2
+                    && stats
+                        .tracks
+                        .values()
+                        .all(|t| t.rx_layers.values().any(|l| l.bytes > 0))
             })
             .await?;
 

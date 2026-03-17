@@ -16,9 +16,12 @@ fn declarative_subscription_test() -> turmoil::Result {
     let sfu_ip = common::subnet_ip(subnet, 1);
 
     sim.host(sfu_ip, move || async move {
-        crate::tests::common::start_sfu_node(sfu_ip)
-            .await
-            .map_err(|e| e.into())
+        crate::tests::common::start_sfu_node(
+            sfu_ip,
+            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+        )
+        .await
+        .map_err(|e| e.into())
     });
 
     let done = CancellationToken::new();
@@ -129,9 +132,12 @@ fn reconnection_recovery_test() -> turmoil::Result {
     let client1_ip = common::subnet_ip(subnet, 2);
 
     sim.host(sfu_ip, move || async move {
-        crate::tests::common::start_sfu_node(sfu_ip)
-            .await
-            .map_err(|e| e.into())
+        crate::tests::common::start_sfu_node(
+            sfu_ip,
+            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+        )
+        .await
+        .map_err(|e| e.into())
     });
 
     sim.client(client1_ip, async move {

@@ -1,11 +1,13 @@
 use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
 use pulsebeam_core::net::TcpListener;
+use pulsebeam_runtime::actor;
 use pulsebeam_runtime::actor::RunnerConfig;
+use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::sync::Arc;
-use pulsebeam_runtime::{actor, net, rand};
+use pulsebeam_runtime::rand;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicUsize;
@@ -143,7 +145,9 @@ impl NodeBuilder {
         let mut all_readers = udp_readers;
         all_readers.push(tcp_reader);
 
-        let rng = self.rng.unwrap_or_else(rand::Rng::from_os_rng);
+        let rng = self.rng.ok_or_else(|| anyhow::anyhow!(
+            "NodeBuilder requires an RNG; call `.rng(...)` when constructing the node"
+        ))?;
 
         let mut join_set = JoinSet::new();
 

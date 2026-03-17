@@ -1,4 +1,5 @@
 use crate::rtp::RtpPacket;
+use pulsebeam_runtime::rand::{self, RngCore};
 use str0m::{
     media::{Frequency, MediaTime},
     rtp::SeqNo,
@@ -17,14 +18,32 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    pub fn new(clock_rate: Frequency) -> Self {
-        let base_seq_no: u16 = rand::random();
+    /// Create a new timeline that starts sequence numbers at `base_seq_no`.
+    ///
+    /// This is the most explicit form and is the one tests should use for
+    /// deterministic behavior.
+    pub fn new_with_base(clock_rate: Frequency, base_seq_no: u16) -> Self {
         Self {
             clock_rate,
             highest_seq_no: SeqNo::from(base_seq_no as u64),
             offset_seq_no: 0,
             anchor: None,
         }
+    }
+
+    /// Create a new timeline using a pseudo-random base sequence number.
+    ///
+    /// This is intended for production usage where clients should not all start
+    /// at the same sequence number.
+    pub fn new(clock_rate: Frequency) -> Self {
+        let mut rng = rand::os_rng();
+        Self::new_with_rng(clock_rate, &mut rng)
+    }
+
+    /// Create a new timeline by drawing the base sequence number from the given RNG.
+    pub fn new_with_rng<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
+        let base_seq_no = (rng.next_u32() & 0xFFFF) as u16;
+        Self::new_with_base(clock_rate, base_seq_no)
     }
 
     /// Re-aligns the timeline to a new stream starting with `packet`.
@@ -74,7 +93,7 @@ mod test {
     #[test]
     fn test_simple_continuity() {
         let start_time = Instant::now();
-        let mut timeline = Timeline::new(Frequency::NINETY_KHZ);
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // Packet 1: First packet (Keyframe) - requires rebase
         let p1 = RtpPacket {
@@ -113,7 +132,7 @@ mod test {
     #[test]
     fn test_switching_streams() {
         let start_time = Instant::now();
-        let mut timeline = Timeline::new(Frequency::NINETY_KHZ);
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // --- Stream A (Seq 1000-1001) ---
         let p_a1 = RtpPacket {
@@ -219,7 +238,7 @@ mod test {
     #[should_panic(expected = "rebase must have occured before rewriting")]
     fn test_panic_if_no_rebase() {
         let start_time = Instant::now();
-        let mut timeline = Timeline::new(Frequency::NINETY_KHZ);
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // Packet without rebase
         let p1 = RtpPacket {
@@ -238,7 +257,7 @@ mod test {
         // Ensures that if a packet arrives late (playout time < previous),
         // the timestamp is calculated correctly relative to anchor.
         let start_time = Instant::now();
-        let mut timeline = Timeline::new(Frequency::NINETY_KHZ);
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // Packet 1 (Base)
         let p1 = RtpPacket {

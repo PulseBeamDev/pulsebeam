@@ -40,7 +40,7 @@ pub fn setup_tracing() {
     });
 }
 
-pub async fn start_sfu_node(ip: IpAddr) -> anyhow::Result<()> {
+pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
@@ -50,6 +50,7 @@ pub async fn start_sfu_node(ip: IpAddr) -> anyhow::Result<()> {
         .workers(1)
         .local_addr(local_addr)
         .external_addr(external_addr)
+        .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)
         .run(tokio_util::sync::CancellationToken::new())
