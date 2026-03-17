@@ -1,7 +1,7 @@
 use super::common;
 use crate::tests::scenario::{
-    AssertAllDisconnectedStage, ChurnStage, ConnectPeersStage, DisconnectStage,
-    HoldStage, PartitionStage, Scenario, StartSfuStage,
+    AssertAllDisconnectedStage, ChurnStage, ConnectPeersStage, DisconnectStage, HoldStage,
+    PartitionStage, Scenario, StartSfuStage,
 };
 use std::time::Duration;
 
@@ -71,4 +71,3 @@ fn simulation_test() {
     // We use low byte-received thresholds to keep the test stable on CI.
     run_connection_scenario("connection_test", 3, 1, true, true);
 }
-

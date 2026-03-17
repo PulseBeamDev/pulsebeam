@@ -49,10 +49,10 @@
 //! which will help you easily identify the blocking operation(s).
 //! ```
 
+use crate::sync::Mutex;
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
-use crate::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::thread::ThreadId;

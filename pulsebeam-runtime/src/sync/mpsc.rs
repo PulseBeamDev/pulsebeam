@@ -1,8 +1,8 @@
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use diatomic_waker::{WakeSink, WakeSource};
 use futures_lite::Stream;
 use std::pin::Pin;
-use crate::sync::Arc;
-use crate::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 

@@ -20,12 +20,11 @@ impl Batcher {
             free_states: Vec::with_capacity(MAX_FREE_STATES),
         }
     }
- 
+
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.active_states.is_empty()
     }
-
 
     /// Pushes a content slice into an appropriate batch.
     ///
@@ -73,7 +72,6 @@ impl Batcher {
             self.free_states.push(state);
         }
     }
-
 
     pub fn flush(&mut self, socket: &net::UnifiedSocketWriter) {
         while let Some(state) = self.front() {

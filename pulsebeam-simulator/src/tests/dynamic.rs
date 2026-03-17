@@ -17,12 +17,9 @@ fn churn_test() {
     let participant2_ip = common::subnet_ip(subnet, 3);
 
     sim.host(server_ip, move || async move {
-        common::start_sfu_node(
-            server_ip,
-            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
-        )
-        .await
-        .map_err(|e| e.into())
+        common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF))
+            .await
+            .map_err(|e| e.into())
     });
     let done = CancellationToken::new();
 

@@ -53,7 +53,7 @@
 use crossbeam_queue::ArrayQueue;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
 /// Slot size for every pool buffer.
 ///
@@ -519,22 +519,22 @@ pub fn net_recv_pool() -> &'static BufPool {
 pub fn describe_metrics() {
     #[cfg(feature = "deep-metrics")]
     {
-    metrics::describe_counter!(
-        "pool_buf_checkout_total",
-        "Total number of PoolBuf checkouts from the pool."
-    );
-    metrics::describe_counter!(
-        "pool_buf_alloc_fallback_total",
-        "Checkouts that fell back to jemalloc because all pool shards were empty."
-    );
-    metrics::describe_gauge!(
-        "pool_buf_idle_slots",
-        "Current number of slots sitting in the pool free lists."
-    );
-    metrics::describe_counter!(
-        "pool_buf_slot_freed_total",
-        "Slots freed to jemalloc because the pool was at capacity on return."
-    );
+        metrics::describe_counter!(
+            "pool_buf_checkout_total",
+            "Total number of PoolBuf checkouts from the pool."
+        );
+        metrics::describe_counter!(
+            "pool_buf_alloc_fallback_total",
+            "Checkouts that fell back to jemalloc because all pool shards were empty."
+        );
+        metrics::describe_gauge!(
+            "pool_buf_idle_slots",
+            "Current number of slots sitting in the pool free lists."
+        );
+        metrics::describe_counter!(
+            "pool_buf_slot_freed_total",
+            "Slots freed to jemalloc because the pool was at capacity on return."
+        );
     }
 }
 

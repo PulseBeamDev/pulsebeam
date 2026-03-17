@@ -232,7 +232,6 @@ impl Synchronizer {
         playout_time
     }
 
-
     pub fn is_synchronized(&self) -> bool {
         !self.is_provisional && self.correction.is_none()
     }
@@ -305,11 +304,14 @@ mod tests {
         let sr_info = create_sr(sr_rtp_ts, sr_ntp_time);
 
         let second_packet_ts = MediaTime::from_90khz(9180); // 2ms after SR
-        let packet2 = sync.process_owned_sr(sr_info, RtpPacket {
-            rtp_ts: second_packet_ts,
-            arrival_ts: sr_arrival_time,
-            ..Default::default()
-        });
+        let packet2 = sync.process_owned_sr(
+            sr_info,
+            RtpPacket {
+                rtp_ts: second_packet_ts,
+                arrival_ts: sr_arrival_time,
+                ..Default::default()
+            },
+        );
 
         let expected_provisional_delta = (9180 - 1000) as f64 / clock_rate;
         let expected_provisional_playout =
@@ -389,11 +391,17 @@ mod tests {
         // Process initial SR to get out of provisional state
         sync_perfect.process_owned_sr(
             create_sr(MediaTime::from_90khz(last_rtp_perfect), last_ntp),
-            RtpPacket { arrival_ts: last_time, ..Default::default() },
+            RtpPacket {
+                arrival_ts: last_time,
+                ..Default::default()
+            },
         );
         sync_drifting.process_owned_sr(
             create_sr(MediaTime::from_90khz(last_rtp_drifting), last_ntp),
-            RtpPacket { arrival_ts: last_time, ..Default::default() },
+            RtpPacket {
+                arrival_ts: last_time,
+                ..Default::default()
+            },
         );
 
         // Wait for smear to finish
@@ -418,11 +426,17 @@ mod tests {
 
             sync_perfect.process_owned_sr(
                 create_sr(MediaTime::from_90khz(last_rtp_perfect), last_ntp),
-                RtpPacket { arrival_ts: last_time, ..Default::default() },
+                RtpPacket {
+                    arrival_ts: last_time,
+                    ..Default::default()
+                },
             );
             sync_drifting.process_owned_sr(
                 create_sr(MediaTime::from_90khz(last_rtp_drifting), last_ntp),
-                RtpPacket { arrival_ts: last_time, ..Default::default() },
+                RtpPacket {
+                    arrival_ts: last_time,
+                    ..Default::default()
+                },
             );
         }
 
@@ -490,11 +504,17 @@ mod tests {
         // Process initial SRs to get out of provisional state
         sync_absolute_perfect.process_owned_sr(
             create_sr(MediaTime::from_90khz(last_rtp_perfect), last_ntp_absolute),
-            RtpPacket { arrival_ts: last_time, ..Default::default() },
+            RtpPacket {
+                arrival_ts: last_time,
+                ..Default::default()
+            },
         );
         sync_relative_drifting.process_owned_sr(
             create_sr(MediaTime::from_90khz(last_rtp_drifting), last_ntp_relative),
-            RtpPacket { arrival_ts: last_time, ..Default::default() },
+            RtpPacket {
+                arrival_ts: last_time,
+                ..Default::default()
+            },
         );
 
         // Wait for smear to finish
@@ -520,11 +540,17 @@ mod tests {
 
             sync_absolute_perfect.process_owned_sr(
                 create_sr(MediaTime::from_90khz(last_rtp_perfect), last_ntp_absolute),
-                RtpPacket { arrival_ts: last_time, ..Default::default() },
+                RtpPacket {
+                    arrival_ts: last_time,
+                    ..Default::default()
+                },
             );
             sync_relative_drifting.process_owned_sr(
                 create_sr(MediaTime::from_90khz(last_rtp_drifting), last_ntp_relative),
-                RtpPacket { arrival_ts: last_time, ..Default::default() },
+                RtpPacket {
+                    arrival_ts: last_time,
+                    ..Default::default()
+                },
             );
         }
 
@@ -587,7 +613,10 @@ mod tests {
         // First SR establishes the baseline
         sync.process_owned_sr(
             create_sr(MediaTime::from_90khz(0), ntp_base_time),
-            RtpPacket { arrival_ts: base_time, ..Default::default() },
+            RtpPacket {
+                arrival_ts: base_time,
+                ..Default::default()
+            },
         );
 
         // We need to wait for the smear to finish before the clock is stable
@@ -601,15 +630,27 @@ mod tests {
         // Second SR is used to calculate the first drift estimate
         let sr2_time = base_time + Duration::from_secs(1);
         sync.process_owned_sr(
-            create_sr(MediaTime::from_90khz(90000), ntp_base_time + Duration::from_secs(1)),
-            RtpPacket { arrival_ts: sr2_time, ..Default::default() },
+            create_sr(
+                MediaTime::from_90khz(90000),
+                ntp_base_time + Duration::from_secs(1),
+            ),
+            RtpPacket {
+                arrival_ts: sr2_time,
+                ..Default::default()
+            },
         );
 
         // Third SR is used to calculate a more stable drift
         let sr3_time = base_time + Duration::from_secs(2);
         sync.process_owned_sr(
-            create_sr(MediaTime::from_90khz(180090), ntp_base_time + Duration::from_secs(2)),
-            RtpPacket { arrival_ts: sr3_time, ..Default::default() },
+            create_sr(
+                MediaTime::from_90khz(180090),
+                ntp_base_time + Duration::from_secs(2),
+            ),
+            RtpPacket {
+                arrival_ts: sr3_time,
+                ..Default::default()
+            },
         );
 
         assert_eq!(sync.estimated_clock_drift_ppm.round() as i64, 1000);

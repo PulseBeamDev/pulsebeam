@@ -30,4 +30,3 @@ pub fn os_rng() -> Rng {
         .expect("OsRng should always be available");
     Rng::from_seed(seed)
 }
-

@@ -24,12 +24,9 @@ fn slots_layout_update_test() -> turmoil::Result {
     let sub1_ip = common::subnet_ip(subnet, 4);
 
     sim.host(server_ip, move || async move {
-        common::start_sfu_node(
-            server_ip,
-            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
-        )
-        .await
-        .map_err(|e| e.into())
+        common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF))
+            .await
+            .map_err(|e| e.into())
     });
 
     // Share publisher track identity (participant_id + mid) with the subscriber.
@@ -207,12 +204,9 @@ fn slots_prioritization_test() -> turmoil::Result {
 
     let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
     sim.host(server_ip, move || async move {
-        common::start_sfu_node(
-            server_ip,
-            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
-        )
-        .await
-        .map_err(|e| e.into())
+        common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF))
+            .await
+            .map_err(|e| e.into())
     });
 
     let pub1_ip: IpAddr = "192.168.1.1".parse().unwrap();

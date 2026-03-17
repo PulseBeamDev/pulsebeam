@@ -81,7 +81,6 @@ impl UpstreamAllocator {
         true
     }
 
-
     /// Drain all pending keyframe requests, applying per-layer leading-edge debounce.
     ///
     /// Call this immediately after [`notified`] resolves. It is O(n) in the number

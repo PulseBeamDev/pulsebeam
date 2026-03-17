@@ -629,7 +629,10 @@ mod tests {
         let packet_hex = "000100502112a4426943746c7a422f4d706e594800060009447172673a35504c4d000000c0570004000003e7802a0008e2e197300acfe8da00250000002400046e001eff00080014b610b03b8165bb4c317192054e00c73afb204dd480280004a953f217";
         let packet_raw = hex::decode(packet_hex).unwrap();
 
-        assert_eq!(find_stun_username_slice(&packet_raw), Some(b"Dqrg:5PLM".as_slice()));
+        assert_eq!(
+            find_stun_username_slice(&packet_raw),
+            Some(b"Dqrg:5PLM".as_slice())
+        );
     }
 
     #[test]

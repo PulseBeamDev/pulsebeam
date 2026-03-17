@@ -125,7 +125,9 @@ impl UdpTransportReader {
 
                         // stride == 0 means a single non-GRO datagram.
                         let stride = if m.stride == 0 { m.len } else { m.stride };
-                        if stride == 0 { continue; }
+                        if stride == 0 {
+                            continue;
+                        }
 
                         // Iterate GRO segments: each becomes one pool slot + RecvPacketBatch.
                         // One memcpy per segment is unavoidable when de-bundling GRO;

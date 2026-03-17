@@ -247,10 +247,7 @@ mod test {
             };
 
             if b.ssrc != c.ssrc {
-                assert_ne!(
-                    a.ssrc, c.ssrc,
-                    "Interleaved SSRCs detected"
-                );
+                assert_ne!(a.ssrc, c.ssrc, "Interleaved SSRCs detected");
             }
         }
     }

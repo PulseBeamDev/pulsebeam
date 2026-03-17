@@ -16,12 +16,9 @@ fn network_impairment_test() {
     let client_ip = common::subnet_ip(subnet, 2);
 
     sim.host(server_ip, move || async move {
-        common::start_sfu_node(
-            server_ip,
-            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
-        )
-        .await
-        .map_err(|e| e.into())
+        common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF))
+            .await
+            .map_err(|e| e.into())
     });
 
     sim.client(client_ip, async move {

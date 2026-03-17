@@ -3,7 +3,10 @@ pub mod client;
 use pulsebeam_runtime::net::UdpMode;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{atomic::{AtomicU8, Ordering}, Once},
+    sync::{
+        Once,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tracing_subscriber::EnvFilter;

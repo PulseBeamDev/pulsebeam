@@ -1,4 +1,5 @@
-    //! Room-level Top-N audio selector.
+
+//! Room-level Top-N audio selector.
 //!
 //! A single async task per room that:
 //!
@@ -53,10 +54,7 @@ use pulsebeam_runtime::sync::spmc;
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
-    controller::MAX_SEND_AUDIO_SLOTS,
-    entity::TrackId,
-    rtp::RtpPacket,
-    rtp::monitor::StreamState,
+    controller::MAX_SEND_AUDIO_SLOTS, entity::TrackId, rtp::RtpPacket, rtp::monitor::StreamState,
     track::TrackReceiver,
 };
 
@@ -313,7 +311,10 @@ impl TopNAudioSelector {
                 let sim = track.lowest_quality();
                 let state = sim.state.clone();
                 let receiver = sim.channel.clone();
-                let key = self.inputs.insert(InputStream { track_id: id, receiver });
+                let key = self.inputs.insert(InputStream {
+                    track_id: id,
+                    receiver,
+                });
                 self.tracks.insert(id, InputTrackMeta { key, state });
             }
             AudioSelectorCmd::RemoveTrack(id) => {
@@ -341,11 +342,7 @@ impl TopNAudioSelector {
     /// only occurs in the ≤200 ms window between a speaker becoming active and
     /// the next re-rank pass assigning them a slot.
     fn forward(&mut self, track_id: TrackId, packet: RtpPacket) {
-        if let Some(slot) = self
-            .slots
-            .iter_mut()
-            .find(|s| s.track_id == Some(track_id))
-        {
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.track_id == Some(track_id)) {
             slot.sender.send(packet);
         }
     }

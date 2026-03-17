@@ -1,4 +1,4 @@
-use crate::tests::common::{run_sim_or_timeout, client::SimClientBuilder};
+use crate::tests::common::{client::SimClientBuilder, run_sim_or_timeout};
 use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -151,7 +151,10 @@ impl Stage for ConnectPeersStage {
 
             // Create a handle so later stages (e.g. disconnect) can interact with this client.
             let client_handle: ClientHandle = Arc::new(tokio::sync::Mutex::new(None));
-            ctx.clients.push(ClientInfo { ip, handle: client_handle.clone() });
+            ctx.clients.push(ClientInfo {
+                ip,
+                handle: client_handle.clone(),
+            });
 
             sim.client(ip, async move {
                 // Build the client and store it in the shared handle.
@@ -350,11 +353,11 @@ impl Stage for DisconnectStage {
             async move {
                 tokio::time::sleep(after).await;
                 for client in &clients {
-                    let mut guard: tokio::sync::MutexGuard<'_, Option<crate::tests::common::client::SimClient>> =
-                        client.handle.lock().await;
-                    let client = guard
-                        .as_mut()
-                        .expect("client should have been initialized");
+                    let mut guard: tokio::sync::MutexGuard<
+                        '_,
+                        Option<crate::tests::common::client::SimClient>,
+                    > = client.handle.lock().await;
+                    let client = guard.as_mut().expect("client should have been initialized");
                     tracing::info!(ip = ?client.ip, "disconnecting client");
                     client.agent.disconnect().await?;
                 }
@@ -387,8 +390,10 @@ impl Stage for AssertAllDisconnectedStage {
             async move {
                 tokio::time::sleep(after).await;
                 for client in &clients {
-                    let client_guard: tokio::sync::MutexGuard<'_, Option<crate::tests::common::client::SimClient>> =
-                        client.handle.lock().await;
+                    let client_guard: tokio::sync::MutexGuard<
+                        '_,
+                        Option<crate::tests::common::client::SimClient>,
+                    > = client.handle.lock().await;
                     let client = client_guard
                         .as_ref()
                         .expect("client should have been initialized");

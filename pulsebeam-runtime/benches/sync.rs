@@ -165,7 +165,8 @@ async fn run_interactive_room_mesh_spawn_test() {
     for _ in 0..NUM_SUBSCRIBERS {
         // --- CHANGE 2: Select 15 random receivers for this specific subscriber. ---
         // First, sample 15 unique random indices from the full range of publishers.
-        let random_indices = rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+        let random_indices =
+            rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         // Then, create the list of receivers by cloning only the ones at the random indices.
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
@@ -263,7 +264,8 @@ async fn run_interactive_room_mesh_futures_unordered_test() {
 
     let mut subscriber_tasks = Vec::with_capacity(NUM_SUBSCRIBERS);
     for _ in 0..NUM_SUBSCRIBERS {
-        let random_indices = rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
+        let random_indices =
+            rand::sample_indices(&mut rng, NUM_PUBLISHERS, SUBSCRIPTIONS_PER_SUBSCRIBER);
 
         let mut subs_receivers = Vec::with_capacity(SUBSCRIPTIONS_PER_SUBSCRIBER);
         for i in random_indices.iter() {
