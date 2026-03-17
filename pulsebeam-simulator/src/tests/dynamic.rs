@@ -2,7 +2,7 @@ use super::common;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
 use std::net::IpAddr;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn churn_test() {
@@ -21,25 +21,26 @@ fn churn_test() {
 
     let participant1_ip: IpAddr = "192.168.1.1".parse().unwrap();
     let participant2_ip: IpAddr = "192.168.2.1".parse().unwrap();
-    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let done = CancellationToken::new();
 
     // Participant 1: Stays in the room
-    sim.client(participant1_ip, async move {
-        let mut client = common::client::SimClientBuilder::bind(participant1_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-            .connect("room1")
-            .await?;
+    sim.client(participant1_ip, {
+        let done = done.clone();
+        async move {
+            let mut client = common::client::SimClientBuilder::bind(participant1_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+                .connect("room1")
+                .await?;
 
-        client
-            .drive_until(Duration::from_secs(30), |_| done_tx.is_closed())
-            .await
-            .ok();
-        Ok(())
+            client.drive(done).await.unwrap();
+            Ok(())
+        }
     });
 
     // Participant 2: Joins and leaves multiple times
     sim.client(participant2_ip, async move {
+        let _done_guard = done.drop_guard();
         for i in 1..=3 {
             tracing::info!("Participant 2 joining, attempt {}", i);
             let mut client = common::client::SimClientBuilder::bind(participant2_ip, server_ip)
@@ -61,7 +62,6 @@ fn churn_test() {
             client.agent.disconnect().await?;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        drop(done_rx);
         Ok(())
     });
 

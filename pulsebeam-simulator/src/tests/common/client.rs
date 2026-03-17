@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
@@ -71,32 +72,25 @@ pub struct SimClient {
 }
 
 impl SimClient {
-    pub async fn drive_until<F>(
+    pub async fn drive(&mut self, token: CancellationToken) -> anyhow::Result<AgentStats> {
+        self.drive_until_cancelled(token, |_| false).await
+    }
+
+    pub async fn drive_until_cancelled<F>(
         &mut self,
-        timeout: Duration,
+        token: CancellationToken,
         mut predicate: F,
     ) -> anyhow::Result<AgentStats>
     where
         F: FnMut(&AgentStats) -> bool,
     {
-        // Use real wall-clock time for the timeout check so the test does not hang
-        // if the tokio time driver is paused or controlled by the simulation.
-        let start = std::time::Instant::now();
         let mut check_interval = tokio::time::interval(Duration::from_millis(200));
-
         loop {
-            if start.elapsed() > timeout {
-                let stats = self.agent.get_stats().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
-                    self.ip,
-                    stats,
-                    self.discovered_tracks,
-                    self.remote_tracks
-                );
-            }
-
             tokio::select! {
+                _ = token.cancelled() => {
+                    let stats = self.agent.get_stats().await.unwrap_or_default();
+                    return Ok(stats);
+                }
                 Some(event) = self.agent.next_event() => {
                     match event {
                         AgentEvent::LocalTrackAdded(sender) => {
@@ -113,19 +107,42 @@ impl SimClient {
                         }
                         AgentEvent::RemoteTrackAdded(recv) => {
                             tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
-                            self.remote_tracks
-                                .push((recv.mid, recv.track.id.clone()));
+                            self.remote_tracks.push((recv.mid, recv.track.id.clone()));
                         }
                         _ => {}
                     }
                 }
-
                 _ = check_interval.tick() => {
                     if let Some(stats) = self.agent.get_stats().await && predicate(&stats) {
                         return Ok(stats);
                     }
                 }
             }
+        }
+    }
+
+    pub async fn drive_until<F>(
+        &mut self,
+        timeout: Duration,
+        predicate: F,
+    ) -> anyhow::Result<AgentStats>
+    where
+        F: FnMut(&AgentStats) -> bool,
+    {
+        let token = CancellationToken::new();
+        let _guard = token.clone().drop_guard();
+        tokio::select! {
+            _ = tokio::time::sleep(timeout) => {
+                let stats = self.agent.get_stats().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
+                    self.ip,
+                    stats,
+                    self.discovered_tracks,
+                    self.remote_tracks
+                );
+            }
+            result = self.drive_until_cancelled(token, predicate) => result
         }
     }
 
