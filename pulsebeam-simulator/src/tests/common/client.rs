@@ -77,7 +77,19 @@ impl SimClient {
     }
 
     pub async fn drive_for(&mut self, timeout: Duration) -> anyhow::Result<AgentStats> {
-        self.drive_until(timeout, |_| false).await
+        let token = CancellationToken::new();
+        let mut driver = Box::pin(self.drive_until_cancelled(token.clone(), |_| false));
+
+        tokio::select! {
+            _ = tokio::time::sleep(timeout) => {
+                token.cancel();
+            }
+            res = &mut driver => {
+                return res;
+            }
+        }
+
+        driver.await
     }
 
     pub async fn drive_until<F>(
@@ -140,9 +152,17 @@ impl SimClient {
                         }
                         _ => {}
                     }
+
+                    // Re-check the predicate after processing an event, since a new
+                    // event may indicate the desired state has been reached.
+                    let stats = self.agent.get_stats().await.unwrap_or_default();
+                    if predicate(&stats) {
+                        return Ok(stats);
+                    }
                 }
                 _ = check_interval.tick() => {
-                    if let Some(stats) = self.agent.get_stats().await && predicate(&stats) {
+                    let stats = self.agent.get_stats().await.unwrap_or_default();
+                    if predicate(&stats) {
                         return Ok(stats);
                     }
                 }
@@ -363,19 +383,22 @@ mod connector {
             cx: &mut std::task::Context<'_>,
             mut buf: hyper::rt::ReadBufCursor<'_>,
         ) -> std::task::Poll<Result<(), Error>> {
-            let n = unsafe {
-                let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
-                let result = tokio::io::AsyncRead::poll_read(self.project().fut, cx, &mut tbuf);
-                match result {
-                    std::task::Poll::Ready(Ok(())) => tbuf.filled().len(),
-                    other => return other,
-                }
-            };
+            // Use a stack buffer for reads to avoid unsafe operations on the
+            // underlying `ReadBufCursor`. This avoids UB while allowing compatibility
+            // with Hyper's legacy runtime traits.
+            let mut temp = [0u8; 8192];
+            let mut tbuf = tokio::io::ReadBuf::new(&mut temp);
 
-            unsafe {
-                buf.advance(n);
+            match tokio::io::AsyncRead::poll_read(self.project().fut, cx, &mut tbuf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let n = tbuf.filled().len();
+                    if n > 0 {
+                        buf.put_slice(tbuf.filled());
+                    }
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
             }
-            std::task::Poll::Ready(Ok(()))
         }
     }
 

@@ -1,6 +1,5 @@
 use super::common;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
-use std::net::IpAddr;
 use std::time::Duration;
 
 #[test]
@@ -12,17 +11,16 @@ fn network_impairment_test() {
         .tick_duration(Duration::from_micros(100))
         .build();
 
-    let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
+    let subnet = common::reserve_subnet();
+    let server_ip = common::subnet_ip(subnet, 1);
+    let client_ip = common::subnet_ip(subnet, 2);
+
     sim.host(server_ip, move || async move {
         common::start_sfu_node(server_ip)
             .await
             .map_err(|e| e.into())
     });
 
-    let client_ip: IpAddr = "192.168.1.1".parse().unwrap();
-
-    // Configure network impairments
-    // Note: Turmoil allows configuring link characteristics.
     sim.client(client_ip, async move {
         let mut client = common::client::SimClientBuilder::bind(client_ip, server_ip)
             .await?
@@ -31,12 +29,26 @@ fn network_impairment_test() {
             .connect("room1")
             .await?;
 
-        // Drive for 30 seconds and check stats
-        client.drive_until(Duration::from_secs(30), |stats| {
-            let Some(peer) = &stats.peer else { return false; };
-            // Assert robustness: we should have some media flow even if impairments were present
-            peer.bytes_tx > 0
-        }).await?;
+        // Phase 1: verify baseline flow
+        client.drive_for(Duration::from_secs(30)).await?;
+        let stats = client.agent.get_stats().await.unwrap_or_default();
+        assert!(
+            stats.peer.as_ref().map_or(false, |p| p.peer_bytes_tx > 0),
+            "no outbound bytes after baseline drive"
+        );
+
+        // Phase 2: apply impairments and ensure we still see some flow.
+        turmoil::partition(client_ip, server_ip);
+        client.drive_for(Duration::from_secs(10)).await?;
+
+        // Phase 3: repair and ensure we can still send/receive.
+        turmoil::repair(client_ip, server_ip);
+        client.drive_for(Duration::from_secs(30)).await?;
+        let stats = client.agent.get_stats().await.unwrap_or_default();
+        assert!(
+            stats.peer.as_ref().map_or(false, |p| p.peer_bytes_tx > 0),
+            "no outbound bytes after repair"
+        );
 
         Ok(())
     });

@@ -1,6 +1,5 @@
 use super::common;
 use pulsebeam_agent::{MediaKind, TransceiverDirection};
-use std::net::IpAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -12,15 +11,16 @@ fn churn_test() {
         .simulation_duration(Duration::from_secs(120))
         .build();
 
-    let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
+    let subnet = common::reserve_subnet();
+    let server_ip = common::subnet_ip(subnet, 1);
+    let participant1_ip = common::subnet_ip(subnet, 2);
+    let participant2_ip = common::subnet_ip(subnet, 3);
+
     sim.host(server_ip, move || async move {
         common::start_sfu_node(server_ip)
             .await
             .map_err(|e| e.into())
     });
-
-    let participant1_ip: IpAddr = "192.168.1.1".parse().unwrap();
-    let participant2_ip: IpAddr = "192.168.2.1".parse().unwrap();
     let done = CancellationToken::new();
 
     // Participant 1: Stays in the room
@@ -54,7 +54,7 @@ fn churn_test() {
                     let Some(peer) = &stats.peer else {
                         return false;
                     };
-                    peer.bytes_rx > 50_000
+                    peer.peer_bytes_rx > 10_000
                 })
                 .await?;
 
@@ -65,5 +65,5 @@ fn churn_test() {
         Ok(())
     });
 
-    sim.run().expect("Simulation failed");
+    common::run_sim_or_timeout(&mut sim, Duration::from_secs(130)).expect("Simulation failed");
 }

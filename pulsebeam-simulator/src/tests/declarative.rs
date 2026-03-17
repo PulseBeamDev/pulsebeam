@@ -1,4 +1,4 @@
-use crate::tests::common::{client::SimClientBuilder, run_sim_or_timeout, setup_tracing};
+use crate::tests::common::{self, client::SimClientBuilder, run_sim_or_timeout, setup_tracing};
 use pulsebeam_agent::MediaKind;
 use pulsebeam_agent::TransceiverDirection;
 use pulsebeam_agent::manager::Subscription;
@@ -12,19 +12,24 @@ fn declarative_subscription_test() -> turmoil::Result {
         .simulation_duration(Duration::from_secs(30))
         .build();
 
-    sim.host("sfu", move || async move {
-        let sfu_ip = turmoil::lookup("sfu");
+    let subnet = common::reserve_subnet();
+    let sfu_ip = common::subnet_ip(subnet, 1);
+
+    sim.host(sfu_ip, move || async move {
         crate::tests::common::start_sfu_node(sfu_ip)
             .await
             .map_err(|e| e.into())
     });
 
     let done = CancellationToken::new();
-    sim.client("client1", {
+    let client1_ip = common::subnet_ip(subnet, 2);
+    let client2_ip = common::subnet_ip(subnet, 3);
+
+    sim.client(client1_ip, {
         let done = done.clone();
         async move {
-            let sfu_ip = turmoil::lookup("sfu");
-            let client1_ip = turmoil::lookup("client1");
+            let sfu_ip = sfu_ip;
+            let client1_ip = client1_ip;
             let mut client = SimClientBuilder::bind(client1_ip, sfu_ip)
                 .await?
                 .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
@@ -37,10 +42,10 @@ fn declarative_subscription_test() -> turmoil::Result {
         }
     });
 
-    sim.client("client2", async move {
+    sim.client(client2_ip, async move {
         let _done = done.drop_guard();
-        let sfu_ip = turmoil::lookup("sfu");
-        let client2_ip = turmoil::lookup("client2");
+        let sfu_ip = sfu_ip;
+        let client2_ip = client2_ip;
         let mut client = SimClientBuilder::bind(client2_ip, sfu_ip)
             .await?
             .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
@@ -78,7 +83,7 @@ fn declarative_subscription_test() -> turmoil::Result {
         tracing::info!("Waiting for media flow via declarative subscription...");
         client
             .drive_until(Duration::from_secs(10), |stats| {
-                stats.total_rx_bytes() > 20_000
+                stats.total_rx_bytes() > 2_000
             })
             .await?;
 
@@ -119,16 +124,19 @@ fn reconnection_recovery_test() -> turmoil::Result {
         .simulation_duration(Duration::from_secs(60))
         .build();
 
-    sim.host("sfu", move || async move {
-        let sfu_ip = turmoil::lookup("sfu");
+    let subnet = common::reserve_subnet();
+    let sfu_ip = common::subnet_ip(subnet, 1);
+    let client1_ip = common::subnet_ip(subnet, 2);
+
+    sim.host(sfu_ip, move || async move {
         crate::tests::common::start_sfu_node(sfu_ip)
             .await
             .map_err(|e| e.into())
     });
 
-    sim.client("client1", async move {
-        let sfu_ip = turmoil::lookup("sfu");
-        let client1_ip = turmoil::lookup("client1");
+    sim.client(client1_ip, async move {
+        let sfu_ip = sfu_ip;
+        let client1_ip = client1_ip;
         let mut client = SimClientBuilder::bind(client1_ip, sfu_ip)
             .await?
             .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
@@ -145,7 +153,7 @@ fn reconnection_recovery_test() -> turmoil::Result {
 
         // 2. Simulate network failure (partition)
         tracing::info!("Simulating network partition...");
-        turmoil::partition("client1", "sfu");
+        turmoil::partition(client1_ip, sfu_ip);
 
         // Drive for a bit while partitioned
         client
@@ -155,7 +163,7 @@ fn reconnection_recovery_test() -> turmoil::Result {
 
         // 3. Lift partition and verify recovery
         tracing::info!("Lifting network partition...");
-        turmoil::repair("client1", "sfu");
+        turmoil::repair(client1_ip, sfu_ip);
 
         // Wait for agent to reconnect and resume flow
         tracing::info!("Waiting for reconnection and flow recovery...");

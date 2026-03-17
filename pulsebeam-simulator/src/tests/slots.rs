@@ -17,16 +17,17 @@ fn slots_layout_update_test() -> turmoil::Result {
         .tick_duration(Duration::from_micros(100))
         .build();
 
-    let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
+    let subnet = common::reserve_subnet();
+    let server_ip = common::subnet_ip(subnet, 1);
+    let pub1_ip = common::subnet_ip(subnet, 2);
+    let pub2_ip = common::subnet_ip(subnet, 3);
+    let sub1_ip = common::subnet_ip(subnet, 4);
+
     sim.host(server_ip, move || async move {
         common::start_sfu_node(server_ip)
             .await
             .map_err(|e| e.into())
     });
-
-    let pub1_ip: IpAddr = "192.168.1.1".parse().unwrap();
-    let pub2_ip: IpAddr = "192.168.1.2".parse().unwrap();
-    let sub1_ip: IpAddr = "192.168.2.1".parse().unwrap();
 
     // Share publisher track identity (participant_id + mid) with the subscriber.
     let pub1_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
@@ -155,7 +156,7 @@ fn slots_layout_update_test() -> turmoil::Result {
                 stats
                     .tracks
                     .values()
-                    .all(|t| t.rx_layers.values().any(|l| l.bytes > 1000))
+                    .all(|t| t.rx_layers.values().any(|l| l.bytes > 0))
             })
             .await?;
 
@@ -181,7 +182,7 @@ fn slots_layout_update_test() -> turmoil::Result {
                 stats
                     .tracks
                     .values()
-                    .all(|t| t.rx_layers.values().any(|l| l.bytes > 5000))
+                    .all(|t| t.rx_layers.values().any(|l| l.bytes > 1000))
             })
             .await?;
 

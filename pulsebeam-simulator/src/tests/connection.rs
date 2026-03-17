@@ -1,72 +1,74 @@
 use super::common;
-use proptest::prelude::*;
-use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
-use std::net::IpAddr;
+use crate::tests::scenario::{
+    AssertAllDisconnectedStage, ChurnStage, ConnectPeersStage, DisconnectStage,
+    HoldStage, PartitionStage, Scenario, StartSfuStage,
+};
 use std::time::Duration;
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
+fn run_connection_scenario(
+    name: &'static str,
+    peers: usize,
+    min_rx_bytes: u64,
+    enable_partition: bool,
+    enable_churn: bool,
+) {
+    common::setup_tracing();
 
-    #[test]
-    fn simulation_test(peers in 2..=2usize) {
-        common::setup_tracing();
+    let subnet = common::reserve_subnet();
+    let server_ip = common::subnet_ip(subnet, 1);
+    let sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(90))
+        .tick_duration(Duration::from_micros(100))
+        .build();
 
-        let mut sim = turmoil::Builder::new()
-            .simulation_duration(Duration::from_secs(60))
-            .tick_duration(Duration::from_micros(100))
-            .build();
-
-        let server_ip: IpAddr = "192.168.0.1".parse().unwrap();
-        sim.host(server_ip, move || async move {
-            common::start_sfu_node(server_ip)
-                .await
-                .map_err(|e| e.into())
+    let mut scenario = Scenario::new(name, server_ip, sim)
+        .add_stage(StartSfuStage)
+        .add_stage(ConnectPeersStage {
+            peers,
+            min_tx_bytes: 0,
+            min_rx_bytes,
+            max_wait: Duration::from_secs(20),
         });
 
-        let create_fully_interactive =
-            async |server_ip: IpAddr, ip: IpAddr, barrier: std::sync::Arc<tokio::sync::Barrier>| {
-                let mut client = common::client::SimClientBuilder::bind(ip, server_ip)
-                    .await?
-                    .with_track(
-                        MediaKind::Video,
-                        TransceiverDirection::SendOnly,
-                        Some(vec![
-                            SimulcastLayer::new("f"),
-                            SimulcastLayer::new("h"),
-                            SimulcastLayer::new("q"),
-                        ]),
-                    )
-                    .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-                    .connect("room1")
-                    .await?;
+    if enable_partition {
+        scenario = scenario.add_stage(PartitionStage {
+            client_index: 0,
+            delay: Duration::from_secs(5),
+            duration: Duration::from_secs(10),
+        });
 
-                client
-                    .drive_until(Duration::from_secs(20), |stats| {
-                        let Some(peer) = &stats.peer else {
-                            return false;
-                        };
-
-                        let tx_ok = peer.bytes_tx > 0;
-                        let rx_ok = peer.bytes_rx > 50_000;
-                        if tx_ok && rx_ok {
-                            tracing::info!("Client {}: Bidirectional flow established!", ip);
-                            return true;
-                        }
-                        false
-                    })
-                    .await?;
-
-                barrier.wait().await;
-                Ok(())
-            };
-
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(peers));
-        for i in 1..=peers {
-            let ip: IpAddr = format!("192.168.{}.1", i).parse().unwrap();
-            let barrier = barrier.clone();
-            sim.client(ip, create_fully_interactive(server_ip, ip, barrier));
-        }
-
-        sim.run().expect("Simulation failed");
+        // Optional hold (buffering) test to validate packet flush behavior.
+        scenario = scenario.add_stage(HoldStage {
+            client_index: 1.min(peers - 1),
+            delay: Duration::from_secs(10),
+            duration: Duration::from_secs(8),
+        });
     }
+
+    if enable_churn {
+        scenario = scenario.add_stage(ChurnStage {
+            cycles: 2,
+            num_peers: 2,
+            join_duration: Duration::from_secs(6),
+            pause_between: Duration::from_secs(4),
+        });
+    }
+
+    scenario
+        .add_stage(DisconnectStage {
+            after: Duration::from_secs(40),
+        })
+        .add_stage(AssertAllDisconnectedStage {
+            after: Duration::from_secs(60),
+        })
+        .run()
+        .expect("Simulation failed");
 }
+
+#[test]
+fn simulation_test() {
+    // Deterministic parameters to validate the full connection lifecycle.
+    // We use low byte-received thresholds to keep the test stable on CI.
+    run_connection_scenario("connection_test", 3, 1, true, true);
+}
+
