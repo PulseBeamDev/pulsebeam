@@ -1,3 +1,8 @@
+## [pulsebeam-v0.3.5] - 2026-03-18
+
+### 🐛 Bug Fixes
+
+- Audio loopback
 ## [pulsebeam-v0.3.4] - 2026-03-18
 
 ### 🚀 Features
