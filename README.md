@@ -37,12 +37,12 @@ The following quickstart assumes that you have a Linux machine. As a fallback, y
 **Docker/Podman (recommended):**
 
 ```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.3.1 --dev
+docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.3.4 --dev
 ```
 
 **Open Port Requirements:**
 
-- **TCP/3000:** HTTP signaling
+- **TCP/7070:** HTTP signaling
 - **UDP/3478:** WebRTC traffic (Multiplexed)
 - **TCP/3478:** WebRTC over TCP fallback (Multiplexed)
 
