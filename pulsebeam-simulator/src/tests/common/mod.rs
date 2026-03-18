@@ -47,7 +47,7 @@ pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> an
     let rtc_port = 3478;
     let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
-    let http_api_addr: SocketAddr = "0.0.0.0:3000".parse()?;
+    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
         .workers(1)

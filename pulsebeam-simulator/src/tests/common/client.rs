@@ -9,7 +9,6 @@ use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::net::IpAddr;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -21,7 +20,7 @@ pub struct SimClientBuilder {
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
-        let server_base_uri = format!("http://{}:3000", server_ip);
+        let server_base_uri = format!("http://{}:7070", server_ip);
         let api = HttpApiClient::new(client, &server_base_uri)?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;

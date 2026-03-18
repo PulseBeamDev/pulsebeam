@@ -25,7 +25,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 struct Cli {
-    #[arg(short, long, default_value = "http://localhost:3000")]
+    #[arg(short, long, default_value = "http://localhost:7070")]
     api_url: String,
     #[command(subcommand)]
     command: Commands,

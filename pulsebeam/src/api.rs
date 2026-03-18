@@ -62,7 +62,7 @@ impl ParticipantResponseHeaders {
 #[derive(Clone)]
 pub struct ApiConfig {
     pub base_path: String,    // e.g. "/api/v1"
-    pub default_host: String, // fallback if no Host header, e.g. "localhost:3000"
+    pub default_host: String, // fallback if no Host header, e.g. "localhost:7070"
 }
 
 /// Error type for api operations

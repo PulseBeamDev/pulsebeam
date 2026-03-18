@@ -74,7 +74,7 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let external_ip = pulsebeam_runtime::system::select_host_address();
     let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
-    let http_api_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse().unwrap();
     let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
 
     // Eagerly warm the RTP payload pool so the first packets don't hit jemalloc.
