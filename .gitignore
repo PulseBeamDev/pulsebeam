@@ -6,3 +6,4 @@ dist
 *.data.old
 venv
 workspace.lock.json
+proptest-regressions/

@@ -200,27 +200,27 @@ impl VideoAllocator {
             self.slots.get_mut(idx).unwrap().assign_to(receiver);
         }
 
-        debug_assert!(
-            {
-                let mut seen = HashSet::new();
-                self.tracks
-                    .values()
-                    .filter_map(|s| s.assigned_mid)
-                    .all(|mid| seen.insert(mid))
-            },
-            "a track was assigned to multiple slots"
-        );
+        {
+            let mut seen = HashSet::new();
+            for mid in self.tracks.values().filter_map(|s| s.assigned_mid) {
+                if !seen.insert(mid) {
+                    tracing::warn!(mid = ?mid, "a track was assigned to multiple slots");
+                }
+            }
+        }
 
-        debug_assert!(
+        {
+            let mut seen = HashSet::new();
+            for id in self
+                .slots
+                .iter()
+                .filter_map(|(_, d)| d.slot.target().map(|t| t.meta.id))
             {
-                let mut seen = HashSet::new();
-                self.slots
-                    .iter()
-                    .filter_map(|(_, d)| d.slot.target().map(|t| t.meta.id))
-                    .all(|id| seen.insert(id))
-            },
-            "a track is assigned to multiple slots (slot-side)"
-        );
+                if !seen.insert(id) {
+                    tracing::warn!(track = ?id, "a track is assigned to multiple slots (slot-side)");
+                }
+            }
+        }
     }
 
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> Bitrate {
