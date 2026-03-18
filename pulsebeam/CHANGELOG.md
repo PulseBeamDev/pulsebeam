@@ -1,3 +1,33 @@
+## [pulsebeam-v0.3.4] - 2026-03-18
+
+### 🚀 Features
+
+- Use connection_id as etag
+- Use memory pool
+
+### 🐛 Bug Fixes
+
+- Inverted power of 2 spmc
+- Missing hex for test
+- Unit and sim tests
+- Incorrect hysteresis cost
+- Remove unsupported mpsc tests
+- Axum task leaks
+- Missing console_subscriber on default
+- Potential spin loop on large switching
+- Missing budget sub
+- Sim tests
+- Some warnings
+- Missing waker on spmc
+- Loom spmc tests
+- Missing presorted slot views
+- Undefined quality bug
+- Stuck stream state transition
+
+### 💼 Other
+
+- Add participanttaskresult type
+- Define runnable first
 ## [pulsebeam-v0.3.3] - 2026-01-28
 
 ### 🚀 Features
@@ -25,6 +55,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump to 0.3.3
+- Release
 ## [pulsebeam-v0.3.1] - 2025-12-29
 
 ### 🚀 Features
