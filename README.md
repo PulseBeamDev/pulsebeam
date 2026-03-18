@@ -37,7 +37,7 @@ The following quickstart assumes that you have a Linux machine. As a fallback, y
 **Docker/Podman (recommended):**
 
 ```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.3.4 --dev
+docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.3.5 --dev
 ```
 
 **Open Port Requirements:**
