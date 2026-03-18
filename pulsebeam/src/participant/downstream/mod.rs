@@ -2,6 +2,7 @@ mod audio;
 mod video;
 
 use crate::audio_selector::AudioSelectorSubscription;
+use crate::entity::ParticipantId;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
 use crate::rtp::RtpPacket;
@@ -26,10 +27,10 @@ pub struct DownstreamAllocator {
 }
 
 impl DownstreamAllocator {
-    pub fn new(manual_sub: bool) -> Self {
+    pub fn new(participant_id: ParticipantId, manual_sub: bool) -> Self {
         Self {
             available_bandwidth: MIN_BANDWIDTH,
-            audio: AudioAllocator::new(),
+            audio: AudioAllocator::new(participant_id),
             video: VideoAllocator::new(manual_sub),
             dirty_allocation: false,
         }

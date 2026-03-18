@@ -5,9 +5,10 @@ use std::task::{Context, Poll};
 
 use crate::audio_selector::AudioSelectorSubscription;
 use crate::controller::MAX_SEND_AUDIO_SLOTS;
+use crate::entity::ParticipantId;
 use crate::rtp;
-use crate::rtp::RtpPacket;
 use crate::rtp::timeline::Timeline;
+use crate::rtp::{AudioRtpPacket, RtpPacket};
 use str0m::media::Mid;
 use str0m::rtp::Ssrc;
 
@@ -18,6 +19,7 @@ use str0m::rtp::Ssrc;
 /// every audio `Mid` negotiated with the client.  The allocator pairs each
 /// slot index with the matching subscription receiver index.
 pub struct AudioAllocator {
+    participant_id: ParticipantId,
     /// One stream per negotiated audio Mid.  Each stream wraps one selector
     /// output receiver + one `AudioSlot` (timeline rewriter).
     ///
@@ -37,8 +39,9 @@ pub struct AudioAllocator {
 }
 
 impl AudioAllocator {
-    pub fn new() -> Self {
+    pub fn new(participant_id: ParticipantId) -> Self {
         Self {
+            participant_id,
             slots: SlotGroup::with_capacity(MAX_SEND_AUDIO_SLOTS),
             pending_sub: None,
         }
@@ -67,7 +70,11 @@ impl AudioAllocator {
     /// regardless of the Top-N ranking.  Returns `false` if `slot_index` has
     /// not yet been registered via [`add_slot`].
     #[allow(unused)]
-    pub fn pin_slot(&mut self, slot_index: usize, receiver: spmc::Receiver<RtpPacket>) -> bool {
+    pub fn pin_slot(
+        &mut self,
+        slot_index: usize,
+        receiver: spmc::Receiver<AudioRtpPacket>,
+    ) -> bool {
         let Some(mut stream) = self.slots.get_mut(slot_index) else {
             return false;
         };
@@ -113,9 +120,20 @@ impl AudioAllocator {
     #[inline]
     pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Mid, RtpPacket)>> {
         use futures_lite::stream::Stream as _;
-        match Pin::new(&mut self.slots).poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
-            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+
+        // Drop packets that originate from this participant to avoid sending
+        // loopback audio back to the sender.
+        loop {
+            match Pin::new(&mut self.slots).poll_next(cx) {
+                Poll::Ready(Some((mid, packet))) => {
+                    if packet.participant_id == self.participant_id {
+                        // Keep draining until we find a packet from another participant.
+                        continue;
+                    }
+                    return Poll::Ready(Some((mid, packet.packet)));
+                }
+                Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
@@ -132,7 +150,7 @@ impl AudioAllocator {
 /// the session lifetime; only the underlying receiver is swapped on
 /// subscription/pin changes.
 struct AudioInputStream {
-    receiver: Option<spmc::Receiver<RtpPacket>>,
+    receiver: Option<spmc::Receiver<AudioRtpPacket>>,
     slot: AudioSlot,
 }
 
@@ -147,14 +165,14 @@ impl AudioInputStream {
     /// Swap in a new receiver and reset the timeline so the SSRC-change
     /// detection in `AudioSlot::process` triggers a clean rebase on the
     /// first packet from the new source.
-    fn set_receiver(&mut self, receiver: spmc::Receiver<RtpPacket>) {
+    fn set_receiver(&mut self, receiver: spmc::Receiver<AudioRtpPacket>) {
         self.receiver = Some(receiver);
         self.slot.last_ssrc = None;
     }
 }
 
 impl futures_lite::stream::Stream for AudioInputStream {
-    type Item = (Mid, RtpPacket);
+    type Item = (Mid, AudioRtpPacket);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -203,11 +221,12 @@ impl AudioSlot {
         }
     }
 
-    fn process(&mut self, packet: RtpPacket) -> (Mid, RtpPacket) {
-        if self.last_ssrc != Some(packet.ssrc) {
-            self.last_ssrc = Some(packet.ssrc);
-            self.timeline.rebase(&packet);
+    fn process(&mut self, mut p: AudioRtpPacket) -> (Mid, AudioRtpPacket) {
+        if self.last_ssrc != Some(p.packet.ssrc) {
+            self.last_ssrc = Some(p.packet.ssrc);
+            self.timeline.rebase(&p.packet);
         }
-        (self.mid, self.timeline.rewrite(packet))
+        p.packet = self.timeline.rewrite(p.packet);
+        (self.mid, p)
     }
 }

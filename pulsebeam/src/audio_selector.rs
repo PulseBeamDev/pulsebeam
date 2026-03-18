@@ -1,4 +1,3 @@
-
 //! Room-level Top-N audio selector.
 //!
 //! A single async task per room that:
@@ -50,12 +49,14 @@ use std::{
 use futures_concurrency::stream::StreamGroup;
 use futures_concurrency::stream::stream_group::Key;
 use futures_lite::stream::Stream as _;
-use pulsebeam_runtime::sync::spmc;
+use pulsebeam_runtime::sync::{Arc, spmc};
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
-    controller::MAX_SEND_AUDIO_SLOTS, entity::TrackId, rtp::RtpPacket, rtp::monitor::StreamState,
-    track::TrackReceiver,
+    controller::MAX_SEND_AUDIO_SLOTS,
+    entity::TrackId,
+    rtp::{AudioRtpPacket, RtpPacket, monitor::StreamState},
+    track::{TrackMeta, TrackReceiver},
 };
 
 /// Number of output slots produced by the selector; matches the controller's
@@ -84,7 +85,7 @@ pub struct AudioSelectorSubscription {
     /// slots.  Slot 0 is the loudest speaker, slot 1 the second-loudest, etc.
     /// (assignments shift after each re-rank, but the slot ordering is stable
     /// within a re-rank window).
-    pub receivers: Vec<spmc::Receiver<RtpPacket>>,
+    pub receivers: Vec<spmc::Receiver<AudioRtpPacket>>,
 }
 
 /// Room-side handle: send track commands and create per-participant subscriptions.
@@ -92,7 +93,7 @@ pub struct AudioSelectorHandle {
     /// Send [`AudioSelectorCmd`]s to the background task.
     pub cmd_tx: mpsc::Sender<AudioSelectorCmd>,
     /// One prototype receiver per slot; cloned for every subscriber.
-    receivers: Vec<spmc::Receiver<RtpPacket>>,
+    receivers: Vec<spmc::Receiver<AudioRtpPacket>>,
 }
 
 impl AudioSelectorHandle {
@@ -129,7 +130,7 @@ pub fn create(
     for _ in 0..SELECTOR_SLOTS {
         // 256-packet ring per slot.  At 50 pkt/s that is 5 s of runway;
         // enough to absorb any downstream stall without dropping audio.
-        let (tx, rx) = spmc::channel::<RtpPacket>(256);
+        let (tx, rx) = spmc::channel::<AudioRtpPacket>(256);
         senders.push(tx);
         receivers.push(rx);
     }
@@ -162,6 +163,7 @@ struct InputTrackMeta {
     /// Shared speech-intensity state maintained by the upstream `StreamMonitor`.
     /// Atomic loads — zero overhead on the hot path.
     state: StreamState,
+    meta: Arc<TrackMeta>,
 }
 
 /// One `spmc` receiver wrapped as a `Stream<Item=(TrackId, RtpPacket)>` so it
@@ -213,7 +215,7 @@ impl futures_lite::stream::Stream for InputStream {
 /// One of the N output slots produced by the selector.
 struct OutputSlot {
     /// Broadcast channel; all participant subscriptions share the same ring.
-    sender: spmc::Sender<RtpPacket>,
+    sender: spmc::Sender<AudioRtpPacket>,
     /// Which input track is currently assigned to this slot.
     track_id: Option<TrackId>,
 }
@@ -310,12 +312,13 @@ impl TopNAudioSelector {
                 }
                 let sim = track.lowest_quality();
                 let state = sim.state.clone();
+                let meta = track.meta.clone();
                 let receiver = sim.channel.clone();
                 let key = self.inputs.insert(InputStream {
                     track_id: id,
                     receiver,
                 });
-                self.tracks.insert(id, InputTrackMeta { key, state });
+                self.tracks.insert(id, InputTrackMeta { key, state, meta });
             }
             AudioSelectorCmd::RemoveTrack(id) => {
                 self.remove_track(id);
@@ -342,9 +345,19 @@ impl TopNAudioSelector {
     /// only occurs in the ≤200 ms window between a speaker becoming active and
     /// the next re-rank pass assigning them a slot.
     fn forward(&mut self, track_id: TrackId, packet: RtpPacket) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.track_id == Some(track_id)) {
-            slot.sender.send(packet);
-        }
+        let Some(slot) = self.slots.iter_mut().find(|s| s.track_id == Some(track_id)) else {
+            return;
+        };
+
+        let Some(track) = self.tracks.get(&track_id) else {
+            return;
+        };
+
+        slot.sender.send(AudioRtpPacket {
+            participant_id: track.meta.origin_participant,
+            track_id,
+            packet,
+        });
     }
 
     // ── Re-ranking ────────────────────────────────────────────────────────────

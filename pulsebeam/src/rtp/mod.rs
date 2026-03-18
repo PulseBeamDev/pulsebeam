@@ -12,6 +12,8 @@ use str0m::rtp::rtcp::SenderInfo;
 use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tokio::time::Instant;
 
+use crate::entity::{ParticipantId, TrackId};
+
 /// Pool capacity: 16 384 slots × 2 048 bytes ≈ 32 MB resident.
 ///
 /// Trade memory for zero jemalloc on the hot path. RTP payload pool and
@@ -41,6 +43,13 @@ pub enum Codec {
     Opus,
 }
 
+#[derive(Clone, Debug)]
+pub struct AudioRtpPacket {
+    pub participant_id: ParticipantId,
+    pub track_id: TrackId,
+    pub packet: RtpPacket,
+}
+
 /// Unified internal RTP packet representation used across the SFU.
 /// This struct is designed for mutability and composition in middleware.
 /// Only the fields actually consumed by the forwarding pipeline are kept here;
@@ -48,9 +57,6 @@ pub enum Codec {
 /// at ingress so every ring-slot stays as small as possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpPacket {
-    // NOTE: `payload` is a `PoolBuf` — a custom Arc-like handle backed by
-    // `rtp_payload_pool()`.  `.clone()` is a single atomic increment with no
-    // heap allocation, making SPMC fan-out essentially free.
     pub ssrc: Ssrc,
     pub marker: bool,
     pub ext_vals: ExtensionValues,

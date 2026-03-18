@@ -111,7 +111,7 @@ impl ParticipantCore {
             udp_batcher,
             tcp_batcher,
             upstream: UpstreamAllocator::new(),
-            downstream: DownstreamAllocator::new(manual_sub),
+            downstream: DownstreamAllocator::new(participant_id, manual_sub),
             slot_meta: HashMap::new(),
             disconnect_reason: None,
             events: Vec::with_capacity(32),
