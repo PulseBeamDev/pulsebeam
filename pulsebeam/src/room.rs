@@ -1,22 +1,20 @@
 use ahash::{HashMap, HashMapExt};
 use pulsebeam_runtime::sync::Arc;
-use std::pin::Pin;
 use std::{collections::BTreeMap, time::Duration};
 
 use pulsebeam_runtime::{
-    actor::{ActorKind, ActorStatus, RunnerConfig},
+    actor::{ActorKind},
     prelude::*,
 };
-use tokio::task::JoinSet;
 
 use crate::{
     audio_selector::{self, AudioSelectorHandle},
     entity::{ConnectionId, ParticipantId, RoomId, TrackId},
+    gateway::GatewayControlMessage,
     node,
-    participant::{self, ParticipantActor},
+    participant::{self},
     track::{self},
 };
-use futures_util::FutureExt;
 use pulsebeam_runtime::actor;
 use str0m::media::MediaKind;
 
@@ -30,7 +28,8 @@ pub enum RoomMessage {
 }
 
 pub struct AddParticipant {
-    pub participant: ParticipantActor,
+    pub participant_id: ParticipantId,
+    pub ufrag: String,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
 }
@@ -41,7 +40,7 @@ pub struct RemoveParticipant {
 
 #[derive(Clone, Debug)]
 pub struct ParticipantMeta {
-    handle: participant::ParticipantHandle,
+    ufrag: String,
     tracks: HashMap<TrackId, track::TrackReceiver>,
     _connection_id: ConnectionId,
 }
@@ -54,14 +53,11 @@ impl actor::MessageSet for RoomMessageSet {
     type ObservableState = RoomState;
 }
 
-type ParticipantTaskResult = (ParticipantId, ConnectionId, ActorStatus);
-type PinnedParticipantTask = Pin<Box<dyn Future<Output = ParticipantTaskResult> + Send + 'static>>;
-
 pub struct RoomActor {
     _node_ctx: node::NodeContext,
     room_id: RoomId,
     state: RoomState,
-    participant_tasks: JoinSet<ParticipantTaskResult>,
+    gateway: crate::gateway::GatewayHandle,
     /// Room-level Top-N audio selector.  Holds the command sender; dropping
     /// this field shuts down the background selector task.
     audio_selector: AudioSelectorHandle,
@@ -99,13 +95,6 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
     ) -> Result<(), actor::ActorError> {
         pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
             select: {
-                Some(Ok((participant_id, connection_id, _))) = self.participant_tasks.join_next() => {
-                    self.handle_participant_left(participant_id, connection_id).await;
-                }
-                _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
-                    tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
-                    break;
-                }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     self.cleanup_old_tombstones().await;
                 }
@@ -125,14 +114,14 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
                 if let Some(old_connection_id) = m.old_connection_id {
                     self.handle_replace_participant(
                         ctx,
-                        m.participant,
+                        m.participant_id,
+                        m.ufrag.clone(),
                         old_connection_id,
                         m.connection_id,
                     )
                     .await;
                 } else {
-                    self.handle_participant_joined(ctx, m.participant, m.connection_id)
-                        .await;
+                    self.handle_participant_joined(ctx, m.participant_id, m.ufrag.clone(), m.connection_id).await;
                 }
             }
             RoomMessage::RemoveParticipant(m) => {
@@ -150,11 +139,12 @@ impl RoomActor {
     pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
         let (audio_selector, selector_task) = audio_selector::create(64);
         tokio::task::spawn_local(selector_task);
+        let gateway_handle = node_ctx.gateway.clone();
         Self {
             _node_ctx: node_ctx,
             room_id,
             state: RoomState::default(),
-            participant_tasks: JoinSet::new(),
+            gateway: gateway_handle,
             audio_selector,
         }
     }
@@ -162,38 +152,33 @@ impl RoomActor {
     async fn handle_participant_joined(
         &mut self,
         _ctx: &mut actor::ActorContext<RoomMessageSet>,
-        participant_actor: ParticipantActor,
+        participant_id: ParticipantId,
+        ufrag: String,
         connection_id: ConnectionId,
     ) {
-        let (mut participant_handle, participant_task) =
-            actor::prepare(participant_actor, RunnerConfig::default());
-        let participant_id = participant_handle.meta;
-
-        self.participant_tasks
-            .spawn(participant_task.map(move |(id, status)| (id, connection_id, status)));
-
         self.state.participants.insert(
             (participant_id, connection_id),
             ParticipantMeta {
-                handle: participant_handle.clone(),
+                ufrag: ufrag.clone(),
                 tracks: HashMap::new(),
                 _connection_id: connection_id,
             },
         );
 
-        // Send current tracks to new participant.
-        let _ = participant_handle
-            .send(participant::ParticipantControlMessage::TracksSnapshot(
-                self.state.tracks.clone(),
+        let _ = self
+            .gateway
+            .send(GatewayControlMessage::ParticipantControl(
+                participant_id,
+                participant::ParticipantControlMessage::TracksSnapshot(self.state.tracks.clone()),
             ))
             .await;
 
-        // Hand the participant its audio subscription so it can receive
-        // the Top-N pre-selected audio streams from the room selector.
         let sub = self.audio_selector.subscribe();
-        let _ = participant_handle
-            .send(participant::ParticipantControlMessage::AudioSubscription(
-                sub,
+        let _ = self
+            .gateway
+            .send(GatewayControlMessage::ParticipantControl(
+                participant_id,
+                participant::ParticipantControlMessage::AudioSubscription(sub),
             ))
             .await;
     }
@@ -215,7 +200,7 @@ impl RoomActor {
             return;
         }
 
-        let Some(mut participant) = self.state.participants.remove(&key) else {
+        let Some(participant_meta) = self.state.participants.remove(&key) else {
             tracing::warn!(
                 ?participant_id,
                 ?connection_id,
@@ -229,13 +214,15 @@ impl RoomActor {
             .tombstoned
             .insert(key, tokio::time::Instant::now());
 
-        // Terminate participant actor
-        let _ = participant.handle.terminate().await;
+        // Notify gateway to cleanup participant state
+        let _ = self
+            .gateway
+            .send(GatewayControlMessage::RemoveParticipant(participant_id))
+            .await;
 
         // Remove tracks published by this connection.
-        for (track_id, track) in participant.tracks.iter() {
+        for (track_id, track) in participant_meta.tracks.iter() {
             self.state.tracks.remove(track_id);
-            // Notify the audio selector to remove audio tracks.
             if track.meta.kind == MediaKind::Audio {
                 let _ = self
                     .audio_selector
@@ -244,8 +231,7 @@ impl RoomActor {
             }
         }
 
-        // Broadcast unpublish to other participants
-        let tracks = Arc::new(participant.tracks);
+        let tracks = Arc::new(participant_meta.tracks.clone());
         let msg = participant::ParticipantControlMessage::TracksUnpublished(tracks);
         self.broadcast_message(msg).await;
 
@@ -306,25 +292,24 @@ impl RoomActor {
     async fn handle_replace_participant(
         &mut self,
         ctx: &mut actor::ActorContext<RoomMessageSet>,
-        new_participant: ParticipantActor,
+        new_participant_id: ParticipantId,
+        new_ufrag: String,
         old_connection_id: ConnectionId,
         new_connection_id: ConnectionId,
     ) {
-        let participant_id = new_participant.meta();
-
         tracing::info!(
-            ?participant_id,
+            ?new_participant_id,
             ?old_connection_id,
             ?new_connection_id,
             "Replacing participant connection"
         );
 
         // Evict old connection
-        self.handle_participant_left(participant_id, old_connection_id)
+        self.handle_participant_left(new_participant_id, old_connection_id)
             .await;
 
         // Add new connection
-        self.handle_participant_joined(ctx, new_participant, new_connection_id)
+        self.handle_participant_joined(ctx, new_participant_id, new_ufrag, new_connection_id)
             .await;
     }
 
@@ -353,8 +338,14 @@ impl RoomActor {
     }
 
     async fn broadcast_message(&mut self, msg: participant::ParticipantControlMessage) {
-        for participant in self.state.participants.values_mut() {
-            let _ = participant.handle.send(msg.clone()).await;
+        for ((participant_id, _), _participant_meta) in self.state.participants.iter() {
+            let _ = self
+                .gateway
+                .send(GatewayControlMessage::ParticipantControl(
+                    *participant_id,
+                    msg.clone(),
+                ))
+                .await;
         }
     }
 }

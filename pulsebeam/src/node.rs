@@ -323,7 +323,7 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
 }
 
 mod internal {
-    use crate::{participant, room};
+    use crate::room;
 
     use super::*;
     use anyhow::Result;
@@ -445,10 +445,7 @@ mod internal {
                 controller::ControllerActor::monitor().intervals(),
             ),
             ("room", room::RoomActor::monitor().intervals()),
-            (
-                "participant",
-                participant::ParticipantActor::monitor().intervals(),
-            ),
+
         ];
 
         describe_gauge!(

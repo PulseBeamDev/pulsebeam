@@ -3,8 +3,9 @@ use std::{collections::HashMap, io, time::Duration};
 
 use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
+    gateway::GatewayControlMessage,
     node,
-    participant::ParticipantActor,
+    participant::Participant,
     room,
 };
 use pulsebeam_runtime::{
@@ -253,9 +254,8 @@ impl ControllerActor {
 
         let (rtc, answer) = self.create_answer(offer, &sockets)?;
         let mut room_handle = self.get_or_create_room(&s.room_id);
-        let gateway = self.node_ctx.gateway.clone();
-        let participant = ParticipantActor::new(
-            gateway,
+        let mut gateway = self.node_ctx.gateway.clone();
+        let mut participant = Participant::new(
             room_handle.clone(),
             udp_egress,
             tcp_egress,
@@ -263,12 +263,23 @@ impl ControllerActor {
             rtc,
             s.manual_sub,
         );
-        // TODO: probably retry? Or, let the client to retry instead?
-        // Each room will always have a graceful timeout before closing.
-        // But, a data race can still occur nonetheless
+
+        let ufrag = participant
+            .core
+            .rtc
+            .direct_api()
+            .local_ice_credentials()
+            .ufrag
+            .clone();
+
+        let _ = gateway
+            .send(GatewayControlMessage::AddParticipant(s.participant_id, participant))
+            .await;
+
         room_handle
             .send(room::RoomMessage::AddParticipant(room::AddParticipant {
-                participant,
+                participant_id: s.participant_id,
+                ufrag,
                 connection_id: s.connection_id,
                 old_connection_id: s.old_connection_id,
             }))

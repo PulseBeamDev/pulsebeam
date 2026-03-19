@@ -2,6 +2,7 @@ pub mod mpsc;
 pub mod pool_buf;
 pub mod slot_group;
 pub mod spmc;
+pub mod spsc;
 
 pub use pool_buf::{BufPool, MAX_PAYLOAD as POOL_MAX_PAYLOAD, PoolBuf, PoolBufMut};
 

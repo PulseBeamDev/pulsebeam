@@ -1,18 +1,20 @@
+use crate::entity::ParticipantId;
 use crate::gateway::demux::Demuxer;
+use crate::participant::Participant;
 use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::{actor, net};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io;
 use tokio::task::JoinSet;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum GatewayControlMessage {
-    AddParticipant(
-        String,
-        pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>,
-    ),
-    RemoveParticipant(String),
+    AddParticipant(ParticipantId, Participant),
+    RemoveParticipant(ParticipantId),
+    ParticipantControl(ParticipantId, crate::participant::ParticipantControlMessage),
 }
 
 pub struct GatewayMessageSet;
@@ -73,13 +75,25 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         _ctx: &mut actor::ActorContext<GatewayMessageSet>,
         msg: GatewayControlMessage,
     ) -> () {
-        for worker in &mut self.workers {
-            worker
-                .tx
-                .send(msg.clone())
-                .await
-                .expect("worker is alive until the controller has drained");
+        if self.workers.is_empty() {
+            return;
         }
+
+        let target_participant_id = match &msg {
+            GatewayControlMessage::AddParticipant(pid, _) => pid,
+            GatewayControlMessage::RemoveParticipant(pid) => pid,
+            GatewayControlMessage::ParticipantControl(pid, _) => pid,
+        };
+
+        let mut hasher = ahash::AHasher::default();
+        target_participant_id.hash(&mut hasher);
+        let worker_idx = (hasher.finish() as usize) % self.workers.len();
+
+        let _ = self.workers[worker_idx]
+            .tx
+            .send(msg)
+            .await
+            .expect("worker is alive until the controller has drained");
     }
 }
 
@@ -100,8 +114,11 @@ pub struct GatewayWorkerActor {
     id: usize,
     socket: net::UnifiedSocketReader,
     demuxer: Demuxer,
+    participants: HashMap<ParticipantId, Participant>,
+    participant_ufrags: HashMap<ParticipantId, String>,
     recv_batches: Vec<net::RecvPacketBatch>,
 }
+
 
 impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
     fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
@@ -139,11 +156,30 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
         msg: <GatewayMessageSet as actor::MessageSet>::Msg,
     ) -> () {
         match msg {
-            GatewayControlMessage::AddParticipant(ufrag, handle) => {
-                self.demuxer.register_ice_ufrag(ufrag.as_bytes(), handle);
+            GatewayControlMessage::AddParticipant(participant_id, mut participant) => {
+                let ufrag = participant
+                    .core
+                    .rtc
+                    .direct_api()
+                    .local_ice_credentials()
+                    .ufrag
+                    .clone();
+
+                self.demuxer
+                    .register_ice_ufrag(ufrag.as_bytes(), participant_id);
+                self.participant_ufrags.insert(participant_id, ufrag);
+                self.participants.insert(participant_id, participant);
             }
-            GatewayControlMessage::RemoveParticipant(ufrag) => {
-                self.demuxer.unregister(&mut self.socket, ufrag.as_bytes());
+            GatewayControlMessage::RemoveParticipant(participant_id) => {
+                if let Some(ufrag) = self.participant_ufrags.remove(&participant_id) {
+                    self.demuxer.unregister(&mut self.socket, ufrag.as_bytes());
+                }
+                self.participants.remove(&participant_id);
+            }
+            GatewayControlMessage::ParticipantControl(participant_id, msg) => {
+                if let Some(p) = self.participants.get_mut(&participant_id) {
+                    p.on_control_message(msg);
+                }
             }
         };
     }
@@ -156,8 +192,10 @@ impl GatewayWorkerActor {
         Self {
             id,
             socket,
-            recv_batches: recv_batch,
             demuxer: Demuxer::new(),
+            participants: HashMap::new(),
+            participant_ufrags: HashMap::new(),
+            recv_batches: recv_batch,
         }
     }
 
@@ -166,22 +204,11 @@ impl GatewayWorkerActor {
         // A yield every ~64 packets keeps latency low for other Tokio tasks.
         const COOP_BUDGET: usize = 64;
 
-        // When the highest observed participant queue fill ratio exceeds this,
-        // yield immediately regardless of how much budget remains. This gives
-        // participant actors a chance to drain before we push more data in and
-        // cause lag (packet loss inside the ring buffer).
-        const HIGH_WATER: f64 = 0.5;
-
-        // After a pressure-triggered yield, give participants up to this many
-        // additional scheduler turns to drain before resuming socket reads.
-        // Each extra yield is only taken while pressure remains above HIGH_WATER.
-        const MAX_PRESSURE_YIELDS: usize = 3;
 
         let mut spent_budget: usize = 0;
 
         loop {
             self.recv_batches.clear();
-            self.demuxer.reset_pressure();
 
             match self.socket.try_recv_batch(&mut self.recv_batches) {
                 Ok(_) => {
@@ -194,7 +221,14 @@ impl GatewayWorkerActor {
                         };
 
                         let src = batch.src;
-                        if !self.demuxer.demux(&mut self.socket, batch) {
+                        if let Some(participant_id) = self.demuxer.demux(&mut self.socket, &batch) {
+                            if let Some(participant) = self.participants.get_mut(&participant_id) {
+                                participant.on_udp_batch(batch);
+                                participant.poll();
+                            } else {
+                                self.socket.close_peer(&src);
+                            }
+                        } else {
                             // In case there's a malicious actor, close immediately as there's no
                             // associated participant.
                             self.socket.close_peer(&src);
@@ -204,25 +238,12 @@ impl GatewayWorkerActor {
                     }
 
                     // Check downstream health after dispatching the whole batch.
-                    // Yield outside the drain loop so we don't split a batch mid-way,
-                    // and so we can make a calmer, informed decision.
-                    let pressure = self.demuxer.pressure();
-                    let should_yield = pressure > HIGH_WATER || spent_budget >= COOP_BUDGET;
+                    // Yield outside the drain loop so we don't split a batch mid-way.
+                    let should_yield = spent_budget >= COOP_BUDGET;
 
                     if should_yield {
                         spent_budget = 0;
                         tokio::task::yield_now().await;
-
-                        // If participants are still congested after the first yield,
-                        // give them more scheduler turns before pulling more packets.
-                        // We re-read live fill ratios (not the cached max_pressure) so
-                        // we accurately reflect how much they've drained since we yielded.
-                        for _ in 0..MAX_PRESSURE_YIELDS {
-                            if self.demuxer.current_pressure() <= HIGH_WATER {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        }
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
