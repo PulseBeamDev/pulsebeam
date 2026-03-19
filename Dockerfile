@@ -14,5 +14,5 @@ RUN --mount=type=cache,target=/app/target \
 FROM gcr.io/distroless/cc-debian13:nonroot
 WORKDIR /app
 COPY --from=builder --chown=nonroot:nonroot /app/pulsebeam-bin /app/pulsebeam
-EXPOSE 3478/udp 3000
+EXPOSE 3478/udp 7070
 ENTRYPOINT ["/app/pulsebeam"]
