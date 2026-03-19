@@ -294,7 +294,7 @@ impl<T: Send> Stream for Receiver<T> {
     }
 }
 
-pub fn channel<T: Send + Sync + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+pub fn channel<T: 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     metrics::describe_histogram!(
         "mpsc_receive_drift_ratio",
         "The ratio of the buffer capacity currently occupied by unread packets \

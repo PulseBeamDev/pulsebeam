@@ -186,6 +186,23 @@ impl futures_lite::stream::Stream for InputStream {
         // InputStream is Unpin (all fields are Unpin), so get_mut is safe.
         let this = self.get_mut();
         loop {
+            // Fast path: stay local and avoid waker registration.
+            match this.receiver.try_recv() {
+                Ok(Some(pkt)) => return Poll::Ready(Some((this.track_id, pkt))),
+                Ok(None) => {}
+                Err(spmc::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        track_id = %this.track_id,
+                        skipped = n,
+                        "audio selector input lagging; retrying"
+                    );
+                    continue;
+                }
+                Err(spmc::RecvError::Closed) => {
+                    return Poll::Pending;
+                }
+            }
+
             match this.receiver.poll_recv(cx) {
                 Poll::Ready(Ok(pkt)) => {
                     return Poll::Ready(Some((this.track_id, pkt)));
@@ -196,14 +213,9 @@ impl futures_lite::stream::Stream for InputStream {
                         skipped = n,
                         "audio selector input lagging; retrying"
                     );
-                    // The receiver's position is now at the ring head.  Loop
-                    // to attempt another read immediately rather than parking
-                    // and requiring another wakeup cycle.
                     continue;
                 }
                 Poll::Ready(Err(spmc::RecvError::Closed)) => {
-                    // Sender dropped.  No waker will ever fire for this slot.
-                    // Stay Pending until explicit RemoveTrack + StreamGroup::remove.
                     return Poll::Pending;
                 }
                 Poll::Pending => return Poll::Pending,

@@ -149,7 +149,7 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 impl RoomActor {
     pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
         let (audio_selector, selector_task) = audio_selector::create(64);
-        tokio::spawn(selector_task);
+        tokio::task::spawn_local(selector_task);
         Self {
             _node_ctx: node_ctx,
             room_id,

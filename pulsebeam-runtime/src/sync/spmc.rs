@@ -1,6 +1,5 @@
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, RwLock};
-use event_listener::{Event, EventListener};
+use crate::sync::{Arc, AtomicWaker, RwLock};
 use futures_lite::Stream;
 use std::fmt::Debug;
 use std::pin::Pin;
@@ -27,7 +26,7 @@ struct Ring<T> {
     head: AtomicU64,
     mask: usize,
     slots: Vec<RwLock<Slot<T>>>,
-    event: Event,
+    waker: AtomicWaker,
     closed: AtomicU64,
 }
 
@@ -61,7 +60,7 @@ impl<T> Ring<T> {
             head: AtomicU64::new(0),
             mask: capacity - 1,
             slots,
-            event: Event::new(),
+            waker: AtomicWaker::new(),
             closed: AtomicU64::new(0),
         })
     }
@@ -92,14 +91,14 @@ impl<T> Sender<T> {
 
         self.local_head += 1;
         self.ring.head.store(self.local_head, Ordering::Release);
-        self.ring.event.notify(usize::MAX);
+        self.ring.waker.wake();
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.ring.closed.store(1, Ordering::Release);
-        self.ring.event.notify(usize::MAX);
+        self.ring.waker.wake();
     }
 }
 
@@ -108,7 +107,6 @@ pub struct Receiver<T> {
     ring: Arc<Ring<T>>,
     next_seq: u64,
     local_head: u64,
-    listener: Option<EventListener>,
     pkts_received: u64,
 }
 
@@ -119,7 +117,51 @@ impl<T: Clone> Receiver<T> {
     pub fn sync(&mut self) {
         self.local_head = self.ring.head.load(Ordering::Acquire);
         self.next_seq = self.local_head;
-        self.listener = None;
+    }
+
+    /// Non-blocking receive; returns `Ok(None)` if no data is currently available.
+    pub fn try_recv(&mut self) -> Result<Option<T>, RecvError> {
+        if self.next_seq >= self.local_head {
+            self.local_head = self.ring.head.load(Ordering::Acquire);
+        }
+
+        if self.next_seq >= self.local_head {
+            if self.ring.closed.load(Ordering::Acquire) == 1 {
+                return Err(RecvError::Closed);
+            }
+            return Ok(None);
+        }
+
+        let idx = (self.next_seq as usize) & self.ring.mask;
+        let (slot_seq, maybe_val) = {
+            let slot = self.ring.slots[idx].read();
+            (slot.seq, slot.val.clone())
+        };
+
+        if slot_seq != self.next_seq {
+            self.local_head = self.ring.head.load(Ordering::Acquire);
+            self.next_seq = self.local_head;
+            #[cfg(not(feature = "loom"))]
+            metrics::counter!("spmc_receive_lag_total").increment(1);
+            return Err(RecvError::Lagged(self.local_head));
+        }
+
+        let Some(out) = maybe_val else {
+            debug_assert!(false, "slot seq matched but val was None — ring invariant violated");
+            self.local_head = self.ring.head.load(Ordering::Acquire);
+            self.next_seq = self.local_head;
+            #[cfg(not(feature = "loom"))]
+            metrics::counter!("spmc_receive_lag_total").increment(1);
+            return Err(RecvError::Lagged(self.local_head));
+        };
+
+        self.next_seq += 1;
+        self.pkts_received += 1;
+        if (self.pkts_received & Self::METRIC_FLUSH_MASK) == 0 {
+            self.flush_metrics();
+        }
+
+        Ok(Some(out))
     }
 
     /// Jump back halfway to provide a processing window (Video/Burst).
@@ -153,24 +195,12 @@ impl<T: Clone> Receiver<T> {
 
             // Still no new items — park.
             if self.next_seq >= self.local_head {
-                // Ensure we have a listener and that it is registered with the event.
-                if self.listener.is_none() {
-                    let mut listener = self.ring.event.listen();
+                self.ring.waker.register(cx.waker());
 
-                    // Poll once so the waker is registered.
-                    if Pin::new(&mut listener).poll(cx).is_ready() {
-                        // Notification already fired; retry the loop.
-                        continue;
-                    }
-
-                    self.listener = Some(listener);
-                }
-
-                // Re-check head after listener registration to close the race window.
+                // Re-check head after waker registration to close the race window.
                 self.local_head = self.ring.head.load(Ordering::Acquire);
                 if self.next_seq < self.local_head {
-                    // Data arrived after we installed the listener.
-                    self.listener = None;
+                    // Data arrived after we registered.
                     continue;
                 }
 
@@ -179,19 +209,8 @@ impl<T: Clone> Receiver<T> {
                     return Poll::Ready(Err(RecvError::Closed));
                 }
 
-                // Park until notified.
-                let listener = self.listener.as_mut().unwrap();
-                match Pin::new(listener).poll(cx) {
-                    Poll::Ready(_) => {
-                        self.listener = None;
-                        continue;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
+                return Poll::Pending;
             }
-
-            // We have at least one item available. Clear stale listener.
-            self.listener = None;
 
             // Read slot for next_seq — clone value under the lock, then release.
             let idx = (self.next_seq as usize) & self.ring.mask;
@@ -270,13 +289,12 @@ impl<T: Clone> Clone for Receiver<T> {
             ring: self.ring.clone(),
             next_seq: self.next_seq,
             local_head: self.local_head,
-            listener: None,
             pkts_received: 0,
         }
     }
 }
 
-pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+pub fn channel<T: Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     #[cfg(not(feature = "loom"))]
     {
         metrics::describe_histogram!(
@@ -306,7 +324,6 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
             ring: ring.clone(),
             next_seq: 0,
             local_head: 0,
-            listener: None,
             pkts_received: 0,
         },
     )

@@ -397,7 +397,7 @@ mod internal {
             .route("/healthz", get(healthcheck))
             .route("/", get(async move || Html(INDEX_HTML)))
             .route("/metrics", get(async move || router_prometheus.render()));
-        let rt_monitor_join = tokio::spawn(rt_background_monitor(prometheus_handle));
+        let rt_monitor_join = tokio::task::spawn_local(rt_background_monitor(prometheus_handle));
 
         tracing::info!("internal metrics listening on {:?}", addr);
 
