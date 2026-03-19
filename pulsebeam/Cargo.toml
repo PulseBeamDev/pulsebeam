@@ -57,6 +57,7 @@ url = "2.5.8"
 utoipa = { version = "5.4.0", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
+tachyonix = "0.3"
 
 [dev-dependencies]
 hex = "0.4.3"

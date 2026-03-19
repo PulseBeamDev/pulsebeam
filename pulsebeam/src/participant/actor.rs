@@ -1,6 +1,9 @@
 use ahash::HashMap;
+use futures_util::{Stream, task::noop_waker_ref};
 use pulsebeam_runtime::sync::Arc;
 use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::participant::batcher::Batcher;
@@ -87,9 +90,9 @@ impl Participant {
         self.control_queue.push_back(msg);
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> Option<Instant> {
         if self.disconnected {
-            return;
+            return None;
         }
 
         while let Some(msg) = self.control_queue.pop_front() {
@@ -97,10 +100,45 @@ impl Participant {
         }
 
         self.handle_core_events();
-        let _ = self.core.poll();
+
+        // Flush signaling + RTC state before pushing downstream output.
+        let next_deadline = self.core.poll();
+
+        self.poll_downstream();
+
+        // Flush any new framed output from downstream packets.
+        let more_deadline = self.core.poll();
+
+        let deadline = match (next_deadline, more_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
         self.core.udp_batcher.flush(&self.udp_egress);
         self.core.tcp_batcher.flush(&self.tcp_egress);
         self.core.handle_tick();
+
+        deadline
+    }
+
+    fn poll_downstream(&mut self) {
+        if self.disconnected {
+            return;
+        }
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        loop {
+            match Pin::new(&mut self.core.downstream).poll_next(&mut cx) {
+                Poll::Ready(Some((mid, packet))) => {
+                    self.core.handle_forward_rtp(mid, packet);
+                }
+                Poll::Ready(None) | Poll::Pending => break,
+            }
+        }
     }
 
     fn apply_control_message(&mut self, msg: ParticipantControlMessage) {
