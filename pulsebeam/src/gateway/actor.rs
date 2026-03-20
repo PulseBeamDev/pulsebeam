@@ -19,6 +19,7 @@ pub enum GatewayControlMessage {
     AddParticipant(ParticipantId, Participant),
     RemoveParticipant(ParticipantId),
     ParticipantControl(ParticipantId, crate::participant::ParticipantControlMessage),
+    DownstreamRtp(ParticipantId, str0m::media::Mid, crate::rtp::RtpPacket),
 }
 
 pub struct GatewayMessageSet;
@@ -31,6 +32,7 @@ impl actor::MessageSet for GatewayMessageSet {
 
 pub enum MeshEvent {
     RemotePacket(ParticipantId, net::RecvPacketBatch),
+    DownstreamRtp(ParticipantId, str0m::media::Mid, crate::rtp::RtpPacket),
 }
 
 pub struct GatewayActor {
@@ -209,9 +211,19 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
                 _ = self.socket.readable() => {
                     let _ = self.read_socket().await;
                 }
-                mesh_msg = self.mesh_rx.recv() => {
+                    mesh_msg = self.mesh_rx.recv() => {
                     match mesh_msg {
-                        Ok(event) => self.handle_mesh_event(event),
+                        Ok(MeshEvent::RemotePacket(participant_id, batch)) => {
+                            if let Some(participant) = self.participants.get_mut(&participant_id) {
+                                participant.on_udp_batch(batch);
+                                self.poll_participant(participant_id);
+                            }
+                        }
+                        Ok(MeshEvent::DownstreamRtp(participant_id, mid, pkt)) => {
+                            if let Some(participant) = self.participants.get_mut(&participant_id) {
+                                participant.on_downstream_rtp(mid, pkt);
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -256,6 +268,11 @@ impl actor::Actor<GatewayMessageSet> for GatewayWorkerActor {
                 if let Some(p) = self.participants.get_mut(&participant_id) {
                     p.on_control_message(msg);
                     self.poll_participant(participant_id);
+                }
+            }
+            GatewayControlMessage::DownstreamRtp(participant_id, mid, pkt) => {
+                if let Some(p) = self.participants.get_mut(&participant_id) {
+                    p.on_downstream_rtp(mid, pkt);
                 }
             }
         };

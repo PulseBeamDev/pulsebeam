@@ -90,6 +90,13 @@ impl Participant {
         self.control_queue.push_back(msg);
     }
 
+    pub fn on_downstream_rtp(&mut self, mid: crate::entity::Mid, packet: crate::rtp::RtpPacket) {
+        if self.disconnected {
+            return;
+        }
+        self.core.handle_forward_rtp(mid, packet);
+    }
+
     pub fn poll(&mut self) -> Option<Instant> {
         if self.disconnected {
             return None;
