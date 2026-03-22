@@ -79,10 +79,6 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse().unwrap();
     let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
 
-    // Eagerly warm the RTP payload pool so the first packets don't hit jemalloc.
-    pulsebeam_runtime::sync::pool_buf::describe_metrics();
-    let _ = pulsebeam::rtp::rtp_payload_pool();
-
     tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
     let mut rng = rand::os_rng();
     let node = NodeBuilder::new()

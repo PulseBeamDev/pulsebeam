@@ -63,7 +63,7 @@ impl AudioAllocator {
         self.pending_sub = Some(sub);
     }
 
-    /// Pin a specific slot to a direct `spmc::Receiver`, bypassing the room
+    /// Pin a specific slot to a direct `spmc::UnsyncReceiver`, bypassing the room
     /// selector for that slot.
     ///
     /// Useful when a participant wants to always show a particular speaker
@@ -73,7 +73,7 @@ impl AudioAllocator {
     pub fn pin_slot(
         &mut self,
         slot_index: usize,
-        receiver: spmc::Receiver<AudioRtpPacket>,
+        receiver: spmc::UnsyncReceiver<AudioRtpPacket>,
     ) -> bool {
         let Some(mut stream) = self.slots.get_mut(slot_index) else {
             return false;
@@ -150,7 +150,7 @@ impl AudioAllocator {
 /// the session lifetime; only the underlying receiver is swapped on
 /// subscription/pin changes.
 struct AudioInputStream {
-    receiver: Option<spmc::Receiver<AudioRtpPacket>>,
+    receiver: Option<spmc::UnsyncReceiver<AudioRtpPacket>>,
     slot: AudioSlot,
 }
 
@@ -165,7 +165,7 @@ impl AudioInputStream {
     /// Swap in a new receiver and reset the timeline so the SSRC-change
     /// detection in `AudioSlot::process` triggers a clean rebase on the
     /// first packet from the new source.
-    fn set_receiver(&mut self, receiver: spmc::Receiver<AudioRtpPacket>) {
+    fn set_receiver(&mut self, receiver: spmc::UnsyncReceiver<AudioRtpPacket>) {
         self.receiver = Some(receiver);
         self.slot.last_ssrc = None;
     }

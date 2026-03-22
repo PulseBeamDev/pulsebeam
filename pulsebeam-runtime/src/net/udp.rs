@@ -1,6 +1,5 @@
 use crate::net::{Transport, UdpMode};
 use crate::sync::Arc;
-use crate::sync::pool_buf::net_recv_pool;
 
 use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
 use quinn_udp::RecvMeta;
@@ -136,7 +135,7 @@ impl UdpTransportReader {
                         while seg_off < m.len {
                             let seg_len = stride.min(m.len - seg_off);
                             let src = &self.batch_buffer[base + seg_off..base + seg_off + seg_len];
-                            let buf = net_recv_pool().checkout(src);
+                            let buf = Arc::new(src.to_vec());
                             out.push(RecvPacketBatch {
                                 src: m.addr,
                                 dst: self.local_addr,

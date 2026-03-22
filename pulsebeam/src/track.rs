@@ -113,7 +113,7 @@ pub struct SimulcastReceiver {
     pub meta: Arc<TrackMeta>,
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
-    pub channel: spmc::Receiver<RtpPacket>,
+    pub channel: spmc::UnsyncReceiver<RtpPacket>,
     pub keyframe_requester: KeyframeRequester,
     pub state: StreamState,
 }
@@ -153,7 +153,7 @@ pub struct SimulcastSender {
     pub quality: SimulcastQuality,
     pub monitor: StreamMonitor,
     synchronizer: Synchronizer,
-    channel: spmc::Sender<RtpPacket>,
+    channel: spmc::UnsyncSender<RtpPacket>,
     filter: PacketFilter,
 }
 
@@ -311,7 +311,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             (MediaKind::Video, Some(_), _) => (SimulcastQuality::Low, 150_000, 1),
         };
 
-        let (tx, rx) = spmc::channel(BASE_CAP * cap_tier);
+        let (tx, rx) = spmc::unsync_channel(BASE_CAP * cap_tier);
         // Shared atomic signal: receiver writes, poll-side reads.
         let signal = Arc::new(AtomicBool::new(false));
 

@@ -1,7 +1,6 @@
 use super::{BATCH_SIZE, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
 use crate::sync::Arc;
-use crate::sync::pool_buf::net_recv_pool;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use pulsebeam_core::net::{TcpListener, TcpStream};
@@ -268,9 +267,7 @@ fn handle_new_connection(
                         recv_buf.advance(2);
                         let data = recv_buf.split_to(len);
 
-                        // Copy from BytesMut staging buffer into a pool slot.
-                        // One memcpy, zero jemalloc after warmup.
-                        let buf = net_recv_pool().checkout(&data);
+                        let buf = Arc::new(data.to_vec());
 
                         // Use try_send to prevent reader task from blocking if SFU logic lags
                         if let Err(_) = packet_tx.try_send(RecvPacketBatch {

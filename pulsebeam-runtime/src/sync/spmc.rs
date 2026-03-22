@@ -500,6 +500,12 @@ impl<T: Clone> Clone for UnsyncReceiver<T> {
     }
 }
 
+impl<T> std::fmt::Debug for UnsyncReceiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnsyncReceiver").finish()
+    }
+}
+
 pub fn unsync_channel<T: Clone + 'static>(capacity: usize) -> (UnsyncSender<T>, UnsyncReceiver<T>) {
     assert!(capacity > 0, "capacity must be > 0");
     let mut cap = capacity;

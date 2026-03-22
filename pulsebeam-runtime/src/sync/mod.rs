@@ -1,12 +1,10 @@
 pub mod mpsc;
-pub mod pool_buf;
 pub mod slot_group;
 pub mod spmc;
 
-pub use pool_buf::{BufPool, MAX_PAYLOAD as POOL_MAX_PAYLOAD, PoolBuf, PoolBufMut};
-
 pub use slot_group::UnsyncSlotGroup;
-pub use spmc::{UnsyncSender, UnsyncReceiver, unsync_channel};
+pub use spmc::{UnsyncSender as UnsyncSpmcSender, UnsyncReceiver as UnsyncSpmcReceiver, unsync_channel as unsync_spmc_channel};
+pub use mpsc::{UnsyncSender as UnsyncMpscSender, UnsyncReceiver as UnsyncMpscReceiver, unsync_channel as unsync_mpsc_channel};
 
 #[cfg(not(feature = "loom"))]
 mod primitives {

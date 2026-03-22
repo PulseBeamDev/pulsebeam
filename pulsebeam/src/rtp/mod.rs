@@ -4,9 +4,7 @@ pub mod switcher;
 pub mod sync;
 pub mod timeline;
 
-use std::sync::OnceLock;
-
-use pulsebeam_runtime::sync::{BufPool, PoolBuf};
+use std::rc::Rc;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::rtcp::SenderInfo;
 use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
@@ -17,17 +15,13 @@ use crate::entity::{ParticipantId, TrackId};
 /// Pool capacity: 16 384 slots × 2 048 bytes ≈ 32 MB resident.
 ///
 /// Trade memory for zero jemalloc on the hot path. RTP payload pool and
-/// net_recv_pool are separate so their shards don’t contend under load.
+/// Previously a pooled payload buffer, now replaced by `Arc<Vec<u8>>`.
 pub const POOL_CAPACITY: usize = 16_384;
 pub const POOL_PREFILL: usize = 8_192;
 
-/// Process-global RTP payload pool.
-///
-/// All inbound packet payloads are allocated from here; clones across
-/// the SPMC ring are free-list pops (refcount increment only).
-pub fn rtp_payload_pool() -> &'static BufPool {
-    static POOL: OnceLock<&'static BufPool> = OnceLock::new();
-    *POOL.get_or_init(|| BufPool::new_prefilled(POOL_CAPACITY, POOL_PREFILL))
+/// No-op function for compatibility; does not return a pool.
+pub fn rtp_payload_pool() -> () {
+    ()
 }
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
@@ -70,12 +64,10 @@ pub struct RtpPacket {
     /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Instant,
     pub is_keyframe_start: bool,
-    /// Pool-backed, reference-counted payload buffer.
+    /// Shared, reference-counted payload buffer.
     ///
-    /// Checked out from [`rtp_payload_pool()`] at ingress.  Every SPMC clone
-    /// is a single `fetch_add`; the last drop returns the slot to the pool
-    /// free list — zero jemalloc after warmup.
-    pub payload: PoolBuf,
+    /// Clone is cheap because this is an `Rc<Vec<u8>>`.
+    pub payload: Rc<Vec<u8>>,
 }
 
 impl Default for RtpPacket {
@@ -90,7 +82,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe_start: false,
-            payload: rtp_payload_pool().checkout(&[0u8; 1200]), // 1.2KB payload for test realism
+            payload: Rc::new(Vec::from(&[0u8; 1200][..])), // 1.2KB payload for test realism
         }
     }
 }
@@ -120,7 +112,7 @@ impl RtpPacket {
             arrival_ts: rtp.timestamp.into(),
             playout_time: rtp.timestamp.into(),
             is_keyframe_start,
-            payload: rtp_payload_pool().checkout(&rtp.payload),
+            payload: Rc::new(rtp.payload.to_vec()),
         };
         (pkt, sr)
     }
