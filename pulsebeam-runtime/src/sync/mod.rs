@@ -5,6 +5,9 @@ pub mod spmc;
 
 pub use pool_buf::{BufPool, MAX_PAYLOAD as POOL_MAX_PAYLOAD, PoolBuf, PoolBufMut};
 
+pub use slot_group::UnsyncSlotGroup;
+pub use spmc::{UnsyncSender, UnsyncReceiver, unsync_channel};
+
 #[cfg(not(feature = "loom"))]
 mod primitives {
     #[cfg(feature = "parking_lot")]

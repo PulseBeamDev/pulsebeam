@@ -506,6 +506,303 @@ impl<S: Stream + Unpin> Stream for SlotGroup<S> {
     }
 }
 
+// ── Unsync SlotGroup (non-Send, non-Sync) ───────────────────────────────────
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+struct UnsyncBitSignal {
+    pending: Cell<u64>,
+    waker: RefCell<Option<Waker>>,
+}
+
+unsafe impl Send for UnsyncBitSignal {}
+unsafe impl Sync for UnsyncBitSignal {}
+
+impl UnsyncBitSignal {
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self {
+            pending: Cell::new(0),
+            waker: RefCell::new(None),
+        })
+    }
+
+    #[inline]
+    pub fn register(&self, waker: &Waker) {
+        *self.waker.borrow_mut() = Some(waker.clone());
+    }
+
+    #[inline]
+    pub fn notify(&self, index: u8) {
+        let old = self.pending.get();
+        self.pending.set(old | (1u64 << (index & 63)));
+        if let Some(w) = self.waker.borrow().as_ref() {
+            w.wake_by_ref();
+        }
+    }
+
+    #[inline]
+    pub fn notify_mask(&self, bits: u64) {
+        if bits == 0 {
+            return;
+        }
+        let old = self.pending.get();
+        self.pending.set(old | bits);
+        if let Some(w) = self.waker.borrow().as_ref() {
+            w.wake_by_ref();
+        }
+    }
+
+    #[inline]
+    pub fn take(&self) -> u64 {
+        let v = self.pending.get();
+        self.pending.set(0);
+        v
+    }
+}
+
+struct UnsyncSlotWakerData {
+    signal: Rc<UnsyncBitSignal>,
+    index: u8,
+}
+
+unsafe fn clone_slot_unsync(ptr: *const ()) -> RawWaker {
+    let rc = ManuallyDrop::new(unsafe { Rc::from_raw(ptr as *const UnsyncSlotWakerData) });
+    let cloned = Rc::clone(&rc);
+    RawWaker::new(Rc::into_raw(cloned) as *const (), slot_vtable_unsync())
+}
+
+unsafe fn wake_slot_unsync(ptr: *const ()) {
+    let rc = unsafe { Rc::from_raw(ptr as *const UnsyncSlotWakerData) };
+    rc.signal.notify(rc.index);
+}
+
+unsafe fn wake_by_ref_slot_unsync(ptr: *const ()) {
+    let rc = ManuallyDrop::new(unsafe { Rc::from_raw(ptr as *const UnsyncSlotWakerData) });
+    rc.signal.notify(rc.index);
+}
+
+unsafe fn drop_slot_unsync(ptr: *const ()) {
+    drop(unsafe { Rc::from_raw(ptr as *const UnsyncSlotWakerData) });
+}
+
+const fn slot_vtable_unsync() -> &'static RawWakerVTable {
+    &RawWakerVTable::new(clone_slot_unsync, wake_slot_unsync, wake_by_ref_slot_unsync, drop_slot_unsync)
+}
+
+fn make_slot_waker_unsync(signal: Rc<UnsyncBitSignal>, index: u8) -> Waker {
+    let data = Rc::new(UnsyncSlotWakerData { signal, index });
+    let raw = RawWaker::new(Rc::into_raw(data) as *const (), slot_vtable_unsync());
+    unsafe { Waker::from_raw(raw) }
+}
+
+/// A `SlotGroup` variant with no atomics and non-Send semantics.
+///
+/// Useful in single-threaded core-local pipelines where `Arc`/`Atomic*` are
+/// undesired.
+pub struct UnsyncSlotGuard<'a, S> {
+    slot: &'a mut S,
+    signal: &'a Rc<UnsyncBitSignal>,
+    index: u8,
+}
+
+impl<S> Deref for UnsyncSlotGuard<'_, S> {
+    type Target = S;
+
+    #[inline]
+    fn deref(&self) -> &S {
+        self.slot
+    }
+}
+
+impl<S> DerefMut for UnsyncSlotGuard<'_, S> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut S {
+        self.slot
+    }
+}
+
+impl<S> Drop for UnsyncSlotGuard<'_, S> {
+    #[inline]
+    fn drop(&mut self) {
+        self.signal.notify(self.index);
+    }
+}
+
+pub struct UnsyncSlotGroup<S> {
+    signal: Rc<UnsyncBitSignal>,
+    pending_bits: u64,
+    occupied: u64,
+    slots: Vec<Option<S>>,
+    slot_wakers: Vec<Option<Waker>>,
+    last_index: u8,
+}
+
+unsafe impl<S> Send for UnsyncSlotGroup<S> {}
+unsafe impl<S> Sync for UnsyncSlotGroup<S> {}
+
+impl<S> UnsyncSlotGroup<S> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity <= 64, "SlotGroup capacity must be ≤ 64, got {capacity}");
+        let signal = UnsyncBitSignal::new();
+        let slots = (0..capacity).map(|_| None).collect();
+        let slot_wakers = (0..capacity).map(|_| None).collect();
+        Self {
+            signal,
+            pending_bits: 0,
+            occupied: 0,
+            slots,
+            slot_wakers,
+            last_index: 63,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.occupied.count_ones() as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.occupied == 0
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&S> {
+        self.slots.get(index)?.as_ref()
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<UnsyncSlotGuard<'_, S>> {
+        if index >= self.slots.len() || self.slots[index].is_none() {
+            return None;
+        }
+        Some(UnsyncSlotGuard {
+            slot: self.slots[index].as_mut().unwrap(),
+            signal: &self.signal,
+            index: index as u8,
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &S)> {
+        self.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, UnsyncSlotGuard<'_, S>)> + '_ {
+        let signal = &self.signal;
+        self.slots.iter_mut().enumerate().filter_map(move |(i, s)| {
+            s.as_mut().map(|slot| {
+                (
+                    i,
+                    UnsyncSlotGuard { slot, signal, index: i as u8 },
+                )
+            })
+        })
+    }
+
+    #[inline]
+    fn poke(&self, index: usize) {
+        if index < 64 && (self.occupied >> index) & 1 == 1 {
+            self.signal.notify(index as u8);
+        }
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<S> {
+        if index >= self.slots.len() {
+            return None;
+        }
+        let stream = self.slots[index].take()?;
+        self.occupied &= !(1u64 << index);
+        self.pending_bits &= !(1u64 << index);
+        Some(stream)
+    }
+}
+
+impl<S: Stream + Unpin> UnsyncSlotGroup<S> {
+    pub fn insert(&mut self, stream: S) -> usize {
+        let index = (!self.occupied).trailing_zeros() as usize;
+        assert!(index < self.slots.len(), "SlotGroup is full (capacity {})", self.slots.len());
+        self.occupied |= 1u64 << index;
+        self.slots[index] = Some(stream);
+        self.slot_wakers[index] = Some(make_slot_waker_unsync(self.signal.clone(), index as u8));
+        self.signal.notify(index as u8);
+        index
+    }
+}
+
+impl<S: Stream + Unpin> Stream for UnsyncSlotGroup<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.signal.register(cx.waker());
+        this.pending_bits |= this.signal.take() & this.occupied;
+
+        if this.pending_bits == 0 {
+            return Poll::Pending;
+        }
+
+        let rotation = (this.last_index.wrapping_add(1) & 63) as u32;
+        let rotated = this.pending_bits.rotate_right(rotation);
+
+        if rotated != 0 {
+            let i_rotated = rotated.trailing_zeros();
+            let i = (i_rotated.wrapping_add(rotation) & 63) as usize;
+
+            if let Some(stream) = this.slots[i].as_mut() {
+                let waker = this.slot_wakers[i].as_ref().expect("waker built on insert");
+                let mut slot_cx = Context::from_waker(waker);
+
+                match Pin::new(stream).poll_next(&mut slot_cx) {
+                    Poll::Ready(Some(item)) => {
+                        this.last_index = i as u8;
+                        return Poll::Ready(Some(item));
+                    }
+                    Poll::Ready(None) => {
+                        this.slots[i] = None;
+                        this.occupied &= !(1u64 << i);
+                        this.pending_bits &= !(1u64 << i);
+                    }
+                    Poll::Pending => {
+                        this.pending_bits &= !(1u64 << i);
+                    }
+                }
+            } else {
+                this.pending_bits &= !(1u64 << i);
+                this.occupied &= !(1u64 << i);
+            }
+        }
+
+        while this.pending_bits != 0 {
+            let lsb = this.pending_bits & this.pending_bits.wrapping_neg();
+            let i = lsb.trailing_zeros() as usize;
+            this.pending_bits &= !lsb;
+
+            if let Some(stream) = this.slots[i].as_mut() {
+                let waker = this.slot_wakers[i].as_ref().expect("waker built on insert");
+                let mut slot_cx = Context::from_waker(waker);
+
+                match Pin::new(stream).poll_next(&mut slot_cx) {
+                    Poll::Ready(Some(item)) => {
+                        this.last_index = i as u8;
+                        this.pending_bits |= lsb;
+                        return Poll::Ready(Some(item));
+                    }
+                    Poll::Ready(None) => {
+                        this.slots[i] = None;
+                        this.occupied &= !(1u64 << i);
+                    }
+                    Poll::Pending => {}
+                }
+            } else {
+                this.occupied &= !(1u64 << i);
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::sync::slot_group::SlotGroup;

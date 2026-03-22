@@ -2,8 +2,11 @@ use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock};
 use event_listener::{Event, EventListener};
 use futures_lite::Stream;
+use local_event::{Event as LocalEvent, EventListener as LocalEventListener};
+use std::cell::RefCell;
 use std::fmt::Debug;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +315,222 @@ pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>,
     )
 }
 
+// ── Unsync SPMC (non-Send, single-threaded) ───────────────────────────────
+
+#[derive(Debug)]
+struct UnsyncSlot<T> {
+    seq: u64,
+    val: Option<T>,
+}
+
+#[derive(Debug)]
+struct UnsyncRing<T> {
+    head: u64,
+    mask: usize,
+    slots: Vec<UnsyncSlot<T>>,
+    event: LocalEvent,
+    closed: bool,
+}
+
+#[derive(Debug)]
+pub struct UnsyncSender<T> {
+    ring: Rc<RefCell<UnsyncRing<T>>>,
+    local_head: u64,
+}
+
+unsafe impl<T> Send for UnsyncSender<T> {}
+unsafe impl<T> Sync for UnsyncSender<T> {}
+
+impl<T> UnsyncSender<T> {
+    pub fn send(&mut self, val: T) {
+        let mut ring = self.ring.borrow_mut();
+        if ring.closed {
+            return;
+        }
+
+        let idx = (self.local_head as usize) & ring.mask;
+        ring.slots[idx].val = Some(val);
+        ring.slots[idx].seq = self.local_head;
+
+        self.local_head += 1;
+        ring.head = self.local_head;
+        ring.event.notify(usize::MAX);
+    }
+}
+
+impl<T> Drop for UnsyncSender<T> {
+    fn drop(&mut self) {
+        let mut ring = self.ring.borrow_mut();
+        ring.closed = true;
+        ring.event.notify(usize::MAX);
+    }
+}
+
+pub struct UnsyncReceiver<T> {
+    ring: Rc<RefCell<UnsyncRing<T>>>,
+    next_seq: u64,
+    local_head: u64,
+    listener: Option<LocalEventListener>,
+}
+
+unsafe impl<T> Send for UnsyncReceiver<T> {}
+unsafe impl<T> Sync for UnsyncReceiver<T> {}
+
+impl<T: Clone> UnsyncReceiver<T> {
+    pub fn sync(&mut self) {
+        let ring = self.ring.borrow();
+        self.local_head = ring.head;
+        self.next_seq = self.local_head;
+        self.listener = None;
+    }
+
+    pub fn rewind(&mut self) {
+        let ring = self.ring.borrow();
+        self.local_head = ring.head;
+        let half_ring_cap = (ring.slots.len() / 2) as u64;
+        let ring_len = self.local_head.wrapping_sub(self.next_seq);
+
+        if ring_len > ring.slots.len() as u64 {
+            self.next_seq = self.local_head;
+        } else {
+            let offset = half_ring_cap.min(ring_len);
+            self.next_seq = self.local_head.wrapping_sub(offset);
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<T, RecvError> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+        loop {
+            if self.next_seq >= self.local_head {
+                let ring = self.ring.borrow();
+                self.local_head = ring.head;
+            }
+
+            if self.next_seq >= self.local_head {
+                if self.listener.is_none() {
+                    let mut listener = self.ring.borrow().event.listen();
+                    if Pin::new(&mut listener).poll(cx).is_ready() {
+                        continue;
+                    }
+                    self.listener = Some(listener);
+                }
+
+                {
+                    let ring = self.ring.borrow();
+                    self.local_head = ring.head;
+                    if self.next_seq < self.local_head {
+                        self.listener = None;
+                        continue;
+                    }
+                    if ring.closed {
+                        return Poll::Ready(Err(RecvError::Closed));
+                    }
+                }
+
+                let listener = self.listener.as_mut().unwrap();
+                match Pin::new(listener).poll(cx) {
+                    Poll::Ready(_) => {
+                        self.listener = None;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            self.listener = None;
+
+            let idx = (self.next_seq as usize) & self.ring.borrow().mask;
+            let (slot_seq, maybe_val) = {
+                let ring = self.ring.borrow();
+                (ring.slots[idx].seq, ring.slots[idx].val.clone())
+            };
+
+            if slot_seq != self.next_seq {
+                let ring = self.ring.borrow();
+                self.local_head = ring.head;
+                self.next_seq = self.local_head;
+                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+            }
+
+            let coop = ready!(crate::sync::coop::poll_proceed(cx));
+
+            let Some(out) = maybe_val else {
+                debug_assert!(false, "slot seq matched but val was None — ring invariant violated");
+                let ring = self.ring.borrow();
+                self.local_head = ring.head;
+                self.next_seq = self.local_head;
+                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+            };
+
+            coop.made_progress();
+            self.next_seq += 1;
+
+            return Poll::Ready(Ok(out));
+        }
+    }
+}
+
+impl<T: Clone + std::marker::Unpin> Stream for UnsyncReceiver<T> {
+    type Item = Result<T, StreamRecvError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        let res = match ready!(this.poll_recv(cx)) {
+            Ok(item) => Some(Ok(item)),
+            Err(RecvError::Lagged(n)) => Some(Err(StreamRecvError::Lagged(n))),
+            Err(RecvError::Closed) => None,
+        };
+
+        Poll::Ready(res)
+    }
+}
+
+impl<T: Clone> Clone for UnsyncReceiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: Rc::clone(&self.ring),
+            next_seq: self.next_seq,
+            local_head: self.local_head,
+            listener: None,
+        }
+    }
+}
+
+pub fn unsync_channel<T: Clone + 'static>(capacity: usize) -> (UnsyncSender<T>, UnsyncReceiver<T>) {
+    assert!(capacity > 0, "capacity must be > 0");
+    let mut cap = capacity;
+    if !capacity.is_power_of_two() {
+        let old_cap = capacity;
+        cap = capacity.next_power_of_two();
+        tracing::warn!("Unsync channel capacity should be power of 2, use nearest: {} -> {}", old_cap, cap);
+    }
+
+    let ring = Rc::new(RefCell::new(UnsyncRing {
+        head: 0,
+        mask: cap - 1,
+        slots: (0..cap).map(|_| UnsyncSlot { seq: 0, val: None }).collect(),
+        event: LocalEvent::new(),
+        closed: false,
+    }));
+
+    (
+        UnsyncSender {
+            ring: ring.clone(),
+            local_head: 0,
+        },
+        UnsyncReceiver {
+            ring: ring.clone(),
+            next_seq: 0,
+            local_head: 0,
+            listener: None,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +588,39 @@ mod tests {
             assert_eq!(try_recv(&mut rx1), Ok(i), "rx1 mismatch at {i}");
             assert_eq!(try_recv(&mut rx2), Ok(i), "rx2 mismatch at {i}");
             assert_eq!(try_recv(&mut rx3), Ok(i), "rx3 mismatch at {i}");
+        }
+    }
+
+    fn try_recv_unsync<T: Clone>(rx: &mut UnsyncReceiver<T>) -> Result<T, RecvError> {
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+        match rx.poll_recv(&mut cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("unexpected Pending — data should have been available"),
+        }
+    }
+
+    #[test]
+    fn unsync_send_and_recv_single_item() {
+        let (mut tx, mut rx) = unsync_channel::<u64>(8);
+        tx.send(42);
+        assert_eq!(try_recv_unsync(&mut rx), Ok(42));
+    }
+
+    #[test]
+    fn unsync_multi_consumer_each_sees_all_messages() {
+        let (mut tx, rx) = unsync_channel::<u32>(8);
+        let mut rx1 = rx.clone();
+        let mut rx2 = rx.clone();
+        let mut rx3 = rx.clone();
+
+        for i in 0..4_u32 {
+            tx.send(i);
+        }
+        for i in 0..4_u32 {
+            assert_eq!(try_recv_unsync(&mut rx1), Ok(i), "rx1 mismatch at {i}");
+            assert_eq!(try_recv_unsync(&mut rx2), Ok(i), "rx2 mismatch at {i}");
+            assert_eq!(try_recv_unsync(&mut rx3), Ok(i), "rx3 mismatch at {i}");
         }
     }
 

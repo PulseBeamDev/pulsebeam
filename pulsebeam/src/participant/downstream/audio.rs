@@ -1,4 +1,4 @@
-use pulsebeam_runtime::sync::slot_group::SlotGroup;
+use pulsebeam_runtime::sync::{UnsyncSlotGroup};
 use pulsebeam_runtime::sync::spmc;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -26,7 +26,7 @@ pub struct AudioAllocator {
     /// The `SlotGroup` gives O(woken) hot-path polling: it only visits slots
     /// that have been notified by the `spmc` ring's per-slot waker, using the
     /// same readiness-bitmask mechanism as `VideoAllocator`.
-    slots: SlotGroup<AudioInputStream>,
+    slots: UnsyncSlotGroup<AudioInputStream>,
 
     /// Stored subscription so that slots added *after* [`set_subscription`]
     /// is called receive their receiver immediately in [`add_slot`].
@@ -42,7 +42,7 @@ impl AudioAllocator {
     pub fn new(participant_id: ParticipantId) -> Self {
         Self {
             participant_id,
-            slots: SlotGroup::with_capacity(MAX_SEND_AUDIO_SLOTS),
+            slots: UnsyncSlotGroup::with_capacity(MAX_SEND_AUDIO_SLOTS),
             pending_sub: None,
         }
     }

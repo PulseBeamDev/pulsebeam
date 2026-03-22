@@ -1,6 +1,6 @@
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
-use pulsebeam_runtime::sync::slot_group::SlotGroup;
+use pulsebeam_runtime::sync::UnsyncSlotGroup;
 use pulsebeam_runtime::sync::spmc;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -39,7 +39,7 @@ pub struct VideoAllocator {
     /// Inline, contiguous storage of all slot drivers.  The hot path polls this
     /// directly via `Stream::poll_next`; the cold path reaches individual drivers
     /// through `get_mut` / `iter_mut` — no extra indirection.
-    slots: SlotGroup<SlotDriver>,
+    slots: UnsyncSlotGroup<SlotDriver>,
     /// Reverse map from `Mid` to slot index for O(1) cold-path lookup.
     mid_to_idx: HashMap<Mid, usize>,
 }
@@ -49,7 +49,7 @@ impl VideoAllocator {
         Self {
             manual_sub,
             tracks: HashMap::new(),
-            slots: SlotGroup::with_capacity(VIDEO_MAX_SLOTS),
+            slots: UnsyncSlotGroup::with_capacity(VIDEO_MAX_SLOTS),
             mid_to_idx: HashMap::new(),
         }
     }
