@@ -2,6 +2,7 @@ use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;
 use std::{net::SocketAddr, num::NonZeroUsize};
+use tokio::runtime::LocalOptions;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
@@ -44,6 +45,7 @@ fn main() {
     }
 
     let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let workers = 1;
     tracing::info!("using {} worker threads", workers);
 
     // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
@@ -51,14 +53,14 @@ fn main() {
     //     Duration::from_micros(100),
     // );
 
-    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    let mut rt_builder = tokio::runtime::Builder::new_current_thread();
     let rt = rt_builder
         .enable_all()
-        .worker_threads(workers)
+        // .worker_threads(workers)
         // .disable_lifo_slot()
         // https://github.com/tokio-rs/tokio/issues/7745
         .enable_alt_timer()
-        .build()
+        .build_local(LocalOptions::default())
         .unwrap();
 
     // let rt = Arc::new(rt);
