@@ -7,9 +7,15 @@ use std::{
 
 use ahash::HashMap;
 use pulsebeam_runtime::net::{self, RecvPacketBatch, UnifiedSocketReader, UnifiedSocketWriter};
+use str0m::media::Mid;
 use tokio::time::Instant;
 
-use crate::{entity::ParticipantId, participant::ParticipantCore, shard::demux::Demuxer};
+use crate::{
+    entity::{ParticipantId, TrackId},
+    participant::ParticipantCore,
+    shard::demux::Demuxer,
+    track::TrackSender,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -20,6 +26,7 @@ pub enum ShardError {
 pub struct Shard {
     demuxer: Demuxer,
     participants: HashMap<ParticipantId, ParticipantCore>,
+    tracks: HashMap<TrackId, TrackSender>,
 
     udp_socket_rx: UnifiedSocketReader,
     udp_socket_tx: UnifiedSocketWriter,
