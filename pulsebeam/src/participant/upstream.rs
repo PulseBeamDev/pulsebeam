@@ -4,14 +4,14 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
-use crate::track::{KeyframePoll, TrackSender};
+use crate::track::Track;
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
 
 struct UpstreamSlot {
     mid: Mid,
-    track: TrackSender,
+    track: Track,
 }
 
 impl PartialEq for UpstreamSlot {
@@ -40,7 +40,7 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, mid: Mid, mut track: TrackSender) -> bool {
+    pub fn add_published_track(&mut self, mid: Mid, mut track: Track) -> bool {
         if self.published_tracks.iter().any(|s| s.mid == mid) {
             tracing::warn!("duplicated slot mid={}.", mid);
             return false;

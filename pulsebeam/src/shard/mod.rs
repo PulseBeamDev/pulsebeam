@@ -2,19 +2,18 @@ mod demux;
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeSet, BinaryHeap},
 };
 
 use ahash::HashMap;
-use pulsebeam_runtime::net::{self, RecvPacketBatch, UnifiedSocketReader, UnifiedSocketWriter};
-use str0m::media::Mid;
+use pulsebeam_runtime::net::{self, UnifiedSocketReader, UnifiedSocketWriter};
 use tokio::time::Instant;
 
 use crate::{
     entity::{ParticipantId, TrackId},
     participant::ParticipantCore,
     shard::demux::Demuxer,
-    track::TrackSender,
+    track::Track,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +25,7 @@ pub enum ShardError {
 pub struct Shard {
     demuxer: Demuxer,
     participants: HashMap<ParticipantId, ParticipantCore>,
-    tracks: HashMap<TrackId, TrackSender>,
+    tracks: HashMap<TrackId, Track>,
 
     udp_socket_rx: UnifiedSocketReader,
     udp_socket_tx: UnifiedSocketWriter,
@@ -54,7 +53,7 @@ impl Shard {
                     continue;
                 };
 
-                if let Some(deadline) = participant.handle_udp_packet_batch(batch, now) {
+                if let Some(deadline) = participant.on_ingress(batch, now) {
                     timer_wheel.push(Reverse(deadline));
                 } else {
                     participant_exited.insert(participant_id);

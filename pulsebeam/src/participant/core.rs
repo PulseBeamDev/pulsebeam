@@ -134,6 +134,10 @@ impl ParticipantCore {
         }
     }
 
+    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch, now: Instant) -> Option<Instant> {
+        self.handle_udp_packet_batch(batch, now)
+    }
+
     pub fn handle_udp_packet_batch(
         &mut self,
         batch: net::RecvPacketBatch,
