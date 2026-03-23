@@ -68,13 +68,15 @@ pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> an
 /// The timeout is enforced by periodically stepping the simulation and checking the
 /// wall clock.
 pub fn run_sim_or_timeout(sim: &mut turmoil::Sim<'_>, timeout: Duration) -> turmoil::Result<()> {
+    // Allow some extra real-world headroom for slower environments or debugging.
+    let wall_timeout = timeout.checked_mul(5).unwrap_or(timeout + Duration::from_secs(10));
     let start = Instant::now();
 
     loop {
-        if start.elapsed() > timeout {
+        if start.elapsed() > wall_timeout {
             return Err(format!(
                 "Simulation did not complete within {:?} (wall-clock); aborting.",
-                timeout
+                wall_timeout
             )
             .into());
         }

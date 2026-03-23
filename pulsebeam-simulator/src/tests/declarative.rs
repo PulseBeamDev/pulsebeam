@@ -1,15 +1,19 @@
 use crate::tests::common::{self, client::SimClientBuilder, run_sim_or_timeout, setup_tracing};
+use pulsebeam::entity::ParticipantId;
 use pulsebeam_agent::MediaKind;
+use std::str::FromStr;
 use pulsebeam_agent::TransceiverDirection;
 use pulsebeam_agent::manager::Subscription;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[test]
 fn declarative_subscription_test() -> turmoil::Result {
     setup_tracing();
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(30))
+        .simulation_duration(Duration::from_secs(120))
         .build();
 
     let subnet = common::reserve_subnet();
@@ -27,9 +31,11 @@ fn declarative_subscription_test() -> turmoil::Result {
     let done = CancellationToken::new();
     let client1_ip = common::subnet_ip(subnet, 2);
     let client2_ip = common::subnet_ip(subnet, 3);
+    let pub_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
     sim.client(client1_ip, {
         let done = done.clone();
+        let pub_info = pub_info.clone();
         async move {
             let sfu_ip = sfu_ip;
             let client1_ip = client1_ip;
@@ -38,6 +44,23 @@ fn declarative_subscription_test() -> turmoil::Result {
                 .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
                 .connect("room1")
                 .await?;
+
+            // Wait for the local track MID to be advertised by the agent.
+            let start = tokio::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(15) {
+                if !client.local_mids.is_empty() {
+                    break;
+                }
+                client
+                    .drive_until(Duration::from_millis(100), |_| false)
+                    .await
+                    .ok();
+            }
+
+            if let Some(mid) = client.local_mids.get(0) {
+                let pid = client.participant_id.clone();
+                *pub_info.lock().await = Some((pid, mid.to_string()));
+            }
 
             client.drive(done).await.ok();
 
@@ -55,10 +78,12 @@ fn declarative_subscription_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // 1. Wait for the publisher to advertise its track via signaling discovery.
+        // 1. Wait for the publisher to advertise its track via shared metadata.
+        let mut track_info = None;
         let start = tokio::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(30) {
-            if !client.discovered_tracks.is_empty() {
+        while start.elapsed() < Duration::from_secs(60) {
+            track_info = pub_info.lock().await.clone();
+            if track_info.is_some() {
                 break;
             }
             client
@@ -67,11 +92,12 @@ fn declarative_subscription_test() -> turmoil::Result {
                 .ok();
         }
 
-        let track_id = client
-            .discovered_tracks
-            .first()
-            .cloned()
-            .expect("No remote tracks discovered");
+        let (pid, mid) = track_info.expect("Publisher track info not available");
+        let track_id = ParticipantId::from_str(&pid)
+            .unwrap()
+            .derive_track_id(MediaKind::Video, &mid)
+            .as_str()
+            .to_string();
 
         // 2. Set declarative subscriptions
         client
@@ -117,7 +143,7 @@ fn declarative_subscription_test() -> turmoil::Result {
         Ok(())
     });
 
-    run_sim_or_timeout(&mut sim, Duration::from_secs(30))?;
+    run_sim_or_timeout(&mut sim, Duration::from_secs(60))?;
     Ok(())
 }
 

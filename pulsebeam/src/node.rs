@@ -1,5 +1,6 @@
 use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
+use futures_util::future::join_all;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::actor::RunnerConfig;
@@ -12,7 +13,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use tokio::task::JoinSet;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
@@ -151,7 +152,7 @@ impl NodeBuilder {
             )
         })?;
 
-        let mut join_set = JoinSet::new();
+        let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
 
         let gateway_handle = if let Some(handle) = self.gateway_handle {
             handle
@@ -160,7 +161,7 @@ impl NodeBuilder {
                 gateway::GatewayActor::new(all_readers),
                 RunnerConfig::default(),
             );
-            join_set.spawn(ignore(task));
+            join_handles.push(tokio::task::spawn_local(ignore(task)));
             handle
         };
 
@@ -176,7 +177,7 @@ impl NodeBuilder {
             controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
         let (controller_handle, controller_task) =
             actor::prepare(controller_actor, RunnerConfig::default());
-        join_set.spawn(ignore(controller_task));
+        join_handles.push(tokio::task::spawn_local(ignore(controller_task)));
 
         if let Some(source) = self.http_api {
             // Resolve listener
@@ -227,11 +228,11 @@ impl NodeBuilder {
             let api_server = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown.child_token().cancelled_owned());
 
-            join_set.spawn(async move {
+            join_handles.push(tokio::task::spawn_local(async move {
                 if let Err(e) = api_server.await {
                     tracing::error!("http server error: {e}");
                 }
-            });
+            }));
         }
 
         if let Some(source) = self.internal_metrics {
@@ -242,15 +243,15 @@ impl NodeBuilder {
                 ListenerSource::PreBound(l) => l,
             };
 
-            join_set.spawn(ignore(internal::serve_internal_http(
+            join_handles.push(tokio::task::spawn_local(ignore(internal::serve_internal_http(
                 listener,
                 shutdown.child_token(),
-            )));
+            ))));
         }
 
-        // Wait for shutdown
+        // Wait for shutdown or task completion
         tokio::select! {
-            _ = join_set.join_all() => {}
+            _ = join_all(join_handles) => {}
             _ = shutdown.cancelled() => {
                 tracing::info!("node received shutdown");
             }

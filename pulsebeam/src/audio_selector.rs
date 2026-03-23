@@ -49,8 +49,9 @@ use std::{
 use futures_concurrency::stream::StreamGroup;
 use futures_concurrency::stream::stream_group::Key;
 use futures_lite::stream::Stream as _;
-use pulsebeam_runtime::sync::{Arc, spmc};
 use tokio::{sync::mpsc, time::Instant};
+
+use pulsebeam_runtime::sync::{Arc, spmc};
 
 use crate::{
     controller::MAX_SEND_AUDIO_SLOTS,
@@ -81,10 +82,7 @@ pub enum AudioSelectorCmd {
 /// Obtain one via [`AudioSelectorHandle::subscribe`].
 #[derive(Clone, Debug)]
 pub struct AudioSelectorSubscription {
-    /// `SELECTOR_SLOTS` receivers, indexed 1-to-1 with the selector's output
-    /// slots.  Slot 0 is the loudest speaker, slot 1 the second-loudest, etc.
-    /// (assignments shift after each re-rank, but the slot ordering is stable
-    /// within a re-rank window).
+    /// `SELECTOR_SLOTS` per-slot receivers for one subscriber.
     pub receivers: Vec<spmc::Receiver<AudioRtpPacket>>,
 }
 
@@ -92,20 +90,22 @@ pub struct AudioSelectorSubscription {
 pub struct AudioSelectorHandle {
     /// Send [`AudioSelectorCmd`]s to the background task.
     pub cmd_tx: mpsc::Sender<AudioSelectorCmd>,
-    /// One prototype receiver per slot; cloned for every subscriber.
-    receivers: Vec<spmc::Receiver<AudioRtpPacket>>,
+    /// Per-slot output senders used by the selector to broadcast to subscribers.
+    slot_senders: Vec<spmc::Sender<AudioRtpPacket>>,
+    /// Master per-slot receivers used as the prototype for new subscriptions.
+    slot_receivers: Vec<spmc::Receiver<AudioRtpPacket>>,
 }
 
 impl AudioSelectorHandle {
     /// Create a subscription for a newly-joined participant.
-    ///
-    /// Clones the receiver end of each output slot's ring buffer so the
-    /// participant starts at the current head position (ready to receive
-    /// future audio for all slots without any replay).
-    pub fn subscribe(&self) -> AudioSelectorSubscription {
-        AudioSelectorSubscription {
-            receivers: self.receivers.clone(),
-        }
+    pub fn subscribe(&mut self) -> AudioSelectorSubscription {
+        let receivers = self
+            .slot_receivers
+            .iter()
+            .map(|receiver| receiver.clone())
+            .collect();
+
+        AudioSelectorSubscription { receivers }
     }
 }
 
@@ -121,30 +121,32 @@ pub fn create(
     cmd_buf: usize,
 ) -> (
     AudioSelectorHandle,
-    impl std::future::Future<Output = ()> + Send + 'static,
+    impl std::future::Future<Output = ()> + 'static,
 ) {
     let (cmd_tx, cmd_rx) = mpsc::channel(cmd_buf);
 
-    let mut senders = Vec::with_capacity(SELECTOR_SLOTS);
-    let mut receivers = Vec::with_capacity(SELECTOR_SLOTS);
+    let mut slot_senders = Vec::with_capacity(SELECTOR_SLOTS);
+    let mut slot_receivers = Vec::with_capacity(SELECTOR_SLOTS);
+
     for _ in 0..SELECTOR_SLOTS {
-        // 256-packet ring per slot.  At 50 pkt/s that is 5 s of runway;
-        // enough to absorb any downstream stall without dropping audio.
-        let (tx, rx) = spmc::channel::<AudioRtpPacket>(256);
-        senders.push(tx);
-        receivers.push(rx);
+        let (tx, rx) = spmc::channel(1024);
+        slot_senders.push(tx);
+        slot_receivers.push(rx);
     }
 
-    let handle = AudioSelectorHandle { cmd_tx, receivers };
+    let task_slot_senders = slot_senders.clone();
+    let handle = AudioSelectorHandle {
+        cmd_tx,
+        slot_senders,
+        slot_receivers,
+    };
+
     let task = TopNAudioSelector {
         cmd_rx,
-        slots: senders
-            .into_iter()
-            .map(|sender| OutputSlot {
-                sender,
-                track_id: None,
-            })
+        slots: (0..SELECTOR_SLOTS)
+            .map(|_| OutputSlot { track_id: None })
             .collect(),
+        slot_sinks: task_slot_senders,
         tracks: HashMap::new(),
         inputs: StreamGroup::new(),
         rerank_sleep: Box::pin(tokio::time::sleep(RERANK_INTERVAL)),
@@ -226,8 +228,6 @@ impl futures_lite::stream::Stream for InputStream {
 
 /// One of the N output slots produced by the selector.
 struct OutputSlot {
-    /// Broadcast channel; all participant subscriptions share the same ring.
-    sender: spmc::Sender<AudioRtpPacket>,
     /// Which input track is currently assigned to this slot.
     track_id: Option<TrackId>,
 }
@@ -236,6 +236,8 @@ struct TopNAudioSelector {
     cmd_rx: mpsc::Receiver<AudioSelectorCmd>,
     /// Exactly `SELECTOR_SLOTS` output slots.
     slots: Vec<OutputSlot>,
+    /// Per-slot sender ring used by selector fanout.
+    slot_sinks: Vec<spmc::Sender<AudioRtpPacket>>,
     /// Scoring metadata (StreamGroup key + StreamState) keyed by TrackId.
     tracks: HashMap<TrackId, InputTrackMeta>,
     /// Fan-in of all input audio streams.
@@ -300,10 +302,8 @@ impl TopNAudioSelector {
                 match Pin::new(&mut self.inputs).poll_next(cx) {
                     Poll::Ready(Some((track_id, packet))) => {
                         self.forward(track_id, packet);
+                        continue;
                     }
-                    // Pending: all ready bits cleared, wakers registered.
-                    // None: would mean all streams ended simultaneously; treat
-                    // the same as Pending — commands can add new streams later.
                     Poll::Ready(None) | Poll::Pending => break,
                 }
             }
@@ -357,7 +357,7 @@ impl TopNAudioSelector {
     /// only occurs in the ≤200 ms window between a speaker becoming active and
     /// the next re-rank pass assigning them a slot.
     fn forward(&mut self, track_id: TrackId, packet: RtpPacket) {
-        let Some(slot) = self.slots.iter_mut().find(|s| s.track_id == Some(track_id)) else {
+        let Some(slot_idx) = self.slots.iter().position(|s| s.track_id == Some(track_id)) else {
             return;
         };
 
@@ -365,11 +365,13 @@ impl TopNAudioSelector {
             return;
         };
 
-        slot.sender.send(AudioRtpPacket {
+        let out = AudioRtpPacket {
             participant_id: track.meta.origin_participant,
             track_id,
             packet,
-        });
+        };
+
+        self.slot_sinks[slot_idx].send(out);
     }
 
     // ── Re-ranking ────────────────────────────────────────────────────────────

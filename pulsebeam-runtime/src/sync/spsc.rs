@@ -185,6 +185,15 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     )
 }
 
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: self.ring.clone(),
+            tail: self.tail,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

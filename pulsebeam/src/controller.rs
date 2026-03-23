@@ -1,3 +1,4 @@
+use pulsebeam_runtime::actor_loop;
 use pulsebeam_runtime::sync::Arc;
 use std::{collections::HashMap, io, time::Duration};
 
@@ -20,10 +21,10 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, Pt},
     net::TcpType,
 };
-use tokio::{sync::oneshot, task::JoinSet, time::Instant};
+use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
 
-pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
-pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
+pub const MAX_RECV_VIDEO_SLOTS: usize = 5;
+pub const MAX_RECV_AUDIO_SLOTS: usize = 5;
 pub const MAX_SEND_VIDEO_SLOTS: usize = 16;
 pub const MAX_SEND_AUDIO_SLOTS: usize = 9;
 pub const MAX_DATA_CHANNELS: usize = 1;
@@ -162,7 +163,7 @@ pub struct ControllerActor {
 
     id: Arc<String>,
     rooms: HashMap<RoomId, room::RoomHandle>,
-    room_tasks: JoinSet<(RoomId, ActorStatus)>,
+    room_tasks: Vec<JoinHandle<(RoomId, ActorStatus)>>,
 }
 
 impl actor::Actor<ControllerMessageSet> for ControllerActor {
@@ -185,13 +186,7 @@ impl actor::Actor<ControllerMessageSet> for ControllerActor {
         &mut self,
         ctx: &mut actor::ActorContext<ControllerMessageSet>,
     ) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
-            select: {
-                Some(Ok((room_id, _))) = self.room_tasks.join_next() => {
-                    self.rooms.remove(&room_id);
-                }
-            }
-        );
+        pulsebeam_runtime::actor_loop!(self, ctx);
         Ok(())
     }
 
@@ -403,7 +398,7 @@ impl ControllerActor {
                 room_actor,
                 actor::RunnerConfig::default().with_mailbox_cap(1024),
             );
-            self.room_tasks.spawn(room_task);
+            self.room_tasks.push(tokio::task::spawn_local(room_task));
 
             self.rooms.insert(room_id.clone(), room_handle.clone());
 
@@ -494,7 +489,7 @@ impl ControllerActor {
             id,
             node_ctx: system_ctx,
             rooms: HashMap::new(),
-            room_tasks: JoinSet::new(),
+            room_tasks: Vec::new(),
         }
     }
 }

@@ -10,7 +10,7 @@ use crate::participant::batcher::Batcher;
 use crate::participant::core::{CoreEvent, ParticipantCore};
 use crate::{audio_selector::AudioSelectorSubscription, entity, room, track};
 use pulsebeam_runtime::net::UnifiedSocketWriter;
-use str0m::{Rtc, RtcError, error::SdpError};
+use str0m::{Rtc, RtcError, media::Mid, error::SdpError};
 use tokio::time::Instant;
 
 pub use crate::participant::core::TrackMapping;
@@ -90,7 +90,7 @@ impl Participant {
         self.control_queue.push_back(msg);
     }
 
-    pub fn on_downstream_rtp(&mut self, mid: crate::entity::Mid, packet: crate::rtp::RtpPacket) {
+    pub fn on_downstream_rtp(&mut self, mid: Mid, packet: crate::rtp::RtpPacket) {
         if self.disconnected {
             return;
         }

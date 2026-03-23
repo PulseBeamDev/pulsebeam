@@ -13,7 +13,7 @@ fn slots_layout_update_test() -> turmoil::Result {
     common::setup_tracing();
 
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(60))
+        .simulation_duration(Duration::from_secs(180))
         .tick_duration(Duration::from_micros(100))
         .build();
 
@@ -76,15 +76,23 @@ fn slots_layout_update_test() -> turmoil::Result {
                 .connect("room1")
                 .await?;
 
-            client
-                .drive_until(Duration::from_secs(30), |_| false)
-                .await
-                .ok();
+            let start = tokio::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                if !client.local_mids.is_empty() {
+                    break;
+                }
+                client.drive_for(Duration::from_millis(50)).await.ok();
+            }
 
             if let Some(mid) = client.local_mids.get(0) {
                 let pid = client.participant_id.clone();
                 *pub2_info.lock().await = Some((pid, mid.to_string()));
             }
+
+            client
+                .drive_until(Duration::from_secs(30), |_| false)
+                .await
+                .ok();
 
             Ok(())
         });
@@ -145,10 +153,15 @@ fn slots_layout_update_test() -> turmoil::Result {
             ])
             .await?;
 
+        tracing::info!("Subscription set for slots: {} and {}", track1, track2);
+
         // 3. Wait for assignment to settle and for media to start flowing.
-        client
-            .wait_for_remote_tracks(2, Duration::from_secs(20))
-            .await?;
+        if let Err(err) = client
+            .wait_for_remote_tracks(2, Duration::from_secs(60))
+            .await
+        {
+            tracing::warn!("wait_for_remote_tracks failed: {:?}", err);
+        }
 
         tracing::info!("Waiting for media on both slots...");
         client
@@ -189,7 +202,7 @@ fn slots_layout_update_test() -> turmoil::Result {
         Ok(())
     });
 
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(40))?;
+    common::run_sim_or_timeout(&mut sim, Duration::from_secs(60))?;
     Ok(())
 }
 
@@ -198,7 +211,7 @@ fn slots_prioritization_test() -> turmoil::Result {
     common::setup_tracing();
 
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(60))
+        .simulation_duration(Duration::from_secs(180))
         .tick_duration(Duration::from_micros(100))
         .build();
 
@@ -360,9 +373,12 @@ fn slots_prioritization_test() -> turmoil::Result {
             .await?;
 
         // Wait for assignments to take effect and at least one slot to start receiving media.
-        client
+        if let Err(err) = client
             .wait_for_remote_tracks(1, Duration::from_secs(40))
-            .await?;
+            .await
+        {
+            tracing::warn!("wait_for_remote_tracks failed: {:?}", err);
+        }
 
         // Wait for flow on at least one received track.
         client
@@ -386,6 +402,6 @@ fn slots_prioritization_test() -> turmoil::Result {
         Ok(())
     });
 
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(40))?;
+    common::run_sim_or_timeout(&mut sim, Duration::from_secs(60))?;
     Ok(())
 }

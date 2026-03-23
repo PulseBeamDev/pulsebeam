@@ -95,6 +95,15 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: self.ring.clone(),
+            local_head: self.local_head,
+        }
+    }
+}
+
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.ring.closed.store(1, Ordering::Release);

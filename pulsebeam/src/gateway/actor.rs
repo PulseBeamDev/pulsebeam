@@ -2,6 +2,7 @@ use crate::entity::ParticipantId;
 use crate::gateway::demux::Demuxer;
 use crate::participant::Participant;
 use pulsebeam_runtime::actor::{ActorKind, ActorStatus, RunnerConfig};
+use pulsebeam_runtime::actor_loop;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::{actor, net};
@@ -11,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::task::JoinSet;
+use tokio::task::JoinHandle;
 use tachyonix::{Receiver as TachyonixReceiver, Sender as TachyonixSender};
 
 #[derive(Debug)]
@@ -40,7 +41,7 @@ pub struct GatewayActor {
     workers: Vec<GatewayWorkerHandle>,
     mesh_senders: Vec<TachyonixSender<MeshEvent>>,
 
-    worker_tasks: JoinSet<(String, ActorStatus)>,
+    worker_tasks: Vec<JoinHandle<(String, ActorStatus)>>,
 }
 
 pub struct GatewayWorkerActor {
@@ -91,17 +92,11 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         {
             let (worker_handle, worker_task) =
                 actor::prepare(GatewayWorkerActor::new(id, socket, mesh_rx), RunnerConfig::default());
-            self.worker_tasks.spawn(worker_task);
+            self.worker_tasks.push(tokio::task::spawn_local(worker_task));
             self.workers.push(worker_handle);
         }
 
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select: {},
-        select: {
-            Some(Ok((id, _))) = self.worker_tasks.join_next() => {
-                tracing::info!("gateway worker-{id} has exited");
-                break;
-            }
-        });
+        pulsebeam_runtime::actor_loop!(self, ctx);
 
         Ok(())
     }
@@ -119,6 +114,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
             GatewayControlMessage::AddParticipant(pid, _) => pid,
             GatewayControlMessage::RemoveParticipant(pid) => pid,
             GatewayControlMessage::ParticipantControl(pid, _) => pid,
+            GatewayControlMessage::DownstreamRtp(pid, _, _) => pid,
         };
 
         let mut hasher = ahash::AHasher::default();
@@ -141,7 +137,7 @@ impl GatewayActor {
             sockets,
             workers,
             mesh_senders,
-            worker_tasks: JoinSet::new(),
+            worker_tasks: Vec::new(),
         }
     }
 
@@ -411,6 +407,12 @@ impl GatewayWorkerActor {
             MeshEvent::RemotePacket(participant_id, batch) => {
                 if let Some(participant) = self.participants.get_mut(&participant_id) {
                     participant.on_udp_batch(batch);
+                    self.poll_participant(participant_id);
+                }
+            }
+            MeshEvent::DownstreamRtp(participant_id, mid, packet) => {
+                if let Some(participant) = self.participants.get_mut(&participant_id) {
+                    participant.on_downstream_rtp(mid, packet);
                     self.poll_participant(participant_id);
                 }
             }

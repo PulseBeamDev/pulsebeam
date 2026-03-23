@@ -26,7 +26,7 @@ tokio::task_local! {
 }
 
 pub struct JoinHandle<M: MessageSet> {
-    inner: Pin<Box<dyn Future<Output = (M::Meta, ActorStatus)> + Send>>,
+    inner: Pin<Box<dyn Future<Output = (M::Meta, ActorStatus)> + 'static>>,
     abort_handle: tokio::task::AbortHandle,
 }
 
@@ -102,42 +102,39 @@ pub struct ActorContext<M: MessageSet> {
     pub handle: ActorHandle<M>,
 }
 
-pub trait MessageSet: Sized + Send + 'static {
-    type Msg: Send + 'static;
-    type Meta: Eq + Hash + Display + Debug + Clone + Send;
-    type ObservableState: Debug + Send + Clone;
+pub trait MessageSet: Sized + 'static {
+    type Msg: 'static;
+    type Meta: Eq + Hash + Display + Debug + Clone + 'static;
+    type ObservableState: Debug + Clone + 'static;
 }
 
-pub trait Actor<M: MessageSet>: Sized + Send + 'static {
+pub trait Actor<M: MessageSet>: Sized + 'static {
     fn meta(&self) -> M::Meta;
     fn get_observable_state(&self) -> M::ObservableState;
 
     fn kind() -> ActorKind;
     fn monitor() -> Arc<TaskMonitor>;
 
-    fn run(
-        &mut self,
-        ctx: &mut ActorContext<M>,
-    ) -> impl Future<Output = Result<(), ActorError>> + Send {
-        async {
+    fn run<'a>(&'a mut self, ctx: &'a mut ActorContext<M>) -> impl Future<Output = Result<(), ActorError>> + 'a {
+        async move {
             actor_loop!(self, ctx);
             Ok(())
         }
     }
 
-    fn on_system(
-        &mut self,
-        _ctx: &mut ActorContext<M>,
+    fn on_system<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<M>,
         _msg: SystemMsg<M::ObservableState>,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> + 'a {
         async move {}
     }
 
-    fn on_msg(
-        &mut self,
-        _ctx: &mut ActorContext<M>,
+    fn on_msg<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<M>,
         _msg: M::Msg,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> + 'a {
         async move {}
     }
 }

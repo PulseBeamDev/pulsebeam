@@ -44,30 +44,62 @@ fn main() {
         registry.init();
     }
 
-    let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let workers = 1;
-    tracing::info!("using {} worker threads", workers);
-
-    // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
-    //     Duration::from_secs(1),
-    //     Duration::from_micros(100),
-    // );
-
-    let mut rt_builder = tokio::runtime::Builder::new_current_thread();
-    let rt = rt_builder
-        .enable_all()
-        // `worker_threads` is irrelevant for current-thread runtime.
-        // .disable_lifo_slot()
-        // https://github.com/tokio-rs/tokio/issues/7745
-        .enable_alt_timer()
-        .build_local(LocalOptions::default())
-        .unwrap();
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    tracing::info!("spawning {} local runtimes (1 shard per runtime)", cores);
 
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
 
-    rt.block_on(run(shutdown.clone(), workers, rtc_port));
-    shutdown.cancel();
+    if cores <= 1 {
+        let mut rt_builder = tokio::runtime::Builder::new_current_thread();
+        let rt = rt_builder
+            .enable_all()
+            .enable_alt_timer()
+            .build_local(LocalOptions::default())
+            .unwrap();
+
+        rt.block_on(run(shutdown.clone(), 1, rtc_port));
+    } else {
+        let mut threads = Vec::with_capacity(cores);
+
+        for shard in 0..cores {
+            let shutdown_handle = shutdown.clone();
+            let rtc_port = rtc_port;
+
+            let builder = std::thread::Builder::new().name(format!("shard-{}", shard));
+            let handle = builder.spawn(move || {
+                let mut rt_builder = tokio::runtime::Builder::new_current_thread();
+                let rt = rt_builder
+                    .enable_all()
+                    .enable_alt_timer()
+                    .build_local(LocalOptions::default())
+                    .unwrap();
+
+                tracing::info!("starting shard {}", shard);
+                rt.block_on(run(shutdown_handle, 1, rtc_port));
+            });
+
+            if let Ok(h) = handle {
+                threads.push(h);
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            pulsebeam_runtime::system::wait_for_signal().await;
+            tracing::info!("shutting down gracefully...");
+            shutdown.cancel();
+        });
+
+        for h in threads {
+            let _ = h.join();
+        }
+    }
+
 }
 
 pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
