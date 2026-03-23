@@ -9,4 +9,5 @@ pub mod node;
 pub mod participant;
 pub mod room;
 pub mod rtp;
+pub mod shard;
 pub mod track;
