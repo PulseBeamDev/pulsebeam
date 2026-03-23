@@ -529,7 +529,14 @@ impl UnsyncBitSignal {
 
     #[inline]
     pub fn register(&self, waker: &Waker) {
-        *self.waker.borrow_mut() = Some(waker.clone());
+        let mut slot = self.waker.borrow_mut();
+        if let Some(existing) = slot.as_ref() {
+            // Avoid cloning/dropping the same waker repeatedly in deterministic hot path.
+            if existing.will_wake(waker) {
+                return;
+            }
+        }
+        *slot = Some(waker.clone());
     }
 
     #[inline]
