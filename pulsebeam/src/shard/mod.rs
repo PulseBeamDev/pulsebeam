@@ -11,7 +11,7 @@ use tokio::time::Instant;
 
 use crate::{entity::ParticipantId, participant::ParticipantCore, shard::demux::Demuxer};
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum ShardError {
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
@@ -26,7 +26,7 @@ pub struct Shard {
 }
 
 impl Shard {
-    pub async fn run(&self) -> Result<(), ShardError> {
+    pub async fn run(&mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
         let mut participant_exited = BTreeSet::new();
@@ -43,7 +43,7 @@ impl Shard {
                     continue;
                 };
 
-                let Some(participant) = self.participants.get(&participant_id) else {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
 
