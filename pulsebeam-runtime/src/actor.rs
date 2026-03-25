@@ -103,7 +103,7 @@ pub struct ActorContext<M: MessageSet> {
 }
 
 pub trait MessageSet: Sized + Send + 'static {
-    type Msg: Send + 'static;
+    type Msg: 'static;
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
     type ObservableState: Debug + Clone;
 }
@@ -126,15 +126,11 @@ pub trait Actor<M: MessageSet>: Sized + 'static {
         &mut self,
         _ctx: &mut ActorContext<M>,
         _msg: SystemMsg<M::ObservableState>,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> {
         async move {}
     }
 
-    fn on_msg(
-        &mut self,
-        _ctx: &mut ActorContext<M>,
-        _msg: M::Msg,
-    ) -> impl Future<Output = ()> + Send {
+    fn on_msg(&mut self, _ctx: &mut ActorContext<M>, _msg: M::Msg) -> impl Future<Output = ()> {
         async move {}
     }
 }
