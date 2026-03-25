@@ -160,7 +160,7 @@ impl NodeBuilder {
                 gateway::GatewayActor::new(all_readers),
                 RunnerConfig::default(),
             );
-            join_set.spawn(ignore(task));
+            join_set.spawn_local(ignore(task));
             handle
         };
 
@@ -176,7 +176,7 @@ impl NodeBuilder {
             controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
         let (controller_handle, controller_task) =
             actor::prepare(controller_actor, RunnerConfig::default());
-        join_set.spawn(ignore(controller_task));
+        join_set.spawn_local(ignore(controller_task));
 
         if let Some(source) = self.http_api {
             // Resolve listener
@@ -227,7 +227,7 @@ impl NodeBuilder {
             let api_server = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown.child_token().cancelled_owned());
 
-            join_set.spawn(async move {
+            join_set.spawn_local(async move {
                 if let Err(e) = api_server.await {
                     tracing::error!("http server error: {e}");
                 }
@@ -242,7 +242,7 @@ impl NodeBuilder {
                 ListenerSource::PreBound(l) => l,
             };
 
-            join_set.spawn(ignore(internal::serve_internal_http(
+            join_set.spawn_local(ignore(internal::serve_internal_http(
                 listener,
                 shutdown.child_token(),
             )));

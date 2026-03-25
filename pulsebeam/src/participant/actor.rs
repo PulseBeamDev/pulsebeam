@@ -31,7 +31,7 @@ enum ControlSignal {
     Msg(ParticipantControlMessage),
 }
 
-type CtrlStream = Pin<Box<dyn Stream<Item = ControlSignal> + Send>>;
+type CtrlStream = Pin<Box<dyn Stream<Item = ControlSignal>>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParticipantError {

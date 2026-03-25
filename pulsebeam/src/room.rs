@@ -55,13 +55,14 @@ impl actor::MessageSet for RoomMessageSet {
 }
 
 type ParticipantTaskResult = (ParticipantId, ConnectionId, ActorStatus);
-type PinnedParticipantTask = Pin<Box<dyn Future<Output = ParticipantTaskResult> + Send + 'static>>;
+type PinnedParticipantTask = Pin<Box<dyn Future<Output = ParticipantTaskResult> + 'static>>;
 
 pub struct RoomActor {
     _node_ctx: node::NodeContext,
     room_id: RoomId,
     state: RoomState,
     participant_tasks: JoinSet<ParticipantTaskResult>,
+    audio_selector_task: JoinSet<()>,
     /// Room-level Top-N audio selector.  Holds the command sender; dropping
     /// this field shuts down the background selector task.
     audio_selector: AudioSelectorHandle,
@@ -101,6 +102,10 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
             select: {
                 Some(Ok((participant_id, connection_id, _))) = self.participant_tasks.join_next() => {
                     self.handle_participant_left(participant_id, connection_id).await;
+                }
+                _ = self.audio_selector_task.join_next() => {
+                    tracing::info!("room audio selector exited prematurely, exiting.");
+                    break;
                 }
                 _ = tokio::time::sleep(EMPTY_ROOM_TIMEOUT), if self.state.participants.is_empty() => {
                     tracing::info!("room has been empty for: {EMPTY_ROOM_TIMEOUT:?}, exiting.");
@@ -149,12 +154,14 @@ impl actor::Actor<RoomMessageSet> for RoomActor {
 impl RoomActor {
     pub fn new(node_ctx: node::NodeContext, room_id: RoomId) -> Self {
         let (audio_selector, selector_task) = audio_selector::create(64);
-        tokio::spawn(selector_task);
+        let mut audio_selector_task = JoinSet::new();
+        audio_selector_task.spawn_local(selector_task);
         Self {
             _node_ctx: node_ctx,
             room_id,
             state: RoomState::default(),
             participant_tasks: JoinSet::new(),
+            audio_selector_task,
             audio_selector,
         }
     }
@@ -170,7 +177,7 @@ impl RoomActor {
         let participant_id = participant_handle.meta;
 
         self.participant_tasks
-            .spawn(participant_task.map(move |(id, status)| (id, connection_id, status)));
+            .spawn_local(participant_task.map(move |(id, status)| (id, connection_id, status)));
 
         self.state.participants.insert(
             (participant_id, connection_id),

@@ -4,6 +4,7 @@ use crate::sync::{Arc, RwLock};
 use event_listener::{Event, EventListener};
 use futures_lite::Stream;
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::fmt::Debug;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -322,6 +323,24 @@ struct UnsyncSlot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
+impl<T: fmt::Debug> fmt::Debug for UnsyncSlot<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stamp = unsafe { *self.stamp.get() };
+        let mut d = f.debug_struct("UnsyncSlot");
+        d.field("stamp", &stamp);
+
+        // We only try to debug-print the value if the stamp isn't the sentinel (usize::MAX)
+        if stamp != usize::MAX {
+            let val = unsafe { (*self.value.get()).assume_init_ref() };
+            d.field("value", val);
+        } else {
+            d.field("value", &"Uninitialized");
+        }
+
+        d.finish()
+    }
+}
+
 // spmc implementation inspired by tachyonix mpsc
 struct UnsyncRing<T> {
     buffer: Box<[UnsyncSlot<T>]>,
@@ -331,14 +350,32 @@ struct UnsyncRing<T> {
     event: UnsyncEvent,
 }
 
+impl<T: fmt::Debug> fmt::Debug for UnsyncRing<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let head = unsafe { *self.head.get() };
+        let closed = unsafe { *self.closed.get() };
+
+        f.debug_struct("UnsyncRing")
+            .field("capacity", &(self.mask + 1))
+            .field("head", &head)
+            .field("closed", &closed)
+            // We usually don't want to dump the whole buffer in a trace,
+            // but we can show the number of slots.
+            .field("buffer_len", &self.buffer.len())
+            .finish()
+    }
+}
+
 pub struct UnsyncSender<T> {
     ring: Rc<UnsyncRing<T>>,
 }
 
-pub struct UnsyncReceiver<T> {
-    ring: Rc<UnsyncRing<T>>,
-    next_seq: usize,
-    listener: Option<UnsyncEventListener>,
+impl<T: fmt::Debug> fmt::Debug for UnsyncSender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsyncSender")
+            .field("ring", &self.ring)
+            .finish()
+    }
 }
 
 impl<T> UnsyncSender<T> {
@@ -359,6 +396,22 @@ impl<T> UnsyncSender<T> {
             *self.ring.head.get() = head.wrapping_add(1);
             self.ring.event.notify(usize::MAX);
         }
+    }
+}
+
+pub struct UnsyncReceiver<T> {
+    ring: Rc<UnsyncRing<T>>,
+    next_seq: usize,
+    listener: Option<UnsyncEventListener>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for UnsyncReceiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsyncReceiver")
+            .field("next_seq", &self.next_seq)
+            .field("is_listening", &self.listener.is_some())
+            .field("ring", &self.ring)
+            .finish()
     }
 }
 
@@ -401,6 +454,28 @@ impl<T: Clone> UnsyncReceiver<T> {
 
         Poll::Pending
     }
+
+    pub fn rewind(&mut self) {
+        let head = unsafe { *self.ring.head.get() };
+
+        let cap = self.ring.buffer.len();
+        let half_cap = cap / 2;
+
+        // If next_seq is > head (wrapping), this result is technically
+        // a very large number, which is caught by the 'distance > cap' check.
+        let distance = head.wrapping_sub(self.next_seq);
+
+        if distance > cap {
+            // We were already lapped or in an invalid state.
+            // Reset to middle of the ring to get a fresh start with some history.
+            self.next_seq = head.wrapping_sub(half_cap);
+        } else {
+            // We are within the valid buffer.
+            // Move back by half the ring, but don't go further back than what's available.
+            let offset = half_cap.min(distance);
+            self.next_seq = head.wrapping_sub(offset);
+        }
+    }
 }
 
 impl<T: Clone + std::marker::Unpin> Stream for UnsyncReceiver<T> {
@@ -426,12 +501,6 @@ impl<T: Clone> Clone for UnsyncReceiver<T> {
             next_seq: self.next_seq,
             listener: None,
         }
-    }
-}
-
-impl<T> std::fmt::Debug for UnsyncReceiver<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnsyncReceiver").finish()
     }
 }
 

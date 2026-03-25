@@ -392,7 +392,7 @@ impl ControllerActor {
                 room_actor,
                 actor::RunnerConfig::default().with_mailbox_cap(1024),
             );
-            self.room_tasks.spawn(room_task);
+            self.room_tasks.spawn_local(room_task);
 
             self.rooms.insert(room_id.clone(), room_handle.clone());
 

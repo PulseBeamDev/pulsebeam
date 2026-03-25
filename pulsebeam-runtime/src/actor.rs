@@ -105,20 +105,17 @@ pub struct ActorContext<M: MessageSet> {
 pub trait MessageSet: Sized + Send + 'static {
     type Msg: Send + 'static;
     type Meta: Eq + Hash + Display + Debug + Clone + Send;
-    type ObservableState: Debug + Send + Clone;
+    type ObservableState: Debug + Clone;
 }
 
-pub trait Actor<M: MessageSet>: Sized + Send + 'static {
+pub trait Actor<M: MessageSet>: Sized + 'static {
     fn meta(&self) -> M::Meta;
     fn get_observable_state(&self) -> M::ObservableState;
 
     fn kind() -> ActorKind;
     fn monitor() -> Arc<TaskMonitor>;
 
-    fn run(
-        &mut self,
-        ctx: &mut ActorContext<M>,
-    ) -> impl Future<Output = Result<(), ActorError>> + Send {
+    fn run(&mut self, ctx: &mut ActorContext<M>) -> impl Future<Output = Result<(), ActorError>> {
         async {
             actor_loop!(self, ctx);
             Ok(())

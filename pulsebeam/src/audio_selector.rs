@@ -121,7 +121,7 @@ pub fn create(
     cmd_buf: usize,
 ) -> (
     AudioSelectorHandle,
-    impl std::future::Future<Output = ()> + Send + 'static,
+    impl std::future::Future<Output = ()> + 'static,
 ) {
     let (cmd_tx, cmd_rx) = mpsc::channel(cmd_buf);
 
