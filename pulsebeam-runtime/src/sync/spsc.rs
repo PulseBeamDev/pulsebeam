@@ -39,6 +39,7 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
+    #[inline]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         let ring = unsafe { &mut *self.ring.get() };
         if ring.is_closed {
@@ -94,6 +95,7 @@ impl<T> Receiver<T> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
+    #[inline]
     pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
         let ring = unsafe { &mut *self.ring.get() };
         if ring.is_lagged {

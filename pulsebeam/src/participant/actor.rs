@@ -180,6 +180,8 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
 
             needs_poll = true;
             tokio::select! {
+                biased;
+
                 // Priority 1: Ingress — incoming network packets drive the RTC state machine.
                 // Must be above egress; otherwise a fully-loaded downstream starves the
                 // ingress path and the RTC engine never processes NACKs / ICE / DTLS.
