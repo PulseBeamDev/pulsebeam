@@ -494,7 +494,6 @@ impl AgentBuilder {
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
             .enable_bwe(Some(Bitrate::kbps(300)))
-            .set_send_buffer_video(200)
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
@@ -970,7 +969,9 @@ impl AgentActor {
                     // The actor signals the looper to seek to the nearest IDR whenever
                     // BWE un-pauses this layer.
                     let (kf_notifier, kf_rx) = KeyframeNotifier::pair();
-                    self.layer_ctrl.register(mid, rid, kf_notifier);
+                    if media.kind.is_video() {
+                        self.layer_ctrl.register(mid, rid, kf_notifier);
+                    }
                     self.senders.insert((mid, rid), ReceiverStream::new(rx));
 
                     self.emit(AgentEvent::LocalTrackAdded(LocalTrack {

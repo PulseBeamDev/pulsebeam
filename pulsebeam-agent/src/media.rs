@@ -104,9 +104,6 @@ impl H264Looper {
         } = sender;
 
         let mut interval = tokio::time::interval(frame_interval);
-        // Skip missed ticks to avoid stale timestamp bursts under load.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         let mut frame_count: u64 = 0;
 
         loop {
