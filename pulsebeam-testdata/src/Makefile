@@ -1,19 +1,26 @@
-# Configurable variables
 INPUT_VIDEO = video.mp4
-OUT_DIR = .
-FPS = 30
-GOP = 60 # 2 second GOP at 30fps
+OUT_DIR     = .
+FPS         = 30
+DURATION    = 45
 
-# Bitrates (bps)
-BITRATE_F = 1250k
-BITRATE_H = 400k
-BITRATE_Q = 150k
+# Bitrates in kbps (GStreamer x264enc uses kbit/sec)
+BITRATE_F = 1250
+BITRATE_H = 400
+BITRATE_Q = 150
 
-# x264 parameters for WebRTC realism: 
-# - filler=1: forces CBR with padding
-# - repeat-headers=1: puts SPS/PPS before every IDR frame
-# - nal-hrd=cbr: essential for strict CBR
-X264_OPTS = "annexb=1:repeat-headers=1:nal-hrd=cbr:filler=1:force-cfr=1"
+# Shared x264enc properties
+# pass=cbr + nal-hrd=cbr is all that's needed for strict CBR
+# key-int-max=2147483647 == one IDR at start, pure P-frames after
+COMMON = pass=cbr \
+         nal-hrd=cbr \
+         tune=zerolatency \
+         bframes=0 \
+         b-adapt=false \
+         key-int-max=2147483647 \
+         speed-preset=ultrafast \
+         byte-stream=true \
+         aud=false \
+         option-string="repeat-headers=1:open-gop=0"
 
 .PHONY: all clean prepare
 
@@ -22,23 +29,58 @@ all: prepare $(OUT_DIR)/full_f.h264 $(OUT_DIR)/half_h.h264 $(OUT_DIR)/quarter_q.
 prepare:
 	mkdir -p $(OUT_DIR)
 
-$(OUT_DIR)/full_f.h264 $(OUT_DIR)/half_h.h264 $(OUT_DIR)/quarter_q.h264: $(INPUT_VIDEO)
-	ffmpeg -i $(INPUT_VIDEO) -t 30 -y \
-		-filter_complex "[0:v]fps=$(FPS),split=3[v_f][v_h][v_q]; \
-						 [v_h]scale=-2:360[h_scaled]; \
-						 [v_q]scale=-2:180[q_scaled]" \
-		-map "[v_f]" -c:v:0 libx264 -profile:v:0 baseline -preset ultrafast \
-			-b:v:0 $(BITRATE_F) -minrate:v:0 $(BITRATE_F) -maxrate:v:0 $(BITRATE_F) -bufsize:v:0 $(BITRATE_F) \
-			-g $(GOP) -keyint_min $(GOP) -sc_threshold 0 -tune zerolatency \
-			-x264-params $(X264_OPTS) -bf 0 $(OUT_DIR)/full_f.h264 \
-		-map "[h_scaled]" -c:v:1 libx264 -profile:v:1 baseline -preset ultrafast \
-			-b:v:1 $(BITRATE_H) -minrate:v:1 $(BITRATE_H) -maxrate:v:1 $(BITRATE_H) -bufsize:v:1 $(BITRATE_H) \
-			-g $(GOP) -keyint_min $(GOP) -sc_threshold 0 -tune zerolatency \
-			-x264-params $(X264_OPTS) -bf 0 $(OUT_DIR)/half_h.h264 \
-		-map "[q_scaled]" -c:v:2 libx264 -profile:v:2 baseline -preset ultrafast \
-			-b:v:2 $(BITRATE_Q) -minrate:v:2 $(BITRATE_Q) -maxrate:v:2 $(BITRATE_Q) -bufsize:v:2 $(BITRATE_Q) \
-			-g $(GOP) -keyint_min $(GOP) -sc_threshold 0 -tune zerolatency \
-			-x264-params $(X264_OPTS) -bf 0 $(OUT_DIR)/quarter_q.h264
+# Trim to 45s — decode only, no quality loss from re-encode
+$(OUT_DIR)/trimmed.mp4: $(INPUT_VIDEO)
+	gst-launch-1.0 -e \
+		filesrc location=$< ! \
+		decodebin ! \
+		videorate ! \
+		video/x-raw,framerate=$(FPS)/1 ! \
+		x264enc pass=cbr nal-hrd=cbr tune=zerolatency \
+			bframes=0 b-adapt=false \
+			key-int-max=2147483647 \
+			speed-preset=ultrafast \
+			byte-stream=true aud=false \
+			bitrate=4000 \
+			option-string="repeat-headers=1:open-gop=0" ! \
+		video/x-h264,profile=baseline,stream-format=byte-stream ! \
+		mp4mux ! \
+		filesink location=$@
+
+# High layer — 1250kbps, native resolution
+$(OUT_DIR)/full_f.h264: $(OUT_DIR)/trimmed.mp4
+	gst-launch-1.0 -e \
+		filesrc location=$< ! \
+		qtdemux ! h264parse ! avdec_h264 ! \
+		videorate ! video/x-raw,framerate=$(FPS)/1 ! \
+		x264enc $(COMMON) bitrate=$(BITRATE_F) ! \
+		video/x-h264,profile=baseline,stream-format=byte-stream ! \
+		filesink location=$@
+
+# Mid layer — 400kbps, scale to 360p
+$(OUT_DIR)/half_h.h264: $(OUT_DIR)/trimmed.mp4
+	gst-launch-1.0 -e \
+		filesrc location=$< ! \
+		qtdemux ! h264parse ! avdec_h264 ! \
+		videorate ! video/x-raw,framerate=$(FPS)/1 ! \
+		videoscale ! video/x-raw,height=360,pixel-aspect-ratio=1/1 ! \
+		x264enc $(COMMON) bitrate=$(BITRATE_H) ! \
+		video/x-h264,profile=baseline,stream-format=byte-stream ! \
+		filesink location=$@
+
+# Low layer — 150kbps, scale to 180p
+$(OUT_DIR)/quarter_q.h264: $(OUT_DIR)/trimmed.mp4
+	gst-launch-1.0 -e \
+		filesrc location=$< ! \
+		qtdemux ! h264parse ! avdec_h264 ! \
+		videorate ! video/x-raw,framerate=$(FPS)/1 ! \
+		videoscale ! video/x-raw,height=180,pixel-aspect-ratio=1/1 ! \
+		x264enc $(COMMON) bitrate=$(BITRATE_Q) ! \
+		video/x-h264,profile=baseline,stream-format=byte-stream ! \
+		filesink location=$@
 
 clean:
-	rm -rf $(OUT_DIR)
+	rm -f $(OUT_DIR)/trimmed.mp4 \
+	      $(OUT_DIR)/full_f.h264 \
+	      $(OUT_DIR)/half_h.h264 \
+	      $(OUT_DIR)/quarter_q.h264
