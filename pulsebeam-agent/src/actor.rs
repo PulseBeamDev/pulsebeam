@@ -15,7 +15,7 @@ use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
-use str0m::media::{Rid, Simulcast, SimulcastLayer};
+use str0m::media::{KeyframeRequestKind, Rid, Simulcast, SimulcastLayer};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid},
@@ -78,9 +78,11 @@ fn rid_quality_rank(rid: Option<Rid>) -> u8 {
 // In normal internet operation the estimator already behaves sanely, so this
 // only matters on zero‑delay links where tiny bursts can trigger over‑use.
 const BW_SMOOTHING_ALPHA: f64 = 0.2;
+const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
 struct LayerController {
     available_bps: f64,
+    last_keyframe_request: HashMap<(Mid, Option<Rid>), Instant>,
     // Sorted by priority: index 0 = q (highest), last = f (lowest).
     order: Vec<(Mid, Option<Rid>)>,
     states: HashMap<(Mid, Option<Rid>), LayerState>,
@@ -109,6 +111,7 @@ impl LayerController {
     fn new() -> Self {
         Self {
             available_bps: f64::MAX,
+            last_keyframe_request: HashMap::new(),
             order: Vec::new(),
             states: HashMap::new(),
             notifiers: HashMap::new(),
@@ -183,7 +186,20 @@ impl LayerController {
         self.states.get(&(mid, rid)).map_or(false, |s| s.paused)
     }
 
-    fn request_keyframe(&self, mid: Mid, rid: Option<Rid>) {
+    fn request_keyframe(&mut self, mid: Mid, rid: Option<Rid>, kind: KeyframeRequestKind) {
+        // Throttle PLI requests to avoid encoder storm like libwebrtc.
+        if kind == KeyframeRequestKind::Pli {
+            let key = (mid, rid);
+            let now = Instant::now();
+            if let Some(last) = self.last_keyframe_request.get(&key) {
+                if now.duration_since(*last) < KEYFRAME_REQUEST_THROTTLE {
+                    tracing::debug!(mid = ?mid, rid = ?rid, "throttling repeated PLI");
+                    return;
+                }
+            }
+            self.last_keyframe_request.insert(key, now);
+        }
+
         if let Some(n) = self.notifiers.get(&(mid, rid)) {
             n.notify();
         }
@@ -929,7 +945,7 @@ impl AgentActor {
                     }
                     Event::KeyframeRequest(req) => {
                         tracing::debug!(mid = ?req.mid, rid = ?req.rid, kind = ?req.kind, "keyframe request");
-                        self.layer_ctrl.request_keyframe(req.mid, req.rid);
+                        self.layer_ctrl.request_keyframe(req.mid, req.rid, req.kind);
                     }
                     Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                         self.layer_ctrl.update_available(available);
@@ -1258,6 +1274,51 @@ impl PendingState {
     fn take(&mut self) -> Vec<pulsebeam_proto::signaling::VideoRequest> {
         self.deadline.take();
         self.requests.drain(..).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+    use str0m::media::{KeyframeRequestKind, Mid, Rid};
+
+    #[test]
+    fn throttles_pli_keyframe_requests() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("mid0");
+        let rid = Some(Rid::from("q"));
+        let (notifier, mut receiver) = KeyframeNotifier::pair();
+
+        ctrl.register(mid, rid, notifier);
+
+        ctrl.request_keyframe(mid, rid, KeyframeRequestKind::Pli);
+        assert!(receiver.is_requested());
+
+        ctrl.request_keyframe(mid, rid, KeyframeRequestKind::Pli);
+        assert!(!receiver.is_requested());
+
+        sleep(Duration::from_millis(1100));
+        ctrl.request_keyframe(mid, rid, KeyframeRequestKind::Pli);
+        assert!(receiver.is_requested());
+    }
+
+    #[test]
+    fn fir_is_not_throttled() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("mid1");
+        let rid = Some(Rid::from("h"));
+        let (notifier, mut receiver) = KeyframeNotifier::pair();
+
+        ctrl.register(mid, rid, notifier);
+
+        ctrl.request_keyframe(mid, rid, KeyframeRequestKind::Fir);
+        assert!(receiver.is_requested());
+
+        // Fire again quickly; should still be granted.
+        ctrl.request_keyframe(mid, rid, KeyframeRequestKind::Fir);
+        assert!(receiver.is_requested());
     }
 }
 

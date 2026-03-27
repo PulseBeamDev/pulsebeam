@@ -594,16 +594,17 @@ async fn spawn_agent(
                     // consecutive poll intervals. This tolerates VBR gaps (e.g.
                     // low-motion scenes, keyframe pauses) without mis-reporting
                     // the stream as dead.
-                    let mut tx_active  = false;
-                    let mut tx_healthy = true;
+                    let mut tx_active = false;
+                    let mut tx_active_layers = 0;
+                    let mut tx_healthy_layers = 0;
 
                     for (rid, egress) in &track_stat.tx_layers {
                         let key = format!("tx_{}_{}", mid, rid_key(rid));
                         let mut prev = prev_tx.get(&key).cloned().unwrap_or_default();
 
                         let packets = egress.packets.saturating_sub(prev.packets);
-                        let nacks   = egress.nacks.saturating_sub(prev.nacks);
-                        let plis    = egress.plis.saturating_sub(prev.plis);
+                        let nacks = egress.nacks.saturating_sub(prev.nacks);
+                        let plis = egress.plis.saturating_sub(prev.plis);
 
                         // Update silence counter based on this tick's delta.
                         prev.silent_ticks = if packets == 0 {
@@ -617,9 +618,9 @@ async fn spawn_agent(
                             && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
 
                         prev_tx.insert(key, CounterSnapshot {
-                            packets:      egress.packets,
-                            nacks:        egress.nacks,
-                            plis:         egress.plis,
+                            packets: egress.packets,
+                            nacks: egress.nacks,
+                            plis: egress.plis,
                             silent_ticks: prev.silent_ticks,
                             ..Default::default()
                         });
@@ -628,12 +629,21 @@ async fn spawn_agent(
                             let _ = stats_tx.try_send(StatReport::Tx { bytes: 0, nacks, plis });
                         }
 
-                        tx_active  |= layer_active;
-                        tx_healthy &= layer_active && plis == 0 && nacks < 3;
+                        if layer_active {
+                            tx_active_layers += 1;
+                            if plis == 0 && nacks < 3 {
+                                tx_healthy_layers += 1;
+                            }
+                        }
+
+                        tx_active |= layer_active;
                     }
 
-                    // Healthy implies active.
-                    let tx_healthy = tx_active && tx_healthy;
+                    // Healthy implies active, but paused simulcast layers (e.g. h/f) should
+                    // not downgrade health when a lower-quality layer is intentionally silent.
+                    let tx_healthy = tx_active
+                        && tx_active_layers > 0
+                        && tx_active_layers == tx_healthy_layers;
 
                     // ── RX layers ─────────────────────────────────────────
                     //
@@ -641,16 +651,17 @@ async fn spawn_agent(
                     // the loss-ratio health check is skipped during silent ticks
                     // because `packets == 0` would make the ratio trivially pass
                     // even if the stream is genuinely stalled.
-                    let mut rx_active  = false;
-                    let mut rx_healthy = true;
+                    let mut rx_active = false;
+                    let mut rx_active_layers = 0;
+                    let mut rx_healthy_layers = 0;
 
                     for (rid, ingress) in &track_stat.rx_layers {
                         let key = format!("rx_{}_{}", mid, rid_key(rid));
                         let mut prev = prev_rx.get(&key).cloned().unwrap_or_default();
 
-                        let packets      = ingress.packets.saturating_sub(prev.packets);
-                        let nacks        = ingress.nacks.saturating_sub(prev.nacks);
-                        let plis         = ingress.plis.saturating_sub(prev.plis);
+                        let packets = ingress.packets.saturating_sub(prev.packets);
+                        let nacks = ingress.nacks.saturating_sub(prev.nacks);
+                        let plis = ingress.plis.saturating_sub(prev.plis);
                         let packets_lost = ingress.loss.unwrap_or(0.0) * packets as f32;
 
                         // Update silence counter based on this tick's delta.
@@ -665,16 +676,20 @@ async fn spawn_agent(
                             && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
 
                         prev_rx.insert(key, CounterSnapshot {
-                            packets:      ingress.packets,
-                            nacks:        ingress.nacks,
-                            plis:         ingress.plis,
+                            packets: ingress.packets,
+                            nacks: ingress.nacks,
+                            plis: ingress.plis,
                             silent_ticks: prev.silent_ticks,
                             ..Default::default()
                         });
 
                         if packets > 0 || packets_lost > 0.0 || nacks > 0 || plis > 0 {
                             let _ = stats_tx.try_send(StatReport::Rx {
-                                bytes: 0, packets, packets_lost, nacks, plis,
+                                bytes: 0,
+                                packets,
+                                packets_lost,
+                                nacks,
+                                plis,
                             });
                         }
 
@@ -684,17 +699,24 @@ async fn spawn_agent(
                         let loss_ok = if packets > 0 {
                             packets_lost < 0.05 * packets as f32
                         } else {
-                            // Silent tick — don't penalise, but don't reward either.
-                            // Carry forward whatever the current rx_healthy state is.
-                            rx_healthy
+                            true
                         };
 
-                        rx_active  |= layer_active;
-                        rx_healthy &= layer_active && loss_ok && plis == 0;
+                        if layer_active {
+                            rx_active_layers += 1;
+                            if loss_ok && plis == 0 {
+                                rx_healthy_layers += 1;
+                            }
+                        }
+
+                        rx_active |= layer_active;
                     }
 
-                    // Healthy implies active.
-                    let rx_healthy = rx_active && rx_healthy;
+                    // Healthy implies active, but paused/idle simulcast layers should
+                    // not cause the whole stream to be reported as unhealthy.
+                    let rx_healthy = rx_active
+                        && rx_active_layers > 0
+                        && rx_active_layers == rx_healthy_layers;
 
                     let _ = stats_tx.try_send(StatReport::StreamHealth {
                         tx_active,

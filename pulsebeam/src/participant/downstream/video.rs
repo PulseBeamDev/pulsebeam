@@ -898,12 +898,9 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
 }
 
 impl AllocationEngine {
-    /// Upgrade hysteresis: Require 30% surplus to absorb the Keyframe/PLI burst.
-    const UPGRADE_FACTOR: f64 = 1.3;
-    /// Downgrade hysteresis: Ignore 10% BWE noise; only drop if truly over budget.
+    const UPGRADE_FACTOR: f64 = 1.15;
     const DOWNGRADE_FACTOR: f64 = 0.9;
-    /// Serializes upgrades to prevent simultaneous Keyframe Storms.
-    const MAX_UPGRADES_PER_TICK: usize = 1;
+    const MAX_UPGRADES_PER_TICK: usize = 2;
 
     pub fn compute<'a>(
         available_bw: Bitrate,
