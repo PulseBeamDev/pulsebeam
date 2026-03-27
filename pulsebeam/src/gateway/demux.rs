@@ -3,9 +3,9 @@ use pulsebeam_runtime::net::UnifiedSocketReader;
 
 use crate::gateway::ice;
 use ahash::{HashMap, HashMapExt};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, rc::Rc};
 
-pub type ParticipantHandle = pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>;
+pub type ParticipantHandle = Rc<pulsebeam_runtime::sync::spsc::Sender<net::RecvPacketBatch>>;
 
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///

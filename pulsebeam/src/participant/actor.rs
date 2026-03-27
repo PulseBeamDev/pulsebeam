@@ -1,6 +1,7 @@
 use ahash::HashMap;
 use pulsebeam_runtime::sync::Arc;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::gateway::GatewayWorkerHandle;
@@ -90,13 +91,13 @@ impl actor::Actor<ParticipantMessageSet> for ParticipantActor {
         ctx: &mut actor::ActorContext<ParticipantMessageSet>,
     ) -> Result<(), actor::ActorError> {
         let ufrag = self.core.rtc.direct_api().local_ice_credentials().ufrag;
-        let (gateway_tx, mut gateway_rx) = pulsebeam_runtime::sync::mpsc::channel(256);
+        let (gateway_tx, mut gateway_rx) = pulsebeam_runtime::sync::spsc::channel(256);
 
         let _ = self
             .gateway
             .send(gateway::GatewayControlMessage::AddParticipant(
                 ufrag.clone(),
-                gateway_tx,
+                Rc::new(gateway_tx),
             ))
             .await;
         let sleep = tokio::time::sleep(MIN_QUANTA);

@@ -56,6 +56,7 @@ fn main() {
     let mut rt_builder = tokio::runtime::Builder::new_current_thread();
     let rt = rt_builder
         .enable_all()
+        .event_interval(255)
         // .worker_threads(workers)
         // .disable_lifo_slot()
         // https://github.com/tokio-rs/tokio/issues/7745
@@ -89,7 +90,7 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr)
         .run(shutdown.child_token());
-    let node_handle = tokio::spawn(node);
+    let node_handle = tokio::task::spawn_local(node);
 
     tracing::info!("server started...");
 

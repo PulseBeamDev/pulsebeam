@@ -4,13 +4,14 @@ use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::{actor, net};
 use std::io;
+use std::rc::Rc;
 use tokio::task::JoinSet;
 
 #[derive(Clone, Debug)]
 pub enum GatewayControlMessage {
     AddParticipant(
         String,
-        pulsebeam_runtime::sync::mpsc::Sender<net::RecvPacketBatch>,
+        Rc<pulsebeam_runtime::sync::spsc::Sender<net::RecvPacketBatch>>,
     ),
     RemoveParticipant(String),
 }
@@ -53,7 +54,7 @@ impl actor::Actor<GatewayMessageSet> for GatewayActor {
         for (id, socket) in self.sockets.drain(..).enumerate() {
             let (worker_handle, worker_task) =
                 actor::prepare(GatewayWorkerActor::new(id, socket), RunnerConfig::default());
-            self.worker_tasks.spawn(worker_task);
+            self.worker_tasks.spawn_local(worker_task);
             self.workers.push(worker_handle);
         }
 

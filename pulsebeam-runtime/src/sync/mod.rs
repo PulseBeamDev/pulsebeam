@@ -2,6 +2,7 @@ pub mod event_listener;
 pub mod mpsc;
 pub mod slot_group;
 pub mod spmc;
+pub mod spsc;
 
 pub use mpsc::{
     UnsyncReceiver as UnsyncMpscReceiver, UnsyncSender as UnsyncMpscSender,
