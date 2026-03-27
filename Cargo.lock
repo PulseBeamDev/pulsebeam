@@ -2746,6 +2746,7 @@ dependencies = [
  "jemalloc_pprof",
  "metrics",
  "metrics-exporter-prometheus",
+ "mimalloc",
  "more-asserts",
  "once_cell",
  "pin-project",

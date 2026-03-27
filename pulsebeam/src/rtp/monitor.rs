@@ -287,7 +287,12 @@ impl StreamMonitor {
         let loss_score = metrics.calculate_loss_score();
         let quality_score = jitter_score.min(loss_score);
 
-        let new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
+        let mut new_quality = metrics.quality_hysteresis(quality_score, self.current_quality);
+        if self.kind.is_audio() {
+            // TODO: handle audio quality properly
+            new_quality = StreamQuality::Good;
+        }
+
         if new_quality == self.current_quality {
             return;
         }

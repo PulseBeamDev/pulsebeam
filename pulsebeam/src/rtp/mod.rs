@@ -67,7 +67,7 @@ pub struct RtpPacket {
     /// Shared, reference-counted payload buffer.
     ///
     /// Clone is cheap because this is an `Rc<Vec<u8>>`.
-    pub payload: Rc<Vec<u8>>,
+    pub payload: Rc<[u8]>,
 }
 
 impl Default for RtpPacket {
@@ -82,7 +82,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe_start: false,
-            payload: Rc::new(Vec::from(&[0u8; 1200][..])), // 1.2KB payload for test realism
+            payload: Rc::new([0u8; 1200]), // 1.2KB payload for test realism
         }
     }
 }
@@ -112,7 +112,7 @@ impl RtpPacket {
             arrival_ts: rtp.timestamp.into(),
             playout_time: rtp.timestamp.into(),
             is_keyframe_start,
-            payload: Rc::new(rtp.payload.to_vec()),
+            payload: Rc::from(rtp.payload),
         };
         (pkt, sr)
     }
