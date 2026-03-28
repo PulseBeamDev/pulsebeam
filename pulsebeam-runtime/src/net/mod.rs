@@ -6,7 +6,8 @@ use std::{io, net::SocketAddr};
 
 use std::sync::Arc;
 
-pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
+// ~0.5 MB should fit L2 cache
+pub const BATCH_SIZE: usize = 8;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
