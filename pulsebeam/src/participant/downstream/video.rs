@@ -898,8 +898,8 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
 }
 
 impl AllocationEngine {
-    const UPGRADE_FACTOR: f64 = 1.15;
-    const DOWNGRADE_FACTOR: f64 = 0.9;
+    const UPGRADE_FACTOR: f64 = 1.3;
+    const DOWNGRADE_FACTOR: f64 = 0.8;
     const MAX_UPGRADES_PER_TICK: usize = 2;
 
     pub fn compute<'a>(
