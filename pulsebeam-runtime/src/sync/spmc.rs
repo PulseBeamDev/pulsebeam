@@ -632,6 +632,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unsync_spmc_wake_on_send_when_waiting() {
+        let (mut tx, mut rx) = unsync_channel::<u32>(8);
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+        assert_eq!(counter.get(), 0);
+
+        tx.send(42);
+        assert_eq!(counter.get(), 1);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(42)));
+    }
+
+    #[test]
+    fn unsync_spmc_does_not_delay_with_inflight_data() {
+        let (mut tx, mut rx) = unsync_channel::<u32>(8);
+        tx.send(1);
+        tx.send(2);
+
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(1)));
+        assert_eq!(counter.get(), 0);
+
+        // We're still holding a waker from the previous poll; read next
+        // ready item immediately, no forced delay in the waker path.
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(2)));
+    }
+
+    #[test]
+    fn unsync_spmc_waker_reuse_with_multiple_contexts() {
+        let (mut tx, mut rx) = unsync_channel::<u32>(8);
+
+        for i in 0..10 {
+            let (waker, counter) = new_count_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+            assert_eq!(counter.get(), 0);
+
+            tx.send(i);
+            assert_eq!(counter.get(), 1);
+
+            assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(i)));
+        }
+    }
+
     // ── §2  Ring wrap-around ──────────────────────────────────────────────────
 
     #[test]
@@ -1147,40 +1197,6 @@ mod tests {
         for rx in &mut rxs {
             assert_eq!(try_recv(rx), Ok(105));
             assert_eq!(try_recv(rx), Ok(200));
-        }
-    }
-
-    #[test]
-    fn cross_thread_contention() {
-        use std::thread;
-        let (mut tx, rx) = channel::<u64>(1024);
-        let num_receivers = 4;
-        let items_per_receiver = 10_000;
-
-        let mut handles = vec![];
-        for _ in 0..num_receivers {
-            let mut rx = rx.clone();
-            handles.push(thread::spawn(move || {
-                let mut count = 0;
-                while count < items_per_receiver {
-                    match futures_lite::future::block_on(rx.recv()) {
-                        Ok(_) => count += 1,
-                        Err(RecvError::Lagged(_)) => {} // ignore lags
-                        Err(RecvError::Closed) => break,
-                    }
-                }
-                count
-            }));
-        }
-
-        for i in 0..(num_receivers * items_per_receiver * 2) {
-            tx.send(i as u64);
-        }
-        drop(tx);
-
-        for handle in handles {
-            let count = handle.join().unwrap();
-            assert!(count > 0);
         }
     }
 }

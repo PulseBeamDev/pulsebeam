@@ -130,3 +130,76 @@ impl<T> Drop for Receiver<T> {
         ring.waker.take();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_test::task::{new_count_waker, panic_waker};
+    use std::task::{Context, Poll};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn spsc_wake_on_send_when_waiting() {
+        let (tx, rx) = channel::<u32>(4);
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+        assert_eq!(counter.get(), 0);
+
+        tx.try_send(10).unwrap();
+        assert_eq!(counter.get(), 1);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(10)));
+    }
+
+    #[test]
+    fn spsc_wake_when_more_data_remains() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+
+        let (waker, _counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(1)));
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(2)));
+
+        // when queue has data, the receiver should get it without extra Pending cycles
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+        tx.try_send(3).unwrap();
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(3)));
+    }
+
+    #[test]
+    fn spsc_closed_while_waiting() {
+        let (tx, mut rx) = channel::<u32>(4);
+        let (waker, _counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+        drop(tx);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Err(RecvError::Closed)));
+    }
+
+    #[test]
+    fn spsc_waker_reuse_with_multiple_contexts() {
+        let (tx, rx) = channel::<u32>(4);
+        let mut rx = rx;
+
+        for i in 0..10 {
+            let (waker, counter) = new_count_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+            assert_eq!(counter.get(), 0);
+
+            tx.try_send(i).unwrap();
+            assert_eq!(counter.get(), 1);
+
+            assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(i)));
+        }
+    }
+}
+

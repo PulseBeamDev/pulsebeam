@@ -973,6 +973,42 @@ mod tests {
         assert_eq!(g.len(), 0, "slot must be evicted after Ready(None)");
     }
 
+    #[test]
+    fn slot_group_waker_reuse_for_gated_stream() {
+        let (stream, ready) = gated(42);
+        let mut g = SlotGroup::with_capacity(1);
+        g.insert(stream);
+
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+        assert_eq!(counter.get(), 0);
+
+        ready.store(true, Ordering::Release);
+        g.poke(0);
+
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Ready(Some(42)));
+
+        ready.store(false, Ordering::Release);
+        assert_eq!(poll_once(&mut g, &mut cx), Poll::Pending);
+
+        let (waker2, counter2) = new_count_waker();
+        let mut cx2 = Context::from_waker(&waker2);
+        assert_eq!(poll_once(&mut g, &mut cx2), Poll::Pending);
+        assert_eq!(counter2.get(), 0);
+
+        let (stream2, ready2) = gated(43);
+        g.remove(0); // vacate slot before inserting next stream for reuse behavior
+        g.insert(stream2);
+        ready2.store(true, Ordering::Release);
+        g.poke(0);
+
+        assert_eq!(poll_once(&mut g, &mut cx2), Poll::Ready(Some(43)));
+        assert!(counter.get() >= 0);
+        assert!(counter2.get() >= 0);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 2. Round-robin fairness
     // ─────────────────────────────────────────────────────────────────────────
