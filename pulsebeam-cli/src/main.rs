@@ -227,10 +227,10 @@ async fn run_bench(
         "├───────┬───────┬────────┬─────────┬─────────┬──────────┬──────────┬───────┬──────┬──────┬──────┬───────┬────────┬──────────────────────┤"
     );
     println!(
-        "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │Tx PLI │ Rx PLI │  TX streams  RX streams  │"
+        "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │FPS tot│FPS/stm│FPS std│Tx PLI │ Rx PLI │  TX streams  RX streams  │"
     );
     println!(
-        "│       │       │        │         │         │          │          │       │      │      │      │       │        │ actv/hlth    actv/hlth   │"
+        "│       │       │        │         │         │          │          │       │      │      │      │       │       │       │       │       │ actv/hlth    actv/hlth   │"
     );
     println!(
         "├───────┼───────┼────────┼─────────┼─────────┼──────────┼──────────┼───────┼──────┼──────┼──────┼───────┼────────┼──────────────────────────┤"
@@ -377,6 +377,7 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
 
     let mut tx_bytes = 0u64;
     let mut rx_bytes = 0u64;
+    let mut rx_packets = 0u64;
     let mut rx_loss = 0.0f32;
     let mut tx_nacks = 0u64;
     let mut rx_nacks = 0u64;
@@ -391,6 +392,10 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
     let mut rtt_hist = LatencyHistogram::default();
     let mut consecutive_high_p99 = 0u32;
 
+    const ESTIMATED_PACKETS_PER_FRAME: f32 = 4.0;
+    let mut fps_history: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(60);
+    let mut consecutive_fps_drops = 0u32;
+
     loop {
         tokio::select! {
             Some(report) = stats_rx.recv() => {
@@ -403,11 +408,12 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                         tx_nacks += nacks;
                         tx_plis  += plis;
                     }
-                    StatReport::Rx { bytes, packets: _, packets_lost, nacks, plis } => {
+                    StatReport::Rx { bytes, packets, packets_lost, nacks, plis } => {
                         rx_bytes += bytes;
-                        rx_loss  += packets_lost;
+                        rx_packets += packets;
+                        rx_loss += packets_lost;
                         rx_nacks += nacks;
-                        rx_plis  += plis;
+                        rx_plis += plis;
                     }
                     StatReport::StreamHealth { tx_active, tx_healthy, rx_active, rx_healthy } => {
                         if tx_active  { tx_active_streams  += 1; }
@@ -437,6 +443,29 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                 let p999 = rtt_hist.percentile(99.9);
                 let mean = rtt_hist.mean();
 
+                let fps_total = (rx_packets as f32) / ESTIMATED_PACKETS_PER_FRAME;
+                let stream_count = (rx_active_streams.max(1)) as f32;
+                let fps_per_stream = fps_total / stream_count;
+
+                let fps_mean = if fps_history.is_empty() {
+                    fps_per_stream
+                } else {
+                    fps_history.iter().sum::<f32>() / fps_history.len() as f32
+                };
+                let fps_std = {
+                    let m = fps_mean;
+                    let variance: f32 = fps_history
+                        .iter()
+                        .map(|x| { let d = x - m; d * d })
+                        .sum::<f32>()
+                        / (fps_history.len().max(1) as f32);
+                    variance.sqrt()
+                };
+                fps_history.push_back(fps_per_stream);
+                if fps_history.len() > 60 {
+                    fps_history.pop_front();
+                }
+
                 // Update shared state so degradation checks can see stream health
                 state.tx_active_streams.store(tx_active_streams, Ordering::Relaxed);
                 state.tx_healthy_streams.store(tx_healthy_streams, Ordering::Relaxed);
@@ -444,11 +473,12 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                 state.rx_healthy_streams.store(rx_healthy_streams, Ordering::Relaxed);
 
                 println!(
-                    "│ {:>5}s│ {:>5} │ {:>6} │ {:>6.2}  │ {:>6.2}  │ {:>8.1}  │ {:>8}  │ {:>5} │{:>5} │{:>5} │{:>5} │{:>6} │ {:>5}  │ {:>4}/{:<4}  {:>4}/{:<4} │",
+                    "│ {}s │ {} │ {} │ {:.2} │ {:.2} │ {:.1} │ {} │ {} │ {} │ {} │ {} │ {:.1} │ {:.1} │ {:.1} │ {} │ {} │ {} / {} │ {} / {} │",
                     elapsed, rooms, agents,
                     tx_mbps, rx_mbps,
                     rx_loss, tx_nacks + rx_nacks,
                     p50, p99, p999, mean,
+                    fps_per_stream, fps_mean, fps_std,
                     tx_plis, rx_plis,
                     tx_active_streams, tx_healthy_streams,
                     rx_active_streams, rx_healthy_streams,
@@ -462,6 +492,19 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                     }
                 } else {
                     consecutive_high_p99 = 0;
+                }
+
+                if fps_mean > 0.0 {
+                    let drop_factor = (fps_mean - fps_per_stream) / fps_mean;
+                    if drop_factor > 0.3 {
+                        consecutive_fps_drops += 1;
+                    } else {
+                        consecutive_fps_drops = 0;
+                    }
+                }
+
+                if consecutive_fps_drops >= 3 {
+                    state.degraded.store(true, Ordering::Relaxed);
                 }
 
                 if rx_loss > 5.0 && agents > 0 {
