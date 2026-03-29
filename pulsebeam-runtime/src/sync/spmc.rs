@@ -417,42 +417,41 @@ impl<T: fmt::Debug> fmt::Debug for UnsyncReceiver<T> {
 
 impl<T: Clone> UnsyncReceiver<T> {
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        let head = unsafe { *self.ring.head.get() };
+        loop {
+            let head = unsafe { *self.ring.head.get() };
 
-        // Catching up
-        if self.next_seq < head {
-            let idx = self.next_seq & self.ring.mask;
-            let slot = &self.ring.buffer[idx];
-            let stamp = unsafe { *slot.stamp.get() };
+            // Catching up
+            if self.next_seq < head {
+                let idx = self.next_seq & self.ring.mask;
+                let slot = &self.ring.buffer[idx];
+                let stamp = unsafe { *slot.stamp.get() };
 
-            // If the stamp doesn't match next_seq, the producer has
-            // wrapped around and overwritten this slot already.
-            if stamp != self.next_seq {
-                self.next_seq = head;
-                return Poll::Ready(Err(RecvError::Lagged(head as u64)));
+                // If the stamp doesn't match next_seq, the producer has
+                // wrapped around and overwritten this slot already.
+                if stamp != self.next_seq {
+                    self.next_seq = head;
+                    return Poll::Ready(Err(RecvError::Lagged(head as u64)));
+                }
+
+                let val = unsafe { (*slot.value.get()).assume_init_ref().clone() };
+                self.next_seq = self.next_seq.wrapping_add(1);
+                return Poll::Ready(Ok(val));
             }
 
-            let val = unsafe { (*slot.value.get()).assume_init_ref().clone() };
-            self.next_seq = self.next_seq.wrapping_add(1);
-            return Poll::Ready(Ok(val));
+            // Caught up
+            if unsafe { *self.ring.closed.get() } {
+                return Poll::Ready(Err(RecvError::Closed));
+            }
+
+            if self
+                .ring
+                .event
+                .poll_listen(&mut self.listener, cx)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
         }
-
-        // Caught up
-        if unsafe { *self.ring.closed.get() } {
-            return Poll::Ready(Err(RecvError::Closed));
-        }
-
-        // If we have a listener, we just poll it to update the waker.
-        // If not, we create it once.
-        let listener = self
-            .listener
-            .get_or_insert_with(|| self.ring.event.listen());
-
-        // Pin and poll the existing listener. local-event will
-        // update the task's waker ONLY if it changed.
-        let _ = std::pin::Pin::new(listener).poll(cx);
-
-        Poll::Pending
     }
 
     pub fn rewind(&mut self) {

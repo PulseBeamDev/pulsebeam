@@ -30,6 +30,35 @@ impl Event {
         }
     }
 
+    pub fn poll_listen(
+        &self,
+        listener: &mut Option<EventListener>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let listener = listener.get_or_insert_with(|| self.listen());
+
+        let mut inner = self.inner.borrow_mut();
+        let entry = inner
+            .listeners
+            .get_mut(&listener.id)
+            .expect("Listener leaked");
+
+        if entry.notified {
+            entry.notified = false;
+            return Poll::Ready(());
+        }
+
+        if entry
+            .waker
+            .as_ref()
+            .map_or(true, |w| !w.will_wake(cx.waker()))
+        {
+            entry.waker = Some(cx.waker().clone());
+        }
+
+        Poll::Pending
+    }
+
     pub fn listen(&self) -> EventListener {
         let mut inner = self.inner.borrow_mut();
         let id = inner.next_id;
