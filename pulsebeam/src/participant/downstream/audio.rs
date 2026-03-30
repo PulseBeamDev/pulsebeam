@@ -1,5 +1,5 @@
-use pulsebeam_runtime::sync::{UnsyncSlotGroup};
-use pulsebeam_runtime::sync::spmc;
+use pulsebeam_runtime::sync::UnsyncSlotGroup;
+use pulsebeam_runtime::unsync::spmc;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -73,7 +73,7 @@ impl AudioAllocator {
     pub fn pin_slot(
         &mut self,
         slot_index: usize,
-        receiver: spmc::UnsyncReceiver<AudioRtpPacket>,
+        receiver: spmc::Receiver<AudioRtpPacket>,
     ) -> bool {
         let Some(mut stream) = self.slots.get_mut(slot_index) else {
             return false;
@@ -150,7 +150,7 @@ impl AudioAllocator {
 /// the session lifetime; only the underlying receiver is swapped on
 /// subscription/pin changes.
 struct AudioInputStream {
-    receiver: Option<spmc::UnsyncReceiver<AudioRtpPacket>>,
+    receiver: Option<spmc::Receiver<AudioRtpPacket>>,
     slot: AudioSlot,
 }
 
@@ -165,7 +165,7 @@ impl AudioInputStream {
     /// Swap in a new receiver and reset the timeline so the SSRC-change
     /// detection in `AudioSlot::process` triggers a clean rebase on the
     /// first packet from the new source.
-    fn set_receiver(&mut self, receiver: spmc::UnsyncReceiver<AudioRtpPacket>) {
+    fn set_receiver(&mut self, receiver: spmc::Receiver<AudioRtpPacket>) {
         self.receiver = Some(receiver);
         self.slot.last_ssrc = None;
     }

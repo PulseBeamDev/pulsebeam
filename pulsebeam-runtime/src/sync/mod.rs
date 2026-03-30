@@ -1,4 +1,3 @@
-pub mod event_listener;
 pub mod mpsc;
 pub mod slot_group;
 pub mod spmc;
@@ -9,10 +8,6 @@ pub use mpsc::{
     unsync_channel as unsync_mpsc_channel,
 };
 pub use slot_group::UnsyncSlotGroup;
-pub use spmc::{
-    UnsyncReceiver as UnsyncSpmcReceiver, UnsyncSender as UnsyncSpmcSender,
-    unsync_channel as unsync_spmc_channel,
-};
 
 #[cfg(not(feature = "loom"))]
 mod primitives {

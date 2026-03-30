@@ -1,7 +1,7 @@
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::UnsyncSlotGroup;
-use pulsebeam_runtime::sync::spmc;
+use pulsebeam_runtime::unsync::spmc;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::pin::Pin;

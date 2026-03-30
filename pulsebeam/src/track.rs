@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use pulsebeam_runtime::sync::spmc;
+use pulsebeam_runtime::unsync::spmc;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -113,7 +113,7 @@ pub struct SimulcastReceiver {
     pub meta: Arc<TrackMeta>,
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
-    pub channel: spmc::UnsyncReceiver<RtpPacket>,
+    pub channel: spmc::Receiver<RtpPacket>,
     pub keyframe_requester: KeyframeRequester,
     pub state: StreamState,
 }
@@ -153,7 +153,7 @@ pub struct SimulcastSender {
     pub quality: SimulcastQuality,
     pub monitor: StreamMonitor,
     synchronizer: Synchronizer,
-    channel: spmc::UnsyncSender<RtpPacket>,
+    channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
 }
 
@@ -311,7 +311,7 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
             (MediaKind::Video, Some(_), _) => (SimulcastQuality::Low, 150_000, 1),
         };
 
-        let (tx, rx) = spmc::unsync_channel(BASE_CAP * cap_tier);
+        let (tx, rx) = spmc::channel(BASE_CAP * cap_tier);
         // Shared atomic signal: receiver writes, poll-side reads.
         let signal = Arc::new(AtomicBool::new(false));
 

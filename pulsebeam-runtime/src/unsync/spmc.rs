@@ -1,9 +1,11 @@
-use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, RwLock};
-use event_listener::{Event, EventListener};
+use crate::unsync::event_listener::{Event, EventListener};
 use futures_lite::Stream;
+use std::cell::UnsafeCell;
+use std::fmt;
 use std::fmt::Debug;
+use std::mem::MaybeUninit;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,240 +19,167 @@ pub enum StreamRecvError {
     Lagged(u64),
 }
 
-#[derive(Debug)]
 struct Slot<T> {
-    seq: u64,
-    val: Option<T>,
+    // Stores: [ Sequence Count | Buffer Index ]
+    stamp: UnsafeCell<usize>,
+    value: UnsafeCell<MaybeUninit<T>>,
 }
 
+impl<T: fmt::Debug> fmt::Debug for Slot<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stamp = unsafe { *self.stamp.get() };
+        let mut d = f.debug_struct("Slot");
+        d.field("stamp", &stamp);
+
+        // We only try to debug-print the value if the stamp isn't the sentinel (usize::MAX)
+        if stamp != usize::MAX {
+            let val = unsafe { (*self.value.get()).assume_init_ref() };
+            d.field("value", val);
+        } else {
+            d.field("value", &"Uninitialized");
+        }
+
+        d.finish()
+    }
+}
+
+// spmc implementation inspired by tachyonix mpsc
 struct Ring<T> {
-    head: AtomicU64,
+    buffer: Box<[Slot<T>]>,
     mask: usize,
-    slots: Vec<RwLock<Slot<T>>>,
+    head: UnsafeCell<usize>, // The writer's sequence
+    closed: UnsafeCell<bool>,
     event: Event,
-    closed: AtomicU64,
 }
 
-impl<T> Debug for Ring<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: fmt::Debug> fmt::Debug for Ring<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let head = unsafe { *self.head.get() };
+        let closed = unsafe { *self.closed.get() };
+
         f.debug_struct("Ring")
-            .field("closed", &self.is_closed())
+            .field("capacity", &(self.mask + 1))
+            .field("head", &head)
+            .field("closed", &closed)
+            // We usually don't want to dump the whole buffer in a trace,
+            // but we can show the number of slots.
+            .field("buffer_len", &self.buffer.len())
             .finish()
     }
 }
 
-impl<T> Ring<T> {
-    fn new(mut capacity: usize) -> Arc<Self> {
-        assert!(capacity > 0, "capacity must be > 0");
-        if !capacity.is_power_of_two() {
-            let old_cap = capacity;
-            capacity = capacity.next_power_of_two();
-            tracing::warn!(
-                "Capacity should be power of 2, use nearest: {} -> {}",
-                old_cap,
-                capacity
-            );
-        }
-
-        let mut slots = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            slots.push(RwLock::new(Slot { seq: 0, val: None }));
-        }
-
-        Arc::new(Self {
-            head: AtomicU64::new(0),
-            mask: capacity - 1,
-            slots,
-            event: Event::new(),
-            closed: AtomicU64::new(0),
-        })
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire) == 1
-    }
+pub struct Sender<T> {
+    ring: Rc<Ring<T>>,
 }
 
-#[derive(Debug)]
-pub struct Sender<T> {
-    ring: Arc<Ring<T>>,
-    local_head: u64,
+impl<T: fmt::Debug> fmt::Debug for Sender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sender").field("ring", &self.ring).finish()
+    }
 }
 
 impl<T> Sender<T> {
-    pub fn send(&mut self, val: T) {
-        if self.ring.is_closed() {
-            return;
-        }
+    pub fn send(&mut self, value: T) {
+        unsafe {
+            if *self.ring.closed.get() {
+                return;
+            }
 
-        let idx = (self.local_head as usize) & self.ring.mask;
-        {
-            let mut slot = self.ring.slots[idx].write();
-            slot.val = Some(val);
-            slot.seq = self.local_head;
-        }
+            let head = *self.ring.head.get();
+            let idx = head & self.ring.mask;
+            let slot = &self.ring.buffer[idx];
 
-        self.local_head += 1;
-        self.ring.head.store(self.local_head, Ordering::Release);
-        self.ring.event.notify(usize::MAX);
+            let ptr = slot.value.get();
+            ptr.replace(MaybeUninit::new(value));
+
+            *slot.stamp.get() = head;
+            *self.ring.head.get() = head.wrapping_add(1);
+            self.ring.event.notify(usize::MAX);
+        }
     }
 }
 
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        self.ring.closed.store(1, Ordering::Release);
-        self.ring.event.notify(usize::MAX);
-    }
-}
-
-#[derive(Debug)]
 pub struct Receiver<T> {
-    ring: Arc<Ring<T>>,
-    next_seq: u64,
-    local_head: u64,
+    ring: Rc<Ring<T>>,
+    next_seq: usize,
     listener: Option<EventListener>,
-    pkts_received: u64,
+}
+
+impl<T: fmt::Debug> fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Receiver")
+            .field("next_seq", &self.next_seq)
+            .field("is_listening", &self.listener.is_some())
+            .field("ring", &self.ring)
+            .finish()
+    }
 }
 
 impl<T: Clone> Receiver<T> {
-    const METRIC_FLUSH_MASK: u64 = 1023;
-
-    /// Jump to the producer's current position (Audio/Low-latency).
-    pub fn sync(&mut self) {
-        self.local_head = self.ring.head.load(Ordering::Acquire);
-        self.next_seq = self.local_head;
-        self.listener = None;
-    }
-
-    /// Jump back halfway to provide a processing window (Video/Burst).
-    pub fn rewind(&mut self) {
-        // Half cap to give a chance to load from cache while not too close
-        // to tail to cause a lag error.
-        self.local_head = self.ring.head.load(Ordering::Acquire);
-        let half_ring_cap = (self.ring.slots.len() / 2) as u64;
-        let ring_len = self.local_head.wrapping_sub(self.next_seq);
-
-        // Defensive: detect if next_seq is impossibly far behind
-        if ring_len > self.ring.slots.len() as u64 {
-            // Something is very wrong - reset to head
-            self.next_seq = self.local_head;
-        } else {
-            let offset = half_ring_cap.min(ring_len);
-            self.next_seq = self.local_head.wrapping_sub(offset);
-        }
-    }
-
-    pub async fn recv(&mut self) -> Result<T, RecvError> {
-        std::future::poll_fn(|cx| self.poll_recv(cx)).await
-    }
-
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
         loop {
-            // Refresh head snapshot only when we've caught up to our last snapshot.
-            if self.next_seq >= self.local_head {
-                self.local_head = self.ring.head.load(Ordering::Acquire);
-            }
+            let head = unsafe { *self.ring.head.get() };
 
-            // Still no new items — park.
-            if self.next_seq >= self.local_head {
-                // Ensure we have a listener and that it is registered with the event.
-                if self.listener.is_none() {
-                    let mut listener = self.ring.event.listen();
+            // Catching up
+            if self.next_seq < head {
+                let idx = self.next_seq & self.ring.mask;
+                let slot = &self.ring.buffer[idx];
+                let stamp = unsafe { *slot.stamp.get() };
 
-                    // Poll once so the waker is registered.
-                    if Pin::new(&mut listener).poll(cx).is_ready() {
-                        // Notification already fired; retry the loop.
-                        continue;
-                    }
-
-                    self.listener = Some(listener);
+                // If the stamp doesn't match next_seq, the producer has
+                // wrapped around and overwritten this slot already.
+                if stamp != self.next_seq {
+                    self.next_seq = head;
+                    return Poll::Ready(Err(RecvError::Lagged(head as u64)));
                 }
 
-                // Re-check head after listener registration to close the race window.
-                self.local_head = self.ring.head.load(Ordering::Acquire);
-                if self.next_seq < self.local_head {
-                    // Data arrived after we installed the listener.
-                    self.listener = None;
-                    continue;
-                }
-
-                // Closed and drained.
-                if self.ring.closed.load(Ordering::Acquire) == 1 {
-                    return Poll::Ready(Err(RecvError::Closed));
-                }
-
-                // Park until notified.
-                let listener = self.listener.as_mut().unwrap();
-                match Pin::new(listener).poll(cx) {
-                    Poll::Ready(_) => {
-                        self.listener = None;
-                        continue;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
+                let val = unsafe { (*slot.value.get()).assume_init_ref().clone() };
+                self.next_seq = self.next_seq.wrapping_add(1);
+                return Poll::Ready(Ok(val));
             }
 
-            // We have at least one item available. Clear stale listener.
-            self.listener = None;
-
-            // Read slot for next_seq — clone value under the lock, then release.
-            let idx = (self.next_seq as usize) & self.ring.mask;
-            let (slot_seq, maybe_val) = {
-                let slot = self.ring.slots[idx].read();
-                (slot.seq, slot.val.clone())
-            };
-
-            // Seq mismatch means producer overwrote this slot while we lagged.
-            if slot_seq != self.next_seq {
-                // Reload head for an accurate lag report.
-                self.local_head = self.ring.head.load(Ordering::Acquire);
-                self.next_seq = self.local_head;
-                #[cfg(not(feature = "loom"))]
-                metrics::counter!("spmc_receive_lag_total").increment(1);
-                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
+            // Caught up
+            if unsafe { *self.ring.closed.get() } {
+                return Poll::Ready(Err(RecvError::Closed));
             }
 
-            // Coop yield point — no locks held here.
-            let coop = ready!(crate::sync::coop::poll_proceed(cx));
-
-            let Some(out) = maybe_val else {
-                // seq matched but val is None — should be impossible, but treat as lag.
-                debug_assert!(
-                    false,
-                    "slot seq matched but val was None — ring invariant violated"
-                );
-                self.local_head = self.ring.head.load(Ordering::Acquire);
-                self.next_seq = self.local_head;
-                #[cfg(not(feature = "loom"))]
-                metrics::counter!("spmc_receive_lag_total").increment(1);
-                return Poll::Ready(Err(RecvError::Lagged(self.local_head)));
-            };
-
-            coop.made_progress();
-            self.next_seq += 1;
-            self.pkts_received += 1;
-
-            if (self.pkts_received & Self::METRIC_FLUSH_MASK) == 0 {
-                self.flush_metrics();
+            if self
+                .ring
+                .event
+                .poll_listen(&mut self.listener, cx)
+                .is_pending()
+            {
+                return Poll::Pending;
             }
-            return Poll::Ready(Ok(out));
         }
     }
 
-    fn flush_metrics(&mut self) {
-        #[cfg(not(feature = "loom"))]
-        {
-            let current_drift = self.local_head.saturating_sub(self.next_seq);
-            let capacity = (self.ring.mask + 1) as f64;
-            metrics::histogram!("spmc_receive_drift_ratio").record(current_drift as f64 / capacity);
-            metrics::counter!("spmc_receive_throughput_total").increment(self.pkts_received);
+    pub fn rewind(&mut self) {
+        let head = unsafe { *self.ring.head.get() };
+
+        let cap = self.ring.buffer.len();
+        let half_cap = cap / 2;
+
+        // If next_seq is > head (wrapping), this result is technically
+        // a very large number, which is caught by the 'distance > cap' check.
+        let distance = head.wrapping_sub(self.next_seq);
+
+        if distance > cap {
+            // We were already lapped or in an invalid state.
+            // Reset to middle of the ring to get a fresh start with some history.
+            self.next_seq = head.wrapping_sub(half_cap);
+        } else {
+            // We are within the valid buffer.
+            // Move back by half the ring, but don't go further back than what's available.
+            let offset = half_cap.min(distance);
+            self.next_seq = head.wrapping_sub(offset);
         }
-        self.pkts_received = 0;
     }
 }
 
 impl<T: Clone + std::marker::Unpin> Stream for Receiver<T> {
     type Item = Result<T, StreamRecvError>;
+
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
@@ -267,47 +196,45 @@ impl<T: Clone + std::marker::Unpin> Stream for Receiver<T> {
 impl<T: Clone> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Self {
-            ring: self.ring.clone(),
+            ring: Rc::clone(&self.ring),
             next_seq: self.next_seq,
-            local_head: self.local_head,
             listener: None,
-            pkts_received: 0,
         }
     }
 }
 
-pub fn channel<T: Send + Sync + Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    #[cfg(not(feature = "loom"))]
-    {
-        metrics::describe_histogram!(
-            "spmc_receive_drift_ratio",
-            "The ratio of the buffer capacity currently occupied by unread packets \
-            at the moment of processing. A value of 1.0 indicates the receiver is \
-            about to be overwritten (lagged)."
-        );
-        metrics::describe_counter!(
-            "spmc_receive_throughput_total",
-            "The total number of packets successfully delivered across all SPMC channels."
-        );
-        metrics::describe_counter!(
-            "spmc_receive_lag_total",
-            "The total number of times a receiver was too slow and was overwritten by \
-            the producer, resulting in dropped data."
-        );
+pub fn channel<T: Clone + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    let mut cap = capacity;
+    if !cap.is_power_of_two() {
+        cap = cap.next_power_of_two();
+        tracing::warn!("Capacity optimized: {} -> {}", capacity, cap);
     }
 
-    let ring = Ring::new(capacity);
+    // Allocate the ring with stamps initialized to a "never-read" state.
+    // By setting stamps to a huge value (or -1), we ensure that a
+    // fresh receiver won't accidentally think uninitialized memory is valid data.
+    let mut buffer = Vec::with_capacity(cap);
+    for _ in 0..cap {
+        buffer.push(Slot {
+            stamp: UnsafeCell::new(usize::MAX), // Sentinel value
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        });
+    }
+
+    let ring = Rc::new(Ring {
+        buffer: buffer.into_boxed_slice(),
+        mask: cap - 1,
+        head: UnsafeCell::new(0),
+        closed: UnsafeCell::new(false),
+        event: Event::new(),
+    });
+
     (
-        Sender {
-            ring: ring.clone(),
-            local_head: 0,
-        },
+        Sender { ring: ring.clone() },
         Receiver {
-            ring: ring.clone(),
+            ring,
             next_seq: 0,
-            local_head: 0,
             listener: None,
-            pkts_received: 0,
         },
     )
 }
@@ -369,6 +296,89 @@ mod tests {
             assert_eq!(try_recv(&mut rx1), Ok(i), "rx1 mismatch at {i}");
             assert_eq!(try_recv(&mut rx2), Ok(i), "rx2 mismatch at {i}");
             assert_eq!(try_recv(&mut rx3), Ok(i), "rx3 mismatch at {i}");
+        }
+    }
+
+    fn try_recv_unsync<T: Clone>(rx: &mut Receiver<T>) -> Result<T, RecvError> {
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+        match rx.poll_recv(&mut cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("unexpected Pending — data should have been available"),
+        }
+    }
+
+    #[test]
+    fn unsync_send_and_recv_single_item() {
+        let (mut tx, mut rx) = channel::<u64>(8);
+        tx.send(42);
+        assert_eq!(try_recv_unsync(&mut rx), Ok(42));
+    }
+
+    #[test]
+    fn unsync_multi_consumer_each_sees_all_messages() {
+        let (mut tx, rx) = channel::<u32>(8);
+        let mut rx1 = rx.clone();
+        let mut rx2 = rx.clone();
+        let mut rx3 = rx.clone();
+
+        for i in 0..4_u32 {
+            tx.send(i);
+        }
+        for i in 0..4_u32 {
+            assert_eq!(try_recv_unsync(&mut rx1), Ok(i), "rx1 mismatch at {i}");
+            assert_eq!(try_recv_unsync(&mut rx2), Ok(i), "rx2 mismatch at {i}");
+            assert_eq!(try_recv_unsync(&mut rx3), Ok(i), "rx3 mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn unsync_spmc_wake_on_send_when_waiting() {
+        let (mut tx, mut rx) = channel::<u32>(8);
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+        assert_eq!(counter.get(), 0);
+
+        tx.send(42);
+        assert_eq!(counter.get(), 1);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(42)));
+    }
+
+    #[test]
+    fn unsync_spmc_does_not_delay_with_inflight_data() {
+        let (mut tx, mut rx) = channel::<u32>(8);
+        tx.send(1);
+        tx.send(2);
+
+        let (waker, counter) = new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(1)));
+        assert_eq!(counter.get(), 0);
+
+        // We're still holding a waker from the previous poll; read next
+        // ready item immediately, no forced delay in the waker path.
+        assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(2)));
+    }
+
+    #[test]
+    fn unsync_spmc_waker_reuse_with_multiple_contexts() {
+        let (mut tx, mut rx) = channel::<u32>(8);
+
+        for i in 0..10 {
+            let (waker, counter) = new_count_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            assert_eq!(rx.poll_recv(&mut cx), Poll::Pending);
+            assert_eq!(counter.get(), 0);
+
+            tx.send(i);
+            assert_eq!(counter.get(), 1);
+
+            assert_eq!(rx.poll_recv(&mut cx), Poll::Ready(Ok(i)));
         }
     }
 
@@ -486,21 +496,6 @@ mod tests {
         let (tx, mut rx) = channel::<u64>(4);
         drop(tx);
         assert_eq!(try_recv(&mut rx), Err(RecvError::Closed));
-    }
-
-    #[test]
-    fn send_after_close_is_a_noop() {
-        let (mut tx, mut rx) = channel::<u64>(4);
-        tx.ring
-            .closed
-            .store(1, std::sync::atomic::Ordering::Release);
-        tx.send(99); // must not panic
-
-        let waker = panic_waker();
-        let mut cx = Context::from_waker(&waker);
-        // Ring is closed and empty — Closed (via try_recv would panic on Pending,
-        // so use poll directly).
-        assert_eq!(poll(&mut rx, &mut cx), Poll::Ready(Err(RecvError::Closed)));
     }
 
     // ── §5  Waker registration & spurious-wake safety ─────────────────────────
@@ -654,28 +649,6 @@ mod tests {
     }
 
     // ── §7  sync() / rewind() ─────────────────────────────────────────────────
-
-    #[test]
-    fn sync_jumps_to_current_head_and_reads_only_new_data() {
-        let (mut tx, mut rx) = channel::<u64>(8);
-        for i in 0..4 {
-            tx.send(i);
-        }
-
-        // Sync skips old data.
-        rx.sync();
-
-        // Nothing new yet — must park.
-        let (waker, _) = new_count_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(poll(&mut rx, &mut cx), Poll::Pending));
-
-        tx.send(99);
-
-        let waker2 = panic_waker();
-        let mut cx2 = Context::from_waker(&waker2);
-        assert_eq!(poll(&mut rx, &mut cx2), Poll::Ready(Ok(99)));
-    }
 
     #[test]
     fn rewind_provides_a_processing_window() {
