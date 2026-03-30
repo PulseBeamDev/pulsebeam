@@ -8,7 +8,7 @@ use pulsebeam_runtime::sync::Arc;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
+use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
 use str0m::net::Protocol;
 use str0m::rtp::Ssrc;
 use str0m::{
@@ -132,6 +132,10 @@ impl ParticipantCore {
         } else {
             tracing::warn!(?key, "stream not found for keyframe request");
         }
+    }
+
+    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch, now: Instant) -> Option<Instant> {
+        self.handle_udp_packet_batch(batch, now)
     }
 
     pub fn handle_udp_packet_batch(
@@ -300,7 +304,14 @@ impl ParticipantCore {
         result
     }
 
-    pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: RtpPacket) {
+    pub fn on_forward_rtp(&mut self, track_id: &TrackId, rid: &Option<&Rid>, pkt: &RtpPacket) {
+        // TODO: filter simulcast switching
+
+        todo!();
+        // self.handle_forward_rtp(mid, pkt);
+    }
+
+    pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: &RtpPacket) {
         let Some(&(pt, ssrc)) = self.slot_meta.get(&mid) else {
             tracing::warn!(%mid, "Dropping RTP: mid not in slot_meta (slot not yet negotiated)");
             return;
@@ -324,7 +335,7 @@ impl ParticipantCore {
             pkt.rtp_ts.numer() as u32,
             pkt.playout_time.into(),
             pkt.marker,
-            pkt.ext_vals,
+            pkt.ext_vals.clone(),
             true,
             pkt.payload.to_vec(),
         ) {
