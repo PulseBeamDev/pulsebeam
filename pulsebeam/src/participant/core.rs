@@ -3,6 +3,7 @@ use ahash::{HashMap, HashMapExt};
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
+use pulsebeam_proto::signaling::Track;
 use pulsebeam_runtime::net::{self, Transport};
 use pulsebeam_runtime::sync::Arc;
 use std::time::Duration;
@@ -134,7 +135,12 @@ impl ParticipantCore {
         }
     }
 
-    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch, now: Instant) -> Option<Instant> {
+    pub fn on_ingress(
+        &mut self,
+        batch: net::RecvPacketBatch,
+        now: Instant,
+        routing: &HashMap<TrackId, Track>,
+    ) -> Option<Instant> {
         self.handle_udp_packet_batch(batch, now)
     }
 
@@ -200,9 +206,7 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    /// The Main Orchestrator.
-    /// Drives the feedback loop between the RTC Engine and the Signaling Logic.
-    pub fn poll(&mut self) -> Option<Instant> {
+    pub fn poll(&mut self, routing: &HashMap<TrackId, Track>) -> Option<Instant> {
         let now = Instant::now();
 
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
@@ -211,7 +215,7 @@ impl ParticipantCore {
         }
 
         loop {
-            let rtc_deadline = self.poll_rtc()?;
+            let rtc_deadline = self.poll_rtc(routing)?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
                 // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
@@ -234,7 +238,7 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self) -> Option<Instant> {
+    fn poll_rtc(&mut self, routing: &HashMap<TrackId, Track>) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -277,7 +281,7 @@ impl ParticipantCore {
                         events += 1;
                         work_items += 1;
                     }
-                    self.handle_event(event);
+                    self.handle_event(event, routing);
                 }
                 Err(e) => {
                     #[cfg(feature = "deep-metrics")]
@@ -343,7 +347,7 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event, routing: &HashMap<TrackId, Track>) {
         match event {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
@@ -423,7 +427,11 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket) {
+    fn handle_incoming_rtp(
+        &mut self,
+        rtp: str0m::rtp::RtpPacket,
+        routing: &HashMap<TrackId, Track>,
+    ) {
         tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {

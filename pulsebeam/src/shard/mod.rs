@@ -53,7 +53,7 @@ impl Shard {
                     continue;
                 };
 
-                if let Some(deadline) = participant.on_ingress(batch, now) {
+                if let Some(deadline) = participant.on_ingress(batch, now, &tracks) {
                     timer_wheel.push(Reverse(deadline));
                 } else {
                     participant_exited.insert(participant_id);
