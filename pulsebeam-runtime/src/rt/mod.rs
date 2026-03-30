@@ -5,6 +5,12 @@ pub use tokio::task::JoinSet;
 mod detector;
 pub use detector::LongRunningTaskDetector as Builder;
 
+mod spawn;
+pub use spawn::{
+    RuntimeSpawner, SpawnError, TaskFactory, TaskHandle, set_global_runtime_spawner, spawn,
+    spawn_control, spawn_data,
+};
+
 pub type Runtime = tokio::runtime::Runtime;
 
 pub fn current() -> Handle {
