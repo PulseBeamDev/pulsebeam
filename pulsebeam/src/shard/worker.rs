@@ -86,6 +86,15 @@ impl ShardWorker {
             while let Some(participant_id) = events.exited.pop_front() {
                 // TODO: participant cleanup
             }
+
+            for participant_id in dirty {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
+                    continue;
+                };
+
+                participant.udp_batcher.flush(&self.udp_socket_tx);
+                // TODO: TCP
+            }
         }
     }
 }
