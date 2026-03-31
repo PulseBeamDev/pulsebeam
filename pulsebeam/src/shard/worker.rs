@@ -42,6 +42,7 @@ impl ShardWorker {
         let mut participant_exited = BTreeSet::new();
         let mut events = ParticipantEvents::default();
         let mut exited = VecDeque::new();
+        let mut dirty = BTreeSet::new();
 
         loop {
             self.udp_socket_rx.readable().await?;
@@ -59,11 +60,8 @@ impl ShardWorker {
                     continue;
                 };
 
-                if let Some(deadline) = participant.on_ingress(batch, now, &mut events) {
-                    timer_wheel.push((deadline, participant_id));
-                } else {
-                    exited.push_back(participant_id);
-                }
+                participant.on_ingress(batch, now, &mut events);
+                dirty.insert(participant_id);
             }
 
             while let Some(stream_id) = events.published_rtp.pop_front() {
@@ -77,7 +75,16 @@ impl ShardWorker {
                     };
 
                     sub.on_forward_rtp(&stream_id, &mut events);
+                    dirty.insert(*participant_id);
                 }
+            }
+
+            while let Some(entry) = events.next_deadlines.pop_front() {
+                timer_wheel.push(entry);
+            }
+
+            while let Some(participant_id) = events.exited.pop_front() {
+                // TODO: participant cleanup
             }
         }
     }

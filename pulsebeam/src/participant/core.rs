@@ -34,6 +34,8 @@ const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct ParticipantEvents {
     pub published_tracks: VecDeque<TrackReceiver>,
     pub published_rtp: VecDeque<StreamId>,
+    pub next_deadlines: VecDeque<(Instant, ParticipantId)>,
+    pub exited: VecDeque<ParticipantId>,
 }
 
 pub struct TrackMapping {
@@ -142,7 +144,7 @@ impl ParticipantCore {
         batch: net::RecvPacketBatch,
         now: Instant,
         events: &mut ParticipantEvents,
-    ) -> Option<Instant> {
+    ) {
         self.handle_udp_packet_batch(batch, now, events)
     }
 
@@ -151,13 +153,12 @@ impl ParticipantCore {
         batch: net::RecvPacketBatch,
         now: Instant,
         events: &mut ParticipantEvents,
-    ) -> Option<Instant> {
+    ) {
         let transport = match batch.transport {
             Transport::Udp(_) => str0m::net::Protocol::Udp,
             Transport::Tcp => str0m::net::Protocol::Tcp,
         };
 
-        let mut maybe_deadline = None;
         for pkt in batch.into_iter() {
             if let Ok(contents) = (*pkt).try_into() {
                 let recv = str0m::net::Receive {
@@ -171,14 +172,12 @@ impl ParticipantCore {
                     .handle_input(Input::Receive(now.into(), recv))
                     .is_ok()
                 {
-                    maybe_deadline = self.poll(events);
+                    self.poll(now, events);
                 }
             } else {
                 tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
             }
         }
-
-        maybe_deadline
     }
 
     pub fn handle_tick(&mut self) {
@@ -211,15 +210,35 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll(&mut self, events: &mut ParticipantEvents) -> Option<Instant> {
-        let now = Instant::now();
+    pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents) {
+        let Some(last_deadline) = self.last_deadline else {
+            // already dead, nothing to do.
+            return;
+        };
 
+        let next_deadline = self.poll_until_deadline(now, events);
+
+        if let Some(next_deadline) = next_deadline {
+            if next_deadline > last_deadline {
+                events.next_deadlines.push_back((now, self.participant_id));
+            }
+        } else {
+            events.exited.push_back(self.participant_id);
+        }
+        self.last_deadline = next_deadline;
+    }
+
+    fn poll_until_deadline(
+        &mut self,
+        now: Instant,
+        events: &mut ParticipantEvents,
+    ) -> Option<Instant> {
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
             self.poll_slow(now);
             self.last_slow_poll = now;
         }
 
-        loop {
+        let next_deadline = loop {
             let rtc_deadline = self.poll_rtc(events)?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
@@ -238,7 +257,7 @@ impl ParticipantCore {
 
             // No new work generated. We are synced. Return the RTC deadline.
             return Some(rtc_deadline.min(next_slow_poll));
-        }
+        };
     }
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
@@ -313,11 +332,7 @@ impl ParticipantCore {
         result
     }
 
-    pub fn on_forward_rtp(
-        &mut self,
-        stream_id: &StreamId,
-        events: &mut ParticipantEvents,
-    ) -> Option<Instant> {
+    pub fn on_forward_rtp(&mut self, stream_id: &StreamId, events: &mut ParticipantEvents) {
         // TODO: filter simulcast switching
 
         todo!();
