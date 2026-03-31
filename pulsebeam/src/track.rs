@@ -10,12 +10,15 @@ use tokio::time::Instant;
 
 #[cfg(test)]
 use crate::entity::ParticipantId;
+use crate::entity::TrackId;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
     sync::Synchronizer,
 };
 use str0m::rtp::rtcp::SenderInfo;
+
+pub type StreamId = (TrackId, Option<Rid>);
 
 /// Leading-edge debounce interval for keyframe requests forwarded upstream.
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);

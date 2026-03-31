@@ -3,15 +3,14 @@ use str0m::rtp::rtcp::SenderInfo;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::rtp::RtpPacket;
-use crate::track::Track;
+use crate::{rtp::RtpPacket, track::TrackSender};
 use str0m::media::{KeyframeRequest, MediaKind, Mid};
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
 
 struct UpstreamSlot {
     mid: Mid,
-    track: Track,
+    track: TrackSender,
 }
 
 impl PartialEq for UpstreamSlot {
