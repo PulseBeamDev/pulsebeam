@@ -15,6 +15,13 @@ pub enum RecvError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    Empty,
+    Lagged(u64),
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamRecvError {
     Lagged(u64),
 }
@@ -116,31 +123,43 @@ impl<T: fmt::Debug> fmt::Debug for Receiver<T> {
 }
 
 impl<T: Clone> Receiver<T> {
-    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        loop {
-            let head = unsafe { *self.ring.head.get() };
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        let head = unsafe { *self.ring.head.get() };
 
-            // Catching up
-            if self.next_seq < head {
-                let idx = self.next_seq & self.ring.mask;
-                let slot = &self.ring.buffer[idx];
-                let stamp = unsafe { *slot.stamp.get() };
-
-                // If the stamp doesn't match next_seq, the producer has
-                // wrapped around and overwritten this slot already.
-                if stamp != self.next_seq {
-                    self.next_seq = head;
-                    return Poll::Ready(Err(RecvError::Lagged(head as u64)));
-                }
-
-                let val = unsafe { (*slot.value.get()).assume_init_ref().clone() };
-                self.next_seq = self.next_seq.wrapping_add(1);
-                return Poll::Ready(Ok(val));
-            }
-
+        if self.next_seq >= head {
             // Caught up
             if unsafe { *self.ring.closed.get() } {
-                return Poll::Ready(Err(RecvError::Closed));
+                return Err(TryRecvError::Closed);
+            }
+
+            return Err(TryRecvError::Empty);
+        }
+
+        // Catching up
+        let idx = self.next_seq & self.ring.mask;
+        let slot = &self.ring.buffer[idx];
+        let stamp = unsafe { *slot.stamp.get() };
+
+        // If the stamp doesn't match next_seq, the producer has
+        // wrapped around and overwritten this slot already.
+        if stamp != self.next_seq {
+            self.next_seq = head;
+            return Err(TryRecvError::Lagged(head as u64));
+        }
+
+        let val = unsafe { (*slot.value.get()).assume_init_ref().clone() };
+        self.next_seq = self.next_seq.wrapping_add(1);
+        return Ok(val);
+    }
+
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+        loop {
+            let res = self.try_recv();
+            match res {
+                Ok(item) => return Poll::Ready(Ok(item)),
+                Err(TryRecvError::Closed) => return Poll::Ready(Err(RecvError::Closed)),
+                Err(TryRecvError::Lagged(n)) => return Poll::Ready(Err(RecvError::Lagged(n))),
+                Err(TryRecvError::Empty) => {}
             }
 
             if self
