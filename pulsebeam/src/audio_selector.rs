@@ -54,7 +54,7 @@ use pulsebeam_runtime::unsync::spmc;
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
-    controller::MAX_SEND_AUDIO_SLOTS,
+    control::controller::MAX_SEND_AUDIO_SLOTS,
     entity::TrackId,
     rtp::{AudioRtpPacket, RtpPacket, monitor::StreamState},
     track::{TrackMeta, TrackReceiver},

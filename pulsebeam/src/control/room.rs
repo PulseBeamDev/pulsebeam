@@ -37,20 +37,6 @@ pub struct RemoveParticipant {
     pub participant_id: ParticipantId,
 }
 
-#[derive(Clone, Debug)]
-pub struct ParticipantMeta {
-    tracks: HashMap<TrackId, track::TrackReceiver>,
-    _connection_id: ConnectionId,
-}
-
-pub struct RoomMessageSet;
-
-impl actor::MessageSet for RoomMessageSet {
-    type Meta = RoomId;
-    type Msg = RoomMessage;
-    type ObservableState = RoomState;
-}
-
 pub struct Room {
     room_id: RoomId,
     state: RoomState,
@@ -58,8 +44,7 @@ pub struct Room {
 
 #[derive(Default, Clone, Debug)]
 pub struct RoomState {
-    participants: BTreeMap<(ParticipantId, ConnectionId), ParticipantMeta>,
-    tracks: HashMap<TrackId, track::TrackReceiver>,
+    participants: BTreeMap<(ParticipantId, ConnectionId), TrackId>,
 }
 
 impl Room {
@@ -74,7 +59,7 @@ impl Room {
         todo!()
     }
 
-    pub fn remove_participant(&mut self, m: RemoveParticipant) {
+    pub fn remove_participant(&mut self, participant_id: &ParticipantId) {
         todo!()
     }
 }

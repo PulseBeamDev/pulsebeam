@@ -18,7 +18,10 @@ use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::entity::ConnectionId;
+use crate::{
+    control::controller::{self, CreateParticipant},
+    entity::ConnectionId,
+};
 use crate::{
     control::controller::{Controller, ParticipantState},
     entity::{IdValidationError, ParticipantId, RoomId},
@@ -36,9 +39,10 @@ impl HeaderExt {
     }
 }
 
+#[derive(Clone)]
 struct AppState {
     controller: Arc<Mutex<Controller>>,
-    api_config: ApiConfig,
+    api_config: Arc<ApiConfig>,
 }
 
 /// Response headers for participant creation
@@ -183,7 +187,7 @@ pub struct CreateParticipantQuery {
 async fn create_participant(
     Path(room_id): Path<RoomId>,
     Query(query): Query<CreateParticipantQuery>,
-    State((mut con, cfg)): State<(ControllerHandle, ApiConfig)>,
+    State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
@@ -199,18 +203,8 @@ async fn create_participant(
         connection_id: ConnectionId::new(),
         old_connection_id: None,
     };
-    let msg = controller::CreateParticipant {
-        state: state.clone(),
-        offer,
-    };
-    con.try_send((msg, reply_tx)).map_err(|e| match e {
-        TrySendError::Full(_) => ApiError::RateLimited,
-        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-    })?;
 
-    let reply: CreateParticipantReply = reply_rx
-        .await
-        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
+    let answer = { s.controller.lock().create_participant(state, offer) }?;
 
     let path = format!(
         "/rooms/{}/participants/{}",
@@ -227,7 +221,7 @@ async fn create_participant(
     Ok((
         StatusCode::CREATED,
         response_headers.to_header_map(),
-        reply.answer.to_sdp_string(),
+        answer.to_sdp_string(),
     ))
 }
 
@@ -251,16 +245,13 @@ async fn create_participant(
 #[axum::debug_handler]
 async fn delete_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
-    State((mut con, _cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+    State(s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    con.try_send(controller::DeleteParticipant {
-        room_id,
-        participant_id,
-    })
-    .map_err(|e| match e {
-        TrySendError::Full(_) => ApiError::RateLimited,
-        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-    })?;
+    {
+        s.controller
+            .lock()
+            .delete_participant(&room_id, &participant_id);
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -299,7 +290,7 @@ pub struct PatchParticipantQuery {
 async fn patch_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     Query(query): Query<PatchParticipantQuery>,
-    State((mut con, cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+    State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
@@ -333,20 +324,12 @@ async fn patch_participant(
         location: location_url,
         etag: state.connection_id,
     };
-    let msg = controller::PatchParticipant { offer, state };
-    con.try_send((msg, reply_tx)).map_err(|e| match e {
-        TrySendError::Full(_) => ApiError::RateLimited,
-        TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-    })?;
-
-    let reply = reply_rx
-        .await
-        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
+    let answer = { s.controller.lock().create_participant(state, offer) }?;
 
     Ok((
         StatusCode::OK,
         response_headers.to_header_map(),
-        reply.answer.to_sdp_string(),
+        answer.to_sdp_string(),
     ))
 }
 
@@ -420,7 +403,12 @@ pub fn router(controller: Controller, cfg: ApiConfig) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi))
         .nest(&cfg.base_path, api)
-        .with_state((controller, cfg))
+        // TODO: far from ideal here. We don't actually need Arc or Mutex since this is single
+        // threaded..
+        .with_state(AppState {
+            controller: Arc::new(Mutex::new(controller)),
+            api_config: Arc::new(cfg),
+        })
 }
 
 async fn track_route_duration(req: Request<axum::body::Body>, next: Next) -> Response {

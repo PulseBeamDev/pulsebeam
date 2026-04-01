@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::audio_selector::AudioSelectorSubscription;
-use crate::controller::MAX_SEND_AUDIO_SLOTS;
+use crate::control::controller::MAX_SEND_AUDIO_SLOTS;
 use crate::entity::ParticipantId;
 use crate::rtp;
 use crate::rtp::timeline::Timeline;

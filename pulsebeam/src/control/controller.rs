@@ -82,19 +82,6 @@ pub struct ParticipantState {
     pub old_connection_id: Option<ConnectionId>,
 }
 
-#[derive(Debug, derive_more::From)]
-pub enum ControllerMessage {
-    CreateParticipant(
-        CreateParticipant,
-        oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
-    ),
-    DeleteParticipant(DeleteParticipant),
-    PatchParticipant(
-        PatchParticipant,
-        oneshot::Sender<Result<PatchParticipantReply, ControllerError>>,
-    ),
-}
-
 #[derive(Debug)]
 pub struct CreateParticipant {
     pub state: ParticipantState,
@@ -148,14 +135,6 @@ pub enum ControllerError {
     Unknown(String),
 }
 
-pub struct ControllerMessageSet;
-
-impl actor::MessageSet for ControllerMessageSet {
-    type Msg = ControllerMessage;
-    type Meta = Arc<String>;
-    type ObservableState = ();
-}
-
 pub struct Controller {
     node_ctx: node::NodeContext,
 
@@ -172,25 +151,17 @@ impl Controller {
 
     pub fn create_participant(
         &mut self,
-        m: CreateParticipant,
-    ) -> Result<CreateParticipantReply, ControllerError> {
-        let answer = self.do_create_participant(m.offer, m.state)?;
-        Ok(CreateParticipantReply { answer })
-    }
-
-    pub fn patch_participant(
-        &mut self,
-        _ctx: &mut actor::ActorContext<ControllerMessageSet>,
-        m: PatchParticipant,
-    ) -> Result<PatchParticipantReply, ControllerError> {
-        let answer = self.do_create_participant(m.offer, m.state)?;
-        Ok(PatchParticipantReply { answer })
+        state: ParticipantState,
+        offer: SdpOffer,
+    ) -> Result<SdpAnswer, ControllerError> {
+        let answer = self.do_create_participant(state, offer)?;
+        Ok(answer)
     }
 
     fn do_create_participant(
         &mut self,
+        state: ParticipantState,
         offer: SdpOffer,
-        s: ParticipantState,
     ) -> Result<SdpAnswer, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();
         let tcp_egress = self.node_ctx.allocate_tcp_egress();
@@ -199,16 +170,23 @@ impl Controller {
         let (rtc, answer) = self.create_answer(offer, &sockets)?;
         let room = self
             .rooms
-            .entry(s.room_id.clone())
-            .or_insert_with(|| Room::new(s.room_id.clone()));
-        let participant = ParticipantCore::new(s.manual_sub, s.participant_id, rtc);
+            .entry(state.room_id.clone())
+            .or_insert_with(|| Room::new(state.room_id.clone()));
+        let participant = ParticipantCore::new(state.manual_sub, state.participant_id, rtc);
 
         room.add_participant(AddParticipant {
             participant,
-            connection_id: s.connection_id,
-            old_connection_id: s.old_connection_id,
+            connection_id: state.connection_id,
+            old_connection_id: state.old_connection_id,
         });
         Ok(answer)
+    }
+
+    pub fn delete_participant(&mut self, room_id: &RoomId, participant_id: &ParticipantId) {
+        if let Some(room) = self.rooms.get_mut(room_id) {
+            // if the room has exited, the participants have already cleaned up too.
+            let _ = room.remove_participant(participant_id);
+        }
     }
 
     fn create_answer(
@@ -391,16 +369,3 @@ impl Controller {
         Ok(())
     }
 }
-
-impl ControllerActor {
-    pub fn new(system_ctx: node::NodeContext, id: Arc<String>) -> Self {
-        Self {
-            id,
-            node_ctx: system_ctx,
-            rooms: HashMap::new(),
-            room_tasks: JoinSet::new(),
-        }
-    }
-}
-
-pub type ControllerHandle = actor::ActorHandle<ControllerMessageSet>;
