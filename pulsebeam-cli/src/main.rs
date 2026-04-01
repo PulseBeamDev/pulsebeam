@@ -549,13 +549,13 @@ struct CounterSnapshot {
 }
 
 async fn spawn_agent(
-    id: usize,
+    _id: usize,
     api_url: String,
     room: String,
     is_pub: bool,
     session_duration: Duration,
     stats_tx: mpsc::Sender<StatReport>,
-    users_per_room: usize,
+    _users_per_room: usize,
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;

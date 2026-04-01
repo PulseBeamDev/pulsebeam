@@ -63,18 +63,17 @@ impl Demuxer {
             return Some(*h);
         }
 
-        if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(batch.data()) {
-            if let Some(h) = self.ufrag_map.get_mut(ufrag_raw) {
+        if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(batch.data())
+            && let Some(h) = self.ufrag_map.get_mut(ufrag_raw) {
                 let boxed_ufrag = ufrag_raw.to_vec().into_boxed_slice();
 
                 // Link address to handle and ufrag
-                self.addr_map.insert(src, h.clone());
+                self.addr_map.insert(src, *h);
                 self.addr_to_ufrag.insert(src, boxed_ufrag.clone());
                 self.ufrag_addrs.entry(boxed_ufrag).or_default().push(src);
 
                 return Some(*h);
             }
-        }
 
         None
     }

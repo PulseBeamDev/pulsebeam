@@ -149,7 +149,7 @@ impl<T: Clone> Receiver<T> {
 
         let val = unsafe { (*slot.value.get()).assume_init_ref().clone() };
         self.next_seq = self.next_seq.wrapping_add(1);
-        return Ok(val);
+        Ok(val)
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {

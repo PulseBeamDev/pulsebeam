@@ -1,10 +1,8 @@
-use pulsebeam_runtime::sync::Arc;
 use str0m::rtp::rtcp::SenderInfo;
-use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::{rtp::RtpPacket, track::TrackSender};
-use str0m::media::{KeyframeRequest, MediaKind, Mid};
+use str0m::media::{MediaKind, Mid};
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
 
@@ -33,7 +31,7 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, mid: Mid, mut track: TrackSender) -> bool {
+    pub fn add_published_track(&mut self, mid: Mid, track: TrackSender) -> bool {
         if self.published_tracks.iter().any(|s| s.mid == mid) {
             tracing::warn!("duplicated slot mid={}.", mid);
             return false;

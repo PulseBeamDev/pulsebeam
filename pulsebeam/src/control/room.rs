@@ -1,22 +1,10 @@
-use ahash::{HashMap, HashMapExt};
-use pulsebeam_runtime::sync::Arc;
-use std::pin::Pin;
 use std::{collections::BTreeMap, time::Duration};
 
-use pulsebeam_runtime::{
-    actor::{ActorKind, ActorStatus, RunnerConfig},
-    prelude::*,
-};
-use tokio::task::JoinSet;
 
 use crate::participant::ParticipantCore;
 use crate::{
-    entity::{ConnectionId, ParticipantId, RoomId, TrackId},
-    node, participant, track,
+    entity::{ConnectionId, ParticipantId, RoomId, TrackId}, track,
 };
-use futures_util::FutureExt;
-use pulsebeam_runtime::actor;
-use str0m::media::MediaKind;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -55,11 +43,11 @@ impl Room {
         }
     }
 
-    pub fn add_participant(&mut self, m: AddParticipant) {
+    pub fn add_participant(&mut self, _m: AddParticipant) {
         todo!()
     }
 
-    pub fn remove_participant(&mut self, participant_id: &ParticipantId) {
+    pub fn remove_participant(&mut self, _participant_id: &ParticipantId) {
         todo!()
     }
 }

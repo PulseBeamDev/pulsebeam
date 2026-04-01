@@ -47,27 +47,23 @@ impl RuntimeSpawner {
         self.data_txs.len().max(1)
     }
 
-    pub fn control_dispatcher(mut rx: mpsc::UnboundedReceiver<SpawnRequest>) -> impl std::future::Future<Output = ()> {
-        async move {
-            while let Some(req) = rx.recv().await {
-                let SpawnRequest { factory, completion } = req;
-                tokio::task::spawn_local(async move {
-                    (factory)().await;
-                    let _ = completion.send(());
-                });
-            }
+    pub async fn control_dispatcher(mut rx: mpsc::UnboundedReceiver<SpawnRequest>) {
+        while let Some(req) = rx.recv().await {
+            let SpawnRequest { factory, completion } = req;
+            tokio::task::spawn_local(async move {
+                (factory)().await;
+                let _ = completion.send(());
+            });
         }
     }
 
-    pub fn worker_dispatcher(mut rx: mpsc::UnboundedReceiver<SpawnRequest>) -> impl std::future::Future<Output = ()> {
-        async move {
-            while let Some(req) = rx.recv().await {
-                let SpawnRequest { factory, completion } = req;
-                tokio::task::spawn_local(async move {
-                    (factory)().await;
-                    let _ = completion.send(());
-                });
-            }
+    pub async fn worker_dispatcher(mut rx: mpsc::UnboundedReceiver<SpawnRequest>) {
+        while let Some(req) = rx.recv().await {
+            let SpawnRequest { factory, completion } = req;
+            tokio::task::spawn_local(async move {
+                (factory)().await;
+                let _ = completion.send(());
+            });
         }
     }
 

@@ -53,7 +53,7 @@ debug = true
 strip = false  # Retain symbols for profiling
 debug-assertions = false
 lto = "thin"
-panic = "unwind"
+panic = "abort"
 force-frame-pointers = true
 
 [profile.test]

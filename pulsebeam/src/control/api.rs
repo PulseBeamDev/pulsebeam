@@ -10,7 +10,6 @@ use axum::{
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::{ETAG, IF_MATCH, LOCATION};
-use pulsebeam_runtime::mailbox::TrySendError;
 use pulsebeam_runtime::sync::{Arc, Mutex};
 use serde::Serialize;
 use str0m::{change::SdpOffer, error::SdpError};
@@ -19,7 +18,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    control::controller::{self, CreateParticipant},
+    control::controller::{self},
     entity::ConnectionId,
 };
 use crate::{

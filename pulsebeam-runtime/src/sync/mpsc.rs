@@ -471,7 +471,7 @@ impl<T: Clone> UnsyncReceiver<T> {
                 self.local_head = ring.head;
             }
 
-            let ring_closed = self.ring.borrow().closed;
+            let _ring_closed = self.ring.borrow().closed;
             if self.next_seq >= self.local_head {
                 if self.listener.is_none() {
                     let mut listener = self.ring.borrow().event.listen();

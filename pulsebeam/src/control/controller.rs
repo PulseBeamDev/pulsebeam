@@ -1,4 +1,3 @@
-use pulsebeam_runtime::sync::Arc;
 use std::{collections::HashMap, io, time::Duration};
 
 use crate::{
@@ -7,11 +6,8 @@ use crate::{
     node,
     participant::ParticipantCore,
 };
-use pulsebeam_runtime::{
-    actor::{self, ActorKind, ActorStatus},
-    net::UnifiedSocketWriter,
-};
-use pulsebeam_runtime::{net::Transport, prelude::*};
+use pulsebeam_runtime::net::UnifiedSocketWriter;
+use pulsebeam_runtime::net::Transport;
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
@@ -19,7 +15,7 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, Pt},
     net::TcpType,
 };
-use tokio::{sync::oneshot, task::JoinSet, time::Instant};
+use tokio::time::Instant;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
@@ -185,7 +181,7 @@ impl Controller {
     pub fn delete_participant(&mut self, room_id: &RoomId, participant_id: &ParticipantId) {
         if let Some(room) = self.rooms.get_mut(room_id) {
             // if the room has exited, the participants have already cleaned up too.
-            let _ = room.remove_participant(participant_id);
+            room.remove_participant(participant_id);
         }
     }
 

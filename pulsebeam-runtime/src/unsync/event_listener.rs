@@ -20,6 +20,12 @@ struct ListenerEntry {
     notified: bool,
 }
 
+impl Default for Event {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Event {
     pub fn new() -> Self {
         Self {
@@ -51,7 +57,7 @@ impl Event {
         if entry
             .waker
             .as_ref()
-            .map_or(true, |w| !w.will_wake(cx.waker()))
+            .is_none_or(|w| !w.will_wake(cx.waker()))
         {
             entry.waker = Some(cx.waker().clone());
         }
@@ -130,7 +136,7 @@ impl std::future::Future for EventListener {
         if entry
             .waker
             .as_ref()
-            .map_or(true, |w| !w.will_wake(cx.waker()))
+            .is_none_or(|w| !w.will_wake(cx.waker()))
         {
             entry.waker = Some(cx.waker().clone());
         }

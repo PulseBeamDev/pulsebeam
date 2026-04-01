@@ -20,8 +20,8 @@ pub const POOL_CAPACITY: usize = 16_384;
 pub const POOL_PREFILL: usize = 8_192;
 
 /// No-op function for compatibility; does not return a pool.
-pub fn rtp_payload_pool() -> () {
-    ()
+pub fn rtp_payload_pool() {
+    
 }
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.

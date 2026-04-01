@@ -183,7 +183,7 @@ impl LayerController {
     }
 
     fn is_paused(&self, mid: Mid, rid: Option<Rid>) -> bool {
-        self.states.get(&(mid, rid)).map_or(false, |s| s.paused)
+        self.states.get(&(mid, rid)).is_some_and(|s| s.paused)
     }
 
     fn request_keyframe(&mut self, mid: Mid, rid: Option<Rid>, kind: KeyframeRequestKind) {
@@ -191,12 +191,11 @@ impl LayerController {
         if kind == KeyframeRequestKind::Pli {
             let key = (mid, rid);
             let now = Instant::now();
-            if let Some(last) = self.last_keyframe_request.get(&key) {
-                if now.duration_since(*last) < KEYFRAME_REQUEST_THROTTLE {
+            if let Some(last) = self.last_keyframe_request.get(&key)
+                && now.duration_since(*last) < KEYFRAME_REQUEST_THROTTLE {
                     tracing::debug!(mid = ?mid, rid = ?rid, "throttling repeated PLI");
                     return;
                 }
-            }
             self.last_keyframe_request.insert(key, now);
         }
 
@@ -266,7 +265,7 @@ impl LayerController {
                 .order
                 .iter()
                 .rev()
-                .find(|k| self.states.get(*k).map_or(false, |s| !s.paused) && k.1.is_some())
+                .find(|k| self.states.get(*k).is_some_and(|s| !s.paused) && k.1.is_some())
                 .cloned()
             {
                 if let Some(s) = self.states.get_mut(&key) {
@@ -287,7 +286,7 @@ impl LayerController {
             if let Some(key) = self
                 .order
                 .iter()
-                .find(|k| self.states.get(*k).map_or(false, |s| s.paused))
+                .find(|k| self.states.get(*k).is_some_and(|s| s.paused))
                 .cloned()
             {
                 let candidate_bps = self.states.get(&key).map_or(0.0, |s| s.bps);
@@ -807,17 +806,15 @@ impl AgentActor {
                 sleep.as_mut().reset(adjusted_deadline);
             }
 
-            if let Some(reconnect_at) = self.reconnect_deadline {
-                if reconnect_timer.deadline() != reconnect_at {
+            if let Some(reconnect_at) = self.reconnect_deadline
+                && reconnect_timer.deadline() != reconnect_at {
                     reconnect_timer.as_mut().reset(reconnect_at);
                 }
-            }
 
-            if let Some(deadline) = self.pending.deadline {
-                if debounce_timer.deadline() != deadline {
+            if let Some(deadline) = self.pending.deadline
+                && debounce_timer.deadline() != deadline {
                     debounce_timer.as_mut().reset(deadline);
                 }
-            }
 
             tokio::select! {
                 biased;

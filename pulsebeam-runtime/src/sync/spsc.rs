@@ -114,7 +114,7 @@ impl<T> Receiver<T> {
         if ring
             .waker
             .as_ref()
-            .map_or(true, |w| !w.will_wake(cx.waker()))
+            .is_none_or(|w| !w.will_wake(cx.waker()))
         {
             ring.waker = Some(cx.waker().clone());
         }

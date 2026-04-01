@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeSet, BinaryHeap, VecDeque},
 };
 
 use ahash::HashMap;
@@ -8,10 +8,10 @@ use pulsebeam_runtime::net::{self, UnifiedSocketReader, UnifiedSocketWriter};
 use tokio::time::Instant;
 
 use crate::{
-    entity::{ParticipantId, TrackId},
-    participant::{self, ParticipantCore, ParticipantEvents},
+    entity::ParticipantId,
+    participant::{ParticipantCore, ParticipantEvents},
     shard::demux::Demuxer,
-    track::{StreamId, TrackReceiver},
+    track::StreamId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -98,7 +98,7 @@ impl ShardWorker {
                 };
 
                 for participant_id in &route.subscibers {
-                    let Some(sub) = self.participants.get_mut(&participant_id) else {
+                    let Some(sub) = self.participants.get_mut(participant_id) else {
                         continue;
                     };
 
@@ -126,11 +126,11 @@ impl ShardWorker {
         }
     }
 
-    fn add_participant(&mut self, participant_id: ParticipantId) {
+    fn add_participant(&mut self, _participant_id: ParticipantId) {
         todo!();
     }
 
-    fn remove_participant(&mut self, participant_id: ParticipantId) {
+    fn remove_participant(&mut self, _participant_id: ParticipantId) {
         todo!();
     }
 }

@@ -270,7 +270,7 @@ fn handle_new_connection(
                         let buf = Arc::new(data.to_vec());
 
                         // Use try_send to prevent reader task from blocking if SFU logic lags
-                        if let Err(_) = packet_tx.try_send(RecvPacketBatch {
+                        if packet_tx.try_send(RecvPacketBatch {
                             src: peer_addr,
                             dst: local_addr,
                             buf,
@@ -278,7 +278,7 @@ fn handle_new_connection(
                             stride: len,
                             len,
                             transport: Transport::Tcp,
-                        }) {
+                        }).is_err() {
                             tracing::debug!("TCP packet dropped: Global queue full");
                         } else {
                             r_notify.notify_waiters();

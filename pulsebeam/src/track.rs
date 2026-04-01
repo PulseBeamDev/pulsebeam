@@ -70,11 +70,10 @@ impl KeyframePoll {
         }
         self.signal.store(false, Ordering::Relaxed);
         // Within debounce window: discard.
-        if let Some(last) = self.last_sent {
-            if now.duration_since(last) < self.debounce {
+        if let Some(last) = self.last_sent
+            && now.duration_since(last) < self.debounce {
                 return None;
             }
-        }
         self.last_sent = Some(now);
         Some(KeyframeRequest {
             kind: KeyframeRequestKind::Pli,

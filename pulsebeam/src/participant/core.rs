@@ -3,14 +3,13 @@ use ahash::{HashMap, HashMapExt};
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
-use pulsebeam_proto::signaling::Track;
 use pulsebeam_runtime::net::{self, Transport};
 use pulsebeam_runtime::sync::Arc;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
+use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
 use str0m::net::Protocol;
 use str0m::rtp::Ssrc;
 use str0m::{
@@ -177,7 +176,7 @@ impl ParticipantCore {
         }
     }
 
-    pub fn on_timeout(&mut self, now: Instant) {
+    pub fn on_timeout(&mut self, _now: Instant) {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }
 
@@ -239,7 +238,7 @@ impl ParticipantCore {
             self.last_slow_poll = now;
         }
 
-        let next_deadline = loop {
+        let _next_deadline = loop {
             let rtc_deadline = self.poll_rtc(events)?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
@@ -333,7 +332,7 @@ impl ParticipantCore {
         result
     }
 
-    pub fn on_forward_rtp(&mut self, stream_id: &StreamId, events: &mut ParticipantEvents) {
+    pub fn on_forward_rtp(&mut self, _stream_id: &StreamId, _events: &mut ParticipantEvents) {
         // TODO: filter simulcast switching
 
         todo!();
@@ -439,14 +438,13 @@ impl ParticipantCore {
                     .set_slot_count(self.downstream.video.slot_count());
                 // Cache (Pt, Ssrc) so handle_forward_rtp avoids per-packet lookups.
                 // Both are stable for the session lifetime after SDP negotiation.
-                if let Some(m) = self.rtc.media(media.mid) {
-                    if let Some(&pt) = m.remote_pts().first() {
+                if let Some(m) = self.rtc.media(media.mid)
+                    && let Some(&pt) = m.remote_pts().first() {
                         let mut api = self.rtc.direct_api();
                         if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
                             self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
                         }
                     }
-                }
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }

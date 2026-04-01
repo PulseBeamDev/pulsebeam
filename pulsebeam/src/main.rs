@@ -49,7 +49,7 @@ fn main() {
         registry.init();
     }
 
-    let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let _workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let workers = 1;
     tracing::info!("using {} worker threads", workers);
 
@@ -86,7 +86,7 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
 
     tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
-    let mut rng = rand::os_rng();
+    let rng = rand::os_rng();
     let node = NodeBuilder::new()
         .workers(workers)
         .local_addr(local_addr)
