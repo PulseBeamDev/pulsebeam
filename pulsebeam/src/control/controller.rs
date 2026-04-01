@@ -2,10 +2,10 @@ use pulsebeam_runtime::sync::Arc;
 use std::{collections::HashMap, io, time::Duration};
 
 use crate::{
+    control::room::{AddParticipant, Room},
     entity::{ConnectionId, ParticipantId, RoomId},
     node,
-    participant::ParticipantActor,
-    room,
+    participant::ParticipantCore,
 };
 use pulsebeam_runtime::{
     actor::{self, ActorKind, ActorStatus},
@@ -156,93 +156,38 @@ impl actor::MessageSet for ControllerMessageSet {
     type ObservableState = ();
 }
 
-pub struct ControllerActor {
+pub struct Controller {
     node_ctx: node::NodeContext,
 
-    id: Arc<String>,
-    rooms: HashMap<RoomId, room::RoomHandle>,
-    room_tasks: JoinSet<(RoomId, ActorStatus)>,
+    rooms: HashMap<RoomId, Room>,
 }
 
-impl actor::Actor<ControllerMessageSet> for ControllerActor {
-    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
-        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
-        MONITOR.clone()
-    }
-
-    fn kind() -> ActorKind {
-        "controller"
-    }
-
-    fn meta(&self) -> Arc<String> {
-        self.id.clone()
-    }
-
-    fn get_observable_state(&self) {}
-
-    async fn run(
-        &mut self,
-        ctx: &mut actor::ActorContext<ControllerMessageSet>,
-    ) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx, pre_select:{} ,
-            select: {
-                Some(Ok((room_id, _))) = self.room_tasks.join_next() => {
-                    self.rooms.remove(&room_id);
-                }
-            }
-        );
-        Ok(())
-    }
-
-    async fn on_msg(
-        &mut self,
-        ctx: &mut actor::ActorContext<ControllerMessageSet>,
-        msg: ControllerMessage,
-    ) -> () {
-        match msg {
-            ControllerMessage::CreateParticipant(m, reply_tx) => {
-                let answer = self.handle_create_participant(ctx, m).await;
-                let _ = reply_tx.send(answer);
-            }
-
-            ControllerMessage::DeleteParticipant(m) => {
-                if let Some(room_handle) = self.rooms.get_mut(&m.room_id) {
-                    // if the room has exited, the participants have already cleaned up too.
-                    let _ = room_handle
-                        .send(room::RemoveParticipant {
-                            participant_id: m.participant_id,
-                        })
-                        .await;
-                }
-            }
-            ControllerMessage::PatchParticipant(m, reply_tx) => {
-                let answer = self.handle_patch_participant(ctx, m).await;
-                let _ = reply_tx.send(answer);
-            }
+impl Controller {
+    pub fn new(node_ctx: node::NodeContext) -> Self {
+        Self {
+            node_ctx,
+            rooms: HashMap::new(),
         }
     }
-}
 
-impl ControllerActor {
-    pub async fn handle_create_participant(
+    pub fn create_participant(
         &mut self,
-        _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: CreateParticipant,
     ) -> Result<CreateParticipantReply, ControllerError> {
-        let answer = self.create_participant(m.offer, m.state).await?;
+        let answer = self.do_create_participant(m.offer, m.state)?;
         Ok(CreateParticipantReply { answer })
     }
 
-    pub async fn handle_patch_participant(
+    pub fn patch_participant(
         &mut self,
         _ctx: &mut actor::ActorContext<ControllerMessageSet>,
         m: PatchParticipant,
     ) -> Result<PatchParticipantReply, ControllerError> {
-        let answer = self.create_participant(m.offer, m.state).await?;
+        let answer = self.do_create_participant(m.offer, m.state)?;
         Ok(PatchParticipantReply { answer })
     }
 
-    async fn create_participant(
+    fn do_create_participant(
         &mut self,
         offer: SdpOffer,
         s: ParticipantState,
@@ -252,28 +197,17 @@ impl ControllerActor {
         let sockets = [&udp_egress, &tcp_egress];
 
         let (rtc, answer) = self.create_answer(offer, &sockets)?;
-        let mut room_handle = self.get_or_create_room(&s.room_id);
-        let gateway = self.node_ctx.gateway.clone();
-        let participant = ParticipantActor::new(
-            gateway,
-            room_handle.clone(),
-            udp_egress,
-            tcp_egress,
-            s.participant_id,
-            rtc,
-            s.manual_sub,
-        );
-        // TODO: probably retry? Or, let the client to retry instead?
-        // Each room will always have a graceful timeout before closing.
-        // But, a data race can still occur nonetheless
-        room_handle
-            .send(room::RoomMessage::AddParticipant(room::AddParticipant {
-                participant,
-                connection_id: s.connection_id,
-                old_connection_id: s.old_connection_id,
-            }))
-            .await
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
+        let room = self
+            .rooms
+            .entry(s.room_id.clone())
+            .or_insert_with(|| Room::new(s.room_id.clone()));
+        let participant = ParticipantCore::new(s.manual_sub, s.participant_id, rtc);
+
+        room.add_participant(AddParticipant {
+            participant,
+            connection_id: s.connection_id,
+            old_connection_id: s.old_connection_id,
+        });
         Ok(answer)
     }
 
@@ -379,25 +313,6 @@ impl ControllerActor {
 
         tracing::debug!("{answer}");
         Ok((rtc, answer))
-    }
-
-    fn get_or_create_room(&mut self, room_id: &RoomId) -> room::RoomHandle {
-        if let Some(handle) = self.rooms.get(room_id) {
-            tracing::info!("get_room: {}", room_id);
-            handle.clone()
-        } else {
-            tracing::info!("create_room: {}", room_id);
-            let room_actor = room::RoomActor::new(self.node_ctx.clone(), room_id.clone());
-            let (room_handle, room_task) = actor::prepare(
-                room_actor,
-                actor::RunnerConfig::default().with_mailbox_cap(1024),
-            );
-            self.room_tasks.spawn_local(room_task);
-
-            self.rooms.insert(room_id.clone(), room_handle.clone());
-
-            room_handle
-        }
     }
 
     fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), OfferRejectedReason> {

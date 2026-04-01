@@ -84,13 +84,7 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
-    pub fn new(
-        manual_sub: bool,
-        participant_id: entity::ParticipantId,
-        mut rtc: Rtc,
-        udp_batcher: Batcher,
-        tcp_batcher: Batcher,
-    ) -> Self {
+    pub fn new(manual_sub: bool, participant_id: entity::ParticipantId, mut rtc: Rtc) -> Self {
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {
             label: namespace::Signaling::Reliable.as_str().to_string(),
@@ -109,6 +103,9 @@ impl ParticipantCore {
                 protocol: "v1".to_string(),
             });
         }
+
+        let udp_batcher = Batcher::default();
+        let tcp_batcher = Batcher::default();
 
         Self {
             last_deadline: None,
@@ -434,7 +431,7 @@ impl ParticipantCore {
                 if !accepted {
                     self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                 }
-                events.push(CoreEvent::SpawnTrack(rx));
+                events.published_tracks.push_back(rx);
             }
             Direction::SendOnly => {
                 self.downstream.add_slot(media.mid, media.kind);

@@ -1,4 +1,3 @@
-use crate::{api, controller, gateway};
 use anyhow::{Context, Result};
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor;
@@ -17,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
+
+use crate::control::api;
+use crate::control::controller::Controller;
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -38,7 +40,6 @@ pub struct NodeBuilder {
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
     udp_mode: UdpMode,
-    gateway_handle: Option<gateway::GatewayHandle>,
 
     // Services
     http_api: Option<ListenerSource>,
@@ -59,7 +60,6 @@ impl NodeBuilder {
             external_addr: None,
             rng: None,
             udp_mode: UdpMode::Batch,
-            gateway_handle: None,
             http_api: None,
             internal_metrics: None,
         }
@@ -93,12 +93,6 @@ impl NodeBuilder {
     /// Set either scalar or batch mode. Default to batch.
     pub fn with_udp_mode(mut self, mode: UdpMode) -> Self {
         self.udp_mode = mode;
-        self
-    }
-
-    /// Inject an existing Gateway handle.
-    pub fn with_gateway(mut self, gateway: gateway::GatewayHandle) -> Self {
-        self.gateway_handle = Some(gateway);
         self
     }
 
@@ -153,30 +147,12 @@ impl NodeBuilder {
 
         let mut join_set = JoinSet::new();
 
-        let gateway_handle = if let Some(handle) = self.gateway_handle {
-            handle
-        } else {
-            let (handle, task) = actor::prepare(
-                gateway::GatewayActor::new(all_readers),
-                RunnerConfig::default(),
-            );
-            join_set.spawn_local(ignore(task));
-            handle
-        };
-
         let node_ctx = NodeContext {
             rng,
-            gateway: gateway_handle.clone(),
             udp_sockets: udp_writers,
             tcp_socket: tcp_writer,
             udp_egress_counter: Arc::new(AtomicUsize::new(0)),
         };
-
-        let controller_actor =
-            controller::ControllerActor::new(node_ctx, Arc::new("root".to_string()));
-        let (controller_handle, controller_task) =
-            actor::prepare(controller_actor, RunnerConfig::default());
-        join_set.spawn_local(ignore(controller_task));
 
         if let Some(source) = self.http_api {
             // Resolve listener
@@ -218,7 +194,8 @@ impl NodeBuilder {
                 .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
                 .max_age(Duration::from_secs(86400));
 
-            let router = api::router(controller_handle, api_cfg)
+            let controller = Controller::new(node_ctx);
+            let router = api::router(controller, api_cfg)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);
@@ -263,7 +240,6 @@ impl NodeBuilder {
 #[derive(Clone)]
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-    pub gateway: gateway::GatewayHandle,
     pub udp_sockets: Vec<net::UnifiedSocketWriter>,
     pub tcp_socket: net::UnifiedSocketWriter,
     udp_egress_counter: Arc<AtomicUsize>,
@@ -434,23 +410,6 @@ mod internal {
     async fn rt_background_monitor(prometheus_handle: PrometheusHandle) {
         let metrics = Handle::current().metrics();
 
-        let mut actor_monitors = [
-            ("gateway", gateway::GatewayActor::monitor().intervals()),
-            (
-                "gateway_worker",
-                gateway::GatewayWorkerActor::monitor().intervals(),
-            ),
-            (
-                "controller",
-                controller::ControllerActor::monitor().intervals(),
-            ),
-            ("room", room::RoomActor::monitor().intervals()),
-            (
-                "participant",
-                participant::ParticipantActor::monitor().intervals(),
-            ),
-        ];
-
         describe_gauge!(
             "tokio_active_tasks",
             Unit::Count,
@@ -559,33 +518,6 @@ mod internal {
 
                 gauge!("tokio_worker_mean_poll_time_us", &labels)
                     .set(metrics.worker_mean_poll_time(i).as_micros() as f64);
-            }
-
-            for (actor_name, monitor) in &mut actor_monitors {
-                let Some(snapshot) = monitor.next() else {
-                    continue;
-                };
-
-                let labels = [("actor", *actor_name)];
-
-                metrics::gauge!("actor_long_delay_ratio", &labels).set(snapshot.long_delay_ratio());
-                metrics::gauge!("actor_slow_poll_ratio", &labels).set(snapshot.slow_poll_ratio());
-                metrics::gauge!("actor_mean_first_poll_delay_us", &labels)
-                    .set(snapshot.mean_first_poll_delay().as_micros() as f64);
-                metrics::gauge!("actor_mean_idle_duration_us", &labels)
-                    .set(snapshot.mean_idle_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_scheduled_duration_us", &labels)
-                    .set(snapshot.mean_scheduled_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_poll_duration_us", &labels)
-                    .set(snapshot.mean_poll_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_fast_poll_duration_us", &labels)
-                    .set(snapshot.mean_fast_poll_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_slow_poll_duration_us", &labels)
-                    .set(snapshot.mean_slow_poll_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_short_delay_duration_us", &labels)
-                    .set(snapshot.mean_short_delay_duration().as_micros() as f64);
-                metrics::gauge!("actor_mean_long_delay_duration_us", &labels)
-                    .set(snapshot.mean_long_delay_duration().as_micros() as f64);
             }
 
             // Keep memory usage and CPU usage bounded per prometheus interval.

@@ -165,7 +165,7 @@ impl UnifiedSocketReader {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
+    pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(packets),
             Self::UdpScalar(inner) => inner.try_recv_batch(packets),

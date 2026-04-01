@@ -48,7 +48,7 @@ impl UdpTransportReader {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
         let mut slot = vec![0u8; CHUNK_SIZE];
         match self.sock.try_recv_from(&mut slot) {
             Ok((n, source)) => {
@@ -69,7 +69,7 @@ impl UdpTransportReader {
             }
         }
 
-        Ok(())
+        Ok(1)
     }
 }
 

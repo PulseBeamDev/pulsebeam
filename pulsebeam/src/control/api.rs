@@ -11,19 +11,17 @@ use axum::{
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::{ETAG, IF_MATCH, LOCATION};
 use pulsebeam_runtime::mailbox::TrySendError;
+use pulsebeam_runtime::sync::{Arc, Mutex};
 use serde::Serialize;
 use str0m::{change::SdpOffer, error::SdpError};
 use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::entity::ConnectionId;
 use crate::{
-    controller::ParticipantState,
+    control::controller::{Controller, ParticipantState},
     entity::{IdValidationError, ParticipantId, RoomId},
-};
-use crate::{
-    controller::{self, CreateParticipantReply},
-    entity::ConnectionId,
 };
 
 pub enum HeaderExt {
@@ -36,6 +34,11 @@ impl HeaderExt {
             Self::ParticipantId => "pb-participant-id",
         }
     }
+}
+
+struct AppState {
+    controller: Arc<Mutex<Controller>>,
+    api_config: ApiConfig,
 }
 
 /// Response headers for participant creation
@@ -180,7 +183,7 @@ pub struct CreateParticipantQuery {
 async fn create_participant(
     Path(room_id): Path<RoomId>,
     Query(query): Query<CreateParticipantQuery>,
-    State((mut con, cfg)): State<(controller::ControllerHandle, ApiConfig)>,
+    State((mut con, cfg)): State<(ControllerHandle, ApiConfig)>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
@@ -400,7 +403,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 struct ApiDoc;
 
 /// Router setup with OpenAPI documentation
-pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Router {
+pub fn router(controller: Controller, cfg: ApiConfig) -> Router {
     let openapi = build_openapi(&cfg.base_path);
 
     let api = Router::new()

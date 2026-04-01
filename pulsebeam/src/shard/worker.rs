@@ -45,7 +45,6 @@ impl ShardWorker {
     pub async fn run(&mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
-        let mut participant_exited = BTreeSet::new();
         let mut events = ParticipantEvents::default();
         let mut exited = VecDeque::new();
         let mut dirty = BTreeSet::new();

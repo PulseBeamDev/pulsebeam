@@ -142,7 +142,7 @@ impl TcpTransportReader {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<()> {
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
         let mut count = 0;
         while let Ok(pkt) = self.packet_rx.try_recv() {
             out.push(pkt);
@@ -154,7 +154,7 @@ impl TcpTransportReader {
         if out.is_empty() {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        Ok(())
+        Ok(count)
     }
 }
 

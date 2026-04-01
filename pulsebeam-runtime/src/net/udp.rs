@@ -96,7 +96,7 @@ impl UdpTransportReader {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<()> {
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
         self.sock.try_io(tokio::io::Interest::READABLE, || {
             // Prepare the pointers for the kernel
             // We set len=capacity so we can take mutable slices of the uninitialized memory
@@ -148,7 +148,7 @@ impl UdpTransportReader {
                             seg_off += stride;
                         }
                     }
-                    Ok(())
+                    Ok(count)
                 }
                 Err(e) => Err(e),
             }
