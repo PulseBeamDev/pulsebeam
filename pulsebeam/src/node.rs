@@ -299,7 +299,7 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
 }
 
 mod internal {
-    use crate::{participant, room};
+    use crate::participant;
 
     use super::*;
     use anyhow::Result;

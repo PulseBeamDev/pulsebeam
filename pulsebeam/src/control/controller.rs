@@ -151,7 +151,7 @@ impl Controller {
 
     pub fn create_participant(
         &mut self,
-        state: ParticipantState,
+        state: &ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         let answer = self.do_create_participant(state, offer)?;
@@ -160,7 +160,7 @@ impl Controller {
 
     fn do_create_participant(
         &mut self,
-        state: ParticipantState,
+        state: &ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         let udp_egress = self.node_ctx.allocate_udp_egress();

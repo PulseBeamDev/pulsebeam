@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::{
     entity::{ParticipantId, TrackId},
-    participant::{ParticipantCore, ParticipantEvents},
+    participant::{self, ParticipantCore, ParticipantEvents},
     shard::demux::Demuxer,
     track::{StreamId, TrackReceiver},
 };
@@ -46,7 +46,7 @@ impl ShardWorker {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
         let mut events = ParticipantEvents::default();
-        let mut dirty = BTreeSet::new();
+        let mut dirty = VecDeque::new();
 
         loop {
             let wait = async {
@@ -75,7 +75,7 @@ impl ShardWorker {
                     continue; // already removed
                 };
                 participant.on_timeout(now);
-                dirty.insert(participant_id);
+                dirty.push_back(participant_id);
             }
 
             let count = self.udp_socket_rx.try_recv_batch(&mut recv_batch)?;
@@ -89,7 +89,7 @@ impl ShardWorker {
                 };
 
                 participant.on_ingress(batch, now, &mut events);
-                dirty.insert(participant_id);
+                dirty.push_back(participant_id);
             }
 
             while let Some(stream_id) = events.published_rtp.pop_front() {
@@ -103,7 +103,7 @@ impl ShardWorker {
                     };
 
                     sub.on_forward_rtp(&stream_id, &mut events);
-                    dirty.insert(*participant_id);
+                    dirty.push_back(*participant_id);
                 }
             }
 
@@ -115,7 +115,7 @@ impl ShardWorker {
                 self.remove_participant(participant_id);
             }
 
-            for participant_id in dirty {
+            while let Some(participant_id) = dirty.pop_front() {
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };

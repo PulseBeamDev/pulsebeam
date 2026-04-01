@@ -195,7 +195,6 @@ async fn create_participant(
     let participant_id = ParticipantId::new();
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let state = ParticipantState {
         manual_sub: query.manual_sub,
         room_id: room_id.clone(),
@@ -204,14 +203,14 @@ async fn create_participant(
         old_connection_id: None,
     };
 
-    let answer = { s.controller.lock().create_participant(state, offer) }?;
+    let answer = { s.controller.lock().create_participant(&state, offer) }?;
 
     let path = format!(
         "/rooms/{}/participants/{}",
         &room_id.external(),
         &participant_id
     );
-    let location_url = build_location(&headers, &cfg, &path, &state)?;
+    let location_url = build_location(&headers, &s.api_config, &path, &state)?;
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
@@ -304,8 +303,6 @@ async fn patch_participant(
         .ok_or(ApiError::BadRequest("If-Match header required".into()))?
         .try_into()?;
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-
     // TODO: merge this logic with POST
     let path = format!(
         "/rooms/{}/participants/{}",
@@ -319,12 +316,12 @@ async fn patch_participant(
         connection_id: ConnectionId::new(),
         old_connection_id: Some(old_connection_id),
     };
-    let location_url = build_location(&headers, &cfg, &path, &state)?;
+    let location_url = build_location(&headers, &s.api_config, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
         etag: state.connection_id,
     };
-    let answer = { s.controller.lock().create_participant(state, offer) }?;
+    let answer = { s.controller.lock().create_participant(&state, offer) }?;
 
     Ok((
         StatusCode::OK,
