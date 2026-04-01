@@ -180,6 +180,10 @@ impl ParticipantCore {
         }
     }
 
+    pub fn on_timeout(&mut self, now: Instant) {
+        let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
+    }
+
     pub fn handle_tick(&mut self) {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }

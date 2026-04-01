@@ -41,6 +41,7 @@ serde = { workspace = true }
 serde_json = "1.0.149"
 sha3 = "0.10.8"
 str0m = { workspace = true }
+tachyonix = "0.3.1"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration", "rt"] }
