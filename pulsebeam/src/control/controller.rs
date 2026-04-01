@@ -6,8 +6,12 @@ use crate::{
     node,
     participant::ParticipantCore,
 };
-use pulsebeam_runtime::net::UnifiedSocketWriter;
-use pulsebeam_runtime::net::Transport;
+use once_cell::sync::Lazy;
+use pulsebeam_runtime::{
+    actor::{self, ActorKind},
+    net::UnifiedSocketWriter,
+};
+use pulsebeam_runtime::{net::Transport, sync::Arc};
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
@@ -15,7 +19,8 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, Pt},
     net::TcpType,
 };
-use tokio::time::Instant;
+use tokio::{sync::oneshot, time::Instant};
+use tokio_metrics::TaskMonitor;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
@@ -78,6 +83,19 @@ pub struct ParticipantState {
     pub old_connection_id: Option<ConnectionId>,
 }
 
+#[derive(Debug, derive_more::From)]
+pub enum ControllerMessage {
+    CreateParticipant(
+        CreateParticipant,
+        oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
+    ),
+    DeleteParticipant(DeleteParticipant),
+    PatchParticipant(
+        PatchParticipant,
+        oneshot::Sender<Result<PatchParticipantReply, ControllerError>>,
+    ),
+}
+
 #[derive(Debug)]
 pub struct CreateParticipant {
     pub state: ParticipantState,
@@ -131,13 +149,71 @@ pub enum ControllerError {
     Unknown(String),
 }
 
-pub struct Controller {
+pub struct ControllerMessageSet;
+
+impl actor::MessageSet for ControllerMessageSet {
+    type Msg = ControllerMessage;
+    type Meta = &'static str;
+    type ObservableState = ();
+}
+
+pub struct ControllerActor {
     node_ctx: node::NodeContext,
 
     rooms: HashMap<RoomId, Room>,
 }
 
-impl Controller {
+impl actor::Actor<ControllerMessageSet> for ControllerActor {
+    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
+        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
+        MONITOR.clone()
+    }
+
+    fn kind() -> ActorKind {
+        "controller"
+    }
+
+    fn meta(&self) -> &'static str {
+        "controller"
+    }
+
+    fn get_observable_state(&self) {}
+
+    async fn run(
+        &mut self,
+        ctx: &mut actor::ActorContext<ControllerMessageSet>,
+    ) -> Result<(), actor::ActorError> {
+        pulsebeam_runtime::actor_loop!(self, ctx);
+        Ok(())
+    }
+
+    async fn on_msg(
+        &mut self,
+        ctx: &mut actor::ActorContext<ControllerMessageSet>,
+        msg: ControllerMessage,
+    ) -> () {
+        match msg {
+            ControllerMessage::CreateParticipant(m, reply_tx) => {
+                let answer = self
+                    .create_participant(&m.state, m.offer)
+                    .map(|res| CreateParticipantReply { answer: res });
+                let _ = reply_tx.send(answer);
+            }
+
+            ControllerMessage::DeleteParticipant(m) => {
+                self.delete_participant(&m.room_id, &m.participant_id);
+            }
+            ControllerMessage::PatchParticipant(m, reply_tx) => {
+                let answer = self
+                    .create_participant(&m.state, m.offer)
+                    .map(|res| PatchParticipantReply { answer: res });
+                let _ = reply_tx.send(answer);
+            }
+        }
+    }
+}
+
+impl ControllerActor {
     pub fn new(node_ctx: node::NodeContext) -> Self {
         Self {
             node_ctx,
@@ -365,3 +441,5 @@ impl Controller {
         Ok(())
     }
 }
+
+pub type ControllerHandle = actor::ActorHandle<ControllerMessageSet>;

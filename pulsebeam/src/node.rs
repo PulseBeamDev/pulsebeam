@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use pulsebeam_core::net::TcpListener;
+use pulsebeam_runtime::actor;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::prelude::*;
@@ -16,7 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
-use crate::control::controller::Controller;
+use crate::control::controller::ControllerActor;
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -192,8 +193,11 @@ impl NodeBuilder {
                 .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
                 .max_age(Duration::from_secs(86400));
 
-            let controller = Controller::new(node_ctx);
-            let router = api::router(controller, api_cfg)
+            let controller = ControllerActor::new(node_ctx);
+            let (controller_handle, controller_actor) =
+                actor::prepare(controller, actor::RunnerConfig::default());
+            join_set.spawn_local(ignore(controller_actor));
+            let router = api::router(controller_handle, api_cfg)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);
@@ -297,7 +301,6 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
 }
 
 mod internal {
-    
 
     use super::*;
     use anyhow::Result;

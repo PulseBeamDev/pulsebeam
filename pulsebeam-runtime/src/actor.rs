@@ -297,12 +297,12 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
 
 #[macro_export]
 macro_rules! actor_loop {
-    ($actor:ident, $ctx:ident) => { actor_loop!($actor, $ctx, pre_select: {}, select: {}) };
-    ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }) => { actor_loop!($actor, $ctx, pre_select: { $($pre_select)* }, select: {}) };
-    ($actor:ident, $ctx:ident, pre_select: { $($pre_select:tt)* }, select: { $($extra:tt)* }) => {
-        // let mut last_yield = tokio::time::Instant::now();
+    ($actor:expr, $ctx:ident) => {
+        $crate::actor_loop!($actor, $ctx, select: {})
+    };
+
+    ($actor:expr, $ctx:ident, select: { $($extra:tt)* }) => {
         loop {
-            $($pre_select)*
             tokio::select! {
                 biased;
                 res = $ctx.sys_rx.recv() => {
@@ -316,15 +316,16 @@ macro_rules! actor_loop {
                         None => break,
                     }
                 }
-                res = $ctx.rx.recv() => { if let Some(msg) = res { $actor.on_msg($ctx, msg).await } else { break; } }
+                res = $ctx.rx.recv() => {
+                    if let Some(msg) = res {
+                        $actor.on_msg($ctx, msg).await
+                    } else {
+                        break;
+                    }
+                }
                 $($extra)*
                 else => break,
             }
-
-            // if last_yield.elapsed() > std::time::Duration::from_micros(50) {
-            //     tokio::task::yield_now().await;
-            //     last_yield = tokio::time::Instant::now();
-            // }
         }
     };
 }

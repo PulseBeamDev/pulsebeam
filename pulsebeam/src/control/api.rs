@@ -10,7 +10,7 @@ use axum::{
 };
 use axum_extra::{TypedHeader, headers::ContentType};
 use hyper::header::{ETAG, IF_MATCH, LOCATION};
-use pulsebeam_runtime::sync::{Arc, Mutex};
+use pulsebeam_runtime::mailbox::TrySendError;
 use serde::Serialize;
 use str0m::{change::SdpOffer, error::SdpError};
 use tokio::time::Instant;
@@ -18,11 +18,11 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    control::controller::{self},
+    control::controller::{self, CreateParticipantReply},
     entity::ConnectionId,
 };
 use crate::{
-    control::controller::{Controller, ParticipantState},
+    control::controller::{ControllerHandle, ParticipantState},
     entity::{IdValidationError, ParticipantId, RoomId},
 };
 
@@ -36,12 +36,6 @@ impl HeaderExt {
             Self::ParticipantId => "pb-participant-id",
         }
     }
-}
-
-#[derive(Clone)]
-struct AppState {
-    controller: Arc<Mutex<Controller>>,
-    api_config: Arc<ApiConfig>,
 }
 
 /// Response headers for participant creation
@@ -62,6 +56,12 @@ impl ParticipantResponseHeaders {
         headers.insert(ETAG, self.etag.as_str().parse().unwrap());
         headers
     }
+}
+
+#[derive(Clone)]
+struct AppState {
+    controller: ControllerHandle,
+    api_config: ApiConfig,
 }
 
 /// Configuration shared across handlers
@@ -186,7 +186,7 @@ pub struct CreateParticipantQuery {
 async fn create_participant(
     Path(room_id): Path<RoomId>,
     Query(query): Query<CreateParticipantQuery>,
-    State(s): State<AppState>,
+    State(mut s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
@@ -194,6 +194,7 @@ async fn create_participant(
     let participant_id = ParticipantId::new();
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let state = ParticipantState {
         manual_sub: query.manual_sub,
         room_id: room_id.clone(),
@@ -201,8 +202,20 @@ async fn create_participant(
         connection_id: ConnectionId::new(),
         old_connection_id: None,
     };
+    let msg = controller::CreateParticipant {
+        state: state.clone(),
+        offer,
+    };
+    s.controller
+        .try_send((msg, reply_tx))
+        .map_err(|e| match e {
+            TrySendError::Full(_) => ApiError::RateLimited,
+            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+        })?;
 
-    let answer = { s.controller.lock().create_participant(&state, offer) }?;
+    let reply: CreateParticipantReply = reply_rx
+        .await
+        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
     let path = format!(
         "/rooms/{}/participants/{}",
@@ -219,7 +232,7 @@ async fn create_participant(
     Ok((
         StatusCode::CREATED,
         response_headers.to_header_map(),
-        answer.to_sdp_string(),
+        reply.answer.to_sdp_string(),
     ))
 }
 
@@ -243,13 +256,17 @@ async fn create_participant(
 #[axum::debug_handler]
 async fn delete_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
-    State(s): State<AppState>,
+    State(mut s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
-        s.controller
-            .lock()
-            .delete_participant(&room_id, &participant_id);
-    }
+    s.controller
+        .try_send(controller::DeleteParticipant {
+            room_id,
+            participant_id,
+        })
+        .map_err(|e| match e {
+            TrySendError::Full(_) => ApiError::RateLimited,
+            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -288,7 +305,7 @@ pub struct PatchParticipantQuery {
 async fn patch_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     Query(query): Query<PatchParticipantQuery>,
-    State(s): State<AppState>,
+    State(mut s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
@@ -301,6 +318,8 @@ async fn patch_participant(
         .map(|s| s.trim_matches('"'))
         .ok_or(ApiError::BadRequest("If-Match header required".into()))?
         .try_into()?;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
     // TODO: merge this logic with POST
     let path = format!(
@@ -320,12 +339,22 @@ async fn patch_participant(
         location: location_url,
         etag: state.connection_id,
     };
-    let answer = { s.controller.lock().create_participant(&state, offer) }?;
+    let msg = controller::PatchParticipant { offer, state };
+    s.controller
+        .try_send((msg, reply_tx))
+        .map_err(|e| match e {
+            TrySendError::Full(_) => ApiError::RateLimited,
+            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+        })?;
+
+    let reply = reply_rx
+        .await
+        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
 
     Ok((
         StatusCode::OK,
         response_headers.to_header_map(),
-        answer.to_sdp_string(),
+        reply.answer.to_sdp_string(),
     ))
 }
 
@@ -382,7 +411,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 struct ApiDoc;
 
 /// Router setup with OpenAPI documentation
-pub fn router(controller: Controller, cfg: ApiConfig) -> Router {
+pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Router {
     let openapi = build_openapi(&cfg.base_path);
 
     let api = Router::new()
@@ -399,11 +428,9 @@ pub fn router(controller: Controller, cfg: ApiConfig) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi))
         .nest(&cfg.base_path, api)
-        // TODO: far from ideal here. We don't actually need Arc or Mutex since this is single
-        // threaded..
         .with_state(AppState {
-            controller: Arc::new(Mutex::new(controller)),
-            api_config: Arc::new(cfg),
+            controller,
+            api_config: cfg,
         })
 }
 
