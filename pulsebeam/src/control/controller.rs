@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io, time::Duration};
 
 use crate::{
-    control::room::{AddParticipant, Room},
+    control::room::Room,
     entity::{ConnectionId, ParticipantId, RoomId},
     node,
     participant::ParticipantCore,
@@ -172,10 +172,10 @@ impl ControllerActor {
         }
     }
 
-    async fn run(
+    pub async fn run(
         mut self,
-        command_rx: mailbox::Receiver<ControllerCommand>,
-        shard_event_rx: mailbox::Receiver<ShardEvent>,
+        mut command_rx: mailbox::Receiver<ControllerCommand>,
+        mut shard_event_rx: mailbox::Receiver<ShardEvent>,
     ) {
         loop {
             tokio::select! {
@@ -448,4 +448,4 @@ impl ControllerActor {
     }
 }
 
-pub type ControllerHandle = actor::ActorHandle<ControllerMessageSet>;
+pub type ControllerHandle = mailbox::Sender<ControllerCommand>;

@@ -207,7 +207,7 @@ async fn create_participant(
         offer,
     };
     s.controller
-        .try_send((msg, reply_tx))
+        .try_send((msg, reply_tx).into())
         .map_err(|e| match e {
             TrySendError::Full(_) => ApiError::RateLimited,
             TrySendError::Closed(_) => ApiError::ServiceUnavailable,
@@ -259,10 +259,13 @@ async fn delete_participant(
     State(mut s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     s.controller
-        .try_send(controller::DeleteParticipant {
-            room_id,
-            participant_id,
-        })
+        .try_send(
+            controller::DeleteParticipant {
+                room_id,
+                participant_id,
+            }
+            .into(),
+        )
         .map_err(|e| match e {
             TrySendError::Full(_) => ApiError::RateLimited,
             TrySendError::Closed(_) => ApiError::ServiceUnavailable,
@@ -341,7 +344,7 @@ async fn patch_participant(
     };
     let msg = controller::PatchParticipant { offer, state };
     s.controller
-        .try_send((msg, reply_tx))
+        .try_send((msg, reply_tx).into())
         .map_err(|e| match e {
             TrySendError::Full(_) => ApiError::RateLimited,
             TrySendError::Closed(_) => ApiError::ServiceUnavailable,

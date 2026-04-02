@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor;
+use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::prelude::*;
@@ -18,6 +19,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
 use crate::control::controller::ControllerActor;
+use crate::shard::worker::ShardCommand;
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -151,6 +153,8 @@ impl NodeBuilder {
             udp_sockets: udp_writers,
             tcp_socket: tcp_writer,
             udp_egress_counter: Arc::new(AtomicUsize::new(0)),
+            // TODO: allocate shard commands
+            shard_command_txs: Vec::new(),
         };
 
         if let Some(source) = self.http_api {
@@ -194,10 +198,14 @@ impl NodeBuilder {
                 .max_age(Duration::from_secs(86400));
 
             let controller = ControllerActor::new(node_ctx);
-            let (controller_handle, controller_actor) =
-                actor::prepare(controller, actor::RunnerConfig::default());
-            join_set.spawn_local(ignore(controller_actor));
-            let router = api::router(controller_handle, api_cfg)
+            let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
+            // intentionally small so backpressure is applied early
+            let (controller_command_tx, controller_command_rx) = mailbox::new(64);
+
+            join_set.spawn_local(ignore(
+                controller.run(controller_command_rx, shard_event_rx),
+            ));
+            let router = api::router(controller_command_tx, api_cfg)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);
@@ -239,12 +247,13 @@ impl NodeBuilder {
     }
 }
 
-#[derive(Clone)]
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
     pub udp_sockets: Vec<net::UnifiedSocketWriter>,
     pub tcp_socket: net::UnifiedSocketWriter,
     udp_egress_counter: Arc<AtomicUsize>,
+
+    shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
 }
 
 impl NodeContext {
