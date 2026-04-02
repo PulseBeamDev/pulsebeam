@@ -22,6 +22,7 @@ pub type StreamId = (TrackId, Option<Rid>);
 
 /// Leading-edge debounce interval for keyframe requests forwarded upstream.
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
+pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
 /// Sends keyframe requests from a [`SimulcastReceiver`] to the upstream publisher.
 ///
@@ -71,9 +72,10 @@ impl KeyframePoll {
         self.signal.store(false, Ordering::Relaxed);
         // Within debounce window: discard.
         if let Some(last) = self.last_sent
-            && now.duration_since(last) < self.debounce {
-                return None;
-            }
+            && now.duration_since(last) < self.debounce
+        {
+            return None;
+        }
         self.last_sent = Some(now);
         Some(KeyframeRequest {
             kind: KeyframeRequestKind::Pli,
@@ -102,17 +104,17 @@ impl std::fmt::Debug for SimulcastQuality {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
     pub id: crate::entity::TrackId,
     pub origin_participant: crate::entity::ParticipantId,
     pub kind: MediaKind,
-    pub simulcast_rids: Option<Vec<Rid>>,
+    pub simulcast_rids: arrayvec::ArrayVec<Rid, MAX_SIMULCAST_LAYERS>,
 }
 
 #[derive(Clone)]
 pub struct SimulcastReceiver {
-    pub meta: Arc<TrackMeta>,
+    pub meta: TrackMeta,
     pub rid: Option<Rid>,
     pub quality: SimulcastQuality,
     pub channel: spmc::Receiver<RtpPacket>,
@@ -185,7 +187,7 @@ impl SimulcastSender {
 }
 
 pub struct TrackSender {
-    pub meta: Arc<TrackMeta>,
+    pub meta: TrackMeta,
     pub simulcast: Vec<SimulcastSender>,
     /// Shared notification handle; set by subscribers via [`KeyframeRequester`].
     pub keyframe_notify: Arc<Notify>,
@@ -237,7 +239,7 @@ impl TrackSender {
 
 #[derive(Clone, Debug)]
 pub struct TrackReceiver {
-    pub meta: Arc<TrackMeta>,
+    pub meta: TrackMeta,
     pub simulcast: Vec<SimulcastReceiver>,
 }
 
@@ -280,13 +282,13 @@ impl TrackReceiver {
     }
 }
 
-pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
+pub fn new(mid: Mid, meta: TrackMeta) -> (TrackSender, TrackReceiver) {
     const BASE_CAP: usize = 128;
 
-    let simulcast_rids: Vec<_> = if let Some(rids) = &meta.simulcast_rids {
-        rids.iter().map(|rid| Some(*rid)).collect()
-    } else {
+    let simulcast_rids: Vec<Option<Rid>> = if meta.simulcast_rids.is_empty() {
         vec![None]
+    } else {
+        meta.simulcast_rids.iter().map(|rid| Some(*rid)).collect()
     };
 
     let keyframe_notify = Arc::new(Notify::new());
@@ -422,12 +424,13 @@ pub mod test_utils {
         rids: Option<Vec<Rid>>,
     ) -> (TrackSender, TrackReceiver) {
         let track_id = participant_id.derive_track_id(kind, &mid);
-        let meta = Arc::new(TrackMeta {
+        let rids = rids.map(|rid| rid).iter().collect();
+        let meta = TrackMeta {
             id: track_id,
             origin_participant: participant_id,
             kind,
             simulcast_rids: rids,
-        });
+        };
 
         crate::track::new(mid, meta)
     }

@@ -147,6 +147,12 @@ impl ShardWorker {
                 participant.udp_batcher.flush(&self.udp_socket);
                 // TODO: TCP
             }
+
+            // Control plane events
+            while let Some(track) = events.published_tracks.pop_front() {
+                self.event_tx
+                    .send(ShardEvent::TrackPublished(track.meta.clone()));
+            }
         }
     }
 

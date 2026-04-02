@@ -164,7 +164,7 @@ struct InputTrackMeta {
     /// Shared speech-intensity state maintained by the upstream `StreamMonitor`.
     /// Atomic loads — zero overhead on the hot path.
     state: StreamState,
-    meta: Arc<TrackMeta>,
+    meta: TrackMeta,
 }
 
 /// One `spmc` receiver wrapped as a `Stream<Item=(TrackId, RtpPacket)>` so it

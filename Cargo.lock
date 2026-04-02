@@ -2777,6 +2777,7 @@ version = "0.3.5"
 dependencies = [
  "ahash",
  "anyhow",
+ "arrayvec",
  "axum",
  "axum-extra",
  "base32",

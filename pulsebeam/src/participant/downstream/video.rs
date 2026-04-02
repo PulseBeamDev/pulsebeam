@@ -118,7 +118,7 @@ impl VideoAllocator {
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
-        self.tracks.values().map(|s| &*s.track.meta)
+        self.tracks.values().map(|s| &s.track.meta)
     }
 
     pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> + '_ {
@@ -355,7 +355,7 @@ struct TrackState {
 
 pub struct SlotAssignment {
     pub mid: Mid,
-    pub track: pulsebeam_runtime::sync::Arc<TrackMeta>,
+    pub track: TrackMeta,
 }
 
 pub struct Intent {

@@ -428,14 +428,15 @@ impl ParticipantCore {
         match media.direction {
             Direction::RecvOnly => {
                 let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
-                let track_meta = Arc::new(track::TrackMeta {
+                let track_meta = track::TrackMeta {
                     id: track_id,
                     origin_participant: self.participant_id,
                     kind: media.kind,
                     simulcast_rids: media
                         .simulcast
-                        .map(|s| s.recv.iter().map(|l| l.rid).collect()),
-                });
+                        .map(|s| s.recv.iter().map(|l| l.rid).collect())
+                        .unwrap_or_default(),
+                };
                 let (tx, rx) = track::new(media.mid, track_meta);
                 let accepted = self.upstream.add_published_track(media.mid, tx);
                 if !accepted {
