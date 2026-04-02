@@ -4,7 +4,6 @@ use ahash::{HashMap, HashMapExt};
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, Transport};
-use pulsebeam_runtime::sync::Arc;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -89,7 +88,7 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
-    pub fn new(mut cfg: ParticipantConfig) -> Self {
+    pub fn new(cfg: ParticipantConfig) -> Self {
         let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {

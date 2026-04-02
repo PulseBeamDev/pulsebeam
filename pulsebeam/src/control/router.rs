@@ -34,10 +34,17 @@ impl ShardRouter {
     }
 
     pub fn try_route<K: Hash>(&self, key: K) -> Option<usize> {
-        let mut best_index = 0;
+        let mut best_index = None;
         let mut max_score = -1.0;
 
         for i in 0..self.shard_loads.len() {
+            let load = self.shard_loads[i];
+
+            // If the shard is too hot, it's not even a candidate.
+            if load >= MAX_LOAD {
+                continue;
+            }
+
             let mut hasher = self.hasher_config.build_hasher();
             key.hash(&mut hasher);
             i.hash(&mut hasher);
@@ -45,22 +52,18 @@ impl ShardRouter {
             // normalize hash value to 0.0 and 1.0
             let h_val = (hasher.finish() as f64) / (u64::MAX as f64);
 
-            // Use a small epsilon (1e-6) so that even at 100% load (1.0),
-            // the hash still has a tiny bit of influence (the "tie-breaker").
-            let capacity_factor = (1.0 - self.shard_loads[i]).max(0.000001);
+            let capacity_factor = 1.0 - load;
             let score = h_val * capacity_factor;
 
             if score > max_score {
                 max_score = score;
-                best_index = i;
+                best_index = Some(i);
             }
         }
 
-        if self.shard_loads[best_index] > MAX_LOAD {
-            return None;
-        }
-
-        Some(best_index)
+        // If all shards were > MAX_LOAD, this returns None.
+        // The Manager should then send a "Server Busy" to the client.
+        best_index
     }
 
     pub async fn send(

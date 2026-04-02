@@ -49,7 +49,6 @@ use std::{
 use futures_concurrency::stream::StreamGroup;
 use futures_concurrency::stream::stream_group::Key;
 use futures_lite::stream::Stream as _;
-use pulsebeam_runtime::sync::Arc;
 use pulsebeam_runtime::unsync::spmc;
 use tokio::{sync::mpsc, time::Instant};
 

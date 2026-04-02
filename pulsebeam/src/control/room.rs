@@ -1,11 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use crate::participant::ParticipantCore;
 use crate::track::TrackMeta;
-use crate::{
-    entity::{ConnectionId, ParticipantId, RoomId, TrackId},
-    track,
-};
+use crate::entity::{ParticipantId, RoomId};
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -39,5 +35,9 @@ impl Room {
         if !tracks.iter().any(|t| t.id == track.id) {
             tracks.push(track);
         }
+    }
+
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
     }
 }

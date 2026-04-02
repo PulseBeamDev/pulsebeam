@@ -186,7 +186,7 @@ pub struct CreateParticipantQuery {
 async fn create_participant(
     Path(room_id): Path<RoomId>,
     Query(query): Query<CreateParticipantQuery>,
-    State(mut s): State<AppState>,
+    State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
@@ -256,7 +256,7 @@ async fn create_participant(
 #[axum::debug_handler]
 async fn delete_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
-    State(mut s): State<AppState>,
+    State(s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     s.controller
         .try_send(
@@ -308,7 +308,7 @@ pub struct PatchParticipantQuery {
 async fn patch_participant(
     Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
     Query(query): Query<PatchParticipantQuery>,
-    State(mut s): State<AppState>,
+    State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,

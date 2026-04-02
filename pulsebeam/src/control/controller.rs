@@ -3,31 +3,25 @@ use std::{collections::HashMap, io, time::Duration};
 use crate::{
     control::{room::Room, router::ShardRouter},
     entity::{ConnectionId, ParticipantId, RoomId},
-    node,
     participant::ParticipantConfig,
     shard::worker::{ShardCommand, ShardEvent},
 };
-use once_cell::sync::Lazy;
-use pulsebeam_runtime::{
-    actor::{self, ActorKind},
-    mailbox,
-};
-use pulsebeam_runtime::{net::Transport, sync::Arc};
+use pulsebeam_runtime::mailbox;
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
     format::{Codec, FormatParams},
     media::{Direction, Frequency, MediaKind, Pt},
-    net::TcpType,
 };
 use tokio::{sync::oneshot, time::Instant};
-use tokio_metrics::TaskMonitor;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
 pub const MAX_SEND_VIDEO_SLOTS: usize = 16;
 pub const MAX_SEND_AUDIO_SLOTS: usize = 9;
 pub const MAX_DATA_CHANNELS: usize = 1;
+/// Maximum participants allowed per "slot" before hashing to a new shard epoch.
+const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 
 #[derive(Debug)]
 pub enum MediaType {
@@ -195,7 +189,7 @@ impl ControllerActor {
                 }
 
                 Some(command) = command_rx.recv() => {
-                    self.on_command(command);
+                    self.on_command(command).await;
                 }
 
                 else => break,
@@ -217,11 +211,12 @@ impl ControllerActor {
         Some(())
     }
 
-    fn on_command(&mut self, cmd: ControllerCommand) {
+    async fn on_command(&mut self, cmd: ControllerCommand) {
         match cmd {
             ControllerCommand::CreateParticipant(m, reply_tx) => {
                 let answer = self
                     .create_participant(&m.state, m.offer)
+                    .await
                     .map(|res| CreateParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
@@ -232,22 +227,23 @@ impl ControllerActor {
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
                     .create_participant(&m.state, m.offer)
+                    .await
                     .map(|res| PatchParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
         }
     }
 
-    pub fn create_participant(
+    pub async fn create_participant(
         &mut self,
         state: &ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        let answer = self.do_create_participant(state, offer)?;
+        let answer = self.do_create_participant(state, offer).await?;
         Ok(answer)
     }
 
-    fn do_create_participant(
+    async fn do_create_participant(
         &mut self,
         state: &ParticipantState,
         offer: SdpOffer,
@@ -257,14 +253,33 @@ impl ControllerActor {
             .rooms
             .entry(state.room_id.clone())
             .or_insert_with(|| Room::new(state.room_id.clone()));
-        let participant_cfg = ParticipantConfig {
+        let cfg = ParticipantConfig {
             manual_sub: state.manual_sub,
             participant_id: state.participant_id,
             rtc,
         };
 
         // TODO: handle patch
-        room.add_participant(&participant_cfg.participant_id);
+        let epoch = room.participant_count() / MAX_PARTICIPANTS_PER_SHARD_SLOT;
+        let routing_key = format!("{}-{}", state.room_id, epoch);
+        let participant_id = cfg.participant_id;
+        let shard_id = self
+            .router
+            .try_route(routing_key)
+            .ok_or(ControllerError::ServiceUnavailable)?;
+        self.router
+            .send(shard_id, ShardCommand::AddParticipant(cfg))
+            .await
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
+
+        room.add_participant(&participant_id);
+        self.participants.insert(
+            participant_id,
+            ParticipantMeta {
+                shard_id,
+                room_id: state.room_id.clone(),
+            },
+        );
         Ok(answer)
     }
 

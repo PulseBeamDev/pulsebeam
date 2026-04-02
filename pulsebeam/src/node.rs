@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use pulsebeam_core::net::TcpListener;
-use pulsebeam_runtime::actor;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::Transport;
@@ -8,10 +7,8 @@ use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::rand;
-use pulsebeam_runtime::sync::Arc;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use str0m::Candidate;
 use tokio::runtime::LocalOptions;

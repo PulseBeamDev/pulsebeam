@@ -102,10 +102,7 @@ pub struct Receiver<T> {
 impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
-        match self.receiver.recv().await {
-            Ok(val) => Some(val),
-            Err(_e) => None,
-        }
+        (self.receiver.recv().await).ok()
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
