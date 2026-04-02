@@ -11,7 +11,7 @@ use crate::{
     entity::ParticipantId,
     participant::{ParticipantCore, ParticipantEvents},
     shard::demux::Demuxer,
-    track::StreamId,
+    track::{StreamId, TrackMeta},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +28,10 @@ type TimerEntry = Reverse<(Instant, ParticipantId)>;
 
 pub enum ShardCommand {
     AddParticipant(ParticipantCore),
+}
+
+pub enum ShardEvent {
+    TrackPublished(TrackMeta),
 }
 
 pub struct ShardWorker {

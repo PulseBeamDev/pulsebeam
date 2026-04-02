@@ -1,53 +1,43 @@
 use std::{collections::BTreeMap, time::Duration};
 
-
 use crate::participant::ParticipantCore;
+use crate::track::TrackMeta;
 use crate::{
-    entity::{ConnectionId, ParticipantId, RoomId, TrackId}, track,
+    entity::{ConnectionId, ParticipantId, RoomId, TrackId},
+    track,
 };
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(derive_more::From)]
-pub enum RoomMessage {
-    PublishTrack(track::TrackReceiver),
-    AddParticipant(AddParticipant),
-    RemoveParticipant(RemoveParticipant),
-}
-
-pub struct AddParticipant {
-    pub participant: ParticipantCore,
-    pub connection_id: ConnectionId,
-    pub old_connection_id: Option<ConnectionId>,
-}
-
-pub struct RemoveParticipant {
-    pub participant_id: ParticipantId,
-}
-
 pub struct Room {
     room_id: RoomId,
-    state: RoomState,
-}
-
-#[derive(Default, Clone, Debug)]
-pub struct RoomState {
-    participants: BTreeMap<(ParticipantId, ConnectionId), TrackId>,
+    participants: BTreeMap<ParticipantId, Vec<TrackMeta>>,
 }
 
 impl Room {
     pub fn new(room_id: RoomId) -> Self {
         Self {
             room_id,
-            state: RoomState::default(),
+            participants: BTreeMap::new(),
         }
     }
 
-    pub fn add_participant(&mut self, _m: AddParticipant) {
-        todo!()
+    pub fn add_participant(&mut self, participant_id: &ParticipantId) {
+        self.participants.insert(*participant_id, Vec::new());
     }
 
-    pub fn remove_participant(&mut self, _participant_id: &ParticipantId) {
-        todo!()
+    pub fn remove_participant(&mut self, participant_id: &ParticipantId) {
+        self.participants.remove(participant_id);
+    }
+
+    pub fn publish_track(&mut self, track: TrackMeta) {
+        let tracks = self
+            .participants
+            .entry(track.origin_participant)
+            .or_default();
+
+        if !tracks.iter().any(|t| t.id == track.id) {
+            tracks.push(track);
+        }
     }
 }

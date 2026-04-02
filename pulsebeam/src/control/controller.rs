@@ -5,10 +5,12 @@ use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
     node,
     participant::ParticipantCore,
+    shard::worker::ShardEvent,
 };
 use once_cell::sync::Lazy;
 use pulsebeam_runtime::{
     actor::{self, ActorKind},
+    mailbox,
     net::UnifiedSocketWriter,
 };
 use pulsebeam_runtime::{net::Transport, sync::Arc};
@@ -84,7 +86,7 @@ pub struct ParticipantState {
 }
 
 #[derive(Debug, derive_more::From)]
-pub enum ControllerMessage {
+pub enum ControllerCommand {
     CreateParticipant(
         CreateParticipant,
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
@@ -149,68 +151,16 @@ pub enum ControllerError {
     Unknown(String),
 }
 
-pub struct ControllerMessageSet;
-
-impl actor::MessageSet for ControllerMessageSet {
-    type Msg = ControllerMessage;
-    type Meta = &'static str;
-    type ObservableState = ();
+struct ParticipantMeta {
+    shard_id: usize,
+    room_id: RoomId,
 }
 
 pub struct ControllerActor {
     node_ctx: node::NodeContext,
 
     rooms: HashMap<RoomId, Room>,
-}
-
-impl actor::Actor<ControllerMessageSet> for ControllerActor {
-    fn monitor() -> Arc<tokio_metrics::TaskMonitor> {
-        static MONITOR: Lazy<Arc<TaskMonitor>> = Lazy::new(|| Arc::new(TaskMonitor::new()));
-        MONITOR.clone()
-    }
-
-    fn kind() -> ActorKind {
-        "controller"
-    }
-
-    fn meta(&self) -> &'static str {
-        "controller"
-    }
-
-    fn get_observable_state(&self) {}
-
-    async fn run(
-        &mut self,
-        ctx: &mut actor::ActorContext<ControllerMessageSet>,
-    ) -> Result<(), actor::ActorError> {
-        pulsebeam_runtime::actor_loop!(self, ctx);
-        Ok(())
-    }
-
-    async fn on_msg(
-        &mut self,
-        ctx: &mut actor::ActorContext<ControllerMessageSet>,
-        msg: ControllerMessage,
-    ) -> () {
-        match msg {
-            ControllerMessage::CreateParticipant(m, reply_tx) => {
-                let answer = self
-                    .create_participant(&m.state, m.offer)
-                    .map(|res| CreateParticipantReply { answer: res });
-                let _ = reply_tx.send(answer);
-            }
-
-            ControllerMessage::DeleteParticipant(m) => {
-                self.delete_participant(&m.room_id, &m.participant_id);
-            }
-            ControllerMessage::PatchParticipant(m, reply_tx) => {
-                let answer = self
-                    .create_participant(&m.state, m.offer)
-                    .map(|res| PatchParticipantReply { answer: res });
-                let _ = reply_tx.send(answer);
-            }
-        }
-    }
+    participants: HashMap<ParticipantId, ParticipantMeta>,
 }
 
 impl ControllerActor {
@@ -218,6 +168,65 @@ impl ControllerActor {
         Self {
             node_ctx,
             rooms: HashMap::new(),
+            participants: HashMap::new(),
+        }
+    }
+
+    async fn run(
+        mut self,
+        command_rx: mailbox::Receiver<ControllerCommand>,
+        shard_event_rx: mailbox::Receiver<ShardEvent>,
+    ) {
+        loop {
+            tokio::select! {
+                // let command to backpressure to signal clients to slow down.
+                biased;
+
+                Some(event) = shard_event_rx.recv() => {
+                    self.on_shard_event(event);
+                }
+
+                Some(command) = command_rx.recv() => {
+                    self.on_command(command);
+                }
+
+                else => break,
+            }
+        }
+    }
+
+    fn on_shard_event(&mut self, event: ShardEvent) -> Option<()> {
+        match event {
+            ShardEvent::TrackPublished(track) => {
+                let meta = self.participants.get(&track.origin_participant)?;
+                let room = self.rooms.get_mut(&meta.room_id)?;
+
+                room.publish_track(track);
+                todo!("broadcast track to all participants in the room");
+            }
+        }
+
+        Some(())
+    }
+
+    fn on_command(&mut self, cmd: ControllerCommand) {
+        match cmd {
+            ControllerCommand::CreateParticipant(m, reply_tx) => {
+                let answer = self
+                    .create_participant(&m.state, m.offer)
+                    .map(|res| CreateParticipantReply { answer: res });
+                let _ = reply_tx.send(answer);
+            }
+
+            ControllerCommand::DeleteParticipant(m) => {
+                self.delete_participant(&m.room_id, &m.participant_id);
+            }
+            ControllerCommand::PatchParticipant(m, reply_tx) => {
+                let answer = self
+                    .create_participant(&m.state, m.offer)
+                    .map(|res| PatchParticipantReply { answer: res });
+                let _ = reply_tx.send(answer);
+            }
         }
     }
 
@@ -246,11 +255,8 @@ impl ControllerActor {
             .or_insert_with(|| Room::new(state.room_id.clone()));
         let participant = ParticipantCore::new(state.manual_sub, state.participant_id, rtc);
 
-        room.add_participant(AddParticipant {
-            participant,
-            connection_id: state.connection_id,
-            old_connection_id: state.old_connection_id,
-        });
+        // TODO: handle patch
+        room.add_participant(&participant.participant_id);
         Ok(answer)
     }
 
