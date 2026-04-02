@@ -3,7 +3,9 @@ use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::actor;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
+use pulsebeam_runtime::net::Transport;
 use pulsebeam_runtime::net::UdpMode;
+use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::sync::Arc;
@@ -11,6 +13,8 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
+use str0m::Candidate;
+use tokio::runtime::LocalOptions;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
@@ -20,6 +24,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 use crate::control::api;
 use crate::control::controller::ControllerActor;
 use crate::shard::worker::ShardCommand;
+use crate::shard::worker::ShardWorker;
 
 /// A pair of reader/writer for a transport connection.
 pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
@@ -131,14 +136,23 @@ impl NodeBuilder {
             .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
         let external_addr = self.external_addr;
 
-        let (udp_readers, udp_writers) =
-            bind_udp_workers(local_addr, external_addr, workers_count, self.udp_mode).await?;
+        let mut join_set = JoinSet::new();
+        let udp_sockets =
+            bind_udp_sockets(local_addr, external_addr, workers_count, self.udp_mode).await?;
 
-        let (tcp_reader, tcp_writer) =
-            net::bind(local_addr, net::Transport::Tcp, external_addr).await?;
-
-        let mut all_readers = udp_readers;
-        all_readers.push(tcp_reader);
+        let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
+        let mut shard_handles = Vec::new();
+        for sock in udp_sockets {
+            let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
+            let handle = std::thread::spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build_local(LocalOptions::default())
+                    .unwrap();
+                let shard = ShardWorker::new(sock, shard_command_rx, shard_event_tx);
+                rt.block_on(shard.run());
+            });
+            shard_handles.push(handle);
+        }
 
         let rng = self.rng.ok_or_else(|| {
             anyhow::anyhow!(
@@ -146,16 +160,20 @@ impl NodeBuilder {
             )
         })?;
 
-        let mut join_set = JoinSet::new();
-
         let node_ctx = NodeContext {
             rng,
-            udp_sockets: udp_writers,
-            tcp_socket: tcp_writer,
-            udp_egress_counter: Arc::new(AtomicUsize::new(0)),
             // TODO: allocate shard commands
             shard_command_txs: Vec::new(),
         };
+
+        let candidates = sockets_to_candidates(&udp_sockets);
+        let controller = ControllerActor::new(node_ctx, candidates);
+        // intentionally small so backpressure is applied early
+        let (controller_command_tx, controller_command_rx) = mailbox::new(64);
+
+        join_set.spawn_local(ignore(
+            controller.run(controller_command_rx, shard_event_rx),
+        ));
 
         if let Some(source) = self.http_api {
             // Resolve listener
@@ -197,14 +215,6 @@ impl NodeBuilder {
                 .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
                 .max_age(Duration::from_secs(86400));
 
-            let controller = ControllerActor::new(node_ctx);
-            let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
-            // intentionally small so backpressure is applied early
-            let (controller_command_tx, controller_command_rx) = mailbox::new(64);
-
-            join_set.spawn_local(ignore(
-                controller.run(controller_command_rx, shard_event_rx),
-            ));
             let router = api::router(controller_command_tx, api_cfg)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
@@ -243,66 +253,69 @@ impl NodeBuilder {
             }
         }
 
+        // TODO: should we bother joining here?
+        for handle in shard_handles {
+            handle.join();
+        }
+
         Ok(())
     }
 }
 
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-    pub udp_sockets: Vec<net::UnifiedSocketWriter>,
-    pub tcp_socket: net::UnifiedSocketWriter,
-    udp_egress_counter: Arc<AtomicUsize>,
 
     shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
 }
 
-impl NodeContext {
-    pub fn allocate_udp_egress(&self) -> net::UnifiedSocketWriter {
-        if self.udp_sockets.is_empty() {
-            // If no UDP sockets exist, fallback to TCP to prevent panic/div-by-zero
-            return self.tcp_socket.clone();
-        }
-        let seq = self
-            .udp_egress_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.udp_sockets[seq % self.udp_sockets.len()].clone()
-    }
-
-    pub fn allocate_tcp_egress(&self) -> net::UnifiedSocketWriter {
-        self.tcp_socket.clone()
-    }
-}
-
-async fn bind_udp_workers(
+async fn bind_udp_sockets(
     local_addr: SocketAddr,
     external_addr: Option<SocketAddr>,
     workers: usize,
     mode: UdpMode,
-) -> Result<(Vec<net::UnifiedSocketReader>, Vec<net::UnifiedSocketWriter>)> {
-    let mut readers = Vec::with_capacity(workers);
-    let mut writers = Vec::with_capacity(workers);
+) -> Result<Vec<net::UnifiedSocket>> {
+    let mut sockets = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let (reader, writer) = match net::bind(local_addr, net::Transport::Udp(mode), external_addr)
-            .await
-        {
+        let socket = match net::bind(local_addr, net::Transport::Udp(mode), external_addr).await {
             Ok(s) => s,
-            Err(e) if writers.is_empty() => {
+            Err(e) if sockets.is_empty() => {
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
             }
             Err(e) => {
                 tracing::warn!(
                     "SO_REUSEPORT not supported or failed after first bind, proceeding with {} workers: {}",
-                    writers.len(),
+                    sockets.len(),
                     e
                 );
                 break;
             }
         };
-        readers.push(reader);
-        writers.push(writer);
+        sockets.push(socket);
     }
-    Ok((readers, writers))
+    Ok(sockets)
+}
+
+fn sockets_to_candidates(sockets: &[UnifiedSocket]) -> Vec<Candidate> {
+    let mut candidates = Vec::with_capacity(sockets.len());
+    for s in sockets {
+        let candidate = match s.transport() {
+            Transport::Udp(_) => Candidate::builder()
+                .udp()
+                .host(s.local_addr())
+                .build()
+                .expect("a UDP host candidate"),
+            Transport::Tcp => Candidate::builder()
+                .tcp()
+                .host(s.local_addr())
+                .tcptype(str0m::net::TcpType::Passive)
+                .build()
+                .expect("a TCP passive host candidate"),
+        };
+        candidates.push(candidate);
+    }
+
+    candidates
 }
 
 pub async fn ignore<T>(fut: impl Future<Output = T>) {

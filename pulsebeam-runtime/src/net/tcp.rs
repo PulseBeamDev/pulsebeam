@@ -21,10 +21,129 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Shared state for connection management
 type ConnMap = Arc<DashMap<SocketAddr, (async_channel::Sender<Bytes>, CancellationToken)>>;
 
+pub struct TcpTransport {
+    packet_rx: async_channel::Receiver<RecvPacketBatch>,
+    readable_notifier: Arc<tokio::sync::Notify>,
+    writable_notifier: Arc<tokio::sync::Notify>,
+    local_addr: SocketAddr,
+    conns: ConnMap,
+}
+
+impl TcpTransport {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn max_gso_segments(&self) -> usize {
+        64
+    }
+
+    pub fn active_connections(&self) -> usize {
+        self.conns.len()
+    }
+
+    pub async fn readable(&self) -> io::Result<()> {
+        loop {
+            if !self.packet_rx.is_empty() {
+                return Ok(());
+            }
+            let wait = self.readable_notifier.notified();
+            if !self.packet_rx.is_empty() {
+                return Ok(());
+            }
+            wait.await;
+        }
+    }
+
+    #[inline]
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
+        let mut count = 0;
+        while let Ok(pkt) = self.packet_rx.try_recv() {
+            out.push(pkt);
+            count += 1;
+            if count >= BATCH_SIZE {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        Ok(count)
+    }
+
+    pub async fn writable(&self) -> io::Result<()> {
+        loop {
+            if self.conns.is_empty() {
+                self.writable_notifier.notified().await;
+                continue;
+            }
+            let mut any_available = false;
+            for c in self.conns.iter() {
+                if !c.value().0.is_full() {
+                    any_available = true;
+                    break;
+                }
+            }
+            if any_available {
+                return Ok(());
+            }
+            let wait = self.writable_notifier.notified();
+            wait.await;
+        }
+    }
+
+    #[inline]
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> io::Result<bool> {
+        let Some(peer_entry) = self.conns.get(&batch.dst) else {
+            return Ok(true);
+        };
+        let (peer_tx, _) = peer_entry.value();
+
+        let required_slots = batch.buf.len().div_ceil(batch.segment_size);
+        if peer_tx.capacity().unwrap() - peer_tx.len() < required_slots {
+            return Ok(false);
+        }
+
+        let mut offset = 0;
+        while offset < batch.buf.len() {
+            let end = std::cmp::min(offset + batch.segment_size, batch.buf.len());
+            let _ = peer_tx.try_send(Bytes::copy_from_slice(&batch.buf[offset..end]));
+            offset = end;
+        }
+        Ok(true)
+    }
+
+    pub fn close_peer(&self, peer_addr: &SocketAddr) {
+        if let Some((_, (tx, cancel))) = self.conns.remove(peer_addr) {
+            cancel.cancel();
+            tx.close();
+            tracing::info!(%peer_addr, "Reader forced connection close");
+        }
+    }
+}
+
+impl TcpTransport {
+    fn from_parts(
+        local_addr: SocketAddr,
+        packet_rx: async_channel::Receiver<RecvPacketBatch>,
+        readable_notifier: Arc<tokio::sync::Notify>,
+        writable_notifier: Arc<tokio::sync::Notify>,
+        conns: ConnMap,
+    ) -> Self {
+        Self {
+            packet_rx,
+            readable_notifier,
+            writable_notifier,
+            local_addr,
+            conns,
+        }
+    }
+}
+
 pub async fn bind(
     addr: SocketAddr,
     external_addr: Option<SocketAddr>,
-) -> io::Result<(TcpTransportReader, TcpTransportWriter)> {
+) -> io::Result<TcpTransport> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = external_addr.unwrap_or(listener.local_addr()?);
 
@@ -89,132 +208,15 @@ pub async fn bind(
         }
     });
 
-    let reader = TcpTransportReader {
-        local_addr,
+    let transport = TcpTransport {
         packet_rx,
         readable_notifier,
-        conns: conns.clone(), // Reader now has access to conns
-    };
-
-    let writer = TcpTransportWriter {
+        writable_notifier,
         local_addr,
         conns,
-        writable_notifier,
     };
 
-    Ok((reader, writer))
-}
-
-pub struct TcpTransportReader {
-    packet_rx: async_channel::Receiver<RecvPacketBatch>,
-    readable_notifier: Arc<tokio::sync::Notify>,
-    local_addr: SocketAddr,
-    /// Shared connection map to allow forced disconnects
-    conns: ConnMap,
-}
-
-impl TcpTransportReader {
-    /// Closes the connection for a specific peer.
-    /// Useful when high-level demux or auth fails.
-    pub fn close_peer(&self, peer_addr: &SocketAddr) {
-        if let Some((_, (tx, cancel))) = self.conns.remove(peer_addr) {
-            cancel.cancel(); // Stops the background reader task
-            tx.close(); // Stops the background writer task
-            tracing::info!(%peer_addr, "Reader forced connection close");
-        }
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    pub async fn readable(&self) -> io::Result<()> {
-        loop {
-            if !self.packet_rx.is_empty() {
-                return Ok(());
-            }
-            let wait = self.readable_notifier.notified();
-            if !self.packet_rx.is_empty() {
-                return Ok(());
-            }
-            wait.await;
-        }
-    }
-
-    #[inline]
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
-        let mut count = 0;
-        while let Ok(pkt) = self.packet_rx.try_recv() {
-            out.push(pkt);
-            count += 1;
-            if count >= BATCH_SIZE {
-                break;
-            }
-        }
-        if out.is_empty() {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        Ok(count)
-    }
-}
-
-#[derive(Clone)]
-pub struct TcpTransportWriter {
-    local_addr: SocketAddr,
-    conns: ConnMap,
-    writable_notifier: Arc<tokio::sync::Notify>,
-}
-
-impl TcpTransportWriter {
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    pub fn max_gso_segments(&self) -> usize {
-        64
-    }
-
-    pub async fn writable(&self) -> io::Result<()> {
-        loop {
-            if self.conns.is_empty() {
-                self.writable_notifier.notified().await;
-                continue;
-            }
-            let mut any_available = false;
-            for c in self.conns.iter() {
-                if !c.value().0.is_full() {
-                    any_available = true;
-                    break;
-                }
-            }
-            if any_available {
-                return Ok(());
-            }
-            let wait = self.writable_notifier.notified();
-            wait.await;
-        }
-    }
-
-    #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> io::Result<bool> {
-        let Some(peer_entry) = self.conns.get(&batch.dst) else {
-            return Ok(true);
-        };
-        let (peer_tx, _) = peer_entry.value();
-
-        let required_slots = batch.buf.len().div_ceil(batch.segment_size);
-        if peer_tx.capacity().unwrap() - peer_tx.len() < required_slots {
-            return Ok(false);
-        }
-
-        let mut offset = 0;
-        while offset < batch.buf.len() {
-            let end = std::cmp::min(offset + batch.segment_size, batch.buf.len());
-            let _ = peer_tx.try_send(Bytes::copy_from_slice(&batch.buf[offset..end]));
-            offset = end;
-        }
-        Ok(true)
-    }
+    Ok(transport)
 }
 
 fn handle_new_connection(
@@ -330,9 +332,9 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_rfc_compliance() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        // 1. Setup: Bind returns the split pair
-        let (mut reader, writer) = bind(addr, None).await.unwrap();
-        let server_addr = writer.local_addr();
+        // 1. Setup: Bind returns a unified socket
+        let mut sock = bind(addr, None).await.unwrap();
+        let server_addr = sock.local_addr();
 
         // 2. Test RFC 6544 (Passive Connection Acceptance)
         let mut client = TcpStream::connect(server_addr).await.unwrap();
@@ -349,9 +351,9 @@ mod tests {
         client.write_all(&stream).await.unwrap();
 
         // Server Reader: Wait and receive
-        reader.readable().await.unwrap();
+        sock.readable().await.unwrap();
         let mut out = Vec::new();
-        reader.try_recv_batch(&mut out).unwrap();
+        sock.try_recv_batch(&mut out).unwrap();
 
         assert_eq!(out.len(), 2);
         assert_eq!(&out[0].buf[..], p1);
@@ -367,8 +369,8 @@ mod tests {
         };
 
         // Server Writer: Wait and send
-        writer.writable().await.unwrap();
-        writer.try_send_batch(&batch).unwrap();
+        sock.writable().await.unwrap();
+        sock.try_send_batch(&batch).unwrap();
 
         // Client must see two separate framed packets
         for expected in [b"segment1", b"segment2"] {
@@ -383,23 +385,22 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_multi_peer_isolation() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (_reader, writer) = bind(addr, None).await.unwrap();
+        let sock = bind(addr, None).await.unwrap();
 
-        let _c1 = TcpStream::connect(writer.local_addr()).await.unwrap();
-        let _c2 = TcpStream::connect(writer.local_addr()).await.unwrap();
+        let _c1 = TcpStream::connect(sock.local_addr()).await.unwrap();
+        let _c2 = TcpStream::connect(sock.local_addr()).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(writer.conns.len(), 2);
+        assert_eq!(sock.active_connections(), 2);
     }
 
     #[tokio::test]
-    async fn test_writer_cloning() {
+    async fn test_access_local_addr() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (_reader, writer) = bind(addr, None).await.unwrap();
+        let sock = bind(addr, None).await.unwrap();
 
-        let writer_clone = writer.clone();
         let handle = tokio::spawn(async move {
-            let _ = writer_clone.local_addr();
+            let _ = sock.local_addr();
         });
         handle.await.unwrap();
     }

@@ -14,10 +14,49 @@ pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
 // per-client-pacer handles the latency bloat. But, big enough for keyframe bursts to many subscribers
 pub const SOCKET_SEND_SIZE: usize = 32 * BATCH_SIZE * CHUNK_SIZE;
 
+pub struct UdpTransport {
+    reader: UdpTransportReader,
+    writer: UdpTransportWriter,
+}
+
+impl UdpTransport {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.reader.local_addr()
+    }
+
+    pub fn max_gso_segments(&self) -> usize {
+        self.writer.max_gso_segments()
+    }
+
+    #[inline]
+    pub async fn readable(&self) -> io::Result<()> {
+        self.reader.readable().await
+    }
+
+    #[inline]
+    pub async fn writable(&self) -> io::Result<()> {
+        self.writer.writable().await
+    }
+
+    #[inline]
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
+        self.reader.try_recv_batch(out)
+    }
+
+    #[inline]
+    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+        self.writer.try_send_batch(batch)
+    }
+
+    pub fn close_peer(&mut self, _peer_addr: &SocketAddr) {
+        // UDP has no per-peer connection state to close.
+    }
+}
+
 pub async fn bind(
     addr: SocketAddr,
     external_addr: Option<SocketAddr>,
-) -> io::Result<(UdpTransportReader, UdpTransportWriter)> {
+) -> io::Result<UdpTransport> {
     let socket2_sock = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::DGRAM,
@@ -68,7 +107,7 @@ pub async fn bind(
         "UDP socket bound"
     );
 
-    Ok((reader, writer))
+    Ok(UdpTransport { reader, writer })
 }
 
 pub struct UdpTransportReader {

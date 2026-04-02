@@ -105,45 +105,37 @@ pub async fn bind(
     addr: SocketAddr,
     transport: Transport,
     external_addr: Option<SocketAddr>,
-) -> io::Result<(UnifiedSocketReader, UnifiedSocketWriter)> {
-    let socks = match transport {
+) -> io::Result<UnifiedSocket> {
+    let sock = match transport {
         Transport::Udp(UdpMode::Batch) => {
-            let (reader, writer) = udp::bind(addr, external_addr).await?;
-            (
-                UnifiedSocketReader::Udp(Box::new(reader)),
-                UnifiedSocketWriter::Udp(writer),
-            )
+            let transport = udp::bind(addr, external_addr).await?;
+            UnifiedSocket::Udp(transport)
         }
         Transport::Udp(UdpMode::Scalar) => {
-            let (reader, writer) = udp_scalar::bind(addr, external_addr).await?;
-            (
-                UnifiedSocketReader::UdpScalar(reader),
-                UnifiedSocketWriter::UdpScalar(writer),
-            )
+            let transport = udp_scalar::bind(addr, external_addr).await?;
+            UnifiedSocket::UdpScalar(transport)
         }
         Transport::Tcp => {
-            let (reader, writer) = tcp::bind(addr, external_addr).await?;
-            (
-                UnifiedSocketReader::Tcp(reader),
-                UnifiedSocketWriter::Tcp(writer),
-            )
+            let transport = tcp::bind(addr, external_addr).await?;
+            UnifiedSocket::Tcp(transport)
         }
     };
     tracing::debug!("bound to {addr} ({transport:?})");
-    Ok(socks)
-}
-pub enum UnifiedSocketReader {
-    Udp(Box<udp::UdpTransportReader>),
-    UdpScalar(udp_scalar::UdpTransportReader),
-    Tcp(tcp::TcpTransportReader),
+    Ok(sock)
 }
 
-impl UnifiedSocketReader {
+pub enum UnifiedSocket {
+    Udp(udp::UdpTransport),
+    UdpScalar(udp_scalar::UdpTransport),
+    Tcp(tcp::TcpTransport),
+}
+
+impl UnifiedSocket {
     pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
         match self {
             Self::Tcp(inner) => inner.close_peer(peer_addr),
-            Self::Udp(_) => {}
-            Self::UdpScalar(_) => {}
+            Self::Udp(inner) => inner.close_peer(peer_addr),
+            Self::UdpScalar(inner) => inner.close_peer(peer_addr),
         }
     }
 
@@ -165,37 +157,20 @@ impl UnifiedSocketReader {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(inner) => inner.try_recv_batch(packets),
-            Self::UdpScalar(inner) => inner.try_recv_batch(packets),
-            Self::Tcp(inner) => inner.try_recv_batch(packets),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub enum UnifiedSocketWriter {
-    Udp(udp::UdpTransportWriter),
-    UdpScalar(udp_scalar::UdpTransportWriter),
-    Tcp(tcp::TcpTransportWriter),
-}
-
-impl UnifiedSocketWriter {
-    pub fn max_gso_segments(&self) -> usize {
-        match self {
-            Self::Udp(inner) => inner.max_gso_segments(),
-            Self::UdpScalar(inner) => inner.max_gso_segments(),
-            Self::Tcp(inner) => inner.max_gso_segments(),
-        }
-    }
-
-    #[inline]
     pub async fn writable(&self) -> io::Result<()> {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::UdpScalar(inner) => inner.writable().await,
             Self::Tcp(inner) => inner.writable().await,
+        }
+    }
+
+    #[inline]
+    pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(inner) => inner.try_recv_batch(packets),
+            Self::UdpScalar(inner) => inner.try_recv_batch(packets),
+            Self::Tcp(inner) => inner.try_recv_batch(packets),
         }
     }
 
@@ -208,19 +183,19 @@ impl UnifiedSocketWriter {
         }
     }
 
+    pub fn max_gso_segments(&self) -> usize {
+        match self {
+            Self::Udp(inner) => inner.max_gso_segments(),
+            Self::UdpScalar(inner) => inner.max_gso_segments(),
+            Self::Tcp(inner) => inner.max_gso_segments(),
+        }
+    }
+
     pub fn transport(&self) -> Transport {
         match self {
             Self::Udp(_) => Transport::Udp(UdpMode::Batch),
             Self::UdpScalar(_) => Transport::Udp(UdpMode::Scalar),
             Self::Tcp(_) => Transport::Tcp,
-        }
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        match self {
-            Self::Udp(inner) => inner.local_addr(),
-            Self::UdpScalar(inner) => inner.local_addr(),
-            Self::Tcp(inner) => inner.local_addr(),
         }
     }
 }

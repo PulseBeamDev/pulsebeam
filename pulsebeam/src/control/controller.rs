@@ -11,7 +11,6 @@ use once_cell::sync::Lazy;
 use pulsebeam_runtime::{
     actor::{self, ActorKind},
     mailbox,
-    net::UnifiedSocketWriter,
 };
 use pulsebeam_runtime::{net::Transport, sync::Arc};
 use str0m::{
@@ -158,15 +157,17 @@ struct ParticipantMeta {
 
 pub struct ControllerActor {
     node_ctx: node::NodeContext,
+    candidates: Vec<Candidate>,
 
     rooms: HashMap<RoomId, Room>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
 }
 
 impl ControllerActor {
-    pub fn new(node_ctx: node::NodeContext) -> Self {
+    pub fn new(node_ctx: node::NodeContext, candidates: Vec<Candidate>) -> Self {
         Self {
             node_ctx,
+            candidates,
             rooms: HashMap::new(),
             participants: HashMap::new(),
         }
@@ -244,11 +245,7 @@ impl ControllerActor {
         state: &ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        let udp_egress = self.node_ctx.allocate_udp_egress();
-        let tcp_egress = self.node_ctx.allocate_tcp_egress();
-        let sockets = [&udp_egress, &tcp_egress];
-
-        let (rtc, answer) = self.create_answer(offer, &sockets)?;
+        let (rtc, answer) = self.create_answer(offer)?;
         let room = self
             .rooms
             .entry(state.room_id.clone())
@@ -267,11 +264,7 @@ impl ControllerActor {
         }
     }
 
-    fn create_answer(
-        &mut self,
-        offer: SdpOffer,
-        sockets: &[&UnifiedSocketWriter],
-    ) -> Result<(Rtc, SdpAnswer), ControllerError> {
+    fn create_answer(&mut self, offer: SdpOffer) -> Result<(Rtc, SdpAnswer), ControllerError> {
         const PT_OPUS: Pt = Pt::new_with_value(111);
 
         tracing::debug!("{offer}");
@@ -343,22 +336,8 @@ impl ControllerActor {
         // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
 
         let mut rtc = rtc_config.build(Instant::now().into());
-        for s in sockets {
-            let candidate = match s.transport() {
-                Transport::Udp(_) => Candidate::builder()
-                    .udp()
-                    .host(s.local_addr())
-                    .build()
-                    .expect("a UDP host candidate"),
-                Transport::Tcp => Candidate::builder()
-                    .tcp()
-                    .host(s.local_addr())
-                    .tcptype(TcpType::Passive)
-                    .build()
-                    .expect("a TCP passive host candidate"),
-            };
-
-            rtc.add_local_candidate(candidate);
+        for c in &self.candidates {
+            rtc.add_local_candidate(c.clone());
         }
 
         let answer = rtc

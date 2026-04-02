@@ -1,10 +1,13 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeSet, BinaryHeap, HashMap, VecDeque},
 };
 
 use ahash::HashMap;
-use pulsebeam_runtime::net::{self, UnifiedSocketReader, UnifiedSocketWriter};
+use pulsebeam_runtime::{
+    mailbox,
+    net::{self, UnifiedSocket},
+};
 use tokio::time::Instant;
 
 use crate::{
@@ -39,14 +42,31 @@ pub struct ShardWorker {
     participants: HashMap<ParticipantId, ParticipantCore>,
     routing: HashMap<StreamId, Routing>,
 
-    udp_socket_rx: UnifiedSocketReader,
-    udp_socket_tx: UnifiedSocketWriter,
+    udp_socket: UnifiedSocket,
 
-    command_rx: tachyonix::Receiver<ShardCommand>,
+    command_rx: mailbox::Receiver<ShardCommand>,
+    event_tx: mailbox::Sender<ShardEvent>,
 }
 
 impl ShardWorker {
-    pub async fn run(&mut self) -> Result<(), ShardError> {
+    pub fn new(
+        udp_socket: UnifiedSocket,
+        command_rx: mailbox::Receiver<ShardCommand>,
+        event_tx: mailbox::Sender<ShardEvent>,
+    ) -> Self {
+        Self {
+            demuxer: Demuxer::default(),
+            participants: HashMap::default(),
+            routing: HashMap::default(),
+
+            udp_socket,
+
+            command_rx,
+            event_tx,
+        }
+    }
+
+    pub async fn run(mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
         let mut events = ParticipantEvents::default();
@@ -65,7 +85,7 @@ impl ShardWorker {
             tokio::select! {
                 biased;
                 _ = wait => {}
-                res = self.udp_socket_rx.readable() => { res?; }
+                res = self.udp_socket.readable() => { res?; }
             }
             let now = Instant::now();
 
@@ -82,7 +102,7 @@ impl ShardWorker {
                 dirty.push_back(participant_id);
             }
 
-            let count = self.udp_socket_rx.try_recv_batch(&mut recv_batch)?;
+            let count = self.udp_socket.try_recv_batch(&mut recv_batch)?;
             for batch in recv_batch.drain(..count) {
                 let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;
@@ -124,7 +144,7 @@ impl ShardWorker {
                     continue;
                 };
 
-                participant.udp_batcher.flush(&self.udp_socket_tx);
+                participant.udp_batcher.flush(&self.udp_socket);
                 // TODO: TCP
             }
         }
