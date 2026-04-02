@@ -1,8 +1,6 @@
 use std::error::Error;
 use std::fmt;
 
-pub type PermitIterator<'a, T> = tokio::sync::mpsc::PermitIterator<'a, T>;
-
 /// An error returned when sending on a closed mailbox.
 ///
 /// This error is returned by the asynchronous `send` method. It contains
@@ -10,8 +8,8 @@ pub type PermitIterator<'a, T> = tokio::sync::mpsc::PermitIterator<'a, T>;
 #[derive(Debug, PartialEq, Eq)]
 pub struct SendError<T>(pub T);
 
-impl<T> From<tokio::sync::mpsc::error::SendError<T>> for SendError<T> {
-    fn from(value: tokio::sync::mpsc::error::SendError<T>) -> Self {
+impl<T> From<tachyonix::SendError<T>> for SendError<T> {
+    fn from(value: tachyonix::SendError<T>) -> Self {
         SendError(value.0)
     }
 }
@@ -31,11 +29,11 @@ pub enum TrySendError<T> {
     Closed(T),
 }
 
-impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for TrySendError<T> {
-    fn from(e: tokio::sync::mpsc::error::TrySendError<T>) -> Self {
+impl<T> From<tachyonix::TrySendError<T>> for TrySendError<T> {
+    fn from(e: tachyonix::TrySendError<T>) -> Self {
         match e {
-            tokio::sync::mpsc::error::TrySendError::Full(e) => TrySendError::Full(e),
-            tokio::sync::mpsc::error::TrySendError::Closed(e) => TrySendError::Closed(e),
+            tachyonix::TrySendError::Full(e) => TrySendError::Full(e),
+            tachyonix::TrySendError::Closed(e) => TrySendError::Closed(e),
         }
     }
 }
@@ -68,7 +66,7 @@ impl fmt::Display for TryRecvError {
 
 /// A handle to send messages to an actor's mailbox.
 pub struct Sender<T> {
-    sender: tokio::sync::mpsc::Sender<T>,
+    sender: tachyonix::Sender<T>,
 }
 
 impl<T> Clone for Sender<T> {
@@ -80,10 +78,6 @@ impl<T> Clone for Sender<T> {
 }
 
 impl<T> Sender<T> {
-    pub async fn reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, SendError<()>> {
-        self.sender.reserve_many(n).await.map_err(|e| e.into())
-    }
-
     /// Sends a message asynchronously, waiting if the mailbox is full.
     ///
     /// Returns a `SendError` only if the receiving actor has terminated.
@@ -102,31 +96,34 @@ impl<T> Sender<T> {
 
 /// An actor's mailbox for receiving messages.
 pub struct Receiver<T> {
-    receiver: tokio::sync::mpsc::Receiver<T>,
+    receiver: tachyonix::Receiver<T>,
 }
 
 impl<T> Receiver<T> {
     /// Receives the next message from the mailbox.
     pub async fn recv(&mut self) -> Option<T> {
-        self.receiver.recv().await
+        match self.receiver.recv().await {
+            Ok(val) => Some(val),
+            Err(_e) => None,
+        }
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         self.receiver.try_recv().map_err(|e| match e {
-            tokio::sync::mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
-            tokio::sync::mpsc::error::TryRecvError::Disconnected => TryRecvError::Disconnected,
+            tachyonix::TryRecvError::Empty => TryRecvError::Empty,
+            tachyonix::TryRecvError::Closed => TryRecvError::Disconnected,
         })
     }
 
-    /// Unwraps the underlying `tokio::sync::mpsc::Receiver`, consuming `self`.
-    pub fn into_inner(self) -> tokio::sync::mpsc::Receiver<T> {
+    /// Unwraps the underlying `tachyonix::Receiver`, consuming `self`.
+    pub fn into_inner(self) -> tachyonix::Receiver<T> {
         self.receiver
     }
 }
 
 /// Creates a new mailbox and a corresponding sender handle.
 pub fn new<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
-    let (sender, receiver) = tokio::sync::mpsc::channel(buffer);
+    let (sender, receiver) = tachyonix::channel(buffer);
     (Sender { sender }, Receiver { receiver })
 }
 

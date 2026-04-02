@@ -2906,6 +2906,7 @@ dependencies = [
  "rand",
  "socket2",
  "systemstat",
+ "tachyonix",
  "thiserror 2.0.18",
  "tokio",
  "tokio-metrics",
