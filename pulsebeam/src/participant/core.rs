@@ -61,6 +61,12 @@ pub enum DisconnectReason {
     SystemTerminated,
 }
 
+pub struct ParticipantConfig {
+    pub manual_sub: bool,
+    pub participant_id: entity::ParticipantId,
+    pub rtc: Rtc,
+}
+
 pub struct ParticipantCore {
     // Hot: touched on every packet
     pub rtc: Rtc,
@@ -83,7 +89,8 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
-    pub fn new(manual_sub: bool, participant_id: entity::ParticipantId, mut rtc: Rtc) -> Self {
+    pub fn new(mut cfg: ParticipantConfig) -> Self {
+        let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {
             label: namespace::Signaling::Reliable.as_str().to_string(),
@@ -108,12 +115,12 @@ impl ParticipantCore {
 
         Self {
             last_deadline: None,
-            participant_id,
+            participant_id: cfg.participant_id,
             rtc,
             udp_batcher,
             tcp_batcher,
             upstream: UpstreamAllocator::new(),
-            downstream: DownstreamAllocator::new(participant_id, manual_sub),
+            downstream: DownstreamAllocator::new(cfg.participant_id, cfg.manual_sub),
             slot_meta: HashMap::new(),
             disconnect_reason: None,
             signaling: Signaling::new(cid),
@@ -439,12 +446,13 @@ impl ParticipantCore {
                 // Cache (Pt, Ssrc) so handle_forward_rtp avoids per-packet lookups.
                 // Both are stable for the session lifetime after SDP negotiation.
                 if let Some(m) = self.rtc.media(media.mid)
-                    && let Some(&pt) = m.remote_pts().first() {
-                        let mut api = self.rtc.direct_api();
-                        if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
-                            self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
-                        }
+                    && let Some(&pt) = m.remote_pts().first()
+                {
+                    let mut api = self.rtc.direct_api();
+                    if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
+                        self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
                     }
+                }
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }

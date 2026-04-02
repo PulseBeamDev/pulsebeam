@@ -4,7 +4,7 @@ use crate::{
     control::room::Room,
     entity::{ConnectionId, ParticipantId, RoomId},
     node,
-    participant::ParticipantCore,
+    participant::ParticipantConfig,
     shard::worker::ShardEvent,
 };
 use once_cell::sync::Lazy;
@@ -250,10 +250,14 @@ impl ControllerActor {
             .rooms
             .entry(state.room_id.clone())
             .or_insert_with(|| Room::new(state.room_id.clone()));
-        let participant = ParticipantCore::new(state.manual_sub, state.participant_id, rtc);
+        let participant_cfg = ParticipantConfig {
+            manual_sub: state.manual_sub,
+            participant_id: state.participant_id,
+            rtc,
+        };
 
         // TODO: handle patch
-        room.add_participant(&participant.participant_id);
+        room.add_participant(&participant_cfg.participant_id);
         Ok(answer)
     }
 

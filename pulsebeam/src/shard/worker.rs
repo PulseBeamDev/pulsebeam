@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeSet, BinaryHeap, VecDeque},
 };
 
 use ahash::HashMap;
@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use crate::{
     entity::ParticipantId,
-    participant::{ParticipantCore, ParticipantEvents},
+    participant::{ParticipantConfig, ParticipantCore, ParticipantEvents},
     shard::demux::Demuxer,
     track::{StreamId, TrackMeta},
 };
@@ -30,7 +30,7 @@ struct Routing {
 type TimerEntry = Reverse<(Instant, ParticipantId)>;
 
 pub enum ShardCommand {
-    AddParticipant(ParticipantCore),
+    AddParticipant(ParticipantConfig),
 }
 
 pub enum ShardEvent {

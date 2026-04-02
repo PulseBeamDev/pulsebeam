@@ -1,5 +1,4 @@
 use pulsebeam_runtime::net;
-use pulsebeam_runtime::net::UnifiedSocketReader;
 
 use crate::entity::ParticipantId;
 
@@ -44,13 +43,15 @@ impl Demuxer {
     }
 
     /// Removes a participant and all associated state (ufrag and address mappings).
-    pub fn unregister(&mut self, socket: &mut UnifiedSocketReader, ufrag: &[u8]) {
+    pub fn unregister(&mut self, ufrag: &[u8]) -> Vec<SocketAddr> {
         self.ufrag_map.remove(ufrag);
         if let Some(addrs) = self.ufrag_addrs.remove(ufrag) {
-            for addr in addrs {
-                self.addr_map.remove(&addr);
-                socket.close_peer(&addr);
+            for addr in &addrs {
+                self.addr_map.remove(addr);
             }
+            addrs
+        } else {
+            vec![]
         }
     }
 
@@ -64,16 +65,17 @@ impl Demuxer {
         }
 
         if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(batch.data())
-            && let Some(h) = self.ufrag_map.get_mut(ufrag_raw) {
-                let boxed_ufrag = ufrag_raw.to_vec().into_boxed_slice();
+            && let Some(h) = self.ufrag_map.get_mut(ufrag_raw)
+        {
+            let boxed_ufrag = ufrag_raw.to_vec().into_boxed_slice();
 
-                // Link address to handle and ufrag
-                self.addr_map.insert(src, *h);
-                self.addr_to_ufrag.insert(src, boxed_ufrag.clone());
-                self.ufrag_addrs.entry(boxed_ufrag).or_default().push(src);
+            // Link address to handle and ufrag
+            self.addr_map.insert(src, *h);
+            self.addr_to_ufrag.insert(src, boxed_ufrag.clone());
+            self.ufrag_addrs.entry(boxed_ufrag).or_default().push(src);
 
-                return Some(*h);
-            }
+            return Some(*h);
+        }
 
         None
     }

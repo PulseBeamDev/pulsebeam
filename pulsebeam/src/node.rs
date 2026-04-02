@@ -26,9 +26,6 @@ use crate::control::controller::ControllerActor;
 use crate::shard::worker::ShardCommand;
 use crate::shard::worker::ShardWorker;
 
-/// A pair of reader/writer for a transport connection.
-pub type TransportPair = (net::UnifiedSocketReader, net::UnifiedSocketWriter);
-
 /// Defines how a service listener is acquired.
 enum ListenerSource {
     /// Bind to this address internally.
@@ -139,11 +136,13 @@ impl NodeBuilder {
         let mut join_set = JoinSet::new();
         let udp_sockets =
             bind_udp_sockets(local_addr, external_addr, workers_count, self.udp_mode).await?;
+        let candidates = sockets_to_candidates(&udp_sockets);
 
         let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
         let mut shard_handles = Vec::new();
         for sock in udp_sockets {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
+            let shard_event_tx = shard_event_tx.clone();
             let handle = std::thread::spawn(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .build_local(LocalOptions::default())
@@ -166,7 +165,6 @@ impl NodeBuilder {
             shard_command_txs: Vec::new(),
         };
 
-        let candidates = sockets_to_candidates(&udp_sockets);
         let controller = ControllerActor::new(node_ctx, candidates);
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
