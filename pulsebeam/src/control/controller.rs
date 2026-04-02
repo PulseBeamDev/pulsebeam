@@ -1,11 +1,11 @@
 use std::{collections::HashMap, io, time::Duration};
 
 use crate::{
-    control::room::Room,
+    control::{room::Room, router::ShardRouter},
     entity::{ConnectionId, ParticipantId, RoomId},
     node,
     participant::ParticipantConfig,
-    shard::worker::ShardEvent,
+    shard::worker::{ShardCommand, ShardEvent},
 };
 use once_cell::sync::Lazy;
 use pulsebeam_runtime::{
@@ -156,20 +156,27 @@ struct ParticipantMeta {
 }
 
 pub struct ControllerActor {
-    node_ctx: node::NodeContext,
     candidates: Vec<Candidate>,
 
     rooms: HashMap<RoomId, Room>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
+    router: ShardRouter,
 }
 
 impl ControllerActor {
-    pub fn new(node_ctx: node::NodeContext, candidates: Vec<Candidate>) -> Self {
+    pub fn new(
+        _rng: pulsebeam_runtime::rand::Rng,
+        shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
+        candidates: Vec<Candidate>,
+    ) -> Self {
+        let router = ShardRouter::new(shard_command_txs);
+
         Self {
-            node_ctx,
             candidates,
+
             rooms: HashMap::new(),
             participants: HashMap::new(),
+            router,
         }
     }
 

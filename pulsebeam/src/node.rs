@@ -140,6 +140,7 @@ impl NodeBuilder {
 
         let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
         let mut shard_handles = Vec::new();
+        let mut shard_command_txs = Vec::new();
         for sock in udp_sockets {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
@@ -151,6 +152,7 @@ impl NodeBuilder {
                 rt.block_on(shard.run());
             });
             shard_handles.push(handle);
+            shard_command_txs.push(shard_command_tx);
         }
 
         let rng = self.rng.ok_or_else(|| {
@@ -159,13 +161,7 @@ impl NodeBuilder {
             )
         })?;
 
-        let node_ctx = NodeContext {
-            rng,
-            // TODO: allocate shard commands
-            shard_command_txs: Vec::new(),
-        };
-
-        let controller = ControllerActor::new(node_ctx, candidates);
+        let controller = ControllerActor::new(rng, shard_command_txs, candidates);
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
 
