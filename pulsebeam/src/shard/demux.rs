@@ -48,6 +48,7 @@ impl Demuxer {
         if let Some(addrs) = self.ufrag_addrs.remove(ufrag) {
             for addr in &addrs {
                 self.addr_map.remove(addr);
+                self.addr_to_ufrag.remove(addr);
             }
             addrs
         } else {

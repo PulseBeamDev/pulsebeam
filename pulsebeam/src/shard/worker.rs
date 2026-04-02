@@ -154,7 +154,13 @@ impl ShardWorker {
         todo!();
     }
 
-    fn remove_participant(&mut self, _participant_id: ParticipantId) {
+    fn remove_participant(&mut self, participantid: ParticipantId) -> Option<ParticipantCore> {
+        let mut participant = self.participants.remove(&participantid)?;
+        let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
+        for addr in &addrs {
+            self.udp_socket.close_peer(addr);
+        }
         todo!();
+        Some(participant)
     }
 }

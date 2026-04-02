@@ -128,6 +128,10 @@ impl ParticipantCore {
         }
     }
 
+    pub fn ufrag(&mut self) -> String {
+        self.rtc.direct_api().local_ice_credentials().ufrag
+    }
+
     pub fn disconnect_reason(&self) -> Option<&DisconnectReason> {
         self.disconnect_reason.as_ref()
     }
