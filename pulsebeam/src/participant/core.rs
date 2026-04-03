@@ -60,6 +60,7 @@ pub enum DisconnectReason {
     SystemTerminated,
 }
 
+#[derive(Debug)]
 pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub participant_id: entity::ParticipantId,
@@ -152,7 +153,6 @@ impl ParticipantCore {
         now: Instant,
         events: &mut ParticipantEvents,
     ) {
-        tracing::info!("got a packet");
         self.handle_udp_packet_batch(batch, now, events)
     }
 

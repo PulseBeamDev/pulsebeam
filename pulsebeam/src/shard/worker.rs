@@ -30,6 +30,7 @@ struct Routing {
 
 type TimerEntry = Reverse<(Instant, ParticipantId)>;
 
+#[derive(Debug)]
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
 }
@@ -58,8 +59,6 @@ impl ShardWorker {
         command_rx: mailbox::Receiver<ShardCommand>,
         event_tx: mailbox::Sender<ShardEvent>,
     ) -> Self {
-        let span = tracing::span!(Level::INFO, "shard_worker", shard_id = shard_id);
-
         Self {
             shard_id,
             demuxer: Demuxer::default(),
@@ -74,7 +73,12 @@ impl ShardWorker {
     }
 
     #[tracing::instrument(skip(self), fields(shard_id = self.shard_id))]
-    pub async fn run(mut self) -> Result<(), ShardError> {
+    pub async fn run(mut self) {
+        let res = self.run_inner().await;
+        tracing::info!("shard exited: {:?}", res);
+    }
+
+    async fn run_inner(mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
         let mut events = ParticipantEvents::default();
@@ -117,7 +121,10 @@ impl ShardWorker {
                 dirty.push_back(participant_id);
             }
 
-            let count = self.udp_socket.try_recv_batch(&mut recv_batch)?;
+            let count = self
+                .udp_socket
+                .try_recv_batch(&mut recv_batch)
+                .unwrap_or_default();
             for batch in recv_batch.drain(..count) {
                 let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;
@@ -174,7 +181,6 @@ impl ShardWorker {
                 self.event_tx.send(event).await;
             }
         }
-
         Ok(())
     }
 

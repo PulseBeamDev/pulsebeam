@@ -271,10 +271,10 @@ impl ControllerActor {
             .router
             .try_route(routing_key)
             .ok_or(ControllerError::ServiceUnavailable)?;
+        tracing::info!("routed {} to {}", participant_id, shard_id);
         self.router
             .send(shard_id, ShardCommand::AddParticipant(cfg))
-            .await
-            .map_err(|_| ControllerError::ServiceUnavailable)?;
+            .await;
 
         room.add_participant(&participant_id);
         self.participants.insert(

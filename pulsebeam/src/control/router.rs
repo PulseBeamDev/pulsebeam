@@ -66,12 +66,11 @@ impl ShardRouter {
         best_index
     }
 
-    pub async fn send(
-        &mut self,
-        shard_id: usize,
-        cmd: ShardCommand,
-    ) -> Result<(), SendError<ShardCommand>> {
-        self.get_mut(shard_id).send(cmd).await
+    pub async fn send(&mut self, shard_id: usize, cmd: ShardCommand) {
+        self.get_mut(shard_id)
+            .send(cmd)
+            .await
+            .expect("shard to be running");
     }
 
     fn get_mut(&mut self, shard_id: usize) -> &mut mailbox::Sender<ShardCommand> {
