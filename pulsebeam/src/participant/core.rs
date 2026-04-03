@@ -78,6 +78,7 @@ pub struct ParticipantCore {
     /// Eliminates per-packet `rtc.media()` + `stream_tx_by_mid()` lookups.
     slot_meta: HashMap<Mid, (Pt, Ssrc)>,
     last_deadline: Option<Instant>,
+    first_poll: bool,
     pending_ingress: VecDeque<RecvPacketBatch>,
 
     // Warm: touched per poll cycle
@@ -118,6 +119,7 @@ impl ParticipantCore {
         Self {
             pending_ingress: VecDeque::new(),
             last_deadline: None,
+            first_poll: true,
             participant_id: cfg.participant_id,
             rtc,
             udp_batcher,
@@ -189,9 +191,14 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents) {
-        let Some(last_deadline) = self.last_deadline else {
-            // already dead, nothing to do.
-            return;
+        let last_deadline = if self.first_poll {
+            self.first_poll = false; // Usually you'd flip this here
+            now
+        } else {
+            let Some(deadline) = self.last_deadline else {
+                return; // Already dead
+            };
+            deadline
         };
 
         let next_deadline = self.poll_until_deadline(now, events);

@@ -143,6 +143,7 @@ impl NodeBuilder {
             let shard_event_tx = shard_event_tx.clone();
             let handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
                     .build_local(LocalOptions::default())
                     .unwrap();
                 let shard = ShardWorker::new(shard_id, sock, shard_command_rx, shard_event_tx);
