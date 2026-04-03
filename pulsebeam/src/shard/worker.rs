@@ -13,7 +13,7 @@ use tracing::Level;
 
 use crate::{
     entity::ParticipantId,
-    participant::{ParticipantConfig, ParticipantCore, ParticipantEvents},
+    participant::{ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents},
     shard::demux::Demuxer,
     track::{StreamId, TrackMeta},
 };
@@ -82,7 +82,6 @@ impl ShardWorker {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
         let mut events = ParticipantEvents::default();
-        let mut dirty = VecDeque::new();
         let mut shard_events = VecDeque::new();
 
         loop {
@@ -100,9 +99,7 @@ impl ShardWorker {
                 _ = wait => {}
                 Ok(_res) = self.udp_socket.readable() => { }
                 Some(cmd) = self.command_rx.recv() => {
-                    // TODO: hack
-                    let now = Instant::now();
-                    self.on_command(now, cmd, &mut events, &mut dirty);
+                    self.on_command(cmd);
                 }
                 else => break,
             }
@@ -118,8 +115,7 @@ impl ShardWorker {
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue; // already removed
                 };
-                participant.on_timeout(now, &mut events);
-                dirty.push_back(participant_id);
+                participant.on_timeout(now);
             }
 
             let count = self
@@ -135,49 +131,45 @@ impl ShardWorker {
                     continue;
                 };
 
-                participant.on_ingress(batch, now, &mut events);
-                dirty.push_back(participant_id);
+                participant.on_ingress(batch);
             }
 
-            while let Some(stream_id) = events.published_rtp.pop_front() {
-                let Some(route) = self.routing.get(&stream_id) else {
-                    continue;
-                };
+            while let Some(event) = events.pop_front() {
+                match event {
+                    ParticipantEvent::PublishedRtp(stream_id) => {
+                        let Some(route) = self.routing.get(&stream_id) else {
+                            continue;
+                        };
 
-                for participant_id in &route.subscibers {
-                    let Some(sub) = self.participants.get_mut(participant_id) else {
-                        continue;
-                    };
+                        for participant_id in &route.subscibers {
+                            let Some(sub) = self.participants.get_mut(participant_id) else {
+                                continue;
+                            };
 
-                    sub.on_forward_rtp(&stream_id, &mut events);
-                    dirty.push_back(*participant_id);
+                            sub.on_forward_rtp(&stream_id);
+                        }
+                    }
+                    ParticipantEvent::NewDeadline(entry) => {
+                        timer_wheel.push(Reverse(entry));
+                    }
+                    ParticipantEvent::PublishedTrack(track) => {
+                        shard_events.push_back(ShardEvent::TrackPublished(track.meta));
+                    }
+                    ParticipantEvent::Exited(participant_id) => {
+                        self.remove_participant(&participant_id);
+                        shard_events.push_back(ShardEvent::ParticipantExited(participant_id));
+                    }
                 }
             }
 
-            while let Some(entry) = events.next_deadlines.pop_front() {
-                timer_wheel.push(Reverse(entry));
-            }
-
-            while let Some(participant_id) = events.exited.pop_front() {
-                self.remove_participant(&participant_id);
-                shard_events.push_back(ShardEvent::ParticipantExited(participant_id));
-            }
-
-            while let Some(participant_id) = dirty.pop_front() {
-                let Some(participant) = self.participants.get_mut(&participant_id) else {
-                    continue;
-                };
-
+            // TODO: only polls certain participants
+            for participant in self.participants.values_mut() {
+                tracing::info!("polling: {}", participant.participant_id);
+                participant.poll(now, &mut events);
                 participant.udp_batcher.flush(&self.udp_socket);
                 // TODO: TCP
             }
 
-            // Control plane events
-            while let Some(track) = events.published_tracks.pop_front() {
-                self.event_tx
-                    .send(ShardEvent::TrackPublished(track.meta.clone()))
-                    .await;
-            }
             while let Some(event) = shard_events.pop_front() {
                 self.event_tx.send(event).await;
             }
@@ -185,20 +177,11 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn on_command(
-        &mut self,
-        now: Instant,
-        cmd: ShardCommand,
-        events: &mut ParticipantEvents,
-        dirty: &mut VecDeque<ParticipantId>,
-    ) -> Option<()> {
+    fn on_command(&mut self, cmd: ShardCommand) -> Option<()> {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
                 let participant_id = cfg.participant_id;
                 self.add_participant(participant_id, cfg);
-
-                let p = self.participants.get_mut(&participant_id)?;
-                p.on_timeout(now, events);
             }
         }
         Some(())

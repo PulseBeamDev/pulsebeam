@@ -10,7 +10,7 @@ SIM := sim
 all: build
 
 dev:
-	$(CARGO_CMD) run -p pulsebeam -- --dev
+	$(CARGO_CMD) run -p pulsebeam --features deep-metrics -- --dev
 
 build:
 	$(CARGO_CMD) build

@@ -3,7 +3,7 @@ use ahash::{HashMap, HashMapExt};
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
-use pulsebeam_runtime::net::{self, Transport};
+use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -28,13 +28,14 @@ use crate::track::{self, StreamId, TrackReceiver};
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Default)]
-pub struct ParticipantEvents {
-    pub published_tracks: VecDeque<TrackReceiver>,
-    pub published_rtp: VecDeque<StreamId>,
-    pub next_deadlines: VecDeque<(Instant, ParticipantId)>,
-    pub exited: VecDeque<ParticipantId>,
+pub enum ParticipantEvent {
+    PublishedTrack(TrackReceiver),
+    PublishedRtp(StreamId),
+    NewDeadline((Instant, ParticipantId)),
+    Exited(ParticipantId),
 }
+
+pub type ParticipantEvents = VecDeque<ParticipantEvent>;
 
 pub struct TrackMapping {
     pub mid: Mid,
@@ -77,6 +78,7 @@ pub struct ParticipantCore {
     /// Eliminates per-packet `rtc.media()` + `stream_tx_by_mid()` lookups.
     slot_meta: HashMap<Mid, (Pt, Ssrc)>,
     last_deadline: Option<Instant>,
+    pending_ingress: VecDeque<RecvPacketBatch>,
 
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
@@ -114,6 +116,7 @@ impl ParticipantCore {
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
         Self {
+            pending_ingress: VecDeque::new(),
             last_deadline: None,
             participant_id: cfg.participant_id,
             rtc,
@@ -147,50 +150,12 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    pub fn on_ingress(
-        &mut self,
-        batch: net::RecvPacketBatch,
-        now: Instant,
-        events: &mut ParticipantEvents,
-    ) {
-        self.handle_udp_packet_batch(batch, now, events)
+    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
+        self.pending_ingress.push_back(batch);
     }
 
-    pub fn handle_udp_packet_batch(
-        &mut self,
-        batch: net::RecvPacketBatch,
-        now: Instant,
-        events: &mut ParticipantEvents,
-    ) {
-        let transport = match batch.transport {
-            Transport::Udp(_) => str0m::net::Protocol::Udp,
-            Transport::Tcp => str0m::net::Protocol::Tcp,
-        };
-
-        for pkt in batch.into_iter() {
-            if let Ok(contents) = (*pkt).try_into() {
-                let recv = str0m::net::Receive {
-                    proto: transport,
-                    source: batch.src,
-                    destination: batch.dst,
-                    contents,
-                };
-                if self
-                    .rtc
-                    .handle_input(Input::Receive(now.into(), recv))
-                    .is_ok()
-                {
-                    self.poll(now, events);
-                }
-            } else {
-                tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
-            }
-        }
-    }
-
-    pub fn on_timeout(&mut self, now: Instant, events: &mut ParticipantEvents) {
+    pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.rtc.handle_input(Input::Timeout(now.into()));
-        self.poll(now, events);
     }
 
     pub fn handle_tick(&mut self) {
@@ -233,10 +198,10 @@ impl ParticipantCore {
 
         if let Some(next_deadline) = next_deadline {
             if next_deadline > last_deadline {
-                events.next_deadlines.push_back((now, self.participant_id));
+                events.push_back(ParticipantEvent::NewDeadline((now, self.participant_id)));
             }
         } else {
-            events.exited.push_back(self.participant_id);
+            events.push_back(ParticipantEvent::Exited(self.participant_id));
         }
         self.last_deadline = next_deadline;
     }
@@ -251,7 +216,36 @@ impl ParticipantCore {
             self.last_slow_poll = now;
         }
 
-        let _next_deadline = loop {
+        while let Some(batch) = self.pending_ingress.pop_front() {
+            let transport = match batch.transport {
+                Transport::Udp(_) => str0m::net::Protocol::Udp,
+                Transport::Tcp => str0m::net::Protocol::Tcp,
+            };
+
+            for pkt in batch.into_iter() {
+                if let Ok(contents) = (*pkt).try_into() {
+                    let recv = str0m::net::Receive {
+                        proto: transport,
+                        source: batch.src,
+                        destination: batch.dst,
+                        contents,
+                    };
+                    if self
+                        .rtc
+                        .handle_input(Input::Receive(now.into(), recv))
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    self.poll_rtc(events)?;
+                } else {
+                    tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
+                }
+            }
+        }
+
+        loop {
             let rtc_deadline = self.poll_rtc(events)?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
@@ -270,7 +264,7 @@ impl ParticipantCore {
 
             // No new work generated. We are synced. Return the RTC deadline.
             return Some(rtc_deadline.min(next_slow_poll));
-        };
+        }
     }
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
@@ -345,7 +339,7 @@ impl ParticipantCore {
         result
     }
 
-    pub fn on_forward_rtp(&mut self, _stream_id: &StreamId, _events: &mut ParticipantEvents) {
+    pub fn on_forward_rtp(&mut self, _stream_id: &StreamId) {
         // TODO: filter simulcast switching
 
         todo!();
@@ -444,7 +438,7 @@ impl ParticipantCore {
                 if !accepted {
                     self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                 }
-                events.published_tracks.push_back(rx);
+                events.push_back(ParticipantEvent::PublishedTrack(rx));
             }
             Direction::SendOnly => {
                 self.downstream.add_slot(media.mid, media.kind);
