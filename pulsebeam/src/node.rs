@@ -138,14 +138,14 @@ impl NodeBuilder {
         let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
         let mut shard_handles = Vec::new();
         let mut shard_command_txs = Vec::new();
-        for sock in udp_sockets {
+        for (shard_id, sock) in udp_sockets.into_iter().enumerate() {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
-            let handle = std::thread::spawn(|| {
+            let handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .build_local(LocalOptions::default())
                     .unwrap();
-                let shard = ShardWorker::new(sock, shard_command_rx, shard_event_tx);
+                let shard = ShardWorker::new(shard_id, sock, shard_command_rx, shard_event_tx);
                 rt.block_on(shard.run());
             });
             shard_handles.push(handle);

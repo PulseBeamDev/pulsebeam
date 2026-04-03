@@ -9,6 +9,7 @@ use pulsebeam_runtime::{
     net::{self, UnifiedSocket},
 };
 use tokio::time::Instant;
+use tracing::Level;
 
 use crate::{
     entity::ParticipantId,
@@ -39,6 +40,7 @@ pub enum ShardEvent {
 }
 
 pub struct ShardWorker {
+    shard_id: usize,
     demuxer: Demuxer,
     participants: HashMap<ParticipantId, ParticipantCore>,
     routing: HashMap<StreamId, Routing>,
@@ -51,11 +53,15 @@ pub struct ShardWorker {
 
 impl ShardWorker {
     pub fn new(
+        shard_id: usize,
         udp_socket: UnifiedSocket,
         command_rx: mailbox::Receiver<ShardCommand>,
         event_tx: mailbox::Sender<ShardEvent>,
     ) -> Self {
+        let span = tracing::span!(Level::INFO, "shard_worker", shard_id = shard_id);
+
         Self {
+            shard_id,
             demuxer: Demuxer::default(),
             participants: HashMap::default(),
             routing: HashMap::default(),
@@ -67,6 +73,7 @@ impl ShardWorker {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(shard_id = self.shard_id))]
     pub async fn run(mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel = BinaryHeap::new();
@@ -185,6 +192,7 @@ impl ShardWorker {
         self.demuxer
             .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
         self.participants.insert(participant_id, participant);
+        tracing::info!(%participant_id, "participant added to shard");
     }
 
     fn remove_participant(&mut self, participantid: &ParticipantId) -> Option<ParticipantCore> {

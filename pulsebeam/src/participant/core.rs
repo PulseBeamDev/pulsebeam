@@ -145,12 +145,14 @@ impl ParticipantCore {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
     pub fn on_ingress(
         &mut self,
         batch: net::RecvPacketBatch,
         now: Instant,
         events: &mut ParticipantEvents,
     ) {
+        tracing::info!("got a packet");
         self.handle_udp_packet_batch(batch, now, events)
     }
 
