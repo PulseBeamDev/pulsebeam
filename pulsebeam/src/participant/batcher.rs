@@ -82,7 +82,6 @@ impl Batcher {
             });
             match res {
                 Ok(true) => {
-                    tracing::info!("flushed buf to {}", state.dst);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }

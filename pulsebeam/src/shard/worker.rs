@@ -30,6 +30,7 @@ type TimerEntry = Reverse<(Instant, ParticipantId)>;
 #[derive(Debug)]
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
+    PublishTrack(Vec<ParticipantId>),
 }
 
 #[derive(Debug)]
@@ -200,6 +201,9 @@ impl ShardWorker {
                 self.add_participant(participant_id, cfg);
                 // Mark dirty so the initial DTLS/ICE output is flushed this tick.
                 dirty.insert(participant_id);
+            }
+            ShardCommand::PublishTrack(participants) => {
+                // TODO:
             }
         }
     }

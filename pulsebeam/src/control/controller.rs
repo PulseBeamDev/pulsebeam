@@ -6,6 +6,7 @@ use crate::{
     participant::ParticipantConfig,
     shard::worker::{ShardCommand, ShardEvent},
 };
+use indexmap::IndexMap;
 use pulsebeam_runtime::mailbox;
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
@@ -185,7 +186,7 @@ impl ControllerActor {
                 biased;
 
                 Some(event) = shard_event_rx.recv() => {
-                    self.on_shard_event(event);
+                    self.on_shard_event(event).await;
                 }
 
                 Some(command) = command_rx.recv() => {
@@ -197,14 +198,27 @@ impl ControllerActor {
         }
     }
 
-    fn on_shard_event(&mut self, event: ShardEvent) -> Option<()> {
+    async fn on_shard_event(&mut self, event: ShardEvent) -> Option<()> {
         match event {
             ShardEvent::TrackPublished(track) => {
                 let meta = self.participants.get(&track.origin_participant)?;
                 let room = self.rooms.get_mut(&meta.room_id)?;
 
                 room.publish_track(track);
-                todo!("broadcast track to all participants in the room");
+                let mut shards: IndexMap<usize, Vec<ParticipantId>> = IndexMap::new();
+                for participant_id in room.participants_iter() {
+                    let Some(p) = self.participants.get(participant_id) else {
+                        continue;
+                    };
+
+                    let entry = shards.entry(p.shard_id).or_default();
+                    entry.push(*participant_id);
+                }
+                for (shard_id, participants) in shards {
+                    self.router
+                        .send(shard_id, ShardCommand::PublishTrack(participants))
+                        .await;
+                }
             }
 
             ShardEvent::ParticipantExited(participant_id) => {

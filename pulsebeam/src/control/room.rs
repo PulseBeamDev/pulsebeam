@@ -1,20 +1,22 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use crate::track::TrackMeta;
+use indexmap::IndexMap;
+
 use crate::entity::{ParticipantId, RoomId};
+use crate::track::TrackMeta;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Room {
     room_id: RoomId,
-    participants: BTreeMap<ParticipantId, Vec<TrackMeta>>,
+    participants: IndexMap<ParticipantId, Vec<TrackMeta>>,
 }
 
 impl Room {
     pub fn new(room_id: RoomId) -> Self {
         Self {
             room_id,
-            participants: BTreeMap::new(),
+            participants: IndexMap::new(),
         }
     }
 
@@ -35,6 +37,10 @@ impl Room {
         if !tracks.iter().any(|t| t.id == track.id) {
             tracks.push(track);
         }
+    }
+
+    pub fn participants_iter(&self) -> impl Iterator<Item = &ParticipantId> {
+        self.participants.keys()
     }
 
     pub fn participant_count(&self) -> usize {

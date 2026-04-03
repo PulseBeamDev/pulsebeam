@@ -151,7 +151,6 @@ impl ParticipantCore {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
     pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
         self.pending_ingress.push_back(batch);
     }
