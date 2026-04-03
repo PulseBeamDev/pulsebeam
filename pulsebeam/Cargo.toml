@@ -24,6 +24,7 @@ futures-concurrency = "7.7.1"
 futures-lite = { workspace = true }
 futures-util = "0.3.32"
 hyper = "1.7.0"
+indexmap = "2.13.1"
 metrics = "0.24.3"
 metrics-exporter-prometheus = "0.18.1"
 mimalloc = { version = "0.1.48", features = ["v3"] }

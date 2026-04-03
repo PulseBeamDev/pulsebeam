@@ -1,15 +1,12 @@
-use std::{
-    cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, VecDeque},
-};
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 use ahash::HashMap;
+use indexmap::IndexSet;
 use pulsebeam_runtime::{
     mailbox,
     net::{self, UnifiedSocket},
 };
 use tokio::time::Instant;
-use tracing::Level;
 
 use crate::{
     entity::ParticipantId,
@@ -25,7 +22,7 @@ pub enum ShardError {
 }
 
 struct Routing {
-    subscibers: BTreeSet<ParticipantId>,
+    subscribers: IndexSet<ParticipantId>,
 }
 
 type TimerEntry = Reverse<(Instant, ParticipantId)>;
@@ -35,6 +32,7 @@ pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
 }
 
+#[derive(Debug)]
 pub enum ShardEvent {
     TrackPublished(TrackMeta),
     ParticipantExited(ParticipantId),
@@ -64,9 +62,7 @@ impl ShardWorker {
             demuxer: Demuxer::default(),
             participants: HashMap::default(),
             routing: HashMap::default(),
-
             udp_socket,
-
             command_rx,
             event_tx,
         }
@@ -80,26 +76,26 @@ impl ShardWorker {
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
-        let mut timer_wheel = BinaryHeap::new();
+        let mut timer_wheel: BinaryHeap<TimerEntry> = BinaryHeap::new();
+        let mut dirty: IndexSet<ParticipantId> = IndexSet::default();
         let mut events = ParticipantEvents::default();
-        let mut shard_events = VecDeque::new();
 
         loop {
-            let wait = async {
-                if let Some(Reverse((deadline, _))) = timer_wheel.peek() {
-                    tokio::time::sleep_until(*deadline).await;
-                } else {
+            let next_deadline = timer_wheel.peek().map(|Reverse((t, _))| *t);
+            let wait = async move {
+                match next_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
                     // No pending timers: park forever until socket wakes us.
-                    std::future::pending::<()>().await;
+                    None => std::future::pending::<()>().await,
                 }
             };
 
             tokio::select! {
                 biased;
                 _ = wait => {}
-                Ok(_res) = self.udp_socket.readable() => { }
+                Ok(_res) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
-                    self.on_command(cmd);
+                    self.on_command(cmd, &mut dirty);
                 }
                 else => break,
             }
@@ -116,6 +112,7 @@ impl ShardWorker {
                     continue; // already removed
                 };
                 participant.on_timeout(now);
+                dirty.insert(participant_id);
             }
 
             let count = self
@@ -126,14 +123,23 @@ impl ShardWorker {
                 let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;
                 };
-
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
-
                 participant.on_ingress(batch);
+                dirty.insert(participant_id);
             }
 
+            // Poll only participants touched this tick, collect their events.
+            for &participant_id in &dirty {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
+                    continue;
+                };
+                participant.poll(now, &mut events);
+            }
+
+            // Drain all events produced this tick before flushing egress,
+            // so RTP forwards from this tick are batched into the same flush.
             while let Some(event) = events.pop_front() {
                 match event {
                     ParticipantEvent::PublishedRtp(stream_id) => {
@@ -141,50 +147,61 @@ impl ShardWorker {
                             continue;
                         };
 
-                        for participant_id in &route.subscibers {
-                            let Some(sub) = self.participants.get_mut(participant_id) else {
+                        for participant_id in &route.subscribers {
+                            let Some(sub) = self.participants.get_mut(&participant_id) else {
                                 continue;
                             };
-
                             sub.on_forward_rtp(&stream_id);
+                            dirty.insert(*participant_id);
                         }
                     }
                     ParticipantEvent::NewDeadline(entry) => {
                         timer_wheel.push(Reverse(entry));
                     }
                     ParticipantEvent::PublishedTrack(track) => {
-                        shard_events.push_back(ShardEvent::TrackPublished(track.meta));
+                        if let Err(e) = self
+                            .event_tx
+                            .try_send(ShardEvent::TrackPublished(track.meta))
+                        {
+                            tracing::warn!("event_tx full, dropping TrackPublished: {e:?}");
+                        }
                     }
                     ParticipantEvent::Exited(participant_id) => {
                         self.remove_participant(&participant_id);
-                        shard_events.push_back(ShardEvent::ParticipantExited(participant_id));
+                        dirty.swap_remove(&participant_id);
+                        if let Err(e) = self
+                            .event_tx
+                            .try_send(ShardEvent::ParticipantExited(participant_id))
+                        {
+                            tracing::warn!("event_tx full, dropping ParticipantExited: {e:?}");
+                        }
                     }
                 }
             }
 
-            // TODO: only polls certain participants
-            for participant in self.participants.values_mut() {
-                tracing::info!("polling: {}", participant.participant_id);
-                participant.poll(now, &mut events);
+            // Flush egress for all dirty participants in one pass.
+            // Exited participants were swap_removed above so this is safe.
+            for participant_id in dirty.drain(..) {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
+                    continue;
+                };
                 participant.udp_batcher.flush(&self.udp_socket);
                 // TODO: TCP
             }
-
-            while let Some(event) = shard_events.pop_front() {
-                self.event_tx.send(event).await;
-            }
         }
+
         Ok(())
     }
 
-    fn on_command(&mut self, cmd: ShardCommand) -> Option<()> {
+    fn on_command(&mut self, cmd: ShardCommand, dirty: &mut IndexSet<ParticipantId>) {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
                 let participant_id = cfg.participant_id;
                 self.add_participant(participant_id, cfg);
+                // Mark dirty so the initial DTLS/ICE output is flushed this tick.
+                dirty.insert(participant_id);
             }
         }
-        Some(())
     }
 
     fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
@@ -199,8 +216,8 @@ impl ShardWorker {
         tracing::info!(%participant_id, "participant added to shard");
     }
 
-    fn remove_participant(&mut self, participantid: &ParticipantId) -> Option<ParticipantCore> {
-        let mut participant = self.participants.remove(participantid)?;
+    fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ParticipantCore> {
+        let mut participant = self.participants.remove(participant_id)?;
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
             self.udp_socket.close_peer(addr);
