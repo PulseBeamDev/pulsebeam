@@ -11,12 +11,6 @@ pub struct Batcher {
     free_states: Vec<BatcherState>,
 }
 
-impl Default for Batcher {
-    fn default() -> Self {
-        Self::with_capacity(MAX_GSO_SEGMENTS)
-    }
-}
-
 impl Batcher {
     /// Creates a new `Batcher` where each internal buffer has the specified capacity.
     pub fn with_capacity(cap: usize) -> Self {
@@ -88,6 +82,7 @@ impl Batcher {
             });
             match res {
                 Ok(true) => {
+                    tracing::info!("flushed buf to {}", state.dst);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }

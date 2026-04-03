@@ -89,7 +89,7 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
-    pub fn new(cfg: ParticipantConfig) -> Self {
+    pub fn new(cfg: ParticipantConfig, udp_gso_size: usize, tcp_gso_size: usize) -> Self {
         let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {
@@ -110,8 +110,8 @@ impl ParticipantCore {
             });
         }
 
-        let udp_batcher = Batcher::default();
-        let tcp_batcher = Batcher::default();
+        let udp_batcher = Batcher::with_capacity(udp_gso_size);
+        let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
         Self {
             last_deadline: None,
@@ -188,8 +188,9 @@ impl ParticipantCore {
         }
     }
 
-    pub fn on_timeout(&mut self, _now: Instant) {
-        let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
+    pub fn on_timeout(&mut self, now: Instant, events: &mut ParticipantEvents) {
+        let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+        self.poll(now, events);
     }
 
     pub fn handle_tick(&mut self) {

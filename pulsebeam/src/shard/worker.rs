@@ -100,8 +100,9 @@ impl ShardWorker {
                 _ = wait => {}
                 Ok(_res) = self.udp_socket.readable() => { }
                 Some(cmd) = self.command_rx.recv() => {
-                    self.on_command(cmd);
-                    continue;
+                    // TODO: hack
+                    let now = Instant::now();
+                    self.on_command(now, cmd, &mut events, &mut dirty);
                 }
                 else => break,
             }
@@ -117,7 +118,7 @@ impl ShardWorker {
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue; // already removed
                 };
-                participant.on_timeout(now);
+                participant.on_timeout(now, &mut events);
                 dirty.push_back(participant_id);
             }
 
@@ -184,17 +185,31 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn on_command(&mut self, cmd: ShardCommand) {
+    fn on_command(
+        &mut self,
+        now: Instant,
+        cmd: ShardCommand,
+        events: &mut ParticipantEvents,
+        dirty: &mut VecDeque<ParticipantId>,
+    ) -> Option<()> {
         match cmd {
-            ShardCommand::AddParticipant(cfg) => self.add_participant(cfg.participant_id, cfg),
+            ShardCommand::AddParticipant(cfg) => {
+                let participant_id = cfg.participant_id;
+                self.add_participant(participant_id, cfg);
+
+                let p = self.participants.get_mut(&participant_id)?;
+                p.on_timeout(now, events);
+            }
         }
+        Some(())
     }
 
     fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
         // TODO: handle replacing participants
         self.remove_participant(&participant_id);
 
-        let mut participant = ParticipantCore::new(cfg);
+        // TODO: update tcp gso size
+        let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1);
         self.demuxer
             .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
         self.participants.insert(participant_id, participant);
