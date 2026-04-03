@@ -1,11 +1,15 @@
+use arrayvec::ArrayString;
 use derive_more::{AsRef, Display};
-use pulsebeam_runtime::sync::Arc;
 use sha3::{Digest, Sha3_256};
 use std::hash::Hasher;
 use std::{fmt, str::FromStr};
 use str0m::media::MediaKind;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+// rm_ prefix (3) + base32 of 16 bytes (26 chars) = 29 chars, 36 is safe headroom
+const MAX_INTERNAL_ROOM_ID_LEN: usize = 36;
+const MAX_EXTERNAL_ROOM_ID_LEN: usize = 36;
 
 pub type EntityId = String;
 
@@ -47,8 +51,8 @@ fn encode_with_prefix(prefix: &str, bytes: &[u8]) -> EntityId {
 }
 
 fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdValidationError> {
-    if value.len() > MAX_INTERNAL_ID_LEN {
-        return Err(IdValidationError::TooLong(MAX_INTERNAL_ID_LEN));
+    if value.len() > MAX_INTERNAL_ROOM_ID_LEN {
+        return Err(IdValidationError::TooLong(MAX_INTERNAL_ROOM_ID_LEN));
     }
     let Some((prefix, encoded)) = value.split_once('_') else {
         return Err(IdValidationError::InvalidEncoding);
@@ -71,8 +75,8 @@ pub fn validate_external_string(s: &str) -> Result<(), IdValidationError> {
     if s.is_empty() {
         return Err(IdValidationError::Empty);
     }
-    if s.len() > MAX_EXTERNAL_ID_LEN {
-        return Err(IdValidationError::TooLong(MAX_EXTERNAL_ID_LEN));
+    if s.len() > MAX_EXTERNAL_ROOM_ID_LEN {
+        return Err(IdValidationError::TooLong(MAX_EXTERNAL_ROOM_ID_LEN));
     }
     if !s
         .chars()
@@ -86,38 +90,47 @@ pub fn validate_external_string(s: &str) -> Result<(), IdValidationError> {
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, Display, AsRef, serde::Serialize, serde::Deserialize,
 )]
-#[serde(try_from = "String")]
+#[serde(try_from = "&str")]
 #[as_ref(forward)]
-pub struct ExternalRoomId(String);
+pub struct ExternalRoomId(ArrayString<MAX_EXTERNAL_ROOM_ID_LEN>);
 
 impl ExternalRoomId {
-    pub fn new(id: String) -> Result<Self, IdValidationError> {
-        validate_external_string(&id)?;
-        Ok(Self(id))
+    pub fn new(id: &str) -> Result<Self, IdValidationError> {
+        validate_external_string(id)?;
+        Ok(Self(ArrayString::from(id).unwrap()))
     }
+
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl FromStr for ExternalRoomId {
     type Err = IdValidationError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(s.to_string())
+        Self::new(s)
     }
 }
 
-impl TryFrom<String> for ExternalRoomId {
+impl TryFrom<&str> for ExternalRoomId {
     type Error = IdValidationError;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
         Self::new(value)
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+// Keep TryFrom<String> for call sites that already have an owned String
+impl TryFrom<String> for ExternalRoomId {
+    type Error = IdValidationError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RoomId {
     external: ExternalRoomId,
-    internal: Arc<EntityId>,
+    internal: ArrayString<MAX_INTERNAL_ROOM_ID_LEN>,
 }
 
 impl RoomId {
@@ -125,41 +138,34 @@ impl RoomId {
         let mut hasher = Sha3_256::default();
         hasher.update(external.as_str().as_bytes());
         let full_hash = hasher.finalize();
-        // Use hash bytes to form the ID
-        let internal = encode_with_prefix(prefix::ROOM_ID, &full_hash[..HASH_OUTPUT_BYTES]);
-
+        let s = encode_with_prefix(prefix::ROOM_ID, &full_hash[..HASH_OUTPUT_BYTES]);
         Self {
             external,
-            internal: Arc::new(internal),
+            internal: ArrayString::from(&s).unwrap(),
         }
     }
 
     pub fn external(&self) -> &ExternalRoomId {
         &self.external
     }
-    pub fn internal(&self) -> &str {
-        &self.internal
-    }
-}
 
-impl std::hash::Hash for RoomId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.external.hash(state);
+    /// Stable opaque key for DB storage, routing tables, etc.
+    pub fn internal(&self) -> &str {
+        self.internal.as_str()
     }
 }
 
 impl FromStr for RoomId {
     type Err = IdValidationError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let external = ExternalRoomId::from_str(s)?;
-        Ok(Self::from_external(external))
+        ExternalRoomId::from_str(s).map(Self::from_external)
     }
 }
 
 impl TryFrom<String> for RoomId {
     type Error = IdValidationError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::from_str(&value)
+        ExternalRoomId::try_from(value).map(Self::from_external)
     }
 }
 
@@ -177,20 +183,24 @@ impl<'de> serde::Deserialize<'de> for RoomId {
     where
         D: serde::Deserializer<'de>,
     {
-        let external = ExternalRoomId::deserialize(deserializer)?;
-        Ok(Self::from_external(external))
+        ExternalRoomId::deserialize(deserializer).map(Self::from_external)
     }
 }
 
+// Display shows external — human readable in logs/errors
 impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.internal, f)
+        fmt::Display::fmt(&self.external, f)
     }
 }
 
+// Debug shows both so you can see the mapping during development
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.internal, f)
+        f.debug_struct("RoomId")
+            .field("external", &self.external.as_str())
+            .field("internal", &self.internal.as_str())
+            .finish()
     }
 }
 
@@ -491,16 +501,16 @@ mod tests {
 
     #[test]
     fn external_room_id_too_long() {
-        let too_long = "a".repeat(MAX_EXTERNAL_ID_LEN + 1);
+        let too_long = "a".repeat(MAX_EXTERNAL_ROOM_ID_LEN + 1);
         assert_eq!(
             ExternalRoomId::new(too_long).unwrap_err(),
-            IdValidationError::TooLong(MAX_EXTERNAL_ID_LEN)
+            IdValidationError::TooLong(MAX_EXTERNAL_ROOM_ID_LEN)
         );
     }
 
     #[test]
     fn external_room_id_max_length_accepted() {
-        assert!(ExternalRoomId::new("a".repeat(MAX_EXTERNAL_ID_LEN)).is_ok());
+        assert!(ExternalRoomId::new("a".repeat(MAX_EXTERNAL_ROOM_ID_LEN)).is_ok());
     }
 
     #[test]
@@ -552,7 +562,7 @@ mod tests {
     fn participant_id_too_long() {
         // Base58 of 16 bytes is approx 22 chars.
         // 36 chars is way more than enough for valid IDs, so we check stricter length or garbage
-        let too_long = format!("pa_{}", "a".repeat(MAX_INTERNAL_ID_LEN));
+        let too_long = format!("pa_{}", "a".repeat(MAX_INTERNAL_ROOM_ID_LEN));
         assert!(matches!(
             ParticipantId::from_str(&too_long).unwrap_err(),
             IdValidationError::TooLong(_) | IdValidationError::InvalidEncoding

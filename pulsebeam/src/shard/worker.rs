@@ -35,6 +35,7 @@ pub enum ShardCommand {
 
 pub enum ShardEvent {
     TrackPublished(TrackMeta),
+    ParticipantExited(ParticipantId),
 }
 
 pub struct ShardWorker {
@@ -71,6 +72,7 @@ impl ShardWorker {
         let mut timer_wheel = BinaryHeap::new();
         let mut events = ParticipantEvents::default();
         let mut dirty = VecDeque::new();
+        let mut shard_events = VecDeque::new();
 
         loop {
             let wait = async {
@@ -85,8 +87,14 @@ impl ShardWorker {
             tokio::select! {
                 biased;
                 _ = wait => {}
-                res = self.udp_socket.readable() => { res?; }
+                Ok(_res) = self.udp_socket.readable() => { }
+                Some(cmd) = self.command_rx.recv() => {
+                    self.on_command(cmd);
+                    continue;
+                }
+                else => break,
             }
+
             let now = Instant::now();
 
             while let Some(Reverse((deadline, participant_id))) = timer_wheel.peek().copied() {
@@ -136,7 +144,8 @@ impl ShardWorker {
             }
 
             while let Some(participant_id) = events.exited.pop_front() {
-                self.remove_participant(participant_id);
+                self.remove_participant(&participant_id);
+                shard_events.push_back(ShardEvent::ParticipantExited(participant_id));
             }
 
             while let Some(participant_id) = dirty.pop_front() {
@@ -151,22 +160,39 @@ impl ShardWorker {
             // Control plane events
             while let Some(track) = events.published_tracks.pop_front() {
                 self.event_tx
-                    .send(ShardEvent::TrackPublished(track.meta.clone()));
+                    .send(ShardEvent::TrackPublished(track.meta.clone()))
+                    .await;
             }
+            while let Some(event) = shard_events.pop_front() {
+                self.event_tx.send(event).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn on_command(&mut self, cmd: ShardCommand) {
+        match cmd {
+            ShardCommand::AddParticipant(cfg) => self.add_participant(cfg.participant_id, cfg),
         }
     }
 
-    fn add_participant(&mut self, _participant_id: ParticipantId) {
-        todo!();
+    fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
+        // TODO: handle replacing participants
+        self.remove_participant(&participant_id);
+
+        let mut participant = ParticipantCore::new(cfg);
+        self.demuxer
+            .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
+        self.participants.insert(participant_id, participant);
     }
 
-    fn remove_participant(&mut self, participantid: ParticipantId) -> Option<ParticipantCore> {
-        let mut participant = self.participants.remove(&participantid)?;
+    fn remove_participant(&mut self, participantid: &ParticipantId) -> Option<ParticipantCore> {
+        let mut participant = self.participants.remove(participantid)?;
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
             self.udp_socket.close_peer(addr);
         }
-        todo!();
         Some(participant)
     }
 }

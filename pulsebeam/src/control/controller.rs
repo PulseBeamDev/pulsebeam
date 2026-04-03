@@ -206,6 +206,10 @@ impl ControllerActor {
                 room.publish_track(track);
                 todo!("broadcast track to all participants in the room");
             }
+
+            ShardEvent::ParticipantExited(participant_id) => {
+                self.delete_participant(&participant_id);
+            }
         }
 
         Some(())
@@ -222,7 +226,7 @@ impl ControllerActor {
             }
 
             ControllerCommand::DeleteParticipant(m) => {
-                self.delete_participant(&m.room_id, &m.participant_id);
+                self.delete_participant(&m.participant_id);
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
@@ -283,9 +287,11 @@ impl ControllerActor {
         Ok(answer)
     }
 
-    pub fn delete_participant(&mut self, room_id: &RoomId, participant_id: &ParticipantId) {
-        if let Some(room) = self.rooms.get_mut(room_id) {
-            // if the room has exited, the participants have already cleaned up too.
+    fn delete_participant(&mut self, participant_id: &ParticipantId) {
+        let Some(meta) = self.participants.remove(participant_id) else {
+            return;
+        };
+        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
             room.remove_participant(participant_id);
         }
     }
