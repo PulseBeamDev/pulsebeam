@@ -1,15 +1,15 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use indexmap::IndexMap;
 
 use crate::entity::{ParticipantId, RoomId};
-use crate::track::TrackMeta;
+use crate::track::Track;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Room {
     room_id: RoomId,
-    participants: IndexMap<ParticipantId, Vec<TrackMeta>>,
+    participants: IndexMap<ParticipantId, Vec<Track>>,
 }
 
 impl Room {
@@ -25,16 +25,16 @@ impl Room {
     }
 
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) {
-        self.participants.remove(participant_id);
+        self.participants.swap_remove(participant_id);
     }
 
-    pub fn publish_track(&mut self, track: TrackMeta) {
+    pub fn publish_track(&mut self, track: Track) {
         let tracks = self
             .participants
-            .entry(track.origin_participant)
+            .entry(track.meta.origin_participant)
             .or_default();
 
-        if !tracks.iter().any(|t| t.id == track.id) {
+        if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
             tracks.push(track);
         }
     }

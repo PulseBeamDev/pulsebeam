@@ -4,7 +4,6 @@ pub mod switcher;
 pub mod sync;
 pub mod timeline;
 
-use std::rc::Rc;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::rtcp::SenderInfo;
 use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
@@ -20,9 +19,7 @@ pub const POOL_CAPACITY: usize = 16_384;
 pub const POOL_PREFILL: usize = 8_192;
 
 /// No-op function for compatibility; does not return a pool.
-pub fn rtp_payload_pool() {
-    
-}
+pub fn rtp_payload_pool() {}
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
 /// TODO: get these clocks from SDP instead.
@@ -64,10 +61,7 @@ pub struct RtpPacket {
     /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Instant,
     pub is_keyframe_start: bool,
-    /// Shared, reference-counted payload buffer.
-    ///
-    /// Clone is cheap because this is an `Rc<Vec<u8>>`.
-    pub payload: Rc<[u8]>,
+    pub payload: Vec<u8>,
 }
 
 impl Default for RtpPacket {
@@ -82,7 +76,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe_start: false,
-            payload: Rc::new([0u8; 1200]), // 1.2KB payload for test realism
+            payload: vec![0u8; 1200], // 1.2KB payload for test realism
         }
     }
 }
@@ -112,7 +106,7 @@ impl RtpPacket {
             arrival_ts: rtp.timestamp.into(),
             playout_time: rtp.timestamp.into(),
             is_keyframe_start,
-            payload: Rc::from(rtp.payload),
+            payload: rtp.payload,
         };
         (pkt, sr)
     }

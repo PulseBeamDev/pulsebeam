@@ -1,4 +1,4 @@
-use pulsebeam_runtime::mailbox::{self, SendError};
+use pulsebeam_runtime::mailbox::{self};
 use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::shard::worker::ShardCommand;

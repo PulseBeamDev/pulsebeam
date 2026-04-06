@@ -2,9 +2,9 @@ use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 use crate::{
-    participant::{ParticipantEvent, ParticipantEvents},
+    entity::TrackId,
     rtp::RtpPacket,
-    track::TrackSender,
+    track::UpstreamTrack,
 };
 use str0m::media::{MediaKind, Mid};
 
@@ -12,7 +12,7 @@ const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
 
 struct UpstreamSlot {
     mid: Mid,
-    track: TrackSender,
+    track: UpstreamTrack,
 }
 
 impl PartialEq for UpstreamSlot {
@@ -35,7 +35,7 @@ impl UpstreamAllocator {
     }
 
     /// Adds a new locally published track that will receive RTP packets.
-    pub fn add_published_track(&mut self, mid: Mid, track: TrackSender) -> bool {
+    pub fn add_published_track(&mut self, mid: Mid, track: UpstreamTrack) -> bool {
         if self.published_tracks.iter().any(|s| s.mid == mid) {
             tracing::warn!("duplicated slot mid={}.", mid);
             return false;
@@ -83,7 +83,15 @@ impl UpstreamAllocator {
             slot.track.process(rid, rtp, sr)
         } else {
             tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
+            false
         }
+    }
+
+    pub fn track_id_for_mid(&self, mid: Mid) -> Option<TrackId> {
+        self.published_tracks
+            .iter()
+            .find(|t| t.mid == mid)
+            .map(|t| t.track.meta.id)
     }
 
     pub fn poll_slow(&mut self, now: Instant) {

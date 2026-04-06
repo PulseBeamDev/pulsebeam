@@ -18,20 +18,21 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::entity::{self, ParticipantId, TrackId};
-use crate::participant::downstream::Slot;
+use crate::participant::downstream::SlotConfig;
 use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
-use crate::track::{self, StreamId, TrackReceiver};
+use crate::shard::worker::Router;
+use crate::track::{self, StreamId, Track};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub enum ParticipantEvent {
-    PublishedTrack(TrackReceiver),
-    PublishedRtp(StreamId),
+    PublishedTrack(Track),
+    PublishedRtp(StreamId, RtpPacket),
     NewDeadline((Instant, ParticipantId)),
     Exited(ParticipantId),
 }
@@ -75,8 +76,6 @@ pub struct ParticipantCore {
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
-    /// (Pt, Ssrc) cached per downstream `Mid` at `MediaAdded(SendOnly)` time.
-    /// Eliminates per-packet `rtc.media()` + `stream_tx_by_mid()` lookups.
     slot_meta: HashMap<Mid, (Pt, Ssrc)>,
     first_poll: bool,
     pending_ingress: VecDeque<RecvPacketBatch>,
@@ -162,20 +161,19 @@ impl ParticipantCore {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }
 
-    pub fn handle_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
-        for track_handle in tracks.values() {
-            if track_handle.meta.origin_participant != self.participant_id {
-                self.downstream.add_track(track_handle.meta.clone());
-            }
-        }
+    pub fn handle_available_tracks(&mut self, _tracks: &HashMap<entity::TrackId, Track>) {
+        // for (meta, layers) in tracks.values() {
+        //     if meta.origin_participant != self.participant_id {
+        //         self.downstream
+        //             .add_video_track(meta.clone(), layers.clone());
+        //     }
+        // }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        // This is used to self-healing state drifting especially when a participant has just
-        // reconnected. The viewer won't get a notification, so we have to be proactive.
         self.signaling.reconcile(&mut self.downstream);
     }
 
-    pub fn remove_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
+    pub fn remove_available_tracks(&mut self, _tracks: &HashMap<entity::TrackId, Track>) {
         // for track in tracks.values() {
         //     self.downstream.remove_track(track);
         // }
@@ -188,10 +186,10 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents) {
-        let next_deadline = self.poll_until_deadline(now, events);
+    pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents, router: &mut Router) {
+        let next_deadline = self.poll_until_deadline(now, events, router);
 
-        if let Some(next_deadline) = next_deadline {
+        if let Some(_next_deadline) = next_deadline {
             events.push_back(ParticipantEvent::NewDeadline((now, self.participant_id)));
         } else {
             events.push_back(ParticipantEvent::Exited(self.participant_id));
@@ -202,6 +200,7 @@ impl ParticipantCore {
         &mut self,
         now: Instant,
         events: &mut ParticipantEvents,
+        router: &mut Router,
     ) -> Option<Instant> {
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
             self.poll_slow(now);
@@ -248,7 +247,8 @@ impl ParticipantCore {
 
             if self.downstream.dirty_allocation {
                 // Make sure rtc is updated with new allocations
-                self.downstream.update_allocations(&mut self.rtc.bwe());
+                self.downstream
+                    .update_allocations(&mut self.rtc.bwe(), router);
                 continue;
             }
 
@@ -329,13 +329,6 @@ impl ParticipantCore {
         }
 
         result
-    }
-
-    pub fn on_forward_rtp(&mut self, _stream_id: &StreamId) {
-        // TODO: filter simulcast switching
-
-        todo!();
-        // self.handle_forward_rtp(mid, pkt);
     }
 
     pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: &RtpPacket) {
@@ -420,21 +413,33 @@ impl ParticipantCore {
                     id: track_id,
                     origin_participant: self.participant_id,
                     kind: media.kind,
-                    simulcast_rids: media
-                        .simulcast
-                        .map(|s| s.recv.iter().map(|l| l.rid).collect())
-                        .unwrap_or_default(),
                 };
-                let (tx, rx) = track::new(media.mid, track_meta);
-                let accepted = self.upstream.add_published_track(media.mid, tx);
-                if !accepted {
-                    self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+                match media.kind {
+                    MediaKind::Audio => {
+                        let (tx, track) = track::new_audio(media.mid, track_meta);
+                        let accepted = self.upstream.add_published_track(media.mid, tx);
+                        if !accepted {
+                            self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+                        }
+                        events.push_back(ParticipantEvent::PublishedTrack(track));
+                    }
+                    MediaKind::Video => {
+                        let (tx, track) = track::new_video(
+                            media.mid,
+                            track_meta,
+                            media.simulcast.map(|s| s.recv).unwrap_or_default(),
+                        );
+                        let accepted = self.upstream.add_published_track(media.mid, tx);
+                        if !accepted {
+                            self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+                        }
+                        events.push_back(ParticipantEvent::PublishedTrack(track));
+                    }
                 }
-                events.push_back(ParticipantEvent::PublishedTrack(rx));
             }
             Direction::SendOnly => {
-                // self.signaling
-                //     .set_slot_count(self.downstream.video.slot_count());
+                self.signaling
+                    .set_slot_count(self.downstream.video.slot_count());
                 if let Some(m) = self.rtc.media(media.mid)
                     && let Some(&pt) = m.remote_pts().first()
                 {
@@ -442,10 +447,13 @@ impl ParticipantCore {
                     if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
                         self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
 
-                        self.downstream.add_slot(Slot {
+                        self.downstream.add_slot(SlotConfig {
                             mid: media.mid,
+                            // TODO: don't ignore simulcast receivers
+                            rid: None,
                             pt,
                             ssrc: stream.ssrc(),
+                            kind: media.kind,
                         });
                     }
                 }
@@ -474,7 +482,12 @@ impl ParticipantCore {
             .upstream
             .handle_incoming_rtp(mid, rid.as_ref(), &mut rtp, sr)
         {
-            todo!();
+            let track_id = self
+                .upstream
+                .track_id_for_mid(mid)
+                .expect("handle_incoming_rtp returned true so mid must have a slot");
+            let stream_id: StreamId = (track_id, rid);
+            events.push_back(ParticipantEvent::PublishedRtp(stream_id, rtp));
         }
     }
 

@@ -12,7 +12,7 @@ use crate::{
     entity::ParticipantId,
     participant::{ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents},
     shard::demux::Demuxer,
-    track::{StreamId, TrackMeta},
+    track::{StreamId, StreamWriter, Track},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -21,8 +21,28 @@ pub enum ShardError {
     IO(#[from] std::io::Error),
 }
 
+#[derive(Default)]
 struct Routing {
     subscribers: IndexSet<ParticipantId>,
+}
+
+pub struct Router<'a> {
+    participant_id: &'a ParticipantId,
+    routes: &'a mut HashMap<StreamId, Routing>,
+}
+
+impl<'a> Router<'a> {
+    pub fn subscribe(&mut self, stream_id: StreamId) {
+        let routing = self.routes.entry(stream_id).or_default();
+        routing.subscribers.insert(*self.participant_id);
+    }
+
+    pub fn unsubscribe(&mut self, stream_id: &StreamId) {
+        let Some(routing) = self.routes.get_mut(stream_id) else {
+            return;
+        };
+        routing.subscribers.swap_remove(self.participant_id);
+    }
 }
 
 type TimerEntry = Reverse<(Instant, ParticipantId)>;
@@ -35,7 +55,7 @@ pub enum ShardCommand {
 
 #[derive(Debug)]
 pub enum ShardEvent {
-    TrackPublished(TrackMeta),
+    TrackPublished(Track),
     ParticipantExited(ParticipantId),
 }
 
@@ -70,7 +90,7 @@ impl ShardWorker {
     }
 
     #[tracing::instrument(skip(self), fields(shard_id = self.shard_id))]
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         let res = self.run_inner().await;
         tracing::info!("shard exited: {:?}", res);
     }
@@ -133,40 +153,41 @@ impl ShardWorker {
             }
 
             // Poll only participants touched this tick, collect their events.
-            for &participant_id in &input_dirty {
-                let Some(participant) = self.participants.get_mut(&participant_id) else {
+            for participant_id in &input_dirty {
+                let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
-                participant.poll(now, &mut events);
+                let mut router = Router {
+                    participant_id,
+                    routes: &mut self.routing,
+                };
+                participant.poll(now, &mut events, &mut router);
             }
 
             // Drain all events produced this tick before flushing egress,
             // so RTP forwards from this tick are batched into the same flush.
             while let Some(event) = events.pop_front() {
                 match event {
-                    ParticipantEvent::PublishedRtp(stream_id) => {
+                    ParticipantEvent::PublishedRtp(stream_id, pkt) => {
                         let Some(route) = self.routing.get(&stream_id) else {
                             continue;
                         };
 
-                        for participant_id in &route.subscribers {
+                        for participant_id in route.subscribers.clone() {
                             let Some(sub) = self.participants.get_mut(&participant_id) else {
                                 continue;
                             };
-                            sub.on_forward_rtp(&stream_id);
-                            fanout_dirty.insert(*participant_id);
+                            let mut writer = StreamWriter(&mut sub.rtc);
+                            sub.downstream
+                                .on_forward_rtp(&stream_id, pkt.clone(), &mut writer);
+                            fanout_dirty.insert(participant_id);
                         }
                     }
                     ParticipantEvent::NewDeadline(entry) => {
                         timer_wheel.push(Reverse(entry));
                     }
-                    ParticipantEvent::PublishedTrack(track) => {
-                        if let Err(e) = self
-                            .event_tx
-                            .try_send(ShardEvent::TrackPublished(track.meta))
-                        {
-                            tracing::warn!("event_tx full, dropping TrackPublished: {e:?}");
-                        }
+                    ParticipantEvent::PublishedTrack(_track) => {
+                        //TODO:
                     }
                     ParticipantEvent::Exited(participant_id) => {
                         self.remove_participant(&participant_id);
@@ -181,11 +202,15 @@ impl ShardWorker {
                 }
             }
 
-            for &participant_id in &fanout_dirty {
-                let Some(participant) = self.participants.get_mut(&participant_id) else {
+            for participant_id in &fanout_dirty {
+                let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
-                participant.poll(now, &mut events);
+                let mut router = Router {
+                    participant_id,
+                    routes: &mut self.routing,
+                };
+                participant.poll(now, &mut events, &mut router);
             }
 
             // Flush egress for all dirty participants in one pass.
@@ -211,19 +236,23 @@ impl ShardWorker {
                 dirty.insert(participant_id);
             }
             ShardCommand::PublishTrack(participants) => {
-                // TODO:
+                for participant_id in &participants {
+                    let Some(_p) = self.participants.get_mut(participant_id) else {
+                        continue;
+                    };
+                    dirty.insert(*participant_id);
+                }
             }
         }
     }
 
     fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
-        // TODO: handle replacing participants
         self.remove_participant(&participant_id);
 
-        // TODO: update tcp gso size
         let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1);
         self.demuxer
             .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
+
         self.participants.insert(participant_id, participant);
         tracing::info!(%participant_id, "participant added to shard");
     }

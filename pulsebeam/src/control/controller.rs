@@ -201,7 +201,7 @@ impl ControllerActor {
     async fn on_shard_event(&mut self, event: ShardEvent) -> Option<()> {
         match event {
             ShardEvent::TrackPublished(track) => {
-                let meta = self.participants.get(&track.origin_participant)?;
+                let meta = self.participants.get(&track.meta.origin_participant)?;
                 let room = self.rooms.get_mut(&meta.room_id)?;
 
                 room.publish_track(track);

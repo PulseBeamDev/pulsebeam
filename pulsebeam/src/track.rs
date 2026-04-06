@@ -2,9 +2,9 @@ use pulsebeam_runtime::sync::Arc;
 use std::fmt::{Debug, Display};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use str0m::rtp::Ssrc;
 
-use pulsebeam_runtime::unsync::spmc;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -24,7 +24,32 @@ pub type StreamId = (TrackId, Option<Rid>);
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
-/// Sends keyframe requests from a [`SimulcastReceiver`] to the upstream publisher.
+pub struct StreamWriter<'a>(pub &'a mut str0m::Rtc);
+
+impl<'a> StreamWriter<'a> {
+    pub fn write(&mut self, pkt: &RtpPacket, ssrc: &Ssrc, pt: Pt) {
+        let mut api = self.0.direct_api();
+        let Some(stream) = api.stream_tx(ssrc) else {
+            tracing::warn!("no stream_tx found for {}", ssrc);
+            return;
+        };
+        let res = stream.write_rtp(
+            pt,
+            pkt.seq_no,
+            pkt.rtp_ts.numer() as u32,
+            pkt.playout_time.into(),
+            pkt.marker,
+            pkt.ext_vals.clone(),
+            true,
+            pkt.payload.to_vec(),
+        );
+        if let Err(err) = res {
+            tracing::warn!(%ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+        }
+    }
+}
+
+/// Sends keyframe requests to the upstream publisher.
 ///
 /// Always requests PLI — the publisher decides the exact RTCP feedback type.
 #[derive(Clone, Debug)]
@@ -50,7 +75,7 @@ impl KeyframeRequester {
 /// Polls a pending keyframe request with leading-edge debounce.
 ///
 /// Owned by `UpstreamAllocator`; the corresponding [`KeyframeRequester`] is held
-/// by each [`SimulcastReceiver`].
+/// by each [`TrackLayer`].
 #[derive(Debug)]
 pub struct KeyframePoll {
     signal: Arc<AtomicBool>,
@@ -87,13 +112,13 @@ impl KeyframePoll {
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-pub enum SimulcastQuality {
+pub enum LayerQuality {
     Low = 1,
     Medium = 2,
     High = 3,
 }
 
-impl std::fmt::Debug for SimulcastQuality {
+impl std::fmt::Debug for LayerQuality {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let txt = match self {
             Self::Low => "low",
@@ -109,84 +134,32 @@ pub struct TrackMeta {
     pub id: crate::entity::TrackId,
     pub origin_participant: crate::entity::ParticipantId,
     pub kind: MediaKind,
-    pub simulcast_rids: arrayvec::ArrayVec<Rid, MAX_SIMULCAST_LAYERS>,
-}
-
-#[derive(Clone)]
-pub struct SimulcastReceiver {
-    pub meta: TrackMeta,
-    pub rid: Option<Rid>,
-    pub quality: SimulcastQuality,
-    pub channel: spmc::Receiver<RtpPacket>,
-    pub keyframe_requester: KeyframeRequester,
-    pub state: StreamState,
-}
-
-impl PartialEq for SimulcastReceiver {
-    fn eq(&self, other: &Self) -> bool {
-        other.meta == self.meta && other.rid == self.rid && other.quality == self.quality
-    }
-}
-
-impl Debug for SimulcastReceiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self, f)
-    }
-}
-
-impl Display for SimulcastReceiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "{}:{}",
-            self.meta.id,
-            self.rid.as_deref().unwrap_or("_")
-        ))
-    }
-}
-
-impl SimulcastReceiver {
-    pub fn request_keyframe(&self) {
-        self.keyframe_requester.request();
-    }
 }
 
 #[derive(Debug)]
-pub struct SimulcastSender {
+pub struct UpstreamTrackLayer {
     pub mid: Mid,
     pub rid: Option<Rid>,
-    pub quality: SimulcastQuality,
+    pub quality: LayerQuality,
     pub monitor: StreamMonitor,
     synchronizer: Synchronizer,
-    channel: spmc::Sender<RtpPacket>,
     filter: PacketFilter,
 }
 
-impl PartialEq for SimulcastSender {
+impl PartialEq for UpstreamTrackLayer {
     fn eq(&self, other: &Self) -> bool {
         self.mid == other.mid && self.rid == other.rid
     }
 }
 
-impl Eq for SimulcastSender {}
+impl Eq for UpstreamTrackLayer {}
 
-impl SimulcastSender {
+impl UpstreamTrackLayer {
     pub fn poll_stats(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.monitor.poll(now, is_any_sibling_active);
     }
 
-    pub fn forward(&mut self, mut pkt: RtpPacket, sr: Option<SenderInfo>) {
-        // Synchronizer stamps playout_time in-place — no move-in/move-out round trip.
-        self.synchronizer.process(&mut pkt, sr);
-        self.monitor
-            .process_packet(&pkt, pkt.payload.len() + pkt.header_len);
-        if (self.filter)(&pkt) {
-            // Move packet into the broadcast ring — zero copies, zero arc bumps.
-            self.channel.send(pkt);
-        }
-    }
-
     pub fn process(&mut self, pkt: &mut RtpPacket, sr: Option<SenderInfo>) -> bool {
-        // Synchronizer stamps playout_time in-place — no move-in/move-out round trip.
         self.synchronizer.process(pkt, sr);
         self.monitor
             .process_packet(pkt, pkt.payload.len() + pkt.header_len);
@@ -194,33 +167,20 @@ impl SimulcastSender {
     }
 }
 
-pub struct TrackSender {
+pub struct UpstreamTrack {
     pub meta: TrackMeta,
-    pub simulcast: Vec<SimulcastSender>,
-    /// Shared notification handle; set by subscribers via [`KeyframeRequester`].
-    pub keyframe_notify: Arc<Notify>,
-    /// Per-simulcast-layer poll handles, drained by the upstream actor.
-    pub keyframe_polls: Vec<KeyframePoll>,
+    pub layers: Vec<UpstreamTrackLayer>,
 }
 
-impl PartialEq for TrackSender {
+impl PartialEq for UpstreamTrack {
     fn eq(&self, other: &Self) -> bool {
-        self.meta == other.meta && self.simulcast == other.simulcast
+        self.meta == other.meta && self.layers == other.layers
     }
 }
 
-impl Eq for TrackSender {}
+impl Eq for UpstreamTrack {}
 
-impl TrackSender {
-    pub fn forward(&mut self, rid: Option<&Rid>, packet: RtpPacket, sr: Option<SenderInfo>) {
-        let sender = self
-            .simulcast
-            .iter_mut()
-            .find(|s| s.rid.as_ref() == rid)
-            .expect("expected sender to always be available");
-        sender.forward(packet, sr);
-    }
-
+impl UpstreamTrack {
     pub fn process(
         &mut self,
         rid: Option<&Rid>,
@@ -228,25 +188,25 @@ impl TrackSender {
         sr: Option<SenderInfo>,
     ) -> bool {
         let sender = self
-            .simulcast
+            .layers
             .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available");
         sender.process(packet, sr)
     }
 
-    pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut SimulcastSender> {
-        self.simulcast.iter_mut().find(|s| s.rid == *rid)
+    pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
+        self.layers.iter_mut().find(|s| s.rid == *rid)
     }
 
     pub fn poll_stats(&mut self, now: Instant) {
         let total_active_streams = self
-            .simulcast
+            .layers
             .iter()
             .filter(|s| !s.monitor.shared_state().is_inactive())
             .count();
 
-        for layer in self.simulcast.iter_mut() {
+        for layer in self.layers.iter_mut() {
             let is_current_layer_active = !layer.monitor.shared_state().is_inactive();
             let is_any_sibling_active = if is_current_layer_active {
                 total_active_streams > 1
@@ -259,142 +219,162 @@ impl TrackSender {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct TrackReceiver {
+#[derive(Debug)]
+pub struct Track {
     pub meta: TrackMeta,
-    pub simulcast: Vec<SimulcastReceiver>,
+    pub layers: Vec<TrackLayer>,
 }
 
-impl TrackReceiver {
-    pub fn by_quality(&self, quality: SimulcastQuality) -> Option<&SimulcastReceiver> {
-        self.simulcast.iter().find(|s| s.quality == quality)
+impl Track {
+    pub fn lowest_quality(&self) -> &TrackLayer {
+        self.layers
+            .iter()
+            .min_by_key(|l| l.quality)
+            .expect("at least one layer")
     }
 
-    pub fn higher_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
-        self.simulcast
-            .iter()
-            // Find layers strictly greater than current
-            .filter(|s| s.quality > current)
-            // Pick the smallest one that is still better than current
-            // (e.g., if you are at Low and have Med/High available, pick Med)
-            .min_by_key(|s| s.quality)
+    pub fn by_quality(&self, quality: LayerQuality) -> Option<&TrackLayer> {
+        self.layers.iter().find(|l| l.quality == quality)
     }
 
-    pub fn lower_quality(&self, current: SimulcastQuality) -> Option<&SimulcastReceiver> {
-        self.simulcast
+    pub fn higher_quality(&self, current: LayerQuality) -> Option<&TrackLayer> {
+        self.layers
             .iter()
-            // Find layers strictly less than current
-            .filter(|s| s.quality < current)
-            // Pick the largest one that is still below current
-            .max_by_key(|s| s.quality)
+            .filter(|l| l.quality > current)
+            .min_by_key(|l| l.quality)
     }
 
-    pub fn lowest_quality(&self) -> &SimulcastReceiver {
-        self.simulcast
+    pub fn lower_quality(&self, current: LayerQuality) -> Option<&TrackLayer> {
+        self.layers
             .iter()
-            .min_by_key(|s| s.quality)
-            .expect("TrackReceiver must have at least one layer")
-    }
-
-    pub fn highest_quality(&self) -> &SimulcastReceiver {
-        self.simulcast
-            .iter()
-            .max_by_key(|s| s.quality)
-            .expect("TrackReceiver must have at least one layer")
+            .filter(|l| l.quality < current)
+            .max_by_key(|l| l.quality)
     }
 }
 
-pub fn new(mid: Mid, meta: TrackMeta) -> (TrackSender, TrackReceiver) {
-    const BASE_CAP: usize = 128;
+#[derive(Clone, Debug)]
+pub struct TrackLayer {
+    pub track_id: TrackId,
+    pub rid: Option<Rid>,
+    pub quality: LayerQuality,
+    // pub keyframe_requester: KeyframeRequester,
+    pub state: StreamState,
+}
 
-    let simulcast_rids: Vec<Option<Rid>> = if meta.simulcast_rids.is_empty() {
+impl TrackLayer {
+    pub fn stream_id(&self) -> StreamId {
+        (self.track_id, self.rid)
+    }
+
+    pub fn request_keyframe(&self) {
+        // self.keyframe_requester.request();
+    }
+}
+
+impl Display for TrackLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}",
+            self.track_id,
+            self.rid.as_deref().unwrap_or("_")
+        )
+    }
+}
+
+/// Construct a new audio track sender and its corresponding layer descriptor.
+pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
+    debug_assert_eq!(meta.kind, MediaKind::Audio);
+    let bitrate = 64_000;
+    let stream_state = StreamState::new(true, bitrate);
+    let stream_id = format!("{}:_", meta.id);
+    let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
+
+    let sender = UpstreamTrack {
+        meta: meta.clone(),
+        layers: vec![UpstreamTrackLayer {
+            mid,
+            rid: None,
+            quality: LayerQuality::Low,
+            filter: should_forward_audio,
+            synchronizer: Synchronizer::new(rtp::AUDIO_FREQUENCY),
+            monitor,
+        }],
+    };
+    (
+        sender,
+        Track {
+            meta,
+            layers: Vec::with_capacity(MAX_SIMULCAST_LAYERS),
+        },
+    )
+}
+
+/// Construct a new video track sender and its per-layer descriptors.
+pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (UpstreamTrack, Track) {
+    debug_assert_eq!(meta.kind, MediaKind::Video);
+    let simulcast_rids: Vec<Option<Rid>> = if layers.is_empty() {
         vec![None]
     } else {
-        meta.simulcast_rids.iter().map(|rid| Some(*rid)).collect()
+        layers.iter().map(|l| Some(l.rid)).collect()
     };
 
-    let keyframe_notify = Arc::new(Notify::new());
+    let _keyframe_notify = Arc::new(Notify::new());
     let mut senders = Vec::new();
-    let mut receivers = Vec::new();
+    let mut layers = Vec::with_capacity(simulcast_rids.len());
     let mut keyframe_polls = Vec::new();
 
     for (index, &rid) in simulcast_rids.iter().enumerate() {
-        // TODO: get this from SDP instead
-        let (clock_rate, filter) = match meta.kind {
-            MediaKind::Audio => (rtp::AUDIO_FREQUENCY, should_forward_audio as PacketFilter),
-            MediaKind::Video => (rtp::VIDEO_FREQUENCY, should_forward_noop as PacketFilter),
+        let (bitrate, quality) = match (rid, index) {
+            (None, _) => (500_000, LayerQuality::Low),
+            (Some(_), 0) => (2_500_000, LayerQuality::High),
+            (Some(_), 1) => (750_000, LayerQuality::Medium),
+            (Some(_), _) => (150_000, LayerQuality::Low),
         };
 
-        let (quality, bitrate, cap_tier) = match (meta.kind, rid, index) {
-            (MediaKind::Audio, _, _) => (SimulcastQuality::Low, 64_000, 1),
-            (MediaKind::Video, None, _) => (SimulcastQuality::Low, 500_000, 4),
-
-            // Ordering here determines the highest quality first.
-            // https://datatracker.ietf.org/doc/html/rfc8853#section-5.2
-            // https://github.com/obsproject/obs-studio/pull/10885
-            (MediaKind::Video, Some(_), 0) => (SimulcastQuality::High, 2_500_000, 4),
-            (MediaKind::Video, Some(_), 1) => (SimulcastQuality::Medium, 750_000, 2),
-            (MediaKind::Video, Some(_), _) => (SimulcastQuality::Low, 150_000, 1),
-        };
-
-        let (tx, rx) = spmc::channel(BASE_CAP * cap_tier);
-        // Shared atomic signal: receiver writes, poll-side reads.
         let signal = Arc::new(AtomicBool::new(false));
-
         let stream_state = StreamState::new(true, bitrate);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
 
-        // Only video tracks need keyframe polling.
-        if meta.kind == MediaKind::Video {
-            keyframe_polls.push(KeyframePoll {
-                signal: signal.clone(),
-                mid,
-                rid,
-                debounce: KEYFRAME_DEBOUNCE,
-                last_sent: None,
-            });
-        }
+        keyframe_polls.push(KeyframePoll {
+            signal: signal.clone(),
+            mid,
+            rid,
+            debounce: KEYFRAME_DEBOUNCE,
+            last_sent: None,
+        });
 
-        senders.push(SimulcastSender {
+        senders.push(UpstreamTrackLayer {
             mid,
             rid,
             quality,
-            filter,
-            synchronizer: Synchronizer::new(clock_rate),
-            channel: tx,
+            filter: should_forward_noop,
+            synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor,
         });
-        receivers.push(SimulcastReceiver {
-            meta: meta.clone(),
-            quality,
+        layers.push(TrackLayer {
+            track_id: meta.id,
             rid,
-            channel: rx,
-            keyframe_requester: KeyframeRequester {
-                signal,
-                notify: keyframe_notify.clone(),
-                #[cfg(test)]
-                request_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            },
+            quality,
             state: stream_state,
         });
     }
     senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
-    receivers.sort_by_key(|e| std::cmp::Reverse(e.quality));
+    layers.sort_by_key(|e| std::cmp::Reverse(e.quality));
 
-    tracing::info!("discovered simulcast mapping: {:?}", receivers);
+    tracing::info!(track_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
+    let track = Track {
+        meta: meta.clone(),
+        layers,
+    };
 
     (
-        TrackSender {
-            meta: meta.clone(),
-            simulcast: senders,
-            keyframe_notify,
-            keyframe_polls,
-        },
-        TrackReceiver {
+        UpstreamTrack {
             meta,
-            simulcast: receivers,
+            layers: senders,
         },
+        track,
     )
 }
 
@@ -439,152 +419,27 @@ fn should_forward_noop(_: &RtpPacket) -> bool {
 pub mod test_utils {
     use super::*;
 
-    pub fn make_track(
-        participant_id: ParticipantId,
-        kind: MediaKind,
-        mid: Mid,
-        rids: Option<Vec<Rid>>,
-    ) -> (TrackSender, TrackReceiver) {
-        let track_id = participant_id.derive_track_id(kind, &mid);
-        let rids = rids.map(|rid| rid).iter().collect();
-        let meta = TrackMeta {
-            id: track_id,
-            origin_participant: participant_id,
-            kind,
-            simulcast_rids: rids,
-        };
-
-        crate::track::new(mid, meta)
-    }
-
     pub fn make_video_track(
         participant_id: ParticipantId,
         mid: Mid,
-    ) -> (TrackSender, TrackReceiver) {
-        make_track(
-            participant_id,
-            MediaKind::Video,
-            mid,
-            Some(vec!["f".into(), "h".into(), "q".into()]),
-        )
+        layers: Vec<SimulcastLayer>,
+    ) -> (UpstreamTrack, Track) {
+        let track_id = participant_id.derive_track_id(MediaKind::Video, &mid);
+        let meta = TrackMeta {
+            id: track_id,
+            origin_participant: participant_id,
+            kind: MediaKind::Video,
+        };
+        crate::track::new_video(mid, meta, layers)
     }
 
-    pub fn make_audio_track(
-        participant_id: ParticipantId,
-        mid: Mid,
-    ) -> (TrackSender, TrackReceiver) {
-        make_track(participant_id, MediaKind::Audio, mid, None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-    use tokio::time::Instant;
-    use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
-
-    /// Stream wrapper that implements leading-edge debounce (test helper only).
-    struct LeadingEdgeDebounce<S> {
-        inner: S,
-        debounce_duration: Duration,
-        last_emitted: Option<Instant>,
-    }
-
-    impl<S> LeadingEdgeDebounce<S> {
-        fn new(inner: S, debounce_duration: Duration) -> Self {
-            Self {
-                inner,
-                debounce_duration,
-                last_emitted: None,
-            }
-        }
-    }
-
-    impl<S, T> Stream for LeadingEdgeDebounce<S>
-    where
-        S: Stream<Item = T> + Unpin,
-    {
-        type Item = T;
-
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            loop {
-                match Pin::new(&mut self.inner).poll_next(cx) {
-                    Poll::Ready(Some(item)) => {
-                        let now = Instant::now();
-                        match self.last_emitted {
-                            Some(last) if now.duration_since(last) < self.debounce_duration => {
-                                continue;
-                            }
-                            _ => {
-                                self.last_emitted = Some(now);
-                                return Poll::Ready(Some(item));
-                            }
-                        }
-                    }
-                    other => return other,
-                }
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_leading_edge_debounce() {
-        // 1. Setup: Debounce for 100ms
-        let (tx, rx) = mpsc::channel(10);
-        let stream = ReceiverStream::new(rx);
-        let mut debounced_stream = LeadingEdgeDebounce::new(stream, Duration::from_millis(100));
-
-        // 2. Event A (Time 0ms): Should pass through immediately (Leading Edge)
-        tx.send("A").await.unwrap();
-
-        let item = debounced_stream.next().await;
-        assert_eq!(item, Some("A"), "First item should be emitted immediately");
-
-        // 3. Event B (Time 1ms): Should be dropped (inside 100ms window)
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tx.send("B").await.unwrap();
-
-        // We poll the stream to ensure it processes "B" and returns Pending
-        // We use tokio::time::timeout to ensure we don't hang if logic is wrong
-        let result = tokio::time::timeout(Duration::from_millis(1), debounced_stream.next()).await;
-        assert!(
-            result.is_err(),
-            "Item B should be swallowed/debounced, so stream should be Pending"
-        );
-
-        // 4. Event C (Time 50ms): Still inside window (total 51ms), should be dropped
-        tokio::time::advance(Duration::from_millis(49)).await;
-        tx.send("C").await.unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(1), debounced_stream.next()).await;
-        assert!(
-            result.is_err(),
-            "Item C should be swallowed (only 50ms passed)"
-        );
-
-        // 5. Event D (Time 101ms): Window passed, should emit
-        // Advance enough to pass the 100ms threshold from the LAST EMISSION (Time 0)
-        tokio::time::advance(Duration::from_millis(51)).await; // Total time since A = 102ms
-        tx.send("D").await.unwrap();
-
-        let item = debounced_stream.next().await;
-        assert_eq!(
-            item,
-            Some("D"),
-            "Item D should be emitted as 100ms has passed since A"
-        );
-
-        // 6. Event E (Time 103ms): Should be dropped (new window started at D)
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tx.send("E").await.unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(1), debounced_stream.next()).await;
-        assert!(
-            result.is_err(),
-            "Item E should be swallowed (too close to D)"
-        );
+    pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
+        let track_id = participant_id.derive_track_id(MediaKind::Audio, &mid);
+        let meta = TrackMeta {
+            id: track_id,
+            origin_participant: participant_id,
+            kind: MediaKind::Audio,
+        };
+        crate::track::new_audio(mid, meta)
     }
 }
