@@ -184,6 +184,14 @@ impl SimulcastSender {
             self.channel.send(pkt);
         }
     }
+
+    pub fn process(&mut self, pkt: &mut RtpPacket, sr: Option<SenderInfo>) -> bool {
+        // Synchronizer stamps playout_time in-place — no move-in/move-out round trip.
+        self.synchronizer.process(pkt, sr);
+        self.monitor
+            .process_packet(pkt, pkt.payload.len() + pkt.header_len);
+        (self.filter)(pkt)
+    }
 }
 
 pub struct TrackSender {
@@ -211,6 +219,20 @@ impl TrackSender {
             .find(|s| s.rid.as_ref() == rid)
             .expect("expected sender to always be available");
         sender.forward(packet, sr);
+    }
+
+    pub fn process(
+        &mut self,
+        rid: Option<&Rid>,
+        packet: &mut RtpPacket,
+        sr: Option<SenderInfo>,
+    ) -> bool {
+        let sender = self
+            .simulcast
+            .iter_mut()
+            .find(|s| s.rid.as_ref() == rid)
+            .expect("expected sender to always be available");
+        sender.process(packet, sr)
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut SimulcastSender> {

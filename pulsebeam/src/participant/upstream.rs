@@ -1,7 +1,11 @@
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
-use crate::{rtp::RtpPacket, track::TrackSender};
+use crate::{
+    participant::{ParticipantEvent, ParticipantEvents},
+    rtp::RtpPacket,
+    track::TrackSender,
+};
 use str0m::media::{MediaKind, Mid};
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
@@ -71,12 +75,12 @@ impl UpstreamAllocator {
         &mut self,
         mid: Mid,
         rid: Option<&str0m::media::Rid>,
-        mut rtp: RtpPacket,
+        rtp: &mut RtpPacket,
         sr: Option<SenderInfo>,
-    ) {
+    ) -> bool {
         if let Some(slot) = self.published_tracks.iter_mut().find(|t| t.mid == mid) {
             rtp.ext_vals.rid = rid.cloned();
-            slot.track.forward(rid, rtp, sr);
+            slot.track.process(rid, rtp, sr)
         } else {
             tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
         }

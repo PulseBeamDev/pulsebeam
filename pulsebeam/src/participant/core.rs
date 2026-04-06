@@ -18,6 +18,7 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::entity::{self, ParticipantId, TrackId};
+use crate::participant::downstream::Slot;
 use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
@@ -164,7 +165,7 @@ impl ParticipantCore {
     pub fn handle_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
         for track_handle in tracks.values() {
             if track_handle.meta.origin_participant != self.participant_id {
-                self.downstream.add_track(track_handle.clone());
+                self.downstream.add_track(track_handle.meta.clone());
             }
         }
         self.signaling.mark_tracks_dirty();
@@ -175,9 +176,9 @@ impl ParticipantCore {
     }
 
     pub fn remove_available_tracks(&mut self, tracks: &HashMap<entity::TrackId, TrackReceiver>) {
-        for track in tracks.values() {
-            self.downstream.remove_track(track);
-        }
+        // for track in tracks.values() {
+        //     self.downstream.remove_track(track);
+        // }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
     }
@@ -375,7 +376,7 @@ impl ParticipantCore {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
             Event::MediaAdded(media) => self.handle_media_added(media, events),
-            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp),
+            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => self.downstream.handle_keyframe_request(req),
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 self.downstream.update_bitrate(available)
@@ -432,17 +433,20 @@ impl ParticipantCore {
                 events.push_back(ParticipantEvent::PublishedTrack(rx));
             }
             Direction::SendOnly => {
-                self.downstream.add_slot(media.mid, media.kind);
-                self.signaling
-                    .set_slot_count(self.downstream.video.slot_count());
-                // Cache (Pt, Ssrc) so handle_forward_rtp avoids per-packet lookups.
-                // Both are stable for the session lifetime after SDP negotiation.
+                // self.signaling
+                //     .set_slot_count(self.downstream.video.slot_count());
                 if let Some(m) = self.rtc.media(media.mid)
                     && let Some(&pt) = m.remote_pts().first()
                 {
                     let mut api = self.rtc.direct_api();
                     if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
                         self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
+
+                        self.downstream.add_slot(Slot {
+                            mid: media.mid,
+                            pt,
+                            ssrc: stream.ssrc(),
+                        });
                     }
                 }
             }
@@ -450,7 +454,7 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket) {
+    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket, events: &mut ParticipantEvents) {
         tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
@@ -462,12 +466,16 @@ impl ParticipantCore {
             return;
         };
 
-        let (rtp, sr) = match media.kind() {
+        let (mut rtp, sr) = match media.kind() {
             MediaKind::Audio => RtpPacket::from_str0m(rtp, crate::rtp::Codec::Opus),
             MediaKind::Video => RtpPacket::from_str0m(rtp, crate::rtp::Codec::H264),
         };
-        self.upstream
-            .handle_incoming_rtp(mid, rid.as_ref(), rtp, sr);
+        if self
+            .upstream
+            .handle_incoming_rtp(mid, rid.as_ref(), &mut rtp, sr)
+        {
+            todo!();
+        }
     }
 
     pub fn disconnect(&mut self, reason: DisconnectReason) {

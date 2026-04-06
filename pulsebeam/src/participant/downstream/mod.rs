@@ -2,74 +2,63 @@ mod audio;
 mod video;
 
 use crate::audio_selector::AudioSelectorSubscription;
-use crate::entity::ParticipantId;
+use crate::entity::{ParticipantId, TrackId};
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::{SlotConfig, VideoAllocator};
 use crate::rtp::RtpPacket;
-use crate::track::TrackReceiver;
+use crate::track::{StreamId, TrackMeta, TrackReceiver};
+use ahash::{HashMap, HashMapExt};
 use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use str0m::bwe::{Bitrate, Bwe};
-use str0m::media::{KeyframeRequest, MediaKind, Mid};
+use str0m::media::{KeyframeRequest, MediaAdded, MediaKind, Mid, Pt};
+use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 pub use video::Intent;
 
 const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
+#[derive(Clone)]
+pub struct Slot {
+    pub mid: Mid,
+    pub ssrc: Ssrc,
+    pub pt: Pt,
+}
+
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
     available_bandwidth: Bitrate,
-
-    pub audio: AudioAllocator,
+    video_tracks: HashMap<TrackId, TrackMeta>,
+    video_slots: Vec<Slot>,
     pub video: VideoAllocator,
+
+    routing: HashMap<StreamId, Slot>,
 }
 
 impl DownstreamAllocator {
     pub fn new(participant_id: ParticipantId, manual_sub: bool) -> Self {
         Self {
             available_bandwidth: MIN_BANDWIDTH,
-            audio: AudioAllocator::new(participant_id),
+            video_tracks: HashMap::new(),
+            video_slots: Vec::new(),
             video: VideoAllocator::new(manual_sub),
+            routing: HashMap::new(),
             dirty_allocation: false,
         }
     }
 
-    /// Replace the audio allocator's input receivers with those from the
-    /// room-level audio selector subscription.
-    ///
-    /// Must be called once after the room hands the subscription to this
-    /// participant (via `ParticipantControlMessage::AudioSubscription`).
-    pub fn set_audio_subscription(&mut self, sub: AudioSelectorSubscription) {
-        self.audio.set_subscription(sub);
+    pub fn add_track(&mut self, track: TrackMeta) {
+        if track.kind.is_audio() {
+            return;
+        }
+
+        self.video_tracks.insert(track.id, track);
     }
 
-    pub fn add_track(&mut self, track: TrackReceiver) {
-        match track.meta.kind {
-            // Audio is now managed by the room-level TopNAudioSelector;
-            // individual audio TrackReceivers are not added here.
-            MediaKind::Audio => {}
-            MediaKind::Video => self.video.add_track(track),
-        }
-        self.dirty_allocation = true;
-    }
-
-    pub fn remove_track(&mut self, track: &TrackReceiver) {
-        match track.meta.kind {
-            // Removal of audio tracks is handled by the room-level selector.
-            MediaKind::Audio => {}
-            MediaKind::Video => self.video.remove_track(&track.meta.id),
-        }
-        self.dirty_allocation = true;
-    }
-
-    pub fn add_slot(&mut self, mid: Mid, kind: MediaKind) {
-        match kind {
-            MediaKind::Audio => self.audio.add_slot(mid),
-            MediaKind::Video => self.video.add_slot(mid, SlotConfig::default()),
-        }
-        self.dirty_allocation = true;
+    pub fn add_slot(&mut self, slot: Slot) {
+        self.video_slots.push(slot);
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
@@ -83,27 +72,50 @@ impl DownstreamAllocator {
         bwe.set_desired_bitrate(desired);
     }
 
-    pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
-        self.video.handle_keyframe_request(req);
-    }
-
     pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe) {
-        self.video.poll_slow(now);
-        self.update_allocations(bwe);
-    }
-}
+        // TODO: super hacky allocation
+        for slot in &self.video_slots {
+            let Some(track) = self.video_tracks.iter().next() else {
+                continue;
+            };
 
-impl Stream for DownstreamAllocator {
-    type Item = (Mid, RtpPacket);
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(pkt) = self.audio.poll_next(cx) {
-            return Poll::Ready(pkt);
+            let rid = track.1.simulcast_rids.first();
+            let stream_id: StreamId = (*track.0, rid.copied());
+            self.routing.insert(stream_id, slot.clone());
         }
-
-        // Video slots won't register wakers until audio goes pending.
-        // This is okay because the invariant is that the executor has to poll
-        // this again whenever it is ready.
-        self.video.poll_next(cx)
     }
+
+    pub fn on_forward_rtp(&self, stream_id: &StreamId, pkt: &RtpPacket, rtc: &mut str0m::Rtc) {
+        // TODO: hack
+        let Some(slot) = self.routing.get(stream_id) else {
+            return;
+        };
+
+        let mut api = rtc.direct_api();
+        let Some(writer) = api.stream_tx(&slot.ssrc) else {
+            tracing::warn!(%slot.ssrc, "Dropping RTP for invalid stream mid");
+            return;
+        };
+
+        tracing::trace!(
+            "forward rtp: seqno={},rtp_ts={:?},playout_time={:?}",
+            pkt.seq_no,
+            pkt.rtp_ts,
+            pkt.playout_time
+        );
+        if let Err(err) = writer.write_rtp(
+            slot.pt,
+            pkt.seq_no,
+            pkt.rtp_ts.numer() as u32,
+            pkt.playout_time.into(),
+            pkt.marker,
+            pkt.ext_vals.clone(),
+            true,
+            pkt.payload.to_vec(),
+        ) {
+            tracing::warn!(%slot.ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+        }
+    }
+
+    pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {}
 }
