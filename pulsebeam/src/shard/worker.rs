@@ -78,7 +78,8 @@ impl ShardWorker {
     async fn run_inner(mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let mut timer_wheel: BinaryHeap<TimerEntry> = BinaryHeap::new();
-        let mut dirty: IndexSet<ParticipantId> = IndexSet::default();
+        let mut input_dirty: IndexSet<ParticipantId> = IndexSet::default();
+        let mut fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
         let mut events = ParticipantEvents::default();
 
         loop {
@@ -96,7 +97,7 @@ impl ShardWorker {
                 _ = wait => {}
                 Ok(_res) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
-                    self.on_command(cmd, &mut dirty);
+                    self.on_command(cmd, &mut input_dirty);
                 }
                 else => break,
             }
@@ -113,7 +114,7 @@ impl ShardWorker {
                     continue; // already removed
                 };
                 participant.on_timeout(now);
-                dirty.insert(participant_id);
+                input_dirty.insert(participant_id);
             }
 
             let count = self
@@ -128,11 +129,11 @@ impl ShardWorker {
                     continue;
                 };
                 participant.on_ingress(batch);
-                dirty.insert(participant_id);
+                input_dirty.insert(participant_id);
             }
 
             // Poll only participants touched this tick, collect their events.
-            for &participant_id in &dirty {
+            for &participant_id in &input_dirty {
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
@@ -153,7 +154,7 @@ impl ShardWorker {
                                 continue;
                             };
                             sub.on_forward_rtp(&stream_id);
-                            dirty.insert(*participant_id);
+                            fanout_dirty.insert(*participant_id);
                         }
                     }
                     ParticipantEvent::NewDeadline(entry) => {
@@ -169,7 +170,7 @@ impl ShardWorker {
                     }
                     ParticipantEvent::Exited(participant_id) => {
                         self.remove_participant(&participant_id);
-                        dirty.swap_remove(&participant_id);
+                        input_dirty.swap_remove(&participant_id);
                         if let Err(e) = self
                             .event_tx
                             .try_send(ShardEvent::ParticipantExited(participant_id))
@@ -182,7 +183,7 @@ impl ShardWorker {
 
             // Flush egress for all dirty participants in one pass.
             // Exited participants were swap_removed above so this is safe.
-            for participant_id in dirty.drain(..) {
+            for participant_id in input_dirty.drain(..).chain(fanout_dirty.drain(..)) {
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
