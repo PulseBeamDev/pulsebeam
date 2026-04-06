@@ -181,6 +181,13 @@ impl ShardWorker {
                 }
             }
 
+            for &participant_id in &fanout_dirty {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
+                    continue;
+                };
+                participant.poll(now, &mut events);
+            }
+
             // Flush egress for all dirty participants in one pass.
             // Exited participants were swap_removed above so this is safe.
             for participant_id in input_dirty.drain(..).chain(fanout_dirty.drain(..)) {
