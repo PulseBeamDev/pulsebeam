@@ -131,6 +131,14 @@ impl ParticipantCore {
         }
     }
 
+    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
+        self.pending_ingress.push_back(batch);
+    }
+
+    pub fn on_timeout(&mut self, now: Instant) {
+        let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+    }
+
     pub fn ufrag(&mut self) -> String {
         self.rtc.direct_api().local_ice_credentials().ufrag
     }
@@ -147,14 +155,6 @@ impl ParticipantCore {
         } else {
             tracing::warn!(?key, "stream not found for keyframe request");
         }
-    }
-
-    pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
-        self.pending_ingress.push_back(batch);
-    }
-
-    pub fn on_timeout(&mut self, now: Instant) {
-        let _ = self.rtc.handle_input(Input::Timeout(now.into()));
     }
 
     pub fn handle_tick(&mut self) {

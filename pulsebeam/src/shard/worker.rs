@@ -1,5 +1,3 @@
-use std::{cmp::Reverse, collections::BinaryHeap};
-
 use ahash::HashMap;
 use indexmap::IndexSet;
 use pulsebeam_runtime::{
@@ -11,7 +9,7 @@ use tokio::time::Instant;
 use crate::{
     entity::ParticipantId,
     participant::{ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents},
-    shard::demux::Demuxer,
+    shard::{demux::Demuxer, timer::TimerWheel},
     track::{StreamId, StreamWriter, Track},
 };
 
@@ -44,8 +42,6 @@ impl<'a> Router<'a> {
         routing.subscribers.swap_remove(self.participant_id);
     }
 }
-
-type TimerEntry = Reverse<(Instant, ParticipantId)>;
 
 #[derive(Debug)]
 pub enum ShardCommand {
@@ -97,25 +93,25 @@ impl ShardWorker {
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
         let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
-        let mut timer_wheel: BinaryHeap<TimerEntry> = BinaryHeap::new();
+        let mut timers = TimerWheel::default();
         let mut input_dirty: IndexSet<ParticipantId> = IndexSet::default();
         let mut fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
         let mut events = ParticipantEvents::default();
 
         loop {
-            let next_deadline = timer_wheel.peek().map(|Reverse((t, _))| *t);
-            let wait = async move {
-                match next_deadline {
+            let wait = async {
+                match timers.next_deadline() {
                     Some(d) => tokio::time::sleep_until(d).await,
                     // No pending timers: park forever until socket wakes us.
                     None => std::future::pending::<()>().await,
                 }
             };
 
+            // Block until at least one source is ready.
             tokio::select! {
                 biased;
                 _ = wait => {}
-                Ok(_res) = self.udp_socket.readable() => {}
+                Ok(_) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
                     self.on_command(cmd, &mut input_dirty);
                 }
@@ -124,23 +120,20 @@ impl ShardWorker {
 
             let now = Instant::now();
 
-            while let Some(Reverse((deadline, participant_id))) = timer_wheel.peek().copied() {
-                if deadline > now {
-                    break; // nothing else has expired yet
+            timers.drain_expired(now, |participant_id| {
+                if let Some(participant) = self.participants.get_mut(&participant_id) {
+                    participant.on_timeout(now);
+                    input_dirty.insert(participant_id);
                 }
-                timer_wheel.pop();
-
-                let Some(participant) = self.participants.get_mut(&participant_id) else {
-                    continue; // already removed
-                };
-                participant.on_timeout(now);
-                input_dirty.insert(participant_id);
-            }
+            });
 
             let count = self
                 .udp_socket
                 .try_recv_batch(&mut recv_batch)
                 .unwrap_or_default();
+            if count == 0 {
+                break;
+            }
             for batch in recv_batch.drain(..count) {
                 let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;
@@ -183,14 +176,15 @@ impl ShardWorker {
                             fanout_dirty.insert(participant_id);
                         }
                     }
-                    ParticipantEvent::NewDeadline(entry) => {
-                        timer_wheel.push(Reverse(entry));
+                    ParticipantEvent::NewDeadline((deadline, pid)) => {
+                        timers.schedule(pid, deadline);
                     }
                     ParticipantEvent::PublishedTrack(_track) => {
                         //TODO:
                     }
                     ParticipantEvent::Exited(participant_id) => {
                         self.remove_participant(&participant_id);
+                        timers.cancel(&participant_id);
                         input_dirty.swap_remove(&participant_id);
                         if let Err(e) = self
                             .event_tx
