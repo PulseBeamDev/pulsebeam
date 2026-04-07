@@ -134,9 +134,6 @@ impl ShardWorker {
                 .udp_socket
                 .try_recv_batch(&mut recv_batch)
                 .unwrap_or_default();
-            if count == 0 {
-                break;
-            }
             for batch in recv_batch.drain(..count) {
                 let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;

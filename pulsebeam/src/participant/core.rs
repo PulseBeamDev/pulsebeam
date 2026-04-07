@@ -189,8 +189,8 @@ impl ParticipantCore {
     pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents, router: &mut Router) {
         let next_deadline = self.poll_until_deadline(now, events, router);
 
-        if let Some(_next_deadline) = next_deadline {
-            events.push_back(ParticipantEvent::NewDeadline((now, self.participant_id)));
+        if let Some(next_deadline) = next_deadline {
+            events.push_back(ParticipantEvent::NewDeadline((next_deadline, self.participant_id)));
         } else {
             events.push_back(ParticipantEvent::Exited(self.participant_id));
         }
