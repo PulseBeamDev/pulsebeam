@@ -1,7 +1,9 @@
+use std::collections::VecDeque;
+
 use ahash::HashMap;
 use indexmap::IndexSet;
 use pulsebeam_runtime::{
-    mailbox,
+    mailbox::{self, TryRecvError},
     net::{self, UnifiedSocket},
 };
 use tokio::time::Instant;
@@ -97,6 +99,7 @@ impl ShardWorker {
         let mut input_dirty: IndexSet<ParticipantId> = IndexSet::default();
         let mut fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
         let mut events = ParticipantEvents::default();
+        let mut shard_events = VecDeque::with_capacity(1024);
 
         loop {
             let wait = async {
@@ -179,19 +182,14 @@ impl ShardWorker {
                     ParticipantEvent::NewDeadline((deadline, pid)) => {
                         timers.schedule(pid, deadline);
                     }
-                    ParticipantEvent::PublishedTrack(_track) => {
-                        //TODO:
+                    ParticipantEvent::PublishedTrack(track) => {
+                        shard_events.push_back(ShardEvent::TrackPublished(track));
                     }
                     ParticipantEvent::Exited(participant_id) => {
                         self.remove_participant(&participant_id);
                         timers.cancel(&participant_id);
                         input_dirty.swap_remove(&participant_id);
-                        if let Err(e) = self
-                            .event_tx
-                            .try_send(ShardEvent::ParticipantExited(participant_id))
-                        {
-                            tracing::warn!("event_tx full, dropping ParticipantExited: {e:?}");
-                        }
+                        shard_events.push_back(ShardEvent::ParticipantExited(participant_id));
                     }
                 }
             }
@@ -215,6 +213,20 @@ impl ShardWorker {
                 };
                 participant.udp_batcher.flush(&self.udp_socket);
                 // TODO: TCP
+            }
+
+            while let Some(event) = shard_events.pop_front() {
+                match self.event_tx.try_send(event) {
+                    Err(mailbox::TrySendError::Full(e)) => {
+                        tracing::warn!("shard event channel is full, piling up shard events");
+                        shard_events.push_front(e)
+                    }
+                    Err(mailbox::TrySendError::Closed(e)) => {
+                        tracing::warn!("shard event channel is closed, piling up shard events");
+                        shard_events.push_front(e)
+                    }
+                    Ok(_) => {}
+                }
             }
         }
 

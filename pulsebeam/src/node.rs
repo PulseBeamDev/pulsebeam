@@ -135,7 +135,7 @@ impl NodeBuilder {
             bind_udp_sockets(local_addr, external_addr, workers_count, self.udp_mode).await?;
         let candidates = sockets_to_candidates(&udp_sockets);
 
-        let (shard_event_tx, shard_event_rx) = mailbox::new(1024);
+        let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
         let mut shard_handles = Vec::new();
         let mut shard_command_txs = Vec::new();
         for (shard_id, sock) in udp_sockets.into_iter().enumerate() {
