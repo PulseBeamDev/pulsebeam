@@ -13,10 +13,6 @@ const MAX_EXTERNAL_ROOM_ID_LEN: usize = 36;
 
 pub type EntityId = String;
 
-/// Shard-local participant slot index. Compact u16 used internally by the shard
-/// instead of the full 16-byte `ParticipantId` UUID.
-pub type ParticipantKey = u16;
-
 pub mod prefix {
     pub const API_KEY_ID: &str = "kid";
     pub const API_PUBLIC_KEY: &str = "pk";

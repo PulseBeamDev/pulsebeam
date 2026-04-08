@@ -3,11 +3,11 @@ use std::{cmp::Reverse, collections::BinaryHeap};
 use ahash::HashMap;
 use tokio::time::Instant;
 
-use crate::entity::ParticipantKey;
+use crate::entity::ParticipantId;
 
-type HeapEntry = Reverse<(Instant, ParticipantKey)>;
+type HeapEntry = Reverse<(Instant, ParticipantId)>;
 
-/// A min-heap timer wheel keyed by `ParticipantKey`.
+/// A min-heap timer wheel keyed by `ParticipantId`.
 ///
 /// Each participant tracks a single active deadline. Scheduling a new deadline
 /// supersedes the previous one via lazy cancellation: stale heap entries are
@@ -17,7 +17,7 @@ pub struct TimerWheel {
     heap: BinaryHeap<HeapEntry>,
     /// Latest registered deadline per participant. Entries absent here or with
     /// a different instant than the heap entry are considered stale.
-    deadlines: HashMap<ParticipantKey, Instant>,
+    deadlines: HashMap<ParticipantId, Instant>,
 }
 
 impl TimerWheel {
@@ -25,15 +25,15 @@ impl TimerWheel {
     ///
     /// If a deadline already exists for this participant it is lazily cancelled:
     /// the old heap entry stays but will be skipped on expiry.
-    pub fn schedule(&mut self, id: ParticipantKey, deadline: Instant) {
+    pub fn schedule(&mut self, id: ParticipantId, deadline: Instant) {
         self.deadlines.insert(id, deadline);
         self.heap.push(Reverse((deadline, id)));
     }
 
     /// Cancel any pending deadline for `id`. Must be called when a participant
     /// is removed so heap entries referencing it are cleanly skipped.
-    pub fn cancel(&mut self, id: ParticipantKey) {
-        self.deadlines.remove(&id);
+    pub fn cancel(&mut self, id: &ParticipantId) {
+        self.deadlines.remove(id);
     }
 
     /// The next expiry instant, if any timers are scheduled.
@@ -51,7 +51,7 @@ impl TimerWheel {
     /// Calls `f(id)` once per participant whose **latest** deadline has fired.
     /// Stale heap entries (superseded by a later `schedule` call) are silently
     /// discarded and `f` is **not** called for them.
-    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantKey)) {
+    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantId)) {
         while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
             if deadline > now {
                 break;

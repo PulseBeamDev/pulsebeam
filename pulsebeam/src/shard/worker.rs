@@ -10,9 +10,9 @@ use str0m::media::KeyframeRequestKind;
 use tokio::time::Instant;
 
 use crate::{
-    entity::{ParticipantId, ParticipantKey},
+    entity::ParticipantId,
     participant::{ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents},
-    shard::{demux::Demuxer, scheduler::ParticipantScheduler, timer::TimerWheel},
+    shard::{demux::Demuxer, timer::TimerWheel},
     track::{StreamId, StreamWriter, Track},
 };
 
@@ -24,25 +24,25 @@ pub enum ShardError {
 
 #[derive(Default)]
 struct Routing {
-    subscribers: IndexSet<ParticipantKey>,
+    subscribers: IndexSet<ParticipantId>,
 }
 
 pub struct Router<'a> {
-    participant_key: ParticipantKey,
+    participant_id: &'a ParticipantId,
     routes: &'a mut HashMap<StreamId, Routing>,
 }
 
 impl<'a> Router<'a> {
     pub fn subscribe(&mut self, stream_id: StreamId) {
         let routing = self.routes.entry(stream_id).or_default();
-        routing.subscribers.insert(self.participant_key);
+        routing.subscribers.insert(*self.participant_id);
     }
 
     pub fn unsubscribe(&mut self, stream_id: &StreamId) {
         let Some(routing) = self.routes.get_mut(stream_id) else {
             return;
         };
-        routing.subscribers.swap_remove(&self.participant_key);
+        routing.subscribers.swap_remove(self.participant_id);
     }
 }
 
@@ -67,11 +67,13 @@ pub enum ShardEvent {
 pub struct ShardWorker {
     shard_id: usize,
     demuxer: Demuxer,
-    scheduler: ParticipantScheduler,
+    participants: HashMap<ParticipantId, ParticipantCore>,
     routing: HashMap<StreamId, Routing>,
 
     recv_batch: Vec<RecvPacketBatch>,
     timers: TimerWheel,
+    input_dirty: IndexSet<ParticipantId>,
+    fanout_dirty: IndexSet<ParticipantId>,
     events: ParticipantEvents,
     shard_events: VecDeque<ShardEvent>,
 
@@ -90,17 +92,21 @@ impl ShardWorker {
     ) -> Self {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let timers = TimerWheel::default();
+        let input_dirty: IndexSet<ParticipantId> = IndexSet::default();
+        let fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
         let events = ParticipantEvents::default();
         let shard_events = VecDeque::with_capacity(1024);
 
         Self {
             shard_id,
             demuxer: Demuxer::default(),
-            scheduler: ParticipantScheduler::new(),
+            participants: HashMap::default(),
             routing: HashMap::default(),
 
             recv_batch,
             timers,
+            input_dirty,
+            fanout_dirty,
             events,
             shard_events,
 
@@ -139,10 +145,10 @@ impl ShardWorker {
 
             let now = Instant::now();
 
-            self.timers.drain_expired(now, |key| {
-                if let Some(p) = self.scheduler.participants[key as usize].as_mut() {
-                    p.on_timeout(now);
-                    self.scheduler.input_dirty.set(key as usize, true);
+            self.timers.drain_expired(now, |participant_id| {
+                if let Some(participant) = self.participants.get_mut(&participant_id) {
+                    participant.on_timeout(now);
+                    self.input_dirty.insert(participant_id);
                 }
             });
 
@@ -151,23 +157,23 @@ impl ShardWorker {
                 .try_recv_batch(&mut self.recv_batch)
                 .unwrap_or_default();
             for batch in self.recv_batch.drain(..count) {
-                let Some(key) = self.demuxer.demux(&batch) else {
+                let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;
                 };
-                let Some(p) = self.scheduler.participants[key as usize].as_mut() else {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
-                p.on_ingress(batch);
-                self.scheduler.input_dirty.set(key as usize, true);
+                participant.on_ingress(batch);
+                self.input_dirty.insert(participant_id);
             }
 
             // Poll only participants touched this tick, collect their events.
-            for slot in self.scheduler.input_dirty.iter_ones() {
-                let Some(participant) = self.scheduler.participants[slot].as_mut() else {
+            for participant_id in &self.input_dirty {
+                let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
                 let mut router = Router {
-                    participant_key: slot as ParticipantKey,
+                    participant_id,
                     routes: &mut self.routing,
                 };
                 participant.poll(now, &mut self.events, &mut router);
@@ -182,14 +188,13 @@ impl ShardWorker {
                             continue;
                         };
 
-                        for key in route.subscribers.clone() {
-                            let Some(sub) = self.scheduler.participants[key as usize].as_mut()
-                            else {
+                        for participant_id in route.subscribers.clone() {
+                            let Some(sub) = self.participants.get_mut(&participant_id) else {
                                 continue;
                             };
                             let mut writer = StreamWriter(&mut sub.rtc);
                             sub.downstream.on_forward_rtp(&stream_id, &pkt, &mut writer);
-                            self.scheduler.fanout_dirty.set(key as usize, true);
+                            self.fanout_dirty.insert(participant_id);
                         }
                     }
                     ParticipantEvent::KeyframeRequest {
@@ -197,67 +202,53 @@ impl ShardWorker {
                         stream_id,
                         kind,
                     } => {
-                        if let Some(slot) = self.scheduler.get_slot(&origin_participant)
-                            && let Some(publisher) =
-                                self.scheduler.participants[slot as usize].as_mut()
-                        {
-                            // Same-shard: handle directly without going through controller.
-                            publisher.handle_remote_keyframe_request(stream_id, kind);
-                            self.scheduler.fanout_dirty.set(slot as usize, true);
-                        } else {
-                            // Cross-shard: forward to controller.
-                            self.shard_events.push_back(ShardEvent::KeyframeRequest {
-                                origin_participant,
-                                stream_id,
-                                kind,
-                            });
-                        }
+                        self.shard_events.push_back(ShardEvent::KeyframeRequest {
+                            origin_participant,
+                            stream_id,
+                            kind,
+                        });
                     }
-                    ParticipantEvent::NewDeadline((deadline, key)) => {
-                        self.timers.schedule(key, deadline);
+                    ParticipantEvent::NewDeadline((deadline, pid)) => {
+                        self.timers.schedule(pid, deadline);
                     }
                     ParticipantEvent::PublishedTrack(track) => {
                         self.shard_events
                             .push_back(ShardEvent::TrackPublished(track));
                     }
-                    ParticipantEvent::Exited(key) => {
-                        let participant_id = self.scheduler.participants[key as usize]
-                            .as_ref()
-                            .map(|p| p.participant_id);
-                        self.remove_participant(key);
-                        self.timers.cancel(key);
+                    ParticipantEvent::Exited(participant_id) => {
+                        self.remove_participant(&participant_id);
+                        self.timers.cancel(&participant_id);
+                        self.input_dirty.swap_remove(&participant_id);
                         self.shard_events
-                            .push_back(ShardEvent::ParticipantExited(participant_id.unwrap()));
+                            .push_back(ShardEvent::ParticipantExited(participant_id));
                     }
                 }
             }
 
-            for slot in self.scheduler.fanout_dirty.iter_ones() {
-                let Some(participant) = self.scheduler.participants[slot].as_mut() else {
+            for participant_id in &self.fanout_dirty {
+                let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
                 let mut router = Router {
-                    participant_key: slot as ParticipantKey,
+                    participant_id,
                     routes: &mut self.routing,
                 };
                 participant.poll(now, &mut self.events, &mut router);
             }
 
             // Flush egress for all dirty participants in one pass.
-            for slot in self
-                .scheduler
+            // Exited participants were swap_removed above so this is safe.
+            for participant_id in self
                 .input_dirty
-                .iter_ones()
-                .chain(self.scheduler.fanout_dirty.iter_ones())
+                .drain(..)
+                .chain(self.fanout_dirty.drain(..))
             {
-                let Some(participant) = self.scheduler.participants[slot].as_mut() else {
+                let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
                 participant.udp_batcher.flush(&self.udp_socket);
                 // TODO: TCP
             }
-            self.scheduler.input_dirty = bitvec::array::BitArray::ZERO;
-            self.scheduler.fanout_dirty = bitvec::array::BitArray::ZERO;
 
             while let Some(event) = self.shard_events.pop_front() {
                 match self.event_tx.try_send(event) {
@@ -280,58 +271,47 @@ impl ShardWorker {
     fn on_command(&mut self, cmd: ShardCommand) {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
-                if let Some(key) = self.add_participant(cfg) {
-                    // Mark dirty so the initial DTLS/ICE output is flushed this tick.
-                    self.scheduler.input_dirty.set(key as usize, true);
-                }
+                let participant_id = cfg.participant_id;
+                self.add_participant(participant_id, cfg);
+                // Mark dirty so the initial DTLS/ICE output is flushed this tick.
+                self.input_dirty.insert(participant_id);
             }
             ShardCommand::PublishTrack(track, participants) => {
                 for participant_id in &participants {
-                    let Some(slot) = self.scheduler.get_slot(participant_id) else {
+                    let Some(p) = self.participants.get_mut(participant_id) else {
                         tracing::debug!(%participant_id, track = %track.meta.id, "PublishTrack: participant not on this shard (may have exited)");
-                        continue;
-                    };
-                    let Some(p) = self.scheduler.participants[slot as usize].as_mut() else {
                         continue;
                     };
 
                     tracing::debug!(%participant_id, track = %track.meta.id, "delivering published track to subscriber");
                     p.on_tracks_published(&[track.clone()]);
-                    self.scheduler.input_dirty.set(slot as usize, true);
+                    self.input_dirty.insert(*participant_id);
                 }
             }
             ShardCommand::RequestKeyframe(participant_id, stream_id, kind) => {
-                let Some(slot) = self.scheduler.get_slot(&participant_id) else {
+                let Some(p) = self.participants.get_mut(&participant_id) else {
                     tracing::warn!(%participant_id, ?stream_id, "RequestKeyframe: publisher participant not on this shard");
                     return;
                 };
-                let Some(p) = self.scheduler.participants[slot as usize].as_mut() else {
-                    return;
-                };
                 p.handle_remote_keyframe_request(stream_id, kind);
-                self.scheduler.input_dirty.set(slot as usize, true);
+                self.input_dirty.insert(participant_id);
             }
         }
     }
 
-    fn add_participant(&mut self, cfg: ParticipantConfig) -> Option<ParticipantKey> {
-        let participant_id = cfg.participant_id;
-        // Evict any existing participant with the same id.
-        if let Some(existing_key) = self.scheduler.get_slot(&participant_id) {
-            self.remove_participant(existing_key);
-            self.timers.cancel(existing_key);
-        }
+    fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
+        self.remove_participant(&participant_id);
 
         let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1);
-        let ufrag = participant.ufrag();
-        let key = self.scheduler.insert(participant_id, participant)?;
-        self.demuxer.register_ice_ufrag(ufrag.as_bytes(), key);
+        self.demuxer
+            .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
+
+        self.participants.insert(participant_id, participant);
         tracing::info!(%participant_id, "participant added to shard");
-        Some(key)
     }
 
-    fn remove_participant(&mut self, key: ParticipantKey) -> Option<ParticipantCore> {
-        let mut participant = self.scheduler.remove(key)?;
+    fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ParticipantCore> {
+        let mut participant = self.participants.remove(participant_id)?;
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
             self.udp_socket.close_peer(addr);

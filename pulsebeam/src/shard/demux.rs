@@ -1,6 +1,6 @@
 use pulsebeam_runtime::net;
 
-use crate::entity::ParticipantKey;
+use crate::entity::ParticipantId;
 
 use ahash::{HashMap, HashMapExt};
 use std::net::SocketAddr;
@@ -17,9 +17,9 @@ use std::net::SocketAddr;
 /// Non-STUN packets from unknown addresses are rejected.
 pub struct Demuxer {
     /// The source of truth: maps a remote ICE ufrag to a participant.
-    ufrag_map: HashMap<Box<[u8]>, ParticipantKey>,
+    ufrag_map: HashMap<Box<[u8]>, ParticipantId>,
     /// A fast-path cache mapping a remote `SocketAddr` to a known participant.
-    addr_map: HashMap<SocketAddr, ParticipantKey>,
+    addr_map: HashMap<SocketAddr, ParticipantId>,
     /// A reverse map from a ufrag to all known addresses, for efficient cleanup.
     ufrag_addrs: HashMap<Box<[u8]>, Vec<SocketAddr>>,
     /// A reverse map from a socket addr to ufrag, for cleanup.
@@ -37,9 +37,9 @@ impl Demuxer {
     }
 
     /// Registers a participant with their ICE username fragment.
-    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], key: ParticipantKey) {
+    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_id: ParticipantId) {
         let boxed_ufrag = ufrag.to_vec().into_boxed_slice();
-        self.ufrag_map.insert(boxed_ufrag, key);
+        self.ufrag_map.insert(boxed_ufrag, participant_id);
     }
 
     /// Removes a participant and all associated state (ufrag and address mappings).
@@ -58,7 +58,7 @@ impl Demuxer {
 
     /// Routes a packet to the correct participant.
     /// Returns `true` if sent, `false` if dropped
-    pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<ParticipantKey> {
+    pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<ParticipantId> {
         let src = batch.src;
 
         if let Some(h) = self.addr_map.get_mut(&src) {
