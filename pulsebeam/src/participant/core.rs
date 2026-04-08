@@ -193,12 +193,11 @@ impl ParticipantCore {
         kind: KeyframeRequestKind,
     ) {
         let now = Instant::now();
-        if let Some(last) = self.last_keyframe_request.get(&stream_id) {
-            if now.duration_since(*last) < KEYFRAME_DEBOUNCE {
+        if let Some(last) = self.last_keyframe_request.get(&stream_id)
+            && now.duration_since(*last) < KEYFRAME_DEBOUNCE {
                 tracing::debug!(?stream_id, "debounced duplicate keyframe request");
                 return;
             }
-        }
 
         let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
             tracing::warn!(track = ?stream_id.0, "unknown upstream track for keyframe request");

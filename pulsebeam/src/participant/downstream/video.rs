@@ -9,7 +9,7 @@ use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
-use crate::entity::{ParticipantId, TrackId};
+use crate::entity::TrackId;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
@@ -226,7 +226,7 @@ impl VideoAllocator {
 
         let mut changed = false;
         for (key, decision) in &decisions {
-            let Some(slot) = self.slots.get_mut(key.clone()) else {
+            let Some(slot) = self.slots.get_mut(*key) else {
                 tracing::warn!("no slot found from decision");
                 continue;
             };
@@ -236,7 +236,7 @@ impl VideoAllocator {
                 AllocationDecision::Forward(layer, _) => {
                     changed |= slot.switch_to(layer, false);
                     let stream_id = layer.stream_id();
-                    self.routes.insert(stream_id.clone(), key.clone());
+                    self.routes.insert(stream_id, *key);
                     router.subscribe(stream_id);
                 }
                 AllocationDecision::Pause(layer) => {

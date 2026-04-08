@@ -4,7 +4,7 @@ use ahash::HashMap;
 use indexmap::IndexSet;
 use pulsebeam_runtime::{
     mailbox::{self},
-    net::{self, UnifiedSocket},
+    net::{self, RecvPacketBatch, UnifiedSocket},
 };
 use str0m::media::KeyframeRequestKind;
 use tokio::time::Instant;
@@ -70,6 +70,13 @@ pub struct ShardWorker {
     participants: HashMap<ParticipantId, ParticipantCore>,
     routing: HashMap<StreamId, Routing>,
 
+    recv_batch: Vec<RecvPacketBatch>,
+    timers: TimerWheel,
+    input_dirty: IndexSet<ParticipantId>,
+    fanout_dirty: IndexSet<ParticipantId>,
+    events: ParticipantEvents,
+    shard_events: VecDeque<ShardEvent>,
+
     udp_socket: UnifiedSocket,
 
     command_rx: mailbox::Receiver<ShardCommand>,
@@ -83,11 +90,26 @@ impl ShardWorker {
         command_rx: mailbox::Receiver<ShardCommand>,
         event_tx: mailbox::Sender<ShardEvent>,
     ) -> Self {
+        let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
+        let timers = TimerWheel::default();
+        let input_dirty: IndexSet<ParticipantId> = IndexSet::default();
+        let fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
+        let events = ParticipantEvents::default();
+        let shard_events = VecDeque::with_capacity(1024);
+
         Self {
             shard_id,
             demuxer: Demuxer::default(),
             participants: HashMap::default(),
             routing: HashMap::default(),
+
+            recv_batch,
+            timers,
+            input_dirty,
+            fanout_dirty,
+            events,
+            shard_events,
+
             udp_socket,
             command_rx,
             event_tx,
@@ -101,16 +123,9 @@ impl ShardWorker {
     }
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
-        let mut recv_batch = Vec::with_capacity(net::BATCH_SIZE);
-        let mut timers = TimerWheel::default();
-        let mut input_dirty: IndexSet<ParticipantId> = IndexSet::default();
-        let mut fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
-        let mut events = ParticipantEvents::default();
-        let mut shard_events = VecDeque::with_capacity(1024);
-
         loop {
             let wait = async {
-                match timers.next_deadline() {
+                match self.timers.next_deadline() {
                     Some(d) => tokio::time::sleep_until(d).await,
                     // No pending timers: park forever until socket wakes us.
                     None => std::future::pending::<()>().await,
@@ -123,25 +138,25 @@ impl ShardWorker {
                 _ = wait => {}
                 Ok(_) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
-                    self.on_command(cmd, &mut input_dirty);
+                    self.on_command(cmd);
                 }
                 else => break,
             }
 
             let now = Instant::now();
 
-            timers.drain_expired(now, |participant_id| {
+            self.timers.drain_expired(now, |participant_id| {
                 if let Some(participant) = self.participants.get_mut(&participant_id) {
                     participant.on_timeout(now);
-                    input_dirty.insert(participant_id);
+                    self.input_dirty.insert(participant_id);
                 }
             });
 
             let count = self
                 .udp_socket
-                .try_recv_batch(&mut recv_batch)
+                .try_recv_batch(&mut self.recv_batch)
                 .unwrap_or_default();
-            for batch in recv_batch.drain(..count) {
+            for batch in self.recv_batch.drain(..count) {
                 let Some(participant_id) = self.demuxer.demux(&batch) else {
                     continue;
                 };
@@ -149,11 +164,11 @@ impl ShardWorker {
                     continue;
                 };
                 participant.on_ingress(batch);
-                input_dirty.insert(participant_id);
+                self.input_dirty.insert(participant_id);
             }
 
             // Poll only participants touched this tick, collect their events.
-            for participant_id in &input_dirty {
+            for participant_id in &self.input_dirty {
                 let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
@@ -161,12 +176,12 @@ impl ShardWorker {
                     participant_id,
                     routes: &mut self.routing,
                 };
-                participant.poll(now, &mut events, &mut router);
+                participant.poll(now, &mut self.events, &mut router);
             }
 
             // Drain all events produced this tick before flushing egress,
             // so RTP forwards from this tick are batched into the same flush.
-            while let Some(event) = events.pop_front() {
+            while let Some(event) = self.events.pop_front() {
                 match event {
                     ParticipantEvent::PublishedRtp(stream_id, pkt) => {
                         let Some(route) = self.routing.get(&stream_id) else {
@@ -179,7 +194,7 @@ impl ShardWorker {
                             };
                             let mut writer = StreamWriter(&mut sub.rtc);
                             sub.downstream.on_forward_rtp(&stream_id, &pkt, &mut writer);
-                            fanout_dirty.insert(participant_id);
+                            self.fanout_dirty.insert(participant_id);
                         }
                     }
                     ParticipantEvent::KeyframeRequest {
@@ -187,28 +202,30 @@ impl ShardWorker {
                         stream_id,
                         kind,
                     } => {
-                        shard_events.push_back(ShardEvent::KeyframeRequest {
+                        self.shard_events.push_back(ShardEvent::KeyframeRequest {
                             origin_participant,
                             stream_id,
                             kind,
                         });
                     }
                     ParticipantEvent::NewDeadline((deadline, pid)) => {
-                        timers.schedule(pid, deadline);
+                        self.timers.schedule(pid, deadline);
                     }
                     ParticipantEvent::PublishedTrack(track) => {
-                        shard_events.push_back(ShardEvent::TrackPublished(track));
+                        self.shard_events
+                            .push_back(ShardEvent::TrackPublished(track));
                     }
                     ParticipantEvent::Exited(participant_id) => {
                         self.remove_participant(&participant_id);
-                        timers.cancel(&participant_id);
-                        input_dirty.swap_remove(&participant_id);
-                        shard_events.push_back(ShardEvent::ParticipantExited(participant_id));
+                        self.timers.cancel(&participant_id);
+                        self.input_dirty.swap_remove(&participant_id);
+                        self.shard_events
+                            .push_back(ShardEvent::ParticipantExited(participant_id));
                     }
                 }
             }
 
-            for participant_id in &fanout_dirty {
+            for participant_id in &self.fanout_dirty {
                 let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
@@ -216,12 +233,16 @@ impl ShardWorker {
                     participant_id,
                     routes: &mut self.routing,
                 };
-                participant.poll(now, &mut events, &mut router);
+                participant.poll(now, &mut self.events, &mut router);
             }
 
             // Flush egress for all dirty participants in one pass.
             // Exited participants were swap_removed above so this is safe.
-            for participant_id in input_dirty.drain(..).chain(fanout_dirty.drain(..)) {
+            for participant_id in self
+                .input_dirty
+                .drain(..)
+                .chain(self.fanout_dirty.drain(..))
+            {
                 let Some(participant) = self.participants.get_mut(&participant_id) else {
                     continue;
                 };
@@ -229,15 +250,15 @@ impl ShardWorker {
                 // TODO: TCP
             }
 
-            while let Some(event) = shard_events.pop_front() {
+            while let Some(event) = self.shard_events.pop_front() {
                 match self.event_tx.try_send(event) {
                     Err(mailbox::TrySendError::Full(e)) => {
                         tracing::warn!("shard event channel is full, piling up shard events");
-                        shard_events.push_front(e)
+                        self.shard_events.push_front(e)
                     }
                     Err(mailbox::TrySendError::Closed(e)) => {
                         tracing::warn!("shard event channel is closed, piling up shard events");
-                        shard_events.push_front(e)
+                        self.shard_events.push_front(e)
                     }
                     Ok(_) => {}
                 }
@@ -247,13 +268,13 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn on_command(&mut self, cmd: ShardCommand, dirty: &mut IndexSet<ParticipantId>) {
+    fn on_command(&mut self, cmd: ShardCommand) {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
                 let participant_id = cfg.participant_id;
                 self.add_participant(participant_id, cfg);
                 // Mark dirty so the initial DTLS/ICE output is flushed this tick.
-                dirty.insert(participant_id);
+                self.input_dirty.insert(participant_id);
             }
             ShardCommand::PublishTrack(track, participants) => {
                 for participant_id in &participants {
@@ -264,7 +285,7 @@ impl ShardWorker {
 
                     tracing::debug!(%participant_id, track = %track.meta.id, "delivering published track to subscriber");
                     p.on_tracks_published(&[track.clone()]);
-                    dirty.insert(*participant_id);
+                    self.input_dirty.insert(*participant_id);
                 }
             }
             ShardCommand::RequestKeyframe(participant_id, stream_id, kind) => {
@@ -273,7 +294,7 @@ impl ShardWorker {
                     return;
                 };
                 p.handle_remote_keyframe_request(stream_id, kind);
-                dirty.insert(participant_id);
+                self.input_dirty.insert(participant_id);
             }
         }
     }
