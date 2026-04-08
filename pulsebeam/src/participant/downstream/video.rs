@@ -226,7 +226,7 @@ impl VideoAllocator {
 
         let mut changed = false;
         for (key, decision) in &decisions {
-            let Some(slot) = self.slots.get_mut(*key) else {
+            let Some(slot) = self.slots.get_mut(key.clone()) else {
                 tracing::warn!("no slot found from decision");
                 continue;
             };
@@ -236,7 +236,7 @@ impl VideoAllocator {
                 AllocationDecision::Forward(layer, _) => {
                     changed |= slot.switch_to(layer, false);
                     let stream_id = layer.stream_id();
-                    self.routes.insert(stream_id, *key);
+                    self.routes.insert(stream_id.clone(), key.clone());
                     router.subscribe(stream_id);
                 }
                 AllocationDecision::Pause(layer) => {
