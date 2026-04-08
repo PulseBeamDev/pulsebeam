@@ -168,7 +168,7 @@ impl Signaling {
             .map(|t| signaling::Track {
                 id: t.id.as_str(),
                 kind: signaling::TrackKind::Video.into(),
-                participant_id: t.origin_participant.as_str(),
+                participant_id: t.origin.as_str(),
                 meta: Default::default(),
             })
             .collect();

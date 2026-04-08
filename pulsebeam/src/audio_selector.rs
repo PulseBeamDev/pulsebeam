@@ -114,7 +114,7 @@ impl TopNAudioSelector {
         Some((
             slot_idx,
             AudioRtpPacket {
-                participant_id: track.meta.origin_participant,
+                participant_id: track.meta.origin,
                 track_id,
                 packet: pkt,
             },

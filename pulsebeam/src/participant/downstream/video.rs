@@ -9,7 +9,7 @@ use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
-use crate::entity::TrackId;
+use crate::entity::{ParticipantId, TrackId};
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
@@ -131,7 +131,7 @@ impl VideoAllocator {
                 mid: s.mid,
                 track: {
                     let layer = s.target()?;
-                    self.tracks.get(&layer.track_id)?.meta.clone()
+                    self.tracks.get(&layer.meta.id)?.meta.clone()
                 },
             })
         })
@@ -152,7 +152,7 @@ impl VideoAllocator {
         let already_assigned: IndexSet<TrackId> = self
             .slots
             .values()
-            .filter_map(|s| s.staging.as_ref().map(|t| t.track_id))
+            .filter_map(|s| s.staging.as_ref().map(|t| t.meta.id))
             .collect();
 
         let mut pending_tracks = self
@@ -208,7 +208,7 @@ impl VideoAllocator {
             .iter()
             .filter_map(|(key, s)| {
                 let current = s.target()?;
-                let track = self.tracks.get(&current.track_id)?;
+                let track = self.tracks.get(&current.meta.id)?;
                 let current_quality = current.quality;
                 Some(SlotView {
                     key,
@@ -255,7 +255,17 @@ impl VideoAllocator {
         desired
     }
 
-    pub fn handle_keyframe_request(&self, _req: KeyframeRequest) {}
+    pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
+        let Some(slot) = self
+            .slots
+            .values()
+            .find(|s| s.mid == req.mid && s.rid == req.rid)
+        else {
+            return None;
+        };
+
+        slot.target()
+    }
 
     #[inline]
     pub fn on_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket, writer: &mut StreamWriter) {

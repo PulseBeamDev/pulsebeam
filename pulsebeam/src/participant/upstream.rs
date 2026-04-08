@@ -94,6 +94,13 @@ impl UpstreamAllocator {
             .map(|t| t.track.meta.id)
     }
 
+    pub fn mid_for_track_id(&self, track_id: TrackId) -> Option<Mid> {
+        self.published_tracks
+            .iter()
+            .find(|t| t.track.meta.id == track_id)
+            .map(|t| t.mid)
+    }
+
     pub fn poll_slow(&mut self, now: Instant) {
         self.published_tracks
             .iter_mut()

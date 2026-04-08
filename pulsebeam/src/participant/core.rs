@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt};
 use str0m::net::Protocol;
 use str0m::rtp::Ssrc;
 use str0m::{
@@ -35,6 +35,11 @@ pub enum ParticipantEvent {
     PublishedRtp(StreamId, RtpPacket),
     NewDeadline((Instant, ParticipantId)),
     Exited(ParticipantId),
+    KeyframeRequest {
+        origin: ParticipantId,
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    },
 }
 
 pub type ParticipantEvents = VecDeque<ParticipantEvent>;
@@ -146,13 +151,13 @@ impl ParticipantCore {
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
     pub fn on_tracks_published(&mut self, tracks: &[Track]) {
         for track in tracks {
-            if track.meta.origin_participant == self.participant_id {
+            if track.meta.origin == self.participant_id {
                 continue;
             }
 
             tracing::info!(
                 track = %track.meta.id,
-                origin = %track.meta.origin_participant,
+                origin = %track.meta.origin,
                 "participant received published track"
             );
             self.downstream.add_track(track.clone());
@@ -178,6 +183,23 @@ impl ParticipantCore {
         } else {
             tracing::warn!(?key, "stream not found for keyframe request");
         }
+    }
+
+    pub fn handle_remote_keyframe_request(
+        &mut self,
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    ) {
+        let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
+            tracing::warn!(track = ?stream_id.0, "unknown upstream track for keyframe request");
+            return;
+        };
+
+        self.handle_keyframe_request(KeyframeRequest {
+            mid,
+            rid: stream_id.1,
+            kind,
+        });
     }
 
     pub fn handle_tick(&mut self) {
@@ -385,7 +407,16 @@ impl ParticipantCore {
             }
             Event::MediaAdded(media) => self.handle_media_added(media, events),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
-            Event::KeyframeRequest(req) => self.downstream.handle_keyframe_request(req),
+            Event::KeyframeRequest(req) => {
+                let kind = req.kind;
+                if let Some(layer) = self.downstream.handle_keyframe_request(req) {
+                    events.push_back(ParticipantEvent::KeyframeRequest {
+                        origin: layer.meta.origin,
+                        stream_id: layer.stream_id(),
+                        kind,
+                    });
+                }
+            }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 self.downstream.update_bitrate(available)
             }
@@ -427,7 +458,7 @@ impl ParticipantCore {
                 let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
                 let track_meta = track::TrackMeta {
                     id: track_id,
-                    origin_participant: self.participant_id,
+                    origin: self.participant_id,
                     kind: media.kind,
                 };
                 match media.kind {

@@ -29,10 +29,7 @@ impl Room {
     }
 
     pub fn publish_track(&mut self, track: Track) {
-        let tracks = self
-            .participants
-            .entry(track.meta.origin_participant)
-            .or_default();
+        let tracks = self.participants.entry(track.meta.origin).or_default();
 
         if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
             tracks.push(track);

@@ -201,7 +201,7 @@ impl ControllerActor {
     async fn on_shard_event(&mut self, event: ShardEvent) -> Option<()> {
         match event {
             ShardEvent::TrackPublished(track) => {
-                let origin = track.meta.origin_participant;
+                let origin = track.meta.origin;
                 let meta = self.participants.get(&origin).or_else(|| {
                     tracing::warn!(%origin, track = %track.meta.id, "TrackPublished: origin participant not found in controller, dropping");
                     None
@@ -214,7 +214,7 @@ impl ControllerActor {
                 room.publish_track(track.clone());
                 let mut shards: IndexMap<usize, Vec<ParticipantId>> = IndexMap::new();
                 for participant_id in room.participants_iter() {
-                    if *participant_id == track.meta.origin_participant {
+                    if *participant_id == track.meta.origin {
                         continue;
                     }
 
@@ -245,6 +245,22 @@ impl ControllerActor {
 
             ShardEvent::ParticipantExited(participant_id) => {
                 self.delete_participant(&participant_id);
+            }
+            ShardEvent::KeyframeRequest {
+                origin_participant,
+                stream_id,
+                kind,
+            } => {
+                let meta = self.participants.get(&origin_participant).or_else(|| {
+                    tracing::warn!(%origin_participant, track = ?stream_id.0, "KeyframeRequest: origin participant not found in controller");
+                    None
+                })?;
+                self.router
+                    .send(
+                        meta.shard_id,
+                        ShardCommand::RequestKeyframe(origin_participant, stream_id, kind),
+                    )
+                    .await;
             }
         }
 

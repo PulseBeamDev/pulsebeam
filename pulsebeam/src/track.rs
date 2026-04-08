@@ -132,7 +132,7 @@ impl std::fmt::Debug for LayerQuality {
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
     pub id: crate::entity::TrackId,
-    pub origin_participant: crate::entity::ParticipantId,
+    pub origin: crate::entity::ParticipantId,
     pub kind: MediaKind,
 }
 
@@ -254,7 +254,7 @@ impl Track {
 
 #[derive(Clone, Debug)]
 pub struct TrackLayer {
-    pub track_id: TrackId,
+    pub meta: TrackMeta,
     pub rid: Option<Rid>,
     pub quality: LayerQuality,
     // pub keyframe_requester: KeyframeRequester,
@@ -265,13 +265,13 @@ impl Eq for TrackLayer {}
 
 impl PartialEq for TrackLayer {
     fn eq(&self, other: &Self) -> bool {
-        other.track_id == self.track_id && other.rid == self.rid && other.quality == self.quality
+        other.meta == self.meta && other.rid == self.rid && other.quality == self.quality
     }
 }
 
 impl TrackLayer {
     pub fn stream_id(&self) -> StreamId {
-        (self.track_id, self.rid)
+        (self.meta.id, self.rid)
     }
 
     pub fn request_keyframe(&self) {
@@ -281,12 +281,7 @@ impl TrackLayer {
 
 impl Display for TrackLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}",
-            self.track_id,
-            self.rid.as_deref().unwrap_or("_")
-        )
+        write!(f, "{}:{}", self.meta.id, self.rid.as_deref().unwrap_or("_"))
     }
 }
 
@@ -362,7 +357,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             monitor,
         });
         layers.push(TrackLayer {
-            track_id: meta.id,
+            meta: meta.clone(),
             rid,
             quality,
             state: stream_state,
@@ -435,7 +430,7 @@ pub mod test_utils {
         let track_id = participant_id.derive_track_id(MediaKind::Video, &mid);
         let meta = TrackMeta {
             id: track_id,
-            origin_participant: participant_id,
+            origin: participant_id,
             kind: MediaKind::Video,
         };
         crate::track::new_video(mid, meta, layers)
@@ -445,7 +440,7 @@ pub mod test_utils {
         let track_id = participant_id.derive_track_id(MediaKind::Audio, &mid);
         let meta = TrackMeta {
             id: track_id,
-            origin_participant: participant_id,
+            origin: participant_id,
             kind: MediaKind::Audio,
         };
         crate::track::new_audio(mid, meta)

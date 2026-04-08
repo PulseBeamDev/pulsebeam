@@ -6,7 +6,7 @@ use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
 use crate::shard::worker::Router;
-use crate::track::{StreamId, StreamWriter, Track};
+use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
@@ -88,8 +88,8 @@ impl DownstreamAllocator {
         self.video.on_rtp(stream_id, pkt, writer);
     }
 
-    pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
-        self.video.handle_keyframe_request(req);
+    pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) -> Option<&TrackLayer> {
+        self.video.handle_keyframe_request(req)
     }
 }
 

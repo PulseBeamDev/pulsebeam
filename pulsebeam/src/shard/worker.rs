@@ -6,6 +6,7 @@ use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, UnifiedSocket},
 };
+use str0m::media::KeyframeRequestKind;
 use tokio::time::Instant;
 
 use crate::{
@@ -49,12 +50,18 @@ impl<'a> Router<'a> {
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
     PublishTrack(Track, Vec<ParticipantId>),
+    RequestKeyframe(ParticipantId, StreamId, KeyframeRequestKind),
 }
 
 #[derive(Debug)]
 pub enum ShardEvent {
     TrackPublished(Track),
     ParticipantExited(ParticipantId),
+    KeyframeRequest {
+        origin_participant: ParticipantId,
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    },
 }
 
 pub struct ShardWorker {
@@ -175,6 +182,17 @@ impl ShardWorker {
                             fanout_dirty.insert(participant_id);
                         }
                     }
+                    ParticipantEvent::KeyframeRequest {
+                        origin: origin_participant,
+                        stream_id,
+                        kind,
+                    } => {
+                        shard_events.push_back(ShardEvent::KeyframeRequest {
+                            origin_participant,
+                            stream_id,
+                            kind,
+                        });
+                    }
                     ParticipantEvent::NewDeadline((deadline, pid)) => {
                         timers.schedule(pid, deadline);
                     }
@@ -248,6 +266,14 @@ impl ShardWorker {
                     p.on_tracks_published(&[track.clone()]);
                     dirty.insert(*participant_id);
                 }
+            }
+            ShardCommand::RequestKeyframe(participant_id, stream_id, kind) => {
+                let Some(p) = self.participants.get_mut(&participant_id) else {
+                    tracing::warn!(%participant_id, ?stream_id, "RequestKeyframe: publisher participant not on this shard");
+                    return;
+                };
+                p.handle_remote_keyframe_request(stream_id, kind);
+                dirty.insert(participant_id);
             }
         }
     }
