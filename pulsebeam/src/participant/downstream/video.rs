@@ -224,26 +224,32 @@ impl VideoAllocator {
 
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
 
-        if !decisions.is_empty() {
-            log_allocation(available_bandwidth, desired, &decisions, &views);
-        }
-
-        for (key, decision) in decisions {
-            let Some(slot) = self.slots.get_mut(key) else {
+        let mut changed = false;
+        for (key, decision) in &decisions {
+            let Some(slot) = self.slots.get_mut(*key) else {
                 tracing::warn!("no slot found from decision");
                 continue;
             };
 
+            // TODO: handle unsubscribing from old routes
             match decision {
                 AllocationDecision::Forward(layer, _) => {
-                    slot.switch_to(layer, false);
-                    router.subscribe(layer.stream_id());
+                    changed |= slot.switch_to(layer, false);
+                    let stream_id = layer.stream_id();
+                    self.routes.insert(stream_id, *key);
+                    router.subscribe(stream_id);
                 }
                 AllocationDecision::Pause(layer) => {
-                    slot.pause_at(layer);
-                    router.unsubscribe(&layer.stream_id());
+                    changed |= slot.pause_at(layer);
+                    let stream_id = layer.stream_id();
+                    tracing::debug!(mid = ?slot.mid, ?stream_id, "unsubscribing paused video stream");
+                    router.unsubscribe(&stream_id);
                 }
             }
+        }
+
+        if changed {
+            log_allocation(available_bandwidth, desired, &decisions, &views);
         }
 
         desired
@@ -322,16 +328,46 @@ impl Slot {
         }
     }
 
-    fn switch_to(&mut self, new_layer: &TrackLayer, _force: bool) {
+    fn switch_to(&mut self, new_layer: &TrackLayer, _force: bool) -> bool {
         // TODO: check old staging, and buffer keyframe.
-        self.staging = Some(new_layer.clone());
-        self.paused = false;
+        let mut changed = false;
+
+        // Check if the staging layer is actually different
+        if self.staging.as_ref() != Some(new_layer) {
+            self.staging = Some(new_layer.clone());
+            changed = true;
+        }
+
+        // Check if we were previously paused
+        if self.paused {
+            self.paused = false;
+            changed = true;
+        }
+
+        changed
     }
 
-    fn pause_at(&mut self, layer: &TrackLayer) {
-        self.active = None;
-        self.staging = Some(layer.clone());
-        self.paused = true;
+    fn pause_at(&mut self, layer: &TrackLayer) -> bool {
+        let mut changed = false;
+
+        // If we weren't active, but now we are explicitly None,
+        // we check if it was already None to avoid redundant dirtying.
+        if self.active.is_some() {
+            self.active = None;
+            changed = true;
+        }
+
+        if self.staging.as_ref() != Some(layer) {
+            self.staging = Some(layer.clone());
+            changed = true;
+        }
+
+        if !self.paused {
+            self.paused = true;
+            changed = true;
+        }
+
+        changed
     }
 
     fn process(&mut self, _pkt: &RtpPacket) {}

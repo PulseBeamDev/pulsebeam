@@ -1,6 +1,5 @@
 use super::signaling::Signaling;
 use ahash::{HashMap, HashMapExt};
-use indexmap::IndexMap;
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;

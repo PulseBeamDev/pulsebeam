@@ -261,6 +261,14 @@ pub struct TrackLayer {
     pub state: StreamState,
 }
 
+impl Eq for TrackLayer {}
+
+impl PartialEq for TrackLayer {
+    fn eq(&self, other: &Self) -> bool {
+        other.track_id == self.track_id && other.rid == self.rid && other.quality == self.quality
+    }
+}
+
 impl TrackLayer {
     pub fn stream_id(&self) -> StreamId {
         (self.track_id, self.rid)

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use ahash::HashMap;
 use indexmap::IndexSet;
 use pulsebeam_runtime::{
-    mailbox::{self, TryRecvError},
+    mailbox::{self},
     net::{self, UnifiedSocket},
 };
 use tokio::time::Instant;
@@ -171,8 +171,7 @@ impl ShardWorker {
                                 continue;
                             };
                             let mut writer = StreamWriter(&mut sub.rtc);
-                            sub.downstream
-                                .on_forward_rtp(&stream_id, pkt.clone(), &mut writer);
+                            sub.downstream.on_forward_rtp(&stream_id, &pkt, &mut writer);
                             fanout_dirty.insert(participant_id);
                         }
                     }

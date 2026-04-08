@@ -74,17 +74,18 @@ impl DownstreamAllocator {
         bwe.set_desired_bitrate(desired);
     }
 
-    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut Router) {
+    pub fn poll_slow(&mut self, now: Instant, _bwe: &mut Bwe, router: &mut Router) {
         self.video.poll_slow(now, self.available_bandwidth, router);
     }
 
     #[inline]
     pub fn on_forward_rtp(
         &mut self,
-        _stream_id: &StreamId,
-        _pkt: RtpPacket,
-        _writer: &mut StreamWriter,
+        stream_id: &StreamId,
+        pkt: &RtpPacket,
+        writer: &mut StreamWriter,
     ) {
+        self.video.on_rtp(stream_id, pkt, writer);
     }
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) {
