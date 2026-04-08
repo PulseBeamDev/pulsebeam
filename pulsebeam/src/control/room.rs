@@ -46,4 +46,15 @@ impl Room {
     pub fn participant_count(&self) -> usize {
         self.participants.len()
     }
+
+    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
+        self.participants.values().flatten()
+    }
+
+    pub fn tracks_for(&self, participant_id: &ParticipantId) -> impl Iterator<Item = &Track> {
+        self.participants
+            .iter()
+            .filter(move |(p_id, _)| *p_id != participant_id)
+            .flat_map(|(_, tracks)| tracks.iter())
+    }
 }

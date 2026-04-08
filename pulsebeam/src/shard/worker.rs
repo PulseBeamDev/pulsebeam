@@ -48,7 +48,7 @@ impl<'a> Router<'a> {
 #[derive(Debug)]
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
-    PublishTrack(Vec<ParticipantId>),
+    PublishTrack(Track, Vec<ParticipantId>),
 }
 
 #[derive(Debug)]
@@ -238,11 +238,13 @@ impl ShardWorker {
                 // Mark dirty so the initial DTLS/ICE output is flushed this tick.
                 dirty.insert(participant_id);
             }
-            ShardCommand::PublishTrack(participants) => {
+            ShardCommand::PublishTrack(track, participants) => {
                 for participant_id in &participants {
-                    let Some(_p) = self.participants.get_mut(participant_id) else {
+                    let Some(p) = self.participants.get_mut(participant_id) else {
                         continue;
                     };
+
+                    p.on_tracks_published(&[track.clone()]);
                     dirty.insert(*participant_id);
                 }
             }

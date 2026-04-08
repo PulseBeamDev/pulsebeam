@@ -219,7 +219,7 @@ impl UpstreamTrack {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Track {
     pub meta: TrackMeta,
     pub layers: Vec<TrackLayer>,

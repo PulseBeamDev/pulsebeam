@@ -204,9 +204,13 @@ impl ControllerActor {
                 let meta = self.participants.get(&track.meta.origin_participant)?;
                 let room = self.rooms.get_mut(&meta.room_id)?;
 
-                room.publish_track(track);
+                room.publish_track(track.clone());
                 let mut shards: IndexMap<usize, Vec<ParticipantId>> = IndexMap::new();
                 for participant_id in room.participants_iter() {
+                    if *participant_id == track.meta.origin_participant {
+                        continue;
+                    }
+
                     let Some(p) = self.participants.get(participant_id) else {
                         continue;
                     };
@@ -216,7 +220,10 @@ impl ControllerActor {
                 }
                 for (shard_id, participants) in shards {
                     self.router
-                        .send(shard_id, ShardCommand::PublishTrack(participants))
+                        .send(
+                            shard_id,
+                            ShardCommand::PublishTrack(track.clone(), participants),
+                        )
                         .await;
                 }
             }
@@ -271,10 +278,12 @@ impl ControllerActor {
             .rooms
             .entry(state.room_id.clone())
             .or_insert_with(|| Room::new(state.room_id.clone()));
+        let tracks = room.tracks_for(&state.participant_id);
         let cfg = ParticipantConfig {
             manual_sub: state.manual_sub,
             participant_id: state.participant_id,
             rtc,
+            available_tracks: tracks.cloned().collect(),
         };
 
         // TODO: handle patch

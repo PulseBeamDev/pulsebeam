@@ -1,5 +1,6 @@
 use super::signaling::Signaling;
 use ahash::{HashMap, HashMapExt};
+use indexmap::IndexMap;
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
@@ -68,6 +69,7 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
+    pub available_tracks: Vec<Track>,
 }
 
 pub struct ParticipantCore {
@@ -139,6 +141,19 @@ impl ParticipantCore {
         let _ = self.rtc.handle_input(Input::Timeout(now.into()));
     }
 
+    pub fn on_tracks_published(&mut self, tracks: &[Track]) {
+        for track in tracks {
+            if track.meta.origin_participant == self.participant_id {
+                continue;
+            }
+
+            self.downstream.add_track(track.clone());
+        }
+        self.signaling.mark_tracks_dirty();
+        self.signaling.mark_assignments_dirty();
+        self.signaling.reconcile(&mut self.downstream);
+    }
+
     pub fn ufrag(&mut self) -> String {
         self.rtc.direct_api().local_ice_credentials().ufrag
     }
@@ -161,18 +176,6 @@ impl ParticipantCore {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }
 
-    pub fn handle_available_tracks(&mut self, _tracks: &HashMap<entity::TrackId, Track>) {
-        // for (meta, layers) in tracks.values() {
-        //     if meta.origin_participant != self.participant_id {
-        //         self.downstream
-        //             .add_video_track(meta.clone(), layers.clone());
-        //     }
-        // }
-        self.signaling.mark_tracks_dirty();
-        self.signaling.mark_assignments_dirty();
-        self.signaling.reconcile(&mut self.downstream);
-    }
-
     pub fn remove_available_tracks(&mut self, _tracks: &HashMap<entity::TrackId, Track>) {
         // for track in tracks.values() {
         //     self.downstream.remove_track(track);
@@ -190,7 +193,10 @@ impl ParticipantCore {
         let next_deadline = self.poll_until_deadline(now, events, router);
 
         if let Some(next_deadline) = next_deadline {
-            events.push_back(ParticipantEvent::NewDeadline((next_deadline, self.participant_id)));
+            events.push_back(ParticipantEvent::NewDeadline((
+                next_deadline,
+                self.participant_id,
+            )));
         } else {
             events.push_back(ParticipantEvent::Exited(self.participant_id));
         }
