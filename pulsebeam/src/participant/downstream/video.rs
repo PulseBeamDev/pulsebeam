@@ -1,6 +1,9 @@
 use crate::participant::downstream::SlotConfig;
-use crate::rtp::RtpPacket;
+use crate::rtp::buffer::KeyframeBuffer;
+use crate::rtp::switcher::Switcher;
+use crate::rtp::{self, RtpPacket};
 use crate::shard::worker::Router;
+use futures_concurrency::stream;
 use indexmap::IndexSet;
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -279,14 +282,13 @@ impl VideoAllocator {
             return;
         };
 
-        // TODO: check slot state before forwarding
-        slot.process(pkt);
-        writer.write(pkt, &slot.ssrc, slot.pt);
+        slot.process(stream_id, pkt);
+        while let Some(pkt) = slot.switcher.pop() {
+            writer.write_owned(pkt, &slot.ssrc, slot.pt);
+        }
     }
 
-    pub fn poll_slow(&mut self, _now: Instant, bandwidth: Bitrate, router: &mut Router) {
-        self.update_allocations(bandwidth, router);
-    }
+    pub fn poll_slow(&mut self, _now: Instant, bandwidth: Bitrate, router: &mut Router) {}
 }
 
 #[derive(PartialEq)]
@@ -304,6 +306,8 @@ struct Slot {
     active: Option<TrackLayer>,
     staging: Option<TrackLayer>,
 
+    switcher: Switcher,
+
     mid: Mid,
     rid: Option<Rid>,
     max_height: u32,
@@ -320,6 +324,8 @@ impl Slot {
 
             active: None,
             staging: None,
+
+            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             max_height: 0,
             paused: true,
         }
@@ -380,7 +386,23 @@ impl Slot {
         changed
     }
 
-    fn process(&mut self, _pkt: &RtpPacket) {}
+    fn process(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
+        if let Some(active) = self.active.as_ref()
+            && active.is(stream_id)
+        {
+            self.switcher.push(pkt.clone());
+        } else if let Some(staging) = self.staging.as_ref()
+            && staging.is(stream_id)
+        {
+            self.switcher.stage(pkt.clone());
+
+            if self.switcher.ready_to_stream() {
+                // TODO: formalize the active and staging mutations to manage the subscriptions
+                drop(staging);
+                self.active = self.staging.take();
+            }
+        }
+    }
 }
 
 pub fn log_allocation(

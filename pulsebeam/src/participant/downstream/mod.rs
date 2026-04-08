@@ -48,6 +48,7 @@ impl DownstreamAllocator {
         } else {
             self.audio.add_track(track);
         }
+        self.dirty_allocation = true;
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
@@ -59,6 +60,7 @@ impl DownstreamAllocator {
                 self.audio.add_slot(slot.mid, slot.pt, slot.ssrc);
             }
         }
+        self.dirty_allocation = true;
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
@@ -74,7 +76,8 @@ impl DownstreamAllocator {
         bwe.set_desired_bitrate(desired);
     }
 
-    pub fn poll_slow(&mut self, now: Instant, _bwe: &mut Bwe, router: &mut Router) {
+    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut Router) {
+        self.update_allocations(bwe, router);
         self.video.poll_slow(now, self.available_bandwidth, router);
     }
 
