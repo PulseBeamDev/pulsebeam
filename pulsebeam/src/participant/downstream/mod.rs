@@ -74,8 +74,8 @@ impl DownstreamAllocator {
         bwe.set_desired_bitrate(desired);
     }
 
-    pub fn poll_slow(&mut self, now: Instant, _bwe: &mut Bwe) {
-        self.video.poll_slow(now);
+    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut Router) {
+        self.video.poll_slow(now, self.available_bandwidth, router);
     }
 
     #[inline]

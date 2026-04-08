@@ -201,8 +201,15 @@ impl ControllerActor {
     async fn on_shard_event(&mut self, event: ShardEvent) -> Option<()> {
         match event {
             ShardEvent::TrackPublished(track) => {
-                let meta = self.participants.get(&track.meta.origin_participant)?;
-                let room = self.rooms.get_mut(&meta.room_id)?;
+                let origin = track.meta.origin_participant;
+                let meta = self.participants.get(&origin).or_else(|| {
+                    tracing::warn!(%origin, track = %track.meta.id, "TrackPublished: origin participant not found in controller, dropping");
+                    None
+                })?;
+                let room = self.rooms.get_mut(&meta.room_id).or_else(|| {
+                    tracing::warn!(%origin, track = %track.meta.id, room = %meta.room_id, "TrackPublished: room not found in controller, dropping");
+                    None
+                })?;
 
                 room.publish_track(track.clone());
                 let mut shards: IndexMap<usize, Vec<ParticipantId>> = IndexMap::new();
@@ -218,6 +225,14 @@ impl ControllerActor {
                     let entry = shards.entry(p.shard_id).or_default();
                     entry.push(*participant_id);
                 }
+                let total_subscribers: usize = shards.values().map(|v| v.len()).sum();
+                tracing::info!(
+                    track = %track.meta.id,
+                    %origin,
+                    total_subscribers,
+                    shard_count = shards.len(),
+                    "fanning out track to subscribers"
+                );
                 for (shard_id, participants) in shards {
                     self.router
                         .send(

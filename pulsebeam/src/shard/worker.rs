@@ -241,9 +241,11 @@ impl ShardWorker {
             ShardCommand::PublishTrack(track, participants) => {
                 for participant_id in &participants {
                     let Some(p) = self.participants.get_mut(participant_id) else {
+                        tracing::debug!(%participant_id, track = %track.meta.id, "PublishTrack: participant not on this shard (may have exited)");
                         continue;
                     };
 
+                    tracing::debug!(%participant_id, track = %track.meta.id, "delivering published track to subscriber");
                     p.on_tracks_published(&[track.clone()]);
                     dirty.insert(*participant_id);
                 }

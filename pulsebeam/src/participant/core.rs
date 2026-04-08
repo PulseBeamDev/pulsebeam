@@ -117,7 +117,7 @@ impl ParticipantCore {
         let udp_batcher = Batcher::with_capacity(udp_gso_size);
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
-        Self {
+        let mut p = Self {
             pending_ingress: VecDeque::new(),
             first_poll: true,
             participant_id: cfg.participant_id,
@@ -130,7 +130,10 @@ impl ParticipantCore {
             disconnect_reason: None,
             signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
-        }
+        };
+
+        p.on_tracks_published(&cfg.available_tracks);
+        p
     }
 
     pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
@@ -141,12 +144,18 @@ impl ParticipantCore {
         let _ = self.rtc.handle_input(Input::Timeout(now.into()));
     }
 
+    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
     pub fn on_tracks_published(&mut self, tracks: &[Track]) {
         for track in tracks {
             if track.meta.origin_participant == self.participant_id {
                 continue;
             }
 
+            tracing::info!(
+                track = %track.meta.id,
+                origin = %track.meta.origin_participant,
+                "participant received published track"
+            );
             self.downstream.add_track(track.clone());
         }
         self.signaling.mark_tracks_dirty();
@@ -184,8 +193,9 @@ impl ParticipantCore {
         self.signaling.mark_assignments_dirty();
     }
 
-    fn poll_slow(&mut self, now: Instant) {
-        self.downstream.poll_slow(now, &mut self.rtc.bwe());
+    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
+    fn poll_slow(&mut self, now: Instant, router: &mut Router) {
+        self.downstream.poll_slow(now, &mut self.rtc.bwe(), router);
         self.upstream.poll_slow(now);
     }
 
@@ -209,7 +219,7 @@ impl ParticipantCore {
         router: &mut Router,
     ) -> Option<Instant> {
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
-            self.poll_slow(now);
+            self.poll_slow(now, router);
             self.last_slow_poll = now;
         }
 
@@ -411,6 +421,7 @@ impl ParticipantCore {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id, mid = %media.mid))]
     fn handle_media_added(&mut self, media: MediaAdded, events: &mut ParticipantEvents) {
         match media.direction {
             Direction::RecvOnly => {
@@ -497,11 +508,12 @@ impl ParticipantCore {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(participant_id = %self.participant_id, %reason))]
     pub fn disconnect(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_some() {
             return;
         }
-        tracing::info!(%reason, "Participant core disconnecting");
+        tracing::info!("Participant core disconnecting");
         self.disconnect_reason = Some(reason);
         self.rtc.disconnect();
     }

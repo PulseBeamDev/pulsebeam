@@ -161,6 +161,21 @@ impl VideoAllocator {
             .filter(|(id, _)| !already_assigned.contains(*id))
             .map(|(_, s)| s);
 
+        let idle_slot_count = self
+            .slots
+            .values()
+            .filter(|s| s.state() == SlotState::Idle)
+            .count();
+        let pending_count = self.tracks.len().saturating_sub(already_assigned.len());
+        if pending_count > 0 && idle_slot_count == 0 {
+            tracing::debug!(
+                pending_tracks = pending_count,
+                total_slots = self.slots.len(),
+                "rebalance: pending tracks but no idle slots, tracks will wait"
+            );
+        }
+
+        let mut staged = 0usize;
         for slot in self
             .slots
             .values_mut()
@@ -169,9 +184,16 @@ impl VideoAllocator {
             if let Some(track_state) = pending_tracks.next() {
                 let layer = track_state.lowest_quality();
                 slot.switch_to(layer, true);
+                staged += 1;
             } else {
                 break;
             }
+        }
+        if staged > 0 {
+            tracing::debug!(
+                staged,
+                "rebalance: staged tracks into idle slots, awaiting BWE to activate"
+            );
         }
     }
 
@@ -246,7 +268,9 @@ impl VideoAllocator {
         writer.write(pkt, &slot.ssrc, slot.pt);
     }
 
-    pub fn poll_slow(&mut self, _now: Instant) {}
+    pub fn poll_slow(&mut self, _now: Instant, bandwidth: Bitrate, router: &mut Router) {
+        self.update_allocations(bandwidth, router);
+    }
 }
 
 #[derive(PartialEq)]
