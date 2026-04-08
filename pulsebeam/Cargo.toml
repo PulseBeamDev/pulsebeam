@@ -16,6 +16,7 @@ arrayvec = { version = "0.7.6", features = ["serde"] }
 axum = { version = "0.8.8", features = ["macros"] }
 axum-extra = { version = "0.12.5", features = ["typed-header"] }
 base32 = "0.5.1"
+bitvec = "1.0.1"
 bytes = { workspace = true }
 clap = { version = "4.5.57", features = ["derive"] }
 console-subscriber = { version = "0.5", optional = true }
