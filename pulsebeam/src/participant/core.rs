@@ -17,7 +17,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity::{self, ParticipantId, TrackId};
+use crate::entity::{self, ParticipantId, ParticipantKey, TrackId};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::signaling;
 use crate::participant::{
@@ -33,8 +33,8 @@ const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub enum ParticipantEvent {
     PublishedTrack(Track),
     PublishedRtp(StreamId, RtpPacket),
-    NewDeadline((Instant, ParticipantId)),
-    Exited(ParticipantId),
+    NewDeadline((Instant, ParticipantKey)),
+    Exited(ParticipantKey),
     KeyframeRequest {
         origin: ParticipantId,
         stream_id: StreamId,
@@ -78,6 +78,7 @@ pub struct ParticipantConfig {
 
 pub struct ParticipantCore {
     // Hot: touched on every packet
+    pub key: ParticipantKey,
     pub rtc: Rtc,
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
@@ -125,6 +126,7 @@ impl ParticipantCore {
         let mut p = Self {
             pending_ingress: VecDeque::new(),
             first_poll: true,
+            key: 0,
             participant_id: cfg.participant_id,
             rtc,
             udp_batcher,
@@ -248,10 +250,10 @@ impl ParticipantCore {
         if let Some(next_deadline) = next_deadline {
             events.push_back(ParticipantEvent::NewDeadline((
                 next_deadline,
-                self.participant_id,
+                self.key,
             )));
         } else {
-            events.push_back(ParticipantEvent::Exited(self.participant_id));
+            events.push_back(ParticipantEvent::Exited(self.key));
         }
     }
 
