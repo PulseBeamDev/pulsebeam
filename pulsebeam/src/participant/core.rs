@@ -25,7 +25,7 @@ use crate::participant::{
 };
 use crate::rtp::RtpPacket;
 use crate::shard::worker::Router;
-use crate::track::{self, StreamId, Track};
+use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, Track};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -89,6 +89,7 @@ pub struct ParticipantCore {
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
     pub participant_id: entity::ParticipantId,
+    last_keyframe_request: HashMap<StreamId, Instant>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -134,6 +135,7 @@ impl ParticipantCore {
             disconnect_reason: None,
             signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
+            last_keyframe_request: HashMap::new(),
         };
 
         p.on_tracks_published(&cfg.available_tracks);
@@ -190,11 +192,20 @@ impl ParticipantCore {
         stream_id: StreamId,
         kind: KeyframeRequestKind,
     ) {
+        let now = Instant::now();
+        if let Some(last) = self.last_keyframe_request.get(&stream_id) {
+            if now.duration_since(*last) < KEYFRAME_DEBOUNCE {
+                tracing::debug!(?stream_id, "debounced duplicate keyframe request");
+                return;
+            }
+        }
+
         let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
             tracing::warn!(track = ?stream_id.0, "unknown upstream track for keyframe request");
             return;
         };
 
+        self.last_keyframe_request.insert(stream_id, now);
         self.handle_keyframe_request(KeyframeRequest {
             mid,
             rid: stream_id.1,
