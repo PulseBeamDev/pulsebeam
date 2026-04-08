@@ -187,10 +187,9 @@ impl<'de> serde::Deserialize<'de> for RoomId {
     }
 }
 
-// Display shows external — human readable in logs/errors
 impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.external, f)
+        fmt::Display::fmt(&self.internal, f)
     }
 }
 
@@ -198,7 +197,6 @@ impl fmt::Display for RoomId {
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RoomId")
-            .field("external", &self.external.as_str())
             .field("internal", &self.internal.as_str())
             .finish()
     }
