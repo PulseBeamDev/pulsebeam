@@ -22,8 +22,7 @@ pub struct Switcher {
     pending: VecDeque<RtpPacket>,
 
     /// The state for the *new* stream we are switching to.
-    /// This is `Some` only when a switch is in progress.
-    staging: Option<KeyframeBuffer>,
+    staging: KeyframeBuffer,
 
     latest_playout: Instant,
 }
@@ -33,7 +32,7 @@ impl Switcher {
         Self {
             timeline: Timeline::new(clock_rate),
             pending: VecDeque::new(),
-            staging: None,
+            staging: KeyframeBuffer::new(),
             latest_playout: Instant::now(),
         }
     }
@@ -45,29 +44,29 @@ impl Switcher {
     }
 
     /// Pushes a packet for the **new** stream we are preparing to switch to.
-    /// The first call to this method will initiate the switching process.
     pub fn stage(&mut self, pkt: RtpPacket) {
-        let staging = self.staging.get_or_insert_default();
-        staging.push(pkt);
+        self.staging.push(pkt);
     }
 
-    pub fn ready_to_switch(&mut self) -> bool {
-        self.staging.is_none()
+    /// Returns true when the staging buffer has been fully drained (switch complete).
+    pub fn ready_to_switch(&self) -> bool {
+        self.staging.is_empty()
     }
 
     /// Returns true if the new stream has received a keyframe and is ready to be popped.
     pub fn ready_to_stream(&self) -> bool {
-        let Some(staging) = self.staging.as_ref() else {
-            tracing::trace!("ready_to_stream: false (no staging)");
-            return false;
-        };
+        if self.pending.is_empty() {
+            let ready = self.staging.has_keyframe_segment();
+            tracing::trace!("ready_to_stream (startup): {} (pending empty)", ready);
+            return ready;
+        }
 
         let target = self
             .latest_playout
             .checked_sub(PLAYOUT_JITTER_TOLERANCE)
             .unwrap_or(self.latest_playout);
 
-        let ready = staging.is_ready(target);
+        let ready = self.staging.is_ready(target);
         tracing::trace!(
             "ready_to_stream: {} (target={:?}, latest_playout={:?})",
             ready,
@@ -92,23 +91,20 @@ impl Switcher {
         }
 
         // 2. Pop packets from the NEW stream if a switch is in progress.
-        if let Some(staging) = &mut self.staging {
-            if let Some(staged_pkt) = staging.pop() {
-                if staged_pkt.is_keyframe_start {
-                    self.timeline.rebase(&staged_pkt);
-                }
-                return Some(self.timeline.rewrite(staged_pkt));
-            } else {
-                self.clear();
-                return None;
+        if let Some(staged_pkt) = self.staging.pop() {
+            if staged_pkt.is_keyframe_start {
+                self.timeline.rebase(&staged_pkt);
             }
+            return Some(self.timeline.rewrite(staged_pkt));
         }
 
         None
     }
 
+    /// Resets the staging buffer and pending queue for reuse, keeping the allocation.
     pub fn clear(&mut self) {
-        self.staging = None;
+        self.pending.clear();
+        self.staging.clear();
     }
 }
 

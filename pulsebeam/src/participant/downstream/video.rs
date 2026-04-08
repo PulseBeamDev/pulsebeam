@@ -8,7 +8,7 @@ use indexmap::IndexSet;
 use slotmap::SlotMap;
 use std::collections::HashMap;
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
@@ -204,7 +204,7 @@ impl VideoAllocator {
         &mut self,
         available_bandwidth: Bitrate,
         router: &mut Router,
-    ) -> Bitrate {
+    ) -> (Bitrate, Vec<KeyframeRequest>) {
         // 1. Prepare the input views.
         let mut views: Vec<SlotView> = self
             .slots
@@ -228,25 +228,43 @@ impl VideoAllocator {
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
 
         let mut changed = false;
+        let mut keyframe_requests: Vec<KeyframeRequest> = Vec::new();
         for (key, decision) in &decisions {
             let Some(slot) = self.slots.get_mut(*key) else {
                 tracing::warn!("no slot found from decision");
                 continue;
             };
 
-            // TODO: handle unsubscribing from old routes
             match decision {
                 AllocationDecision::Forward(layer, _) => {
-                    changed |= slot.switch_to(layer, false);
-                    let stream_id = layer.stream_id();
-                    self.routes.insert(stream_id, *key);
-                    router.subscribe(stream_id);
+                    let old_stream_id = slot.target().map(|l| l.stream_id());
+                    let new_stream_id = layer.stream_id();
+                    let switched = slot.switch_to(layer, false);
+                    changed |= switched;
+                    if old_stream_id.as_ref() != Some(&new_stream_id) {
+                        if let Some(old) = old_stream_id {
+                            router.unsubscribe(&old);
+                            self.routes.remove(&old);
+                        }
+                    }
+                    self.routes.insert(new_stream_id, *key);
+                    router.subscribe(new_stream_id);
+                    // Request a keyframe whenever we start staging a new stream so
+                    // the subscriber doesn't wait indefinitely for a mid-stream IDR.
+                    if switched {
+                        keyframe_requests.push(KeyframeRequest {
+                            mid: slot.mid,
+                            rid: slot.rid,
+                            kind: KeyframeRequestKind::Pli,
+                        });
+                    }
                 }
                 AllocationDecision::Pause(layer) => {
                     changed |= slot.pause_at(layer);
                     let stream_id = layer.stream_id();
                     tracing::debug!(mid = ?slot.mid, ?stream_id, "unsubscribing paused video stream");
                     router.unsubscribe(&stream_id);
+                    self.routes.remove(&stream_id);
                 }
             }
         }
@@ -255,7 +273,7 @@ impl VideoAllocator {
             log_allocation(available_bandwidth, desired, &decisions, &views);
         }
 
-        desired
+        (desired, keyframe_requests)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
@@ -286,9 +304,17 @@ impl VideoAllocator {
         while let Some(pkt) = slot.switcher.pop() {
             writer.write_owned(pkt, &slot.ssrc, slot.pt);
         }
+        // After draining all staged packets the switcher clears its internal
+        // staging buffer; that is the right moment to promote staging→active so
+        // that subsequent packets take the push() path instead of stage().
+        if slot.switcher.ready_to_switch() && slot.staging.is_some() {
+            slot.active = slot.staging.take();
+        }
     }
 
-    pub fn poll_slow(&mut self, _now: Instant, bandwidth: Bitrate, router: &mut Router) {}
+    pub fn poll_slow(&mut self, _now: Instant, _bandwidth: Bitrate, _router: &mut Router) {
+        // Allocation is handled at the downstream allocator level.
+    }
 }
 
 #[derive(PartialEq)]
@@ -351,6 +377,9 @@ impl Slot {
         // Check if the staging layer is actually different
         if self.staging.as_ref() != Some(new_layer) {
             self.staging = Some(new_layer.clone());
+            // Reset the switcher staging buffer so stale seq-no state from a
+            // previous stream doesn't mix with the new stream's packets.
+            self.switcher.clear();
             changed = true;
         }
 
@@ -387,6 +416,10 @@ impl Slot {
     }
 
     fn process(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
+        if self.paused {
+            return;
+        }
+
         if let Some(active) = self.active.as_ref()
             && active.is(stream_id)
         {
@@ -395,12 +428,6 @@ impl Slot {
             && staging.is(stream_id)
         {
             self.switcher.stage(pkt.clone());
-
-            if self.switcher.ready_to_stream() {
-                // TODO: formalize the active and staging mutations to manage the subscriptions
-                drop(staging);
-                self.active = self.staging.take();
-            }
         }
     }
 }

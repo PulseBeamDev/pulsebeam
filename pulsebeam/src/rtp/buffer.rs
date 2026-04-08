@@ -32,7 +32,6 @@ impl KeyframeBuffer {
 
     pub fn is_ready(&self, target_playout: Instant) -> bool {
         // TODO: use target_playout to decide
-        // self.segment.is_some()
         let Some(segment) = self.segment.as_ref() else {
             tracing::trace!("KeyframeBuffer is_ready: false (no segment)");
             return false;
@@ -50,6 +49,10 @@ impl KeyframeBuffer {
         true
     }
 
+    pub fn has_keyframe_segment(&self) -> bool {
+        self.segment.is_some()
+    }
+
     pub fn reset_to(&mut self, seq_no: SeqNo) {
         self.head = seq_no.wrapping_add(1).into();
         self.tail = seq_no;
@@ -59,6 +62,7 @@ impl KeyframeBuffer {
 
     pub fn clear(&mut self) {
         self.reset_to(0.into());
+        self.initialized = false;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -85,7 +89,7 @@ impl KeyframeBuffer {
             let diff = (*pkt.seq_no - *self.tail) as usize;
             if diff >= 2 * self.ring.len() {
                 self.reset_to(pkt.seq_no);
-                tracing::warn!("very large jump detected, reset to {}", pkt.seq_no);
+                tracing::debug!("very large jump detected, reset to {}", pkt.seq_no);
             } else if diff >= self.ring.len() {
                 let to_drop = (diff - self.ring.len()) + 1;
                 // tracing::warn!(

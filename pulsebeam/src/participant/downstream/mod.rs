@@ -68,12 +68,17 @@ impl DownstreamAllocator {
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self, bwe: &mut Bwe, router: &mut Router) {
+    pub fn update_allocations(
+        &mut self,
+        bwe: &mut Bwe,
+        router: &mut Router,
+    ) -> Vec<KeyframeRequest> {
         self.dirty_allocation = false;
-        let desired = self
+        let (desired, keyframe_requests) = self
             .video
             .update_allocations(self.available_bandwidth, router);
         bwe.set_desired_bitrate(desired);
+        keyframe_requests
     }
 
     pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut Router) {

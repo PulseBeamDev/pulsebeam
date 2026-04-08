@@ -225,8 +225,20 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    fn poll_slow(&mut self, now: Instant, router: &mut Router) {
-        self.downstream.poll_slow(now, &mut self.rtc.bwe(), router);
+    fn poll_slow(&mut self, now: Instant, router: &mut Router, events: &mut ParticipantEvents) {
+        let keyframe_requests = self
+            .downstream
+            .update_allocations(&mut self.rtc.bwe(), router);
+        for req in keyframe_requests {
+            let kind = req.kind;
+            if let Some(layer) = self.downstream.handle_keyframe_request(req) {
+                events.push_back(ParticipantEvent::KeyframeRequest {
+                    origin: layer.meta.origin,
+                    stream_id: layer.stream_id(),
+                    kind,
+                });
+            }
+        }
         self.upstream.poll_slow(now);
     }
 
@@ -250,7 +262,7 @@ impl ParticipantCore {
         router: &mut Router,
     ) -> Option<Instant> {
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
-            self.poll_slow(now, router);
+            self.poll_slow(now, router, events);
             self.last_slow_poll = now;
         }
 
@@ -294,8 +306,19 @@ impl ParticipantCore {
 
             if self.downstream.dirty_allocation {
                 // Make sure rtc is updated with new allocations
-                self.downstream
+                let keyframe_requests = self
+                    .downstream
                     .update_allocations(&mut self.rtc.bwe(), router);
+                for req in keyframe_requests {
+                    let kind = req.kind;
+                    if let Some(layer) = self.downstream.handle_keyframe_request(req) {
+                        events.push_back(ParticipantEvent::KeyframeRequest {
+                            origin: layer.meta.origin,
+                            stream_id: layer.stream_id(),
+                            kind,
+                        });
+                    }
+                }
                 continue;
             }
 
