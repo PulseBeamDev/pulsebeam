@@ -1,3 +1,4 @@
+use crate::participant::ParticipantEvents;
 use crate::participant::downstream::{RouteUpdater, SlotConfig};
 use crate::rtp::buffer::KeyframeBuffer;
 use crate::rtp::switcher::Switcher;
@@ -20,39 +21,9 @@ slotmap::new_key_type! {
     pub struct SlotKey;
 }
 
-#[derive(Default)]
-struct RouteTable {
-    inner: HashMap<StreamId, SlotKey>,
-}
-
-impl RouteTable {
-    fn add(&mut self, stream_id: StreamId, key: SlotKey, router: &mut impl RouteUpdater) {
-        self.inner.insert(stream_id, key);
-        router.subscribe(stream_id);
-    }
-
-    fn remove(&mut self, stream_id: &StreamId, router: &mut impl RouteUpdater) {
-        if self.inner.remove(stream_id).is_some() {
-            router.unsubscribe(stream_id);
-        }
-    }
-
-    fn get(&self, stream_id: &StreamId) -> Option<&SlotKey> {
-        self.inner.get(stream_id)
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &StreamId> {
-        self.inner.keys()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&StreamId, &SlotKey)> {
-        self.inner.iter()
-    }
-}
-
 pub struct VideoAllocator {
     // Hot
-    routes: RouteTable,
+    routes: HashMap<StreamId, SlotKey>,
     slots: SlotMap<SlotKey, Slot>,
 
     // Cold
@@ -66,7 +37,7 @@ impl VideoAllocator {
             manual_sub,
             tracks: HashMap::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
-            routes: RouteTable::default(),
+            routes: HashMap::new(),
         }
     }
 
@@ -90,18 +61,13 @@ impl VideoAllocator {
         self.slots.len()
     }
 
-    pub fn configure(&mut self, intents: &HashMap<Mid, Intent>, router: &mut impl RouteUpdater) {
+    pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
         for (key, slot) in self.slots.iter_mut() {
             let tracks = &mut self.tracks;
             if let Some(intent) = intents.get(&slot.mid) {
                 Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id));
             } else {
-                // Slot not in intent map — pause it and clean up any active route.
-                let was_active = slot.target().map(|l| l.stream_id());
                 Self::configure_slot(tracks, slot, 0, None);
-                if let Some(stream_id) = was_active {
-                    self.routes.remove(&stream_id, router);
-                }
             }
         }
     }
@@ -129,13 +95,12 @@ impl VideoAllocator {
                 track_state.lowest_quality()
             };
 
+            let layer = layer.clone();
             slot.max_height = max_height;
             slot.switch_to(&layer, false);
         } else {
             slot.max_height = 0;
-            // Pause at current layer if one exists so the switcher stays coherent.
-            let layer = slot.target()?;
-            slot.pause_at(&layer);
+            slot.stop();
         }
 
         Some(())
@@ -216,11 +181,7 @@ impl VideoAllocator {
         }
     }
 
-    pub fn update_allocations(
-        &mut self,
-        available_bandwidth: Bitrate,
-        router: &mut impl RouteUpdater,
-    ) -> (Bitrate, Vec<KeyframeRequest>) {
+    pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> Bitrate {
         // 1. Prepare the input views
         let mut views: Vec<SlotView> = self
             .slots
@@ -253,31 +214,12 @@ impl VideoAllocator {
 
             match decision {
                 AllocationDecision::Forward(layer, _) => {
-                    let old_stream_id = slot.target().map(|l| l.stream_id());
-                    let new_stream_id = layer.stream_id();
-                    let switched = slot.switch_to(layer, false);
-                    changed |= switched;
-                    if old_stream_id.as_ref() != Some(&new_stream_id) {
-                        if let Some(old) = old_stream_id {
-                            self.routes.remove(&old, router);
-                        }
-                    }
-                    self.routes.add(new_stream_id, *key, router);
-                    // Request a keyframe whenever we start staging a new stream so
-                    // the subscriber doesn't wait indefinitely for a mid-stream IDR.
-                    if switched {
-                        keyframe_requests.push(KeyframeRequest {
-                            mid: slot.mid,
-                            rid: slot.rid,
-                            kind: KeyframeRequestKind::Pli,
-                        });
-                    }
+                    changed |= slot.switch_to(layer, false);
                 }
                 AllocationDecision::Pause(layer) => {
                     changed |= slot.pause_at(layer);
                     let stream_id = layer.stream_id();
                     tracing::debug!(mid = ?slot.mid, ?stream_id, "unsubscribing paused video stream");
-                    self.routes.remove(&stream_id, router);
                 }
             }
         }
@@ -286,7 +228,7 @@ impl VideoAllocator {
             log_allocation(available_bandwidth, desired, &decisions, &views);
         }
 
-        (desired, keyframe_requests)
+        desired
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
@@ -329,35 +271,55 @@ impl VideoAllocator {
         _now: Instant,
         _bandwidth: Bitrate,
         router: &mut impl RouteUpdater,
+        events: &mut ParticipantEvents,
     ) {
-        // Self-heal: remove any routes whose slot no longer targets that stream.
-        // Bounded by VIDEO_MAX_SLOTS (25), so safe to run every slow-poll tick.
-        let stale: Vec<StreamId> = self
+        self.reconcile_routes(router, events);
+    }
+
+    pub fn reconcile_routes(
+        &mut self,
+        router: &mut impl RouteUpdater,
+        events: &mut ParticipantEvents,
+    ) {
+        // Pass 1: remove routes that no longer match any active slot.
+        let to_remove: Vec<StreamId> = self
             .routes
-            .iter()
-            .filter(|(stream_id, key)| {
+            .keys()
+            .filter(|sid| {
                 !self
                     .slots
-                    .get(**key)
-                    .and_then(|s| s.target())
-                    .is_some_and(|l| &l.stream_id() == *stream_id)
+                    .values()
+                    .any(|s| !s.paused && s.target().is_some_and(|l| &l.stream_id() == *sid))
             })
-            .map(|(stream_id, _)| *stream_id)
+            .copied()
             .collect();
 
-        for stream_id in stale {
-            tracing::warn!(?stream_id, "poll_slow: removing stale video route");
-            self.routes.remove(&stream_id, router);
+        for sid in &to_remove {
+            self.routes.remove(sid);
+            router.unsubscribe(sid);
+        }
+
+        // Pass 2: add routes for active slots not yet in the table.
+        for (key, slot) in self.slots.iter() {
+            if slot.paused {
+                continue;
+            }
+            let Some(layer) = slot.target() else { continue };
+            let sid = layer.stream_id();
+            if !self.routes.contains_key(&sid) {
+                self.routes.insert(sid, key);
+                router.subscribe(sid);
+                events.push_back(crate::participant::ParticipantEvent::KeyframeRequest {
+                    origin: layer.meta.origin,
+                    stream_id: layer.stream_id(),
+                    kind: KeyframeRequestKind::Pli,
+                });
+            }
         }
     }
 
-    /// Unsubscribe from all currently active video routes.
-    /// Must be called when a participant exits to clean up the shard routing table.
-    pub fn unsubscribe_all(&mut self, router: &mut impl RouteUpdater) {
-        let stream_ids: Vec<StreamId> = self.routes.keys().copied().collect();
-        for stream_id in stream_ids {
-            self.routes.remove(&stream_id, router);
-        }
+    pub fn unsubscribe_all(&mut self) {
+        todo!()
     }
 }
 
@@ -434,6 +396,11 @@ impl Slot {
         }
 
         changed
+    }
+
+    fn stop(&mut self) {
+        self.active = None;
+        self.staging = None;
     }
 
     fn pause_at(&mut self, layer: &TrackLayer) -> bool {

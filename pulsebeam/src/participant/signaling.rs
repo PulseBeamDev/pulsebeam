@@ -60,13 +60,9 @@ impl Signaling {
         self.slot_count = slot_count;
     }
 
-    pub fn reconcile(
-        &mut self,
-        downstream: &mut DownstreamAllocator,
-        router: &mut impl crate::participant::downstream::RouteUpdater,
-    ) {
+    pub fn reconcile(&mut self, downstream: &mut DownstreamAllocator) {
         if let Some(last_client_intents) = &self.last_client_intents {
-            downstream.video.configure(last_client_intents, router);
+            downstream.video.configure(last_client_intents);
             self.mark_assignments_dirty();
         }
     }
@@ -75,7 +71,6 @@ impl Signaling {
         &mut self,
         data: &[u8],
         downstream: &mut DownstreamAllocator,
-        router: &mut impl crate::participant::downstream::RouteUpdater,
     ) -> Result<(), SignalingError> {
         if data.len() > MAX_SIGNALING_MSG_SIZE {
             tracing::warn!(len = data.len(), "Fatal: Oversized signaling message");
@@ -94,7 +89,7 @@ impl Signaling {
                     return Err(SignalingError::ComplexityExceeded);
                 }
                 tracing::info!("received client intent: {:?}", intent);
-                self.apply_client_intent(intent, downstream, router);
+                self.apply_client_intent(intent, downstream);
                 self.dirty_assignments = true;
             }
             Some(signaling::client_message::Payload::RequestSync(_)) => {
@@ -110,7 +105,6 @@ impl Signaling {
         &mut self,
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
-        router: &mut impl crate::participant::downstream::RouteUpdater,
     ) {
         let mut intents = HashMap::with_capacity(intent.requests.len());
         for req in intent.requests {
@@ -139,7 +133,7 @@ impl Signaling {
             );
         }
         self.last_client_intents = Some(intents);
-        self.reconcile(downstream, router);
+        self.reconcile(downstream);
     }
 
     pub fn mark_tracks_dirty(&mut self) {

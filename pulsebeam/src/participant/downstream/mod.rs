@@ -2,6 +2,7 @@ mod audio;
 mod video;
 
 use crate::entity::ParticipantId;
+use crate::participant::ParticipantEvents;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
@@ -84,26 +85,34 @@ impl DownstreamAllocator {
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(
+    pub fn update_allocations(&mut self, bwe: &mut Bwe) {
+        self.dirty_allocation = false;
+        let desired = self.video.update_allocations(self.available_bandwidth);
+        bwe.set_desired_bitrate(desired);
+    }
+
+    pub fn reconcile_routes(
         &mut self,
+        router: &mut impl RouteUpdater,
+        events: &mut ParticipantEvents,
+    ) {
+        self.video.reconcile_routes(router, events);
+    }
+
+    pub fn poll_slow(
+        &mut self,
+        now: Instant,
         bwe: &mut Bwe,
         router: &mut impl RouteUpdater,
-    ) -> Vec<KeyframeRequest> {
-        self.dirty_allocation = false;
-        let (desired, keyframe_requests) = self
-            .video
-            .update_allocations(self.available_bandwidth, router);
-        bwe.set_desired_bitrate(desired);
-        keyframe_requests
+        events: &mut ParticipantEvents,
+    ) {
+        self.update_allocations(bwe);
+        self.video
+            .poll_slow(now, self.available_bandwidth, router, events);
     }
 
-    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut impl RouteUpdater) {
-        self.update_allocations(bwe, router);
-        self.video.poll_slow(now, self.available_bandwidth, router);
-    }
-
-    pub fn unsubscribe_all(&mut self, router: &mut impl RouteUpdater) {
-        self.video.unsubscribe_all(router);
+    pub fn unsubscribe_all(&mut self) {
+        self.video.unsubscribe_all();
     }
 
     #[inline]

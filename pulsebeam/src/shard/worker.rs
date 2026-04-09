@@ -290,7 +290,7 @@ impl ShardWorker {
                         participant_id,
                         routes: &mut self.routing,
                     };
-                    p.on_tracks_published(&[track.clone()], &mut router);
+                    p.on_tracks_published(&[track.clone()]);
                     self.input_dirty.insert(*participant_id);
                 }
             }
@@ -312,7 +312,7 @@ impl ShardWorker {
             participant_id: &participant_id,
             routes: &mut self.routing,
         };
-        let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1, &mut router);
+        let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1);
         self.demuxer
             .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
 
@@ -328,12 +328,11 @@ impl ShardWorker {
             participant_id,
             routes: &mut self.routing,
         };
-        participant.downstream.unsubscribe_all(&mut router);
+        participant.downstream.unsubscribe_all();
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
             self.udp_socket.close_peer(addr);
         }
         Some(participant)
     }
-
 }

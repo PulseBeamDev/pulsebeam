@@ -97,12 +97,7 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
-    pub fn new(
-        cfg: ParticipantConfig,
-        udp_gso_size: usize,
-        tcp_gso_size: usize,
-        router: &mut impl RouteUpdater,
-    ) -> Self {
+    pub fn new(cfg: ParticipantConfig, udp_gso_size: usize, tcp_gso_size: usize) -> Self {
         let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {
@@ -142,7 +137,7 @@ impl ParticipantCore {
             last_keyframe_request: HashMap::new(),
         };
 
-        p.on_tracks_published(&cfg.available_tracks, router);
+        p.on_tracks_published(&cfg.available_tracks);
         p
     }
 
@@ -155,7 +150,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    pub fn on_tracks_published(&mut self, tracks: &[Track], router: &mut impl RouteUpdater) {
+    pub fn on_tracks_published(&mut self, tracks: &[Track]) {
         for track in tracks {
             if track.meta.origin == self.participant_id {
                 continue;
@@ -170,7 +165,7 @@ impl ParticipantCore {
         }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        self.signaling.reconcile(&mut self.downstream, router);
+        self.signaling.reconcile(&mut self.downstream);
     }
 
     pub fn ufrag(&mut self) -> String {
@@ -236,19 +231,8 @@ impl ParticipantCore {
         router: &mut impl RouteUpdater,
         events: &mut ParticipantEvents,
     ) {
-        let keyframe_requests = self
-            .downstream
-            .update_allocations(&mut self.rtc.bwe(), router);
-        for req in keyframe_requests {
-            let kind = req.kind;
-            if let Some(layer) = self.downstream.handle_keyframe_request(req) {
-                events.push_back(ParticipantEvent::KeyframeRequest {
-                    origin: layer.meta.origin,
-                    stream_id: layer.stream_id(),
-                    kind,
-                });
-            }
-        }
+        self.downstream
+            .poll_slow(now, &mut self.rtc.bwe(), router, events);
         self.upstream.poll_slow(now);
     }
 
@@ -303,7 +287,7 @@ impl ParticipantCore {
                         continue;
                     }
 
-                    self.poll_rtc(events, router)?;
+                    self.poll_rtc(events)?;
                 } else {
                     tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
                 }
@@ -311,7 +295,7 @@ impl ParticipantCore {
         }
 
         loop {
-            let rtc_deadline = self.poll_rtc(events, router)?;
+            let rtc_deadline = self.poll_rtc(events)?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
                 // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
@@ -321,19 +305,8 @@ impl ParticipantCore {
 
             if self.downstream.dirty_allocation {
                 // Make sure rtc is updated with new allocations
-                let keyframe_requests = self
-                    .downstream
-                    .update_allocations(&mut self.rtc.bwe(), router);
-                for req in keyframe_requests {
-                    let kind = req.kind;
-                    if let Some(layer) = self.downstream.handle_keyframe_request(req) {
-                        events.push_back(ParticipantEvent::KeyframeRequest {
-                            origin: layer.meta.origin,
-                            stream_id: layer.stream_id(),
-                            kind,
-                        });
-                    }
-                }
+                self.downstream.update_allocations(&mut self.rtc.bwe());
+                self.downstream.reconcile_routes(router, events);
                 continue;
             }
 
@@ -346,11 +319,7 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(
-        &mut self,
-        events: &mut ParticipantEvents,
-        router: &mut impl RouteUpdater,
-    ) -> Option<Instant> {
+    fn poll_rtc(&mut self, events: &mut ParticipantEvents) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -393,7 +362,7 @@ impl ParticipantCore {
                         event_count += 1;
                         work_items += 1;
                     }
-                    self.handle_event(event, events, router);
+                    self.handle_event(event, events);
                 }
                 Err(e) => {
                     #[cfg(feature = "deep-metrics")]
@@ -452,12 +421,7 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_event(
-        &mut self,
-        e: Event,
-        events: &mut ParticipantEvents,
-        router: &mut impl RouteUpdater,
-    ) {
+    fn handle_event(&mut self, e: Event, events: &mut ParticipantEvents) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
@@ -480,9 +444,9 @@ impl ParticipantCore {
             Event::ChannelOpen(_cid, _label) => {}
             Event::ChannelData(data) => {
                 if data.id == self.signaling.cid
-                    && let Err(err) =
-                        self.signaling
-                            .handle_input(&data.data, &mut self.downstream, router)
+                    && let Err(err) = self
+                        .signaling
+                        .handle_input(&data.data, &mut self.downstream)
                 {
                     self.disconnect(err.into());
                 }
