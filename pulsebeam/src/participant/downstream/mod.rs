@@ -5,13 +5,17 @@ use crate::entity::ParticipantId;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::rtp::RtpPacket;
-use crate::shard::worker::Router;
 use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 pub use video::Intent;
+
+pub trait RouteUpdater {
+    fn subscribe(&mut self, stream_id: StreamId);
+    fn unsubscribe(&mut self, stream_id: &StreamId);
+}
 
 const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
@@ -23,6 +27,18 @@ pub struct SlotConfig {
     pub ssrc: Ssrc,
     pub pt: Pt,
     pub kind: MediaKind,
+}
+
+impl Default for SlotConfig {
+    fn default() -> Self {
+        Self {
+            mid: Mid::from("0"),
+            rid: None,
+            ssrc: 0u32.into(),
+            pt: 100u8.into(),
+            kind: MediaKind::Video,
+        }
+    }
 }
 
 pub struct DownstreamAllocator {
@@ -44,7 +60,7 @@ impl DownstreamAllocator {
 
     pub fn add_track(&mut self, track: Track) {
         if track.meta.kind.is_video() {
-            self.video.add_track(track);
+            self.video.add_track(track.meta, track.layers);
         } else {
             self.audio.add_track(track);
         }
@@ -54,7 +70,7 @@ impl DownstreamAllocator {
     pub fn add_slot(&mut self, slot: SlotConfig) {
         match slot.kind {
             MediaKind::Video => {
-                self.video.add_slot(slot);
+                self.video.add_slot(slot.mid, slot);
             }
             MediaKind::Audio => {
                 self.audio.add_slot(slot.mid, slot.pt, slot.ssrc);
@@ -71,7 +87,7 @@ impl DownstreamAllocator {
     pub fn update_allocations(
         &mut self,
         bwe: &mut Bwe,
-        router: &mut Router,
+        router: &mut impl RouteUpdater,
     ) -> Vec<KeyframeRequest> {
         self.dirty_allocation = false;
         let (desired, keyframe_requests) = self
@@ -81,9 +97,13 @@ impl DownstreamAllocator {
         keyframe_requests
     }
 
-    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut Router) {
+    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, router: &mut impl RouteUpdater) {
         self.update_allocations(bwe, router);
         self.video.poll_slow(now, self.available_bandwidth, router);
+    }
+
+    pub fn unsubscribe_all(&mut self, router: &mut impl RouteUpdater) {
+        self.video.unsubscribe_all(router);
     }
 
     #[inline]

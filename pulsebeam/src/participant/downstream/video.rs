@@ -1,9 +1,7 @@
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{RouteUpdater, SlotConfig};
 use crate::rtp::buffer::KeyframeBuffer;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
-use crate::shard::worker::Router;
-use futures_concurrency::stream;
 use indexmap::IndexSet;
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -42,17 +40,17 @@ impl VideoAllocator {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) {
-        if self.tracks.contains_key(&track.meta.id) {
+    pub fn add_track(&mut self, meta: TrackMeta, layers: Vec<TrackLayer>) {
+        if self.tracks.contains_key(&meta.id) {
             return;
         }
-        tracing::info!(track = %track.meta.id, "video track added");
-        self.tracks.insert(track.meta.id, track);
+        tracing::info!(track = %meta.id, "video track added");
+        self.tracks.insert(meta.id, Track { meta, layers });
         self.rebalance();
     }
 
     pub fn remove_track(&mut self, track_id: &TrackId) {
-        if let Some(_track) = self.tracks.remove(track_id) {
+        if self.tracks.remove(track_id).is_some() {
             tracing::info!(track = %track_id, "video track removed");
             self.rebalance();
         }
@@ -62,67 +60,54 @@ impl VideoAllocator {
         self.slots.len()
     }
 
-    pub fn configure(&mut self, _intents: &HashMap<Mid, Intent>) {
-        todo!()
+    pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
+        for s in self.slots.values_mut() {
+            let tracks = &mut self.tracks;
+            if let Some(intent) = intents.get(&s.mid) {
+                Self::configure_slot(tracks, s, intent.max_height, Some(&intent.track_id));
+            } else {
+                Self::configure_slot(tracks, s, 0, None);
+            }
+        }
     }
 
-    // pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
-    //     let mids: Vec<Mid> = self.mid_to_idx.keys().copied().collect();
-    //     for mid in mids {
-    //         let idx = self.mid_to_idx[&mid];
-    //         {
-    //             let tracks = &mut self.tracks;
-    //             let Some(driver) = self.slots.get_mut(idx) else {
-    //                 continue;
-    //             };
-    //             if let Some(intent) = intents.get(&mid) {
-    //                 Self::configure_slot(tracks, driver, intent.max_height, Some(&intent.track_id));
-    //             } else {
-    //                 Self::configure_slot(tracks, driver, 0, None);
-    //             }
-    //         }
-    //     }
-    // }
-    //
-    // fn configure_slot(
-    //     tracks: &mut HashMap<TrackId, Track>,
-    //     slot: &mut Slot,
-    //     max_height: u32,
-    //     track_id: Option<&TrackId>,
-    // ) -> bool {
-    //     // Clear any previous assignment on the target track.
-    //     if let Some(target) = slot.target()
-    //         && let Some(state) = tracks.get_mut(&target.track_id)
-    //     {
-    //         state.assigned_mid = None;
-    //     }
-    //
-    //     let switched = if let Some(track_id) = track_id
-    //         && max_height > 0
-    //     {
-    //         let Some(track_state) = tracks.get_mut(track_id) else {
-    //             return false;
-    //         };
-    //
-    //         let layer = if let Some(target) = driver.slot.target()
-    //             && target.track_id == track_state.meta.id
-    //         {
-    //             target.clone()
-    //         } else {
-    //             track_state.lowest_quality().clone()
-    //         };
-    //
-    //         driver.switch_to(layer, false);
-    //         track_state.assigned_mid = Some(driver.mid);
-    //         driver.slot.state.is_playing()
-    //     } else {
-    //         driver.stop();
-    //         false
-    //     };
-    //
-    //     driver.max_height = max_height;
-    //     switched
-    // }
+    /// Routes this slot to the given track at the specified maximum height,
+    /// or stops routing if `track_id` is `None` or `max_height` is 0.
+    fn configure_slot(
+        tracks: &mut HashMap<TrackId, Track>,
+        slot: &mut Slot,
+        max_height: u32,
+        track_id: Option<&TrackId>,
+    ) -> bool {
+        if let Some(track_id) = track_id
+            && max_height > 0
+        {
+            let Some(track_state) = tracks.get_mut(track_id) else {
+                return false;
+            };
+
+            // Keep current layer if slot already targets this track to avoid
+            // unnecessary PLI requests; otherwise start at lowest quality.
+            let layer = if let Some(target) = slot.target()
+                && target.meta.id == track_state.meta.id
+            {
+                target.clone()
+            } else {
+                track_state.lowest_quality().clone()
+            };
+
+            slot.max_height = max_height;
+            slot.switch_to(&layer, false)
+        } else {
+            slot.max_height = 0;
+            // Pause at current layer if one exists so the switcher stays coherent.
+            if let Some(layer) = slot.target().cloned() {
+                slot.pause_at(&layer)
+            } else {
+                false
+            }
+        }
+    }
 
     pub fn tracks(&self) -> impl Iterator<Item = &TrackMeta> {
         self.tracks.values().map(|s| &s.meta)
@@ -140,9 +125,8 @@ impl VideoAllocator {
         })
     }
 
-    pub fn add_slot(&mut self, config: SlotConfig) {
-        let _idx = self.slots.len();
-        let slot = Slot::new(config);
+    pub fn add_slot(&mut self, mid: Mid, config: SlotConfig) {
+        let slot = Slot::new(SlotConfig { mid, ..config });
         self.slots.insert(slot);
         self.rebalance();
     }
@@ -203,7 +187,7 @@ impl VideoAllocator {
     pub fn update_allocations(
         &mut self,
         available_bandwidth: Bitrate,
-        router: &mut Router,
+        router: &mut impl RouteUpdater,
     ) -> (Bitrate, Vec<KeyframeRequest>) {
         // 1. Prepare the input views.
         let mut views: Vec<SlotView> = self
@@ -312,8 +296,41 @@ impl VideoAllocator {
         }
     }
 
-    pub fn poll_slow(&mut self, _now: Instant, _bandwidth: Bitrate, _router: &mut Router) {
-        // Allocation is handled at the downstream allocator level.
+    pub fn poll_slow(
+        &mut self,
+        _now: Instant,
+        _bandwidth: Bitrate,
+        router: &mut impl RouteUpdater,
+    ) {
+        // Self-heal: remove any routes whose slot no longer targets that stream.
+        // Bounded by VIDEO_MAX_SLOTS (25), so safe to run every slow-poll tick.
+        let stale: Vec<StreamId> = self
+            .routes
+            .iter()
+            .filter(|(stream_id, key)| {
+                !self
+                    .slots
+                    .get(**key)
+                    .and_then(|s| s.target())
+                    .is_some_and(|l| &l.stream_id() == *stream_id)
+            })
+            .map(|(stream_id, _)| *stream_id)
+            .collect();
+
+        for stream_id in stale {
+            tracing::warn!(?stream_id, "poll_slow: removing stale video route");
+            self.routes.remove(&stream_id);
+            router.unsubscribe(&stream_id);
+        }
+    }
+
+    /// Unsubscribe from all currently active video routes.
+    /// Must be called when a participant exits to clean up the shard routing table.
+    pub fn unsubscribe_all(&mut self, router: &mut impl RouteUpdater) {
+        for stream_id in self.routes.keys() {
+            router.unsubscribe(&stream_id);
+        }
+        self.routes.clear();
     }
 }
 
@@ -635,6 +652,19 @@ mod assignment_tests {
     use str0m::bwe::Bitrate;
     use str0m::media::Mid;
 
+    #[derive(Default)]
+    struct FakeRouter {
+        subscribed: std::collections::HashSet<StreamId>,
+    }
+    impl RouteUpdater for FakeRouter {
+        fn subscribe(&mut self, s: StreamId) {
+            self.subscribed.insert(s);
+        }
+        fn unsubscribe(&mut self, s: &StreamId) {
+            self.subscribed.remove(s);
+        }
+    }
+
     struct TestTracks {
         pub senders: Vec<UpstreamTrack>,
         pub ids: Vec<TrackId>,
@@ -652,16 +682,16 @@ mod assignment_tests {
 
         for i in 0..count {
             let mid = Mid::from(&format!("v{i}")[..]);
-            let (tx, layers) = make_video_track(pid, mid);
+            let (tx, track) = make_video_track(pid, mid, vec![]);
             let meta = tx.meta.clone();
 
             // Ensure tracks are considered "healthy" for allocation tests.
-            for layer in &layers {
+            for layer in &track.layers {
                 layer.state.update_for_test().inactive(false);
             }
 
             ids.push(meta.id);
-            allocator.add_track(meta, layers);
+            allocator.add_track(meta, track.layers);
             senders.push(tx);
         }
 
@@ -761,7 +791,8 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
-        let desired = allocator.update_allocations(Bitrate::from(5_000_000));
+        let mut router = FakeRouter::default();
+        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000), &mut router);
         assert!(desired.as_f64() > 0.0);
     }
 
@@ -772,10 +803,13 @@ mod assignment_tests {
         add_slots(&mut allocator, 3);
         allocator.remove_track(&tracks.ids[1]);
         let pid = ParticipantId::new();
-        let (tx, layers) = make_video_track(pid, Mid::from("new_track"));
+        let (tx, track) = make_video_track(pid, Mid::from("new_track"), vec![]);
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        let meta = tx.meta.clone();
         tracks.senders.push(tx);
-        let meta = tracks.senders.last().unwrap().meta.clone();
-        allocator.add_track(meta, layers);
+        allocator.add_track(meta, track.layers);
         assert_eq!(allocator.slots().count(), 3);
     }
 }
@@ -790,19 +824,18 @@ mod allocation_tests {
     use str0m::bwe::Bitrate;
     use str0m::media::Mid;
 
-    fn healthy_track() -> VideoTrack {
-        let (tx, layers) = make_video_track(ParticipantId::new(), Mid::from("t"));
-        for layer in &layers {
+    fn healthy_track() -> Track {
+        let (tx, track) = make_video_track(ParticipantId::new(), Mid::from("t"), vec![]);
+        for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        VideoTrack {
-            meta: tx.meta.clone(),
-            layers,
-            assigned_mid: None,
+        Track {
+            meta: tx.meta,
+            layers: track.layers,
         }
     }
 
-    fn track_with_bad_layer(bad: LayerQuality) -> VideoTrack {
+    fn track_with_bad_layer(bad: LayerQuality) -> Track {
         let vt = healthy_track();
         vt.by_quality(bad)
             .unwrap()
@@ -812,12 +845,7 @@ mod allocation_tests {
         vt
     }
 
-    fn slot<'a>(
-        mid: &str,
-        priority: u32,
-        track: &'a VideoTrack,
-        current: LayerQuality,
-    ) -> SlotView<'a> {
+    fn slot<'a>(mid: &str, priority: u32, track: &'a Track, current: LayerQuality) -> SlotView<'a> {
         SlotView {
             mid: Mid::from(mid),
             priority,
@@ -830,7 +858,7 @@ mod allocation_tests {
         Bitrate::from(kbps * 1_000)
     }
 
-    fn layer_bps(track: &VideoTrack, q: LayerQuality) -> f64 {
+    fn layer_bps(track: &Track, q: LayerQuality) -> f64 {
         track.by_quality(q).unwrap().state.bitrate_bps()
     }
 

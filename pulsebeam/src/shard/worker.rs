@@ -11,7 +11,9 @@ use tokio::time::Instant;
 
 use crate::{
     entity::ParticipantId,
-    participant::{ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents},
+    participant::{
+        ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents, RouteUpdater,
+    },
     shard::{demux::Demuxer, timer::TimerWheel},
     track::{StreamId, StreamWriter, Track},
 };
@@ -32,13 +34,13 @@ pub struct Router<'a> {
     routes: &'a mut HashMap<StreamId, Routing>,
 }
 
-impl<'a> Router<'a> {
-    pub fn subscribe(&mut self, stream_id: StreamId) {
+impl RouteUpdater for Router<'_> {
+    fn subscribe(&mut self, stream_id: StreamId) {
         let routing = self.routes.entry(stream_id).or_default();
         routing.subscribers.insert(*self.participant_id);
     }
 
-    pub fn unsubscribe(&mut self, stream_id: &StreamId) {
+    fn unsubscribe(&mut self, stream_id: &StreamId) {
         let Some(routing) = self.routes.get_mut(stream_id) else {
             return;
         };
@@ -312,10 +314,18 @@ impl ShardWorker {
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ParticipantCore> {
         let mut participant = self.participants.remove(participant_id)?;
+        // Clean up the shard routing table before teardown.
+        // participant is already removed from self.participants so there is no aliasing.
+        let mut router = Router {
+            participant_id,
+            routes: &mut self.routing,
+        };
+        participant.downstream.unsubscribe_all(&mut router);
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
             self.udp_socket.close_peer(addr);
         }
         Some(participant)
     }
+
 }

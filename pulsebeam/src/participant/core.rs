@@ -18,13 +18,12 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::entity::{self, ParticipantId, TrackId};
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{RouteUpdater, SlotConfig};
 use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
-use crate::shard::worker::Router;
 use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, Track};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
@@ -225,7 +224,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    fn poll_slow(&mut self, now: Instant, router: &mut Router, events: &mut ParticipantEvents) {
+    fn poll_slow(&mut self, now: Instant, router: &mut impl RouteUpdater, events: &mut ParticipantEvents) {
         let keyframe_requests = self
             .downstream
             .update_allocations(&mut self.rtc.bwe(), router);
@@ -242,7 +241,7 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents, router: &mut Router) {
+    pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents, router: &mut impl RouteUpdater) {
         let next_deadline = self.poll_until_deadline(now, events, router);
 
         if let Some(next_deadline) = next_deadline {
@@ -259,7 +258,7 @@ impl ParticipantCore {
         &mut self,
         now: Instant,
         events: &mut ParticipantEvents,
-        router: &mut Router,
+        router: &mut impl RouteUpdater,
     ) -> Option<Instant> {
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
             self.poll_slow(now, router, events);
