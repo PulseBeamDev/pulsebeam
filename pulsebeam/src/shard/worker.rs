@@ -286,7 +286,11 @@ impl ShardWorker {
                     };
 
                     tracing::debug!(%participant_id, track = %track.meta.id, "delivering published track to subscriber");
-                    p.on_tracks_published(&[track.clone()]);
+                    let mut router = Router {
+                        participant_id,
+                        routes: &mut self.routing,
+                    };
+                    p.on_tracks_published(&[track.clone()], &mut router);
                     self.input_dirty.insert(*participant_id);
                 }
             }
@@ -304,7 +308,11 @@ impl ShardWorker {
     fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
         self.remove_participant(&participant_id);
 
-        let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1);
+        let mut router = Router {
+            participant_id: &participant_id,
+            routes: &mut self.routing,
+        };
+        let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1, &mut router);
         self.demuxer
             .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
 

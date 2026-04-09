@@ -97,7 +97,12 @@ pub struct ParticipantCore {
 }
 
 impl ParticipantCore {
-    pub fn new(cfg: ParticipantConfig, udp_gso_size: usize, tcp_gso_size: usize) -> Self {
+    pub fn new(
+        cfg: ParticipantConfig,
+        udp_gso_size: usize,
+        tcp_gso_size: usize,
+        router: &mut impl RouteUpdater,
+    ) -> Self {
         let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {
@@ -137,7 +142,7 @@ impl ParticipantCore {
             last_keyframe_request: HashMap::new(),
         };
 
-        p.on_tracks_published(&cfg.available_tracks);
+        p.on_tracks_published(&cfg.available_tracks, router);
         p
     }
 
@@ -150,7 +155,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    pub fn on_tracks_published(&mut self, tracks: &[Track]) {
+    pub fn on_tracks_published(&mut self, tracks: &[Track], router: &mut impl RouteUpdater) {
         for track in tracks {
             if track.meta.origin == self.participant_id {
                 continue;
@@ -165,7 +170,7 @@ impl ParticipantCore {
         }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        self.signaling.reconcile(&mut self.downstream);
+        self.signaling.reconcile(&mut self.downstream, router);
     }
 
     pub fn ufrag(&mut self) -> String {
@@ -193,10 +198,11 @@ impl ParticipantCore {
     ) {
         let now = Instant::now();
         if let Some(last) = self.last_keyframe_request.get(&stream_id)
-            && now.duration_since(*last) < KEYFRAME_DEBOUNCE {
-                tracing::debug!(?stream_id, "debounced duplicate keyframe request");
-                return;
-            }
+            && now.duration_since(*last) < KEYFRAME_DEBOUNCE
+        {
+            tracing::debug!(?stream_id, "debounced duplicate keyframe request");
+            return;
+        }
 
         let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
             tracing::warn!(track = ?stream_id.0, "unknown upstream track for keyframe request");
@@ -224,7 +230,12 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    fn poll_slow(&mut self, now: Instant, router: &mut impl RouteUpdater, events: &mut ParticipantEvents) {
+    fn poll_slow(
+        &mut self,
+        now: Instant,
+        router: &mut impl RouteUpdater,
+        events: &mut ParticipantEvents,
+    ) {
         let keyframe_requests = self
             .downstream
             .update_allocations(&mut self.rtc.bwe(), router);
@@ -241,7 +252,12 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll(&mut self, now: Instant, events: &mut ParticipantEvents, router: &mut impl RouteUpdater) {
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        events: &mut ParticipantEvents,
+        router: &mut impl RouteUpdater,
+    ) {
         let next_deadline = self.poll_until_deadline(now, events, router);
 
         if let Some(next_deadline) = next_deadline {
@@ -287,7 +303,7 @@ impl ParticipantCore {
                         continue;
                     }
 
-                    self.poll_rtc(events)?;
+                    self.poll_rtc(events, router)?;
                 } else {
                     tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
                 }
@@ -295,7 +311,7 @@ impl ParticipantCore {
         }
 
         loop {
-            let rtc_deadline = self.poll_rtc(events)?;
+            let rtc_deadline = self.poll_rtc(events, router)?;
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
                 // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
@@ -330,7 +346,11 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self, events: &mut ParticipantEvents) -> Option<Instant> {
+    fn poll_rtc(
+        &mut self,
+        events: &mut ParticipantEvents,
+        router: &mut impl RouteUpdater,
+    ) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -373,7 +393,7 @@ impl ParticipantCore {
                         event_count += 1;
                         work_items += 1;
                     }
-                    self.handle_event(event, events);
+                    self.handle_event(event, events, router);
                 }
                 Err(e) => {
                     #[cfg(feature = "deep-metrics")]
@@ -432,7 +452,12 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_event(&mut self, e: Event, events: &mut ParticipantEvents) {
+    fn handle_event(
+        &mut self,
+        e: Event,
+        events: &mut ParticipantEvents,
+        router: &mut impl RouteUpdater,
+    ) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
@@ -455,9 +480,9 @@ impl ParticipantCore {
             Event::ChannelOpen(_cid, _label) => {}
             Event::ChannelData(data) => {
                 if data.id == self.signaling.cid
-                    && let Err(err) = self
-                        .signaling
-                        .handle_input(&data.data, &mut self.downstream)
+                    && let Err(err) =
+                        self.signaling
+                            .handle_input(&data.data, &mut self.downstream, router)
                 {
                     self.disconnect(err.into());
                 }
