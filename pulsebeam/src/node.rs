@@ -147,7 +147,7 @@ impl NodeBuilder {
                     .build_local(LocalOptions::default())
                     .unwrap();
                 let shard = ShardWorker::new(shard_id, sock, shard_command_rx, shard_event_tx);
-                rt.block_on(shard.run());
+                rt.block_on(tokio::task::unconstrained(shard.run()));
             });
             shard_handles.push(handle);
             shard_command_txs.push(shard_command_tx);
