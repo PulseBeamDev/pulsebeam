@@ -46,11 +46,19 @@ impl TimerWheel {
     /// The next expiry instant, if any timers are scheduled.
     ///
     /// This is suitable for use in a `tokio::select!` sleep arm.
-    pub fn next_deadline(&self) -> Option<Instant> {
-        // Peek may return a stale entry, but its instant is always >= the real
-        // next deadline, so we might sleep a little longer — never shorter.
-        // The expiry loop below will then immediately drain all due entries.
-        self.heap.peek().map(|Reverse((t, _))| *t)
+    pub fn next_deadline(&mut self) -> Option<Instant> {
+        while let Some(Reverse((t, id))) = self.heap.peek() {
+            match self.deadlines.get(id) {
+                Some(current) if current == t => {
+                    return Some(*t);
+                }
+                _ => {
+                    // stale → discard
+                    self.heap.pop();
+                }
+            }
+        }
+        None
     }
 
     /// Drain all entries whose deadline has passed as of `now`.
