@@ -5,7 +5,6 @@ use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::Transport;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::UnifiedSocket;
-use pulsebeam_runtime::prelude::*;
 use pulsebeam_runtime::rand;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -144,6 +143,7 @@ impl NodeBuilder {
             let handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
+                    .enable_alt_timer()
                     .build_local(LocalOptions::default())
                     .unwrap();
                 let shard = ShardWorker::new(shard_id, sock, shard_command_rx, shard_event_tx);

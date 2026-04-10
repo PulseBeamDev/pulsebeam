@@ -147,11 +147,11 @@ impl ShardWorker {
             // Block until at least one source is ready.
             tokio::select! {
                 biased;
-                _ = wait => {}
                 Ok(_) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
                     self.on_command(cmd);
                 }
+                _ = wait => {}
                 else => break,
             }
 
