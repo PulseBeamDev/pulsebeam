@@ -256,11 +256,13 @@ impl ShardWorker {
                 match self.event_tx.try_send(event) {
                     Err(mailbox::TrySendError::Full(e)) => {
                         tracing::warn!("shard event channel is full, piling up shard events");
-                        self.shard_events.push_front(e)
+                        self.shard_events.push_front(e);
+                        break;
                     }
                     Err(mailbox::TrySendError::Closed(e)) => {
                         tracing::warn!("shard event channel is closed, piling up shard events");
-                        self.shard_events.push_front(e)
+                        self.shard_events.push_front(e);
+                        break;
                     }
                     Ok(_) => {}
                 }
