@@ -219,7 +219,6 @@ impl VideoAllocator {
                 AllocationDecision::Pause(layer) => {
                     changed |= slot.pause_at(layer);
                     let stream_id = layer.stream_id();
-                    tracing::debug!(mid = ?slot.mid, ?stream_id, "unsubscribing paused video stream");
                 }
             }
         }
