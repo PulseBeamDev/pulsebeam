@@ -190,13 +190,13 @@ impl ShardWorker {
                             continue;
                         };
 
-                        for participant_id in route.subscribers.clone() {
-                            let Some(sub) = self.participants.get_mut(&participant_id) else {
+                        for participant_id in &route.subscribers {
+                            let Some(sub) = self.participants.get_mut(participant_id) else {
                                 continue;
                             };
                             let mut writer = StreamWriter(&mut sub.rtc);
                             sub.downstream.on_forward_rtp(&stream_id, &pkt, &mut writer);
-                            self.fanout_dirty.insert(participant_id);
+                            self.fanout_dirty.insert(*participant_id);
                         }
                     }
                     ParticipantEvent::KeyframeRequest {
@@ -281,18 +281,13 @@ impl ShardWorker {
                 self.input_dirty.insert(participant_id);
             }
             ShardCommand::PublishTrack(track, participants) => {
+                let tracks = &[track];
                 for participant_id in &participants {
                     let Some(p) = self.participants.get_mut(participant_id) else {
-                        tracing::debug!(%participant_id, track = %track.meta.id, "PublishTrack: participant not on this shard (may have exited)");
                         continue;
                     };
 
-                    tracing::debug!(%participant_id, track = %track.meta.id, "delivering published track to subscriber");
-                    let mut router = Router {
-                        participant_id,
-                        routes: &mut self.routing,
-                    };
-                    p.on_tracks_published(&[track.clone()]);
+                    p.on_tracks_published(tracks);
                     self.input_dirty.insert(*participant_id);
                 }
             }
@@ -310,10 +305,6 @@ impl ShardWorker {
     fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
         self.remove_participant(&participant_id);
 
-        let mut router = Router {
-            participant_id: &participant_id,
-            routes: &mut self.routing,
-        };
         let mut participant = ParticipantCore::new(cfg, self.udp_socket.max_gso_segments(), 1);
         self.demuxer
             .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
@@ -326,10 +317,6 @@ impl ShardWorker {
         let mut participant = self.participants.remove(participant_id)?;
         // Clean up the shard routing table before teardown.
         // participant is already removed from self.participants so there is no aliasing.
-        let mut router = Router {
-            participant_id,
-            routes: &mut self.routing,
-        };
         participant.downstream.unsubscribe_all();
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
