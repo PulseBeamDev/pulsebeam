@@ -1,6 +1,6 @@
 use std::{cmp::Reverse, collections::BinaryHeap};
 
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 use tokio::time::Instant;
 
 use crate::entity::ParticipantId;
@@ -21,6 +21,13 @@ pub struct TimerWheel {
 }
 
 impl TimerWheel {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(capacity * 2), // 1 live + 1 stale per participant
+            deadlines: HashMap::with_capacity(capacity),
+        }
+    }
+
     /// Schedule (or reschedule) a deadline for `id`.
     ///
     /// If a deadline already exists for this participant it is lazily cancelled:
@@ -52,18 +59,15 @@ impl TimerWheel {
     /// Stale heap entries (superseded by a later `schedule` call) are silently
     /// discarded and `f` is **not** called for them.
     pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantId)) {
-        while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
-            if deadline > now {
+        while let Some(Reverse((t, _))) = self.heap.peek() {
+            if *t > now {
                 break;
             }
-            self.heap.pop();
-
-            // Skip stale: a newer deadline was registered after this heap entry.
+            let Reverse((deadline, id)) = self.heap.pop().unwrap();
             if self.deadlines.get(&id) != Some(&deadline) {
+                // lazy cancelation
                 continue;
             }
-
-            // Entry is live and expired — remove tracking and fire.
             self.deadlines.remove(&id);
             f(id);
         }

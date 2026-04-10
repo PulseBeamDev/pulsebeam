@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{char::MAX, collections::VecDeque};
 
 use ahash::HashMap;
 use indexmap::IndexSet;
@@ -17,6 +17,8 @@ use crate::{
     shard::{demux::Demuxer, timer::TimerWheel},
     track::{StreamId, StreamWriter, Track},
 };
+
+const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -74,8 +76,8 @@ pub struct ShardWorker {
 
     recv_batch: Vec<RecvPacketBatch>,
     timers: TimerWheel,
-    input_dirty: IndexSet<ParticipantId>,
-    fanout_dirty: IndexSet<ParticipantId>,
+    input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
+    fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     events: ParticipantEvents,
     shard_events: VecDeque<ShardEvent>,
 
@@ -93,11 +95,19 @@ impl ShardWorker {
         event_tx: mailbox::Sender<ShardEvent>,
     ) -> Self {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
-        let timers = TimerWheel::default();
-        let input_dirty: IndexSet<ParticipantId> = IndexSet::default();
-        let fanout_dirty: IndexSet<ParticipantId> = IndexSet::default();
-        let events = ParticipantEvents::default();
-        let shard_events = VecDeque::with_capacity(1024);
+        let timers = TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD);
+        let input_dirty: IndexSet<ParticipantId, ahash::RandomState> =
+            IndexSet::with_capacity_and_hasher(
+                MAX_PARTICIPANTS_PER_SHARD,
+                ahash::RandomState::default(),
+            );
+        let fanout_dirty: IndexSet<ParticipantId, ahash::RandomState> =
+            IndexSet::with_capacity_and_hasher(
+                MAX_PARTICIPANTS_PER_SHARD,
+                ahash::RandomState::default(),
+            );
+        let events = ParticipantEvents::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
+        let shard_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
 
         Self {
             shard_id,
