@@ -393,7 +393,8 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
     let mut consecutive_high_p99 = 0u32;
 
     const ESTIMATED_PACKETS_PER_FRAME: f32 = 4.0;
-    let mut fps_history: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(60);
+    let mut fps_history: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(60);
     let mut consecutive_fps_drops = 0u32;
 
     loop {

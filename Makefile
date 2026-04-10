@@ -33,7 +33,7 @@ test-loom:
 	LOOM_MAX_PREEMPTIONS=2 $(CARGO_CMD) test --workspace --features loom loom_
 
 lint:
-	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty
+	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all
 
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam

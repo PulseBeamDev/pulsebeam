@@ -594,7 +594,12 @@ unsafe fn drop_slot_unsync(ptr: *const ()) {
 }
 
 const fn slot_vtable_unsync() -> &'static RawWakerVTable {
-    &RawWakerVTable::new(clone_slot_unsync, wake_slot_unsync, wake_by_ref_slot_unsync, drop_slot_unsync)
+    &RawWakerVTable::new(
+        clone_slot_unsync,
+        wake_slot_unsync,
+        wake_by_ref_slot_unsync,
+        drop_slot_unsync,
+    )
 }
 
 fn make_slot_waker_unsync(signal: Rc<UnsyncBitSignal>, index: u8) -> Waker {
@@ -650,7 +655,10 @@ unsafe impl<S> Sync for UnsyncSlotGroup<S> {}
 
 impl<S> UnsyncSlotGroup<S> {
     pub fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity <= 64, "SlotGroup capacity must be ≤ 64, got {capacity}");
+        assert!(
+            capacity <= 64,
+            "SlotGroup capacity must be ≤ 64, got {capacity}"
+        );
         let signal = UnsyncBitSignal::new();
         let slots = (0..capacity).map(|_| None).collect();
         let slot_wakers = (0..capacity).map(|_| None).collect();
@@ -692,7 +700,10 @@ impl<S> UnsyncSlotGroup<S> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, &S)> {
-        self.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, UnsyncSlotGuard<'_, S>)> + '_ {
@@ -701,7 +712,11 @@ impl<S> UnsyncSlotGroup<S> {
             s.as_mut().map(|slot| {
                 (
                     i,
-                    UnsyncSlotGuard { slot, signal, index: i as u8 },
+                    UnsyncSlotGuard {
+                        slot,
+                        signal,
+                        index: i as u8,
+                    },
                 )
             })
         })
@@ -728,7 +743,11 @@ impl<S> UnsyncSlotGroup<S> {
 impl<S: Stream + Unpin> UnsyncSlotGroup<S> {
     pub fn insert(&mut self, stream: S) -> usize {
         let index = (!self.occupied).trailing_zeros() as usize;
-        assert!(index < self.slots.len(), "SlotGroup is full (capacity {})", self.slots.len());
+        assert!(
+            index < self.slots.len(),
+            "SlotGroup is full (capacity {})",
+            self.slots.len()
+        );
         self.occupied |= 1u64 << index;
         self.slots[index] = Some(stream);
         self.slot_wakers[index] = Some(make_slot_waker_unsync(self.signal.clone(), index as u8));

@@ -111,11 +111,7 @@ impl<T> Receiver<T> {
             return Poll::Ready(Err(RecvError::Closed));
         }
 
-        if ring
-            .waker
-            .as_ref()
-            .is_none_or(|w| !w.will_wake(cx.waker()))
-        {
+        if ring.waker.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
             ring.waker = Some(cx.waker().clone());
         }
 
@@ -135,8 +131,8 @@ impl<T> Drop for Receiver<T> {
 mod tests {
     use super::*;
     use futures_test::task::{new_count_waker, panic_waker};
-    use std::task::{Context, Poll};
     use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll};
 
     #[test]
     fn spsc_wake_on_send_when_waiting() {
@@ -202,4 +198,3 @@ mod tests {
         }
     }
 }
-

@@ -61,7 +61,7 @@ impl VideoAllocator {
     }
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
-        for (key, slot) in self.slots.iter_mut() {
+        for (_key, slot) in self.slots.iter_mut() {
             let tracks = &mut self.tracks;
             if let Some(intent) = intents.get(&slot.mid) {
                 Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id));
@@ -204,7 +204,7 @@ impl VideoAllocator {
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
 
         let mut changed = false;
-        let mut keyframe_requests: Vec<KeyframeRequest> = Vec::new();
+        let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
         for (key, decision) in &decisions {
             let Some(slot) = self.slots.get_mut(*key) else {
                 tracing::warn!("no slot found from decision");
@@ -217,7 +217,7 @@ impl VideoAllocator {
                 }
                 AllocationDecision::Pause(layer) => {
                     changed |= slot.pause_at(layer);
-                    let stream_id = layer.stream_id();
+                    let _stream_id = layer.stream_id();
                 }
             }
         }
@@ -294,8 +294,8 @@ impl VideoAllocator {
             }
             let Some(layer) = slot.target() else { continue };
             let sid = layer.stream_id();
-            if !self.routes.contains_key(&sid) {
-                self.routes.insert(sid, key);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.routes.entry(sid) {
+                e.insert(key);
                 events.subscribe(sid);
                 events.request_keyframe(layer);
             }

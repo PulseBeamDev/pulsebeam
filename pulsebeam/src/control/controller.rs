@@ -246,20 +246,13 @@ impl ControllerActor {
             ShardEvent::ParticipantExited(participant_id) => {
                 self.delete_participant(&participant_id);
             }
-            ShardEvent::KeyframeRequest {
-                origin_participant,
-                stream_id,
-                kind,
-            } => {
-                let meta = self.participants.get(&origin_participant).or_else(|| {
-                    tracing::warn!(%origin_participant, track = ?stream_id.0, "KeyframeRequest: origin participant not found in controller");
+            ShardEvent::KeyframeRequest(req) => {
+                let meta = self.participants.get(&req.origin).or_else(|| {
+                    tracing::warn!(origin = %req.origin, track = ?req.stream_id.0, "KeyframeRequest: origin participant not found in controller");
                     None
                 })?;
                 self.router
-                    .send(
-                        meta.shard_id,
-                        ShardCommand::RequestKeyframe(origin_participant, stream_id, kind),
-                    )
+                    .send(meta.shard_id, ShardCommand::RequestKeyframe(req))
                     .await;
             }
         }

@@ -40,7 +40,10 @@ impl RuntimeSpawner {
         control_tx: mpsc::UnboundedSender<SpawnRequest>,
         data_txs: Vec<mpsc::UnboundedSender<SpawnRequest>>,
     ) -> Self {
-        Self { control_tx, data_txs }
+        Self {
+            control_tx,
+            data_txs,
+        }
     }
 
     pub fn data_workers(&self) -> usize {
@@ -49,7 +52,10 @@ impl RuntimeSpawner {
 
     pub async fn control_dispatcher(mut rx: mpsc::UnboundedReceiver<SpawnRequest>) {
         while let Some(req) = rx.recv().await {
-            let SpawnRequest { factory, completion } = req;
+            let SpawnRequest {
+                factory,
+                completion,
+            } = req;
             tokio::task::spawn_local(async move {
                 (factory)().await;
                 let _ = completion.send(());
@@ -59,7 +65,10 @@ impl RuntimeSpawner {
 
     pub async fn worker_dispatcher(mut rx: mpsc::UnboundedReceiver<SpawnRequest>) {
         while let Some(req) = rx.recv().await {
-            let SpawnRequest { factory, completion } = req;
+            let SpawnRequest {
+                factory,
+                completion,
+            } = req;
             tokio::task::spawn_local(async move {
                 (factory)().await;
                 let _ = completion.send(());
@@ -69,16 +78,26 @@ impl RuntimeSpawner {
 
     pub fn spawn_control(&self, factory: TaskFactory) -> Result<TaskHandle, SpawnError> {
         let (tx, rx) = oneshot::channel();
-        let req = SpawnRequest { factory, completion: tx };
+        let req = SpawnRequest {
+            factory,
+            completion: tx,
+        };
         self.control_tx
             .send(req)
             .map_err(|_| SpawnError::TargetUnavailable)?;
         Ok(TaskHandle { rx })
     }
 
-    pub fn spawn_data(&self, worker: usize, factory: TaskFactory) -> Result<TaskHandle, SpawnError> {
+    pub fn spawn_data(
+        &self,
+        worker: usize,
+        factory: TaskFactory,
+    ) -> Result<TaskHandle, SpawnError> {
         let (tx, rx) = oneshot::channel();
-        let req = SpawnRequest { factory, completion: tx };
+        let req = SpawnRequest {
+            factory,
+            completion: tx,
+        };
 
         if self.data_txs.is_empty() {
             // Single-thread mode: data tasks run on control runtime.
@@ -92,7 +111,9 @@ impl RuntimeSpawner {
             .data_txs
             .get(worker % self.data_txs.len())
             .ok_or(SpawnError::TargetUnavailable)?;
-        target.send(req).map_err(|_| SpawnError::TargetUnavailable)?;
+        target
+            .send(req)
+            .map_err(|_| SpawnError::TargetUnavailable)?;
         Ok(TaskHandle { rx })
     }
 
@@ -104,7 +125,6 @@ impl RuntimeSpawner {
         }
     }
 }
-
 
 static GLOBAL_SPAWNER: OnceCell<Arc<RuntimeSpawner>> = OnceCell::new();
 
@@ -129,4 +149,3 @@ pub fn spawn_control(factory: TaskFactory) -> Result<TaskHandle, SpawnError> {
 pub fn spawn_data(worker: usize, factory: TaskFactory) -> Result<TaskHandle, SpawnError> {
     global_spawner()?.spawn_data(worker, factory)
 }
-

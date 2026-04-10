@@ -1,11 +1,7 @@
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
-use crate::{
-    entity::TrackId,
-    rtp::RtpPacket,
-    track::UpstreamTrack,
-};
+use crate::{entity::TrackId, rtp::RtpPacket, track::UpstreamTrack};
 use str0m::media::{MediaKind, Mid};
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;

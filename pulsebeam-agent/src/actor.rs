@@ -192,10 +192,11 @@ impl LayerController {
             let key = (mid, rid);
             let now = Instant::now();
             if let Some(last) = self.last_keyframe_request.get(&key)
-                && now.duration_since(*last) < KEYFRAME_REQUEST_THROTTLE {
-                    tracing::debug!(mid = ?mid, rid = ?rid, "throttling repeated PLI");
-                    return;
-                }
+                && now.duration_since(*last) < KEYFRAME_REQUEST_THROTTLE
+            {
+                tracing::debug!(mid = ?mid, rid = ?rid, "throttling repeated PLI");
+                return;
+            }
             self.last_keyframe_request.insert(key, now);
         }
 
@@ -807,14 +808,16 @@ impl AgentActor {
             }
 
             if let Some(reconnect_at) = self.reconnect_deadline
-                && reconnect_timer.deadline() != reconnect_at {
-                    reconnect_timer.as_mut().reset(reconnect_at);
-                }
+                && reconnect_timer.deadline() != reconnect_at
+            {
+                reconnect_timer.as_mut().reset(reconnect_at);
+            }
 
             if let Some(deadline) = self.pending.deadline
-                && debounce_timer.deadline() != deadline {
-                    debounce_timer.as_mut().reset(deadline);
-                }
+                && debounce_timer.deadline() != deadline
+            {
+                debounce_timer.as_mut().reset(deadline);
+            }
 
             tokio::select! {
                 biased;

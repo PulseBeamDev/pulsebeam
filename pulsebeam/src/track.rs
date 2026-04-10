@@ -8,7 +8,6 @@ use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-#[cfg(test)]
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::rtp::{
@@ -23,6 +22,13 @@ pub type StreamId = (TrackId, Option<Rid>);
 /// Leading-edge debounce interval for keyframe requests forwarded upstream.
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
+
+#[derive(Debug)]
+pub struct GlobalKeyframeRequest {
+    pub origin: ParticipantId,
+    pub stream_id: StreamId,
+    pub kind: KeyframeRequestKind,
+}
 
 pub struct StreamWriter<'a>(pub &'a mut str0m::Rtc);
 

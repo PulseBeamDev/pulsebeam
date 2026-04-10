@@ -377,9 +377,7 @@ pub fn unsync_channel<T: Clone + 'static>(capacity: usize) -> (UnsyncSender<T>, 
         head: 0,
         tail: 0,
         mask: cap - 1,
-        slots: (0..cap)
-            .map(|_| UnsyncSlot { seq: 0, val: None })
-            .collect(),
+        slots: (0..cap).map(|_| UnsyncSlot { seq: 0, val: None }).collect(),
         event: LocalEvent::new(),
         closed: false,
     }));
