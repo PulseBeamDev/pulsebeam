@@ -140,10 +140,7 @@ impl TcpTransport {
     }
 }
 
-pub async fn bind(
-    addr: SocketAddr,
-    external_addr: Option<SocketAddr>,
-) -> io::Result<TcpTransport> {
+pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<TcpTransport> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = external_addr.unwrap_or(listener.local_addr()?);
 
@@ -269,13 +266,11 @@ fn handle_new_connection(
                         recv_buf.advance(2);
                         let data = recv_buf.split_to(len);
 
-                        let buf = Arc::new(data.to_vec());
-
                         // Use try_send to prevent reader task from blocking if SFU logic lags
                         if packet_tx.try_send(RecvPacketBatch {
                             src: peer_addr,
                             dst: local_addr,
-                            buf,
+                            buf: data.to_vec(),
                             offset: 0,
                             stride: len,
                             len,

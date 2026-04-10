@@ -47,10 +47,7 @@ impl UdpTransport {
     }
 }
 
-pub async fn bind(
-    addr: SocketAddr,
-    external_addr: Option<SocketAddr>,
-) -> io::Result<UdpTransport> {
+pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
     let socket = UdpSocket::bind(addr).await?;
     let socket = Arc::new(socket);
     let local_addr = external_addr.unwrap_or(socket.local_addr()?);
@@ -92,12 +89,11 @@ impl UdpTransportReader {
         match self.sock.try_recv_from(&mut slot) {
             Ok((n, source)) => {
                 slot.truncate(n);
-                let buf = Arc::new(slot);
                 out.push(RecvPacketBatch {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf,
+                    buf: slot,
                     offset: 0,
                     stride: n,
                     len: n,

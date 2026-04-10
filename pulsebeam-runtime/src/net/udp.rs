@@ -53,10 +53,7 @@ impl UdpTransport {
     }
 }
 
-pub async fn bind(
-    addr: SocketAddr,
-    external_addr: Option<SocketAddr>,
-) -> io::Result<UdpTransport> {
+pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
     let socket2_sock = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::DGRAM,
@@ -174,11 +171,10 @@ impl UdpTransportReader {
                         while seg_off < m.len {
                             let seg_len = stride.min(m.len - seg_off);
                             let src = &self.batch_buffer[base + seg_off..base + seg_off + seg_len];
-                            let buf = Arc::new(src.to_vec());
                             out.push(RecvPacketBatch {
                                 src: m.addr,
                                 dst: self.local_addr,
-                                buf,
+                                buf: src.to_vec(),
                                 offset: 0,
                                 stride: seg_len,
                                 len: seg_len,
