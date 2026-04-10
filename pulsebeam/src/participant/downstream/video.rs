@@ -1,13 +1,12 @@
-use crate::participant::ParticipantEvents;
-use crate::participant::downstream::{RouteUpdater, SlotConfig};
-use crate::rtp::buffer::KeyframeBuffer;
+use crate::participant::downstream::SlotConfig;
+use crate::participant::event::EventQueue;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use indexmap::IndexSet;
 use slotmap::SlotMap;
 use std::collections::HashMap;
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, Mid, Pt, Rid};
+use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
@@ -265,21 +264,11 @@ impl VideoAllocator {
         }
     }
 
-    pub fn poll_slow(
-        &mut self,
-        _now: Instant,
-        _bandwidth: Bitrate,
-        router: &mut impl RouteUpdater,
-        events: &mut ParticipantEvents,
-    ) {
-        self.reconcile_routes(router, events);
+    pub fn poll_slow(&mut self, _now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {
+        self.reconcile_routes(events);
     }
 
-    pub fn reconcile_routes(
-        &mut self,
-        router: &mut impl RouteUpdater,
-        events: &mut ParticipantEvents,
-    ) {
+    pub fn reconcile_routes(&mut self, events: &mut EventQueue) {
         // Pass 1: remove routes that no longer match any active slot.
         let to_remove: Vec<StreamId> = self
             .routes
@@ -295,7 +284,7 @@ impl VideoAllocator {
 
         for sid in &to_remove {
             self.routes.remove(sid);
-            router.unsubscribe(sid);
+            events.unsubscribe(*sid);
         }
 
         // Pass 2: add routes for active slots not yet in the table.
@@ -307,12 +296,8 @@ impl VideoAllocator {
             let sid = layer.stream_id();
             if !self.routes.contains_key(&sid) {
                 self.routes.insert(sid, key);
-                router.subscribe(sid);
-                events.push_back(crate::participant::ParticipantEvent::KeyframeRequest {
-                    origin: layer.meta.origin,
-                    stream_id: layer.stream_id(),
-                    kind: KeyframeRequestKind::Pli,
-                });
+                events.subscribe(sid);
+                events.request_keyframe(layer);
             }
         }
     }

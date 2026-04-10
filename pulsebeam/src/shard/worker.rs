@@ -1,4 +1,4 @@
-use std::{char::MAX, collections::VecDeque};
+use std::collections::VecDeque;
 
 use ahash::HashMap;
 use indexmap::IndexSet;
@@ -12,7 +12,8 @@ use tokio::time::Instant;
 use crate::{
     entity::ParticipantId,
     participant::{
-        ParticipantConfig, ParticipantCore, ParticipantEvent, ParticipantEvents, RouteUpdater,
+        ParticipantConfig, ParticipantCore,
+        event::{EventQueue, ParticipantEvent},
     },
     shard::{demux::Demuxer, timer::TimerWheel},
     track::{StreamId, StreamWriter, Track},
@@ -29,25 +30,6 @@ pub enum ShardError {
 #[derive(Default)]
 struct Routing {
     subscribers: IndexSet<ParticipantId>,
-}
-
-pub struct Router<'a> {
-    participant_id: &'a ParticipantId,
-    routes: &'a mut HashMap<StreamId, Routing>,
-}
-
-impl RouteUpdater for Router<'_> {
-    fn subscribe(&mut self, stream_id: StreamId) {
-        let routing = self.routes.entry(stream_id).or_default();
-        routing.subscribers.insert(*self.participant_id);
-    }
-
-    fn unsubscribe(&mut self, stream_id: &StreamId) {
-        let Some(routing) = self.routes.get_mut(stream_id) else {
-            return;
-        };
-        routing.subscribers.swap_remove(self.participant_id);
-    }
 }
 
 #[derive(Debug)]
@@ -78,7 +60,7 @@ pub struct ShardWorker {
     timers: TimerWheel,
     input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
-    events: ParticipantEvents,
+    events: VecDeque<ParticipantEvent>,
     shard_events: VecDeque<ShardEvent>,
 
     udp_socket: UnifiedSocket,
@@ -106,7 +88,7 @@ impl ShardWorker {
                 MAX_PARTICIPANTS_PER_SHARD,
                 ahash::RandomState::default(),
             );
-        let events = ParticipantEvents::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
+        let events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
         let shard_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
 
         Self {
@@ -184,11 +166,8 @@ impl ShardWorker {
                 let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
-                let mut router = Router {
-                    participant_id,
-                    routes: &mut self.routing,
-                };
-                participant.poll(now, &mut self.events, &mut router);
+                let mut queue = EventQueue::new(participant_id, &mut self.events);
+                participant.poll(now, &mut queue);
             }
 
             // Drain all events produced this tick before flushing egress,
@@ -220,7 +199,16 @@ impl ShardWorker {
                             kind,
                         });
                     }
-                    ParticipantEvent::NewDeadline((deadline, pid)) => {
+                    ParticipantEvent::SubscribedTrack(participant_id, stream_id) => {
+                        let routing = self.routing.entry(stream_id).or_default();
+                        routing.subscribers.insert(participant_id);
+                    }
+                    ParticipantEvent::UnsubscribedTrack(participant_id, stream_id) => {
+                        if let Some(routing) = self.routing.get_mut(&stream_id) {
+                            routing.subscribers.swap_remove(&participant_id);
+                        }
+                    }
+                    ParticipantEvent::NewDeadline(deadline, pid) => {
                         self.timers.schedule(pid, deadline);
                     }
                     ParticipantEvent::PublishedTrack(track) => {
@@ -241,11 +229,8 @@ impl ShardWorker {
                 let Some(participant) = self.participants.get_mut(participant_id) else {
                     continue;
                 };
-                let mut router = Router {
-                    participant_id,
-                    routes: &mut self.routing,
-                };
-                participant.poll(now, &mut self.events, &mut router);
+                let mut queue = EventQueue::new(participant_id, &mut self.events);
+                participant.poll(now, &mut queue);
             }
 
             // Flush egress for all dirty participants in one pass.

@@ -17,8 +17,9 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity::{self, ParticipantId, TrackId};
-use crate::participant::downstream::{RouteUpdater, SlotConfig};
+use crate::entity::{self, TrackId};
+use crate::participant::downstream::SlotConfig;
+use crate::participant::event::EventQueue;
 use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
@@ -28,20 +29,6 @@ use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, Track};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-pub enum ParticipantEvent {
-    PublishedTrack(Track),
-    PublishedRtp(StreamId, RtpPacket),
-    NewDeadline((Instant, ParticipantId)),
-    Exited(ParticipantId),
-    KeyframeRequest {
-        origin: ParticipantId,
-        stream_id: StreamId,
-        kind: KeyframeRequestKind,
-    },
-}
-
-pub type ParticipantEvents = VecDeque<ParticipantEvent>;
 
 pub struct TrackMapping {
     pub mid: Mid,
@@ -225,43 +212,24 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    fn poll_slow(
-        &mut self,
-        now: Instant,
-        router: &mut impl RouteUpdater,
-        events: &mut ParticipantEvents,
-    ) {
-        self.downstream
-            .poll_slow(now, &mut self.rtc.bwe(), router, events);
+    fn poll_slow(&mut self, now: Instant, events: &mut EventQueue) {
+        self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll(
-        &mut self,
-        now: Instant,
-        events: &mut ParticipantEvents,
-        router: &mut impl RouteUpdater,
-    ) {
-        let next_deadline = self.poll_until_deadline(now, events, router);
+    pub fn poll(&mut self, now: Instant, events: &mut EventQueue) {
+        let next_deadline = self.poll_until_deadline(now, events);
 
         if let Some(next_deadline) = next_deadline {
-            events.push_back(ParticipantEvent::NewDeadline((
-                next_deadline,
-                self.participant_id,
-            )));
+            events.update_deadline(next_deadline);
         } else {
-            events.push_back(ParticipantEvent::Exited(self.participant_id));
+            events.exit();
         }
     }
 
-    fn poll_until_deadline(
-        &mut self,
-        now: Instant,
-        events: &mut ParticipantEvents,
-        router: &mut impl RouteUpdater,
-    ) -> Option<Instant> {
+    fn poll_until_deadline(&mut self, now: Instant, events: &mut EventQueue) -> Option<Instant> {
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
-            self.poll_slow(now, router, events);
+            self.poll_slow(now, events);
             self.last_slow_poll = now;
         }
 
@@ -306,7 +274,7 @@ impl ParticipantCore {
             if self.downstream.dirty_allocation {
                 // Make sure rtc is updated with new allocations
                 self.downstream.update_allocations(&mut self.rtc.bwe());
-                self.downstream.reconcile_routes(router, events);
+                self.downstream.reconcile_routes(events);
                 continue;
             }
 
@@ -319,7 +287,7 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self, events: &mut ParticipantEvents) -> Option<Instant> {
+    fn poll_rtc(&mut self, events: &mut EventQueue) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -421,7 +389,7 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_event(&mut self, e: Event, events: &mut ParticipantEvents) {
+    fn handle_event(&mut self, e: Event, events: &mut EventQueue) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
@@ -429,13 +397,8 @@ impl ParticipantCore {
             Event::MediaAdded(media) => self.handle_media_added(media, events),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
-                let kind = req.kind;
                 if let Some(layer) = self.downstream.handle_keyframe_request(req) {
-                    events.push_back(ParticipantEvent::KeyframeRequest {
-                        origin: layer.meta.origin,
-                        stream_id: layer.stream_id(),
-                        kind,
-                    });
+                    events.request_keyframe(layer);
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
@@ -473,7 +436,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id, mid = %media.mid))]
-    fn handle_media_added(&mut self, media: MediaAdded, events: &mut ParticipantEvents) {
+    fn handle_media_added(&mut self, media: MediaAdded, events: &mut EventQueue) {
         match media.direction {
             Direction::RecvOnly => {
                 let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
@@ -489,7 +452,7 @@ impl ParticipantCore {
                         if !accepted {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                         }
-                        events.push_back(ParticipantEvent::PublishedTrack(track));
+                        events.publish_track(track);
                     }
                     MediaKind::Video => {
                         let (tx, track) = track::new_video(
@@ -501,7 +464,7 @@ impl ParticipantCore {
                         if !accepted {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                         }
-                        events.push_back(ParticipantEvent::PublishedTrack(track));
+                        events.publish_track(track);
                     }
                 }
             }
@@ -530,7 +493,7 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket, events: &mut ParticipantEvents) {
+    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket, events: &mut EventQueue) {
         tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
@@ -555,7 +518,7 @@ impl ParticipantCore {
                 .track_id_for_mid(mid)
                 .expect("handle_incoming_rtp returned true so mid must have a slot");
             let stream_id: StreamId = (track_id, rid);
-            events.push_back(ParticipantEvent::PublishedRtp(stream_id, rtp));
+            events.publish_rtp(stream_id, rtp);
         }
     }
 

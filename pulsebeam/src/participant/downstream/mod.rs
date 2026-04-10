@@ -2,9 +2,9 @@ mod audio;
 mod video;
 
 use crate::entity::ParticipantId;
-use crate::participant::ParticipantEvents;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
+use crate::participant::event::EventQueue;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
 use str0m::bwe::{Bitrate, Bwe};
@@ -12,11 +12,6 @@ use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 pub use video::Intent;
-
-pub trait RouteUpdater {
-    fn subscribe(&mut self, stream_id: StreamId);
-    fn unsubscribe(&mut self, stream_id: &StreamId);
-}
 
 const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
@@ -91,24 +86,13 @@ impl DownstreamAllocator {
         bwe.set_desired_bitrate(desired);
     }
 
-    pub fn reconcile_routes(
-        &mut self,
-        router: &mut impl RouteUpdater,
-        events: &mut ParticipantEvents,
-    ) {
-        self.video.reconcile_routes(router, events);
+    pub fn reconcile_routes(&mut self, events: &mut EventQueue) {
+        self.video.reconcile_routes(events);
     }
 
-    pub fn poll_slow(
-        &mut self,
-        now: Instant,
-        bwe: &mut Bwe,
-        router: &mut impl RouteUpdater,
-        events: &mut ParticipantEvents,
-    ) {
+    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, events: &mut EventQueue) {
         self.update_allocations(bwe);
-        self.video
-            .poll_slow(now, self.available_bandwidth, router, events);
+        self.video.poll_slow(now, self.available_bandwidth, events);
     }
 
     pub fn unsubscribe_all(&mut self) {
