@@ -5,6 +5,7 @@ use crate::rtp::{self, RtpPacket};
 use indexmap::IndexSet;
 use slotmap::SlotMap;
 use std::collections::HashMap;
+use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
@@ -15,6 +16,12 @@ use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, Trac
 
 /// Maximum number of video slots per participant.
 const VIDEO_MAX_SLOTS: usize = 25;
+
+/// How long to wait between PLI retries while a slot is in a transition state.
+const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Maximum number of PLI retries before giving up and waiting for a natural keyframe.
+const KEYFRAME_MAX_RETRIES: u32 = 5;
 
 slotmap::new_key_type! {
     pub struct SlotKey;
@@ -268,8 +275,60 @@ impl VideoAllocator {
         }
     }
 
-    pub fn poll_slow(&mut self, _now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {
+    pub fn poll_slow(&mut self, now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {
         self.reconcile_routes(events);
+        self.retry_keyframe_requests(now, events);
+    }
+
+    fn retry_keyframe_requests(&mut self, now: Instant, events: &mut EventQueue) {
+        let mut to_request: Vec<TrackLayer> = Vec::new();
+
+        for (_, slot) in self.slots.iter_mut() {
+            if slot.paused {
+                continue;
+            }
+            if !matches!(slot.state(), SlotState::Starting | SlotState::Switching) {
+                continue;
+            }
+
+            // Clone staging layer before mutating the slot.
+            let Some(staging_clone) = slot.staging.clone() else {
+                continue;
+            };
+            let last_at = slot.staging_keyframe_last_at;
+            let retries = slot.staging_keyframe_retries;
+
+            let should_request =
+                last_at.is_none_or(|last| now.duration_since(last) >= KEYFRAME_RETRY_INTERVAL);
+            if !should_request {
+                continue;
+            }
+
+            if retries >= KEYFRAME_MAX_RETRIES {
+                // Retries exhausted: stay subscribed but stop sending PLIs.
+                // Update last_at so we re-evaluate at the next interval without
+                // logging on every tick.
+                slot.staging_keyframe_last_at = Some(now);
+                continue;
+            }
+
+            slot.staging_keyframe_retries += 1;
+            slot.staging_keyframe_last_at = Some(now);
+
+            if slot.staging_keyframe_retries == KEYFRAME_MAX_RETRIES {
+                tracing::warn!(
+                    mid = %slot.mid,
+                    retries = KEYFRAME_MAX_RETRIES,
+                    "slot transition stalled; stopping PLI retries, waiting for natural keyframe"
+                );
+            }
+
+            to_request.push(staging_clone);
+        }
+
+        for layer in &to_request {
+            events.request_keyframe(layer);
+        }
     }
 
     pub fn reconcile_routes(&mut self, events: &mut EventQueue) {
@@ -332,6 +391,11 @@ struct Slot {
     rid: Option<Rid>,
     max_height: u32,
     paused: bool,
+
+    /// Number of PLI retries sent for the current staging layer.
+    staging_keyframe_retries: u32,
+    /// When the last PLI retry was sent for the current staging layer.
+    staging_keyframe_last_at: Option<Instant>,
 }
 
 impl Slot {
@@ -348,6 +412,9 @@ impl Slot {
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             max_height: 0,
             paused: true,
+
+            staging_keyframe_retries: 0,
+            staging_keyframe_last_at: None,
         }
     }
 
@@ -374,6 +441,9 @@ impl Slot {
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
             self.switcher.clear();
+            // Reset retry state so the new staging layer gets fresh PLI attempts.
+            self.staging_keyframe_retries = 0;
+            self.staging_keyframe_last_at = None;
             changed = true;
         }
 
@@ -389,6 +459,8 @@ impl Slot {
     fn stop(&mut self) {
         self.active = None;
         self.staging = None;
+        self.staging_keyframe_retries = 0;
+        self.staging_keyframe_last_at = None;
     }
 
     fn pause_at(&mut self, layer: &TrackLayer) -> bool {
