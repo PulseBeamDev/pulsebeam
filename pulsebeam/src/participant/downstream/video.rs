@@ -192,14 +192,18 @@ impl VideoAllocator {
                 Some(SlotView {
                     key,
                     mid: s.mid,
-                    priority: s.max_height,
+                    max_height: s.max_height,
                     track,
                     current_quality,
                 })
             })
             .collect();
 
-        views.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.mid.cmp(&b.mid)));
+        views.sort_by(|a, b| {
+            b.max_height
+                .cmp(&a.max_height)
+                .then_with(|| a.mid.cmp(&b.mid))
+        });
 
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
 
@@ -478,7 +482,7 @@ pub struct AllocationEngine;
 pub struct SlotView<'a> {
     pub key: SlotKey,
     pub mid: Mid,
-    pub priority: u32,
+    pub max_height: u32,
     pub track: &'a Track,
     pub current_quality: LayerQuality,
 }
@@ -506,6 +510,16 @@ impl AllocationEngine {
     const UPGRADE_FACTOR: f64 = 1.3;
     const DOWNGRADE_FACTOR: f64 = 0.8;
     const MAX_UPGRADES_PER_TICK: usize = 2;
+    const SPATIAL_TOLERANCE: f64 = 1.2;
+
+    // TODO: determine this through either H264 SPS or Simulcast SDP.
+    fn max_height_for_quality(quality: LayerQuality) -> u32 {
+        match quality {
+            LayerQuality::High => 720,
+            LayerQuality::Medium => 360,
+            LayerQuality::Low => 180,
+        }
+    }
 
     pub fn compute<'a>(
         available_bw: Bitrate,
@@ -551,9 +565,19 @@ impl AllocationEngine {
                 break;
             }
 
+            let tier_height = Self::max_height_for_quality(tier);
+            // Calculate the "effective" height of the tier considering tolerance.
+            // We only want to jump to this tier if the UI is large enough to
+            // actually justify the bitrate cost.
+            let min_required_ui_height = (tier_height as f64 / Self::SPATIAL_TOLERANCE) as u32;
+
             for slot in slots {
                 if upgrades_performed >= Self::MAX_UPGRADES_PER_TICK {
                     break;
+                }
+
+                if min_required_ui_height > slot.max_height {
+                    continue;
                 }
 
                 // If this slot didn't even get the baseline, or couldn't get the previous tier, skip it.
@@ -839,7 +863,7 @@ mod allocation_tests {
     fn slot<'a>(mid: &str, priority: u32, track: &'a Track, current: LayerQuality) -> SlotView<'a> {
         SlotView {
             mid: Mid::from(mid),
-            priority,
+            max_height: priority,
             track,
             current_quality: current,
         }
@@ -978,7 +1002,7 @@ mod allocation_tests {
         let mid = Mid::from("a");
         let slots = vec![SlotView {
             mid,
-            priority: 1080,
+            max_height: 1080,
             track: &t,
             current_quality: LayerQuality::High,
         }];
@@ -1024,13 +1048,13 @@ mod allocation_tests {
         let slots = vec![
             SlotView {
                 mid: mid_high_pri,
-                priority: 1080,
+                max_height: 1080,
                 track: &t,
                 current_quality: LayerQuality::Low,
             },
             SlotView {
                 mid: mid_low_pri,
-                priority: 360,
+                max_height: 360,
                 track: &t,
                 current_quality: LayerQuality::Low,
             },
