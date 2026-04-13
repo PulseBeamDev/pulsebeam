@@ -226,7 +226,7 @@ impl StreamMonitor {
             .inactive
             .store(is_inactive, Ordering::Relaxed);
 
-        if is_inactive {
+        if self.kind.is_video() && is_inactive {
             if is_any_sibling_active {
                 // This stream is inactive, but its siblings are active.
                 // This suggests a sender-side bandwidth limitation.
