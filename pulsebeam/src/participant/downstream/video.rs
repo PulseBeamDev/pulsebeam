@@ -514,37 +514,39 @@ impl AllocationEngine {
         let mut decisions: HashMap<SlotKey, AllocationDecision<'a>> = HashMap::new();
         let mut remaining_bps = available_bw.as_f64();
 
-        // 1. Maintain or Downgrade
+        // Track the target quality we are building up for each slot
+        let mut targets: HashMap<SlotKey, Option<&TrackLayer>> = HashMap::new();
+
+        // 1. Guarantee everyone at least 'Low' quality
         for slot in slots {
-            let current = slot.track.by_quality(slot.current_quality);
+            let lowest = slot.track.lowest_quality();
 
-            let stay_layer = current.filter(|l| {
-                l.state.is_healthy()
-                    && (l.state.bitrate_bps() * Self::DOWNGRADE_FACTOR) <= remaining_bps
-            });
+            if !lowest.state.is_healthy() {
+                targets.insert(slot.key, None);
+                continue;
+            }
 
-            let final_layer = stay_layer.or_else(|| {
-                slot.track
-                    .lower_quality(slot.current_quality)
-                    .filter(|l| l.state.is_healthy() && l.state.bitrate_bps() <= remaining_bps)
-            });
+            let cost = lowest.state.bitrate_bps();
 
-            if let Some(layer) = final_layer {
-                let layer_bitrate = Bitrate::from(layer.state.bitrate_bps());
-                let bps = layer_bitrate.as_f64();
-                remaining_bps -= bps;
-                decisions.insert(slot.key, AllocationDecision::Forward(layer, layer_bitrate));
+            let required_bps = if slot.current_quality == lowest.quality {
+                cost * Self::DOWNGRADE_FACTOR
             } else {
-                decisions.insert(
-                    slot.key,
-                    AllocationDecision::Pause(slot.track.lowest_quality()),
-                );
+                cost
+            };
+
+            if remaining_bps >= required_bps {
+                remaining_bps -= cost;
+                targets.insert(slot.key, Some(lowest));
+            } else {
+                // Starvation: Not enough bandwidth even for the lowest layer
+                targets.insert(slot.key, None);
             }
         }
 
-        // 2. Upgrade
+        // 2. Distribute excess to Medium, then High
         let mut upgrades_performed = 0;
-        for tier in [LayerQuality::Low, LayerQuality::Medium, LayerQuality::High] {
+
+        for tier in [LayerQuality::Medium, LayerQuality::High] {
             if upgrades_performed >= Self::MAX_UPGRADES_PER_TICK {
                 break;
             }
@@ -554,35 +556,59 @@ impl AllocationEngine {
                     break;
                 }
 
-                let Some(AllocationDecision::Forward(current_layer, current_bw)) =
-                    decisions.get(&slot.key).copied()
-                else {
+                // If this slot didn't even get the baseline, or couldn't get the previous tier, skip it.
+                let Some(current_target) = targets.get(&slot.key).copied().flatten() else {
                     continue;
                 };
 
-                if current_layer.quality >= tier {
-                    continue;
-                }
-                let Some(target) = slot.track.by_quality(tier) else {
+                let Some(next_layer) = slot.track.by_quality(tier) else {
                     continue;
                 };
-                if !target.state.is_healthy() {
+                if !next_layer.state.is_healthy() {
                     continue;
                 }
 
-                let target_bw = Bitrate::from(target.state.bitrate_bps());
-                let incremental_cost = target_bw.as_f64() - current_bw.as_f64();
+                let next_cost = next_layer.state.bitrate_bps();
+                let current_cost = current_target.state.bitrate_bps();
+                let incremental_cost = next_cost - current_cost;
 
-                // Check against the 30% upgrade headroom (UPGRADE_FACTOR = 1.3)
-                if remaining_bps >= (incremental_cost * Self::UPGRADE_FACTOR) {
+                // Apply Hysteresis
+                // If we are trying to upgrade beyond what the slot CURRENTLY has, apply UPGRADE_FACTOR.
+                // If we are just rebuilding the state they ALREADY had, apply DOWNGRADE_FACTOR so we don't drop them too eagerly.
+                let required_budget = if tier > slot.current_quality {
+                    incremental_cost * Self::UPGRADE_FACTOR
+                } else if tier == slot.current_quality {
+                    incremental_cost * Self::DOWNGRADE_FACTOR
+                } else {
+                    incremental_cost
+                };
+
+                if remaining_bps >= required_budget {
                     remaining_bps -= incremental_cost;
-                    decisions.insert(slot.key, AllocationDecision::Forward(target, target_bw));
-                    upgrades_performed += 1;
+                    targets.insert(slot.key, Some(next_layer));
+
+                    if tier > slot.current_quality {
+                        upgrades_performed += 1;
+                    }
                 }
             }
         }
 
-        // 3. Demand Calculation (The "Want" Bitrate)
+        // 3. finalize
+        let mut used_bps: f64 = 0.0;
+
+        for slot in slots {
+            if let Some(Some(layer)) = targets.get(&slot.key) {
+                let bw = Bitrate::from(layer.state.bitrate_bps());
+                used_bps += bw.as_f64();
+                decisions.insert(slot.key, AllocationDecision::Forward(layer, bw));
+            } else {
+                decisions.insert(
+                    slot.key,
+                    AllocationDecision::Pause(slot.track.lowest_quality()),
+                );
+            }
+        }
         let total_desired_bps: f64 = slots
             .iter()
             .map(|s| {
@@ -596,23 +622,10 @@ impl AllocationEngine {
             })
             .sum();
 
-        let used_bps: f64 = decisions
-            .values()
-            .filter_map(|d| match d {
-                AllocationDecision::Forward(_, bw) => Some(bw.as_f64()),
-                AllocationDecision::Pause(_) => None,
-            })
-            .sum();
-
-        // The allocator uses hysteresis (DOWNGRADE_FACTOR / UPGRADE_FACTOR) to
-        // prevent frequent bitrate churning. This can result in allocating slightly
-        // more than the estimated available bandwidth. Allow a small overshoot
-        // bound to prevent debug builds from panicking while still catching
-        // gross allocation bugs.
         let max_allowed = available_bw.as_f64() / Self::DOWNGRADE_FACTOR;
         debug_assert!(
             used_bps <= max_allowed + f64::EPSILON,
-            "AllocationEngine allocated more bandwidth than allowed: used {} > allowed {} (available {} )",
+            "Engine over-allocated: used {} > allowed {} (available {})",
             used_bps,
             max_allowed,
             available_bw.as_f64()
