@@ -9,7 +9,7 @@ use pulsebeam_runtime::{
 use tokio::time::Instant;
 
 use crate::{
-    entity::ParticipantId,
+    entity::{CohortId, ParticipantId},
     participant::{
         ParticipantConfig, ParticipantCore,
         event::{
@@ -37,8 +37,15 @@ struct Routing {
 #[derive(Debug)]
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
-    PublishTrack(Track, Vec<ParticipantId>),
+    PublishTrack(Track, CohortId),
     RequestKeyframe(GlobalKeyframeRequest),
+}
+
+/// Per-cohort state on a shard. A shard may host participants from many cohorts;
+/// each cohort has its own independent membership set.
+#[derive(Default)]
+struct CohortState {
+    members: IndexSet<ParticipantId>,
 }
 
 #[derive(Debug)]
@@ -52,6 +59,7 @@ pub struct ShardWorker {
     shard_id: usize,
     demuxer: Demuxer,
     participants: HashMap<ParticipantId, ParticipantCore>,
+    cohorts: HashMap<CohortId, CohortState>,
     routing: HashMap<StreamId, Routing>,
 
     recv_batch: Vec<RecvPacketBatch>,
@@ -93,6 +101,7 @@ impl ShardWorker {
             shard_id,
             demuxer: Demuxer::default(),
             participants: HashMap::default(),
+            cohorts: HashMap::default(),
             routing: HashMap::default(),
 
             recv_batch,
@@ -242,19 +251,30 @@ impl ShardWorker {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
                 let participant_id = cfg.participant_id;
+                let cohort_id = cfg.cohort_id;
                 self.add_participant(participant_id, cfg);
-                // Mark dirty so the initial DTLS/ICE output is flushed this tick.
+                self.cohorts
+                    .entry(cohort_id)
+                    .or_default()
+                    .members
+                    .insert(participant_id);
                 self.input_dirty.insert(participant_id);
             }
-            ShardCommand::PublishTrack(track, participants) => {
+            ShardCommand::PublishTrack(track, cohort_id) => {
+                let publisher = track.meta.origin;
                 let tracks = &[track];
-                for participant_id in &participants {
-                    let Some(p) = self.participants.get_mut(participant_id) else {
+                let Some(cohort) = self.cohorts.get(&cohort_id) else {
+                    return;
+                };
+                for &participant_id in &cohort.members {
+                    if participant_id == publisher {
+                        continue;
+                    }
+                    let Some(p) = self.participants.get_mut(&participant_id) else {
                         continue;
                     };
-
                     p.on_tracks_published(tracks);
-                    self.input_dirty.insert(*participant_id);
+                    self.input_dirty.insert(participant_id);
                 }
             }
             ShardCommand::RequestKeyframe(req) => {
@@ -281,6 +301,12 @@ impl ShardWorker {
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ParticipantCore> {
         let mut participant = self.participants.remove(participant_id)?;
+        if let Some(cohort) = self.cohorts.get_mut(&participant.cohort_id) {
+            cohort.members.swap_remove(participant_id);
+            if cohort.members.is_empty() {
+                self.cohorts.remove(&participant.cohort_id);
+            }
+        }
         // Clean up the shard routing table before teardown.
         // participant is already removed from self.participants so there is no aliasing.
         participant.downstream.unsubscribe_all();

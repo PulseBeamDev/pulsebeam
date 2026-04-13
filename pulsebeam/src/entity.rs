@@ -353,6 +353,14 @@ impl fmt::Debug for ConnectionId {
     }
 }
 
+/// Opaque broadcast-domain key used by shards.
+///
+/// Derived by the controller from `(project_id, room_id)` using a dense
+/// sequential counter — never parsed or interpreted by the shard.
+/// Each shard holds only its local slice of the cohort's membership.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CohortId(pub u32);
+
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TrackId {
     uuid: Uuid,
