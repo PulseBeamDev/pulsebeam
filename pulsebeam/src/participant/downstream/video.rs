@@ -417,7 +417,8 @@ impl Slot {
             staging: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
-            max_height: 0,
+            // With no signaling, we assume users are viewing with 720p playback
+            max_height: 720,
             paused: true,
 
             staging_keyframe_retries: 0,
