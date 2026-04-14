@@ -83,10 +83,16 @@ pub struct ParticipantCore {
     signaling: Signaling,
     last_slow_poll: Instant,
     pub room_id: entity::RoomId,
+    pub shard_id: usize,
 }
 
 impl ParticipantCore {
-    pub fn new(cfg: ParticipantConfig, udp_gso_size: usize, tcp_gso_size: usize) -> Self {
+    pub fn new(
+        cfg: ParticipantConfig,
+        shard_id: usize,
+        udp_gso_size: usize,
+        tcp_gso_size: usize,
+    ) -> Self {
         let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
         let cid = api.create_data_channel(ChannelConfig {
@@ -125,6 +131,7 @@ impl ParticipantCore {
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
             room_id: cfg.room_id,
+            shard_id,
         };
 
         p.on_tracks_published(&cfg.available_tracks);
@@ -444,6 +451,7 @@ impl ParticipantCore {
             Direction::RecvOnly => {
                 let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
                 let track_meta = track::TrackMeta {
+                    shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
                     kind: media.kind,

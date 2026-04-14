@@ -56,7 +56,7 @@ impl DownstreamAllocator {
 
     pub fn add_track(&mut self, track: Track) {
         if track.meta.kind.is_video() {
-            self.video.add_track(track.meta, track.layers);
+            self.video.add_track(track);
         } else {
             self.audio.add_track(track);
         }

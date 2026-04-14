@@ -21,11 +21,13 @@ pub enum ParticipantEvent {
 
 pub enum TopologyEvent {
     StreamSubscribed {
+        shard_id: usize,
         participant_id: ParticipantId,
         stream_id: StreamId,
         kind: MediaKind,
     },
     StreamUnsubscribed {
+        shard_id: usize,
         participant_id: ParticipantId,
         stream_id: StreamId,
     },
@@ -66,21 +68,23 @@ impl<'a> EventQueue<'a> {
         }
     }
 
-    pub fn subscribe(&mut self, stream_id: StreamId, kind: MediaKind) {
+    pub fn subscribe(&mut self, layer: &TrackLayer) {
         self.queue.push_back(ParticipantEvent::Topology(
             TopologyEvent::StreamSubscribed {
+                shard_id: layer.meta.shard_id,
                 participant_id: *self.id,
-                stream_id,
-                kind,
+                stream_id: layer.stream_id(),
+                kind: layer.meta.kind,
             },
         ));
     }
 
-    pub fn unsubscribe(&mut self, stream_id: StreamId) {
+    pub fn unsubscribe(&mut self, layer: &TrackLayer) {
         self.queue.push_back(ParticipantEvent::Topology(
             TopologyEvent::StreamUnsubscribed {
+                shard_id: layer.meta.shard_id,
                 participant_id: *self.id,
-                stream_id,
+                stream_id: layer.stream_id(),
             },
         ));
     }
@@ -100,6 +104,7 @@ impl<'a> EventQueue<'a> {
         self.queue
             .push_back(ParticipantEvent::Control(ControlEvent::KeyframeRequested(
                 GlobalKeyframeRequest {
+                    shard_id: layer.meta.shard_id,
                     origin: layer.meta.origin,
                     stream_id: layer.stream_id(),
                     kind: KeyframeRequestKind::Pli,

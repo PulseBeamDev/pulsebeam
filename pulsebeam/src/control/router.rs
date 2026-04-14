@@ -73,6 +73,14 @@ impl ShardRouter {
             .expect("shard to be running");
     }
 
+    pub async fn broadcast(&mut self, make_cmd: impl Fn() -> ShardCommand) {
+        for tx in &self.shard_command_txs {
+            tx.send(make_cmd())
+                .await
+                .expect("shard to be running");
+        }
+    }
+
     fn get_mut(&mut self, shard_id: usize) -> &mut mailbox::Sender<ShardCommand> {
         &mut self.shard_command_txs[shard_id]
     }

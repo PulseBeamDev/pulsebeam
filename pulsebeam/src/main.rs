@@ -49,8 +49,7 @@ fn main() {
         registry.init();
     }
 
-    let _workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let workers = 1;
+    let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     tracing::info!("using {} worker threads", workers);
 
     // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(

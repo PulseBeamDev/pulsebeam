@@ -212,8 +212,6 @@ impl ControllerActor {
                     None
                 })?;
 
-                room.publish_track(track.clone());
-
                 // TODO: make room shard aware?
                 let mut shard_ids: IndexMap<usize, ()> = IndexMap::new();
                 for participant_id in room.participants_iter() {
@@ -232,6 +230,7 @@ impl ControllerActor {
                     shard_count = shard_ids.len(),
                     "fanning out track to shards"
                 );
+                room.publish_track(track.clone());
                 for (shard_id, _) in shard_ids {
                     self.router
                         .send(shard_id, ShardCommand::PublishTrack(track.clone(), room_id))
@@ -240,7 +239,7 @@ impl ControllerActor {
             }
 
             ShardEvent::ParticipantExited(participant_id) => {
-                self.delete_participant(&participant_id);
+                self.delete_participant(&participant_id).await;
             }
             ShardEvent::KeyframeRequest(req) => {
                 let meta = self.participants.get(&req.origin).or_else(|| {
@@ -267,7 +266,7 @@ impl ControllerActor {
             }
 
             ControllerCommand::DeleteParticipant(m) => {
-                self.delete_participant(&m.participant_id);
+                self.delete_participant(&m.participant_id).await;
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
@@ -299,25 +298,30 @@ impl ControllerActor {
             .entry(state.room_id)
             .or_insert_with(|| Room::new(state.room_id));
         let tracks = room.tracks_for(&state.participant_id);
-        let cfg = ParticipantConfig {
-            manual_sub: state.manual_sub,
-            room_id: state.room_id,
-            participant_id: state.participant_id,
-            rtc,
-            available_tracks: tracks.cloned().collect(),
-        };
-
         // TODO: handle patch
         let epoch = room.participant_count() / MAX_PARTICIPANTS_PER_SHARD_SLOT;
         let routing_key = format!("{}-{}", state.room_id, epoch);
-        let participant_id = cfg.participant_id;
+        let participant_id = state.participant_id;
         let shard_id = self
             .router
             .try_route(routing_key)
             .ok_or(ControllerError::ServiceUnavailable)?;
+        let cfg = ParticipantConfig {
+            manual_sub: state.manual_sub,
+            room_id: state.room_id,
+            participant_id,
+            rtc,
+            available_tracks: tracks.cloned().collect(),
+        };
         tracing::info!("routed {} to {}", participant_id, shard_id);
         self.router
             .send(shard_id, ShardCommand::AddParticipant(cfg))
+            .await;
+        self.router
+            .broadcast(|| ShardCommand::RegisterParticipant {
+                participant_id,
+                shard_id,
+            })
             .await;
 
         room.add_participant(&participant_id);
@@ -331,7 +335,7 @@ impl ControllerActor {
         Ok(answer)
     }
 
-    fn delete_participant(&mut self, participant_id: &ParticipantId) {
+    async fn delete_participant(&mut self, participant_id: &ParticipantId) {
         let Some(meta) = self.participants.remove(participant_id) else {
             return;
         };
@@ -341,6 +345,11 @@ impl ControllerActor {
                 self.rooms.remove(&meta.room_id);
             }
         }
+        self.router
+            .broadcast(|| ShardCommand::UnregisterParticipant {
+                participant_id: *participant_id,
+            })
+            .await;
     }
 
     fn create_answer(&mut self, offer: SdpOffer) -> Result<(Rtc, SdpAnswer), ControllerError> {

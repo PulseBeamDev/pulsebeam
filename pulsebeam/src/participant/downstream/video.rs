@@ -47,12 +47,12 @@ impl VideoAllocator {
         }
     }
 
-    pub fn add_track(&mut self, meta: TrackMeta, layers: Vec<TrackLayer>) {
-        if self.tracks.contains_key(&meta.id) {
+    pub fn add_track(&mut self, track: Track) {
+        if self.tracks.contains_key(&track.meta.id) {
             return;
         }
-        tracing::info!(track = %meta.id, "video track added");
-        self.tracks.insert(meta.id, Track { meta, layers });
+        tracing::info!(track = %track.meta.id, "video track added");
+        self.tracks.insert(track.meta.id, track);
         self.rebalance();
     }
 
@@ -347,7 +347,14 @@ impl VideoAllocator {
 
         for sid in &to_remove {
             self.routes.remove(sid);
-            events.unsubscribe(*sid);
+            // TODO: check how safe this is
+            let Some(track) = self.tracks.get(&sid.0) else {
+                continue;
+            };
+            let Some(layer) = track.layers.iter().find(|l| l.rid == sid.1) else {
+                continue;
+            };
+            events.unsubscribe(layer);
         }
 
         // Pass 2: add routes for active slots not yet in the table.
@@ -359,7 +366,7 @@ impl VideoAllocator {
             let sid = layer.stream_id();
             if let std::collections::hash_map::Entry::Vacant(e) = self.routes.entry(sid) {
                 e.insert(key);
-                events.subscribe(sid, MediaKind::Video);
+                events.subscribe(layer);
                 events.request_keyframe(layer);
             }
         }
@@ -919,6 +926,7 @@ mod allocation_tests {
         Track {
             meta: tx.meta,
             layers: track.layers,
+            shard_id: 0,
         }
     }
 
