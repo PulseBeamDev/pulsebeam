@@ -1,7 +1,6 @@
 use arrayvec::ArrayString;
 use derive_more::{AsRef, Display};
 use sha3::{Digest, Sha3_256};
-use std::hash::Hasher;
 use std::{fmt, str::FromStr};
 use str0m::media::MediaKind;
 use utoipa::ToSchema;
@@ -69,6 +68,28 @@ fn decode_with_prefix(value: &str, expected_prefix: &str) -> Result<Uuid, IdVali
     let bytes = base32::decode(base32::Alphabet::Crockford, encoded)
         .ok_or(IdValidationError::InvalidEncoding)?;
     Uuid::from_slice(&bytes).map_err(|_| IdValidationError::InvalidEncoding)
+}
+
+/// Generates a UUIDv8 using SHA3-256, following the logic of UUIDv5 (Name-based).
+/// Per RFC 9562 Appendix B.2:
+/// https://www.ietf.org/rfc/rfc9562.html#appendix-B.2
+pub fn new_v8_sha3(namespace: &Uuid, name: &[u8]) -> Uuid {
+    let mut hasher = Sha3_256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(name);
+    let hash = hasher.finalize();
+
+    // Take the first 16 bytes of the SHA3-256 hash
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+
+    // Set Version to 8
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+
+    // Set Variant to RFC 4122
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    Uuid::from_bytes(bytes)
 }
 
 pub fn validate_external_string(s: &str) -> Result<(), IdValidationError> {
@@ -218,9 +239,8 @@ impl ParticipantId {
         encode_with_prefix(prefix::PARTICIPANT_ID, self.uuid.as_bytes())
     }
 
-    /// Derives a TrackId using UUIDv5 (Namespace: Self, Name: label)
     pub fn derive_track_id(&self, kind: MediaKind, label: &str) -> TrackId {
-        let uuid = Uuid::new_v5(&self.uuid, label.as_bytes());
+        let uuid = new_v8_sha3(&self.uuid, label.as_bytes());
         TrackId { kind, uuid }
     }
 }
