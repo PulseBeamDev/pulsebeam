@@ -41,6 +41,11 @@ pub enum ShardCommand {
     RequestKeyframe(GlobalKeyframeRequest),
 }
 
+pub enum CrossShardEvent {
+    RtpPublished(),
+    KeyframeRequested(),
+}
+
 #[derive(Default)]
 struct RoomState {
     members: IndexSet<ParticipantId>,
@@ -53,8 +58,23 @@ pub enum ShardEvent {
     KeyframeRequest(GlobalKeyframeRequest),
 }
 
-pub struct ShardWorker {
+struct ShardRouter {
     shard_id: usize,
+    cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
+}
+
+impl ShardRouter {
+    fn send(&self, shard_id: usize, ev: CrossShardEvent) {
+        debug_assert!(
+            shard_id != self.shard_id,
+            "ShardRouter sends a loopback event"
+        );
+
+        self.cross_shard_event_txs[shard_id].try_send(ev);
+    }
+}
+
+pub struct ShardWorker {
     demuxer: Demuxer,
     participants: HashMap<ParticipantId, ParticipantCore>,
     rooms: HashMap<RoomId, RoomState>,
@@ -72,6 +92,8 @@ pub struct ShardWorker {
 
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEvent>,
+    cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
+    router: ShardRouter,
 }
 
 impl ShardWorker {
@@ -80,6 +102,8 @@ impl ShardWorker {
         udp_socket: UnifiedSocket,
         command_rx: mailbox::Receiver<ShardCommand>,
         event_tx: mailbox::Sender<ShardEvent>,
+        cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
+        cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
     ) -> Self {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
         let timers = TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD);
@@ -96,9 +120,13 @@ impl ShardWorker {
         let events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
         let rtp_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
         let shard_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
+        let router = ShardRouter {
+            shard_id,
+            cross_shard_event_txs,
+        };
 
         Self {
-            shard_id,
+            router,
             demuxer: Demuxer::default(),
             participants: HashMap::default(),
             rooms: HashMap::default(),
@@ -115,10 +143,11 @@ impl ShardWorker {
             udp_socket,
             command_rx,
             event_tx,
+            cross_shard_event_rx,
         }
     }
 
-    #[tracing::instrument(skip(self), fields(shard_id = self.shard_id))]
+    #[tracing::instrument(skip(self), fields(shard_id = self.router.shard_id))]
     pub async fn run(self) {
         let res = self.run_inner().await;
         tracing::info!("shard exited: {:?}", res);
@@ -140,6 +169,9 @@ impl ShardWorker {
                 Ok(_) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
                     self.on_command(cmd);
+                }
+                Some(ev) = self.cross_shard_event_rx.recv() => {
+                    // TODO: handle cross_shard_event_rx
                 }
                 _ = wait => {}
                 else => break,

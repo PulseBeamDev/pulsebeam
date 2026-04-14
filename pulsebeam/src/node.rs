@@ -137,16 +137,35 @@ impl NodeBuilder {
         let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
         let mut shard_handles = Vec::new();
         let mut shard_command_txs = Vec::new();
-        for (shard_id, sock) in udp_sockets.into_iter().enumerate() {
+        let mut cross_shard_event_txs = Vec::new();
+        let mut cross_shard_event_rxs = Vec::new();
+        for _ in 0..udp_sockets.len() {
+            // TODO: should cross shard channel capacities this big?
+            let (tx, rx) = mailbox::new(1024);
+            cross_shard_event_txs.push(tx);
+            cross_shard_event_rxs.push(rx);
+        }
+
+        let contexts = udp_sockets.into_iter().zip(cross_shard_event_rxs);
+
+        for (shard_id, (sock, cross_shard_event_rx)) in contexts.into_iter().enumerate() {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
+            let cross_shard_event_txs = cross_shard_event_txs.clone();
             let handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .enable_alt_timer()
                     .build_local(LocalOptions::default())
                     .unwrap();
-                let shard = ShardWorker::new(shard_id, sock, shard_command_rx, shard_event_tx);
+                let shard = ShardWorker::new(
+                    shard_id,
+                    sock,
+                    shard_command_rx,
+                    shard_event_tx,
+                    cross_shard_event_rx,
+                    cross_shard_event_txs,
+                );
                 rt.block_on(tokio::task::unconstrained(shard.run()));
             });
             shard_handles.push(handle);
