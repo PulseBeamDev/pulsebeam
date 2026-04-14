@@ -214,7 +214,8 @@ pub struct ParticipantId {
 impl ParticipantId {
     pub fn new() -> Self {
         Self {
-            uuid: Uuid::new_v4(),
+            // TODO: use deterministic timestamp
+            uuid: Uuid::now_v7(),
         }
     }
 
