@@ -292,7 +292,8 @@ impl ControllerActor {
         state: &ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        let (rtc, answer) = self.create_answer(offer)?;
+        let (mut rtc, answer) = self.create_answer(offer)?;
+        let ufrag = rtc.direct_api().local_ice_credentials().ufrag.clone();
         let room = self
             .rooms
             .entry(state.room_id)
@@ -321,6 +322,7 @@ impl ControllerActor {
             .broadcast(|| ShardCommand::RegisterParticipant {
                 participant_id,
                 shard_id,
+                ufrag: ufrag.clone(),
             })
             .await;
 

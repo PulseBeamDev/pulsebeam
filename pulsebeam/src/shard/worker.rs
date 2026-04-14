@@ -47,6 +47,7 @@ pub enum ShardCommand {
     RegisterParticipant {
         participant_id: ParticipantId,
         shard_id: usize,
+        ufrag: String,
     },
     UnregisterParticipant {
         participant_id: ParticipantId,
@@ -118,6 +119,9 @@ pub struct ShardWorker {
     events: VecDeque<ParticipantEvent>,
     rtp_events: VecDeque<RtpEvent>,
     shard_events: VecDeque<ShardEvent>,
+    /// Ufrag for participants that live on a remote shard, used to demux
+    /// cross-shard UDP packets and to clean up demuxer state on unregister.
+    remote_participant_ufrags: HashMap<ParticipantId, String>,
 
     udp_socket: UnifiedSocket,
 
@@ -163,6 +167,7 @@ impl ShardWorker {
             rooms: HashMap::default(),
             routing: HashMap::default(),
             participant_shards: HashMap::default(),
+            remote_participant_ufrags: HashMap::default(),
 
             recv_batch,
             timers,
@@ -420,11 +425,25 @@ impl ShardWorker {
             ShardCommand::RegisterParticipant {
                 participant_id,
                 shard_id,
+                ufrag,
             } => {
                 self.participant_shards.insert(participant_id, shard_id);
+                // Register the ufrag in this shard's demuxer so that STUN packets
+                // arriving on the wrong shard can still be identified and forwarded.
+                if shard_id != self.router.shard_id {
+                    self.demuxer
+                        .register_ice_ufrag(ufrag.as_bytes(), participant_id);
+                    self.remote_participant_ufrags.insert(participant_id, ufrag);
+                }
             }
             ShardCommand::UnregisterParticipant { participant_id } => {
                 self.participant_shards.remove(&participant_id);
+                if let Some(ufrag) = self.remote_participant_ufrags.remove(&participant_id) {
+                    let addrs = self.demuxer.unregister(ufrag.as_bytes());
+                    for addr in &addrs {
+                        self.udp_socket.close_peer(addr);
+                    }
+                }
             }
         }
         Some(())
