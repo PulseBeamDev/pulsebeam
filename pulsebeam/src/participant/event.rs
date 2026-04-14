@@ -1,28 +1,29 @@
 use std::collections::VecDeque;
 
-use str0m::media::KeyframeRequestKind;
+use str0m::media::{KeyframeRequestKind, MediaKind};
 use tokio::time::Instant;
 
 use crate::entity::ParticipantId;
 use crate::rtp::RtpPacket;
 use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer};
 
+pub struct RtpEvent {
+    pub stream_id: StreamId,
+    pub pkt: RtpPacket,
+}
+
 pub enum ParticipantEvent {
-    Media(MediaEvent),
     Topology(TopologyEvent),
     Timer(TimerEvent),
     Lifecycle(LifecycleEvent),
     Control(ControlEvent),
 }
 
-pub enum MediaEvent {
-    RtpPublished { stream_id: StreamId, pkt: RtpPacket },
-}
-
 pub enum TopologyEvent {
     StreamSubscribed {
         participant_id: ParticipantId,
         stream_id: StreamId,
+        kind: MediaKind,
     },
     StreamUnsubscribed {
         participant_id: ParticipantId,
@@ -49,18 +50,28 @@ pub enum ControlEvent {
 pub struct EventQueue<'a> {
     id: &'a ParticipantId,
     queue: &'a mut VecDeque<ParticipantEvent>,
+    rtp_queue: &'a mut VecDeque<RtpEvent>,
 }
 
 impl<'a> EventQueue<'a> {
-    pub fn new(id: &'a ParticipantId, queue: &'a mut VecDeque<ParticipantEvent>) -> Self {
-        Self { id, queue }
+    pub fn new(
+        id: &'a ParticipantId,
+        queue: &'a mut VecDeque<ParticipantEvent>,
+        rtp_queue: &'a mut VecDeque<RtpEvent>,
+    ) -> Self {
+        Self {
+            id,
+            queue,
+            rtp_queue,
+        }
     }
 
-    pub fn subscribe(&mut self, stream_id: StreamId) {
+    pub fn subscribe(&mut self, stream_id: StreamId, kind: MediaKind) {
         self.queue.push_back(ParticipantEvent::Topology(
             TopologyEvent::StreamSubscribed {
                 participant_id: *self.id,
                 stream_id,
+                kind,
             },
         ));
     }
@@ -75,11 +86,7 @@ impl<'a> EventQueue<'a> {
     }
 
     pub fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket) {
-        self.queue
-            .push_back(ParticipantEvent::Media(MediaEvent::RtpPublished {
-                stream_id,
-                pkt,
-            }));
+        self.rtp_queue.push_back(RtpEvent { stream_id, pkt });
     }
 
     pub fn publish_track(&mut self, track: Track) {

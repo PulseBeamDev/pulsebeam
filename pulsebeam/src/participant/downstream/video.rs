@@ -7,7 +7,7 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::time::Duration;
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
+use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
@@ -359,7 +359,7 @@ impl VideoAllocator {
             let sid = layer.stream_id();
             if let std::collections::hash_map::Entry::Vacant(e) = self.routes.entry(sid) {
                 e.insert(key);
-                events.subscribe(sid);
+                events.subscribe(sid, MediaKind::Video);
                 events.request_keyframe(layer);
             }
         }

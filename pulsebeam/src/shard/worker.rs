@@ -13,14 +13,14 @@ use crate::{
     participant::{
         ParticipantConfig, ParticipantCore,
         event::{
-            ControlEvent, EventQueue, LifecycleEvent, MediaEvent, ParticipantEvent, TimerEvent,
+            ControlEvent, EventQueue, LifecycleEvent, ParticipantEvent, RtpEvent, TimerEvent,
             TopologyEvent,
         },
     },
     shard::{demux::Demuxer, timer::TimerWheel},
     track::{GlobalKeyframeRequest, StreamId, StreamWriter, Track},
 };
-
+use str0m::media::MediaKind;
 const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 
 #[derive(Debug, thiserror::Error)]
@@ -29,8 +29,8 @@ pub enum ShardError {
     IO(#[from] std::io::Error),
 }
 
-#[derive(Default)]
 struct Routing {
+    kind: MediaKind,
     subscribers: IndexSet<ParticipantId>,
 }
 
@@ -65,6 +65,7 @@ pub struct ShardWorker {
     input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     events: VecDeque<ParticipantEvent>,
+    rtp_events: VecDeque<RtpEvent>,
     shard_events: VecDeque<ShardEvent>,
 
     udp_socket: UnifiedSocket,
@@ -93,6 +94,7 @@ impl ShardWorker {
                 ahash::RandomState::default(),
             );
         let events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
+        let rtp_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
         let shard_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
 
         Self {
@@ -107,6 +109,7 @@ impl ShardWorker {
             input_dirty,
             fanout_dirty,
             events,
+            rtp_events,
             shard_events,
 
             udp_socket,
@@ -171,20 +174,30 @@ impl ShardWorker {
                 &self.input_dirty,
                 &mut self.participants,
                 &mut self.events,
+                &mut self.rtp_events,
+            );
+
+            while let Some(ev) = self.rtp_events.pop_front() {
+                handle_rtp(
+                    ev,
+                    &self.routing,
+                    &mut self.participants,
+                    &mut self.fanout_dirty,
+                );
+            }
+
+            poll_participants(
+                now,
+                &self.fanout_dirty,
+                &mut self.participants,
+                &mut self.events,
+                &mut self.rtp_events,
             );
 
             // Drain all events produced this tick before flushing egress,
             // so RTP forwards from this tick are batched into the same flush.
             while let Some(event) = self.events.pop_front() {
                 match event {
-                    ParticipantEvent::Media(ev) => {
-                        handle_participant_media(
-                            ev,
-                            &self.routing,
-                            &mut self.participants,
-                            &mut self.fanout_dirty,
-                        );
-                    }
                     ParticipantEvent::Topology(ev) => {
                         handle_participant_topology(ev, &mut self.routing);
                     }
@@ -203,13 +216,6 @@ impl ShardWorker {
                     }
                 }
             }
-
-            poll_participants(
-                now,
-                &self.fanout_dirty,
-                &mut self.participants,
-                &mut self.events,
-            );
 
             // Flush egress for all dirty participants in one pass.
             // Exited participants were swap_removed above so this is safe.
@@ -245,7 +251,7 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn on_command(&mut self, cmd: ShardCommand) {
+    fn on_command(&mut self, cmd: ShardCommand) -> Option<()> {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
                 let participant_id = cfg.participant_id;
@@ -261,9 +267,7 @@ impl ShardWorker {
             ShardCommand::PublishTrack(track, room_id) => {
                 let publisher = track.meta.origin;
                 let tracks = &[track];
-                let Some(room) = self.rooms.get(&room_id) else {
-                    return;
-                };
+                let room = self.rooms.get(&room_id)?;
                 for &participant_id in &room.members {
                     if participant_id == publisher {
                         continue;
@@ -276,14 +280,12 @@ impl ShardWorker {
                 }
             }
             ShardCommand::RequestKeyframe(req) => {
-                let Some(p) = self.participants.get_mut(&req.origin) else {
-                    tracing::warn!(%req.origin, ?req.stream_id, "RequestKeyframe: publisher participant not on this shard");
-                    return;
-                };
+                let p = self.participants.get_mut(&req.origin)?;
                 p.handle_remote_keyframe_request(req.stream_id, req.kind);
                 self.input_dirty.insert(req.origin);
             }
         }
+        Some(())
     }
 
     fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
@@ -319,50 +321,59 @@ impl ShardWorker {
 fn poll_participants(
     now: Instant,
     dirty: &IndexSet<ParticipantId, ahash::RandomState>,
-
     participants: &mut HashMap<ParticipantId, ParticipantCore>,
     events: &mut VecDeque<ParticipantEvent>,
+    rtp_events: &mut VecDeque<RtpEvent>,
 ) {
     for participant_id in dirty {
         let Some(participant) = participants.get_mut(participant_id) else {
             continue;
         };
-        let mut queue = EventQueue::new(participant_id, events);
+        let mut queue = EventQueue::new(participant_id, events, rtp_events);
         participant.poll(now, &mut queue);
     }
 }
 
-fn handle_participant_media(
-    ev: MediaEvent,
+fn handle_rtp(
+    ev: RtpEvent,
     routing: &HashMap<StreamId, Routing>,
-
     participants: &mut HashMap<ParticipantId, ParticipantCore>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
 ) -> Option<()> {
-    match ev {
-        MediaEvent::RtpPublished { stream_id, pkt } => {
-            let route = routing.get(&stream_id)?;
-
+    let route = routing.get(&ev.stream_id)?;
+    match route.kind {
+        MediaKind::Video => {
             for participant_id in &route.subscribers {
                 let Some(sub) = participants.get_mut(participant_id) else {
                     continue;
                 };
                 let mut writer = StreamWriter(&mut sub.rtc);
-                sub.downstream.on_forward_rtp(&stream_id, &pkt, &mut writer);
+                sub.downstream
+                    .on_forward_rtp(&ev.stream_id, &ev.pkt, &mut writer);
                 dirty.insert(*participant_id);
             }
+        }
+        MediaKind::Audio => {
+            // TODO: audio forwarding
         }
     }
     Some(())
 }
 
-fn handle_participant_topology(ev: TopologyEvent, routing: &mut HashMap<StreamId, Routing>) {
+fn handle_participant_topology(
+    ev: TopologyEvent,
+    routing: &mut HashMap<StreamId, Routing>,
+) -> Option<()> {
     match ev {
         TopologyEvent::StreamSubscribed {
             participant_id,
             stream_id,
+            kind,
         } => {
-            let routing = routing.entry(stream_id).or_default();
+            let routing = routing.entry(stream_id).or_insert_with(|| Routing {
+                kind,
+                subscribers: IndexSet::with_capacity(256),
+            });
             routing.subscribers.insert(participant_id);
         }
         TopologyEvent::StreamUnsubscribed {
@@ -374,6 +385,8 @@ fn handle_participant_topology(ev: TopologyEvent, routing: &mut HashMap<StreamId
             }
         }
     }
+
+    Some(())
 }
 fn handle_participant_timer(_ev: TimerEvent) {}
 fn handle_participant_lifecycle(_ev: LifecycleEvent) {}
