@@ -4,10 +4,12 @@
 //!
 //! 1. Tracks are registered via [`TopNAudioSelector::add_track`].
 //! 2. Packets are pushed via [`TopNAudioSelector::push_rtp`]; the selector
-//!    routes each packet to the slot assigned to that track, then returns
-//!    `Some((slot_idx, packet))` so the caller can forward to all subscribers.
-//! 3. [`TopNAudioSelector::poll_slow`] re-ranks the top-N speakers.  Call it
-//!    on a ~200 ms cadence from the shard worker's slow path.
+//!    updates the RFC 6464 audio-level EMA for that track and returns
+//!    `Some(slot_idx)` so the caller knows which output slot to forward on.
+//! 3. [`TopNAudioSelector::poll_slow`] re-ranks the top-N speakers and returns
+//!    `true` if any slot assignment changed.  Call on a ~200 ms cadence.
+//! 4. [`TopNAudioSelector::current_assignments`] returns the current
+//!    `(slot_idx, ParticipantId)` mapping for signaling.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -17,9 +19,9 @@ use tokio::time::Instant;
 
 use crate::{
     control::controller::MAX_SEND_AUDIO_SLOTS,
-    entity::TrackId,
-    rtp::{AudioRtpPacket, RtpPacket, monitor::StreamState},
-    track::{Track, TrackMeta},
+    entity::{ParticipantId, TrackId},
+    rtp::RtpPacket,
+    track::TrackMeta,
 };
 
 /// Number of output slots produced by the selector.
@@ -31,10 +33,13 @@ const RERANK_INTERVAL: Duration = Duration::from_millis(200);
 // ── Scoring metadata ─────────────────────────────────────────────────────────
 
 struct InputTrack {
-    state: StreamState,
     meta: TrackMeta,
     /// Which output slot this track is currently assigned to.
     slot: Option<usize>,
+    /// Exponential moving average of the RFC 6464 dBov level.
+    /// Scale: 0 = loudest (digital full scale), -127 = silence.
+    /// Higher (closer to 0) means louder → ranked first.
+    audio_level_ema: f32,
 }
 
 // ── Output slot ───────────────────────────────────────────────────────────────
@@ -74,23 +79,17 @@ impl TopNAudioSelector {
     }
 
     /// Register a newly published audio track.
-    pub fn add_track(&mut self, track: Track) {
-        let id = track.meta.id;
+    pub fn add_track(&mut self, meta: TrackMeta) {
+        let id = meta.id;
         if self.tracks.contains_key(&id) {
             return;
         }
-
-        // TODO: allow simulcast audio
-        let Some(layer) = track.layers.first() else {
-            return;
-        };
-
         self.tracks.insert(
             id,
             InputTrack {
-                state: layer.state.clone(),
-                meta: track.meta,
+                meta,
                 slot: None,
+                audio_level_ema: -127.0, // start at silence
             },
         );
     }
@@ -104,55 +103,59 @@ impl TopNAudioSelector {
         }
     }
 
-    /// Hot-path entry point.  Returns `Some((slot_idx, packet))` when the
-    /// packet should be forwarded to all subscribers on that slot, or `None`
-    /// if the track has no active slot assignment.
+    /// Hot-path entry point.  Updates the RFC 6464 audio-level EMA for the
+    /// track and returns `Some(slot_idx)` if the track has an active slot
+    /// assignment, or `None` if it is currently unselected.
     #[inline]
-    pub fn push_rtp(&self, track_id: TrackId, pkt: RtpPacket) -> Option<(usize, AudioRtpPacket)> {
-        let track = self.tracks.get(&track_id)?;
-        let slot_idx = track.slot?;
-        Some((
-            slot_idx,
-            AudioRtpPacket {
-                participant_id: track.meta.origin,
-                track_id,
-                packet: pkt,
-            },
-        ))
+    pub fn push_rtp(&mut self, track_id: TrackId, pkt: &RtpPacket) -> Option<usize> {
+        let track = self.tracks.get_mut(&track_id)?;
+        // RFC 6464: ext_vals.audio_level is i8, 0 = loudest, -127 = silence.
+        if let Some(level) = pkt.ext_vals.audio_level {
+            track.audio_level_ema = 0.8 * track.audio_level_ema + 0.2 * (level as f32);
+        }
+        track.slot
+    }
+
+    /// Returns the current `(slot_idx, ParticipantId)` pairs for all occupied slots.
+    pub fn current_assignments(&self) -> Vec<(usize, ParticipantId)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let track_id = slot.track_id?;
+                let participant_id = self.tracks.get(&track_id)?.meta.origin;
+                Some((i, participant_id))
+            })
+            .collect()
     }
 
     /// Slow-path: re-rank the top-N speakers if the interval has elapsed.
-    /// Call from the shard worker's 100 ms slow-poll bucket.
-    pub fn poll_slow(&mut self, now: Instant) {
+    /// Returns `true` if any slot assignment changed.
+    /// Call from the shard worker's slow-poll path (~200 ms cadence).
+    pub fn poll_slow(&mut self, now: Instant) -> bool {
         if let Some(last) = self.last_rerank
             && now.duration_since(last) < RERANK_INTERVAL
         {
-            return;
+            return false;
         }
         self.last_rerank = Some(now);
-        self.rerank();
+        self.rerank()
     }
 
     // ── Re-ranking ────────────────────────────────────────────────────────────
 
-    fn rerank(&mut self) {
+    /// Re-rank tracks by loudness.  Returns `true` if any slot assignment changed.
+    fn rerank(&mut self) -> bool {
         if self.tracks.is_empty() {
-            return;
+            return false;
         }
 
+        // Sort descending by audio_level_ema — higher (closer to 0) = louder = ranked first.
         let mut scored: Vec<(TrackId, f32)> = self
             .tracks
             .iter()
-            .map(|(&id, t)| {
-                let envelope = t.state.audio_envelope();
-                let silence_penalty = {
-                    let secs = t.state.silence_duration().as_secs_f32();
-                    -(secs / 2.0).min(1.0) * 0.2
-                };
-                (id, envelope + silence_penalty)
-            })
+            .map(|(&id, t)| (id, t.audio_level_ema))
             .collect();
-
         scored.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(Ordering::Equal));
 
         let top_n: Vec<TrackId> = scored
@@ -161,9 +164,11 @@ impl TopNAudioSelector {
             .map(|(id, _)| *id)
             .collect();
 
-        // Pass 1 — retain existing valid assignments.
+        let mut changed = false;
+
+        // Pass 1 — retain existing valid assignments; evict tracks that fell out of top-N.
         let mut unassigned: Vec<TrackId> = top_n.clone();
-        for (slot_idx, slot) in self.slots.iter_mut().enumerate() {
+        for slot in self.slots.iter_mut() {
             if let Some(id) = slot.track_id {
                 if let Some(pos) = unassigned.iter().position(|x| *x == id) {
                     unassigned.remove(pos);
@@ -173,12 +178,12 @@ impl TopNAudioSelector {
                     if let Some(t) = self.tracks.get_mut(&id) {
                         t.slot = None;
                     }
+                    changed = true;
                 }
             }
-            let _ = slot_idx;
         }
 
-        // Pass 2 — fill empty slots.
+        // Pass 2 — fill empty slots with newly top-N tracks.
         let mut iter = unassigned.into_iter();
         for (slot_idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.track_id.is_none()
@@ -188,13 +193,17 @@ impl TopNAudioSelector {
                 if let Some(t) = self.tracks.get_mut(&id) {
                     t.slot = Some(slot_idx);
                 }
+                changed = true;
             }
         }
 
-        tracing::trace!(
-            tracks = self.tracks.len(),
-            assigned = self.slots.iter().filter(|s| s.track_id.is_some()).count(),
-            "audio selector re-ranked"
-        );
+        if changed {
+            tracing::trace!(
+                tracks = self.tracks.len(),
+                assigned = self.slots.iter().filter(|s| s.track_id.is_some()).count(),
+                "audio selector re-ranked"
+            );
+        }
+        changed
     }
 }
