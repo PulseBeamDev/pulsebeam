@@ -96,11 +96,9 @@ struct ShardRouter {
 
 impl ShardRouter {
     fn send(&self, shard_id: usize, ev: CrossShardEvent) {
-        debug_assert!(
-            shard_id != self.shard_id,
-            "ShardRouter sends a loopback event"
-        );
-
+        if shard_id == self.shard_id {
+            return;
+        }
         let _ = self.cross_shard_event_txs[shard_id].try_send(ev);
     }
 }
