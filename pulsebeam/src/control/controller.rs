@@ -2,7 +2,7 @@ use std::{collections::HashMap, io, time::Duration};
 
 use crate::{
     control::{room::Room, router::ShardRouter},
-    entity::{CohortId, ConnectionId, ParticipantId, RoomId},
+    entity::{ConnectionId, ParticipantId, RoomId},
     participant::ParticipantConfig,
     shard::worker::{ShardCommand, ShardEvent},
 };
@@ -148,7 +148,6 @@ pub enum ControllerError {
 struct ParticipantMeta {
     shard_id: usize,
     room_id: RoomId,
-    cohort_id: CohortId,
 }
 
 pub struct ControllerActor {
@@ -156,9 +155,6 @@ pub struct ControllerActor {
 
     rooms: HashMap<RoomId, Room>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
-    room_cohorts: HashMap<String, CohortId>,
-    free_cohorts: Vec<CohortId>,
-    next_cohort_id: u32,
     router: ShardRouter,
 }
 
@@ -175,9 +171,6 @@ impl ControllerActor {
 
             rooms: HashMap::new(),
             participants: HashMap::new(),
-            room_cohorts: HashMap::new(),
-            free_cohorts: Vec::new(),
-            next_cohort_id: 0,
             router,
         }
     }
@@ -213,7 +206,7 @@ impl ControllerActor {
                     tracing::warn!(%origin, track = %track.meta.id, "TrackPublished: origin participant not found in controller, dropping");
                     None
                 })?;
-                let cohort_id = meta.cohort_id;
+                let room_id = meta.room_id;
                 let room = self.rooms.get_mut(&meta.room_id).or_else(|| {
                     tracing::warn!(%origin, track = %track.meta.id, room = %meta.room_id, "TrackPublished: room not found in controller, dropping");
                     None
@@ -235,16 +228,13 @@ impl ControllerActor {
                 tracing::info!(
                     track = %track.meta.id,
                     %origin,
-                    cohort_id = ?cohort_id,
+                    room_id = ?room_id,
                     shard_count = shard_ids.len(),
                     "fanning out track to shards"
                 );
                 for (shard_id, _) in shard_ids {
                     self.router
-                        .send(
-                            shard_id,
-                            ShardCommand::PublishTrack(track.clone(), cohort_id),
-                        )
+                        .send(shard_id, ShardCommand::PublishTrack(track.clone(), room_id))
                         .await;
                 }
             }
@@ -304,15 +294,14 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
         let (rtc, answer) = self.create_answer(offer)?;
-        let cohort_id = self.get_or_create_cohort(&state.room_id);
         let room = self
             .rooms
-            .entry(state.room_id.clone())
-            .or_insert_with(|| Room::new(state.room_id.clone()));
+            .entry(state.room_id)
+            .or_insert_with(|| Room::new(state.room_id));
         let tracks = room.tracks_for(&state.participant_id);
         let cfg = ParticipantConfig {
             manual_sub: state.manual_sub,
-            cohort_id,
+            room_id: state.room_id,
             participant_id: state.participant_id,
             rtc,
             available_tracks: tracks.cloned().collect(),
@@ -322,7 +311,6 @@ impl ControllerActor {
         let epoch = room.participant_count() / MAX_PARTICIPANTS_PER_SHARD_SLOT;
         let routing_key = format!("{}-{}", state.room_id, epoch);
         let participant_id = cfg.participant_id;
-        let cohort_id = cfg.cohort_id;
         let shard_id = self
             .router
             .try_route(routing_key)
@@ -337,31 +325,10 @@ impl ControllerActor {
             participant_id,
             ParticipantMeta {
                 shard_id,
-                room_id: state.room_id.clone(),
-                cohort_id,
+                room_id: state.room_id,
             },
         );
         Ok(answer)
-    }
-
-    /// Returns the `CohortId` for a room, allocating a new one if this is the
-    /// first time this room is seen. Freed IDs are recycled via `free_cohorts`
-    /// so the u32 counter is bounded by peak concurrent room count, not lifetime.
-    fn get_or_create_cohort(&mut self, room_id: &RoomId) -> CohortId {
-        let key = room_id.internal().to_string();
-        if let Some(&existing) = self.room_cohorts.get(&key) {
-            return existing;
-        }
-        let id = self.free_cohorts.pop().unwrap_or_else(|| {
-            let id = CohortId(self.next_cohort_id);
-            self.next_cohort_id = self
-                .next_cohort_id
-                .checked_add(1)
-                .expect("CohortId overflow: more simultaneous rooms than u32::MAX");
-            id
-        });
-        self.room_cohorts.insert(key, id);
-        id
     }
 
     fn delete_participant(&mut self, participant_id: &ParticipantId) {
@@ -372,9 +339,6 @@ impl ControllerActor {
             room.remove_participant(participant_id);
             if room.participant_count() == 0 {
                 self.rooms.remove(&meta.room_id);
-                if let Some(id) = self.room_cohorts.remove(meta.room_id.internal()) {
-                    self.free_cohorts.push(id);
-                }
             }
         }
     }

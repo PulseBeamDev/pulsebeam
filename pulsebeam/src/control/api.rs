@@ -23,7 +23,7 @@ use crate::{
 };
 use crate::{
     control::controller::{ControllerHandle, ParticipantState},
-    entity::{IdValidationError, ParticipantId, RoomId},
+    entity::{ExternalRoomId, IdValidationError, ParticipantId, RoomId},
 };
 
 pub enum HeaderExt {
@@ -184,20 +184,21 @@ pub struct CreateParticipantQuery {
 )]
 #[axum::debug_handler]
 async fn create_participant(
-    Path(room_id): Path<RoomId>,
+    Path(external_room_id): Path<ExternalRoomId>,
     Query(query): Query<CreateParticipantQuery>,
     State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
+    let room_id = RoomId::from_external(&external_room_id);
     let participant_id = ParticipantId::new();
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let state = ParticipantState {
         manual_sub: query.manual_sub,
-        room_id: room_id.clone(),
+        room_id,
         participant_id,
         connection_id: ConnectionId::new(),
         old_connection_id: None,
@@ -219,8 +220,7 @@ async fn create_participant(
 
     let path = format!(
         "/rooms/{}/participants/{}",
-        &room_id.external(),
-        &participant_id
+        &external_room_id, &participant_id
     );
     let location_url = build_location(&headers, &s.api_config, &path, &state)?;
 
@@ -255,9 +255,10 @@ async fn create_participant(
 )]
 #[axum::debug_handler]
 async fn delete_participant(
-    Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
+    Path((external_room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
     State(s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let room_id = RoomId::from_external(&external_room_id);
     s.controller
         .try_send(
             controller::DeleteParticipant {
@@ -306,13 +307,14 @@ pub struct PatchParticipantQuery {
 )]
 #[axum::debug_handler]
 async fn patch_participant(
-    Path((room_id, participant_id)): Path<(RoomId, ParticipantId)>,
+    Path((external_room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
     Query(query): Query<PatchParticipantQuery>,
     State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
+    let room_id = RoomId::from_external(&external_room_id);
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
 
     let old_connection_id: ConnectionId = headers
@@ -327,8 +329,7 @@ async fn patch_participant(
     // TODO: merge this logic with POST
     let path = format!(
         "/rooms/{}/participants/{}",
-        &room_id.external(),
-        &participant_id
+        &external_room_id, &participant_id
     );
     let state = ParticipantState {
         manual_sub: query.manual_sub,

@@ -9,7 +9,7 @@ use pulsebeam_runtime::{
 use tokio::time::Instant;
 
 use crate::{
-    entity::{CohortId, ParticipantId},
+    entity::{ParticipantId, RoomId},
     participant::{
         ParticipantConfig, ParticipantCore,
         event::{
@@ -37,14 +37,12 @@ struct Routing {
 #[derive(Debug)]
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
-    PublishTrack(Track, CohortId),
+    PublishTrack(Track, RoomId),
     RequestKeyframe(GlobalKeyframeRequest),
 }
 
-/// Per-cohort state on a shard. A shard may host participants from many cohorts;
-/// each cohort has its own independent membership set.
 #[derive(Default)]
-struct CohortState {
+struct RoomState {
     members: IndexSet<ParticipantId>,
 }
 
@@ -59,7 +57,7 @@ pub struct ShardWorker {
     shard_id: usize,
     demuxer: Demuxer,
     participants: HashMap<ParticipantId, ParticipantCore>,
-    cohorts: HashMap<CohortId, CohortState>,
+    rooms: HashMap<RoomId, RoomState>,
     routing: HashMap<StreamId, Routing>,
 
     recv_batch: Vec<RecvPacketBatch>,
@@ -101,7 +99,7 @@ impl ShardWorker {
             shard_id,
             demuxer: Demuxer::default(),
             participants: HashMap::default(),
-            cohorts: HashMap::default(),
+            rooms: HashMap::default(),
             routing: HashMap::default(),
 
             recv_batch,
@@ -251,22 +249,22 @@ impl ShardWorker {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
                 let participant_id = cfg.participant_id;
-                let cohort_id = cfg.cohort_id;
+                let room_id = cfg.room_id;
                 self.add_participant(participant_id, cfg);
-                self.cohorts
-                    .entry(cohort_id)
+                self.rooms
+                    .entry(room_id)
                     .or_default()
                     .members
                     .insert(participant_id);
                 self.input_dirty.insert(participant_id);
             }
-            ShardCommand::PublishTrack(track, cohort_id) => {
+            ShardCommand::PublishTrack(track, room_id) => {
                 let publisher = track.meta.origin;
                 let tracks = &[track];
-                let Some(cohort) = self.cohorts.get(&cohort_id) else {
+                let Some(room) = self.rooms.get(&room_id) else {
                     return;
                 };
-                for &participant_id in &cohort.members {
+                for &participant_id in &room.members {
                     if participant_id == publisher {
                         continue;
                     }
@@ -301,10 +299,10 @@ impl ShardWorker {
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ParticipantCore> {
         let mut participant = self.participants.remove(participant_id)?;
-        if let Some(cohort) = self.cohorts.get_mut(&participant.cohort_id) {
-            cohort.members.swap_remove(participant_id);
-            if cohort.members.is_empty() {
-                self.cohorts.remove(&participant.cohort_id);
+        if let Some(room) = self.rooms.get_mut(&participant.room_id) {
+            room.members.swap_remove(participant_id);
+            if room.members.is_empty() {
+                self.rooms.remove(&participant.room_id);
             }
         }
         // Clean up the shard routing table before teardown.

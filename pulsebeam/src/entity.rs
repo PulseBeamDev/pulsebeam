@@ -25,10 +25,6 @@ pub mod prefix {
     pub const VIDEO_TRACK_ID: &str = "vid";
 }
 
-const HASH_OUTPUT_BYTES: usize = 16;
-const MAX_INTERNAL_ID_LEN: usize = 36;
-const MAX_EXTERNAL_ID_LEN: usize = 36;
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IdValidationError {
@@ -148,45 +144,34 @@ impl TryFrom<String> for ExternalRoomId {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RoomId {
-    external: ExternalRoomId,
-    internal: ArrayString<MAX_INTERNAL_ROOM_ID_LEN>,
+    uuid: Uuid,
 }
 
 impl RoomId {
-    pub fn from_external(external: ExternalRoomId) -> Self {
-        let mut hasher = Sha3_256::default();
-        hasher.update(external.as_str().as_bytes());
-        let full_hash = hasher.finalize();
-        let s = encode_with_prefix(prefix::ROOM_ID, &full_hash[..HASH_OUTPUT_BYTES]);
-        Self {
-            external,
-            internal: ArrayString::from(&s).unwrap(),
-        }
+    pub fn from_external(external: &ExternalRoomId) -> Self {
+        let uuid = new_v8_sha3(&Uuid::nil(), external.as_str().as_bytes());
+        Self { uuid }
     }
 
-    pub fn external(&self) -> &ExternalRoomId {
-        &self.external
-    }
-
-    /// Stable opaque key for DB storage, routing tables, etc.
-    pub fn internal(&self) -> &str {
-        self.internal.as_str()
-    }
-}
-
-impl FromStr for RoomId {
-    type Err = IdValidationError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ExternalRoomId::from_str(s).map(Self::from_external)
+    pub fn as_str(&self) -> String {
+        encode_with_prefix(prefix::ROOM_ID, self.uuid.as_bytes())
     }
 }
 
 impl TryFrom<String> for RoomId {
     type Error = IdValidationError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        ExternalRoomId::try_from(value).map(Self::from_external)
+        let uuid = decode_with_prefix(&value, prefix::ROOM_ID)?;
+        Ok(Self { uuid })
+    }
+}
+
+impl FromStr for RoomId {
+    type Err = IdValidationError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_string())
     }
 }
 
@@ -195,7 +180,7 @@ impl serde::Serialize for RoomId {
     where
         S: serde::Serializer,
     {
-        self.external.serialize(serializer)
+        serializer.serialize_str(&self.as_str())
     }
 }
 
@@ -204,22 +189,20 @@ impl<'de> serde::Deserialize<'de> for RoomId {
     where
         D: serde::Deserializer<'de>,
     {
-        ExternalRoomId::deserialize(deserializer).map(Self::from_external)
+        let s = String::deserialize(deserializer)?;
+        Self::try_from(s).map_err(serde::de::Error::custom)
     }
 }
 
 impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.internal, f)
+        write!(f, "{}", self.as_str())
     }
 }
 
-// Debug shows both so you can see the mapping during development
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RoomId")
-            .field("internal", &self.internal.as_str())
-            .finish()
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -373,14 +356,6 @@ impl fmt::Debug for ConnectionId {
     }
 }
 
-/// Opaque broadcast-domain key used by shards.
-///
-/// Derived by the controller from `(project_id, room_id)` using a dense
-/// sequential counter — never parsed or interpreted by the shard.
-/// Each shard holds only its local slice of the cohort's membership.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct CohortId(pub u32);
-
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TrackId {
     uuid: Uuid,
@@ -466,9 +441,10 @@ mod tests {
 
     #[test]
     fn room_id_from_external() {
-        let room_id = RoomId::from_str("my-room").unwrap();
+        let ext = ExternalRoomId::new("my-room").unwrap();
+        let room_id = RoomId::from_external(&ext);
         assert!(room_id.to_string().starts_with("rm_"));
-        assert!(room_id.internal().starts_with("rm_"));
+        assert!(room_id.as_str().starts_with("rm_"));
     }
 
     #[test]
@@ -480,47 +456,47 @@ mod tests {
 
     #[test]
     fn external_room_id_rejects_sql_injection() {
-        assert!(ExternalRoomId::new("room'; DROP TABLE users--".to_string()).is_err());
+        assert!(ExternalRoomId::new("room'; DROP TABLE users--").is_err());
     }
 
     #[test]
     fn external_room_id_rejects_xss() {
-        assert!(ExternalRoomId::new("<script>alert('xss')</script>".to_string()).is_err());
+        assert!(ExternalRoomId::new("<script>alert('xss')</script>").is_err());
     }
 
     #[test]
     fn external_room_id_rejects_path_traversal() {
-        assert!(ExternalRoomId::new("../../../etc/passwd".to_string()).is_err());
+        assert!(ExternalRoomId::new("../../../etc/passwd").is_err());
     }
 
     #[test]
     fn external_room_id_rejects_null_bytes() {
-        assert!(ExternalRoomId::new("room\0id".to_string()).is_err());
+        assert!(ExternalRoomId::new("room\0id").is_err());
     }
 
     #[test]
     fn external_room_id_rejects_unicode_exploits() {
-        assert!(ExternalRoomId::new("room\u{202e}attacked".to_string()).is_err());
+        assert!(ExternalRoomId::new("room\u{202e}attacked").is_err());
     }
 
     #[test]
     fn external_room_id_rejects_whitespace() {
-        assert!(ExternalRoomId::new("room id".to_string()).is_err());
-        assert!(ExternalRoomId::new("room\tid".to_string()).is_err());
-        assert!(ExternalRoomId::new("room\nid".to_string()).is_err());
+        assert!(ExternalRoomId::new("room id").is_err());
+        assert!(ExternalRoomId::new("room\tid").is_err());
+        assert!(ExternalRoomId::new("room\nid").is_err());
     }
 
     #[test]
     fn external_room_id_rejects_special_chars() {
         for input in ["room@id", "room#id", "room$id", "room%id", "room&id"] {
-            assert!(ExternalRoomId::new(input.to_string()).is_err());
+            assert!(ExternalRoomId::new(input).is_err());
         }
     }
 
     #[test]
     fn external_room_id_empty_string() {
         assert_eq!(
-            ExternalRoomId::new("".to_string()).unwrap_err(),
+            ExternalRoomId::new("").unwrap_err(),
             IdValidationError::Empty
         );
     }
@@ -529,14 +505,14 @@ mod tests {
     fn external_room_id_too_long() {
         let too_long = "a".repeat(MAX_EXTERNAL_ROOM_ID_LEN + 1);
         assert_eq!(
-            ExternalRoomId::new(too_long).unwrap_err(),
+            ExternalRoomId::new(&too_long).unwrap_err(),
             IdValidationError::TooLong(MAX_EXTERNAL_ROOM_ID_LEN)
         );
     }
 
     #[test]
     fn external_room_id_max_length_accepted() {
-        assert!(ExternalRoomId::new("a".repeat(MAX_EXTERNAL_ROOM_ID_LEN)).is_ok());
+        assert!(ExternalRoomId::new(&"a".repeat(MAX_EXTERNAL_ROOM_ID_LEN)).is_ok());
     }
 
     #[test]
@@ -544,7 +520,7 @@ mod tests {
         for input in [
             "room123", "ROOM123", "room_123", "room-123", "a", "Z", "0", "_", "-",
         ] {
-            assert!(ExternalRoomId::new(input.to_string()).is_ok());
+            assert!(ExternalRoomId::new(input).is_ok());
         }
     }
 
@@ -597,20 +573,20 @@ mod tests {
 
     #[test]
     fn room_id_deterministic_hashing() {
-        let external = ExternalRoomId::new("test-room".to_string()).unwrap();
-        let room1 = RoomId::from_external(external.clone());
-        let room2 = RoomId::from_external(external);
-        assert_eq!(room1.internal(), room2.internal());
+        let external = ExternalRoomId::new("test-room").unwrap();
+        let room1 = RoomId::from_external(&external);
+        let room2 = RoomId::from_external(&external);
+        assert_eq!(room1.as_str(), room2.as_str());
         assert_eq!(room1, room2);
     }
 
     #[test]
     fn room_id_different_external_different_hash() {
-        let ext1 = ExternalRoomId::new("room1".to_string()).unwrap();
-        let ext2 = ExternalRoomId::new("room2".to_string()).unwrap();
-        let room1 = RoomId::from_external(ext1);
-        let room2 = RoomId::from_external(ext2);
-        assert_ne!(room1.internal(), room2.internal());
+        let ext1 = ExternalRoomId::new("room1").unwrap();
+        let ext2 = ExternalRoomId::new("room2").unwrap();
+        let room1 = RoomId::from_external(&ext1);
+        let room2 = RoomId::from_external(&ext2);
+        assert_ne!(room1.as_str(), room2.as_str());
         assert_ne!(room1, room2);
     }
 
@@ -658,16 +634,16 @@ mod tests {
 
     #[test]
     fn room_id_serde_roundtrip() {
-        let external = ExternalRoomId::new("test-room".to_string()).unwrap();
-        let id = RoomId::from_external(external);
+        let external = ExternalRoomId::new("test-room").unwrap();
+        let id = RoomId::from_external(&external);
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized: RoomId = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(id.external(), deserialized.external());
+        assert_eq!(id, deserialized);
     }
 
     #[test]
     fn external_room_id_serde_roundtrip() {
-        let id = ExternalRoomId::new("test-room".to_string()).unwrap();
+        let id = ExternalRoomId::new("test-room").unwrap();
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized: ExternalRoomId = serde_json::from_str(&serialized).unwrap();
         assert_eq!(id, deserialized);
@@ -682,9 +658,9 @@ mod tests {
     #[test]
     fn room_id_as_hashmap_key() {
         let mut map: HashMap<RoomId, String> = HashMap::new();
-        let ext = ExternalRoomId::new("room1".to_string()).unwrap();
-        let room_id = RoomId::from_external(ext);
-        map.insert(room_id.clone(), "value".to_string());
+        let ext = ExternalRoomId::new("room1").unwrap();
+        let room_id = RoomId::from_external(&ext);
+        map.insert(room_id, "value".to_string());
         assert_eq!(map.get(&room_id), Some(&"value".to_string()));
     }
 
@@ -709,9 +685,9 @@ mod tests {
     fn room_id_hash_consistency_after_clone() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hash;
-        let ext = ExternalRoomId::new("room1".to_string()).unwrap();
-        let room1 = RoomId::from_external(ext);
-        let room2 = room1.clone();
+        let ext = ExternalRoomId::new("room1").unwrap();
+        let room1 = RoomId::from_external(&ext);
+        let room2 = room1; // Copy
         let mut h1 = DefaultHasher::new();
         let mut h2 = DefaultHasher::new();
         room1.hash(&mut h1);
@@ -735,11 +711,11 @@ mod tests {
     }
 
     #[test]
-    fn room_id_arc_sharing() {
-        let ext = ExternalRoomId::new("room1".to_string()).unwrap();
-        let id1 = RoomId::from_external(ext);
-        let id2 = id1.clone();
-        assert!(Arc::ptr_eq(&id1.internal, &id2.internal));
+    fn room_id_copy_semantics() {
+        let ext = ExternalRoomId::new("room1").unwrap();
+        let id1 = RoomId::from_external(&ext);
+        let id2 = id1; // Copy
+        assert_eq!(id1, id2);
     }
 
     #[test]
@@ -753,20 +729,20 @@ mod tests {
 
     #[test]
     fn external_room_id_single_char() {
-        assert!(ExternalRoomId::new("a".to_string()).is_ok());
-        assert!(ExternalRoomId::new("Z".to_string()).is_ok());
-        assert!(ExternalRoomId::new("0".to_string()).is_ok());
-        assert!(ExternalRoomId::new("_".to_string()).is_ok());
-        assert!(ExternalRoomId::new("-".to_string()).is_ok());
+        assert!(ExternalRoomId::new("a").is_ok());
+        assert!(ExternalRoomId::new("Z").is_ok());
+        assert!(ExternalRoomId::new("0").is_ok());
+        assert!(ExternalRoomId::new("_").is_ok());
+        assert!(ExternalRoomId::new("-").is_ok());
     }
 
     #[test]
     fn room_id_case_sensitivity() {
-        let ext1 = ExternalRoomId::new("Room".to_string()).unwrap();
-        let ext2 = ExternalRoomId::new("room".to_string()).unwrap();
-        let room1 = RoomId::from_external(ext1);
-        let room2 = RoomId::from_external(ext2);
-        assert_ne!(room1.internal(), room2.internal());
+        let ext1 = ExternalRoomId::new("Room").unwrap();
+        let ext2 = ExternalRoomId::new("room").unwrap();
+        let room1 = RoomId::from_external(&ext1);
+        let room2 = RoomId::from_external(&ext2);
+        assert_ne!(room1.as_str(), room2.as_str());
     }
 
     #[test]
@@ -774,8 +750,8 @@ mod tests {
         assert!(format!("{}", ParticipantId::new()).starts_with("pa_"));
         let p = ParticipantId::new();
         assert!(format!("{}", p.derive_track_id(MediaKind::Video, "c")).starts_with("vid_"));
-        let ext = ExternalRoomId::new("test".to_string()).unwrap();
-        assert!(format!("{}", RoomId::from_external(ext)).starts_with("rm_"));
+        let ext = ExternalRoomId::new("test").unwrap();
+        assert!(format!("{}", RoomId::from_external(&ext)).starts_with("rm_"));
     }
 
     #[test]
@@ -790,7 +766,7 @@ mod tests {
 
     #[test]
     fn parsing_from_client_input() {
-        assert!(RoomId::from_str("my-conference-room").is_ok());
+        assert!(ExternalRoomId::from_str("my-conference-room").is_ok());
         let participant_id = ParticipantId::new();
         let serialized = participant_id.as_str();
         let parsed = ParticipantId::from_str(&serialized).unwrap();
@@ -823,9 +799,9 @@ mod tests {
     fn collision_resistance() {
         let mut internal_ids = HashSet::new();
         for external in ["room", "room1", "Room", "ROOM", "room_", "room-1"] {
-            let ext = ExternalRoomId::new(external.to_string()).unwrap();
-            let room_id = RoomId::from_external(ext);
-            assert!(internal_ids.insert(room_id.internal().to_string()));
+            let ext = ExternalRoomId::new(external).unwrap();
+            let room_id = RoomId::from_external(&ext);
+            assert!(internal_ids.insert(room_id.as_str()));
         }
     }
 

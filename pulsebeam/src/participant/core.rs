@@ -57,7 +57,7 @@ pub enum DisconnectReason {
 #[derive(Debug)]
 pub struct ParticipantConfig {
     pub manual_sub: bool,
-    pub cohort_id: entity::CohortId,
+    pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub available_tracks: Vec<Track>,
@@ -82,7 +82,7 @@ pub struct ParticipantCore {
     disconnect_reason: Option<DisconnectReason>,
     signaling: Signaling,
     last_slow_poll: Instant,
-    pub cohort_id: entity::CohortId,
+    pub room_id: entity::RoomId,
 }
 
 impl ParticipantCore {
@@ -124,7 +124,7 @@ impl ParticipantCore {
             signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
-            cohort_id: cfg.cohort_id,
+            room_id: cfg.room_id,
         };
 
         p.on_tracks_published(&cfg.available_tracks);
