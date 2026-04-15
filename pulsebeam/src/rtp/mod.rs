@@ -11,16 +11,6 @@ use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, TrackId};
 
-/// Pool capacity: 16 384 slots × 2 048 bytes ≈ 32 MB resident.
-///
-/// Trade memory for zero jemalloc on the hot path. RTP payload pool and
-/// Previously a pooled payload buffer, now replaced by `Arc<Vec<u8>>`.
-pub const POOL_CAPACITY: usize = 16_384;
-pub const POOL_PREFILL: usize = 8_192;
-
-/// No-op function for compatibility; does not return a pool.
-pub fn rtp_payload_pool() {}
-
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
 /// TODO: get these clocks from SDP instead.
 pub const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
