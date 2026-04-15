@@ -3,13 +3,16 @@ use std::collections::VecDeque;
 use str0m::media::{KeyframeRequestKind, MediaKind};
 use tokio::time::Instant;
 
-use crate::entity::ParticipantId;
+use crate::entity::{ParticipantId, RoomId};
 use crate::rtp::RtpPacket;
 use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer};
 
 pub struct RtpEvent {
     pub stream_id: StreamId,
     pub pkt: RtpPacket,
+    pub room_id: RoomId,
+    /// The participant that published this packet (used to skip self-forwarding on audio fanout).
+    pub origin: ParticipantId,
 }
 
 pub enum ParticipantEvent {
@@ -51,6 +54,7 @@ pub enum ControlEvent {
 
 pub struct EventQueue<'a> {
     id: &'a ParticipantId,
+    room_id: RoomId,
     queue: &'a mut VecDeque<ParticipantEvent>,
     rtp_queue: &'a mut VecDeque<RtpEvent>,
 }
@@ -58,11 +62,13 @@ pub struct EventQueue<'a> {
 impl<'a> EventQueue<'a> {
     pub fn new(
         id: &'a ParticipantId,
+        room_id: RoomId,
         queue: &'a mut VecDeque<ParticipantEvent>,
         rtp_queue: &'a mut VecDeque<RtpEvent>,
     ) -> Self {
         Self {
             id,
+            room_id,
             queue,
             rtp_queue,
         }
@@ -90,7 +96,12 @@ impl<'a> EventQueue<'a> {
     }
 
     pub fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket) {
-        self.rtp_queue.push_back(RtpEvent { stream_id, pkt });
+        self.rtp_queue.push_back(RtpEvent {
+            stream_id,
+            pkt,
+            room_id: self.room_id,
+            origin: *self.id,
+        });
     }
 
     pub fn publish_track(&mut self, track: Track) {

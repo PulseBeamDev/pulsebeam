@@ -45,11 +45,11 @@ pub struct DownstreamAllocator {
 }
 
 impl DownstreamAllocator {
-    pub fn new(participant_id: ParticipantId, manual_sub: bool) -> Self {
+    pub fn new(_participant_id: ParticipantId, manual_sub: bool) -> Self {
         Self {
             available_bandwidth: MIN_BANDWIDTH,
             video: VideoAllocator::new(manual_sub),
-            audio: AudioAllocator::new(participant_id),
+            audio: AudioAllocator::new(),
             dirty_allocation: false,
         }
     }
@@ -57,10 +57,9 @@ impl DownstreamAllocator {
     pub fn add_track(&mut self, track: Track) {
         if track.meta.kind.is_video() {
             self.video.add_track(track);
-        } else {
-            self.audio.add_track(track);
+            self.dirty_allocation = true;
         }
-        self.dirty_allocation = true;
+        // Audio tracks need no static registration; slots are claimed dynamically.
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
@@ -109,35 +108,18 @@ impl DownstreamAllocator {
         self.video.on_rtp(stream_id, pkt, writer);
     }
 
+    /// Forward an audio packet through the per-subscriber slot gate.
+    #[inline]
+    pub fn on_forward_audio_rtp(
+        &mut self,
+        slot_idx: usize,
+        pkt: &RtpPacket,
+        writer: &mut StreamWriter,
+    ) {
+        self.audio.on_rtp(slot_idx, pkt, writer);
+    }
+
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) -> Option<&TrackLayer> {
         self.video.handle_keyframe_request(req)
-    }
-}
-
-fn write_rtp(pt: Pt, ssrc: Ssrc, mid: Mid, pkt: &RtpPacket, rtc: &mut str0m::Rtc) {
-    let mut api = rtc.direct_api();
-    let Some(writer) = api.stream_tx(&ssrc) else {
-        tracing::warn!(%ssrc, "Dropping RTP: stream_tx handle invalid");
-        return;
-    };
-
-    tracing::trace!(
-        "forward rtp: seqno={}, rtp_ts={:?}, playout_time={:?}",
-        pkt.seq_no,
-        pkt.rtp_ts,
-        pkt.playout_time
-    );
-
-    if let Err(err) = writer.write_rtp(
-        pt,
-        pkt.seq_no,
-        pkt.rtp_ts.numer() as u32,
-        pkt.playout_time.into(),
-        pkt.marker,
-        pkt.ext_vals.clone(),
-        true,
-        pkt.payload.to_vec(),
-    ) {
-        tracing::warn!(%mid, %ssrc, "Dropping RTP: write_rtp error: {err:?}");
     }
 }

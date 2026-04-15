@@ -66,8 +66,25 @@ pub enum CrossShardEvent {
         stream_id: StreamId,
         from_shard_id: usize,
     },
-    /// Publisher shard → Subscriber shards: carry an RTP packet across the shard boundary.
+    /// Publisher shard → Subscriber shards: carry a video RTP packet across the shard boundary.
     RtpPublished { stream_id: StreamId, pkt: RtpPacket },
+    /// Publisher shard → all other shards in the same room: carry an audio RTP packet.
+    AudioRtpPublished {
+        room_id: RoomId,
+        origin: ParticipantId,
+        stream_id: StreamId,
+        pkt: RtpPacket,
+    },
+    /// Shard → all others: this shard now has at least one member of `room_id`.
+    RoomMemberJoined {
+        room_id: RoomId,
+        from_shard_id: usize,
+    },
+    /// Shard → all others: this shard no longer has any members of `room_id`.
+    RoomMemberLeft {
+        room_id: RoomId,
+        from_shard_id: usize,
+    },
     /// Subscriber shard → Publisher shard: keyframe request.
     KeyframeRequested(GlobalKeyframeRequest),
     /// A UDP packet batch arrived on this shard but the participant lives elsewhere.
@@ -80,6 +97,13 @@ pub enum CrossShardEvent {
 #[derive(Default)]
 struct RoomState {
     members: IndexSet<ParticipantId>,
+    /// Remote shard IDs that have at least one member of this room.
+    /// Used to fan out audio RTP across shards.
+    remote_shards: IndexSet<usize>,
+    /// Per-shard, per-room Top-N audio selector.
+    /// Receives every audio stream in the room (unconditional fanout) and
+    /// independently picks the loudest SELECTOR_SLOTS speakers for local delivery.
+    audio_selector: crate::audio_selector::TopNAudioSelector,
 }
 
 #[derive(Debug)]
@@ -101,6 +125,15 @@ impl ShardRouter {
         }
         let _ = self.cross_shard_event_txs[shard_id].try_send(ev);
     }
+
+    fn broadcast(&self, make_ev: impl Fn() -> CrossShardEvent) {
+        for (shard_id, tx) in self.cross_shard_event_txs.iter().enumerate() {
+            if shard_id == self.shard_id {
+                continue;
+            }
+            let _ = tx.try_send(make_ev());
+        }
+    }
 }
 
 pub struct ShardWorker {
@@ -111,6 +144,7 @@ pub struct ShardWorker {
     participant_shards: HashMap<ParticipantId, usize>,
 
     recv_batch: Vec<RecvPacketBatch>,
+    pending_cross_shard: VecDeque<CrossShardEvent>,
     timers: TimerWheel,
     input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
@@ -139,6 +173,7 @@ impl ShardWorker {
         cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
     ) -> Self {
         let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
+        let pending_cross_shard = VecDeque::with_capacity(64);
         let timers = TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD);
         let input_dirty: IndexSet<ParticipantId, ahash::RandomState> =
             IndexSet::with_capacity_and_hasher(
@@ -168,6 +203,7 @@ impl ShardWorker {
             remote_participant_ufrags: HashMap::default(),
 
             recv_batch,
+            pending_cross_shard,
             timers,
             input_dirty,
             fanout_dirty,
@@ -206,7 +242,7 @@ impl ShardWorker {
                     self.on_command(cmd);
                 }
                 Some(ev) = self.cross_shard_event_rx.recv() => {
-                    self.on_cross_shard_event(ev);
+                    self.pending_cross_shard.push_back(ev);
                 }
                 _ = wait => {}
                 else => break,
@@ -217,10 +253,14 @@ impl ShardWorker {
             }
 
             while let Ok(ev) = self.cross_shard_event_rx.try_recv() {
-                self.on_cross_shard_event(ev);
+                self.pending_cross_shard.push_back(ev);
             }
 
             let now = Instant::now();
+
+            while let Some(ev) = self.pending_cross_shard.pop_front() {
+                self.on_cross_shard_event(ev, now);
+            }
 
             self.timers.drain_expired(now, |participant_id| {
                 if let Some(participant) = self.participants.get_mut(&participant_id) {
@@ -260,13 +300,25 @@ impl ShardWorker {
             );
 
             while let Some(ev) = self.rtp_events.pop_front() {
-                handle_rtp(
-                    ev,
-                    &self.routing,
-                    &mut self.participants,
-                    &mut self.fanout_dirty,
-                    &self.router,
-                );
+                if ev.stream_id.0.kind().is_audio() {
+                    handle_audio_rtp(
+                        ev,
+                        &mut self.rooms,
+                        &mut self.participants,
+                        &mut self.fanout_dirty,
+                        now,
+                        &self.router,
+                    );
+                } else {
+                    handle_rtp(
+                        ev.stream_id,
+                        &ev.pkt,
+                        &self.routing,
+                        &mut self.participants,
+                        &mut self.fanout_dirty,
+                        &self.router,
+                    );
+                }
             }
 
             poll_participants(
@@ -334,7 +386,7 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn on_cross_shard_event(&mut self, ev: CrossShardEvent) {
+    fn on_cross_shard_event(&mut self, ev: CrossShardEvent, now: Instant) {
         match ev {
             CrossShardEvent::StreamSubscribed {
                 stream_id,
@@ -360,14 +412,58 @@ impl ShardWorker {
                 }
             }
             CrossShardEvent::RtpPublished { stream_id, pkt } => {
-                let ev = RtpEvent { stream_id, pkt };
                 handle_rtp(
-                    ev,
+                    stream_id,
+                    &pkt,
                     &self.routing,
                     &mut self.participants,
                     &mut self.fanout_dirty,
                     &self.router,
                 );
+            }
+            CrossShardEvent::AudioRtpPublished {
+                room_id,
+                origin,
+                stream_id,
+                pkt,
+            } => {
+                let ev = RtpEvent {
+                    stream_id,
+                    pkt,
+                    room_id,
+                    origin,
+                };
+                handle_audio_rtp(
+                    ev,
+                    &mut self.rooms,
+                    &mut self.participants,
+                    &mut self.fanout_dirty,
+                    now,
+                    &self.router,
+                );
+            }
+            CrossShardEvent::RoomMemberJoined {
+                room_id,
+                from_shard_id,
+            } => {
+                // A remote shard now has members for this room; register it so that
+                // local audio publishers will forward RTP there.
+                self.rooms
+                    .entry(room_id)
+                    .or_default()
+                    .remote_shards
+                    .insert(from_shard_id);
+            }
+            CrossShardEvent::RoomMemberLeft {
+                room_id,
+                from_shard_id,
+            } => {
+                if let Some(room) = self.rooms.get_mut(&room_id) {
+                    room.remote_shards.swap_remove(&from_shard_id);
+                    if room.members.is_empty() && room.remote_shards.is_empty() {
+                        self.rooms.remove(&room_id);
+                    }
+                }
             }
             CrossShardEvent::UdpPacket {
                 participant_id,
@@ -393,11 +489,16 @@ impl ShardWorker {
                 let participant_id = cfg.participant_id;
                 let room_id = cfg.room_id;
                 self.add_participant(participant_id, cfg);
-                self.rooms
-                    .entry(room_id)
-                    .or_default()
-                    .members
-                    .insert(participant_id);
+                let room = self.rooms.entry(room_id).or_default();
+                let was_empty = room.members.is_empty();
+                room.members.insert(participant_id);
+                if was_empty {
+                    let shard_id = self.router.shard_id;
+                    self.router.broadcast(|| CrossShardEvent::RoomMemberJoined {
+                        room_id,
+                        from_shard_id: shard_id,
+                    });
+                }
                 self.input_dirty.insert(participant_id);
             }
             ShardCommand::PublishTrack(track, room_id) => {
@@ -468,11 +569,26 @@ impl ShardWorker {
         if let Some(room) = self.rooms.get_mut(&participant.room_id) {
             room.members.swap_remove(participant_id);
             if room.members.is_empty() {
-                self.rooms.remove(&participant.room_id);
+                let room_id = participant.room_id;
+                let shard_id = self.router.shard_id;
+                self.router.broadcast(|| CrossShardEvent::RoomMemberLeft {
+                    room_id,
+                    from_shard_id: shard_id,
+                });
+                if room.remote_shards.is_empty() {
+                    self.rooms.remove(&participant.room_id);
+                }
             }
         }
         // Clean up the shard routing table before teardown.
         // participant is already removed from self.participants so there is no aliasing.
+        // Also evict all audio tracks this participant published from the room selector.
+        if let Some(room) = self.rooms.get_mut(&participant.room_id) {
+            let audio_ids: Vec<_> = participant.upstream.audio_track_ids().collect();
+            for id in audio_ids {
+                room.audio_selector.remove_track(id);
+            }
+        }
         let unsubs = participant.downstream.unsubscribe_all();
         for (stream_id, shard_id) in unsubs {
             handle_participant_topology(
@@ -504,19 +620,21 @@ fn poll_participants(
         let Some(participant) = participants.get_mut(participant_id) else {
             continue;
         };
-        let mut queue = EventQueue::new(participant_id, events, rtp_events);
+        let room_id = participant.room_id;
+        let mut queue = EventQueue::new(participant_id, room_id, events, rtp_events);
         participant.poll(now, &mut queue);
     }
 }
 
 fn handle_rtp(
-    ev: RtpEvent,
+    stream_id: StreamId,
+    pkt: &RtpPacket,
     routing: &HashMap<StreamId, Routing>,
     participants: &mut HashMap<ParticipantId, ParticipantCore>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
     router: &ShardRouter,
 ) -> Option<()> {
-    let route = routing.get(&ev.stream_id)?;
+    let route = routing.get(&stream_id)?;
     match route.kind {
         MediaKind::Video => {
             for participant_id in &route.subscribers {
@@ -524,8 +642,7 @@ fn handle_rtp(
                     continue;
                 };
                 let mut writer = StreamWriter(&mut sub.rtc);
-                sub.downstream
-                    .on_forward_rtp(&ev.stream_id, &ev.pkt, &mut writer);
+                sub.downstream.on_forward_rtp(&stream_id, pkt, &mut writer);
                 dirty.insert(*participant_id);
             }
             // Cross-shard fanout: send to remote shards that have subscribers.
@@ -533,17 +650,71 @@ fn handle_rtp(
                 router.send(
                     shard_id,
                     CrossShardEvent::RtpPublished {
-                        stream_id: ev.stream_id,
-                        pkt: ev.pkt.clone(),
+                        stream_id,
+                        pkt: pkt.clone(),
                     },
                 );
             }
         }
-        MediaKind::Audio => {
-            // TODO: audio forwarding
-        }
+        MediaKind::Audio => {}
     }
     Some(())
+}
+
+/// Fan out an audio packet across the room.
+///
+/// Cross-shard: packets originating from a local publisher are forwarded
+/// unconditionally to every remote shard that has room members.
+///
+/// Local delivery: the room's [`TopNAudioSelector`] updates the EMA, arbitrates
+/// slot ownership, and rewrites the packet in one event-driven call.  The
+/// returned slot index and rewritten packet are delivered to all local
+/// subscribers.
+fn handle_audio_rtp(
+    ev: RtpEvent,
+    rooms: &mut HashMap<RoomId, RoomState>,
+    participants: &mut HashMap<ParticipantId, ParticipantCore>,
+    dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
+    now: Instant,
+    router: &ShardRouter,
+) {
+    let Some(room) = rooms.get_mut(&ev.room_id) else {
+        return;
+    };
+
+    // Update EMA, arbitrate slot, rewrite packet — all in one call.
+    let selection = room.audio_selector.push_rtp(ev.stream_id.0, &ev.pkt, now);
+
+    // Cross-shard fanout: only from the originating shard to avoid loops.
+    if participants.contains_key(&ev.origin) {
+        for &shard_id in &room.remote_shards {
+            router.send(
+                shard_id,
+                CrossShardEvent::AudioRtpPublished {
+                    room_id: ev.room_id,
+                    origin: ev.origin,
+                    stream_id: ev.stream_id,
+                    pkt: ev.pkt.clone(),
+                },
+            );
+        }
+    }
+
+    let Some((slot_idx, rewritten_pkt)) = selection else {
+        return;
+    };
+    for &participant_id in &room.members {
+        if participant_id == ev.origin {
+            continue;
+        }
+        let Some(sub) = participants.get_mut(&participant_id) else {
+            continue;
+        };
+        let mut writer = StreamWriter(&mut sub.rtc);
+        sub.downstream
+            .on_forward_audio_rtp(slot_idx, &rewritten_pkt, &mut writer);
+        dirty.insert(participant_id);
+    }
 }
 
 fn handle_participant_topology(

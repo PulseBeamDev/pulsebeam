@@ -7,7 +7,7 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::time::Duration;
 use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
+use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 

@@ -19,7 +19,7 @@ use tokio::{sync::oneshot, time::Instant};
 pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
 pub const MAX_SEND_VIDEO_SLOTS: usize = 16;
-pub const MAX_SEND_AUDIO_SLOTS: usize = 9;
+pub const MAX_SEND_AUDIO_SLOTS: usize = 5;
 pub const MAX_DATA_CHANNELS: usize = 1;
 /// Maximum participants allowed per "slot" before hashing to a new shard epoch.
 const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;

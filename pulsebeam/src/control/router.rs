@@ -75,9 +75,7 @@ impl ShardRouter {
 
     pub async fn broadcast(&mut self, make_cmd: impl Fn() -> ShardCommand) {
         for tx in &self.shard_command_txs {
-            tx.send(make_cmd())
-                .await
-                .expect("shard to be running");
+            tx.send(make_cmd()).await.expect("shard to be running");
         }
     }
 
