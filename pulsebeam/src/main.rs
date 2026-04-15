@@ -54,7 +54,11 @@ fn main() {
     // them to time-slice and roughly halves throughput.
     let total_cores = std::thread::available_parallelism().map_or(2, NonZeroUsize::get);
     let workers = total_cores.saturating_sub(1).max(1);
-    tracing::info!("using {} data plane worker threads ({} total cores)", workers, total_cores);
+    tracing::info!(
+        "using {} data plane worker threads ({} total cores)",
+        workers,
+        total_cores
+    );
 
     // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
     //     Duration::from_secs(1),

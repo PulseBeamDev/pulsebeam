@@ -6,35 +6,43 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-// Timeline allows switching between input streams that
-// output a stream with a continuous seq_no and playout_time
-// as if it comes from a single stream.
+// Timeline allows switching between input streams that outputs a stream with a
+// continuous seq_no and playout_time as if it comes from a single stream.
+//
+// Sequence rewriting:
+//
+//   output = (input_seq + base) mod 2^16
+//
+// `base` is adjusted on every stream switch (rebase) to make the new stream's
+// first packet follow the previous stream's last output.  `drop_count` decrements
+// `base` by the number of upstream-filtered packets between consecutive forwarded
+// ones, closing those gaps in the output seq space without needing to see the
+// dropped packets here.
 #[derive(Debug)]
 pub struct Timeline {
     clock_rate: Frequency,
-    highest_seq_no: SeqNo,
-    offset_seq_no: u64,
+    /// The last output seq_no actually written (used to compute `base` on rebase).
+    max_output: u16,
+    /// Additive offset: output = (input + base) & 0xFFFF.
+    base: u16,
+    /// Whether any packet has been forwarded yet.
+    started: bool,
     anchor: Option<Instant>,
 }
 
 impl Timeline {
-    /// Create a new timeline that starts sequence numbers at `base_seq_no`.
-    ///
-    /// This is the most explicit form and is the one tests should use for
-    /// deterministic behavior.
+    /// Create a new timeline that starts output sequence numbers at `base_seq_no`.
     pub fn new_with_base(clock_rate: Frequency, base_seq_no: u16) -> Self {
         Self {
             clock_rate,
-            highest_seq_no: SeqNo::from(base_seq_no as u64),
-            offset_seq_no: 0,
+            max_output: base_seq_no,
+            base: 0,
+            started: false,
             anchor: None,
         }
     }
 
     /// Create a new timeline using a pseudo-random base sequence number.
-    ///
-    /// This is intended for production usage where clients should not all start
-    /// at the same sequence number.
     pub fn new(clock_rate: Frequency) -> Self {
         let mut rng = rand::os_rng();
         Self::new_with_rng(clock_rate, &mut rng)
@@ -46,33 +54,52 @@ impl Timeline {
         Self::new_with_base(clock_rate, base_seq_no)
     }
 
-    /// Re-aligns the timeline to a new stream starting with `packet`.
+    /// Re-aligns the timeline to a new video stream starting with `packet`.
     /// `packet` must be a keyframe (start of a new GOP).
     pub fn rebase(&mut self, packet: &RtpPacket) {
         debug_assert!(
             packet.is_keyframe_start,
             "Rebase should only happen on keyframe boundaries"
         );
+        self.rebase_inner(packet);
+    }
 
-        // We want the new packet to immediately follow the last output packet.
-        // target = highest_output + 1
-        // target = input + offset  =>  offset = target - input
-        let target_seq_no = self.highest_seq_no.wrapping_add(1);
-        self.offset_seq_no = target_seq_no.wrapping_sub(*packet.seq_no);
+    /// Re-aligns the timeline to a new audio stream.
+    ///
+    /// Identical to `rebase` but without the keyframe assertion.
+    pub fn rebase_audio(&mut self, packet: &RtpPacket) {
+        self.rebase_inner(packet);
+    }
 
-        // Initialize anchor if this is the very first packet
+    fn rebase_inner(&mut self, packet: &RtpPacket) {
+        let input_seq = *packet.seq_no as u16;
+        // Make the first output from the new stream follow max_output.
+        // output = (input + base) mod 2^16 = max_output + 1
+        // => base = (max_output + 1 - input) mod 2^16
+        self.base = self.max_output.wrapping_add(1).wrapping_sub(input_seq);
+        self.started = false;
+
         if self.anchor.is_none() {
             self.anchor = Some(packet.playout_time);
         }
     }
 
-    pub fn rewrite(&mut self, mut pkt: RtpPacket) -> RtpPacket {
-        let new_seq_u64 = pkt.seq_no.wrapping_add(self.offset_seq_no);
-        pkt.seq_no = new_seq_u64.into();
+    /// Adjust `base` to account for `n` upstream-filtered packets that will
+    /// never arrive here.  Call this before `rewrite` for the packet immediately
+    /// following the filtered run.
+    pub fn drop_count(&mut self, n: u16) {
+        self.base = self.base.wrapping_sub(n);
+    }
 
-        if new_seq_u64 > *self.highest_seq_no {
-            self.highest_seq_no = pkt.seq_no;
+    pub fn rewrite(&mut self, mut pkt: RtpPacket) -> RtpPacket {
+        let input_seq = *pkt.seq_no as u16;
+        let output_seq = input_seq.wrapping_add(self.base);
+        pkt.seq_no = SeqNo::from(output_seq as u64);
+
+        if !self.started || wrapping_gt(output_seq, self.max_output) {
+            self.max_output = output_seq;
         }
+        self.started = true;
 
         let anchor = self
             .anchor
@@ -83,6 +110,12 @@ impl Timeline {
 
         pkt
     }
+}
+
+/// Returns true if `a` is strictly after `b` in the wrapping u16 seq space.
+#[inline]
+fn wrapping_gt(a: u16, b: u16) -> bool {
+    a.wrapping_sub(b) < 0x8000 && a != b
 }
 
 #[cfg(test)]

@@ -97,6 +97,16 @@ impl UpstreamAllocator {
             .map(|t| t.mid)
     }
 
+    /// Iterates the `TrackId`s of all published audio tracks.
+    /// Used by the shard worker to clean up room-level audio selector state
+    /// when this participant leaves.
+    pub fn audio_track_ids(&self) -> impl Iterator<Item = TrackId> + '_ {
+        self.published_tracks
+            .iter()
+            .filter(|s| s.track.meta.kind == MediaKind::Audio)
+            .map(|s| s.track.meta.id)
+    }
+
     pub fn poll_slow(&mut self, now: Instant) {
         self.published_tracks
             .iter_mut()

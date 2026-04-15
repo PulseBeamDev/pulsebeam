@@ -1,63 +1,59 @@
-//! Room-level Top-N audio selector.
+//! Per-shard, per-room Top-N audio selector.
 //!
-//! A synchronous, pure-push component owned by the shard worker:
+//! Each shard instance independently picks the top `SELECTOR_SLOTS` loudest
+//! speakers using a decaying EMA of RFC 6464 audio levels.  No cross-shard
+//! coordination is required — every shard hears every audio stream (unconditional
+//! fanout in `handle_audio_rtp`) and derives its own independent ranking.
 //!
-//! 1. Tracks are registered via [`TopNAudioSelector::add_track`].
-//! 2. Packets are pushed via [`TopNAudioSelector::push_rtp`]; the selector
-//!    updates the RFC 6464 audio-level EMA for that track and returns
-//!    `Some(slot_idx)` so the caller knows which output slot to forward on.
-//! 3. [`TopNAudioSelector::poll_slow`] re-ranks the top-N speakers and returns
-//!    `true` if any slot assignment changed.  Call on a ~200 ms cadence.
-//! 4. [`TopNAudioSelector::current_assignments`] returns the current
-//!    `(slot_idx, ParticipantId)` mapping for signaling.
+//! Pipeline per RTP packet:
+//!
+//! 1. [`TopNAudioSelector::push_rtp`] updates the EMA for that track and returns
+//!    `true` if the track is in the current Top-N selection.  All packets —
+//!    including DTX comfort-noise frames — are forwarded for selected tracks so
+//!    that transitions remain smooth.
+//! 2. [`TopNAudioSelector::poll_slow`] re-ranks all tracks and refreshes the
+//!    selected set.  Call from the shard main loop every iteration; the method
+//!    internally rate-limits to at most once per [`RERANK_INTERVAL`].
+//! 3. [`TopNAudioSelector::remove_track`] evicts a track when its publisher
+//!    leaves the room.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::time::Duration;
 
+use ahash::{HashMap, HashMapExt};
 use tokio::time::Instant;
 
-use crate::{
-    control::controller::MAX_SEND_AUDIO_SLOTS,
-    entity::{ParticipantId, TrackId},
-    rtp::RtpPacket,
-    track::TrackMeta,
-};
+use crate::{control::controller::MAX_SEND_AUDIO_SLOTS, entity::TrackId, rtp::RtpPacket};
 
-/// Number of output slots produced by the selector.
+/// Number of output slots (loudest speakers) produced by the selector.
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 
 /// Minimum interval between Top-N re-rank passes.
 const RERANK_INTERVAL: Duration = Duration::from_millis(200);
 
-// ── Scoring metadata ─────────────────────────────────────────────────────────
+// ── Per-track state ───────────────────────────────────────────────────────────
 
-struct InputTrack {
-    meta: TrackMeta,
-    /// Which output slot this track is currently assigned to.
-    slot: Option<usize>,
+struct TrackState {
     /// Exponential moving average of the RFC 6464 dBov level.
-    /// Scale: 0 = loudest (digital full scale), -127 = silence.
-    /// Higher (closer to 0) means louder → ranked first.
+    /// 0 = loudest (0 dBov), −127 = silence; higher → louder → ranked first.
     audio_level_ema: f32,
-}
-
-// ── Output slot ───────────────────────────────────────────────────────────────
-
-struct OutputSlot {
-    /// Which input track is currently assigned to this slot.
-    track_id: Option<TrackId>,
+    /// Whether this track is currently in the Top-N selection.
+    /// Only changes during [`TopNAudioSelector::poll_slow`], so the hot path
+    /// is a single bool read.
+    selected: bool,
 }
 
 // ── Selector ─────────────────────────────────────────────────────────────────
 
-/// Pure-push Top-N audio selector.
+/// Per-shard, per-room Top-N audio selector.
 ///
-/// Owned by the shard worker.  All operations are synchronous; no async
-/// machinery, no channels.
+/// Owned by the shard worker inside `RoomState`.  All operations are
+/// synchronous and allocation-free on the hot path once tracks are registered.
+///
+/// Tracks auto-register on their first [`push_rtp`] call and must be
+/// explicitly evicted via [`remove_track`] when their publisher leaves.
 pub struct TopNAudioSelector {
-    slots: Vec<OutputSlot>,
-    tracks: HashMap<TrackId, InputTrack>,
+    tracks: HashMap<TrackId, TrackState>,
     last_rerank: Option<Instant>,
 }
 
@@ -70,87 +66,62 @@ impl Default for TopNAudioSelector {
 impl TopNAudioSelector {
     pub fn new() -> Self {
         Self {
-            slots: (0..SELECTOR_SLOTS)
-                .map(|_| OutputSlot { track_id: None })
-                .collect(),
             tracks: HashMap::new(),
             last_rerank: None,
         }
     }
 
-    /// Register a newly published audio track.
-    pub fn add_track(&mut self, meta: TrackMeta) {
-        let id = meta.id;
-        if self.tracks.contains_key(&id) {
-            return;
-        }
-        self.tracks.insert(
-            id,
-            InputTrack {
-                meta,
-                slot: None,
-                audio_level_ema: -127.0, // start at silence
-            },
-        );
-    }
-
-    /// Unregister a track that has been unpublished.
-    pub fn remove_track(&mut self, id: TrackId) {
-        if let Some(track) = self.tracks.remove(&id)
-            && let Some(slot_idx) = track.slot
-        {
-            self.slots[slot_idx].track_id = None;
-        }
-    }
-
-    /// Hot-path entry point.  Updates the RFC 6464 audio-level EMA for the
-    /// track and returns `Some(slot_idx)` if the track has an active slot
-    /// assignment, or `None` if it is currently unselected.
+    /// Hot-path entry point.
+    ///
+    /// Updates the RFC 6464 audio-level EMA for the track using the `audio_level`
+    /// extension value directly.  If no extension is present the EMA is left
+    /// unchanged so the current ranking is preserved.
+    ///
+    /// Returns `true` if the track is in the current Top-N selection, meaning
+    /// all of its packets (speech *and* comfort noise) should be forwarded to
+    /// local subscribers.  The selected set is refreshed only by [`poll_slow`]
+    /// so this read is branch-free on the hot path.
     #[inline]
-    pub fn push_rtp(&mut self, track_id: TrackId, pkt: &RtpPacket) -> Option<usize> {
-        let track = self.tracks.get_mut(&track_id)?;
-        // RFC 6464: ext_vals.audio_level is i8, 0 = loudest, -127 = silence.
+    pub fn push_rtp(&mut self, track_id: TrackId, pkt: &RtpPacket, _now: Instant) -> bool {
+        let state = self.tracks.entry(track_id).or_insert(TrackState {
+            audio_level_ema: -127.0,
+            selected: false,
+        });
+
+        // Update EMA from the RFC 6464 audio-level extension whenever present.
+        // No special-casing for DTX/comfort-noise — ranking is purely level-based.
         if let Some(level) = pkt.ext_vals.audio_level {
-            track.audio_level_ema = 0.8 * track.audio_level_ema + 0.2 * (level as f32);
+            state.audio_level_ema = 0.8 * state.audio_level_ema + 0.2 * (level as f32);
         }
-        track.slot
+
+        state.selected
     }
 
-    /// Returns the current `(slot_idx, ParticipantId)` pairs for all occupied slots.
-    pub fn current_assignments(&self) -> Vec<(usize, ParticipantId)> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| {
-                let track_id = slot.track_id?;
-                let participant_id = self.tracks.get(&track_id)?.meta.origin;
-                Some((i, participant_id))
-            })
-            .collect()
+    /// Remove a track that has left the room.
+    pub fn remove_track(&mut self, id: TrackId) {
+        self.tracks.remove(&id);
     }
 
-    /// Slow-path: re-rank the top-N speakers if the interval has elapsed.
-    /// Returns `true` if any slot assignment changed.
-    /// Call from the shard worker's slow-poll path (~200 ms cadence).
-    pub fn poll_slow(&mut self, now: Instant) -> bool {
-        if let Some(last) = self.last_rerank
-            && now.duration_since(last) < RERANK_INTERVAL
-        {
-            return false;
+    /// Slow-path: re-rank all tracks and refresh the Top-N selected set.
+    ///
+    /// Call from the shard main loop on every iteration.  The method
+    /// rate-limits actual work to at most once per [`RERANK_INTERVAL`].
+    pub fn poll_slow(&mut self, now: Instant) {
+        if let Some(last) = self.last_rerank {
+            if now.duration_since(last) < RERANK_INTERVAL {
+                return;
+            }
         }
         self.last_rerank = Some(now);
-        self.rerank()
+        self.rerank();
     }
 
-    // ── Re-ranking ────────────────────────────────────────────────────────────
-
-    /// Re-rank tracks by loudness.  Returns `true` if any slot assignment changed.
-    fn rerank(&mut self) -> bool {
+    fn rerank(&mut self) {
         if self.tracks.is_empty() {
-            return false;
+            return;
         }
 
-        // Sort descending by audio_level_ema — higher (closer to 0) = louder = ranked first.
+        // Sort track IDs by descending EMA (loudest first).
         let mut scored: Vec<(TrackId, f32)> = self
             .tracks
             .iter()
@@ -158,52 +129,14 @@ impl TopNAudioSelector {
             .collect();
         scored.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(Ordering::Equal));
 
-        let top_n: Vec<TrackId> = scored
-            .iter()
-            .take(SELECTOR_SLOTS)
-            .map(|(id, _)| *id)
-            .collect();
-
-        let mut changed = false;
-
-        // Pass 1 — retain existing valid assignments; evict tracks that fell out of top-N.
-        let mut unassigned: Vec<TrackId> = top_n.clone();
-        for slot in self.slots.iter_mut() {
-            if let Some(id) = slot.track_id {
-                if let Some(pos) = unassigned.iter().position(|x| *x == id) {
-                    unassigned.remove(pos);
-                } else {
-                    // Fell out of top-N → vacate.
-                    slot.track_id = None;
-                    if let Some(t) = self.tracks.get_mut(&id) {
-                        t.slot = None;
-                    }
-                    changed = true;
-                }
+        // Clear all selected flags, then mark the top-N.
+        for state in self.tracks.values_mut() {
+            state.selected = false;
+        }
+        for (id, _) in scored.iter().take(SELECTOR_SLOTS) {
+            if let Some(state) = self.tracks.get_mut(id) {
+                state.selected = true;
             }
         }
-
-        // Pass 2 — fill empty slots with newly top-N tracks.
-        let mut iter = unassigned.into_iter();
-        for (slot_idx, slot) in self.slots.iter_mut().enumerate() {
-            if slot.track_id.is_none()
-                && let Some(id) = iter.next()
-            {
-                slot.track_id = Some(id);
-                if let Some(t) = self.tracks.get_mut(&id) {
-                    t.slot = Some(slot_idx);
-                }
-                changed = true;
-            }
-        }
-
-        if changed {
-            tracing::trace!(
-                tracks = self.tracks.len(),
-                assigned = self.slots.iter().filter(|s| s.track_id.is_some()).count(),
-                "audio selector re-ranked"
-            );
-        }
-        changed
     }
 }

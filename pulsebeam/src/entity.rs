@@ -364,6 +364,10 @@ pub struct TrackId {
 }
 
 impl TrackId {
+    pub fn kind(&self) -> MediaKind {
+        self.kind
+    }
+
     pub fn as_str(&self) -> String {
         let prefix_str = match self.kind {
             MediaKind::Audio => prefix::AUDIO_TRACK_ID,

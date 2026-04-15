@@ -407,9 +407,9 @@ pub fn should_forward_audio(packet: &RtpPacket) -> bool {
     // -50dBov is a standard noise floor. Anything quieter is background hiss.
     const NOISE_FLOOR_DB: i8 = -50;
 
-    // 1. Always relay tiny packets (Comfort Noise / DTX)
+    // 1. Always drop tiny packets (Comfort Noise / DTX)
     if packet.payload.len() < DTX_THRESHOLD {
-        return true;
+        return false;
     }
 
     let ext = &packet.ext_vals;
