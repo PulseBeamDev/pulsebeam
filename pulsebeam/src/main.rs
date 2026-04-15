@@ -49,8 +49,12 @@ fn main() {
         registry.init();
     }
 
-    let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    tracing::info!("using {} worker threads", workers);
+    // Reserve 1 core for the control plane (ControllerActor, HTTP API, metrics).
+    // Data plane needs at least 1 dedicated core; running both on 1 core causes
+    // them to time-slice and roughly halves throughput.
+    let total_cores = std::thread::available_parallelism().map_or(2, NonZeroUsize::get);
+    let workers = total_cores.saturating_sub(1).max(1);
+    tracing::info!("using {} data plane worker threads ({} total cores)", workers, total_cores);
 
     // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
     //     Duration::from_secs(1),
