@@ -372,8 +372,21 @@ impl VideoAllocator {
         }
     }
 
-    pub fn unsubscribe_all(&mut self) {
-        todo!()
+    pub fn unsubscribe_all(&mut self) -> Vec<(StreamId, usize)> {
+        let subs: Vec<(StreamId, usize)> = self
+            .routes
+            .keys()
+            .filter_map(|sid| {
+                let track = self.tracks.get(&sid.0)?;
+                let layer = track.layers.iter().find(|l| l.rid == sid.1)?;
+                Some((*sid, layer.meta.shard_id))
+            })
+            .collect();
+        self.routes.clear();
+        for slot in self.slots.values_mut() {
+            slot.stop();
+        }
+        subs
     }
 }
 

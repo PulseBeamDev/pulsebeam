@@ -95,8 +95,8 @@ impl DownstreamAllocator {
         self.video.poll_slow(now, self.available_bandwidth, events);
     }
 
-    pub fn unsubscribe_all(&mut self) {
-        self.video.unsubscribe_all();
+    pub fn unsubscribe_all(&mut self) -> Vec<(StreamId, usize)> {
+        self.video.unsubscribe_all()
     }
 
     #[inline]

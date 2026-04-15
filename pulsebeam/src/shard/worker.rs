@@ -473,7 +473,18 @@ impl ShardWorker {
         }
         // Clean up the shard routing table before teardown.
         // participant is already removed from self.participants so there is no aliasing.
-        participant.downstream.unsubscribe_all();
+        let unsubs = participant.downstream.unsubscribe_all();
+        for (stream_id, shard_id) in unsubs {
+            handle_participant_topology(
+                TopologyEvent::StreamUnsubscribed {
+                    shard_id,
+                    participant_id: *participant_id,
+                    stream_id,
+                },
+                &mut self.routing,
+                &self.router,
+            );
+        }
         let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
         for addr in &addrs {
             self.udp_socket.close_peer(addr);
