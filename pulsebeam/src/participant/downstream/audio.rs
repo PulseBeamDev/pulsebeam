@@ -15,7 +15,14 @@ use crate::track::StreamWriter;
 /// are provisioned for this subscriber).
 pub struct AudioAllocator {
     /// M ≤ N provisioned slots; `None` entries are unfilled.
-    slots: [Option<(Mid, Pt, Ssrc)>; SELECTOR_SLOTS],
+    slots: [Option<Slot>; SELECTOR_SLOTS],
+}
+
+pub struct Slot {
+    pt: Pt,
+    mid: Mid,
+    ssrc: Ssrc,
+    pending_marker: bool,
 }
 
 impl AudioAllocator {
@@ -27,18 +34,28 @@ impl AudioAllocator {
 
     pub fn add_slot(&mut self, mid: Mid, pt: Pt, ssrc: Ssrc) {
         if let Some(entry) = self.slots.iter_mut().find(|s| s.is_none()) {
-            *entry = Some((mid, pt, ssrc));
+            *entry = Some(Slot {
+                mid,
+                pt,
+                ssrc,
+                pending_marker: true,
+            });
         }
     }
 
     pub fn on_rtp(
-        &self,
+        &mut self,
         slot_idx: usize,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) -> Option<()> {
-        let &(_, pt, ssrc) = self.slots.get(slot_idx)?.as_ref()?;
-        writer.write(pkt, &ssrc, pt);
+        let slot = self.slots.get_mut(slot_idx)?.as_mut()?;
+        let mut pkt = pkt.clone();
+        if slot.pending_marker {
+            pkt.marker = true;
+            slot.pending_marker = false;
+        }
+        writer.write_owned(pkt, &slot.ssrc, slot.pt);
         Some(())
     }
 }
