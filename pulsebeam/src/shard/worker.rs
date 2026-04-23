@@ -584,7 +584,8 @@ impl ShardWorker {
         if let Some(room) = self.rooms.get_mut(&participant.room_id) {
             let audio_ids: Vec<_> = participant.upstream.audio_track_ids().collect();
             for id in audio_ids {
-                room.audio_selector.remove_track(id);
+                // Audio tracks have no simulcast layer (Rid = None).
+                room.audio_selector.remove_track((id, None));
             }
         }
         let unsubs = participant.downstream.unsubscribe_all();
@@ -680,7 +681,7 @@ fn handle_audio_rtp(
     };
 
     // Inline Top-5 filter: synchronous, no buffering, returns leaderboard slot.
-    let selection = room.audio_selector.filter(ev.stream_id.0, &ev.pkt);
+    let selection = room.audio_selector.filter(ev.stream_id, &ev.pkt);
 
     // Cross-shard fanout: only from the originating shard to avoid loops.
     if participants.contains_key(&ev.origin) {

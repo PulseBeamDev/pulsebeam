@@ -147,7 +147,7 @@ mod test {
                 // is abandoned (e.g. switching to a different simulcast layer before the first one completed).
                 // We must explicitly clear the staging buffer to prevent mixing streams.
                 if staging_ssrc.is_some() && staging_ssrc != Some(current_ssrc) {
-                    seq.staging = None;
+                    seq.staging.clear();
                 }
                 staging_ssrc = Some(current_ssrc);
 

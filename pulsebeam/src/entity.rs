@@ -690,6 +690,7 @@ mod tests {
     fn room_id_hash_consistency_after_clone() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hash;
+        use std::hash::Hasher;
         let ext = ExternalRoomId::new("room1").unwrap();
         let room1 = RoomId::from_external(&ext);
         let room2 = room1; // Copy
