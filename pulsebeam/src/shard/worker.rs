@@ -306,7 +306,6 @@ impl ShardWorker {
                         &mut self.rooms,
                         &mut self.participants,
                         &mut self.fanout_dirty,
-                        now,
                         &self.router,
                     );
                 } else {
@@ -386,7 +385,7 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn on_cross_shard_event(&mut self, ev: CrossShardEvent, now: Instant) {
+    fn on_cross_shard_event(&mut self, ev: CrossShardEvent, _now: Instant) {
         match ev {
             CrossShardEvent::StreamSubscribed {
                 stream_id,
@@ -438,7 +437,6 @@ impl ShardWorker {
                     &mut self.rooms,
                     &mut self.participants,
                     &mut self.fanout_dirty,
-                    now,
                     &self.router,
                 );
             }
@@ -666,24 +664,23 @@ fn handle_rtp(
 /// Cross-shard: packets originating from a local publisher are forwarded
 /// unconditionally to every remote shard that has room members.
 ///
-/// Local delivery: the room's [`TopNAudioSelector`] updates the EMA, arbitrates
-/// slot ownership, and rewrites the packet in one event-driven call.  The
-/// returned slot index and rewritten packet are delivered to all local
-/// subscribers.
+/// Local delivery: the room's [`TopNAudioSelector`] runs the inline Top-5
+/// filter and returns the leaderboard slot index when the stream should be
+/// forwarded.  The original packet (no rewriting) is delivered to all local
+/// subscribers through that slot.
 fn handle_audio_rtp(
     ev: RtpEvent,
     rooms: &mut HashMap<RoomId, RoomState>,
     participants: &mut HashMap<ParticipantId, ParticipantCore>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
-    now: Instant,
     router: &ShardRouter,
 ) {
     let Some(room) = rooms.get_mut(&ev.room_id) else {
         return;
     };
 
-    // Update EMA, arbitrate slot, rewrite packet — all in one call.
-    let selection = room.audio_selector.push_rtp(ev.stream_id.0, &ev.pkt, now);
+    // Inline Top-5 filter: synchronous, no buffering, returns leaderboard slot.
+    let selection = room.audio_selector.filter(ev.stream_id.0, &ev.pkt);
 
     // Cross-shard fanout: only from the originating shard to avoid loops.
     if participants.contains_key(&ev.origin) {
@@ -700,7 +697,7 @@ fn handle_audio_rtp(
         }
     }
 
-    let Some((slot_idx, rewritten_pkt)) = selection else {
+    let Some(slot_idx) = selection else {
         return;
     };
     for &participant_id in &room.members {
@@ -712,7 +709,7 @@ fn handle_audio_rtp(
         };
         let mut writer = StreamWriter(&mut sub.rtc);
         sub.downstream
-            .on_forward_audio_rtp(slot_idx, &rewritten_pkt, &mut writer);
+            .on_forward_audio_rtp(slot_idx, &ev.pkt, &mut writer);
         dirty.insert(participant_id);
     }
 }

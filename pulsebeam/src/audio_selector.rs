@@ -1,107 +1,52 @@
-use std::array;
+use std::cmp::Reverse;
 use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt};
-use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 
-use crate::{
-    control::controller::MAX_SEND_AUDIO_SLOTS,
-    entity::TrackId,
-    rtp::{self, RtpPacket, timeline::Timeline},
-};
+use crate::{control::controller::MAX_SEND_AUDIO_SLOTS, entity::TrackId, rtp::RtpPacket};
 
 /// Number of output slots (loudest speakers) produced by the selector.
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 
-// EMA: α = 0.2 → ~5-frame (100 ms) time constant.
-const EMA_SILENCE: f32 = -127.0;
-const EMA_ALPHA: f32 = 0.2;
-const EMA_HOLD: f32 = 1.0 - EMA_ALPHA;
+/// Streams silent for longer than this are evicted from the leaderboard (VAD/DTX handling).
+const EVICTION_WINDOW: Duration = Duration::from_millis(100);
 
-// Minimum time a slot must hold its current track before it can be evicted.
-const SWITCH_HOLD: Duration = Duration::from_millis(300);
+/// An incumbent whose `playout_time` falls within this window of `global_clock`
+/// is protected from eviction (fairness for jittery / slow senders).
+const VETERAN_WINDOW: Duration = Duration::from_millis(150);
 
-struct TrackState {
-    /// EMA of the RFC 6464 level; 0 = loudest, −127 = silence.
-    ema: f32,
-    /// Index into `slots`, `None` when not in the top-N.
-    slot: Option<usize>,
+/// Challenger must exceed the weakest incumbent's smoothed energy by at least
+/// this many units before it can replace it (5 dB equivalent hysteresis).
+const HYSTERESIS_BONUS: u8 = 5;
+
+// EMA: E_smooth = E_old × 0.7 + E_new × 0.3   (integer form: multiply by 10)
+const EMA_OLD: u32 = 7;
+const EMA_NEW: u32 = 3;
+
+/// Per-stream speaker state kept in the registry.
+struct SpeakerMetadata {
+    last_playout_time: Instant,
+    /// Smoothed energy value; higher = louder (inverse of RFC 6464 attenuation).
+    smoothed_energy: u8,
+    /// `true` while this stream occupies a leaderboard slot.
+    is_veteran: bool,
 }
 
-impl TrackState {
-    fn new() -> Self {
-        Self {
-            ema: EMA_SILENCE,
-            slot: None,
-        }
-    }
-}
-
-struct SlotState {
-    /// `None` when the slot is unoccupied
-    track_id: Option<TrackId>,
-    timeline: Timeline,
-    switch_seq: SeqNo,
-    pending_marker: bool,
-    last_ssrc: Option<Ssrc>,
-    /// When this slot last switched to its current track.
-    switched_at: Instant,
-}
-
-impl SlotState {
-    fn new_empty(now: Instant) -> Self {
-        Self {
-            track_id: None,
-            timeline: Timeline::new(rtp::AUDIO_FREQUENCY),
-            switch_seq: SeqNo::from(0u64),
-            pending_marker: false,
-            last_ssrc: None,
-            switched_at: now,
-        }
-    }
-
-    fn assign(&mut self, track_id: TrackId, pkt: &RtpPacket, now: Instant) {
-        self.track_id = Some(track_id);
-        self.timeline.rebase_audio(pkt);
-        self.switch_seq = pkt.seq_no;
-        self.pending_marker = true;
-        self.last_ssrc = Some(pkt.ssrc);
-        self.switched_at = now;
-    }
-
-    fn release(&mut self) {
-        self.track_id = None;
-    }
-
-    fn process(&mut self, mut pkt: RtpPacket, now: Instant) -> Option<RtpPacket> {
-        // Mid-stream SSRC change (e.g. ICE restart on publisher).
-        if self.last_ssrc != Some(pkt.ssrc) {
-            self.assign(self.track_id?, &pkt, now);
-        }
-
-        // Drop packets that arrived before the switch point.
-        if pkt.seq_no < self.switch_seq {
-            return None;
-        }
-
-        if self.pending_marker {
-            pkt.marker = true;
-            self.pending_marker = false;
-        }
-
-        Some(self.timeline.rewrite(pkt))
-    }
-}
-
-/// Per-shard, per-room Top-N audio selector.
+/// Per-shard, per-room Top-5 inline audio filter.
 ///
-/// Tracks auto-register on their first [`push_rtp`] call and must be
-/// explicitly evicted via [`remove_track`] when their publisher leaves.
+/// Call [`filter`] on every incoming audio packet metadata. The function
+/// returns `Some(slot_idx)` when the packet should be forwarded and `None`
+/// when it must be dropped.  All four algorithm phases execute synchronously
+/// with **no heap allocation on the hot path** and **no payload buffering**.
 pub struct TopNAudioSelector {
-    tracks: HashMap<TrackId, TrackState>,
-    /// Fixed N=5 slots; index is the downstream slot identifier.
-    slots: [SlotState; SELECTOR_SLOTS],
+    /// Top-5 leaderboard; index 0 = loudest speaker, index 4 = weakest.
+    /// Re-sorted descending by `smoothed_energy` after every challenger eviction.
+    leaderboard: [Option<TrackId>; SELECTOR_SLOTS],
+    /// Metadata for every audio stream observed in this room.
+    registry: HashMap<TrackId, SpeakerMetadata>,
+    /// Maximum `playout_time` observed across all streams; drives eviction.
+    global_clock: Option<Instant>,
 }
 
 impl Default for TopNAudioSelector {
@@ -112,100 +57,152 @@ impl Default for TopNAudioSelector {
 
 impl TopNAudioSelector {
     pub fn new() -> Self {
-        let now = Instant::now();
         Self {
-            tracks: HashMap::new(),
-            slots: array::from_fn(|_| SlotState::new_empty(now)),
+            leaderboard: [None; SELECTOR_SLOTS],
+            registry: HashMap::new(),
+            global_clock: None,
         }
     }
 
-    /// Hot-path entry point.
+    /// Inline hot-path filter — runs all four algorithm phases synchronously.
     ///
-    /// Updates the RFC 6464 EMA when the audio level extension is present,
-    /// promotes the track into the top-N if it outbids the quietest slot, and
-    /// rewrites the packet through the slot's [`Timeline`].
-    ///
-    /// Returns `Some((slot_idx, rewritten_pkt))` when the track is selected,
-    /// `None` otherwise.
+    /// Returns `Some(slot_idx)` when the packet should be forwarded through
+    /// leaderboard position `slot_idx`, `None` when it should be dropped.
     #[inline]
-    pub fn push_rtp(
-        &mut self,
-        track_id: TrackId,
-        pkt: &RtpPacket,
-        now: Instant,
-    ) -> Option<(usize, RtpPacket)> {
-        // Phase 1: update EMA.
-        let state = self.tracks.entry(track_id).or_insert_with(TrackState::new);
-        if let Some(level) = pkt.ext_vals.audio_level {
-            state.ema = EMA_HOLD * state.ema + EMA_ALPHA * (level as f32);
-        }
-        let new_ema = state.ema;
-        let current_slot = state.slot;
+    pub fn filter(&mut self, stream_id: TrackId, pkt: &RtpPacket) -> Option<usize> {
+        let playout_time = pkt.playout_time;
+        // RFC 6464 (str0m): 0 = loudest, -127 = silence → invert so higher value = louder.
+        let energy = rfc6464_to_energy(pkt.ext_vals.audio_level.unwrap_or(-127));
 
-        // Phase 2: slot arbitration.
-        let slot_idx = match current_slot {
-            Some(idx) => idx,
-            None => self.try_claim_slot(track_id, new_ema, pkt, now)?,
+        // ── Phase 1: Clock sync ───────────────────────────────────────────────
+        let global_clock = match self.global_clock {
+            Some(prev) if prev >= playout_time => prev,
+            _ => {
+                self.global_clock = Some(playout_time);
+                playout_time
+            }
         };
 
-        // Phase 3: rewrite through the slot's timeline.
-        let out = self.slots[slot_idx].process(pkt.clone(), now)?;
-        Some((slot_idx, out))
+        // ── Phase 2: State update (EMA + last_playout_time) ───────────────────
+        let meta = self
+            .registry
+            .entry(stream_id)
+            .or_insert_with(|| SpeakerMetadata {
+                last_playout_time: playout_time,
+                smoothed_energy: energy,
+                is_veteran: false,
+            });
+        meta.smoothed_energy =
+            ((meta.smoothed_energy as u32 * EMA_OLD + energy as u32 * EMA_NEW) / 10) as u8;
+        meta.last_playout_time = playout_time;
+
+        // ── Phase 3: Lazy eviction ────────────────────────────────────────────
+        // Remove leaderboard members that have been silent longer than EVICTION_WINDOW.
+        if let Some(threshold) = global_clock.checked_sub(EVICTION_WINDOW) {
+            for slot in &mut self.leaderboard {
+                let Some(id) = *slot else { continue };
+                let stale = self
+                    .registry
+                    .get(&id)
+                    .map_or(false, |m| m.last_playout_time < threshold);
+                if stale {
+                    if let Some(m) = self.registry.get_mut(&id) {
+                        m.is_veteran = false;
+                    }
+                    *slot = None;
+                }
+            }
+        }
+
+        // ── Phase 4: Forwarding decision (two-tier gate) ──────────────────────
+
+        // Tier 1 — Veteran protection.
+        // If the stream is already on the leaderboard and its playout_time is
+        // recent enough, forward immediately regardless of current energy rank.
+        if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
+            let fresh = global_clock
+                .checked_sub(VETERAN_WINDOW)
+                .map_or(true, |threshold| playout_time >= threshold);
+            if fresh {
+                return Some(pos);
+            }
+        }
+
+        // Tier 2a — Challenger: fill an empty slot without any energy comparison.
+        if let Some(pos) = self.leaderboard.iter().position(|s| s.is_none()) {
+            self.leaderboard[pos] = Some(stream_id);
+            if let Some(m) = self.registry.get_mut(&stream_id) {
+                m.is_veteran = true;
+            }
+            return Some(pos);
+        }
+
+        // Tier 2b — Challenger: beat the weakest incumbent with hysteresis bonus.
+        // Split the borrow so the closure can read the registry while we
+        // hold a shared reference to the leaderboard.
+        let (weakest_pos, weakest_energy) = {
+            let reg = &self.registry;
+            self.leaderboard
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let id = (*s)?;
+                    let e = reg.get(&id)?.smoothed_energy;
+                    Some((i, e))
+                })
+                .min_by_key(|&(_, e)| e)?
+        };
+
+        let challenger_energy = self.registry.get(&stream_id)?.smoothed_energy;
+        if challenger_energy > weakest_energy.saturating_add(HYSTERESIS_BONUS) {
+            // Demote the weakest incumbent.
+            if let Some(evicted) = self.leaderboard[weakest_pos] {
+                if let Some(m) = self.registry.get_mut(&evicted) {
+                    m.is_veteran = false;
+                }
+            }
+            self.leaderboard[weakest_pos] = Some(stream_id);
+            if let Some(m) = self.registry.get_mut(&stream_id) {
+                m.is_veteran = true;
+            }
+
+            // Re-sort descending by energy so position 0 = loudest speaker.
+            // Explicit field split: leaderboard mutably, registry immutably.
+            let (lb, reg) = (&mut self.leaderboard, &self.registry);
+            lb.sort_unstable_by_key(|s| {
+                Reverse(
+                    s.and_then(|id| reg.get(&id))
+                        .map(|m| m.smoothed_energy)
+                        .unwrap_or(0),
+                )
+            });
+
+            let new_pos = self
+                .leaderboard
+                .iter()
+                .position(|s| *s == Some(stream_id))?;
+            return Some(new_pos);
+        }
+
+        None
     }
 
-    /// Evict a track that has left the room.
+    /// Remove a track from the leaderboard and the registry when its publisher leaves.
     pub fn remove_track(&mut self, id: TrackId) {
-        if let Some(state) = self.tracks.remove(&id)
-            && let Some(idx) = state.slot
-        {
-            self.slots[idx].release();
-        }
-    }
-
-    /// Tries to assign an unselected track to a slot.
-    ///
-    /// Uses a free slot if available; otherwise evicts the quietest occupied
-    /// slot when the challenger's EMA is strictly greater.
-    fn try_claim_slot(
-        &mut self,
-        track_id: TrackId,
-        ema: f32,
-        pkt: &RtpPacket,
-        now: Instant,
-    ) -> Option<usize> {
-        if let Some(idx) = self.slots.iter().position(|s| s.track_id.is_none()) {
-            self.slots[idx].assign(track_id, pkt, now);
-            self.tracks.get_mut(&track_id)?.slot = Some(idx);
-            return Some(idx);
-        }
-
-        // Find the evictable slot with the lowest current EMA.
-        // Slots within SWITCH_HOLD of their last switch are not eligible.
-        let mut min_idx = 0;
-        let mut min_ema = f32::MAX;
-        let mut evicted_id = None;
-        for (i, slot) in self.slots.iter().enumerate() {
-            let Some(tid) = slot.track_id else { continue };
-            if now.duration_since(slot.switched_at) < SWITCH_HOLD {
-                continue;
-            }
-            let e = self.tracks.get(&tid).map(|t| t.ema).unwrap_or(EMA_SILENCE);
-            if e < min_ema {
-                min_ema = e;
-                min_idx = i;
-                evicted_id = Some(tid);
+        self.registry.remove(&id);
+        for slot in &mut self.leaderboard {
+            if *slot == Some(id) {
+                *slot = None;
+                break;
             }
         }
-
-        if ema <= min_ema {
-            return None;
-        }
-
-        // Reuse the existing slot — preserves the Timeline so the
-        // output seq/timestamp sequence remains continuous for the subscriber.
-        self.tracks.get_mut(&evicted_id?)?.slot = None;
-        self.slots[min_idx].assign(track_id, pkt, now);
-        self.tracks.get_mut(&track_id)?.slot = Some(min_idx);
-        Some(min_idx)
     }
+}
+
+/// Convert an RFC 6464 audio level as represented by str0m (`i8`, 0 = loudest,
+/// -127 = silence) to an energy value in `[0, 127]` where higher means louder,
+/// suitable for EMA accumulation and hysteresis comparison.
+#[inline(always)]
+fn rfc6464_to_energy(level: i8) -> u8 {
+    ((level as i16) + 127).clamp(0, 127) as u8
 }
