@@ -10,42 +10,25 @@ use crate::{
     track::StreamId,
 };
 
-/// Number of output physical slots produced by the selector.
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 
-/// Streams silent for longer than this are evicted. Increased slightly to accommodate DTX.
-const EVICTION_WINDOW: Duration = Duration::from_millis(150);
-
-/// An incumbent whose `playout_time` falls within this window of `global_clock`
-/// is protected from immediate eviction if already holding a slot.
-const VETERAN_WINDOW: Duration = Duration::from_millis(150);
-
-/// Prevents a buggy client with a future timestamp from instantly clearing the board.
-const MAX_CLOCK_ADVANCE: Duration = Duration::from_millis(500);
-
-/// Challenger SNR score must exceed weakest incumbent by this many dB to steal their slot.
+// Increased to 1000ms. A 150ms physical window is too tight for bad internet connections.
+const EVICTION_WINDOW: Duration = Duration::from_millis(1000);
+const GC_WINDOW: Duration = Duration::from_secs(10);
 const HYSTERESIS_BONUS_DB: f32 = 5.0;
 
-/// EMA Time Constants
-const TAU_FAST_MS: f32 = 50.0; // Fast tracking for speech bursts
-const TAU_FLOOR_MS: f32 = 2000.0; // Slow tracking for background noise
+const TAU_FAST_MS: f32 = 50.0;
+const TAU_FLOOR_MS: f32 = 2000.0;
+const VAD_THRESHOLD_RATIO: f32 = 3.981;
 
-/// Ratio threshold (approx 6 dB) above noise floor to trigger VAD (Voice Activity Detection).
-const VAD_THRESHOLD_RATIO: f32 = 3.981; // 10^(6/10)
-
-/// Per-stream speaker state kept in the registry.
 struct SpeakerMetadata {
     last_playout_time: Instant,
-    /// Linear power fast EMA (speech)
+    last_arrival_ts: Instant, // Used exclusively to prevent jitter-based evictions
     e_fast: f32,
-    /// Linear power slow EMA (noise floor)
     e_floor: f32,
-    /// `true` while this stream occupies a downstream slot
-    is_veteran: bool,
 }
 
 impl SpeakerMetadata {
-    /// SNR score in decibels. How far above the stream's own noise floor it is.
     #[inline]
     fn score_db(&self) -> f32 {
         if self.e_floor <= 0.0 {
@@ -60,171 +43,116 @@ impl SpeakerMetadata {
     }
 }
 
-/// Per-slot timeline state owned by the selector.
 struct SlotTimeline {
     timeline: Timeline,
-    /// Set to `true` whenever a new stream takes over the slot so the first
-    /// forwarded packet carries the RTP marker bit.
     pending_marker: bool,
 }
 
-/// Per-shard, per-room Top-N inline audio filter.
+#[derive(Default)]
 pub struct TopNAudioSelector {
-    /// Stable routing slots. The index `0..SELECTOR_SLOTS` maps directly to your
-    /// downstream SFU SSRC output. This array is NEVER sorted.
     leaderboard: [Option<StreamId>; SELECTOR_SLOTS],
-    /// Per-slot continuous timeline (parallel to `leaderboard`).
     timelines: [Option<SlotTimeline>; SELECTOR_SLOTS],
     registry: HashMap<StreamId, SpeakerMetadata>,
-    global_clock: Option<Instant>,
-}
-
-impl Default for TopNAudioSelector {
-    fn default() -> Self {
-        Self::new()
-    }
+    global_arrival_ts: Option<Instant>,
 }
 
 impl TopNAudioSelector {
     pub fn new() -> Self {
-        Self {
-            leaderboard: array::from_fn(|_| None),
-            timelines: array::from_fn(|_| None),
-            registry: HashMap::new(),
-            global_clock: None,
-        }
+        Self::default()
     }
 
-    /// Inline hot-path filter.
-    /// Returns `Some((slot_idx, rewritten_pkt))` — a continuously rewritten RTP packet
-    /// mapped to the stable slot index — or `None` if the packet must be dropped.
-    /// The marker bit is set to `true` on the first packet after a stream switch.
     #[inline]
     pub fn filter(&mut self, stream_id: StreamId, pkt: &mut RtpPacket) -> Option<usize> {
-        let playout_time = pkt.playout_time;
         let power = rfc6464_to_power(pkt.ext_vals.audio_level.unwrap_or(-127));
 
-        // ── Phase 1: Clock sync & Clamp ───────────────────────────────────────
-        let global_clock = match self.global_clock {
-            Some(prev) if playout_time > prev => {
-                let jump = playout_time.saturating_duration_since(prev);
-                if jump > MAX_CLOCK_ADVANCE {
-                    prev + MAX_CLOCK_ADVANCE // Clamp aggressive future timestamps
-                } else {
-                    playout_time
-                }
-            }
-            Some(prev) => prev,
-            None => playout_time,
+        // 1. Advance the PHYSICAL server timeline (Immune to all RTP clock drift/jitter)
+        let global_arrival_ts = match self.global_arrival_ts {
+            Some(prev) => prev.max(pkt.arrival_ts),
+            None => pkt.arrival_ts,
         };
-        self.global_clock = Some(global_clock);
+        self.global_arrival_ts = Some(global_arrival_ts);
 
-        // ── Phase 2: State update (Time-Weighted EMAs + VAD Gate) ─────────────
+        // 2. State & VAD Update
         let meta = self
             .registry
             .entry(stream_id)
             .or_insert_with(|| SpeakerMetadata {
-                last_playout_time: playout_time,
+                last_playout_time: pkt.playout_time,
+                last_arrival_ts: pkt.arrival_ts,
                 e_fast: power,
                 e_floor: power,
-                is_veteran: false,
             });
 
-        // Calculate delta time in milliseconds
-        let dt = if playout_time > meta.last_playout_time {
-            (playout_time - meta.last_playout_time).as_millis() as f32
-        } else {
-            0.0 // Handle out-of-order or duplicate timestamps safely
-        };
+        meta.last_arrival_ts = pkt.arrival_ts;
 
-        if dt > 0.0 {
-            // Fast EMA for tracking active speech energy
-            let alpha_fast = 1.0 - (-dt / TAU_FAST_MS).exp();
-            meta.e_fast += alpha_fast * (power - meta.e_fast);
+        if let Some(dt) = pkt
+            .playout_time
+            .checked_duration_since(meta.last_playout_time)
+        {
+            let dt_ms = dt.as_millis() as f32;
+            if dt_ms > 0.0 {
+                let alpha_fast = 1.0 - (-dt_ms / TAU_FAST_MS).exp();
+                meta.e_fast += alpha_fast * (power - meta.e_fast);
 
-            // VAD Gate: Are we significantly above the noise floor?
-            let is_speech = meta.e_fast > meta.e_floor * VAD_THRESHOLD_RATIO;
+                let is_speech = meta.e_fast > meta.e_floor * VAD_THRESHOLD_RATIO;
+                let tau_floor = if is_speech {
+                    TAU_FLOOR_MS * 10.0
+                } else {
+                    TAU_FLOOR_MS
+                };
 
-            if !is_speech {
-                // Not speech: freely update the noise floor
-                let alpha_floor = 1.0 - (-dt / TAU_FLOOR_MS).exp();
+                let alpha_floor = 1.0 - (-dt_ms / tau_floor).exp();
                 meta.e_floor += alpha_floor * (power - meta.e_floor);
-            } else {
-                // Speech: severely throttle floor updates to prevent catching up
-                let alpha_floor_speech = 1.0 - (-dt / (TAU_FLOOR_MS * 10.0)).exp();
-                meta.e_floor += alpha_floor_speech * (power - meta.e_floor);
             }
         }
-        meta.last_playout_time = playout_time;
+        meta.last_playout_time = meta.last_playout_time.max(pkt.playout_time);
 
-        // ── Phase 3: Lazy eviction ────────────────────────────────────────────
-        if let Some(threshold) = global_clock.checked_sub(EVICTION_WINDOW) {
+        // 3. Lazy Eviction (Based ONLY on physical arrival)
+        if let Some(threshold) = global_arrival_ts.checked_sub(EVICTION_WINDOW) {
             for slot in &mut self.leaderboard {
-                let Some(id) = *slot else { continue };
-                let stale = self
-                    .registry
-                    .get(&id)
-                    .map_or(false, |m| m.last_playout_time < threshold);
-
-                if stale {
-                    if let Some(m) = self.registry.get_mut(&id) {
-                        m.is_veteran = false;
+                if let Some(id) = *slot {
+                    if self
+                        .registry
+                        .get(&id)
+                        .map_or(false, |m| m.last_arrival_ts < threshold)
+                    {
+                        *slot = None;
                     }
-                    *slot = None;
                 }
             }
-        }
 
-        // ── Phase 4: Forwarding decision (Stable Indicies) ────────────────────
-
-        // Tier 1 — Veteran fast-pass (Stable Index)
-        if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
-            let fresh = global_clock
-                .checked_sub(VETERAN_WINDOW)
-                .map_or(true, |threshold| playout_time >= threshold);
-            if fresh {
-                self.rewrite_slot(pos, false, pkt);
-                return Some(pos);
+            if let Some(gc_threshold) = global_arrival_ts.checked_sub(GC_WINDOW) {
+                self.registry
+                    .retain(|_, m| m.last_arrival_ts >= gc_threshold);
             }
         }
 
-        // Tier 2a — Challenger: fill an empty physical slot immediately
+        // 4. Slot Assignment
+
+        // Tier 1 — Veteran: Already has a slot, keep flowing.
+        if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
+            self.rewrite_slot(pos, false, pkt);
+            return Some(pos);
+        }
+
+        // Tier 2 — Empty Slot: With 3 participants and 5 slots, everyone lands here.
         if let Some(pos) = self.leaderboard.iter().position(|s| s.is_none()) {
             self.leaderboard[pos] = Some(stream_id);
-            if let Some(m) = self.registry.get_mut(&stream_id) {
-                m.is_veteran = true;
-            }
             self.rewrite_slot(pos, true, pkt);
             return Some(pos);
         }
 
-        // Tier 2b — Challenger: beat weakest incumbent
-        // Iterate physical slots to find the weakest. N <= 5, so O(N) is negligible.
-        let (weakest_pos, weakest_score) = {
-            let reg = &self.registry;
-            self.leaderboard
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| {
-                    let id = (*s)?;
-                    let score = reg.get(&id)?.score_db();
-                    Some((i, score))
-                })
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?
-        };
-
+        // Tier 3 — Contention: Only triggers if 6+ participants are actively speaking
         let challenger_score = self.registry.get(&stream_id)?.score_db();
+        let (weakest_pos, weakest_score) = self
+            .leaderboard
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((i, self.registry.get(&(*s)?)?.score_db())))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+
         if challenger_score > weakest_score + HYSTERESIS_BONUS_DB {
-            // Take the EXACT physical index of the evicted stream
-            if let Some(evicted) = self.leaderboard[weakest_pos] {
-                if let Some(m) = self.registry.get_mut(&evicted) {
-                    m.is_veteran = false;
-                }
-            }
             self.leaderboard[weakest_pos] = Some(stream_id);
-            if let Some(m) = self.registry.get_mut(&stream_id) {
-                m.is_veteran = true;
-            }
             self.rewrite_slot(weakest_pos, true, pkt);
             return Some(weakest_pos);
         }
@@ -232,10 +160,6 @@ impl TopNAudioSelector {
         None
     }
 
-    /// Rewrite `pkt` through the per-slot [`Timeline`].
-    ///
-    /// If `switched` is `true` (or the slot has never been used) the timeline is
-    /// rebased to the new stream and the resulting packet's marker bit is set.
     #[inline]
     fn rewrite_slot(&mut self, pos: usize, switched: bool, pkt: &mut RtpPacket) {
         let was_uninit = self.timelines[pos].is_none();
@@ -265,8 +189,6 @@ impl TopNAudioSelector {
     }
 }
 
-/// Converts RFC 6464 audio level to linear power.
-/// `level` is 0 (max) to -127 (silence). Power = 10^(level/10).
 #[inline(always)]
 fn rfc6464_to_power(level: i8) -> f32 {
     let clamped = level.clamp(-127, 0) as f32;

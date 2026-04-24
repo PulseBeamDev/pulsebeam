@@ -1,6 +1,5 @@
 use crate::rtp::RtpPacket;
 use metrics::histogram;
-use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
 use str0m::{
     media::{Frequency, MediaTime},
@@ -8,7 +7,6 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-const SR_HISTORY_CAPACITY: usize = 5;
 const MIN_SR_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy)]
@@ -20,15 +18,11 @@ struct ClockReference {
 #[derive(Debug)]
 pub struct Synchronizer {
     clock_rate: Frequency,
-    sr_history: VecDeque<ClockReference>,
+    first_sr: Option<ClockReference>,
+    latest_sr: Option<ClockReference>,
     last_sr_time: Option<Instant>,
-
-    /// The RTP timestamp of the very first packet received.
     base_rtp: Option<MediaTime>,
-    /// The absolute server timeline anchor. This shifts backwards as we discover
-    /// packets with lower network jitter, ensuring a perfectly smooth timeline.
     base_server_time: Option<Instant>,
-
     pub estimated_clock_drift_ppm: f64,
 }
 
@@ -36,7 +30,8 @@ impl Synchronizer {
     pub fn new(clock_rate: Frequency) -> Self {
         Self {
             clock_rate,
-            sr_history: VecDeque::with_capacity(SR_HISTORY_CAPACITY),
+            first_sr: None,
+            latest_sr: None,
             last_sr_time: None,
             base_rtp: None,
             base_server_time: None,
@@ -44,13 +39,11 @@ impl Synchronizer {
         }
     }
 
-    /// Compute and stamp `playout_time` on the packet in-place.
     pub fn process(&mut self, packet: &mut RtpPacket, sr: Option<SenderInfo>) {
         if let Some(sr) = sr {
             self.add_sender_report(sr, packet.arrival_ts);
         }
 
-        // Initialize our baseline on the very first packet.
         if self.base_rtp.is_none() {
             self.base_rtp = Some(packet.rtp_ts);
             self.base_server_time = Some(packet.arrival_ts);
@@ -59,9 +52,7 @@ impl Synchronizer {
         let base_rtp = self.base_rtp.unwrap();
         let mut base_server_time = self.base_server_time.unwrap();
 
-        // Use i64 to prevent overflow on streams that run for >6 hours
         let rtp_delta = (packet.rtp_ts.numer() as i64).wrapping_sub(base_rtp.numer() as i64);
-
         let drift = self.estimated_clock_drift_ppm / 1_000_000.0;
         let drift_correction = 1.0 / (1.0 + drift);
         let seconds_delta = rtp_delta as f64 / self.clock_rate.get() as f64 * drift_correction;
@@ -74,13 +65,9 @@ impl Synchronizer {
                 .unwrap_or(packet.arrival_ts)
         };
 
-        // Minimum Jitter Filter:
-        // If a packet arrives *earlier* than our calculated playout time, it means our initial
-        // base_server_time included network jitter. We correct the timeline globally by
-        // shifting the base backward. This guarantees standard synchronization without jumps.
+        // Minimum envelope filter: safely absorb all network jitter without bounding box bounce
         if packet.arrival_ts < expected_playout {
             let error = expected_playout.duration_since(packet.arrival_ts);
-
             if let Some(new_base) = base_server_time.checked_sub(error) {
                 base_server_time = new_base;
                 self.base_server_time = Some(base_server_time);
@@ -98,30 +85,26 @@ impl Synchronizer {
             }
         }
 
-        if let Some(last) = self.sr_history.back() {
-            // Reject stale or reordered SRs
-            if sr.ntp_time <= last.ntp_time {
-                return;
-            }
-            if sr.rtp_time.numer().wrapping_sub(last.rtp_time.numer()) as i64 <= 0 {
-                return;
-            }
-        }
-
-        self.last_sr_time = Some(now);
-        self.sr_history.push_back(ClockReference {
+        let current = ClockReference {
             rtp_time: sr.rtp_time,
             ntp_time: sr.ntp_time,
-        });
+        };
 
-        if self.sr_history.len() > SR_HISTORY_CAPACITY {
-            self.sr_history.pop_front();
+        if let Some(last) = self.latest_sr {
+            if current.ntp_time <= last.ntp_time
+                || current.rtp_time.numer().wrapping_sub(last.rtp_time.numer()) as i64 <= 0
+            {
+                return;
+            }
+        } else {
+            self.first_sr = Some(current); // Permanent lock on the first report
         }
 
-        if self.sr_history.len() >= 2 {
-            let first = self.sr_history.front().unwrap();
-            let current = self.sr_history.back().unwrap();
-            self.estimated_clock_drift_ppm = Self::compute_clock_drift(first, current);
+        self.latest_sr = Some(current);
+        self.last_sr_time = Some(now);
+
+        if let (Some(first), Some(latest)) = (self.first_sr, self.latest_sr) {
+            self.estimated_clock_drift_ppm = Self::compute_clock_drift(&first, &latest);
             histogram!("rtp_sync_clock_drift_ppm").record(self.estimated_clock_drift_ppm);
         }
     }
@@ -131,10 +114,6 @@ impl Synchronizer {
             .rtp_time
             .numer()
             .wrapping_sub(first.rtp_time.numer()) as i64;
-
-        // We purely use the Sender's NTP delta to find the exact *speed* of the media clock.
-        // This is perfectly safe as it bypasses network jitter entirely, while continuing to
-        // ignore the absolute offset constraint.
         let sender_ntp_delta_secs = current
             .ntp_time
             .duration_since(first.ntp_time)
@@ -152,20 +131,9 @@ impl Synchronizer {
     }
 
     pub fn is_synchronized(&self) -> bool {
-        self.sr_history.len() >= 2
-    }
-}
-
-#[cfg(test)]
-impl Synchronizer {
-    fn process_owned(&mut self, mut packet: RtpPacket) -> RtpPacket {
-        self.process(&mut packet, None);
-        packet
-    }
-
-    fn process_owned_sr(&mut self, sr: SenderInfo, mut packet: RtpPacket) -> RtpPacket {
-        self.process(&mut packet, Some(sr));
-        packet
+        self.latest_sr.map_or(false, |l| {
+            self.first_sr.map_or(false, |f| f.ntp_time != l.ntp_time)
+        })
     }
 }
 
