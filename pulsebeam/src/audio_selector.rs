@@ -6,59 +6,62 @@ use tokio::time::Instant;
 
 use crate::{control::controller::MAX_SEND_AUDIO_SLOTS, rtp::RtpPacket, track::StreamId};
 
-/// Number of output slots (loudest speakers) produced by the selector.
+/// Number of output physical slots produced by the selector.
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 
-/// Streams silent for longer than this are evicted from the leaderboard (VAD/DTX handling).
-const EVICTION_WINDOW: Duration = Duration::from_millis(100);
+/// Streams silent for longer than this are evicted. Increased slightly to accommodate DTX.
+const EVICTION_WINDOW: Duration = Duration::from_millis(150);
 
 /// An incumbent whose `playout_time` falls within this window of `global_clock`
-/// is protected from eviction (fairness for jittery / slow senders).
+/// is protected from immediate eviction if already holding a slot.
 const VETERAN_WINDOW: Duration = Duration::from_millis(150);
 
-/// Challenger score must exceed the weakest incumbent's score by at least this
-/// many units before it can replace it (5 dB equivalent hysteresis in score space).
-const HYSTERESIS_BONUS: f32 = 5.0;
+/// Prevents a buggy client with a future timestamp from instantly clearing the board.
+const MAX_CLOCK_ADVANCE: Duration = Duration::from_millis(500);
 
-// SNR EMA alphas:
-//   e_fast tracks the current packet energy with a fast-reacting EMA (α = 0.7).
-//   e_floor tracks the background noise floor with a very slow EMA (α = 0.01).
-//   score = e_fast − e_floor  (positive when speaker is above their own noise floor)
-const E_FAST_ALPHA: f32 = 0.7;
-const E_FLOOR_ALPHA: f32 = 0.01;
+/// Challenger SNR score must exceed weakest incumbent by this many dB to steal their slot.
+const HYSTERESIS_BONUS_DB: f32 = 5.0;
+
+/// EMA Time Constants
+const TAU_FAST_MS: f32 = 50.0; // Fast tracking for speech bursts
+const TAU_FLOOR_MS: f32 = 2000.0; // Slow tracking for background noise
+
+/// Ratio threshold (approx 6 dB) above noise floor to trigger VAD (Voice Activity Detection).
+const VAD_THRESHOLD_RATIO: f32 = 3.981; // 10^(6/10)
 
 /// Per-stream speaker state kept in the registry.
 struct SpeakerMetadata {
     last_playout_time: Instant,
-    /// Fast EMA of energy — reacts quickly to speech activity.
+    /// Linear power fast EMA (speech)
     e_fast: f32,
-    /// Slow EMA of energy — tracks per-stream noise floor.
+    /// Linear power slow EMA (noise floor)
     e_floor: f32,
-    /// `true` while this stream occupies a leaderboard slot.
+    /// `true` while this stream occupies a downstream slot
     is_veteran: bool,
 }
 
 impl SpeakerMetadata {
-    /// SNR-normalised score: how far above the stream's own noise floor it currently is.
+    /// SNR score in decibels. How far above the stream's own noise floor it is.
     #[inline]
-    fn score(&self) -> f32 {
-        self.e_fast - self.e_floor
+    fn score_db(&self) -> f32 {
+        if self.e_floor <= 0.0 {
+            return 0.0;
+        }
+        let ratio = self.e_fast / self.e_floor;
+        if ratio <= 1.0 {
+            0.0
+        } else {
+            10.0 * ratio.log10()
+        }
     }
 }
 
-/// Per-shard, per-room Top-5 inline audio filter.
-///
-/// Call [`filter`] on every incoming audio packet metadata. The function
-/// returns `Some(slot_idx)` when the packet should be forwarded and `None`
-/// when it must be dropped.  All four algorithm phases execute synchronously
-/// with **no heap allocation on the hot path** and **no payload buffering**.
+/// Per-shard, per-room Top-N inline audio filter.
 pub struct TopNAudioSelector {
-    /// Top-5 leaderboard; index 0 = loudest speaker, index 4 = weakest.
-    /// Re-sorted descending by score after every challenger eviction.
-    leaderboard: [Option<StreamId>; SELECTOR_SLOTS],
-    /// Metadata for every audio stream observed in this room.
+    /// Stable routing slots. The index `0..SELECTOR_SLOTS` maps directly to your
+    /// downstream SFU SSRC output. This array is NEVER sorted.
+    slots: [Option<StreamId>; SELECTOR_SLOTS],
     registry: HashMap<StreamId, SpeakerMetadata>,
-    /// Maximum `playout_time` observed across all streams; drives eviction.
     global_clock: Option<Instant>,
 }
 
@@ -71,54 +74,82 @@ impl Default for TopNAudioSelector {
 impl TopNAudioSelector {
     pub fn new() -> Self {
         Self {
-            leaderboard: array::from_fn(|_| None),
+            slots: array::from_fn(|_| None),
             registry: HashMap::new(),
             global_clock: None,
         }
     }
 
-    /// Inline hot-path filter — runs all four algorithm phases synchronously.
-    ///
-    /// Returns `Some(slot_idx)` when the packet should be forwarded through
-    /// leaderboard position `slot_idx`, `None` when it must be dropped.
+    /// Inline hot-path filter.
+    /// Returns `Some(slot_idx)` mapping to a stable routing index if the packet should
+    /// be forwarded, or `None` if it must be dropped.
     #[inline]
     pub fn filter(&mut self, stream_id: StreamId, pkt: &RtpPacket) -> Option<usize> {
         let playout_time = pkt.playout_time;
-        // RFC 6464 (str0m): 0 = loudest, -127 = silence → invert so higher = louder.
-        let energy = rfc6464_to_energy(pkt.ext_vals.audio_level.unwrap_or(-127));
+        let power = rfc6464_to_power(pkt.ext_vals.audio_level.unwrap_or(-127));
 
-        // ── Phase 1: Clock sync ───────────────────────────────────────────────
+        // ── Phase 1: Clock sync & Clamp ───────────────────────────────────────
         let global_clock = match self.global_clock {
-            Some(prev) if prev >= playout_time => prev,
-            _ => {
-                self.global_clock = Some(playout_time);
-                playout_time
+            Some(prev) if playout_time > prev => {
+                let jump = playout_time.saturating_duration_since(prev);
+                if jump > MAX_CLOCK_ADVANCE {
+                    prev + MAX_CLOCK_ADVANCE // Clamp aggressive future timestamps
+                } else {
+                    playout_time
+                }
             }
+            Some(prev) => prev,
+            None => playout_time,
         };
+        self.global_clock = Some(global_clock);
 
-        // ── Phase 2: State update (SNR EMAs + last_playout_time) ──────────────
+        // ── Phase 2: State update (Time-Weighted EMAs + VAD Gate) ─────────────
         let meta = self
             .registry
             .entry(stream_id)
             .or_insert_with(|| SpeakerMetadata {
                 last_playout_time: playout_time,
-                e_fast: energy,
-                e_floor: energy,
+                e_fast: power,
+                e_floor: power,
                 is_veteran: false,
             });
-        meta.e_fast = E_FAST_ALPHA * energy + (1.0 - E_FAST_ALPHA) * meta.e_fast;
-        meta.e_floor = E_FLOOR_ALPHA * energy + (1.0 - E_FLOOR_ALPHA) * meta.e_floor;
+
+        // Calculate delta time in milliseconds
+        let dt = if playout_time > meta.last_playout_time {
+            (playout_time - meta.last_playout_time).as_millis() as f32
+        } else {
+            0.0 // Handle out-of-order or duplicate timestamps safely
+        };
+
+        if dt > 0.0 {
+            // Fast EMA for tracking active speech energy
+            let alpha_fast = 1.0 - (-dt / TAU_FAST_MS).exp();
+            meta.e_fast += alpha_fast * (power - meta.e_fast);
+
+            // VAD Gate: Are we significantly above the noise floor?
+            let is_speech = meta.e_fast > meta.e_floor * VAD_THRESHOLD_RATIO;
+
+            if !is_speech {
+                // Not speech: freely update the noise floor
+                let alpha_floor = 1.0 - (-dt / TAU_FLOOR_MS).exp();
+                meta.e_floor += alpha_floor * (power - meta.e_floor);
+            } else {
+                // Speech: severely throttle floor updates to prevent catching up
+                let alpha_floor_speech = 1.0 - (-dt / (TAU_FLOOR_MS * 10.0)).exp();
+                meta.e_floor += alpha_floor_speech * (power - meta.e_floor);
+            }
+        }
         meta.last_playout_time = playout_time;
 
         // ── Phase 3: Lazy eviction ────────────────────────────────────────────
-        // Remove leaderboard members that have been silent longer than EVICTION_WINDOW.
         if let Some(threshold) = global_clock.checked_sub(EVICTION_WINDOW) {
-            for slot in &mut self.leaderboard {
+            for slot in &mut self.slots {
                 let Some(id) = *slot else { continue };
                 let stale = self
                     .registry
                     .get(&id)
                     .map_or(false, |m| m.last_playout_time < threshold);
+
                 if stale {
                     if let Some(m) = self.registry.get_mut(&id) {
                         m.is_veteran = false;
@@ -128,12 +159,10 @@ impl TopNAudioSelector {
             }
         }
 
-        // ── Phase 4: Forwarding decision (two-tier gate) ──────────────────────
+        // ── Phase 4: Forwarding decision (Stable Indicies) ────────────────────
 
-        // Tier 1 — Veteran protection.
-        // If the stream is already on the leaderboard and its playout_time is
-        // recent enough, forward immediately regardless of current score rank.
-        if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
+        // Tier 1 — Veteran fast-pass (Stable Index)
+        if let Some(pos) = self.slots.iter().position(|s| *s == Some(stream_id)) {
             let fresh = global_clock
                 .checked_sub(VETERAN_WINDOW)
                 .map_or(true, |threshold| playout_time >= threshold);
@@ -142,71 +171,51 @@ impl TopNAudioSelector {
             }
         }
 
-        // Tier 2a — Challenger: fill an empty slot without any score comparison.
-        if let Some(pos) = self.leaderboard.iter().position(|s| s.is_none()) {
-            self.leaderboard[pos] = Some(stream_id);
+        // Tier 2a — Challenger: fill an empty physical slot immediately
+        if let Some(pos) = self.slots.iter().position(|s| s.is_none()) {
+            self.slots[pos] = Some(stream_id);
             if let Some(m) = self.registry.get_mut(&stream_id) {
                 m.is_veteran = true;
             }
             return Some(pos);
         }
 
-        // Tier 2b — Challenger: beat the weakest incumbent with hysteresis bonus.
+        // Tier 2b — Challenger: beat weakest incumbent
+        // Iterate physical slots to find the weakest. N <= 5, so O(N) is negligible.
         let (weakest_pos, weakest_score) = {
             let reg = &self.registry;
-            self.leaderboard
+            self.slots
                 .iter()
                 .enumerate()
                 .filter_map(|(i, s)| {
                     let id = (*s)?;
-                    let score = reg.get(&id)?.score();
+                    let score = reg.get(&id)?.score_db();
                     Some((i, score))
                 })
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?
         };
 
-        let challenger_score = self.registry.get(&stream_id)?.score();
-        if challenger_score > weakest_score + HYSTERESIS_BONUS {
-            // Demote the weakest incumbent.
-            if let Some(evicted) = self.leaderboard[weakest_pos] {
+        let challenger_score = self.registry.get(&stream_id)?.score_db();
+        if challenger_score > weakest_score + HYSTERESIS_BONUS_DB {
+            // Take the EXACT physical index of the evicted stream
+            if let Some(evicted) = self.slots[weakest_pos] {
                 if let Some(m) = self.registry.get_mut(&evicted) {
                     m.is_veteran = false;
                 }
             }
-            self.leaderboard[weakest_pos] = Some(stream_id);
+            self.slots[weakest_pos] = Some(stream_id);
             if let Some(m) = self.registry.get_mut(&stream_id) {
                 m.is_veteran = true;
             }
-
-            // Re-sort descending by score so position 0 = loudest speaker.
-            let (lb, reg) = (&mut self.leaderboard, &self.registry);
-            lb.sort_unstable_by(|a, b| {
-                let sa = a
-                    .and_then(|id| reg.get(&id))
-                    .map(|m| m.score())
-                    .unwrap_or(f32::NEG_INFINITY);
-                let sb = b
-                    .and_then(|id| reg.get(&id))
-                    .map(|m| m.score())
-                    .unwrap_or(f32::NEG_INFINITY);
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let new_pos = self
-                .leaderboard
-                .iter()
-                .position(|s| *s == Some(stream_id))?;
-            return Some(new_pos);
+            return Some(weakest_pos);
         }
 
         None
     }
 
-    /// Remove a track from the leaderboard and registry when its publisher leaves.
-    /// Accepts a `StreamId` directly.
     pub fn remove_track(&mut self, id: StreamId) {
         self.registry.remove(&id);
-        for slot in &mut self.leaderboard {
+        for slot in &mut self.slots {
             if *slot == Some(id) {
                 *slot = None;
                 break;
@@ -215,12 +224,12 @@ impl TopNAudioSelector {
     }
 }
 
-/// Convert an RFC 6464 audio level as represented by str0m (`i8`, 0 = loudest,
-/// -127 = silence) to a linear energy value in `[0.0, 127.0]` where higher
-/// means louder.
+/// Converts RFC 6464 audio level to linear power.
+/// `level` is 0 (max) to -127 (silence). Power = 10^(level/10).
 #[inline(always)]
-fn rfc6464_to_energy(level: i8) -> f32 {
-    ((level as i16) + 127).clamp(0, 127) as f32
+fn rfc6464_to_power(level: i8) -> f32 {
+    let clamped = level.clamp(-127, 0) as f32;
+    10.0_f32.powf(clamped / 10.0)
 }
 
 #[cfg(test)]
@@ -327,7 +336,10 @@ mod tests {
 
         // One more packet — still within eviction window; score ≈ 0; must be dropped.
         let result = sel.filter(quiet, &pkt_at(base, 135, -120));
-        assert!(result.is_none(), "quiet challenger must be dropped from a full leaderboard");
+        assert!(
+            result.is_none(),
+            "quiet challenger must be dropped from a full leaderboard"
+        );
 
         let occupied = sel.leaderboard.iter().filter(|s| s.is_some()).count();
         assert_eq!(occupied, SELECTOR_SLOTS, "leaderboard must remain full");
