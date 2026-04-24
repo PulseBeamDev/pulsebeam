@@ -91,7 +91,7 @@ impl Timeline {
         self.base = self.base.wrapping_sub(n);
     }
 
-    pub fn rewrite(&mut self, mut pkt: RtpPacket) -> RtpPacket {
+    pub fn rewrite(&mut self, pkt: &mut RtpPacket) {
         let input_seq = *pkt.seq_no as u16;
         let output_seq = input_seq.wrapping_add(self.base);
         pkt.seq_no = SeqNo::from(output_seq as u64);
@@ -107,8 +107,6 @@ impl Timeline {
 
         let duration = pkt.playout_time.saturating_duration_since(anchor);
         pkt.rtp_ts = MediaTime::from(duration).rebase(self.clock_rate);
-
-        pkt
     }
 }
 

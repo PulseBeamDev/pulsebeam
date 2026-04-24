@@ -79,11 +79,12 @@ impl Switcher {
     /// Pops the next available packet, prioritizing the old stream to ensure a smooth drain.
     pub fn pop(&mut self) -> Option<RtpPacket> {
         // 1. Drain the pending packet from the OLD stream.
-        if let Some(pending_pkt) = self.pending.pop_front() {
+        if let Some(mut pending_pkt) = self.pending.pop_front() {
             if pending_pkt.playout_time > self.latest_playout {
                 self.latest_playout = pending_pkt.playout_time;
             }
-            return Some(self.timeline.rewrite(pending_pkt));
+            self.timeline.rewrite(&mut pending_pkt);
+            return Some(pending_pkt);
         }
 
         if !self.ready_to_stream() {
@@ -91,11 +92,12 @@ impl Switcher {
         }
 
         // 2. Pop packets from the NEW stream if a switch is in progress.
-        if let Some(staged_pkt) = self.staging.pop() {
+        if let Some(mut staged_pkt) = self.staging.pop() {
             if staged_pkt.is_keyframe_start {
                 self.timeline.rebase(&staged_pkt);
             }
-            return Some(self.timeline.rewrite(staged_pkt));
+            self.timeline.rewrite(&mut staged_pkt);
+            return Some(staged_pkt);
         }
 
         None

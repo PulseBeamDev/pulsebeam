@@ -10,9 +10,8 @@ use crate::track::StreamWriter;
 /// Downstream audio allocator.
 ///
 /// Holds the fixed mapping of slot index → (Mid, Pt, Ssrc) for this subscriber.
-/// Timeline rewriting and top-N selection are owned by the shard-level
-/// [`TopNAudioSelector`]; this type only applies the N→M filter (M ≤ N slots
-/// are provisioned for this subscriber).
+/// Timeline rewriting and marker-on-switch are handled upstream by the shard-level
+/// [`TopNAudioSelector`]; packets arriving here are already continuous.
 pub struct AudioAllocator {
     /// M ≤ N provisioned slots; `None` entries are unfilled.
     slots: [Option<Slot>; SELECTOR_SLOTS],
@@ -22,6 +21,8 @@ pub struct Slot {
     pt: Pt,
     mid: Mid,
     ssrc: Ssrc,
+    /// Set to `true` when the slot is first provisioned for this subscriber so the
+    /// very first forwarded packet carries the RTP marker bit (talk-spurt start).
     pending_marker: bool,
 }
 

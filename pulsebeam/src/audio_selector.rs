@@ -4,7 +4,11 @@ use std::time::Duration;
 use ahash::{HashMap, HashMapExt};
 use tokio::time::Instant;
 
-use crate::{control::controller::MAX_SEND_AUDIO_SLOTS, rtp::RtpPacket, track::StreamId};
+use crate::{
+    control::controller::MAX_SEND_AUDIO_SLOTS,
+    rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline},
+    track::StreamId,
+};
 
 /// Number of output physical slots produced by the selector.
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
@@ -56,11 +60,21 @@ impl SpeakerMetadata {
     }
 }
 
+/// Per-slot timeline state owned by the selector.
+struct SlotTimeline {
+    timeline: Timeline,
+    /// Set to `true` whenever a new stream takes over the slot so the first
+    /// forwarded packet carries the RTP marker bit.
+    pending_marker: bool,
+}
+
 /// Per-shard, per-room Top-N inline audio filter.
 pub struct TopNAudioSelector {
     /// Stable routing slots. The index `0..SELECTOR_SLOTS` maps directly to your
     /// downstream SFU SSRC output. This array is NEVER sorted.
-    slots: [Option<StreamId>; SELECTOR_SLOTS],
+    leaderboard: [Option<StreamId>; SELECTOR_SLOTS],
+    /// Per-slot continuous timeline (parallel to `leaderboard`).
+    timelines: [Option<SlotTimeline>; SELECTOR_SLOTS],
     registry: HashMap<StreamId, SpeakerMetadata>,
     global_clock: Option<Instant>,
 }
@@ -74,17 +88,19 @@ impl Default for TopNAudioSelector {
 impl TopNAudioSelector {
     pub fn new() -> Self {
         Self {
-            slots: array::from_fn(|_| None),
+            leaderboard: array::from_fn(|_| None),
+            timelines: array::from_fn(|_| None),
             registry: HashMap::new(),
             global_clock: None,
         }
     }
 
     /// Inline hot-path filter.
-    /// Returns `Some(slot_idx)` mapping to a stable routing index if the packet should
-    /// be forwarded, or `None` if it must be dropped.
+    /// Returns `Some((slot_idx, rewritten_pkt))` — a continuously rewritten RTP packet
+    /// mapped to the stable slot index — or `None` if the packet must be dropped.
+    /// The marker bit is set to `true` on the first packet after a stream switch.
     #[inline]
-    pub fn filter(&mut self, stream_id: StreamId, pkt: &RtpPacket) -> Option<usize> {
+    pub fn filter(&mut self, stream_id: StreamId, pkt: &mut RtpPacket) -> Option<usize> {
         let playout_time = pkt.playout_time;
         let power = rfc6464_to_power(pkt.ext_vals.audio_level.unwrap_or(-127));
 
@@ -143,7 +159,7 @@ impl TopNAudioSelector {
 
         // ── Phase 3: Lazy eviction ────────────────────────────────────────────
         if let Some(threshold) = global_clock.checked_sub(EVICTION_WINDOW) {
-            for slot in &mut self.slots {
+            for slot in &mut self.leaderboard {
                 let Some(id) = *slot else { continue };
                 let stale = self
                     .registry
@@ -162,21 +178,23 @@ impl TopNAudioSelector {
         // ── Phase 4: Forwarding decision (Stable Indicies) ────────────────────
 
         // Tier 1 — Veteran fast-pass (Stable Index)
-        if let Some(pos) = self.slots.iter().position(|s| *s == Some(stream_id)) {
+        if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
             let fresh = global_clock
                 .checked_sub(VETERAN_WINDOW)
                 .map_or(true, |threshold| playout_time >= threshold);
             if fresh {
+                self.rewrite_slot(pos, false, pkt);
                 return Some(pos);
             }
         }
 
         // Tier 2a — Challenger: fill an empty physical slot immediately
-        if let Some(pos) = self.slots.iter().position(|s| s.is_none()) {
-            self.slots[pos] = Some(stream_id);
+        if let Some(pos) = self.leaderboard.iter().position(|s| s.is_none()) {
+            self.leaderboard[pos] = Some(stream_id);
             if let Some(m) = self.registry.get_mut(&stream_id) {
                 m.is_veteran = true;
             }
+            self.rewrite_slot(pos, true, pkt);
             return Some(pos);
         }
 
@@ -184,7 +202,7 @@ impl TopNAudioSelector {
         // Iterate physical slots to find the weakest. N <= 5, so O(N) is negligible.
         let (weakest_pos, weakest_score) = {
             let reg = &self.registry;
-            self.slots
+            self.leaderboard
                 .iter()
                 .enumerate()
                 .filter_map(|(i, s)| {
@@ -198,24 +216,47 @@ impl TopNAudioSelector {
         let challenger_score = self.registry.get(&stream_id)?.score_db();
         if challenger_score > weakest_score + HYSTERESIS_BONUS_DB {
             // Take the EXACT physical index of the evicted stream
-            if let Some(evicted) = self.slots[weakest_pos] {
+            if let Some(evicted) = self.leaderboard[weakest_pos] {
                 if let Some(m) = self.registry.get_mut(&evicted) {
                     m.is_veteran = false;
                 }
             }
-            self.slots[weakest_pos] = Some(stream_id);
+            self.leaderboard[weakest_pos] = Some(stream_id);
             if let Some(m) = self.registry.get_mut(&stream_id) {
                 m.is_veteran = true;
             }
+            self.rewrite_slot(weakest_pos, true, pkt);
             return Some(weakest_pos);
         }
 
         None
     }
 
+    /// Rewrite `pkt` through the per-slot [`Timeline`].
+    ///
+    /// If `switched` is `true` (or the slot has never been used) the timeline is
+    /// rebased to the new stream and the resulting packet's marker bit is set.
+    #[inline]
+    fn rewrite_slot(&mut self, pos: usize, switched: bool, pkt: &mut RtpPacket) {
+        let was_uninit = self.timelines[pos].is_none();
+        let slot = self.timelines[pos].get_or_insert_with(|| SlotTimeline {
+            timeline: Timeline::new(AUDIO_FREQUENCY),
+            pending_marker: false,
+        });
+        if switched || was_uninit {
+            slot.timeline.rebase_audio(pkt);
+            slot.pending_marker = true;
+        }
+        slot.timeline.rewrite(pkt);
+        if slot.pending_marker {
+            pkt.marker = true;
+            slot.pending_marker = false;
+        }
+    }
+
     pub fn remove_track(&mut self, id: StreamId) {
         self.registry.remove(&id);
-        for slot in &mut self.slots {
+        for slot in &mut self.leaderboard {
             if *slot == Some(id) {
                 *slot = None;
                 break;

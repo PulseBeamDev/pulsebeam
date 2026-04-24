@@ -670,7 +670,7 @@ fn handle_rtp(
 /// forwarded.  The original packet (no rewriting) is delivered to all local
 /// subscribers through that slot.
 fn handle_audio_rtp(
-    ev: RtpEvent,
+    mut ev: RtpEvent,
     rooms: &mut HashMap<RoomId, RoomState>,
     participants: &mut HashMap<ParticipantId, ParticipantCore>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
@@ -679,9 +679,6 @@ fn handle_audio_rtp(
     let Some(room) = rooms.get_mut(&ev.room_id) else {
         return;
     };
-
-    // Inline Top-5 filter: synchronous, no buffering, returns leaderboard slot.
-    let selection = room.audio_selector.filter(ev.stream_id, &ev.pkt);
 
     // Cross-shard fanout: only from the originating shard to avoid loops.
     if participants.contains_key(&ev.origin) {
@@ -698,6 +695,8 @@ fn handle_audio_rtp(
         }
     }
 
+    // Inline Top-5 filter: synchronous, no buffering, returns leaderboard slot.
+    let selection = room.audio_selector.filter(ev.stream_id, &mut ev.pkt);
     let Some(slot_idx) = selection else {
         return;
     };
