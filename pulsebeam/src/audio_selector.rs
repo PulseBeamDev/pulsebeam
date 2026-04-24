@@ -324,7 +324,7 @@ mod tests {
     ) -> StreamId {
         let id = make_stream();
         for t in 0..n {
-            sel.filter(id, &pkt_at(base, start_ms + t * TICK_MS, level));
+            sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, level));
         }
         id
     }
@@ -376,7 +376,7 @@ mod tests {
         let quiet = warm_up(&mut sel, base, 80, -120, 10);
 
         // One more packet — still within eviction window; score ≈ 0; must be dropped.
-        let result = sel.filter(quiet, &pkt_at(base, 135, -120));
+        let result = sel.filter(quiet, &mut pkt_at(base, 135, -120));
         assert!(
             result.is_none(),
             "quiet challenger must be dropped from a full leaderboard"
@@ -403,13 +403,13 @@ mod tests {
         // Silence warmup at base+80..base+125 ms (within eviction window of incumbents).
         let interrupter = make_stream();
         for t in 0..10u64 {
-            sel.filter(interrupter, &pkt_at(base, 80 + t * TICK_MS, -127));
+            sel.filter(interrupter, &mut pkt_at(base, 80 + t * TICK_MS, -127));
         }
         // One loud packet: e_fast = 0.7 × 127 ≈ 89, e_floor ≈ 0 → score ≈ 89.
         // global_clock = base+130 ms, threshold = base+30 ms.
         // All incumbents last at base+70 ms > base+30 ms → still fresh, no eviction.
         // 89 > 0 + HYSTERESIS_BONUS(5) → displaces the weakest incumbent.
-        let result = sel.filter(interrupter, &pkt_at(base, 130, 0));
+        let result = sel.filter(interrupter, &mut pkt_at(base, 130, 0));
         assert!(result.is_some(), "new speaker must be accepted");
         assert!(
             sel.leaderboard.contains(&Some(interrupter)),
@@ -434,7 +434,7 @@ mod tests {
         // Warmup at base+80..base+150 ms (still within eviction window of incumbents).
         let challenger = make_stream();
         for t in 0..15u64 {
-            sel.filter(challenger, &pkt_at(base, 80 + t * TICK_MS, -27));
+            sel.filter(challenger, &mut pkt_at(base, 80 + t * TICK_MS, -27));
         }
 
         // One packet at energy 103 (level −24):
@@ -443,7 +443,7 @@ mod tests {
         //   score   = 2.07  <  HYSTERESIS_BONUS (5.0)
         // global_clock = base+155 ms, threshold = base+55 ms.
         // Incumbents last at base+70 ms > base+55 ms → still fresh.
-        let result = sel.filter(challenger, &pkt_at(base, 155, -24));
+        let result = sel.filter(challenger, &mut pkt_at(base, 155, -24));
         assert!(
             result.is_none(),
             "challenger with SNR score 2.07 (< 5.0 hysteresis) must be blocked"
@@ -469,7 +469,7 @@ mod tests {
 
         // stream_a sends a packet with playout_time = base+120 ms.
         // Distance behind clock: 170 − 120 = 50 ms < VETERAN_WINDOW (150 ms).
-        let result = sel.filter(stream_a, &pkt_at(base, 120, 0));
+        let result = sel.filter(stream_a, &mut pkt_at(base, 120, 0));
         assert!(
             result.is_some(),
             "veteran 50 ms behind clock must be forwarded via Tier-1"
@@ -484,17 +484,17 @@ mod tests {
         let mut sel = TopNAudioSelector::new();
         let id = make_stream();
 
-        sel.filter(id, &pkt_at(base, 100, 0));
+        sel.filter(id, &mut pkt_at(base, 100, 0));
         let clock_high = sel.global_clock.expect("clock must be set");
 
-        sel.filter(id, &pkt_at(base, 50, 0));
+        sel.filter(id, &mut pkt_at(base, 50, 0));
         let clock_after_old = sel.global_clock.expect("clock must be set");
 
         assert_eq!(clock_high, clock_after_old, "clock must not regress");
 
         // Both directions must be forwarded for this veteran stream.
-        assert!(sel.filter(id, &pkt_at(base, 100, 0)).is_some());
-        assert!(sel.filter(id, &pkt_at(base, 50, 0)).is_some());
+        assert!(sel.filter(id, &mut pkt_at(base, 100, 0)).is_some());
+        assert!(sel.filter(id, &mut pkt_at(base, 50, 0)).is_some());
     }
 
     // ── 3. VAD & DTX (Eviction) ───────────────────────────────────────────────
@@ -511,15 +511,18 @@ mod tests {
         let stale_id = tracks[0];
 
         // Refresh streams 1–4 (but NOT stale_id) at base+200 ms.
-        // After this: global_clock = base+200 ms, threshold = base+100 ms.
-        // stale_id.last (70 ms) < threshold (100 ms) → evicted on next filter call.
-        // tracks[1..].last (200 ms) > threshold (100 ms) → fresh.
+        // After this: global_clock = base+200 ms, threshold = base+200-150 = base+50 ms.
+        // stale_id.last (70 ms) > base+50 ms → not yet evicted here.
+        // tracks[1..].last (200 ms) → fresh.
         for &id in tracks.iter().skip(1) {
-            sel.filter(id, &pkt_at(base, 200, 0));
+            sel.filter(id, &mut pkt_at(base, 200, 0));
         }
 
+        // Newcomer at base+240 ms → global_clock = base+240 ms, threshold = base+90 ms.
+        // stale_id.last (70 ms) < threshold (90 ms) → evicted.
+        // tracks[1..].last (200 ms) > threshold (90 ms) → still fresh.
         let newcomer = make_stream();
-        let result = sel.filter(newcomer, &pkt_at(base, 210, 0));
+        let result = sel.filter(newcomer, &mut pkt_at(base, 240, 0));
         assert!(result.is_some(), "newcomer must claim the evicted slot");
         assert!(
             !sel.leaderboard.contains(&Some(stale_id)),
@@ -539,7 +542,7 @@ mod tests {
         // Probe at base+300 ms → global_clock = base+300 ms, threshold = base+200 ms.
         // All incumbents (70 ms) < threshold (200 ms) → ALL evicted.
         let probe = make_stream();
-        sel.filter(probe, &pkt_at(base, 300, 0));
+        sel.filter(probe, &mut pkt_at(base, 300, 0));
 
         let occupied = sel.leaderboard.iter().filter(|s| s.is_some()).count();
         assert!(
@@ -558,7 +561,7 @@ mod tests {
         let id = make_stream();
 
         for t in 0..8u64 {
-            sel.filter(id, &pkt_at(base, t * TICK_MS, 0));
+            sel.filter(id, &mut pkt_at(base, t * TICK_MS, 0));
         }
 
         let count = sel.leaderboard.iter().filter(|s| **s == Some(id)).count();
@@ -582,7 +585,7 @@ mod tests {
         // After refresh: global_clock = base+200 ms.
         let incumbents: Vec<StreamId> = sel.leaderboard.iter().filter_map(|s| *s).collect();
         for &id in &incumbents {
-            sel.filter(id, &pkt_at(base, 200, 0));
+            sel.filter(id, &mut pkt_at(base, 200, 0));
         }
 
         // Challenger warmed up at energy 100 (level −27).
@@ -592,14 +595,14 @@ mod tests {
         // Incumbents last at base+200 ms > base+175 ms → fresh ✓.
         let challenger = make_stream();
         for t in 0..15u64 {
-            sel.filter(challenger, &pkt_at(base, 205 + t * TICK_MS, -27));
+            sel.filter(challenger, &mut pkt_at(base, 205 + t * TICK_MS, -27));
         }
 
         // Challenger sends one packet at energy 103 (level −24):
         //   score = (0.7 × 103 + 0.3 × 100) − (0.01 × 103 + 0.99 × 100) ≈ 2.07
         // Weakest incumbent score = 0.
         // 2.07 > 0 + 5.0 → false → challenger must be rejected.
-        let result = sel.filter(challenger, &pkt_at(base, 280, -24));
+        let result = sel.filter(challenger, &mut pkt_at(base, 280, -24));
         assert!(
             result.is_none(),
             "challenger with score ≈ 2.07 must be blocked by hysteresis (bonus = 5.0)"

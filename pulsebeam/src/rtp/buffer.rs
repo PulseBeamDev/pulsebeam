@@ -139,6 +139,9 @@ impl KeyframeBuffer {
             return Some(pkt);
         }
 
+        // Buffer fully drained — clear the segment marker so has_keyframe_segment()
+        // returns false and ready_to_stream() correctly reports the buffer as empty.
+        self.segment = None;
         None
     }
 
