@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use ahash::HashMap;
 use tokio::time::Instant;
 
 use crate::{
@@ -11,142 +10,174 @@ use crate::{
 
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 
-// Increased to 1000ms. A 150ms physical window is too tight for bad internet connections.
-const EVICTION_WINDOW: Duration = Duration::from_millis(1000);
-const GC_WINDOW: Duration = Duration::from_secs(10);
-const HYSTERESIS_BONUS_DB: f32 = 5.0;
-
-const TAU_FAST_MS: f32 = 50.0;
-const TAU_FLOOR_MS: f32 = 2000.0;
-const VAD_THRESHOLD_RATIO: f32 = 3.981;
-
-struct SpeakerMetadata {
-    last_playout_time: Instant,
-    last_arrival_ts: Instant, // Used exclusively to prevent jitter-based evictions
-    e_fast: f32,
-    e_floor: f32,
-}
-
-impl SpeakerMetadata {
-    #[inline]
-    fn score_db(&self) -> f32 {
-        if self.e_floor <= 0.0 {
-            return 0.0;
-        }
-        let ratio = self.e_fast / self.e_floor;
-        if ratio <= 1.0 {
-            0.0
-        } else {
-            10.0 * ratio.log10()
-        }
-    }
-}
+/// -40 dBov → linear power: 10^(-40/10) = 0.0001
+const SPEECH_THRESHOLD: f32 = 1e-4;
+/// Slot is considered dead if no packet has arrived within this window.
+const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Slot is considered resting (DTX) if no *loud* packet has arrived within this window.
+const DTX_REST_TIMEOUT: Duration = Duration::from_millis(500);
+/// After a slot is stolen, this window protects the new owner from being immediately
+/// evicted by delayed packets from the previous owner.
+const NEWBORN_IMMUNITY: Duration = Duration::from_millis(300);
+/// +5 dB power ratio: 10^(5/10) ≈ 3.1623. The incoming packet must be this much
+/// louder than the quietest active slot to steal it during active contention.
+const HYSTERESIS_MULTIPLIER: f32 = 3.1623;
 
 struct SlotTimeline {
     timeline: Timeline,
     pending_marker: bool,
 }
 
-#[derive(Default)]
+struct SlotState {
+    owner: Option<StreamId>,
+    /// Wall-clock time of the most recent packet (loud or quiet). `None` means the
+    /// slot has never been used.
+    last_arrival_ts: Option<Instant>,
+    /// Wall-clock time of the most recent packet that exceeded SPEECH_THRESHOLD.
+    /// `None` means the slot has never received a loud packet.
+    last_loud_ts: Option<Instant>,
+    /// Wall-clock time until which this slot cannot be stolen (newborn immunity).
+    immunity_expiry: Instant,
+    /// Power of the most recent packet, used for Active Contention (Priority C).
+    last_power: f32,
+    slot_timeline: SlotTimeline,
+}
+
+impl SlotState {
+    /// A slot is "dead" if it has no owner, or its owner has been silent for DEAD_TIMEOUT.
+    #[inline]
+    fn is_dead(&self, now: Instant) -> bool {
+        match (self.owner, self.last_arrival_ts) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(_), Some(ts)) => now.duration_since(ts) > DEAD_TIMEOUT,
+        }
+    }
+
+    /// A slot is "resting" (DTX mode) if its owner has sent no loud packet recently.
+    #[inline]
+    fn is_resting(&self, now: Instant) -> bool {
+        match self.last_loud_ts {
+            None => true,
+            Some(ts) => now.duration_since(ts) > DTX_REST_TIMEOUT,
+        }
+    }
+
+    /// Returns true if this slot is currently immune to being stolen.
+    #[inline]
+    fn is_immune(&self, now: Instant) -> bool {
+        now < self.immunity_expiry
+    }
+}
+
 pub struct TopNAudioSelector {
-    leaderboard: [Option<StreamId>; SELECTOR_SLOTS],
-    timelines: [Option<SlotTimeline>; SELECTOR_SLOTS],
-    registry: HashMap<StreamId, SpeakerMetadata>,
-    global_arrival_ts: Option<Instant>,
+    slots: [SlotState; SELECTOR_SLOTS],
+}
+
+impl Default for TopNAudioSelector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TopNAudioSelector {
     pub fn new() -> Self {
-        Self::default()
+        // immunity_expiry is set to Instant::now() at construction; any packet arriving
+        // later will have now >= construction_time, so is_immune() returns false.
+        let init_instant = Instant::now();
+        Self {
+            slots: std::array::from_fn(|_| SlotState {
+                owner: None,
+                last_arrival_ts: None,
+                last_loud_ts: None,
+                immunity_expiry: init_instant,
+                last_power: 0.0,
+                slot_timeline: SlotTimeline {
+                    timeline: Timeline::new(AUDIO_FREQUENCY),
+                    pending_marker: false,
+                },
+            }),
+        }
     }
 
     #[inline]
     pub fn filter(&mut self, stream_id: StreamId, pkt: &mut RtpPacket) -> Option<usize> {
+        // Step 1: Parse power and wall-clock arrival time.
         let power = rfc6464_to_power(pkt.ext_vals.audio_level.unwrap_or(-127));
+        let is_loud = power > SPEECH_THRESHOLD;
+        let now = pkt.arrival_ts;
 
-        // 1. Advance the PHYSICAL server timeline (Immune to all RTP clock drift/jitter)
-        let global_arrival_ts = match self.global_arrival_ts {
-            Some(prev) => prev.max(pkt.arrival_ts),
-            None => pkt.arrival_ts,
-        };
-        self.global_arrival_ts = Some(global_arrival_ts);
+        // Step 2: Gatekeeper — non-owners that are not loud are dropped immediately.
+        let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
+        if owner_slot.is_none() && !is_loud {
+            return None;
+        }
 
-        // 2. State & VAD Update
-        let meta = self
-            .registry
-            .entry(stream_id)
-            .or_insert_with(|| SpeakerMetadata {
-                last_playout_time: pkt.playout_time,
-                last_arrival_ts: pkt.arrival_ts,
-                e_fast: power,
-                e_floor: power,
-            });
-
-        meta.last_arrival_ts = pkt.arrival_ts;
-
-        if let Some(dt) = pkt
-            .playout_time
-            .checked_duration_since(meta.last_playout_time)
-        {
-            let dt_ms = dt.as_millis() as f32;
-            if dt_ms > 0.0 {
-                let alpha_fast = 1.0 - (-dt_ms / TAU_FAST_MS).exp();
-                meta.e_fast += alpha_fast * (power - meta.e_fast);
-
-                let is_speech = meta.e_fast > meta.e_floor * VAD_THRESHOLD_RATIO;
-                let tau_floor = if is_speech {
-                    TAU_FLOOR_MS * 10.0
-                } else {
-                    TAU_FLOOR_MS
-                };
-
-                let alpha_floor = 1.0 - (-dt_ms / tau_floor).exp();
-                meta.e_floor += alpha_floor * (power - meta.e_floor);
+        // Step 3: Owner fast-path — update timestamps and forward.
+        if let Some(idx) = owner_slot {
+            let slot = &mut self.slots[idx];
+            slot.last_arrival_ts = Some(now);
+            slot.last_power = power;
+            if is_loud {
+                slot.last_loud_ts = Some(now);
             }
-        }
-        meta.last_playout_time = meta.last_playout_time.max(pkt.playout_time);
-
-        // 3. Slot Assignment
-
-        // Tier 1 — Veteran: Already has a slot, keep flowing.
-        if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
-            self.rewrite_slot(pos, false, pkt);
-            return Some(pos);
+            Self::rewrite_slot_timeline(&mut slot.slot_timeline, false, pkt);
+            return Some(idx);
         }
 
-        // Tier 2 — Empty Slot: With 3 participants and 5 slots, everyone lands here.
-        if let Some(pos) = self.leaderboard.iter().position(|s| s.is_none()) {
-            self.leaderboard[pos] = Some(stream_id);
-            self.rewrite_slot(pos, true, pkt);
-            return Some(pos);
-        }
+        // Step 4: Slot stealing — we have a loud non-owner. Find a victim.
+        // Filter out immune slots first, then apply priority order.
 
-        // Tier 3 — Contention: Only triggers if 6+ participants are actively speaking
-        let challenger_score = self.registry.get(&stream_id)?.score_db();
-        let (weakest_pos, weakest_score) = self
-            .leaderboard
+        // Priority A: Dead slot (no owner, or silent for >DEAD_TIMEOUT).
+        let victim = self
+            .slots
             .iter()
-            .enumerate()
-            .filter_map(|(i, s)| Some((i, self.registry.get(&(*s)?)?.score_db())))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+            .position(|s| !s.is_immune(now) && s.is_dead(now));
 
-        if challenger_score > weakest_score + HYSTERESIS_BONUS_DB {
-            self.leaderboard[weakest_pos] = Some(stream_id);
-            self.rewrite_slot(weakest_pos, true, pkt);
-            return Some(weakest_pos);
-        }
+        // Priority B: Resting (DTX) slot — pick the one that has been resting longest.
+        let victim = victim.or_else(|| {
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.is_immune(now) && s.is_resting(now))
+                .min_by_key(|(_, s)| s.last_loud_ts)
+                .map(|(i, _)| i)
+        });
 
-        None
+        // Priority C: Active contention — find the quietest non-immune slot and compare.
+        let victim = victim.or_else(|| {
+            let (quietest_idx, quietest_slot) = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.is_immune(now))
+                .min_by(|(_, a), (_, b)| {
+                    a.last_power
+                        .partial_cmp(&b.last_power)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })?;
+            if power > quietest_slot.last_power * HYSTERESIS_MULTIPLIER {
+                Some(quietest_idx)
+            } else {
+                None
+            }
+        });
+
+        // Step 5: Execute the steal.
+        let victim_idx = victim?;
+        let slot = &mut self.slots[victim_idx];
+        slot.owner = Some(stream_id);
+        slot.last_arrival_ts = Some(now);
+        slot.last_loud_ts = Some(now);
+        slot.immunity_expiry = now + NEWBORN_IMMUNITY;
+        slot.last_power = power;
+        Self::rewrite_slot_timeline(&mut slot.slot_timeline, true, pkt);
+        Some(victim_idx)
     }
 
     #[inline]
-    fn rewrite_slot(&mut self, pos: usize, switched: bool, pkt: &mut RtpPacket) {
-        let was_uninit = self.timelines[pos].is_none();
-        let slot = self.timelines[pos].get_or_insert_with(|| SlotTimeline {
-            timeline: Timeline::new(AUDIO_FREQUENCY),
-            pending_marker: false,
-        });
-        if switched || was_uninit {
+    fn rewrite_slot_timeline(slot: &mut SlotTimeline, switched: bool, pkt: &mut RtpPacket) {
+        if switched {
             slot.timeline.rebase_audio(pkt);
             slot.pending_marker = true;
         }
@@ -158,35 +189,21 @@ impl TopNAudioSelector {
     }
 
     pub fn remove_track(&mut self, id: StreamId) {
-        self.registry.remove(&id);
-        for slot in &mut self.leaderboard {
-            if *slot == Some(id) {
-                *slot = None;
+        for slot in &mut self.slots {
+            if slot.owner == Some(id) {
+                slot.owner = None;
                 break;
             }
         }
     }
 
     pub fn cleanup(&mut self) -> Option<()> {
-        let global_arrival_ts = self.global_arrival_ts?;
-        let threshold = global_arrival_ts.checked_sub(EVICTION_WINDOW)?;
-
-        for slot in &mut self.leaderboard {
-            let Some(id) = *slot else {
-                continue;
-            };
-            if self
-                .registry
-                .get(&id)
-                .is_some_and(|m| m.last_arrival_ts < threshold)
-            {
-                *slot = None;
+        let now = Instant::now();
+        for slot in &mut self.slots {
+            if slot.owner.is_some() && slot.is_dead(now) {
+                slot.owner = None;
             }
         }
-
-        let gc_threshold = global_arrival_ts.checked_sub(GC_WINDOW)?;
-        self.registry
-            .retain(|_, m| m.last_arrival_ts >= gc_threshold);
         Some(())
     }
 }
@@ -211,10 +228,7 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    /// Packet-spacing used by helpers. 5 ms keeps the full warmup window
-    /// (15 × 5 = 75 ms) well inside the 100 ms eviction window when
-    /// challenge packets are sent soon after fill_leaderboard.
-    const TICK_MS: u64 = 5;
+    const TICK_MS: u64 = 20;
 
     fn make_stream() -> StreamId {
         (
@@ -223,320 +237,246 @@ mod tests {
         )
     }
 
-    fn pkt_with(level: i8, playout_time: Instant) -> RtpPacket {
+    /// Build a packet with the given audio level arriving at `arrival_ts`.
+    fn pkt_at(base: Instant, offset_ms: u64, level: i8) -> RtpPacket {
         let mut ext_vals = ExtensionValues::default();
         ext_vals.audio_level = Some(level);
         RtpPacket {
             ext_vals,
-            playout_time,
+            arrival_ts: base + Duration::from_millis(offset_ms),
+            playout_time: base + Duration::from_millis(offset_ms),
             ..Default::default()
         }
     }
 
-    fn pkt_at(base: Instant, offset_ms: u64, level: i8) -> RtpPacket {
-        pkt_with(level, base + Duration::from_millis(offset_ms))
-    }
-
-    /// Warm up a stream with `n` packets at `level`, spaced TICK_MS apart,
-    /// starting at `start_ms` relative to `base`. Returns the StreamId.
-    fn warm_up(
-        sel: &mut TopNAudioSelector,
-        base: Instant,
-        start_ms: u64,
-        level: i8,
-        n: u64,
-    ) -> StreamId {
+    /// Helper: send `n` loud packets spaced TICK_MS apart, return the StreamId.
+    fn add_loud_stream(sel: &mut TopNAudioSelector, base: Instant, start_ms: u64) -> StreamId {
         let id = make_stream();
-        for t in 0..n {
-            sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, level));
+        for t in 0..5u64 {
+            sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, 0));
         }
         id
     }
 
-    /// Fill `n` leaderboard slots with loud (level=0) streams.
-    ///
-    /// All streams use the SAME compact time window (0 ms … 70 ms) so
-    /// global_clock settles at base+70 ms after the call. Challenge packets
-    /// can safely arrive at base+80 ms … base+169 ms without triggering
-    /// eviction (threshold = global_clock − 100 ms < base+0 ms for those times).
-    ///
-    /// For eviction tests advance the challenge time to ≥ base+172 ms
-    /// (threshold ≥ base+72 ms > base+70 ms) so all incumbents become stale.
-    fn fill_leaderboard(sel: &mut TopNAudioSelector, n: usize, base: Instant) -> Vec<StreamId> {
-        (0..n)
-            .map(|_| {
-                // 15 packets × 5 ms = last packet at base+70 ms.
-                let id = warm_up(sel, base, 0, 0, 15);
-                assert!(
-                    sel.leaderboard.contains(&Some(id)),
-                    "stream must be on leaderboard after warm-up"
-                );
-                id
-            })
+    /// Fill all SELECTOR_SLOTS with active loud streams.
+    /// All streams send their last packet at `base + start_ms + 4*TICK_MS`.
+    fn fill_slots(sel: &mut TopNAudioSelector, base: Instant, start_ms: u64) -> Vec<StreamId> {
+        (0..SELECTOR_SLOTS)
+            .map(|_| add_loud_stream(sel, base, start_ms))
             .collect()
     }
 
-    /// SNR score formula (mirrors the production code) for test assertions.
-    fn score_of(sel: &TopNAudioSelector, id: StreamId) -> f32 {
-        let m = sel.registry.get(&id).expect("stream must be in registry");
-        m.e_fast - m.e_floor
+    fn slot_owners(sel: &TopNAudioSelector) -> Vec<Option<StreamId>> {
+        sel.slots.iter().map(|s| s.owner).collect()
     }
 
-    // ── 1. Functional Ranking & Capacity ─────────────────────────────────────
+    // ── 1. Basic admission ────────────────────────────────────────────────────
 
-    /// A 6th stream with a near-zero score cannot enter a full leaderboard.
-    ///
-    /// With SNR normalization a stream warmed up at constant energy has
-    /// e_fast = e_floor = energy, so score = 0. 0 > 0 + HYSTERESIS_BONUS(5) → false.
+    /// A single loud packet from an unknown stream should claim an empty slot.
     #[test]
-    fn saturated_room_drops_quiet_stream() {
-        let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
-        // After fill: global_clock = base+70 ms; all incumbents score ≈ 0.
-        fill_leaderboard(&mut sel, SELECTOR_SLOTS, base);
-
-        // Quiet challenger enters at base+80 ms — well within the eviction window
-        // so all 5 slots remain occupied.
-        let quiet = warm_up(&mut sel, base, 80, -120, 10);
-
-        // One more packet — still within eviction window; score ≈ 0; must be dropped.
-        let result = sel.filter(quiet, &mut pkt_at(base, 135, -120));
-        assert!(
-            result.is_none(),
-            "quiet challenger must be dropped from a full leaderboard"
-        );
-
-        let occupied = sel.leaderboard.iter().filter(|s| s.is_some()).count();
-        assert_eq!(occupied, SELECTOR_SLOTS, "leaderboard must remain full");
-    }
-
-    /// A new speaker who was previously silent scores very high on first loud
-    /// packet (e_fast ≈ 0.7 × 127 ≈ 89, e_floor ≈ 0, score ≈ 89) and must
-    /// evict whichever incumbent has the lowest score.
-    #[test]
-    fn loud_interrupter_evicts_weakest() {
-        let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
-        // After fill: global_clock = base+70 ms; all 5 incumbents score ≈ 0.
-        let tracks = fill_leaderboard(&mut sel, SELECTOR_SLOTS, base);
-        for &id in &tracks {
-            assert!(sel.leaderboard.contains(&Some(id)));
-        }
-
-        // Interrupter: warm up at silence (score ≈ 0), then fire one loud packet.
-        // Silence warmup at base+80..base+125 ms (within eviction window of incumbents).
-        let interrupter = make_stream();
-        for t in 0..10u64 {
-            sel.filter(interrupter, &mut pkt_at(base, 80 + t * TICK_MS, -127));
-        }
-        // One loud packet: e_fast = 0.7 × 127 ≈ 89, e_floor ≈ 0 → score ≈ 89.
-        // global_clock = base+130 ms, threshold = base+30 ms.
-        // All incumbents last at base+70 ms > base+30 ms → still fresh, no eviction.
-        // 89 > 0 + HYSTERESIS_BONUS(5) → displaces the weakest incumbent.
-        let result = sel.filter(interrupter, &mut pkt_at(base, 130, 0));
-        assert!(result.is_some(), "new speaker must be accepted");
-        assert!(
-            sel.leaderboard.contains(&Some(interrupter)),
-            "new speaker must be on leaderboard"
-        );
-    }
-
-    /// A stream that has established a high noise floor can only gain a small
-    /// SNR score by going slightly louder. That small score must not clear the
-    /// 5-unit hysteresis threshold needed to displace an incumbent.
-    ///
-    /// This verifies e_floor correctly suppresses background-noise sources.
-    #[test]
-    fn snr_floor_blocks_marginal_challenger() {
-        let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
-        // After fill: global_clock = base+70 ms; all 5 incumbents score ≈ 0.
-        fill_leaderboard(&mut sel, SELECTOR_SLOTS, base);
-
-        // Challenger: warmed up at energy 100 (level −27).
-        // After warmup: e_fast ≈ e_floor ≈ 100, score ≈ 0.
-        // Warmup at base+80..base+150 ms (still within eviction window of incumbents).
-        let challenger = make_stream();
-        for t in 0..15u64 {
-            sel.filter(challenger, &mut pkt_at(base, 80 + t * TICK_MS, -27));
-        }
-
-        // One packet at energy 103 (level −24):
-        //   e_fast  = 0.7 × 103 + 0.3 × 100 = 102.1
-        //   e_floor = 0.01 × 103 + 0.99 × 100 = 100.03
-        //   score   = 2.07  <  HYSTERESIS_BONUS (5.0)
-        // global_clock = base+155 ms, threshold = base+55 ms.
-        // Incumbents last at base+70 ms > base+55 ms → still fresh.
-        let result = sel.filter(challenger, &mut pkt_at(base, 155, -24));
-        assert!(
-            result.is_none(),
-            "challenger with SNR score 2.07 (< 5.0 hysteresis) must be blocked"
-        );
-    }
-
-    // ── 2. Temporal Fairness ─────────────────────────────────────────────────
-
-    /// A veteran stream whose playout_time is 50 ms behind the global clock
-    /// must still be forwarded via the Tier-1 veteran fast-pass (window = 150 ms).
-    #[test]
-    fn late_arrival_grace_period() {
-        let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
-
-        // Admit stream_a at base+0..base+70 ms.
-        let stream_a = warm_up(&mut sel, base, 0, 0, 15);
-
-        // Advance global clock to base+150 ms via stream_b.
-        let stream_b = warm_up(&mut sel, base, 150, 0, 5);
-        let _ = stream_b;
-        // global_clock = base+170 ms.
-
-        // stream_a sends a packet with playout_time = base+120 ms.
-        // Distance behind clock: 170 − 120 = 50 ms < VETERAN_WINDOW (150 ms).
-        let result = sel.filter(stream_a, &mut pkt_at(base, 120, 0));
-        assert!(
-            result.is_some(),
-            "veteran 50 ms behind clock must be forwarded via Tier-1"
-        );
-    }
-
-    /// Out-of-order packets (lower playout_time arriving after a higher one)
-    /// must never cause the global clock to regress.
-    #[test]
-    fn out_of_order_does_not_regress_clock() {
+    fn loud_packet_claims_empty_slot() {
         let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
         let id = make_stream();
-
-        sel.filter(id, &mut pkt_at(base, 100, 0));
-        let clock_high = sel.global_clock.expect("clock must be set");
-
-        sel.filter(id, &mut pkt_at(base, 50, 0));
-        let clock_after_old = sel.global_clock.expect("clock must be set");
-
-        assert_eq!(clock_high, clock_after_old, "clock must not regress");
-
-        // Both directions must be forwarded for this veteran stream.
-        assert!(sel.filter(id, &mut pkt_at(base, 100, 0)).is_some());
-        assert!(sel.filter(id, &mut pkt_at(base, 50, 0)).is_some());
+        let result = sel.filter(id, &mut pkt_at(base, 0, 0));
+        assert!(result.is_some(), "loud packet must claim an empty slot");
+        assert!(slot_owners(&sel).contains(&Some(id)));
     }
 
-    // ── 3. VAD & DTX (Eviction) ───────────────────────────────────────────────
-
-    /// A stream that stops sending packets is lazily evicted once the global clock
-    /// advances more than EVICTION_WINDOW (100 ms) beyond its last playout_time.
-    /// The freed slot must immediately be claimed by a newcomer.
+    /// A quiet (sub-threshold) packet from a non-owner must be dropped at the gatekeeper.
     #[test]
-    fn stale_stream_eviction_opens_slot() {
+    fn quiet_non_owner_dropped() {
         let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
-        let tracks = fill_leaderboard(&mut sel, SELECTOR_SLOTS, base);
-        // All 5 incumbents: last_playout = base+70 ms.
-        let stale_id = tracks[0];
-
-        // Refresh streams 1–4 (but NOT stale_id) at base+200 ms.
-        // After this: global_clock = base+200 ms, threshold = base+200-150 = base+50 ms.
-        // stale_id.last (70 ms) > base+50 ms → not yet evicted here.
-        // tracks[1..].last (200 ms) → fresh.
-        for &id in tracks.iter().skip(1) {
-            sel.filter(id, &mut pkt_at(base, 200, 0));
-        }
-
-        // Newcomer at base+240 ms → global_clock = base+240 ms, threshold = base+90 ms.
-        // stale_id.last (70 ms) < threshold (90 ms) → evicted.
-        // tracks[1..].last (200 ms) > threshold (90 ms) → still fresh.
-        let newcomer = make_stream();
-        let result = sel.filter(newcomer, &mut pkt_at(base, 240, 0));
-        assert!(result.is_some(), "newcomer must claim the evicted slot");
-        assert!(
-            !sel.leaderboard.contains(&Some(stale_id)),
-            "stale stream must have been evicted"
-        );
+        let id = make_stream();
+        // -127 dBov → power = 10^(-127/10) ≈ 2e-13, well below SPEECH_THRESHOLD (1e-4)
+        let result = sel.filter(id, &mut pkt_at(base, 0, -127));
+        assert!(result.is_none(), "quiet non-owner must be dropped");
+        assert!(!slot_owners(&sel).contains(&Some(id)));
     }
 
-    /// After a long silence the global clock jumps far enough that ALL leaderboard
-    /// members are simultaneously evicted, leaving slots open for newcomers.
+    /// After owning a slot, a quiet (DTX) packet from the owner must still be forwarded.
     #[test]
-    fn total_silence_clears_leaderboard() {
+    fn owner_dtx_packet_forwarded() {
         let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
-        fill_leaderboard(&mut sel, SELECTOR_SLOTS, base);
-        // global_clock = base+70 ms; all incumbents last at base+70 ms.
-
-        // Probe at base+300 ms → global_clock = base+300 ms, threshold = base+200 ms.
-        // All incumbents (70 ms) < threshold (200 ms) → ALL evicted.
-        let probe = make_stream();
-        sel.filter(probe, &mut pkt_at(base, 300, 0));
-
-        let occupied = sel.leaderboard.iter().filter(|s| s.is_some()).count();
-        assert!(
-            occupied <= 1,
-            "all stale incumbents must be evicted; {occupied} occupied"
-        );
+        let id = make_stream();
+        // Claim a slot with a loud packet.
+        sel.filter(id, &mut pkt_at(base, 0, 0));
+        // Then send a DTX (quiet) packet — must be forwarded since id is the owner.
+        let result = sel.filter(id, &mut pkt_at(base, 100, -127));
+        assert!(result.is_some(), "DTX packet from owner must be forwarded");
     }
 
-    // ── 4. Robustness & Identity ──────────────────────────────────────────────
+    // ── 2. Stream occupies exactly one slot ───────────────────────────────────
 
-    /// A stream that sends multiple packets must occupy exactly one leaderboard slot.
     #[test]
     fn stream_id_occupies_single_slot() {
         let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
         let id = make_stream();
-
         for t in 0..8u64 {
             sel.filter(id, &mut pkt_at(base, t * TICK_MS, 0));
         }
-
-        let count = sel.leaderboard.iter().filter(|s| **s == Some(id)).count();
+        let count = sel.slots.iter().filter(|s| s.owner == Some(id)).count();
         assert_eq!(count, 1, "same StreamId must occupy exactly one slot");
     }
 
-    /// A challenger whose SNR score exceeds the weakest incumbent's score by
-    /// less than HYSTERESIS_BONUS (5.0) must be rejected, preventing rapid
-    /// slot-flapping between two streams at similar energy levels.
+    // ── 3. Slot stealing — Priority A (dead slot) ─────────────────────────────
+
+    /// A loud newcomer steals a dead slot (silent for >DEAD_TIMEOUT).
     #[test]
-    fn hysteresis_prevents_flapping() {
+    fn loud_newcomer_steals_dead_slot() {
         let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
+        fill_slots(&mut sel, base, 0);
+        // All incumbents last active at base + 4*TICK_MS = base+80ms.
+        // Advance time past DEAD_TIMEOUT (2000ms).
+        let newcomer = make_stream();
+        // Arrive at base + 3000ms: all incumbents have been silent for >2000ms.
+        let result = sel.filter(newcomer, &mut pkt_at(base, 3000, 0));
+        assert!(result.is_some(), "newcomer must steal a dead slot");
+        assert!(slot_owners(&sel).contains(&Some(newcomer)));
+    }
 
-        // 5 incumbents, all stabilised → score ≈ 0.
-        // Use the same compact window (base+0..base+70 ms).
-        fill_leaderboard(&mut sel, SELECTOR_SLOTS, base);
+    // ── 4. Slot stealing — Priority B (DTX resting slot) ─────────────────────
 
-        // Refresh all incumbents at base+200 ms so they remain fresh
-        // throughout the challenger's warmup.
-        // After refresh: global_clock = base+200 ms.
-        let incumbents: Vec<StreamId> = sel.leaderboard.iter().filter_map(|s| *s).collect();
+    /// A loud newcomer steals the longest-resting DTX slot when all slots have owners
+    /// but none have been loud recently.
+    #[test]
+    fn loud_newcomer_steals_resting_slot() {
+        let base = Instant::now();
+        let mut sel = TopNAudioSelector::new();
+        // Fill all slots with loud streams (last loud packet at base+80ms).
+        let incumbents = fill_slots(&mut sel, base, 0);
+
+        // Keep all incumbents alive with quiet DTX pings at base+200ms so they're
+        // not dead, but their last_loud_ts stays at base+80ms (>500ms DTX_REST_TIMEOUT
+        // from the steal attempt at base+700ms).
         for &id in &incumbents {
-            sel.filter(id, &mut pkt_at(base, 200, 0));
+            sel.filter(id, &mut pkt_at(base, 200, -127));
         }
 
-        // Challenger warmed up at energy 100 (level −27).
-        // After 15 packets: e_fast ≈ e_floor ≈ 100, score ≈ 0.
-        // Warmup at base+205..base+275 ms.
-        // global_clock after warmup = base+275 ms; threshold = base+175 ms.
-        // Incumbents last at base+200 ms > base+175 ms → fresh ✓.
+        // At base+700ms all slots are resting (last_loud = base+80ms, 620ms ago > 500ms).
+        let newcomer = make_stream();
+        let result = sel.filter(newcomer, &mut pkt_at(base, 700, 0));
+        assert!(result.is_some(), "newcomer must steal a resting slot");
+        assert!(slot_owners(&sel).contains(&Some(newcomer)));
+    }
+
+    // ── 5. Slot stealing — Priority C (active contention) ────────────────────
+
+    /// A much louder newcomer (>+5dB) must evict the quietest active slot.
+    #[test]
+    fn much_louder_newcomer_steals_active_slot() {
+        let base = Instant::now();
+        let mut sel = TopNAudioSelector::new();
+        // All 5 slots active with moderate level (-20 dBov).
+        // Send continuous loud packets to keep last_loud_ts fresh (within 500ms).
+        let incumbents = fill_slots(&mut sel, base, 0);
+        // Refresh at t=200ms to ensure slots are not resting at t=300ms.
+        for &id in &incumbents {
+            sel.filter(id, &mut pkt_at(base, 200, -20));
+        }
+
+        // Newcomer arrives at t=300ms with 0 dBov (full power = 1.0).
+        // Incumbents last_power ≈ rfc6464_to_power(-20) = 10^(-2) = 0.01.
+        // 1.0 > 0.01 * 3.1623 (≈ 0.032) → steal succeeds.
+        let newcomer = make_stream();
+        let result = sel.filter(newcomer, &mut pkt_at(base, 300, 0));
+        assert!(result.is_some(), "much louder newcomer must steal an active slot");
+        assert!(slot_owners(&sel).contains(&Some(newcomer)));
+    }
+
+    /// A newcomer just slightly louder than all incumbents must be blocked by hysteresis.
+    #[test]
+    fn hysteresis_blocks_marginal_challenger() {
+        let base = Instant::now();
+        let mut sel = TopNAudioSelector::new();
+        // All 5 slots active with level -20 dBov; refresh to keep last_loud_ts fresh.
+        let incumbents = fill_slots(&mut sel, base, 0);
+        for &id in &incumbents {
+            sel.filter(id, &mut pkt_at(base, 200, -20));
+        }
+
+        // Challenger at -17 dBov: power = 10^(-17/10) ≈ 0.02.
+        // Quietest incumbent power ≈ 0.01.
+        // 0.02 > 0.01 * 3.1623 (≈ 0.032)? No (0.02 < 0.032) → blocked.
         let challenger = make_stream();
-        for t in 0..15u64 {
-            sel.filter(challenger, &mut pkt_at(base, 205 + t * TICK_MS, -27));
-        }
-
-        // Challenger sends one packet at energy 103 (level −24):
-        //   score = (0.7 × 103 + 0.3 × 100) − (0.01 × 103 + 0.99 × 100) ≈ 2.07
-        // Weakest incumbent score = 0.
-        // 2.07 > 0 + 5.0 → false → challenger must be rejected.
-        let result = sel.filter(challenger, &mut pkt_at(base, 280, -24));
+        let result = sel.filter(challenger, &mut pkt_at(base, 300, -17));
         assert!(
             result.is_none(),
-            "challenger with score ≈ 2.07 must be blocked by hysteresis (bonus = 5.0)"
+            "marginally louder challenger must be blocked by hysteresis"
         );
-        // All original incumbents must still hold their slots.
-        for &id in &incumbents {
-            assert!(
-                sel.leaderboard.contains(&Some(id)),
-                "incumbent must not have been displaced"
-            );
+    }
+
+    // ── 6. Newborn immunity ───────────────────────────────────────────────────
+
+    /// Delayed packets from the evicted stream must NOT re-steal the slot during
+    /// the NEWBORN_IMMUNITY window.
+    #[test]
+    fn newborn_immunity_blocks_evicted_owner() {
+        let base = Instant::now();
+        let mut sel = TopNAudioSelector::new();
+        // Fill with 5 resting streams (last_loud = base+80ms).
+        let evicted_candidates = fill_slots(&mut sel, base, 0);
+        for &id in &evicted_candidates {
+            sel.filter(id, &mut pkt_at(base, 200, -127));
         }
+
+        // Newcomer steals at base+700ms (slots are resting, >500ms DTX_REST_TIMEOUT).
+        let newcomer = make_stream();
+        let stolen_idx = sel
+            .filter(newcomer, &mut pkt_at(base, 700, 0))
+            .expect("newcomer must steal a slot");
+
+        // 50ms later (well within 300ms immunity), the evicted stream sends a loud packet.
+        // It should NOT be able to steal back the slot.
+        let evicted_id = evicted_candidates[stolen_idx];
+        let result = sel.filter(evicted_id, &mut pkt_at(base, 750, 0));
+        // evicted_id may own a different slot (not the stolen one), but it must not
+        // have displaced the newcomer from the stolen slot.
+        assert_eq!(
+            sel.slots[stolen_idx].owner,
+            Some(newcomer),
+            "newcomer must retain its immune slot"
+        );
+        let _ = result;
+    }
+
+    // ── 7. remove_track ───────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_track_frees_slot() {
+        let base = Instant::now();
+        let mut sel = TopNAudioSelector::new();
+        let id = make_stream();
+        sel.filter(id, &mut pkt_at(base, 0, 0));
+        assert!(slot_owners(&sel).contains(&Some(id)));
+        sel.remove_track(id);
+        assert!(!slot_owners(&sel).contains(&Some(id)));
+    }
+
+    // ── 8. cleanup ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_evicts_dead_slots() {
+        let base = Instant::now();
+        let mut sel = TopNAudioSelector::new();
+        // Inject a stream that received its last packet far in the past.
+        // We manipulate last_arrival_ts directly to simulate time passage.
+        let id = make_stream();
+        sel.filter(id, &mut pkt_at(base, 0, 0));
+        // Manually set last_arrival_ts to a time >DEAD_TIMEOUT ago.
+        let long_ago = Instant::now()
+            .checked_sub(DEAD_TIMEOUT + Duration::from_millis(1))
+            .unwrap_or(Instant::now());
+        for slot in &mut sel.slots {
+            if slot.owner == Some(id) {
+                slot.last_arrival_ts = Some(long_ago);
+            }
+        }
+        sel.cleanup();
+        assert!(!slot_owners(&sel).contains(&Some(id)), "dead slot must be evicted by cleanup");
     }
 }
