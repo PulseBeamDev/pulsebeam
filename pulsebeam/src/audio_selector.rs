@@ -1,7 +1,6 @@
-use std::array;
 use std::time::Duration;
 
-use ahash::{HashMap, HashMapExt};
+use ahash::HashMap;
 use tokio::time::Instant;
 
 use crate::{
@@ -107,27 +106,7 @@ impl TopNAudioSelector {
         }
         meta.last_playout_time = meta.last_playout_time.max(pkt.playout_time);
 
-        // 3. Lazy Eviction (Based ONLY on physical arrival)
-        if let Some(threshold) = global_arrival_ts.checked_sub(EVICTION_WINDOW) {
-            for slot in &mut self.leaderboard {
-                if let Some(id) = *slot {
-                    if self
-                        .registry
-                        .get(&id)
-                        .map_or(false, |m| m.last_arrival_ts < threshold)
-                    {
-                        *slot = None;
-                    }
-                }
-            }
-
-            if let Some(gc_threshold) = global_arrival_ts.checked_sub(GC_WINDOW) {
-                self.registry
-                    .retain(|_, m| m.last_arrival_ts >= gc_threshold);
-            }
-        }
-
-        // 4. Slot Assignment
+        // 3. Slot Assignment
 
         // Tier 1 — Veteran: Already has a slot, keep flowing.
         if let Some(pos) = self.leaderboard.iter().position(|s| *s == Some(stream_id)) {
@@ -186,6 +165,29 @@ impl TopNAudioSelector {
                 break;
             }
         }
+    }
+
+    pub fn cleanup(&mut self) -> Option<()> {
+        let global_arrival_ts = self.global_arrival_ts?;
+        let threshold = global_arrival_ts.checked_sub(EVICTION_WINDOW)?;
+
+        for slot in &mut self.leaderboard {
+            let Some(id) = *slot else {
+                continue;
+            };
+            if self
+                .registry
+                .get(&id)
+                .is_some_and(|m| m.last_arrival_ts < threshold)
+            {
+                *slot = None;
+            }
+        }
+
+        let gc_threshold = global_arrival_ts.checked_sub(GC_WINDOW)?;
+        self.registry
+            .retain(|_, m| m.last_arrival_ts >= gc_threshold);
+        Some(())
     }
 }
 
