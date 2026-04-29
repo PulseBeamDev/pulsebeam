@@ -2,7 +2,8 @@ use std::io;
 
 use crate::{
     control::{
-        core::{ControllerCore, ControllerEventQueue, OfferRejectedReason},
+        core::{ControllerCore, ControllerEventQueue},
+        negotiator::NegotiatorError,
         router::ShardRouter,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
@@ -68,7 +69,7 @@ pub struct PatchParticipantReply {
 #[derive(thiserror::Error, Debug)]
 pub enum ControllerError {
     #[error("sdp offer is rejected: {0}")]
-    OfferRejected(#[from] OfferRejectedReason),
+    OfferRejected(#[from] NegotiatorError),
 
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,

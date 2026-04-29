@@ -29,6 +29,16 @@ impl RoomRegistry {
         }
     }
 
+    pub fn get_room(&mut self, room_id: &RoomId) -> Option<&Room> {
+        self.rooms.get(room_id)
+    }
+
+    pub fn get_or_create_room(&mut self, room_id: RoomId) -> &Room {
+        self.rooms
+            .entry(room_id)
+            .or_insert_with(|| Room::new(room_id))
+    }
+
     pub fn room_mut_for(&mut self, participant_id: &ParticipantId) -> Option<&mut Room> {
         let meta = self.participants.get(participant_id).or_else(|| {
             tracing::warn!(%participant_id, "participant not found in reigstry, dropping");
