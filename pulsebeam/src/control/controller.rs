@@ -81,11 +81,6 @@ pub enum ControllerError {
     Unknown(String),
 }
 
-struct ParticipantMeta {
-    shard_id: usize,
-    room_id: RoomId,
-}
-
 pub struct ControllerActor {
     router: ShardRouter,
     core: ControllerCore,

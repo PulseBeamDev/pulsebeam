@@ -82,6 +82,12 @@ impl RoomRegistry {
     }
 
     pub async fn next_expired(&mut self) {
+        // DelayQueue returns Poll::Ready(None) immediately when empty, which
+        // would cause the select! caller to spin at 100% CPU. Park forever
+        // when there is nothing scheduled.
+        if self.sweeper.is_empty() {
+            std::future::pending::<()>().await;
+        }
         if let Some(entry) = self.sweeper.next().await {
             self.maybe_delete_room(entry.get_ref());
         }
