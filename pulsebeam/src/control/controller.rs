@@ -3,7 +3,7 @@ use std::io;
 use crate::{
     control::{
         core::{ControllerCore, ControllerEvent, ControllerEventQueue},
-        negotiator::NegotiatorError,
+        negotiator::{Negotiator, NegotiatorError},
         router::ShardRouter,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
@@ -84,6 +84,7 @@ pub enum ControllerError {
 pub struct ControllerActor {
     router: ShardRouter,
     core: ControllerCore,
+    negotiator: Negotiator,
     eq: ControllerEventQueue,
 }
 
@@ -97,7 +98,8 @@ impl ControllerActor {
 
         Self {
             router,
-            core: ControllerCore::new(candidates),
+            core: ControllerCore::new(),
+            negotiator: Negotiator::new(candidates),
             eq: ControllerEventQueue::default(),
         }
     }
@@ -133,7 +135,7 @@ impl ControllerActor {
         match cmd {
             ControllerCommand::CreateParticipant(m, reply_tx) => {
                 let answer = self
-                    .handle_create_participant(&m.state, m.offer)
+                    .handle_create_participant(m.state, m.offer)
                     .map(|res| CreateParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
@@ -144,7 +146,7 @@ impl ControllerActor {
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
-                    .handle_create_participant(&m.state, m.offer)
+                    .handle_create_participant(m.state, m.offer)
                     .map(|res| PatchParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
@@ -164,23 +166,24 @@ impl ControllerActor {
 
     pub fn handle_create_participant(
         &mut self,
-        state: &ParticipantState,
+        state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        let mut stg = self.core.create_participant(state, offer)?;
+        let (rtc, answer) = self.negotiator.create_answer(offer)?;
+        let routing_key = self.core.routing_key(&state.room_id);
         let shard_id = self
             .router
-            .try_route(&stg.routing_key)
+            .try_route(&routing_key)
             .ok_or(ControllerError::ServiceUnavailable)?;
-        let ufrag = stg.cfg.ufrag();
+        let mut cfg = self.core.create_participant(rtc, state, shard_id);
+        let ufrag = cfg.ufrag();
         self.eq.broadcast(ClusterCommand::RegisterParticipant {
             shard_id,
-            participant_id: stg.cfg.participant_id,
+            participant_id: cfg.participant_id,
             ufrag,
         });
-        self.eq
-            .send(shard_id, ShardCommand::AddParticipant(stg.cfg));
-        Ok(stg.answer)
+        self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
+        Ok(answer)
     }
 }
 

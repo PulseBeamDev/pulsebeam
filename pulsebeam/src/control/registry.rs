@@ -29,7 +29,7 @@ impl RoomRegistry {
         }
     }
 
-    pub fn get_room(&mut self, room_id: &RoomId) -> Option<&Room> {
+    pub fn get_room(&self, room_id: &RoomId) -> Option<&Room> {
         self.rooms.get(room_id)
     }
 

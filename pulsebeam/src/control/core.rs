@@ -1,20 +1,16 @@
-use std::{collections::VecDeque, time::Duration};
+use std::collections::VecDeque;
 
 use crate::{
-    control::{
-        controller::{ControllerError, ParticipantState},
-        negotiator::Negotiator,
-        registry::RoomRegistry,
-    },
+    control::{controller::ParticipantState, registry::RoomRegistry},
     entity::{ParticipantId, RoomId},
     participant::ParticipantConfig,
     shard::worker::{ClusterCommand, ShardCommand, ShardEvent},
 };
 use indexmap::IndexMap;
-use str0m::{
-    Candidate,
-    change::{SdpAnswer, SdpOffer},
-};
+use str0m::Rtc;
+
+/// Maximum participants allowed per "slot" before hashing to a new shard epoch.
+const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 
 pub enum ControllerEvent {
     ShardCommandBroadcasted(ClusterCommand),
@@ -56,26 +52,13 @@ impl ControllerEventQueue {
     }
 }
 
-struct ParticipantMeta {
-    shard_id: usize,
-    room_id: RoomId,
-}
-
-pub struct ParticipantStaging {
-    pub routing_key: String,
-    pub cfg: ParticipantConfig,
-    pub answer: SdpAnswer,
-}
-
 pub struct ControllerCore {
-    negotiator: Negotiator,
     registry: RoomRegistry,
 }
 
 impl ControllerCore {
-    pub fn new(candidates: Vec<Candidate>) -> Self {
+    pub fn new() -> Self {
         Self {
-            negotiator: Negotiator::new(candidates),
             registry: RoomRegistry::new(),
         }
     }
@@ -133,30 +116,35 @@ impl ControllerCore {
         self.registry.next_expired().await;
     }
 
+    pub fn routing_key(&self, room_id: &RoomId) -> String {
+        let count = self
+            .registry
+            .get_room(room_id)
+            .map(|r| r.participant_count())
+            .unwrap_or_default();
+        let epoch = count / MAX_PARTICIPANTS_PER_SHARD_SLOT;
+        format!("{}-{}", room_id, epoch)
+    }
+
     pub fn create_participant(
         &mut self,
-        state: &ParticipantState,
-        offer: SdpOffer,
-    ) -> Result<ParticipantStaging, ControllerError> {
-        let (rtc, answer) = self.negotiator.create_answer(offer)?;
-        let room = self.registry.get_or_create_room(state.room_id);
-        let tracks = room.tracks_for(&state.participant_id);
-        let participant_id = state.participant_id;
-        let key = room.routing_key();
-        let cfg = ParticipantConfig {
+        rtc: Rtc,
+        state: ParticipantState,
+        shard_id: usize,
+    ) -> ParticipantConfig {
+        let tracks = {
+            let room = self.registry.get_or_create_room(state.room_id);
+            room.tracks_for(&state.participant_id).cloned().collect()
+        };
+        self.registry
+            .add_participant(state.participant_id, state.room_id, shard_id);
+        ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
-            participant_id,
+            participant_id: state.participant_id,
             rtc,
-            available_tracks: tracks.cloned().collect(),
-        };
-        let stg = ParticipantStaging {
-            routing_key: key,
-            cfg,
-            answer,
-        };
-
-        Ok(stg)
+            available_tracks: tracks,
+        }
     }
 
     pub fn delete_participant(
