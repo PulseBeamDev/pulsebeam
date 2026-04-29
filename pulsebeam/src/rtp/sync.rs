@@ -161,32 +161,35 @@ mod tests {
 
         // 1. First packet establishes baseline (simulated with 100ms jitter delay)
         let p1_arrival = base_time + Duration::from_millis(100);
-        let p1 = sync.process_owned(RtpPacket {
+        let mut p1 = RtpPacket {
             rtp_ts: MediaTime::from_90khz(90_000),
             arrival_ts: p1_arrival,
             ..Default::default()
-        });
+        };
+        sync.process(&mut p1, None);
         assert_eq!(p1.playout_time, p1_arrival);
 
         // 2. Second packet arrives exactly 1 second of media later, but with NO jitter.
         // This packet arrives 900ms after the first packet instead of 1000ms.
         let p2_arrival = base_time + Duration::from_secs(1);
-        let p2 = sync.process_owned(RtpPacket {
+        let mut p2 = RtpPacket {
             rtp_ts: MediaTime::from_90khz(180_000),
             arrival_ts: p2_arrival,
             ..Default::default()
-        });
+        };
+        sync.process(&mut p2, None);
 
         // The baseline should shift backward seamlessly! The playout matches arrival.
         assert_eq!(p2.playout_time, p2_arrival);
 
         // 3. Third packet arrives 2 seconds of media later, but with 50ms of jitter again.
         let p3_arrival = base_time + Duration::from_secs(2) + Duration::from_millis(50);
-        let p3 = sync.process_owned(RtpPacket {
+        let mut p3 = RtpPacket {
             rtp_ts: MediaTime::from_90khz(270_000),
             arrival_ts: p3_arrival,
             ..Default::default()
-        });
+        };
+        sync.process(&mut p3, None);
 
         // The expected playout time MUST strip the jitter and map exactly to the updated server timeline.
         let expected_p3_playout = base_time + Duration::from_secs(2);
@@ -216,21 +219,24 @@ mod tests {
             last_rtp_perf += perfect_ticks;
             last_rtp_drift += drifting_ticks;
 
-            sync_perfect.process_owned_sr(
-                create_sr(MediaTime::from_90khz(last_rtp_perf), last_ntp),
-                RtpPacket {
-                    arrival_ts: last_time,
-                    rtp_ts: MediaTime::from_90khz(last_rtp_perf),
-                    ..Default::default()
-                },
+            let mut pkt_perf = RtpPacket {
+                arrival_ts: last_time,
+                rtp_ts: MediaTime::from_90khz(last_rtp_perf),
+                ..Default::default()
+            };
+            sync_perfect.process(
+                &mut pkt_perf,
+                Some(create_sr(MediaTime::from_90khz(last_rtp_perf), last_ntp)),
             );
-            sync_drifting.process_owned_sr(
-                create_sr(MediaTime::from_90khz(last_rtp_drift), last_ntp),
-                RtpPacket {
-                    arrival_ts: last_time,
-                    rtp_ts: MediaTime::from_90khz(last_rtp_drift),
-                    ..Default::default()
-                },
+
+            let mut pkt_drift = RtpPacket {
+                arrival_ts: last_time,
+                rtp_ts: MediaTime::from_90khz(last_rtp_drift),
+                ..Default::default()
+            };
+            sync_drifting.process(
+                &mut pkt_drift,
+                Some(create_sr(MediaTime::from_90khz(last_rtp_drift), last_ntp)),
             );
         }
 
@@ -240,16 +246,19 @@ mod tests {
         // Verify alignment 10 seconds in.
         let event_time = base_time + Duration::from_secs(10);
 
-        let p_perf = sync_perfect.process_owned(RtpPacket {
+        let mut p_perf = RtpPacket {
             rtp_ts: MediaTime::from_90khz(90_000 * 10),
             arrival_ts: event_time,
             ..Default::default()
-        });
-        let p_drift = sync_drifting.process_owned(RtpPacket {
+        };
+        sync_perfect.process(&mut p_perf, None);
+
+        let mut p_drift = RtpPacket {
             rtp_ts: MediaTime::from_90khz(90_090 * 10),
             arrival_ts: event_time,
             ..Default::default()
-        });
+        };
+        sync_drifting.process(&mut p_drift, None);
 
         // The absolute offset perfectly aligns both playout clocks to the exact same Instant base
         let diff = if p_perf.playout_time > p_drift.playout_time {
@@ -278,37 +287,43 @@ mod tests {
             last_ntp_abs += Duration::from_secs(1);
             last_ntp_rel += Duration::from_secs(1);
 
-            sync_perfect.process_owned_sr(
-                create_sr(MediaTime::from_90khz(90_000 * i), last_ntp_abs),
-                RtpPacket {
-                    arrival_ts: last_time,
-                    rtp_ts: MediaTime::from_90khz(90_000 * i),
-                    ..Default::default()
-                },
+            let mut pkt_perf = RtpPacket {
+                arrival_ts: last_time,
+                rtp_ts: MediaTime::from_90khz(90_000 * i),
+                ..Default::default()
+            };
+            sync_perfect.process(
+                &mut pkt_perf,
+                Some(create_sr(MediaTime::from_90khz(90_000 * i), last_ntp_abs)),
             );
-            sync_drifting.process_owned_sr(
-                create_sr(MediaTime::from_90khz(90_090 * i), last_ntp_rel),
-                RtpPacket {
-                    arrival_ts: last_time,
-                    rtp_ts: MediaTime::from_90khz(90_090 * i),
-                    ..Default::default()
-                },
+
+            let mut pkt_drift = RtpPacket {
+                arrival_ts: last_time,
+                rtp_ts: MediaTime::from_90khz(90_090 * i),
+                ..Default::default()
+            };
+            sync_drifting.process(
+                &mut pkt_drift,
+                Some(create_sr(MediaTime::from_90khz(90_090 * i), last_ntp_rel)),
             );
         }
 
         // Test 10s into the future
         let event_time = base_time + Duration::from_secs(10);
 
-        let p_perf = sync_perfect.process_owned(RtpPacket {
+        let mut p_perf = RtpPacket {
             rtp_ts: MediaTime::from_90khz(900_000),
             arrival_ts: event_time,
             ..Default::default()
-        });
-        let p_drift = sync_drifting.process_owned(RtpPacket {
+        };
+        sync_perfect.process(&mut p_perf, None);
+
+        let mut p_drift = RtpPacket {
             rtp_ts: MediaTime::from_90khz(900_900),
             arrival_ts: event_time,
             ..Default::default()
-        });
+        };
+        sync_drifting.process(&mut p_drift, None);
 
         // Even with fully decoupled NTP uptime bases, the single shared server baseline aligns flawlessly.
         let diff = if p_perf.playout_time > p_drift.playout_time {

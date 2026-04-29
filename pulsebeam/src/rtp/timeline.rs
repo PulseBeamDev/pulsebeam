@@ -127,7 +127,7 @@ mod test {
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // Packet 1: First packet (Keyframe) - requires rebase
-        let p1 = RtpPacket {
+        let mut p1 = RtpPacket {
             seq_no: 100.into(),
             playout_time: start_time,
             is_keyframe_start: true,
@@ -135,28 +135,28 @@ mod test {
         };
 
         timeline.rebase(&p1);
-        let out1 = timeline.rewrite(p1);
-        let base_seq = *out1.seq_no;
+        timeline.rewrite(&mut p1);
+        let base_seq = *p1.seq_no;
 
         // Packet 2: Regular packet, 100ms later
-        let p2 = RtpPacket {
+        let mut p2 = RtpPacket {
             seq_no: 101.into(),
             playout_time: start_time + Duration::from_millis(100),
             is_keyframe_start: false,
             ..Default::default()
         };
 
-        let out2 = timeline.rewrite(p2);
+        timeline.rewrite(&mut p2);
 
         // Verify Sequence Continuity
         assert_eq!(
-            *out2.seq_no,
+            *p2.seq_no,
             base_seq + 1,
             "Sequence number should increment by 1"
         );
 
         // Verify Timestamp: 100ms at 90kHz = 9000 ticks
-        let ts_diff = out2.rtp_ts.numer().wrapping_sub(out1.rtp_ts.numer());
+        let ts_diff = p2.rtp_ts.numer().wrapping_sub(p1.rtp_ts.numer());
         assert_eq!(ts_diff, 9000, "Timestamp should correspond to 100ms delta");
     }
 
@@ -166,7 +166,7 @@ mod test {
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // --- Stream A (Seq 1000-1001) ---
-        let p_a1 = RtpPacket {
+        let mut p_a1 = RtpPacket {
             seq_no: 1000.into(),
             playout_time: start_time,
             is_keyframe_start: true,
@@ -174,19 +174,19 @@ mod test {
         };
 
         timeline.rebase(&p_a1);
-        let out_a1 = timeline.rewrite(p_a1);
+        timeline.rewrite(&mut p_a1);
 
-        let p_a2 = RtpPacket {
+        let mut p_a2 = RtpPacket {
             seq_no: 1001.into(),
             playout_time: start_time + Duration::from_millis(33),
             is_keyframe_start: false,
             ..Default::default()
         };
-        let out_a2 = timeline.rewrite(p_a2);
+        timeline.rewrite(&mut p_a2);
 
         // --- Switch to Stream B (Seq 5000) ---
         // Stream B arrives 100ms after start, starting at random Seq 5000
-        let p_b1 = RtpPacket {
+        let mut p_b1 = RtpPacket {
             seq_no: 5000.into(),
             playout_time: start_time + Duration::from_millis(100),
             is_keyframe_start: true,
@@ -194,19 +194,19 @@ mod test {
         };
 
         timeline.rebase(&p_b1); // Rebase aligns Stream B to follow Stream A
-        let out_b1 = timeline.rewrite(p_b1);
+        timeline.rewrite(&mut p_b1);
 
         // Verify Continuity across switch
         assert_eq!(
-            *out_b1.seq_no,
-            (*out_a2.seq_no).wrapping_add(1),
+            *p_b1.seq_no,
+            (*p_a2.seq_no).wrapping_add(1),
             "Output sequence must be continuous across switch"
         );
 
         // Verify Timestamp linearity
         // A1=0ms, B1=100ms. Diff should be 9000 ticks.
         // The timeline calculates B1 based on (B1.time - anchor), where anchor is A1.time
-        let ts_diff = out_b1.rtp_ts.numer().wrapping_sub(out_a1.rtp_ts.numer());
+        let ts_diff = p_b1.rtp_ts.numer().wrapping_sub(p_a1.rtp_ts.numer());
         assert_eq!(ts_diff, 9000, "Timestamp should be linear across switch");
     }
 
@@ -216,14 +216,14 @@ mod test {
         let mut timeline = Timeline::new(Frequency::NINETY_KHZ);
 
         // Start normally
-        let p1 = RtpPacket {
+        let mut p1 = RtpPacket {
             seq_no: 10.into(),
             playout_time: start_time,
             is_keyframe_start: true,
             ..Default::default()
         };
         timeline.rebase(&p1);
-        let out1 = timeline.rewrite(p1);
+        timeline.rewrite(&mut p1);
 
         // Manually force the internal highest_seq_no to u64 boundary - 1
         // We can't modify private state directly, so we simulate a stream
@@ -237,7 +237,7 @@ mod test {
         // Offset = (X+1) - Y.
 
         // We simply verify strict +1 increments even if input jumps largely
-        let p_next = RtpPacket {
+        let mut p_next = RtpPacket {
             seq_no: u64::MAX.into(), // Input at boundary
             playout_time: start_time + Duration::from_millis(33),
             is_keyframe_start: true,
@@ -246,12 +246,12 @@ mod test {
 
         // Switch to high sequence number
         timeline.rebase(&p_next);
-        let out_next = timeline.rewrite(p_next);
+        timeline.rewrite(&mut p_next);
 
-        assert_eq!(*out_next.seq_no, (*out1.seq_no).wrapping_add(1));
+        assert_eq!(*p_next.seq_no, (*p1.seq_no).wrapping_add(1));
 
         // Next packet wraps the input
-        let p_wrap = RtpPacket {
+        let mut p_wrap = RtpPacket {
             seq_no: 0.into(),
             playout_time: start_time + Duration::from_millis(66),
             is_keyframe_start: false,
@@ -261,8 +261,8 @@ mod test {
         // Normal rewrite (no rebase needed for contiguous input)
         // Input: u64::MAX -> 0 (wrapped)
         // Output: X+1 -> X+2
-        let out_wrap = timeline.rewrite(p_wrap);
-        assert_eq!(*out_wrap.seq_no, (*out_next.seq_no).wrapping_add(1));
+        timeline.rewrite(&mut p_wrap);
+        assert_eq!(*p_wrap.seq_no, (*p_next.seq_no).wrapping_add(1));
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod test {
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // Packet without rebase
-        let p1 = RtpPacket {
+        let mut p1 = RtpPacket {
             seq_no: 100.into(),
             playout_time: start_time,
             is_keyframe_start: true,
@@ -280,7 +280,7 @@ mod test {
         };
 
         // This should panic because anchor is None
-        timeline.rewrite(p1);
+        timeline.rewrite(&mut p1);
     }
 
     #[test]
@@ -291,14 +291,14 @@ mod test {
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
         // Packet 1 (Base)
-        let p1 = RtpPacket {
+        let mut p1 = RtpPacket {
             seq_no: 10.into(),
             playout_time: start_time + Duration::from_millis(100),
             is_keyframe_start: true,
             ..Default::default()
         };
         timeline.rebase(&p1); // Sets anchor at T+100ms
-        let _out1 = timeline.rewrite(p1);
+        timeline.rewrite(&mut p1);
 
         // Packet 2 (Arrives with earlier playout time due to reordering/jitter)
         // T+50ms (Before anchor)
@@ -306,17 +306,17 @@ mod test {
         // or handle gracefully depending on logic.
         // The current logic: playout.saturating_duration_since(anchor)
         // If playout < anchor, result is 0.
-        let p2 = RtpPacket {
+        let mut p2 = RtpPacket {
             seq_no: 11.into(),
             playout_time: start_time + Duration::from_millis(50),
             is_keyframe_start: false,
             ..Default::default()
         };
 
-        let out2 = timeline.rewrite(p2);
+        timeline.rewrite(&mut p2);
 
         // Anchor is at T+100. P2 is at T+50.
         // saturating_duration_since(100) returns 0.
-        assert_eq!(out2.rtp_ts.numer(), 0);
+        assert_eq!(p2.rtp_ts.numer(), 0);
     }
 }
