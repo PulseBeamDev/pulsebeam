@@ -295,6 +295,15 @@ impl ShardCore {
                     self.pending_close.extend(addrs);
                 }
             }
+            ClusterCommand::UnpublishTracks {
+                origin: _,
+                track_ids,
+            } => {
+                for (participant_id, participant) in self.participants.iter_mut() {
+                    participant.on_tracks_unpublished(track_ids.as_slice());
+                    self.input_dirty.insert(*participant_id);
+                }
+            }
         }
         Some(())
     }
@@ -1292,5 +1301,438 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, 0, "must be directed to the publisher's shard");
         assert!(matches!(sent[0].1, CrossShardEvent::KeyframeRequested(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for participant lifecycle tests
+    // -----------------------------------------------------------------------
+
+    fn make_participant_cfg(participant_id: ParticipantId, room_id: RoomId) -> ParticipantConfig {
+        ParticipantConfig {
+            manual_sub: false,
+            room_id,
+            participant_id,
+            rtc: str0m::RtcConfig::new().build(std::time::Instant::now()),
+            available_tracks: vec![],
+        }
+    }
+
+    fn make_video_track(origin: ParticipantId, shard_id: usize) -> crate::track::Track {
+        use crate::rtp::monitor::StreamState;
+        use crate::track::{LayerQuality, Track, TrackLayer, TrackMeta};
+        let meta = TrackMeta {
+            shard_id,
+            id: origin.derive_track_id(MediaKind::Video, "v"),
+            origin,
+            kind: MediaKind::Video,
+        };
+        let layer = TrackLayer {
+            meta: meta.clone(),
+            rid: None,
+            quality: LayerQuality::Low,
+            state: StreamState::new(false, 100_000),
+        };
+        Track {
+            meta,
+            layers: vec![layer],
+        }
+    }
+
+    fn add_participant(
+        core: &mut ShardCore,
+        router: &TestRouter,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+    ) {
+        core.on_command(
+            ShardCommand::AddParticipant(make_participant_cfg(participant_id, room_id)),
+            router,
+        );
+        router.take_sent();
+    }
+
+    // -----------------------------------------------------------------------
+    // Participant leave — cleanup invariants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn participant_leave_removed_from_participants() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p = pid();
+        let r = room_id("leave1");
+
+        add_participant(&mut core, &router, p, r);
+        assert!(core.participants.contains_key(&p));
+
+        core.remove_participant(&p, &router);
+
+        assert!(
+            !core.participants.contains_key(&p),
+            "participant must be gone from participants map"
+        );
+    }
+
+    #[test]
+    fn participant_leave_last_in_room_removes_room() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p = pid();
+        let r = room_id("leave2");
+
+        add_participant(&mut core, &router, p, r);
+        assert!(core.rooms.contains_key(&r));
+
+        core.remove_participant(&p, &router);
+
+        assert!(!core.rooms.contains_key(&r), "empty room must be removed");
+    }
+
+    #[test]
+    fn participant_leave_last_in_room_broadcasts_room_left() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p = pid();
+        let r = room_id("leave3");
+
+        add_participant(&mut core, &router, p, r);
+        // Keep the room alive after the last local member leaves so we can
+        // inspect room state afterwards.
+        core.rooms.get_mut(&r).unwrap().remote_shards.insert(1);
+
+        core.remove_participant(&p, &router);
+
+        let sent = router.take_sent();
+        assert_eq!(
+            sent.len(),
+            2,
+            "must broadcast RoomMemberLeft to all other shards"
+        );
+        for (_, ev) in &sent {
+            assert!(
+                matches!(ev, CrossShardEvent::RoomMemberLeft { .. }),
+                "broadcast must be RoomMemberLeft"
+            );
+        }
+    }
+
+    #[test]
+    fn participant_leave_not_last_member_room_persists() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p1 = pid();
+        let p2 = pid();
+        let r = room_id("leave4");
+
+        add_participant(&mut core, &router, p1, r);
+        add_participant(&mut core, &router, p2, r);
+
+        core.remove_participant(&p1, &router);
+
+        assert!(
+            core.rooms.contains_key(&r),
+            "room must persist with remaining member"
+        );
+        assert!(
+            core.rooms[&r].members.contains(&p2),
+            "remaining member must still be in room"
+        );
+        assert!(
+            !core.rooms[&r].members.contains(&p1),
+            "removed participant must not be in room members"
+        );
+        assert!(
+            !core.participants.contains_key(&p1),
+            "removed participant must not be in participants map"
+        );
+    }
+
+    #[test]
+    fn participant_leave_not_last_member_no_broadcast() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p1 = pid();
+        let p2 = pid();
+        let r = room_id("leave5");
+
+        add_participant(&mut core, &router, p1, r);
+        add_participant(&mut core, &router, p2, r);
+
+        core.remove_participant(&p1, &router);
+
+        assert!(
+            router.take_sent().is_empty(),
+            "must not broadcast RoomMemberLeft while other members remain"
+        );
+    }
+
+    #[test]
+    fn participant_leave_room_kept_when_remote_shards_present() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p = pid();
+        let r = room_id("leave6");
+
+        add_participant(&mut core, &router, p, r);
+        core.rooms.get_mut(&r).unwrap().remote_shards.insert(2);
+
+        core.remove_participant(&p, &router);
+
+        assert!(
+            core.rooms.contains_key(&r),
+            "room must remain while remote shards are present"
+        );
+        assert!(
+            core.rooms[&r].members.is_empty(),
+            "local members list must be empty"
+        );
+        assert!(
+            core.rooms[&r].remote_shards.contains(&2),
+            "remote shard must remain registered"
+        );
+    }
+
+    #[test]
+    fn participant_rejoin_removes_previous_instance() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p = pid();
+        let r = room_id("leave7");
+
+        add_participant(&mut core, &router, p, r);
+        assert_eq!(core.participants.len(), 1);
+        assert_eq!(core.rooms[&r].members.len(), 1);
+
+        add_participant(&mut core, &router, p, r);
+
+        assert_eq!(
+            core.participants.len(),
+            1,
+            "must not have duplicate participant entries"
+        );
+        assert_eq!(
+            core.rooms[&r].members.len(),
+            1,
+            "must not have duplicate room member entries"
+        );
+        assert!(core.participants.contains_key(&p));
+    }
+
+    #[test]
+    fn lifecycle_exited_cleans_up_participant_and_emits_shard_event() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let p = pid();
+        let r = room_id("leave8");
+
+        add_participant(&mut core, &router, p, r);
+
+        core.events
+            .push_back(ParticipantEvent::Lifecycle(LifecycleEvent::Exited {
+                participant_id: p,
+            }));
+        core.flush_participant_events(&router);
+
+        assert!(
+            !core.participants.contains_key(&p),
+            "participant must be removed on Exited lifecycle event"
+        );
+        assert!(
+            !core.rooms.contains_key(&r),
+            "empty room must be removed on participant exit"
+        );
+        assert!(
+            core.shard_events
+                .iter()
+                .any(|e| matches!(e, ShardEvent::ParticipantExited(id) if *id == p)),
+            "must emit ShardEvent::ParticipantExited"
+        );
+    }
+
+    #[test]
+    fn participant_leave_clears_routing_subscriber_entry() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let publisher = pid();
+        let subscriber = pid();
+        let r = room_id("leave9");
+        let stream = video_stream(publisher);
+
+        add_participant(&mut core, &router, subscriber, r);
+
+        // Simulate the subscriber having a routing entry (as produced by reconcile_routes
+        // → TopologyEvent::StreamSubscribed → flush_participant_events in the normal flow).
+        handle_participant_topology(
+            TopologyEvent::StreamSubscribed {
+                shard_id: 1,
+                participant_id: subscriber,
+                stream_id: stream,
+                kind: MediaKind::Video,
+            },
+            &mut core.routing,
+            &router,
+        );
+        router.take_sent();
+
+        assert!(core.routing[&stream].subscribers.contains(&subscriber));
+
+        // Simulate the downstream emitting StreamUnsubscribed on cleanup, as it does
+        // when participant.downstream.unsubscribe_all() returns routes and
+        // flush_participant_events processes them.
+        core.events.push_back(ParticipantEvent::Topology(
+            TopologyEvent::StreamUnsubscribed {
+                shard_id: 1,
+                participant_id: subscriber,
+                stream_id: stream,
+            },
+        ));
+        core.flush_participant_events(&router);
+
+        assert!(
+            !core.routing.contains_key(&stream),
+            "routing entry must be cleaned up when subscriber unsubscribes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UnpublishTracks — cleanup of departed participant's tracks from subscribers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unpublish_tracks_removes_track_from_subscriber_downstream() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let a = pid(); // publisher (remote)
+        let b = pid(); // local subscriber
+        let r = room_id("unp1");
+
+        add_participant(&mut core, &router, b, r);
+
+        // Simulate B having A's video track (delivered earlier via PublishTrack).
+        let a_track = make_video_track(a, 1);
+        let track_id = a_track.meta.id;
+        core.participants
+            .get_mut(&b)
+            .unwrap()
+            .downstream
+            .add_track(a_track);
+
+        assert!(
+            core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == track_id),
+            "B must have A's track before UnpublishTracks"
+        );
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                origin: a,
+                track_ids: vec![track_id],
+            }),
+            &router,
+        );
+
+        assert!(
+            !core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == track_id),
+            "B must NOT have A's track after UnpublishTracks"
+        );
+        assert!(
+            core.input_dirty.contains(&b),
+            "B must be dirty so signaling removes A's track from the client view"
+        );
+    }
+
+    #[test]
+    fn unpublish_tracks_marks_all_local_subscribers_dirty() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let a = pid(); // publisher
+        let b = pid();
+        let c = pid();
+        let r = room_id("unp2");
+
+        add_participant(&mut core, &router, b, r);
+        add_participant(&mut core, &router, c, r);
+
+        let a_track = make_video_track(a, 1);
+        let track_id = a_track.meta.id;
+        // Both B and C are subscribed to A's track.
+        core.participants
+            .get_mut(&b)
+            .unwrap()
+            .downstream
+            .add_track(a_track.clone());
+        core.participants
+            .get_mut(&c)
+            .unwrap()
+            .downstream
+            .add_track(a_track);
+        core.input_dirty.clear();
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                origin: a,
+                track_ids: vec![track_id],
+            }),
+            &router,
+        );
+
+        assert!(
+            core.input_dirty.contains(&b),
+            "B must be dirty after UnpublishTracks"
+        );
+        assert!(
+            core.input_dirty.contains(&c),
+            "C must be dirty after UnpublishTracks"
+        );
+        assert!(
+            !core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == track_id),
+            "B must not retain A's track"
+        );
+        assert!(
+            !core.participants[&c]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == track_id),
+            "C must not retain A's track"
+        );
+    }
+
+    #[test]
+    fn unpublish_tracks_no_op_when_no_subscriber_holds_track() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1);
+        let a = pid();
+        let b = pid();
+        let r = room_id("unp3");
+
+        add_participant(&mut core, &router, b, r);
+        core.input_dirty.clear();
+
+        // B never received A's track — command should be a no-op.
+        let unknown_track_id = a.derive_track_id(MediaKind::Video, "v");
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                origin: a,
+                track_ids: vec![unknown_track_id],
+            }),
+            &router,
+        );
+
+        assert!(
+            core.input_dirty.is_empty(),
+            "must not dirty participants when no subscriber held the track"
+        );
     }
 }

@@ -39,6 +39,10 @@ pub enum ClusterCommand {
     UnregisterParticipant {
         participant_id: ParticipantId,
     },
+    UnpublishTracks {
+        origin: ParticipantId,
+        track_ids: Vec<crate::entity::TrackId>,
+    },
 }
 
 pub enum CrossShardEvent {

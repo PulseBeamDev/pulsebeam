@@ -56,11 +56,22 @@ impl VideoAllocator {
         self.rebalance();
     }
 
-    pub fn remove_track(&mut self, track_id: &TrackId) {
-        if self.tracks.remove(track_id).is_some() {
-            tracing::info!(track = %track_id, "video track removed");
-            self.rebalance();
+    pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
+        if self.tracks.remove(track_id).is_none() {
+            return false;
         }
+        tracing::info!(track = %track_id, "video track removed");
+        // Stop any slot currently targeting the removed track so reconcile_routes
+        // fires StreamUnsubscribed and cleans up the routing table.
+        for slot in self.slots.values_mut() {
+            if slot.staging.as_ref().is_some_and(|l| l.meta.id == *track_id)
+                || slot.active.as_ref().is_some_and(|l| l.meta.id == *track_id)
+            {
+                slot.stop();
+            }
+        }
+        self.rebalance();
+        true
     }
 
     pub fn slot_count(&self) -> usize {

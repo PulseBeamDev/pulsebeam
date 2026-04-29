@@ -152,9 +152,28 @@ impl ControllerCore {
         participant_id: &ParticipantId,
         eq: &mut ControllerEventQueue,
     ) {
+        // Collect track IDs before removing from registry so we can notify all shards.
+        let track_ids: Vec<_> = self
+            .registry
+            .get_participant(participant_id)
+            .and_then(|meta| self.registry.get_room(&meta.room_id))
+            .map(|room| {
+                room.tracks_published_by(participant_id)
+                    .into_iter()
+                    .map(|t| t.meta.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         self.registry.remove_participant(participant_id);
         eq.broadcast(ClusterCommand::UnregisterParticipant {
             participant_id: *participant_id,
         });
+        if !track_ids.is_empty() {
+            eq.broadcast(ClusterCommand::UnpublishTracks {
+                origin: *participant_id,
+                track_ids,
+            });
+        }
     }
 }

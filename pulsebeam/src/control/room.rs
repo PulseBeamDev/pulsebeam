@@ -54,4 +54,11 @@ impl Room {
             .filter(move |(p_id, _)| *p_id != participant_id)
             .flat_map(|(_, tracks)| tracks.iter())
     }
+
+    pub fn tracks_published_by(&self, participant_id: &ParticipantId) -> Vec<Track> {
+        self.participants
+            .get(participant_id)
+            .cloned()
+            .unwrap_or_default()
+    }
 }

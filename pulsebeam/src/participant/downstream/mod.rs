@@ -2,6 +2,7 @@ mod audio;
 mod video;
 
 use crate::entity::ParticipantId;
+use crate::entity::TrackId;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::EventQueue;
@@ -60,6 +61,14 @@ impl DownstreamAllocator {
             self.dirty_allocation = true;
         }
         // Audio tracks need no static registration; slots are claimed dynamically.
+    }
+
+    pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
+        let removed = self.video.remove_track(track_id);
+        if removed {
+            self.dirty_allocation = true;
+        }
+        removed
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {

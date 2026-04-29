@@ -172,6 +172,15 @@ impl ParticipantCore {
         self.signaling.reconcile(&mut self.downstream);
     }
 
+    pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) {
+        for track_id in tracks {
+            self.downstream.remove_track(track_id);
+        }
+        self.signaling.mark_tracks_dirty();
+        self.signaling.mark_assignments_dirty();
+        self.signaling.reconcile(&mut self.downstream);
+    }
+
     pub fn ufrag(&mut self) -> String {
         self.rtc.direct_api().local_ice_credentials().ufrag
     }
