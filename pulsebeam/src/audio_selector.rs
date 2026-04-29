@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::{
-    control::controller::MAX_SEND_AUDIO_SLOTS,
+    control::MAX_SEND_AUDIO_SLOTS,
     rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline},
     track::StreamId,
 };

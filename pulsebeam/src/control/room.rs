@@ -5,6 +5,8 @@ use indexmap::IndexMap;
 use crate::entity::{ParticipantId, RoomId};
 use crate::track::Track;
 
+/// Maximum participants allowed per "slot" before hashing to a new shard epoch.
+const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Room {
@@ -34,6 +36,12 @@ impl Room {
         if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
             tracks.push(track);
         }
+    }
+
+    pub fn routing_key(&self) -> Option<String> {
+        let epoch = self.participant_count() / MAX_PARTICIPANTS_PER_SHARD_SLOT;
+        let key = format!("{}-{}", self.room_id, epoch);
+        Some(key)
     }
 
     pub fn participants_iter(&self) -> impl Iterator<Item = &ParticipantId> {

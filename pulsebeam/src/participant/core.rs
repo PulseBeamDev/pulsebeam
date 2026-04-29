@@ -61,6 +61,14 @@ pub struct ParticipantConfig {
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub available_tracks: Vec<Track>,
+    pub shard_id: usize,
+}
+
+impl ParticipantConfig {
+    // TODO: wrap rtc instead
+    pub fn ufrag(&self) -> String {
+        self.rtc.direct_api().local_ice_credentials().ufrag
+    }
 }
 
 pub struct ParticipantCore {

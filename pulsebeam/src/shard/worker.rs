@@ -41,17 +41,10 @@ struct Routing {
 
 #[derive(Debug)]
 pub enum ShardCommand {
-    AddParticipant(ParticipantConfig),
     PublishTrack(Track, RoomId),
     RequestKeyframe(GlobalKeyframeRequest),
-    RegisterParticipant {
-        participant_id: ParticipantId,
-        shard_id: usize,
-        ufrag: String,
-    },
-    UnregisterParticipant {
-        participant_id: ParticipantId,
-    },
+    RegisterParticipant(ParticipantConfig),
+    UnregisterParticipant { participant_id: ParticipantId },
 }
 
 pub enum CrossShardEvent {
@@ -483,22 +476,6 @@ impl ShardWorker {
 
     fn on_command(&mut self, cmd: ShardCommand) -> Option<()> {
         match cmd {
-            ShardCommand::AddParticipant(cfg) => {
-                let participant_id = cfg.participant_id;
-                let room_id = cfg.room_id;
-                self.add_participant(participant_id, cfg);
-                let room = self.rooms.entry(room_id).or_default();
-                let was_empty = room.members.is_empty();
-                room.members.insert(participant_id);
-                if was_empty {
-                    let shard_id = self.router.shard_id;
-                    self.router.broadcast(|| CrossShardEvent::RoomMemberJoined {
-                        room_id,
-                        from_shard_id: shard_id,
-                    });
-                }
-                self.input_dirty.insert(participant_id);
-            }
             ShardCommand::PublishTrack(track, room_id) => {
                 let publisher = track.meta.origin;
                 let tracks = &[track];
@@ -519,18 +496,32 @@ impl ShardWorker {
                 p.handle_remote_keyframe_request(req.stream_id, req.kind);
                 self.input_dirty.insert(req.origin);
             }
-            ShardCommand::RegisterParticipant {
-                participant_id,
-                shard_id,
-                ufrag,
-            } => {
-                self.participant_shards.insert(participant_id, shard_id);
+            ShardCommand::RegisterParticipant(cfg) => {
+                self.participant_shards
+                    .insert(cfg.participant_id, cfg.shard_id);
+                let ufrag = cfg.ufrag();
                 // Register the ufrag in this shard's demuxer so that STUN packets
                 // arriving on the wrong shard can still be identified and forwarded.
-                if shard_id != self.router.shard_id {
+                if cfg.shard_id == self.router.shard_id {
+                    let participant_id = cfg.participant_id;
+                    let room_id = cfg.room_id;
+                    self.add_participant(participant_id, cfg);
+                    let room = self.rooms.entry(room_id).or_default();
+                    let was_empty = room.members.is_empty();
+                    room.members.insert(participant_id);
+                    if was_empty {
+                        let shard_id = self.router.shard_id;
+                        self.router.broadcast(|| CrossShardEvent::RoomMemberJoined {
+                            room_id,
+                            from_shard_id: shard_id,
+                        });
+                    }
+                    self.input_dirty.insert(participant_id);
+                } else {
                     self.demuxer
-                        .register_ice_ufrag(ufrag.as_bytes(), participant_id);
-                    self.remote_participant_ufrags.insert(participant_id, ufrag);
+                        .register_ice_ufrag(ufrag.as_bytes(), cfg.participant_id);
+                    self.remote_participant_ufrags
+                        .insert(cfg.participant_id, ufrag);
                 }
             }
             ShardCommand::UnregisterParticipant { participant_id } => {

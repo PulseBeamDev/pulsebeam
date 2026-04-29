@@ -12,7 +12,7 @@ use crate::{
     },
     entity::{ParticipantId, RoomId},
     participant::ParticipantConfig,
-    shard::worker::ShardEvent,
+    shard::worker::{ShardCommand, ShardEvent},
 };
 use futures_lite::StreamExt;
 use indexmap::IndexMap;
@@ -24,11 +24,11 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-/// Maximum participants allowed per "slot" before hashing to a new shard epoch.
-const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub enum ControllerEvent {}
+pub enum ControllerEvent {
+    BroadcastShardCommand(ShardCommand),
+}
 
 pub struct ControllerEventQueue {
     queue: VecDeque<ControllerEvent>,
@@ -47,6 +47,10 @@ impl ControllerEventQueue {
 
     pub fn pop(&mut self) -> Option<ControllerEvent> {
         self.queue.pop_front()
+    }
+
+    pub fn broadcast(&mut self, cmd: ShardCommand) {
+        self.push(ControllerEvent::BroadcastShardCommand(cmd));
     }
 }
 
@@ -156,28 +160,17 @@ impl ControllerCore {
         Ok(answer)
     }
 
-    fn routing_key_for(&self, room_id: &RoomId) -> Option<String> {
-        let room = self.registry.get_room(room_id)?;
-        let epoch = room.participant_count() / MAX_PARTICIPANTS_PER_SHARD_SLOT;
-        let key = format!("{}-{}", room_id, epoch);
-        Some(key)
-    }
-
-    fn add_participant(&mut self, participant: ParticipantConfig) {}
-
-    // step 1: validations
-    // step 2: find a routing
-    // step 3: add participant
-
     async fn create_participant(
         &mut self,
         state: &ParticipantState,
         offer: SdpOffer,
+        eq: &mut ControllerEventQueue,
     ) -> Result<SdpAnswer, ControllerError> {
-        let (mut rtc, answer) = self.create_answer(offer)?;
+        let (rtc, answer) = self.negotiator.create_answer(offer)?;
         let room = self.registry.get_or_create_room(state.room_id);
         let tracks = room.tracks_for(&state.participant_id);
         let participant_id = state.participant_id;
+        let key = room.routing_key();
         let cfg = ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
@@ -185,23 +178,18 @@ impl ControllerCore {
             rtc,
             available_tracks: tracks.cloned().collect(),
         };
+
         Ok(answer)
     }
 
-    async fn delete_participant(&mut self, participant_id: &ParticipantId) {
-        let Some(meta) = self.participants.remove(participant_id) else {
-            return;
-        };
-        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
-            room.remove_participant(participant_id);
-            if room.participant_count() == 0 {
-                self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
-            }
-        }
-        self.router
-            .broadcast(|| ShardCommand::UnregisterParticipant {
-                participant_id: *participant_id,
-            })
-            .await;
+    fn delete_participant(
+        &mut self,
+        participant_id: &ParticipantId,
+        eq: &mut ControllerEventQueue,
+    ) {
+        self.registry.remove_participant(participant_id);
+        eq.broadcast(ShardCommand::UnregisterParticipant {
+            participant_id: *participant_id,
+        });
     }
 }

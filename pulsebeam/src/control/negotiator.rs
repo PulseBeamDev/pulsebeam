@@ -79,7 +79,7 @@ impl Negotiator {
         Self { candidates }
     }
 
-    fn create_answer(&mut self, offer: SdpOffer) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
+    pub fn create_answer(&mut self, offer: SdpOffer) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
         const PT_OPUS: Pt = Pt::new_with_value(111);
 
         tracing::debug!("{offer}");
