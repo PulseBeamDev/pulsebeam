@@ -79,10 +79,10 @@ impl Synchronizer {
     }
 
     fn add_sender_report(&mut self, sr: SenderInfo, now: Instant) {
-        if let Some(last_time) = self.last_sr_time {
-            if now.duration_since(last_time) < MIN_SR_UPDATE_INTERVAL {
-                return;
-            }
+        if let Some(last_time) = self.last_sr_time
+            && now.duration_since(last_time) < MIN_SR_UPDATE_INTERVAL
+        {
+            return;
         }
 
         let current = ClockReference {
@@ -131,9 +131,8 @@ impl Synchronizer {
     }
 
     pub fn is_synchronized(&self) -> bool {
-        self.latest_sr.map_or(false, |l| {
-            self.first_sr.map_or(false, |f| f.ntp_time != l.ntp_time)
-        })
+        self.latest_sr
+            .is_some_and(|l| self.first_sr.is_some_and(|f| f.ntp_time != l.ntp_time))
     }
 }
 

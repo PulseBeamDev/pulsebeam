@@ -226,8 +226,6 @@ mod tests {
     use crate::rtp::RtpPacket;
     use str0m::media::MediaKind;
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
     const TICK_MS: u64 = 20;
 
     fn make_stream() -> StreamId {
@@ -384,7 +382,10 @@ mod tests {
         // 1.0 > 0.01 * 3.1623 (≈ 0.032) → steal succeeds.
         let newcomer = make_stream();
         let result = sel.filter(newcomer, &mut pkt_at(base, 300, 0));
-        assert!(result.is_some(), "much louder newcomer must steal an active slot");
+        assert!(
+            result.is_some(),
+            "much louder newcomer must steal an active slot"
+        );
         assert!(slot_owners(&sel).contains(&Some(newcomer)));
     }
 
@@ -477,6 +478,9 @@ mod tests {
             }
         }
         sel.cleanup();
-        assert!(!slot_owners(&sel).contains(&Some(id)), "dead slot must be evicted by cleanup");
+        assert!(
+            !slot_owners(&sel).contains(&Some(id)),
+            "dead slot must be evicted by cleanup"
+        );
     }
 }
