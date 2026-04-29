@@ -1,42 +1,24 @@
-use std::collections::VecDeque;
-
-use ahash::HashMap;
-use indexmap::IndexSet;
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
 };
 use tokio::time::Instant;
 
+use str0m::media::MediaKind;
+
 use crate::{
     entity::{self, ParticipantId, RoomId},
-    participant::{
-        ParticipantConfig, ParticipantCore,
-        event::{
-            ControlEvent, EventQueue, LifecycleEvent, ParticipantEvent, RtpEvent, TimerEvent,
-            TopologyEvent,
-        },
-    },
+    participant::ParticipantConfig,
     rtp::RtpPacket,
-    shard::{demux::Demuxer, timer::TimerWheel},
-    track::{GlobalKeyframeRequest, StreamId, StreamWriter, Track},
+    track::{GlobalKeyframeRequest, StreamId, Track},
 };
-use str0m::media::MediaKind;
-const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
+
+use super::core::{CrossShardSend, ShardCore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
-}
-
-struct Routing {
-    kind: MediaKind,
-    /// Local participants subscribed to this stream.
-    subscribers: IndexSet<ParticipantId>,
-    /// Remote shard IDs that have at least one subscriber for this stream.
-    /// Only populated on the publisher's shard.
-    remote_shards: IndexSet<usize>,
 }
 
 #[derive(Debug)]
@@ -99,18 +81,6 @@ pub enum CrossShardEvent {
     },
 }
 
-#[derive(Default)]
-struct RoomState {
-    members: IndexSet<ParticipantId>,
-    /// Remote shard IDs that have at least one member of this room.
-    /// Used to fan out audio RTP across shards.
-    remote_shards: IndexSet<usize>,
-    /// Per-shard, per-room Top-N audio selector.
-    /// Receives every audio stream in the room (unconditional fanout) and
-    /// independently picks the loudest SELECTOR_SLOTS speakers for local delivery.
-    audio_selector: crate::audio_selector::TopNAudioSelector,
-}
-
 #[derive(Debug)]
 pub enum ShardEvent {
     TrackPublished(Track),
@@ -123,7 +93,7 @@ struct ShardRouter {
     cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
 }
 
-impl ShardRouter {
+impl CrossShardSend for ShardRouter {
     fn send(&self, shard_id: usize, ev: CrossShardEvent) {
         if shard_id == self.shard_id {
             return;
@@ -131,7 +101,7 @@ impl ShardRouter {
         let _ = self.cross_shard_event_txs[shard_id].try_send(ev);
     }
 
-    fn broadcast(&self, make_ev: impl Fn() -> CrossShardEvent) {
+    fn broadcast<F: Fn() -> CrossShardEvent>(&self, make_ev: F) {
         for (shard_id, tx) in self.cross_shard_event_txs.iter().enumerate() {
             if shard_id == self.shard_id {
                 continue;
@@ -139,29 +109,16 @@ impl ShardRouter {
             let _ = tx.try_send(make_ev());
         }
     }
+
+    fn shard_id(&self) -> usize {
+        self.shard_id
+    }
 }
 
 pub struct ShardWorker {
-    demuxer: Demuxer,
-    participants: HashMap<ParticipantId, ParticipantCore>,
-    rooms: HashMap<RoomId, RoomState>,
-    routing: HashMap<StreamId, Routing>,
-    participant_shards: HashMap<ParticipantId, usize>,
-
+    core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
-    pending_cross_shard: VecDeque<CrossShardEvent>,
-    timers: TimerWheel,
-    input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
-    fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
-    events: VecDeque<ParticipantEvent>,
-    rtp_events: VecDeque<RtpEvent>,
-    shard_events: VecDeque<ShardEvent>,
-    /// Ufrag for participants that live on a remote shard, used to demux
-    /// cross-shard UDP packets and to clean up demuxer state on unregister.
-    remote_participant_ufrags: HashMap<ParticipantId, String>,
-
     udp_socket: UnifiedSocket,
-
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEvent>,
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
@@ -177,49 +134,19 @@ impl ShardWorker {
         cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
         cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
     ) -> Self {
-        let recv_batch = Vec::with_capacity(net::BATCH_SIZE);
-        let pending_cross_shard = VecDeque::with_capacity(64);
-        let timers = TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD);
-        let input_dirty: IndexSet<ParticipantId, ahash::RandomState> =
-            IndexSet::with_capacity_and_hasher(
-                MAX_PARTICIPANTS_PER_SHARD,
-                ahash::RandomState::default(),
-            );
-        let fanout_dirty: IndexSet<ParticipantId, ahash::RandomState> =
-            IndexSet::with_capacity_and_hasher(
-                MAX_PARTICIPANTS_PER_SHARD,
-                ahash::RandomState::default(),
-            );
-        let events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
-        let rtp_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
-        let shard_events = VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD);
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments());
         let router = ShardRouter {
             shard_id,
             cross_shard_event_txs,
         };
-
         Self {
-            router,
-            demuxer: Demuxer::default(),
-            participants: HashMap::default(),
-            rooms: HashMap::default(),
-            routing: HashMap::default(),
-            participant_shards: HashMap::default(),
-            remote_participant_ufrags: HashMap::default(),
-
-            recv_batch,
-            pending_cross_shard,
-            timers,
-            input_dirty,
-            fanout_dirty,
-            events,
-            rtp_events,
-            shard_events,
-
+            core,
+            recv_batch: Vec::with_capacity(net::BATCH_SIZE),
             udp_socket,
             command_rx,
             event_tx,
             cross_shard_event_rx,
+            router,
         }
     }
 
@@ -231,8 +158,11 @@ impl ShardWorker {
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
         loop {
-            let wait = async {
-                match self.timers.next_deadline() {
+            // Compute the deadline before the select so no borrow of self.core
+            // outlives this block.
+            let deadline = self.core.next_timer_deadline();
+            let wait = async move {
+                match deadline {
                     Some(d) => tokio::time::sleep_until(d).await,
                     // No pending timers: park forever until socket wakes us.
                     None => std::future::pending::<()>().await,
@@ -244,142 +174,52 @@ impl ShardWorker {
                 biased;
                 Ok(_) = self.udp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
-                    self.on_command(cmd);
+                    self.core.on_command(cmd, &self.router);
                 }
                 Some(ev) = self.cross_shard_event_rx.recv() => {
-                    self.pending_cross_shard.push_back(ev);
+                    self.core.pending_cross_shard.push_back(ev);
                 }
                 _ = wait => {}
                 else => break,
             }
 
             while let Ok(cmd) = self.command_rx.try_recv() {
-                self.on_command(cmd);
+                self.core.on_command(cmd, &self.router);
             }
-
             while let Ok(ev) = self.cross_shard_event_rx.try_recv() {
-                self.pending_cross_shard.push_back(ev);
+                self.core.pending_cross_shard.push_back(ev);
             }
 
             let now = Instant::now();
 
-            while let Some(ev) = self.pending_cross_shard.pop_front() {
-                self.on_cross_shard_event(ev, now);
-            }
-
-            self.timers.drain_expired(now, |participant_id| {
-                if let Some(participant) = self.participants.get_mut(&participant_id) {
-                    participant.on_timeout(now);
-                    self.input_dirty.insert(participant_id);
-                }
-            });
+            self.core.flush_cross_shard(now, &self.router);
+            self.core.fire_timers(now);
 
             let count = self
                 .udp_socket
                 .try_recv_batch(&mut self.recv_batch)
                 .unwrap_or_default();
             for batch in self.recv_batch.drain(..count) {
-                let Some(participant_id) = self.demuxer.demux(&batch) else {
-                    continue;
-                };
-                if let Some(participant) = self.participants.get_mut(&participant_id) {
-                    participant.on_ingress(batch);
-                    self.input_dirty.insert(participant_id);
-                } else if let Some(&shard_id) = self.participant_shards.get(&participant_id) {
-                    self.router.send(
-                        shard_id,
-                        CrossShardEvent::UdpPacket {
-                            participant_id,
-                            batch,
-                        },
-                    );
-                }
+                self.core.on_udp_batch(batch, &self.router);
             }
 
-            poll_participants(
-                now,
-                &self.input_dirty,
-                &mut self.participants,
-                &mut self.events,
-                &mut self.rtp_events,
-            );
+            self.core.poll_input(now);
+            self.core.flush_rtp_events(&self.router);
+            self.core.poll_fanout(now);
+            self.core.flush_participant_events(&self.router);
+            self.core.flush_egress(&self.udp_socket);
+            self.core.flush_close_peers(&mut self.udp_socket);
 
-            while let Some(ev) = self.rtp_events.pop_front() {
-                if ev.stream_id.0.kind().is_audio() {
-                    handle_audio_rtp(
-                        ev,
-                        &mut self.rooms,
-                        &mut self.participants,
-                        &mut self.fanout_dirty,
-                        &self.router,
-                    );
-                } else {
-                    handle_rtp(
-                        ev.stream_id,
-                        &ev.pkt,
-                        &self.routing,
-                        &mut self.participants,
-                        &mut self.fanout_dirty,
-                        &self.router,
-                    );
-                }
-            }
-
-            poll_participants(
-                now,
-                &self.fanout_dirty,
-                &mut self.participants,
-                &mut self.events,
-                &mut self.rtp_events,
-            );
-
-            // Drain all events produced this tick before flushing egress,
-            // so RTP forwards from this tick are batched into the same flush.
-            while let Some(event) = self.events.pop_front() {
-                match event {
-                    ParticipantEvent::Topology(ev) => {
-                        handle_participant_topology(ev, &mut self.routing, &self.router);
-                    }
-                    ParticipantEvent::Timer(TimerEvent::DeadlineUpdated { at, participant_id }) => {
-                        self.timers.schedule(participant_id, at);
-                    }
-                    ParticipantEvent::Lifecycle(LifecycleEvent::Exited { participant_id }) => {
-                        self.remove_participant(&participant_id);
-                        self.timers.cancel(&participant_id);
-                        self.input_dirty.swap_remove(&participant_id);
-                        self.shard_events
-                            .push_back(ShardEvent::ParticipantExited(participant_id));
-                    }
-                    ParticipantEvent::Control(ev) => {
-                        handle_participant_control(ev, &mut self.shard_events, &self.router);
-                    }
-                }
-            }
-
-            // Flush egress for all dirty participants in one pass.
-            // Exited participants were swap_removed above so this is safe.
-            for participant_id in self
-                .input_dirty
-                .drain(..)
-                .chain(self.fanout_dirty.drain(..))
-            {
-                let Some(participant) = self.participants.get_mut(&participant_id) else {
-                    continue;
-                };
-                participant.udp_batcher.flush(&self.udp_socket);
-                // TODO: TCP
-            }
-
-            while let Some(event) = self.shard_events.pop_front() {
+            while let Some(event) = self.core.shard_events.pop_front() {
                 match self.event_tx.try_send(event) {
                     Err(mailbox::TrySendError::Full(e)) => {
                         tracing::warn!("shard event channel is full, piling up shard events");
-                        self.shard_events.push_front(e);
+                        self.core.shard_events.push_front(e);
                         break;
                     }
                     Err(mailbox::TrySendError::Closed(e)) => {
                         tracing::warn!("shard event channel is closed, piling up shard events");
-                        self.shard_events.push_front(e);
+                        self.core.shard_events.push_front(e);
                         break;
                     }
                     Ok(_) => {}
@@ -389,421 +229,5 @@ impl ShardWorker {
 
         Ok(())
     }
-
-    fn on_cross_shard_event(&mut self, ev: CrossShardEvent, _now: Instant) {
-        match ev {
-            CrossShardEvent::StreamSubscribed {
-                stream_id,
-                kind,
-                from_shard_id,
-            } => {
-                let routing = self.routing.entry(stream_id).or_insert_with(|| Routing {
-                    kind,
-                    subscribers: IndexSet::new(),
-                    remote_shards: IndexSet::new(),
-                });
-                routing.remote_shards.insert(from_shard_id);
-            }
-            CrossShardEvent::StreamUnsubscribed {
-                stream_id,
-                from_shard_id,
-            } => {
-                if let Some(routing) = self.routing.get_mut(&stream_id) {
-                    routing.remote_shards.swap_remove(&from_shard_id);
-                    if routing.subscribers.is_empty() && routing.remote_shards.is_empty() {
-                        self.routing.remove(&stream_id);
-                    }
-                }
-            }
-            CrossShardEvent::RtpPublished { stream_id, pkt } => {
-                handle_rtp(
-                    stream_id,
-                    &pkt,
-                    &self.routing,
-                    &mut self.participants,
-                    &mut self.fanout_dirty,
-                    &self.router,
-                );
-            }
-            CrossShardEvent::AudioRtpPublished {
-                room_id,
-                origin,
-                stream_id,
-                pkt,
-            } => {
-                let ev = RtpEvent {
-                    stream_id,
-                    pkt,
-                    room_id,
-                    origin,
-                };
-                handle_audio_rtp(
-                    ev,
-                    &mut self.rooms,
-                    &mut self.participants,
-                    &mut self.fanout_dirty,
-                    &self.router,
-                );
-            }
-            CrossShardEvent::RoomMemberJoined {
-                room_id,
-                from_shard_id,
-            } => {
-                // A remote shard now has members for this room; register it so that
-                // local audio publishers will forward RTP there.
-                self.rooms
-                    .entry(room_id)
-                    .or_default()
-                    .remote_shards
-                    .insert(from_shard_id);
-            }
-            CrossShardEvent::RoomMemberLeft {
-                room_id,
-                from_shard_id,
-            } => {
-                if let Some(room) = self.rooms.get_mut(&room_id) {
-                    room.remote_shards.swap_remove(&from_shard_id);
-                    if room.members.is_empty() && room.remote_shards.is_empty() {
-                        self.rooms.remove(&room_id);
-                    }
-                }
-            }
-            CrossShardEvent::UdpPacket {
-                participant_id,
-                batch,
-            } => {
-                if let Some(participant) = self.participants.get_mut(&participant_id) {
-                    participant.on_ingress(batch);
-                    self.input_dirty.insert(participant_id);
-                }
-            }
-            CrossShardEvent::KeyframeRequested(req) => {
-                if let Some(p) = self.participants.get_mut(&req.origin) {
-                    p.handle_remote_keyframe_request(req.stream_id, req.kind);
-                    self.input_dirty.insert(req.origin);
-                }
-            }
-        }
-    }
-
-    fn on_command(&mut self, cmd: ShardCommand) -> Option<()> {
-        match cmd {
-            ShardCommand::AddParticipant(cfg) => {
-                let participant_id = cfg.participant_id;
-                let room_id = cfg.room_id;
-                self.add_participant(participant_id, cfg);
-                let room = self.rooms.entry(room_id).or_default();
-                let was_empty = room.members.is_empty();
-                room.members.insert(participant_id);
-                if was_empty {
-                    let shard_id = self.router.shard_id;
-                    self.router.broadcast(|| CrossShardEvent::RoomMemberJoined {
-                        room_id,
-                        from_shard_id: shard_id,
-                    });
-                }
-                self.input_dirty.insert(participant_id);
-            }
-            ShardCommand::Cluster(cmd) => self.on_cluster_command(cmd)?,
-        }
-        Some(())
-    }
-
-    fn on_cluster_command(&mut self, cmd: ClusterCommand) -> Option<()> {
-        match cmd {
-            ClusterCommand::PublishTrack(track, room_id) => {
-                let publisher = track.meta.origin;
-                let tracks = &[track];
-                let room = self.rooms.get(&room_id)?;
-                for &participant_id in &room.members {
-                    if participant_id == publisher {
-                        continue;
-                    }
-                    let Some(p) = self.participants.get_mut(&participant_id) else {
-                        continue;
-                    };
-                    p.on_tracks_published(tracks);
-                    self.input_dirty.insert(participant_id);
-                }
-            }
-            ClusterCommand::RequestKeyframe(req) => {
-                let p = self.participants.get_mut(&req.origin)?;
-                p.handle_remote_keyframe_request(req.stream_id, req.kind);
-                self.input_dirty.insert(req.origin);
-            }
-            ClusterCommand::RegisterParticipant {
-                shard_id,
-                participant_id,
-                ufrag,
-            } => {
-                // Register the ufrag in this shard's demuxer so that STUN packets
-                // arriving on the wrong shard can still be identified and forwarded.
-                if shard_id != self.router.shard_id {
-                    self.demuxer
-                        .register_ice_ufrag(ufrag.as_bytes(), participant_id);
-                    self.remote_participant_ufrags.insert(participant_id, ufrag);
-                    self.participant_shards.insert(participant_id, shard_id);
-                }
-            }
-            ClusterCommand::UnregisterParticipant { participant_id } => {
-                self.participant_shards.remove(&participant_id);
-                if let Some(ufrag) = self.remote_participant_ufrags.remove(&participant_id) {
-                    let addrs = self.demuxer.unregister(ufrag.as_bytes());
-                    for addr in &addrs {
-                        self.udp_socket.close_peer(addr);
-                    }
-                }
-            }
-        }
-
-        Some(())
-    }
-
-    fn add_participant(&mut self, participant_id: ParticipantId, cfg: ParticipantConfig) {
-        self.remove_participant(&participant_id);
-
-        let mut participant = ParticipantCore::new(
-            cfg,
-            self.router.shard_id,
-            self.udp_socket.max_gso_segments(),
-            1,
-        );
-        self.demuxer
-            .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
-
-        self.participants.insert(participant_id, participant);
-        tracing::info!(%participant_id, "participant added to shard");
-    }
-
-    fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ParticipantCore> {
-        let mut participant = self.participants.remove(participant_id)?;
-        if let Some(room) = self.rooms.get_mut(&participant.room_id) {
-            room.members.swap_remove(participant_id);
-            if room.members.is_empty() {
-                let room_id = participant.room_id;
-                let shard_id = self.router.shard_id;
-                self.router.broadcast(|| CrossShardEvent::RoomMemberLeft {
-                    room_id,
-                    from_shard_id: shard_id,
-                });
-                if room.remote_shards.is_empty() {
-                    self.rooms.remove(&participant.room_id);
-                }
-            }
-        }
-        // Clean up the shard routing table before teardown.
-        // participant is already removed from self.participants so there is no aliasing.
-        // Also evict all audio tracks this participant published from the room selector.
-        if let Some(room) = self.rooms.get_mut(&participant.room_id) {
-            let audio_ids: Vec<_> = participant.upstream.audio_track_ids().collect();
-            for id in audio_ids {
-                // Audio tracks have no simulcast layer (Rid = None).
-                room.audio_selector.remove_track((id, None));
-            }
-        }
-        let unsubs = participant.downstream.unsubscribe_all();
-        for (stream_id, shard_id) in unsubs {
-            handle_participant_topology(
-                TopologyEvent::StreamUnsubscribed {
-                    shard_id,
-                    participant_id: *participant_id,
-                    stream_id,
-                },
-                &mut self.routing,
-                &self.router,
-            );
-        }
-        let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
-        for addr in &addrs {
-            self.udp_socket.close_peer(addr);
-        }
-        Some(participant)
-    }
 }
 
-fn poll_participants(
-    now: Instant,
-    dirty: &IndexSet<ParticipantId, ahash::RandomState>,
-    participants: &mut HashMap<ParticipantId, ParticipantCore>,
-    events: &mut VecDeque<ParticipantEvent>,
-    rtp_events: &mut VecDeque<RtpEvent>,
-) {
-    for participant_id in dirty {
-        let Some(participant) = participants.get_mut(participant_id) else {
-            continue;
-        };
-        let room_id = participant.room_id;
-        let mut queue = EventQueue::new(participant_id, room_id, events, rtp_events);
-        participant.poll(now, &mut queue);
-    }
-}
-
-fn handle_rtp(
-    stream_id: StreamId,
-    pkt: &RtpPacket,
-    routing: &HashMap<StreamId, Routing>,
-    participants: &mut HashMap<ParticipantId, ParticipantCore>,
-    dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
-    router: &ShardRouter,
-) -> Option<()> {
-    let route = routing.get(&stream_id)?;
-    match route.kind {
-        MediaKind::Video => {
-            for participant_id in &route.subscribers {
-                let Some(sub) = participants.get_mut(participant_id) else {
-                    continue;
-                };
-                let mut writer = StreamWriter(&mut sub.rtc);
-                sub.downstream.on_forward_rtp(&stream_id, pkt, &mut writer);
-                dirty.insert(*participant_id);
-            }
-            // Cross-shard fanout: send to remote shards that have subscribers.
-            for &shard_id in &route.remote_shards {
-                router.send(
-                    shard_id,
-                    CrossShardEvent::RtpPublished {
-                        stream_id,
-                        pkt: pkt.clone(),
-                    },
-                );
-            }
-        }
-        MediaKind::Audio => {}
-    }
-    Some(())
-}
-
-/// Fan out an audio packet across the room.
-///
-/// Cross-shard: packets originating from a local publisher are forwarded
-/// unconditionally to every remote shard that has room members.
-///
-/// Local delivery: the room's [`TopNAudioSelector`] runs the inline Top-5
-/// filter and returns the leaderboard slot index when the stream should be
-/// forwarded.  The original packet (no rewriting) is delivered to all local
-/// subscribers through that slot.
-fn handle_audio_rtp(
-    mut ev: RtpEvent,
-    rooms: &mut HashMap<RoomId, RoomState>,
-    participants: &mut HashMap<ParticipantId, ParticipantCore>,
-    dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
-    router: &ShardRouter,
-) {
-    let Some(room) = rooms.get_mut(&ev.room_id) else {
-        return;
-    };
-
-    // Cross-shard fanout: only from the originating shard to avoid loops.
-    if participants.contains_key(&ev.origin) {
-        for &shard_id in &room.remote_shards {
-            router.send(
-                shard_id,
-                CrossShardEvent::AudioRtpPublished {
-                    room_id: ev.room_id,
-                    origin: ev.origin,
-                    stream_id: ev.stream_id,
-                    pkt: ev.pkt.clone(),
-                },
-            );
-        }
-    }
-
-    // Inline Top-5 filter: synchronous, no buffering, returns leaderboard slot.
-    let selection = room.audio_selector.filter(ev.stream_id, &mut ev.pkt);
-    let Some(slot_idx) = selection else {
-        return;
-    };
-    for &participant_id in &room.members {
-        if participant_id == ev.origin {
-            continue;
-        }
-        let Some(sub) = participants.get_mut(&participant_id) else {
-            continue;
-        };
-        let mut writer = StreamWriter(&mut sub.rtc);
-        sub.downstream
-            .on_forward_audio_rtp(slot_idx, &ev.pkt, &mut writer);
-        dirty.insert(participant_id);
-    }
-}
-
-fn handle_participant_topology(
-    ev: TopologyEvent,
-    routing: &mut HashMap<StreamId, Routing>,
-    router: &ShardRouter,
-) -> Option<()> {
-    match ev {
-        TopologyEvent::StreamSubscribed {
-            shard_id,
-            participant_id,
-            stream_id,
-            kind,
-        } => {
-            let entry = routing.entry(stream_id).or_insert_with(|| Routing {
-                kind,
-                subscribers: IndexSet::with_capacity(256),
-                remote_shards: IndexSet::new(),
-            });
-            let was_empty = entry.subscribers.is_empty();
-            entry.subscribers.insert(participant_id);
-            // First local subscriber: tell the publisher shard to forward RTP to us.
-            if was_empty {
-                router.send(
-                    shard_id,
-                    CrossShardEvent::StreamSubscribed {
-                        stream_id,
-                        kind,
-                        from_shard_id: router.shard_id,
-                    },
-                );
-            }
-        }
-        TopologyEvent::StreamUnsubscribed {
-            shard_id,
-            participant_id,
-            stream_id,
-        } => {
-            if let Some(entry) = routing.get_mut(&stream_id) {
-                entry.subscribers.swap_remove(&participant_id);
-                // Last local subscriber: stop forwarding from the publisher shard.
-                if entry.subscribers.is_empty() {
-                    router.send(
-                        shard_id,
-                        CrossShardEvent::StreamUnsubscribed {
-                            stream_id,
-                            from_shard_id: router.shard_id,
-                        },
-                    );
-                    if entry.remote_shards.is_empty() {
-                        routing.remove(&stream_id);
-                    }
-                }
-            }
-        }
-    }
-
-    Some(())
-}
-fn handle_participant_timer(_ev: TimerEvent) {}
-fn handle_participant_lifecycle(_ev: LifecycleEvent) {}
-
-fn handle_participant_control(
-    ev: ControlEvent,
-    shard_events: &mut VecDeque<ShardEvent>,
-    router: &ShardRouter,
-) {
-    match ev {
-        ControlEvent::TrackPublished(track) => {
-            shard_events.push_back(ShardEvent::TrackPublished(track));
-        }
-        ControlEvent::KeyframeRequested(req) => {
-            if req.shard_id == router.shard_id {
-                // Publisher is local or unknown: let the controller route it.
-                shard_events.push_back(ShardEvent::KeyframeRequest(req));
-            } else {
-                // Publisher is on a remote shard: bypass the controller.
-                router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
-            }
-        }
-    }
-}
