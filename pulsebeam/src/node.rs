@@ -152,22 +152,26 @@ impl NodeBuilder {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
-            let handle = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .enable_alt_timer()
-                    .build_local(LocalOptions::default())
-                    .unwrap();
-                let shard = ShardWorker::new(
-                    shard_id,
-                    sock,
-                    shard_command_rx,
-                    shard_event_tx,
-                    cross_shard_event_rx,
-                    cross_shard_event_txs,
-                );
-                rt.block_on(tokio::task::unconstrained(shard.run()));
-            });
+            let builder =
+                std::thread::Builder::new().name(format!("pulsebeam-worker-{}", shard_id));
+            let handle = builder
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .enable_alt_timer()
+                        .build_local(LocalOptions::default())
+                        .unwrap();
+                    let shard = ShardWorker::new(
+                        shard_id,
+                        sock,
+                        shard_command_rx,
+                        shard_event_tx,
+                        cross_shard_event_rx,
+                        cross_shard_event_txs,
+                    );
+                    rt.block_on(tokio::task::unconstrained(shard.run()));
+                })
+                .unwrap();
             shard_handles.push(handle);
             shard_command_txs.push(shard_command_tx);
         }
