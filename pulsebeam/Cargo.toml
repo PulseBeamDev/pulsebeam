@@ -50,7 +50,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration", "rt"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["time"] }
 tower-http = { version = "0.6.8", features = [
   "compression-zstd",
   "cors",
@@ -68,6 +68,7 @@ uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
 hex = "0.4.3"
 more-asserts = { workspace = true }
 proptest = "1.10.0"
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemalloc_pprof = { version = "0.8.1", features = ["flamegraph", "symbolize"] }

@@ -6,8 +6,9 @@ use crate::{
     participant::ParticipantConfig,
     shard::worker::{ShardCommand, ShardEvent},
 };
+use futures_lite::StreamExt;
 use indexmap::IndexMap;
-use pulsebeam_runtime::mailbox;
+use pulsebeam_runtime::{mailbox, rand};
 use str0m::{
     Candidate, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
@@ -15,6 +16,7 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, Pt},
 };
 use tokio::{sync::oneshot, time::Instant};
+use tokio_util::time::DelayQueue;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
@@ -23,6 +25,7 @@ pub const MAX_SEND_AUDIO_SLOTS: usize = 5;
 pub const MAX_DATA_CHANNELS: usize = 1;
 /// Maximum participants allowed per "slot" before hashing to a new shard epoch.
 const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
+const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum MediaType {
@@ -153,12 +156,19 @@ struct ParticipantMeta {
 pub struct ControllerActor {
     candidates: Vec<Candidate>,
 
+    sweeper: DelayQueue<RoomId>,
     rooms: HashMap<RoomId, Room>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
     router: ShardRouter,
 }
 
 impl ControllerActor {
+    #[cfg(test)]
+    pub fn new_fake() -> Self {
+        let rng = rand::seeded_rng(0);
+        ControllerActor::new(rng, vec![], vec![])
+    }
+
     pub fn new(
         _rng: pulsebeam_runtime::rand::Rng,
         shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
@@ -168,6 +178,7 @@ impl ControllerActor {
 
         Self {
             candidates,
+            sweeper: DelayQueue::with_capacity(1024),
 
             rooms: HashMap::new(),
             participants: HashMap::new(),
@@ -187,6 +198,10 @@ impl ControllerActor {
 
                 Some(event) = shard_event_rx.recv() => {
                     self.on_shard_event(event).await;
+                }
+
+                Some(e) = self.sweeper.next() => {
+                    self.maybe_delete_room(e.get_ref());
                 }
 
                 Some(command) = command_rx.recv() => {
@@ -259,7 +274,7 @@ impl ControllerActor {
         match cmd {
             ControllerCommand::CreateParticipant(m, reply_tx) => {
                 let answer = self
-                    .create_participant(&m.state, m.offer)
+                    .handle_create_participant(&m.state, m.offer)
                     .await
                     .map(|res| CreateParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
@@ -270,7 +285,7 @@ impl ControllerActor {
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
-                    .create_participant(&m.state, m.offer)
+                    .handle_create_participant(&m.state, m.offer)
                     .await
                     .map(|res| PatchParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
@@ -278,16 +293,16 @@ impl ControllerActor {
         }
     }
 
-    pub async fn create_participant(
+    pub async fn handle_create_participant(
         &mut self,
         state: &ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        let answer = self.do_create_participant(state, offer).await?;
+        let answer = self.create_participant(state, offer).await?;
         Ok(answer)
     }
 
-    async fn do_create_participant(
+    async fn create_participant(
         &mut self,
         state: &ParticipantState,
         offer: SdpOffer,
@@ -344,7 +359,7 @@ impl ControllerActor {
         if let Some(room) = self.rooms.get_mut(&meta.room_id) {
             room.remove_participant(participant_id);
             if room.participant_count() == 0 {
-                self.rooms.remove(&meta.room_id);
+                self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
             }
         }
         self.router
@@ -352,6 +367,16 @@ impl ControllerActor {
                 participant_id: *participant_id,
             })
             .await;
+    }
+
+    fn maybe_delete_room(&mut self, room_id: &RoomId) {
+        if let Some(room) = self.rooms.get(room_id) {
+            // someone may have joined after the timer started.
+            if room.participant_count() == 0 {
+                tracing::info!(%room_id, "removing empty room after grace period");
+                self.rooms.remove(room_id);
+            }
+        }
     }
 
     fn create_answer(&mut self, offer: SdpOffer) -> Result<(Rtc, SdpAnswer), ControllerError> {
@@ -518,3 +543,26 @@ impl ControllerActor {
 }
 
 pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::control::controller::ControllerActor;
+    use str0m::change::SdpOffer;
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_empty_rooms() -> anyhow::Result<()> {
+        let offer = SdpOffer::from_sdp_string(pulsebeam_testdata::RAW_CHROME_SDP)?;
+        let mut controller = ControllerActor::new_fake();
+        let state = &ParticipantState {
+            manual_sub: false,
+            room_id: RoomId::from_external(&"test".try_into()?),
+            participant_id: ParticipantId::new(),
+            connection_id: ConnectionId::new(),
+            old_connection_id: None,
+        };
+        controller.create_participant(state, offer).await?;
+
+        Ok(())
+    }
+}

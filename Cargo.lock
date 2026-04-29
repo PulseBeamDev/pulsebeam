@@ -2825,6 +2825,7 @@ dependencies = [
  "pulsebeam-core",
  "pulsebeam-proto",
  "pulsebeam-runtime",
+ "pulsebeam-testdata",
  "rand",
  "serde",
  "serde_json",
@@ -4162,6 +4163,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
