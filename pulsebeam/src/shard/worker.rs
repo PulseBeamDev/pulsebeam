@@ -9,7 +9,7 @@ use pulsebeam_runtime::{
 use tokio::time::Instant;
 
 use crate::{
-    entity::{ParticipantId, RoomId},
+    entity::{self, ParticipantId, RoomId},
     participant::{
         ParticipantConfig, ParticipantCore,
         event::{
@@ -39,13 +39,20 @@ struct Routing {
     remote_shards: IndexSet<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ShardCommand {
+    AddParticipant(ParticipantConfig),
+    Cluster(ClusterCommand),
+}
+
+#[derive(Debug, Clone)]
+pub enum ClusterCommand {
     PublishTrack(Track, RoomId),
     RequestKeyframe(GlobalKeyframeRequest),
     RegisterParticipant {
+        ufrag: String,
         shard_id: usize,
-        cfg: ParticipantConfig,
+        participant_id: entity::ParticipantId,
     },
     UnregisterParticipant {
         participant_id: ParticipantId,
@@ -481,7 +488,30 @@ impl ShardWorker {
 
     fn on_command(&mut self, cmd: ShardCommand) -> Option<()> {
         match cmd {
-            ShardCommand::PublishTrack(track, room_id) => {
+            ShardCommand::AddParticipant(cfg) => {
+                let participant_id = cfg.participant_id;
+                let room_id = cfg.room_id;
+                self.add_participant(participant_id, cfg);
+                let room = self.rooms.entry(room_id).or_default();
+                let was_empty = room.members.is_empty();
+                room.members.insert(participant_id);
+                if was_empty {
+                    let shard_id = self.router.shard_id;
+                    self.router.broadcast(|| CrossShardEvent::RoomMemberJoined {
+                        room_id,
+                        from_shard_id: shard_id,
+                    });
+                }
+                self.input_dirty.insert(participant_id);
+            }
+            ShardCommand::Cluster(cmd) => self.on_cluster_command(cmd)?,
+        }
+        Some(())
+    }
+
+    fn on_cluster_command(&mut self, cmd: ClusterCommand) -> Option<()> {
+        match cmd {
+            ClusterCommand::PublishTrack(track, room_id) => {
                 let publisher = track.meta.origin;
                 let tracks = &[track];
                 let room = self.rooms.get(&room_id)?;
@@ -496,39 +526,26 @@ impl ShardWorker {
                     self.input_dirty.insert(participant_id);
                 }
             }
-            ShardCommand::RequestKeyframe(req) => {
+            ClusterCommand::RequestKeyframe(req) => {
                 let p = self.participants.get_mut(&req.origin)?;
                 p.handle_remote_keyframe_request(req.stream_id, req.kind);
                 self.input_dirty.insert(req.origin);
             }
-            ShardCommand::RegisterParticipant { shard_id, mut cfg } => {
-                self.participant_shards.insert(cfg.participant_id, shard_id);
-                let ufrag = cfg.ufrag();
+            ClusterCommand::RegisterParticipant {
+                shard_id,
+                participant_id,
+                ufrag,
+            } => {
                 // Register the ufrag in this shard's demuxer so that STUN packets
                 // arriving on the wrong shard can still be identified and forwarded.
-                if shard_id == self.router.shard_id {
-                    let participant_id = cfg.participant_id;
-                    let room_id = cfg.room_id;
-                    self.add_participant(participant_id, cfg);
-                    let room = self.rooms.entry(room_id).or_default();
-                    let was_empty = room.members.is_empty();
-                    room.members.insert(participant_id);
-                    if was_empty {
-                        let shard_id = self.router.shard_id;
-                        self.router.broadcast(|| CrossShardEvent::RoomMemberJoined {
-                            room_id,
-                            from_shard_id: shard_id,
-                        });
-                    }
-                    self.input_dirty.insert(participant_id);
-                } else {
+                if shard_id != self.router.shard_id {
                     self.demuxer
-                        .register_ice_ufrag(ufrag.as_bytes(), cfg.participant_id);
-                    self.remote_participant_ufrags
-                        .insert(cfg.participant_id, ufrag);
+                        .register_ice_ufrag(ufrag.as_bytes(), participant_id);
+                    self.remote_participant_ufrags.insert(participant_id, ufrag);
+                    self.participant_shards.insert(participant_id, shard_id);
                 }
             }
-            ShardCommand::UnregisterParticipant { participant_id } => {
+            ClusterCommand::UnregisterParticipant { participant_id } => {
                 self.participant_shards.remove(&participant_id);
                 if let Some(ufrag) = self.remote_participant_ufrags.remove(&participant_id) {
                     let addrs = self.demuxer.unregister(ufrag.as_bytes());
@@ -538,6 +555,7 @@ impl ShardWorker {
                 }
             }
         }
+
         Some(())
     }
 
@@ -779,12 +797,12 @@ fn handle_participant_control(
             shard_events.push_back(ShardEvent::TrackPublished(track));
         }
         ControlEvent::KeyframeRequested(req) => {
-            if req.shard_id != router.shard_id {
-                // Publisher is on a remote shard: bypass the controller.
-                router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
-            } else {
+            if req.shard_id == router.shard_id {
                 // Publisher is local or unknown: let the controller route it.
                 shard_events.push_back(ShardEvent::KeyframeRequest(req));
+            } else {
+                // Publisher is on a remote shard: bypass the controller.
+                router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
             }
         }
     }

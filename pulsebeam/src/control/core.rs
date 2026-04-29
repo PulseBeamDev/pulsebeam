@@ -1,33 +1,24 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
+use std::{collections::VecDeque, time::Duration};
 
 use crate::{
     control::{
-        controller::{ControllerCommand, ControllerError, ParticipantState},
+        controller::{ControllerError, ParticipantState},
         negotiator::Negotiator,
         registry::RoomRegistry,
-        room::Room,
     },
     entity::{ParticipantId, RoomId},
     participant::ParticipantConfig,
-    shard::worker::{ShardCommand, ShardEvent},
+    shard::worker::{ClusterCommand, ShardCommand, ShardEvent},
 };
-use futures_lite::StreamExt;
 use indexmap::IndexMap;
 use str0m::{
-    Candidate, Rtc, RtcConfig, RtcError,
+    Candidate,
     change::{SdpAnswer, SdpOffer},
-    format::{Codec, FormatParams},
-    media::{Direction, Frequency, MediaKind, Pt},
 };
-use tokio::time::Instant;
-
-const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum ControllerEvent {
-    BroadcastShardCommand(ShardCommand),
+    ShardCommandBroadcasted(ClusterCommand),
+    ShardCommandSent(usize, ShardCommand),
 }
 
 pub struct ControllerEventQueue {
@@ -49,8 +40,19 @@ impl ControllerEventQueue {
         self.queue.pop_front()
     }
 
-    pub fn broadcast(&mut self, cmd: ShardCommand) {
-        self.push(ControllerEvent::BroadcastShardCommand(cmd));
+    pub fn broadcast(&mut self, cmd: ClusterCommand) {
+        self.push(ControllerEvent::ShardCommandBroadcasted(cmd));
+    }
+
+    pub fn send(&mut self, shard_id: usize, cmd: ShardCommand) {
+        self.push(ControllerEvent::ShardCommandSent(shard_id, cmd));
+    }
+
+    pub fn send_cluster(&mut self, shard_id: usize, cmd: ClusterCommand) {
+        self.push(ControllerEvent::ShardCommandSent(
+            shard_id,
+            ShardCommand::Cluster(cmd),
+        ));
     }
 }
 
@@ -75,6 +77,55 @@ impl ControllerCore {
         Self {
             negotiator: Negotiator::new(candidates),
             registry: RoomRegistry::new(),
+        }
+    }
+
+    pub fn process_shard_event(&mut self, ev: ShardEvent, eq: &mut ControllerEventQueue) {
+        match ev {
+            ShardEvent::TrackPublished(track) => {
+                let origin = track.meta.origin;
+
+                let (room_id, other_participants) = {
+                    let Some(room) = self.registry.room_mut_for(&origin) else {
+                        return;
+                    };
+                    room.publish_track(track.clone());
+
+                    let ids: Vec<ParticipantId> = room
+                        .participants_iter()
+                        .filter(|&&id| id != origin)
+                        .cloned()
+                        .collect();
+
+                    (room.room_id, ids)
+                };
+
+                // TODO: should we make room shard aware?
+                let mut shard_ids: IndexMap<usize, ()> = IndexMap::new();
+                for participant_id in other_participants {
+                    if let Some(p) = self.registry.get_participant(&participant_id) {
+                        shard_ids.entry(p.shard_id).or_default();
+                    }
+                }
+
+                for (shard_id, _) in shard_ids {
+                    eq.send_cluster(
+                        shard_id,
+                        ClusterCommand::PublishTrack(track.clone(), room_id),
+                    );
+                }
+            }
+
+            ShardEvent::ParticipantExited(participant_id) => {
+                self.delete_participant(&participant_id, eq);
+            }
+            ShardEvent::KeyframeRequest(req) => {
+                let Some(meta) = self.registry.get_participant(&req.origin) else {
+                    tracing::warn!(origin = %req.origin, track = ?req.stream_id.0, "KeyframeRequest: origin participant not found in controller");
+                    return;
+                };
+                eq.send_cluster(meta.shard_id, ClusterCommand::RequestKeyframe(req))
+            }
         }
     }
 
@@ -114,7 +165,7 @@ impl ControllerCore {
         eq: &mut ControllerEventQueue,
     ) {
         self.registry.remove_participant(participant_id);
-        eq.broadcast(ShardCommand::UnregisterParticipant {
+        eq.broadcast(ClusterCommand::UnregisterParticipant {
             participant_id: *participant_id,
         });
     }

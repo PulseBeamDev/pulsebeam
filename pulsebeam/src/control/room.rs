@@ -10,7 +10,7 @@ const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Room {
-    room_id: RoomId,
+    pub room_id: RoomId,
     participants: IndexMap<ParticipantId, Vec<Track>>,
 }
 

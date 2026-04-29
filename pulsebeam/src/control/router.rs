@@ -1,7 +1,7 @@
 use pulsebeam_runtime::mailbox::{self};
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use crate::shard::worker::ShardCommand;
+use crate::shard::worker::{ClusterCommand, ShardCommand};
 
 const MAX_LOAD: f64 = 0.7;
 
@@ -73,9 +73,10 @@ impl ShardRouter {
             .expect("shard to be running");
     }
 
-    pub async fn broadcast(&mut self, cmd: &ShardCommand) {
+    pub async fn broadcast(&mut self, cmd: ClusterCommand) {
         for tx in &self.shard_command_txs {
-            tx.send(cmd.clone()).await.expect("shard to be running");
+            let cmd = ShardCommand::Cluster(cmd.clone());
+            tx.send(cmd).await.expect("shard to be running");
         }
     }
 

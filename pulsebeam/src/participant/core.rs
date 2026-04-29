@@ -54,7 +54,7 @@ pub enum DisconnectReason {
     SystemTerminated,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,

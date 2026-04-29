@@ -9,9 +9,9 @@ use tokio_util::time::DelayQueue;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct ParticipantMeta {
-    shard_id: usize,
-    room_id: RoomId,
+pub struct ParticipantMeta {
+    pub shard_id: usize,
+    pub room_id: RoomId,
 }
 
 pub struct RoomRegistry {
@@ -65,6 +65,10 @@ impl RoomRegistry {
             .insert(participant_id, ParticipantMeta { shard_id, room_id });
     }
 
+    pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
+        self.participants.get(participant_id)
+    }
+
     /// Returns the shard_id that was hosting the participant, if found.
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<usize> {
         let meta = self.participants.remove(participant_id)?;
@@ -84,10 +88,10 @@ impl RoomRegistry {
     }
 
     fn maybe_delete_room(&mut self, room_id: &RoomId) {
-        if let Some(room) = self.rooms.get(room_id) {
-            if room.participant_count() == 0 {
-                self.rooms.remove(room_id);
-            }
+        if let Some(room) = self.rooms.get(room_id)
+            && room.participant_count() == 0
+        {
+            self.rooms.remove(room_id);
         }
     }
 
