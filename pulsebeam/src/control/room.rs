@@ -38,10 +38,10 @@ impl Room {
         }
     }
 
-    pub fn routing_key(&self) -> Option<String> {
+    pub fn routing_key(&self) -> String {
         let epoch = self.participant_count() / MAX_PARTICIPANTS_PER_SHARD_SLOT;
         let key = format!("{}-{}", self.room_id, epoch);
-        Some(key)
+        key
     }
 
     pub fn participants_iter(&self) -> impl Iterator<Item = &ParticipantId> {

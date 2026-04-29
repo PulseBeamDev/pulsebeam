@@ -59,6 +59,12 @@ struct ParticipantMeta {
     room_id: RoomId,
 }
 
+pub struct ParticipantStaging {
+    pub routing_key: String,
+    pub cfg: ParticipantConfig,
+    pub answer: SdpAnswer,
+}
+
 pub struct ControllerCore {
     negotiator: Negotiator,
     registry: RoomRegistry,
@@ -76,96 +82,11 @@ impl ControllerCore {
         self.registry.next_expired().await;
     }
 
-    pub fn process_shard_event(&mut self, ev: ShardEvent, eq: &mut ControllerEventQueue) {
-        match ev {
-            ShardEvent::TrackPublished(track) => {
-                let origin = track.meta.origin;
-                let Some(room) = self.registry.room_mut_for(&track.meta.origin) else {
-                    return;
-                };
-
-                // TODO: make room shard aware?
-                let mut shard_ids: IndexMap<usize, ()> = IndexMap::new();
-                for participant_id in room.participants_iter() {
-                    if *participant_id == origin {
-                        continue;
-                    }
-                    if let Some(p) = self.registry.get(participant_id) {
-                        shard_ids.entry(p.shard_id).or_default();
-                    }
-                }
-
-                tracing::info!(
-                    track = %track.meta.id,
-                    %origin,
-                    room_id = ?room_id,
-                    shard_count = shard_ids.len(),
-                    "fanning out track to shards"
-                );
-                room.publish_track(track.clone());
-                for (shard_id, _) in shard_ids {
-                    self.router
-                        .send(shard_id, ShardCommand::PublishTrack(track.clone(), room_id))
-                        .await;
-                }
-            }
-
-            ShardEvent::ParticipantExited(participant_id) => {
-                self.delete_participant(&participant_id).await;
-            }
-            ShardEvent::KeyframeRequest(req) => {
-                let meta = self.registry.get(&req.origin).or_else(|| {
-                    tracing::warn!(origin = %req.origin, track = ?req.stream_id.0, "KeyframeRequest: origin participant not found in controller");
-                    None
-                })?;
-                self.router
-                    .send(meta.shard_id, ShardCommand::RequestKeyframe(req))
-                    .await;
-            }
-        }
-
-        Some(())
-    }
-
-    pub fn process_command(&mut self, cmd: ControllerCommand, eq: &mut ControllerEventQueue) {
-        match cmd {
-            ControllerCommand::CreateParticipant(m, reply_tx) => {
-                let answer = self
-                    .handle_create_participant(&m.state, m.offer)
-                    .await
-                    .map(|res| CreateParticipantReply { answer: res });
-                let _ = reply_tx.send(answer);
-            }
-
-            ControllerCommand::DeleteParticipant(m) => {
-                self.delete_participant(&m.participant_id).await;
-            }
-            ControllerCommand::PatchParticipant(m, reply_tx) => {
-                let answer = self
-                    .handle_create_participant(&m.state, m.offer)
-                    .await
-                    .map(|res| PatchParticipantReply { answer: res });
-                let _ = reply_tx.send(answer);
-            }
-        }
-    }
-
-    pub async fn handle_create_participant(
+    pub fn create_participant(
         &mut self,
         state: &ParticipantState,
         offer: SdpOffer,
-        eq: &mut ControllerEventQueue,
-    ) -> Result<SdpAnswer, ControllerError> {
-        let answer = self.create_participant(state, offer, eq)?;
-        Ok(answer)
-    }
-
-    async fn create_participant(
-        &mut self,
-        state: &ParticipantState,
-        offer: SdpOffer,
-        eq: &mut ControllerEventQueue,
-    ) -> Result<SdpAnswer, ControllerError> {
+    ) -> Result<ParticipantStaging, ControllerError> {
         let (rtc, answer) = self.negotiator.create_answer(offer)?;
         let room = self.registry.get_or_create_room(state.room_id);
         let tracks = room.tracks_for(&state.participant_id);
@@ -178,11 +99,16 @@ impl ControllerCore {
             rtc,
             available_tracks: tracks.cloned().collect(),
         };
+        let stg = ParticipantStaging {
+            routing_key: key,
+            cfg,
+            answer,
+        };
 
-        Ok(answer)
+        Ok(stg)
     }
 
-    fn delete_participant(
+    pub fn delete_participant(
         &mut self,
         participant_id: &ParticipantId,
         eq: &mut ControllerEventQueue,

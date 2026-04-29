@@ -33,7 +33,7 @@ impl ShardRouter {
         }
     }
 
-    pub fn try_route<K: Hash>(&self, key: K) -> Option<usize> {
+    pub fn try_route<K: Hash>(&self, key: &K) -> Option<usize> {
         let mut best_index = None;
         let mut max_score = -1.0;
 
@@ -73,9 +73,9 @@ impl ShardRouter {
             .expect("shard to be running");
     }
 
-    pub async fn broadcast(&mut self, make_cmd: impl Fn() -> ShardCommand) {
+    pub async fn broadcast(&mut self, cmd: &ShardCommand) {
         for tx in &self.shard_command_txs {
-            tx.send(make_cmd()).await.expect("shard to be running");
+            tx.send(cmd.clone()).await.expect("shard to be running");
         }
     }
 

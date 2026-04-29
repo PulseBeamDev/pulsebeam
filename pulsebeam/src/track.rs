@@ -23,7 +23,7 @@ pub type StreamId = (TrackId, Option<Rid>);
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GlobalKeyframeRequest {
     pub shard_id: usize,
     pub origin: ParticipantId,

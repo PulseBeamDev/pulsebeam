@@ -39,12 +39,17 @@ struct Routing {
     remote_shards: IndexSet<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ShardCommand {
     PublishTrack(Track, RoomId),
     RequestKeyframe(GlobalKeyframeRequest),
-    RegisterParticipant(ParticipantConfig),
-    UnregisterParticipant { participant_id: ParticipantId },
+    RegisterParticipant {
+        shard_id: usize,
+        cfg: ParticipantConfig,
+    },
+    UnregisterParticipant {
+        participant_id: ParticipantId,
+    },
 }
 
 pub enum CrossShardEvent {
@@ -496,13 +501,12 @@ impl ShardWorker {
                 p.handle_remote_keyframe_request(req.stream_id, req.kind);
                 self.input_dirty.insert(req.origin);
             }
-            ShardCommand::RegisterParticipant(cfg) => {
-                self.participant_shards
-                    .insert(cfg.participant_id, cfg.shard_id);
+            ShardCommand::RegisterParticipant { shard_id, mut cfg } => {
+                self.participant_shards.insert(cfg.participant_id, shard_id);
                 let ufrag = cfg.ufrag();
                 // Register the ufrag in this shard's demuxer so that STUN packets
                 // arriving on the wrong shard can still be identified and forwarded.
-                if cfg.shard_id == self.router.shard_id {
+                if shard_id == self.router.shard_id {
                     let participant_id = cfg.participant_id;
                     let room_id = cfg.room_id;
                     self.add_participant(participant_id, cfg);

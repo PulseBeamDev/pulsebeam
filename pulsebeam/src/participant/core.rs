@@ -54,19 +54,18 @@ pub enum DisconnectReason {
     SystemTerminated,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
     pub rtc: Rtc,
     pub available_tracks: Vec<Track>,
-    pub shard_id: usize,
 }
 
 impl ParticipantConfig {
     // TODO: wrap rtc instead
-    pub fn ufrag(&self) -> String {
+    pub fn ufrag(&mut self) -> String {
         self.rtc.direct_api().local_ice_credentials().ufrag
     }
 }
