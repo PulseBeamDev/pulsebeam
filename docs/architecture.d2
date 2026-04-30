@@ -1,0 +1,104 @@
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+  }
+}
+
+# --- STYLING ---
+classes: {
+  control_box: {
+    style: {
+      fill: "#2c3e50"
+      font-color: "#ffffff"
+      stroke-width: 2
+      border-radius: 10
+    }
+  }
+  shard_style: {
+    style: {
+      fill: "#f8f9fa"
+      stroke: "#27ae60"
+      stroke-width: 2
+      border-radius: 8
+    }
+  }
+}
+
+# --- TOP SECTION: MANAGEMENT ---
+Control_Layer: {
+  style: { stroke-width: 0; fill: transparent }
+  
+  Control_Plane: {
+    class: control_box
+    label: "CONTROL PLANE (Thread 0)"
+    
+    grid-columns: 2
+    State: "Global State" { shape: cylinder }
+    Logic: "Orchestrator" { shape: hexagon }
+    
+    State <-> Logic
+  }
+}
+
+# Forced vertical separation
+Control_Layer -> Data_Layer: { style: { stroke-width: 0 } }
+
+# --- BOTTOM SECTION: DATA PLANES ---
+Data_Layer: {
+  style: { stroke-width: 0; fill: transparent }
+  grid-columns: 3
+
+  Shard_1: {
+    class: shard_style
+    label: "Core 1"
+    Socket: "UDP:443 (REUSE)" { shape: hexagon }
+    Pipeline: "Packet Pipeline" { shape: queue }
+    Room_A: "Room A (Partial)" { shape: cylinder; style: { fill: "#f1948a" } }
+    
+    Socket -> Pipeline -> Room_A
+  }
+
+  Shard_2: {
+    class: shard_style
+    label: "Core 2"
+    Socket: "UDP:443 (REUSE)" { shape: hexagon }
+    Pipeline: "Packet Pipeline" { shape: queue }
+    Room_A: "Room A (Partial)" { shape: cylinder; style: { fill: "#f1948a" } }
+    
+    Socket -> Pipeline -> Room_A
+  }
+
+  Shard_N: {
+    class: shard_style
+    label: "Core N-1"
+    Socket: "UDP:443 (REUSE)" { shape: hexagon }
+    Pipeline: "Packet Pipeline" { shape: queue }
+    Room_B: "Room B (Full)" { shape: cylinder; style: { fill: "#85c1e9" } }
+    
+    Socket -> Pipeline -> Room_B
+  }
+}
+
+# --- CONSOLIDATED COMMUNICATION ---
+
+# Combined Command & Event Bus
+# Connecting to the Data_Layer container instead of individual shards 
+# indicates a broadcast/multiplexed communication channel.
+Control_Layer.Control_Plane <-> Data_Layer: "Commands & Event Bus" {
+  style: { 
+    stroke: "#3498db"
+    stroke-width: 5
+    # A double-headed arrow representing bidirectional control flow
+  }
+}
+
+# Inter-shard Relay (Media Data Plane)
+# We keep these detailed as they represent cross-core affinity/latency
+Data_Layer.Shard_1.Pipeline <-> Data_Layer.Shard_2.Pipeline: "Relay" { 
+  style: { stroke: "#e67e22"; stroke-width: 2 } 
+}
+Data_Layer.Shard_2.Pipeline <-> Data_Layer.Shard_N.Pipeline: "Relay" { 
+  style: { stroke: "#e67e22"; stroke-width: 2; stroke-dash: 3 } 
+}
