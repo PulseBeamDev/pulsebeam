@@ -88,6 +88,7 @@ impl UdpTransportReader {
         let mut slot = vec![0u8; CHUNK_SIZE];
         match self.sock.try_recv_from(&mut slot) {
             Ok((n, source)) => {
+                debug_assert!(n <= CHUNK_SIZE, "scalar recv length exceeds maximum UDP chunk size");
                 slot.truncate(n);
                 out.push(RecvPacketBatch {
                     transport: Transport::Udp(UdpMode::Scalar),
@@ -95,7 +96,7 @@ impl UdpTransportReader {
                     dst: self.local_addr,
                     buf: slot,
                     offset: 0,
-                    stride: n,
+                    stride: 0,
                     len: n,
                 });
             }

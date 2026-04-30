@@ -75,6 +75,9 @@ impl Batcher {
 
     pub fn flush(&mut self, socket: &net::UnifiedSocket) {
         while let Some(state) = self.front() {
+            debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
+            debug_assert!(state.segment_size != 0, "BatcherState must have a nonzero segment_size before flush");
+            debug_assert!(state.buf.len() <= state.max_segments * BatcherState::MAX_MTU, "Batch exceeds configured UDP batch capacity");
             let res = socket.try_send_batch(&net::SendPacketBatch {
                 dst: state.dst,
                 buf: &state.buf,
@@ -121,6 +124,9 @@ impl BatcherState {
 
     /// Attempts to append a content slice to the buffer. Returns true on success.
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
+        debug_assert!(!content.is_empty(), "Segment content must not be empty");
+        debug_assert!(content.len() <= Self::MAX_MTU, "Segment content exceeds maximum supported MTU");
+
         if self.sealed {
             return false;
         }
@@ -138,10 +144,12 @@ impl BatcherState {
         }
 
         if content.len() == self.segment_size {
+            debug_assert!(self.buf.len() + content.len() <= self.max_segments * Self::MAX_MTU);
             self.buf.extend_from_slice(content);
             self.segment_count += 1;
             true
         } else if content.len() < self.segment_size {
+            debug_assert!(self.buf.len() + content.len() <= self.max_segments * Self::MAX_MTU);
             self.buf.extend_from_slice(content);
             self.segment_count += 1;
             self.sealed = true;
@@ -320,5 +328,43 @@ mod tests {
         assert_eq!(batch.buf.len(), 29);
         let batch = batcher.pop_front().unwrap();
         assert_eq!(batch.buf.len(), 18);
+    }
+
+    #[test]
+    fn test_segment_capacity_limits_and_batch_creation() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(2);
+
+        batcher.push_back(addr, &[1; 500]);
+        batcher.push_back(addr, &[2; 500]);
+        batcher.push_back(addr, &[3; 500]);
+
+        assert_eq!(batcher.active_states.len(), 2);
+        let first = batcher.pop_front().unwrap();
+        assert_eq!(first.segment_count, 2);
+        assert_eq!(first.buf.len(), 1000);
+        assert!(!first.sealed);
+
+        let second = batcher.pop_front().unwrap();
+        assert_eq!(second.segment_count, 1);
+        assert_eq!(second.buf.len(), 500);
+        assert_eq!(second.segment_size, 500);
+    }
+
+    #[test]
+    fn test_batcher_seals_on_smaller_tail_packet() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(3);
+
+        batcher.push_back(addr, &[1; 1000]);
+        batcher.push_back(addr, &[2; 1000]);
+        batcher.push_back(addr, &[3; 500]);
+
+        assert_eq!(batcher.active_states.len(), 1);
+        let batch = &batcher.active_states[0];
+        assert!(batch.sealed);
+        assert_eq!(batch.segment_size, 1000);
+        assert_eq!(batch.segment_count, 3);
+        assert_eq!(batch.buf.len(), 2500);
     }
 }

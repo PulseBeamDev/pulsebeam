@@ -177,6 +177,7 @@ impl UdpTransportReader {
                         let mut seg_off = 0;
                         while seg_off < m.len {
                             let seg_len = stride.min(m.len - seg_off);
+                            debug_assert!(seg_len > 0, "computed UDP segment length must be nonzero");
                             let src = &self.batch_buffer[base + seg_off..base + seg_off + seg_len];
                             out.push(RecvPacketBatch {
                                 src: m.addr,
@@ -223,6 +224,8 @@ impl UdpTransportWriter {
     #[inline]
     pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
+        debug_assert!(!batch.buf.is_empty(), "SendPacketBatch buffer must not be empty");
+        debug_assert!(batch.segment_size <= batch.buf.len(), "SendPacketBatch segment_size must not exceed total buffer length");
         let transmit = quinn_udp::Transmit {
             destination: batch.dst,
             ecn: None,
@@ -242,5 +245,67 @@ impl UdpTransportWriter {
                 Err(err)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{net::SocketAddr, time::Duration};
+    use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn udp_transport_reader_receives_packet() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut transport = bind(addr, None).await.unwrap();
+        let local_addr = transport.local_addr();
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"test-udp-payload", &local_addr).await.unwrap();
+
+        transport.readable().await.unwrap();
+        let mut out = Vec::new();
+        let count = transport.try_recv_batch(&mut out).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data(), b"test-udp-payload");
+        assert_eq!(out[0].src, sender.local_addr().unwrap());
+        assert_eq!(out[0].dst, local_addr);
+    }
+
+    #[tokio::test]
+    async fn udp_transport_writer_sends_payload_without_corruption() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let transport = bind(addr, None).await.unwrap();
+        let send_addr = transport.local_addr();
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = receiver.local_addr().unwrap();
+
+        let payload = (0..1500).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+        let batch = SendPacketBatch {
+            dst: recv_addr,
+            buf: &payload,
+            segment_size: 500,
+        };
+
+        transport.writable().await.unwrap();
+        let sent = transport.try_send_batch(&batch).unwrap();
+        assert!(sent, "UDP transport should accept the batch for egress");
+
+        let mut buf = vec![0u8; 2048];
+        let mut received = Vec::with_capacity(payload.len());
+
+        while received.len() < payload.len() {
+            let (n, peer) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for UDP packet")
+                .expect("failed to receive UDP packet");
+            assert_eq!(peer, send_addr);
+            received.extend_from_slice(&buf[..n]);
+        }
+
+        assert_eq!(received, payload);
     }
 }
