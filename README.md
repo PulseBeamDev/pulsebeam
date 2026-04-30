@@ -14,6 +14,10 @@ PulseBeam is an open source, general-purpose WebRTC SFU server for connecting br
 
 If your client device speaks WebRTC, it can communicate with PulseBeam.
 
+## Technical Targets
+
+- CPU induced p99 jitter: <2ms
+
 ## Compatibility
 
 PulseBeam is opinionated about media handling to prioritize battery efficiency, hardware support, and predictable performance:
