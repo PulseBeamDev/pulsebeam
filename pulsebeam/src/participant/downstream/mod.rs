@@ -1,8 +1,6 @@
 mod audio;
 mod video;
 
-use crate::bitrate::BitrateController;
-use crate::bitrate::BitrateControllerConfig;
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::participant::downstream::audio::AudioAllocator;
@@ -42,7 +40,7 @@ impl Default for SlotConfig {
 
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
-    available_bandwidth: BitrateController,
+    available_bandwidth: Bitrate,
     pub video: VideoAllocator,
     audio: AudioAllocator,
 }
@@ -50,7 +48,7 @@ pub struct DownstreamAllocator {
 impl DownstreamAllocator {
     pub fn new(_participant_id: ParticipantId, manual_sub: bool) -> Self {
         Self {
-            available_bandwidth: BitrateControllerConfig::available_bandwidth().build(),
+            available_bandwidth: MIN_BANDWIDTH,
             video: VideoAllocator::new(manual_sub),
             audio: AudioAllocator::new(),
             dirty_allocation: false,
@@ -86,15 +84,13 @@ impl DownstreamAllocator {
     }
 
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
-        self.available_bandwidth.update(available_bandwidth);
+        self.available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         self.dirty_allocation = true;
     }
 
     pub fn update_allocations(&mut self, bwe: &mut Bwe) {
         self.dirty_allocation = false;
-        let desired = self
-            .video
-            .update_allocations(self.available_bandwidth.current());
+        let desired = self.video.update_allocations(self.available_bandwidth);
         bwe.set_desired_bitrate(desired);
     }
 
@@ -104,8 +100,7 @@ impl DownstreamAllocator {
 
     pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, events: &mut EventQueue) {
         self.update_allocations(bwe);
-        self.video
-            .poll_slow(now, self.available_bandwidth.current(), events);
+        self.video.poll_slow(now, self.available_bandwidth, events);
     }
 
     pub fn unsubscribe_all(&mut self) -> Vec<(StreamId, usize)> {

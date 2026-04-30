@@ -494,8 +494,10 @@ impl Slot {
         // TODO: check old staging, and buffer keyframe.
         let mut changed = false;
 
-        // Check if the staging layer is actually different
-        if self.staging.as_ref() != Some(new_layer) {
+        // Check if the current effective target already matches the requested layer.
+        // This avoids re-staging an already-active layer and emitting duplicate
+        // allocation logs when the desired allocation is re-applied.
+        if self.target().as_ref() != Some(&new_layer) {
             self.staging = Some(new_layer.clone());
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
@@ -973,6 +975,28 @@ mod assignment_tests {
 
         let desired = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
+    }
+
+    #[test]
+    fn switch_to_same_active_layer_is_idempotent() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        let track_id = tracks.ids[0];
+        let layer = allocator
+            .tracks
+            .get(&track_id)
+            .unwrap()
+            .lowest_quality()
+            .clone();
+
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.active = Some(layer.clone());
+        slot.staging = None;
+        slot.paused = false;
+
+        assert!(!slot.switch_to(&layer, false), "re-applying the same active layer should not mark a change");
     }
 
     #[test]
