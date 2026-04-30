@@ -287,11 +287,12 @@ impl VideoAllocator {
         while let Some(pkt) = slot.switcher.pop() {
             writer.write_owned(pkt, &slot.ssrc, slot.pt);
         }
-        // After draining all staged packets the switcher clears its internal
-        // staging buffer; that is the right moment to promote staging→active so
-        // that subsequent packets take the push() path instead of stage().
-        if slot.switcher.ready_to_switch() && slot.staging.is_some() {
+        // Only promote staging→active once we have actually seen packets for the
+        // current staging layer. Otherwise an empty staging buffer will appear
+        // ready immediately and can prematurely switch away from the old stream.
+        if slot.should_promote_staging() {
             slot.active = slot.staging.take();
+            slot.staging_packet_seen = false;
         }
     }
 
@@ -632,6 +633,10 @@ impl Slot {
         }
     }
 
+    fn should_promote_staging(&self) -> bool {
+        self.staging_packet_seen && self.switcher.ready_to_switch() && self.staging.is_some()
+    }
+
     fn matches_stream_id(&self, stream_id: &StreamId) -> bool {
         if self.paused {
             return false;
@@ -882,6 +887,7 @@ mod assignment_tests {
     use super::*;
     use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId};
     use crate::participant::event::{ControlEvent, EventQueue, ParticipantEvent};
+    use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
     use std::collections::VecDeque;
     use str0m::bwe::Bitrate;
@@ -1177,6 +1183,52 @@ mod assignment_tests {
             events
                 .iter()
                 .any(|event| matches!(event, ParticipantEvent::Topology(_)))
+        );
+    }
+
+    #[test]
+    fn does_not_promote_staging_before_staging_packets() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+
+        let mid = Mid::from("v0");
+        let (tx, track) = make_video_track(
+            pid,
+            mid,
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m")],
+        );
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        allocator.add_track(Track {
+            meta: tx.meta.clone(),
+            layers: track.layers,
+        });
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.tracks.get(&tx.meta.id).unwrap();
+        let high = track.by_quality(LayerQuality::High).unwrap().clone();
+        let medium = track.by_quality(LayerQuality::Medium).unwrap().clone();
+
+        let slot_key = allocator.slots.keys().next().unwrap().clone();
+        let slot = allocator.slots.get_mut(slot_key).unwrap();
+        slot.active = Some(high.clone());
+        slot.staging = Some(medium.clone());
+        slot.paused = false;
+
+        let mut pkt = RtpPacket::default();
+        pkt.seq_no = 1.into();
+
+        slot.process(&high.stream_id(), &pkt);
+
+        assert!(
+            !slot.should_promote_staging(),
+            "staging should not promote before any staging packets are seen"
+        );
+        assert_eq!(slot.active.as_ref().unwrap().stream_id(), high.stream_id());
+        assert_eq!(
+            slot.staging.as_ref().unwrap().stream_id(),
+            medium.stream_id()
         );
     }
 

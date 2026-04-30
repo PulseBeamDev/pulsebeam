@@ -22,12 +22,17 @@ use tokio::time::Instant;
 pub struct Timeline {
     clock_rate: Frequency,
     /// The last output seq_no actually written (used to compute `base` on rebase).
-    max_output: u16,
-    /// Additive offset: output = (input + base) & 0xFFFF.
-    base: u16,
+    max_output: u64,
+    /// Additive offset: output = input + base.
+    seq_base: u64,
     /// Whether any packet has been forwarded yet.
     started: bool,
-    anchor: Option<Instant>,
+    /// The last output rtp_ts written (used to compute `ts_base` on rebase).
+    max_output_ts: u32,
+    /// Additive offset for RTP timestamps.
+    ts_base: u32,
+    /// The playout time of the last output packet.
+    last_playout_time: Option<Instant>,
 }
 
 impl Timeline {
@@ -35,10 +40,12 @@ impl Timeline {
     pub fn new_with_base(clock_rate: Frequency, base_seq_no: u16) -> Self {
         Self {
             clock_rate,
-            max_output: base_seq_no,
-            base: 0,
+            max_output: base_seq_no as u64,
+            seq_base: 0,
             started: false,
-            anchor: None,
+            max_output_ts: 0,
+            ts_base: 0,
+            last_playout_time: None,
         }
     }
 
@@ -72,15 +79,21 @@ impl Timeline {
     }
 
     fn rebase_inner(&mut self, packet: &RtpPacket) {
-        let input_seq = *packet.seq_no as u16;
+        let input_seq = *packet.seq_no;
         // Make the first output from the new stream follow max_output.
-        // output = (input + base) mod 2^16 = max_output + 1
-        // => base = (max_output + 1 - input) mod 2^16
-        self.base = self.max_output.wrapping_add(1).wrapping_sub(input_seq);
+        self.seq_base = self.max_output.wrapping_add(1).wrapping_sub(input_seq);
         self.started = false;
 
-        if self.anchor.is_none() {
-            self.anchor = Some(packet.playout_time);
+        let input_ts = packet.rtp_ts.numer() as u32;
+
+        if let Some(last_playout) = self.last_playout_time {
+            let time_delta = packet.playout_time.saturating_duration_since(last_playout);
+            let ts_delta = (time_delta.as_secs_f64() * (self.clock_rate.get() as f64)) as u32;
+            let expected_ts = self.max_output_ts.wrapping_add(ts_delta);
+            self.ts_base = expected_ts.wrapping_sub(input_ts);
+        } else {
+            // Preserve the original timestamp offset on the first packet.
+            self.ts_base = 0;
         }
     }
 
@@ -88,32 +101,26 @@ impl Timeline {
     /// never arrive here.  Call this before `rewrite` for the packet immediately
     /// following the filtered run.
     pub fn drop_count(&mut self, n: u16) {
-        self.base = self.base.wrapping_sub(n);
+        self.seq_base = self.seq_base.wrapping_sub(n as u64);
     }
 
     pub fn rewrite(&mut self, pkt: &mut RtpPacket) {
-        let input_seq = *pkt.seq_no as u16;
-        let output_seq = input_seq.wrapping_add(self.base);
-        pkt.seq_no = SeqNo::from(output_seq as u64);
+        let input_seq = *pkt.seq_no;
+        let output_seq = input_seq.wrapping_add(self.seq_base);
+        pkt.seq_no = SeqNo::from(output_seq);
 
-        if !self.started || wrapping_gt(output_seq, self.max_output) {
+        if !self.started || output_seq > self.max_output {
             self.max_output = output_seq;
         }
         self.started = true;
 
-        let anchor = self
-            .anchor
-            .expect("rebase must have occured before rewriting to create the first anchor");
+        let input_ts = pkt.rtp_ts.numer() as u32;
+        let output_ts = input_ts.wrapping_add(self.ts_base);
+        pkt.rtp_ts = MediaTime::new(output_ts as u64, self.clock_rate);
 
-        let duration = pkt.playout_time.saturating_duration_since(anchor);
-        pkt.rtp_ts = MediaTime::from(duration).rebase(self.clock_rate);
+        self.max_output_ts = output_ts;
+        self.last_playout_time = Some(pkt.playout_time);
     }
-}
-
-/// Returns true if `a` is strictly after `b` in the wrapping u16 seq space.
-#[inline]
-fn wrapping_gt(a: u16, b: u16) -> bool {
-    a.wrapping_sub(b) < 0x8000 && a != b
 }
 
 #[cfg(test)]
@@ -129,6 +136,7 @@ mod test {
         // Packet 1: First packet (Keyframe) - requires rebase
         let mut p1 = RtpPacket {
             seq_no: 100.into(),
+            rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
             playout_time: start_time,
             is_keyframe_start: true,
             ..Default::default()
@@ -141,6 +149,7 @@ mod test {
         // Packet 2: Regular packet, 100ms later
         let mut p2 = RtpPacket {
             seq_no: 101.into(),
+            rtp_ts: MediaTime::new(19000, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(100),
             is_keyframe_start: false,
             ..Default::default()
@@ -168,6 +177,7 @@ mod test {
         // --- Stream A (Seq 1000-1001) ---
         let mut p_a1 = RtpPacket {
             seq_no: 1000.into(),
+            rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
             playout_time: start_time,
             is_keyframe_start: true,
             ..Default::default()
@@ -178,6 +188,7 @@ mod test {
 
         let mut p_a2 = RtpPacket {
             seq_no: 1001.into(),
+            rtp_ts: MediaTime::new(13000, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(33),
             is_keyframe_start: false,
             ..Default::default()
@@ -188,6 +199,7 @@ mod test {
         // Stream B arrives 100ms after start, starting at random Seq 5000
         let mut p_b1 = RtpPacket {
             seq_no: 5000.into(),
+            rtp_ts: MediaTime::new(80000, Frequency::NINETY_KHZ), // Random initial timestamp
             playout_time: start_time + Duration::from_millis(100),
             is_keyframe_start: true,
             ..Default::default()
@@ -204,10 +216,11 @@ mod test {
         );
 
         // Verify Timestamp linearity
-        // A1=0ms, B1=100ms. Diff should be 9000 ticks.
-        // The timeline calculates B1 based on (B1.time - anchor), where anchor is A1.time
-        let ts_diff = p_b1.rtp_ts.numer().wrapping_sub(p_a1.rtp_ts.numer());
-        assert_eq!(ts_diff, 9000, "Timestamp should be linear across switch");
+        // A2 was at 33ms. B1 is at 100ms. Time delta is 67ms.
+        // 67ms at 90kHz = 6030 ticks.
+        // So B1 should be A2 + 6030 ticks.
+        let ts_diff = p_b1.rtp_ts.numer().wrapping_sub(p_a2.rtp_ts.numer());
+        assert_eq!(ts_diff, 6030, "Timestamp should be linear across switch");
     }
 
     #[test]
@@ -265,49 +278,26 @@ mod test {
         assert_eq!(*p_wrap.seq_no, (*p_next.seq_no).wrapping_add(1));
     }
 
-    #[test]
-    #[should_panic(expected = "rebase must have occured before rewriting")]
-    fn test_panic_if_no_rebase() {
-        let start_time = Instant::now();
-        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
-
-        // Packet without rebase
-        let mut p1 = RtpPacket {
-            seq_no: 100.into(),
-            playout_time: start_time,
-            is_keyframe_start: true,
-            ..Default::default()
-        };
-
-        // This should panic because anchor is None
-        timeline.rewrite(&mut p1);
-    }
+    // removed test test_panic_if_no_rebase
 
     #[test]
     fn test_late_packet_ordering() {
-        // Ensures that if a packet arrives late (playout time < previous),
-        // the timestamp is calculated correctly relative to anchor.
         let start_time = Instant::now();
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
-        // Packet 1 (Base)
         let mut p1 = RtpPacket {
             seq_no: 10.into(),
+            rtp_ts: MediaTime::new(1000, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(100),
             is_keyframe_start: true,
             ..Default::default()
         };
-        timeline.rebase(&p1); // Sets anchor at T+100ms
+        timeline.rebase(&p1);
         timeline.rewrite(&mut p1);
 
-        // Packet 2 (Arrives with earlier playout time due to reordering/jitter)
-        // T+50ms (Before anchor)
-        // Since `saturating_duration_since` is used, this should clamp to 0
-        // or handle gracefully depending on logic.
-        // The current logic: playout.saturating_duration_since(anchor)
-        // If playout < anchor, result is 0.
         let mut p2 = RtpPacket {
             seq_no: 11.into(),
+            rtp_ts: MediaTime::new(1500, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(50),
             is_keyframe_start: false,
             ..Default::default()
@@ -315,8 +305,7 @@ mod test {
 
         timeline.rewrite(&mut p2);
 
-        // Anchor is at T+100. P2 is at T+50.
-        // saturating_duration_since(100) returns 0.
-        assert_eq!(p2.rtp_ts.numer(), 0);
+        // rtp_ts should just be linearly transformed, preserving input timing
+        assert_eq!(p2.rtp_ts.numer().wrapping_sub(p1.rtp_ts.numer()), 500);
     }
 }

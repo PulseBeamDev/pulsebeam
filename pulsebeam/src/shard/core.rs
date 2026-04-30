@@ -293,7 +293,9 @@ impl ShardCore {
             }
             ClusterCommand::RequestKeyframe(req) => {
                 let p = self.participants.get_mut(&req.origin)?;
-                p.handle_remote_keyframe_request(req.stream_id, req.kind);
+                let _guard = p.span.enter();
+                p.core
+                    .handle_remote_keyframe_request(req.stream_id, req.kind);
                 self.input_dirty.insert(req.origin);
             }
             ClusterCommand::RegisterParticipant {
@@ -421,7 +423,9 @@ impl ShardCore {
             }
             CrossShardEvent::KeyframeRequested(req) => {
                 if let Some(p) = self.participants.get_mut(&req.origin) {
-                    p.handle_remote_keyframe_request(req.stream_id, req.kind);
+                    let _guard = p.span.enter();
+                    p.core
+                        .handle_remote_keyframe_request(req.stream_id, req.kind);
                     self.input_dirty.insert(req.origin);
                 }
             }
