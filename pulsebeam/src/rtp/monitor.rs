@@ -388,7 +388,7 @@ impl BitrateEstimate {
         let config = BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(10),
             max_bitrate: Bitrate::mbps(5),
-            default_bitrate: Bitrate::kbps(300),
+            default_bitrate: Bitrate::kbps(100),
             ..Default::default()
         };
 

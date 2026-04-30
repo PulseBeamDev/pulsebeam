@@ -20,7 +20,10 @@ const VIDEO_MAX_SLOTS: usize = 25;
 /// How long to wait between PLI retries while a slot is in a transition state.
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Maximum number of PLI retries before giving up and waiting for a natural keyframe.
+/// After repeated retries, continue to probe the stream with lower-frequency keep-alives.
+const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
 slotmap::new_key_type! {
@@ -290,7 +293,7 @@ impl VideoAllocator {
     }
 
     pub fn poll_slow(&mut self, now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {
-        self.reconcile_routes(events);
+        self.reconcile_routes(now, events);
         self.retry_keyframe_requests(now, events);
     }
 
@@ -312,29 +315,37 @@ impl VideoAllocator {
             let last_at = slot.staging_keyframe_last_at;
             let retries = slot.staging_keyframe_retries;
 
-            let should_request =
-                last_at.is_none_or(|last| now.duration_since(last) >= KEYFRAME_RETRY_INTERVAL);
+            let should_request = last_at
+                .is_none_or(|last| now.duration_since(last) >= slot.staging_keyframe_interval);
             if !should_request {
                 continue;
             }
 
-            if retries >= KEYFRAME_MAX_RETRIES {
-                // Retries exhausted: stay subscribed but stop sending PLIs.
-                // Update last_at so we re-evaluate at the next interval without
-                // logging on every tick.
-                slot.staging_keyframe_last_at = Some(now);
-                continue;
+            let staging_has_packets = slot.staging_packet_seen;
+            let keepalive_mode = retries >= KEYFRAME_MAX_RETRIES;
+            let reached_keepalive = !keepalive_mode && retries + 1 == KEYFRAME_MAX_RETRIES;
+            if !keepalive_mode {
+                slot.staging_keyframe_retries += 1;
             }
-
-            slot.staging_keyframe_retries += 1;
             slot.staging_keyframe_last_at = Some(now);
 
-            if slot.staging_keyframe_retries == KEYFRAME_MAX_RETRIES {
-                tracing::warn!(
-                    mid = %slot.mid,
-                    retries = KEYFRAME_MAX_RETRIES,
-                    "slot transition stalled; stopping PLI retries, waiting for natural keyframe"
-                );
+            if reached_keepalive {
+                slot.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
+                if staging_has_packets {
+                    tracing::warn!(
+                        mid = %slot.mid,
+                        retries = KEYFRAME_MAX_RETRIES,
+                        interval = ?slot.staging_keyframe_interval,
+                        "slot transition stalled; switching to low-frequency keep-alive PLIs while waiting for a natural keyframe"
+                    );
+                } else {
+                    tracing::debug!(
+                        mid = %slot.mid,
+                        retries = KEYFRAME_MAX_RETRIES,
+                        interval = ?slot.staging_keyframe_interval,
+                        "slot transition still waiting for any packets on the staged stream; using low-frequency keep-alive PLIs"
+                    );
+                }
             }
 
             to_request.push(staging_clone);
@@ -345,7 +356,7 @@ impl VideoAllocator {
         }
     }
 
-    pub fn reconcile_routes(&mut self, events: &mut EventQueue) {
+    pub fn reconcile_routes(&mut self, now: Instant, events: &mut EventQueue) {
         // Pass 1: remove routes that no longer match any active slot.
         let to_remove: Vec<StreamId> = self
             .routes
@@ -372,7 +383,9 @@ impl VideoAllocator {
         }
 
         // Pass 2: add routes for active slots not yet in the table.
-        for (key, slot) in self.slots.iter() {
+        let keys: Vec<_> = self.slots.keys().collect();
+        for key in keys {
+            let slot = &self.slots[key];
             if slot.paused {
                 continue;
             }
@@ -382,6 +395,11 @@ impl VideoAllocator {
                 e.insert(key);
                 events.subscribe(layer);
                 events.request_keyframe(layer);
+
+                if let Some(slot) = self.slots.get_mut(key) {
+                    slot.staging_keyframe_retries = 1;
+                    slot.staging_keyframe_last_at = Some(now);
+                }
             }
         }
     }
@@ -426,10 +444,14 @@ struct Slot {
     max_height: u32,
     paused: bool,
 
+    /// Whether we have observed any packets for the current staging layer.
+    staging_packet_seen: bool,
     /// Number of PLI retries sent for the current staging layer.
     staging_keyframe_retries: u32,
     /// When the last PLI retry was sent for the current staging layer.
     staging_keyframe_last_at: Option<Instant>,
+    /// Current retry interval for PLI probes while waiting for the staging keyframe.
+    staging_keyframe_interval: Duration,
 }
 
 impl Slot {
@@ -448,8 +470,10 @@ impl Slot {
             max_height: 720,
             paused: true,
 
+            staging_packet_seen: false,
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
+            staging_keyframe_interval: KEYFRAME_RETRY_INTERVAL,
         }
     }
 
@@ -477,8 +501,10 @@ impl Slot {
             // previous stream doesn't mix with the new stream's packets.
             self.switcher.clear();
             // Reset retry state so the new staging layer gets fresh PLI attempts.
+            self.staging_packet_seen = false;
             self.staging_keyframe_retries = 0;
             self.staging_keyframe_last_at = None;
+            self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
             changed = true;
         }
 
@@ -494,8 +520,10 @@ impl Slot {
     fn stop(&mut self) {
         self.active = None;
         self.staging = None;
+        self.staging_packet_seen = false;
         self.staging_keyframe_retries = 0;
         self.staging_keyframe_last_at = None;
+        self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
     }
 
     fn pause_at(&mut self, layer: &TrackLayer) -> bool {
@@ -510,6 +538,7 @@ impl Slot {
 
         if self.staging.as_ref() != Some(layer) {
             self.staging = Some(layer.clone());
+            self.staging_packet_seen = false;
             changed = true;
         }
 
@@ -533,6 +562,7 @@ impl Slot {
         } else if let Some(staging) = self.staging.as_ref()
             && staging.is(stream_id)
         {
+            self.staging_packet_seen = true;
             self.switcher.stage(pkt.clone());
         }
     }
@@ -769,10 +799,12 @@ impl AllocationEngine {
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
-    use crate::entity::{ParticipantId, TrackId};
+    use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId};
+    use crate::participant::event::{ControlEvent, EventQueue, ParticipantEvent};
     use crate::track::{UpstreamTrack, test_utils::make_video_track};
     use str0m::bwe::Bitrate;
     use str0m::media::Mid;
+    use std::collections::VecDeque;
 
     #[derive(Default)]
     struct FakeRouter {
@@ -879,6 +911,40 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 2);
         add_slots(&mut allocator, 2);
         assert_eq!(allocator.slots().count(), 2);
+    }
+
+    #[test]
+    fn route_subscription_initializes_keyframe_retry_state() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+        let _tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
+        let mut events = VecDeque::new();
+        let mut rtp_events = VecDeque::new();
+        let now = Instant::now();
+
+        {
+            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
+            allocator.reconcile_routes(now, &mut queue);
+        }
+
+        assert_eq!(
+            events.iter().filter(|event| matches!(event, ParticipantEvent::Control(ControlEvent::KeyframeRequested(_)))).count(),
+            1
+        );
+
+        {
+            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
+            allocator.retry_keyframe_requests(now, &mut queue);
+        }
+
+        assert_eq!(
+            events.iter().filter(|event| matches!(event, ParticipantEvent::Control(ControlEvent::KeyframeRequested(_)))).count(),
+            1,
+            "retry_keyframe_requests should not send an immediate duplicate PLI after reconcile_routes"
+        );
     }
 
     #[test]

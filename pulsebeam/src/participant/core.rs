@@ -303,7 +303,7 @@ impl ParticipantCore {
             if self.downstream.dirty_allocation {
                 // Make sure rtc is updated with new allocations
                 self.downstream.update_allocations(&mut self.rtc.bwe());
-                self.downstream.reconcile_routes(events);
+                self.downstream.reconcile_routes(now, events);
                 continue;
             }
 
