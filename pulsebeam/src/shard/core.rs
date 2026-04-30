@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::ops::DerefMut;
+use std::{collections::VecDeque, ops::Deref};
 
 use ahash::HashMap;
 use indexmap::IndexSet;
@@ -38,6 +39,25 @@ pub(super) struct RoomState {
     pub(super) audio_selector: crate::audio_selector::TopNAudioSelector,
 }
 
+struct ParticipantMeta {
+    span: tracing::Span,
+    core: ParticipantCore,
+}
+
+impl Deref for ParticipantMeta {
+    type Target = ParticipantCore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for ParticipantMeta {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
 /// Abstraction over the cross-shard message bus.
 pub(crate) trait CrossShardSend {
     fn send(&self, shard_id: usize, ev: CrossShardEvent);
@@ -51,7 +71,7 @@ pub(crate) struct ShardCore {
     pub(crate) shard_id: usize,
     max_gso_segments: usize,
     pub(super) demuxer: Demuxer,
-    pub(super) participants: HashMap<ParticipantId, ParticipantCore>,
+    pub(super) participants: HashMap<ParticipantId, ParticipantMeta>,
     pub(super) rooms: HashMap<RoomId, RoomState>,
     pub(super) routing: HashMap<StreamId, Routing>,
     pub(super) participant_shards: HashMap<ParticipantId, usize>,
@@ -415,10 +435,20 @@ impl ShardCore {
         router: &impl CrossShardSend,
     ) {
         self.remove_participant(&participant_id, router);
+        let span = tracing::info_span!(
+            "participant",
+            room_id = %cfg.room_id,
+            participant_id = %cfg.participant_id
+        );
         let mut participant = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
+        let ufrag = participant.ufrag();
+        let meta = ParticipantMeta {
+            core: participant,
+            span,
+        };
         self.demuxer
-            .register_ice_ufrag(participant.ufrag().as_bytes(), participant_id);
-        self.participants.insert(participant_id, participant);
+            .register_ice_ufrag(ufrag.as_bytes(), participant_id);
+        self.participants.insert(participant_id, meta);
         tracing::info!(%participant_id, "participant added to shard");
     }
 
@@ -426,7 +456,7 @@ impl ShardCore {
         &mut self,
         participant_id: &ParticipantId,
         router: &impl CrossShardSend,
-    ) -> Option<ParticipantCore> {
+    ) -> Option<ParticipantMeta> {
         let mut participant = self.participants.remove(participant_id)?;
         if let Some(room) = self.rooms.get_mut(&participant.room_id) {
             room.members.swap_remove(participant_id);
@@ -470,7 +500,7 @@ impl ShardCore {
 pub(super) fn poll_participants(
     now: Instant,
     dirty: &IndexSet<ParticipantId, ahash::RandomState>,
-    participants: &mut HashMap<ParticipantId, ParticipantCore>,
+    participants: &mut HashMap<ParticipantId, ParticipantMeta>,
     events: &mut VecDeque<ParticipantEvent>,
     rtp_events: &mut VecDeque<RtpEvent>,
 ) {
@@ -480,7 +510,8 @@ pub(super) fn poll_participants(
         };
         let room_id = participant.room_id;
         let mut queue = EventQueue::new(participant_id, room_id, events, rtp_events);
-        participant.poll(now, &mut queue);
+        let _guard = participant.span.enter();
+        participant.core.poll(now, &mut queue);
     }
 }
 
@@ -488,7 +519,7 @@ pub(super) fn handle_rtp(
     stream_id: StreamId,
     pkt: &RtpPacket,
     routing: &HashMap<StreamId, Routing>,
-    participants: &mut HashMap<ParticipantId, ParticipantCore>,
+    participants: &mut HashMap<ParticipantId, ParticipantMeta>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
     router: &impl CrossShardSend,
 ) -> Option<()> {
@@ -499,8 +530,10 @@ pub(super) fn handle_rtp(
                 let Some(sub) = participants.get_mut(participant_id) else {
                     continue;
                 };
-                let mut writer = StreamWriter(&mut sub.rtc);
-                sub.downstream.on_forward_rtp(&stream_id, pkt, &mut writer);
+                let mut writer = StreamWriter(&mut sub.core.rtc);
+                sub.core
+                    .downstream
+                    .on_forward_rtp(&stream_id, pkt, &mut writer);
                 dirty.insert(*participant_id);
             }
             for &shard_id in &route.remote_shards {
@@ -521,7 +554,7 @@ pub(super) fn handle_rtp(
 pub(super) fn handle_audio_rtp(
     mut ev: RtpEvent,
     rooms: &mut HashMap<RoomId, RoomState>,
-    participants: &mut HashMap<ParticipantId, ParticipantCore>,
+    participants: &mut HashMap<ParticipantId, ParticipantMeta>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
     router: &impl CrossShardSend,
 ) {
@@ -554,8 +587,9 @@ pub(super) fn handle_audio_rtp(
         let Some(sub) = participants.get_mut(&participant_id) else {
             continue;
         };
-        let mut writer = StreamWriter(&mut sub.rtc);
-        sub.downstream
+        let mut writer = StreamWriter(&mut sub.core.rtc);
+        sub.core
+            .downstream
             .on_forward_audio_rtp(slot_idx, &ev.pkt, &mut writer);
         dirty.insert(participant_id);
     }
@@ -938,7 +972,7 @@ mod tests {
         routing.insert(stream, route);
 
         let pkt = RtpPacket::default();
-        let mut participants: HashMap<ParticipantId, ParticipantCore> = HashMap::default();
+        let mut participants: HashMap<ParticipantId, ParticipantMeta> = HashMap::default();
         let mut dirty: IndexSet<ParticipantId, ahash::RandomState> =
             IndexSet::with_hasher(ahash::RandomState::default());
 

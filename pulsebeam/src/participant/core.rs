@@ -232,15 +232,6 @@ impl ParticipantCore {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }
 
-    pub fn remove_available_tracks(&mut self, _tracks: &HashMap<entity::TrackId, Track>) {
-        // for track in tracks.values() {
-        //     self.downstream.remove_track(track);
-        // }
-        self.signaling.mark_tracks_dirty();
-        self.signaling.mark_assignments_dirty();
-    }
-
-    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
     fn poll_slow(&mut self, now: Instant, events: &mut EventQueue) {
         self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         self.upstream.poll_slow(now);
