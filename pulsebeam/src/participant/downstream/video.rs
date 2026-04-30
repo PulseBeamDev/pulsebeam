@@ -360,30 +360,23 @@ impl VideoAllocator {
     }
 
     pub fn reconcile_routes(&mut self, now: Instant, events: &mut EventQueue) {
-        // Pass 1: remove routes that no longer match any active or staging slot.
+        // Pass 1: remove routes that no longer match the slot they point to.
+        // This also removes stale route mappings that were pointing at a slot
+        // that no longer claims the stream.
         let to_remove: Vec<StreamId> = self
             .routes
-            .keys()
-            .filter(|sid| {
-                !self.slots.values().any(|s| {
-                            if s.paused {
-                        return false;
-                    }
-                    s.active
-                        .as_ref()
-                        .map(|l| l.stream_id() == (*sid).clone())
-                        .unwrap_or(false)
-                        || s.staging
-                            .as_ref()
-                            .map(|l| l.stream_id() == (*sid).clone())
-                            .unwrap_or(false)
-                })
+            .iter()
+            .filter_map(|(sid, slot_key)| {
+                let remove = match self.slots.get(*slot_key) {
+                    Some(slot) => !slot.matches_stream_id(sid),
+                    None => true,
+                };
+                remove.then_some(sid.clone())
             })
-            .copied()
             .collect();
 
         for sid in &to_remove {
-            tracing::debug!(stream_id=?sid, "route removed: no matching active or staging slot");
+            tracing::debug!(stream_id=?sid, "route removed: route no longer matches its mapped slot");
             self.routes.remove(sid);
             // TODO: check how safe this is
             let Some(track) = self.tracks.get(&sid.0) else {
@@ -444,6 +437,11 @@ impl VideoAllocator {
                 }
             }
         }
+
+        debug_assert!(
+            self.routes_consistent(),
+            "route table inconsistent after reconcile_routes"
+        );
     }
 
     pub fn unsubscribe_all(&mut self) -> Vec<(StreamId, usize)> {
@@ -461,6 +459,14 @@ impl VideoAllocator {
             slot.stop();
         }
         subs
+    }
+
+    fn routes_consistent(&self) -> bool {
+        self.routes.iter().all(|(sid, slot_key)| {
+            self.slots
+                .get(*slot_key)
+                .map_or(false, |slot| slot.matches_stream_id(sid))
+        })
     }
 }
 
@@ -624,6 +630,22 @@ impl Slot {
         } else {
             tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
         }
+    }
+
+    fn matches_stream_id(&self, stream_id: &StreamId) -> bool {
+        if self.paused {
+            return false;
+        }
+
+        self.active
+            .as_ref()
+            .map(|l| l.stream_id() == *stream_id)
+            .unwrap_or(false)
+            || self
+                .staging
+                .as_ref()
+                .map(|l| l.stream_id() == *stream_id)
+                .unwrap_or(false)
     }
 }
 
@@ -861,9 +883,9 @@ mod assignment_tests {
     use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId};
     use crate::participant::event::{ControlEvent, EventQueue, ParticipantEvent};
     use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
+    use std::collections::VecDeque;
     use str0m::bwe::Bitrate;
     use str0m::media::{Mid, SimulcastLayer};
-    use std::collections::VecDeque;
 
     #[derive(Default)]
     struct FakeRouter {
@@ -896,7 +918,10 @@ mod assignment_tests {
             }
 
             ids.push(meta.id);
-            allocator.add_track(Track { meta, layers: track.layers });
+            allocator.add_track(Track {
+                meta,
+                layers: track.layers,
+            });
             senders.push(tx);
         }
 
@@ -990,7 +1015,13 @@ mod assignment_tests {
         }
 
         assert_eq!(
-            events.iter().filter(|event| matches!(event, ParticipantEvent::Control(ControlEvent::KeyframeRequested(_)))).count(),
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ParticipantEvent::Control(ControlEvent::KeyframeRequested(_))
+                ))
+                .count(),
             1
         );
 
@@ -1000,7 +1031,13 @@ mod assignment_tests {
         }
 
         assert_eq!(
-            events.iter().filter(|event| matches!(event, ParticipantEvent::Control(ControlEvent::KeyframeRequested(_)))).count(),
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ParticipantEvent::Control(ControlEvent::KeyframeRequested(_))
+                ))
+                .count(),
             1,
             "retry_keyframe_requests should not send an immediate duplicate PLI after reconcile_routes"
         );
@@ -1022,7 +1059,10 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let track_id = tx.meta.id;
-        allocator.add_track(Track { meta: tx.meta.clone(), layers: track.layers });
+        allocator.add_track(Track {
+            meta: tx.meta.clone(),
+            layers: track.layers,
+        });
         add_slots(&mut allocator, 1);
 
         let track = allocator.tracks.get(&track_id).unwrap();
@@ -1047,11 +1087,20 @@ mod assignment_tests {
         assert!(allocator.routes.contains_key(&low.stream_id()));
         assert!(allocator.routes.contains_key(&high.stream_id()));
         assert_eq!(
-            events.iter().filter(|event| matches!(event, ParticipantEvent::Topology(_))).count(),
+            events
+                .iter()
+                .filter(|event| matches!(event, ParticipantEvent::Topology(_)))
+                .count(),
             2
         );
         assert_eq!(
-            events.iter().filter(|event| matches!(event, ParticipantEvent::Control(ControlEvent::KeyframeRequested(_)))).count(),
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ParticipantEvent::Control(ControlEvent::KeyframeRequested(_))
+                ))
+                .count(),
             1
         );
     }
@@ -1084,7 +1133,51 @@ mod assignment_tests {
         }
 
         assert!(allocator.routes.is_empty());
-        assert!(events.iter().any(|event| matches!(event, ParticipantEvent::Topology(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ParticipantEvent::Topology(_)))
+        );
+    }
+
+    #[test]
+    fn reconcile_routes_corrects_invalid_route_slot_mapping() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 2);
+
+        let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
+        let low = track.lowest_quality().clone();
+        let slot_keys: Vec<_> = allocator.slots.keys().collect();
+        let correct_slot_key = slot_keys[0];
+        let stale_slot_key = slot_keys[1];
+
+        let slot = allocator.slots.get_mut(correct_slot_key).unwrap();
+        slot.active = Some(low.clone());
+        slot.paused = false;
+
+        allocator.routes.insert(low.stream_id(), stale_slot_key);
+
+        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
+        let mut events = VecDeque::new();
+        let mut rtp_events = VecDeque::new();
+        let now = Instant::now();
+
+        {
+            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
+            allocator.reconcile_routes(now, &mut queue);
+        }
+
+        assert_eq!(
+            allocator.routes.get(&low.stream_id()),
+            Some(&correct_slot_key)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ParticipantEvent::Topology(_)))
+        );
     }
 
     #[test]
@@ -1134,7 +1227,10 @@ mod assignment_tests {
         slot.staging = None;
         slot.paused = false;
 
-        assert!(!slot.switch_to(&layer, false), "re-applying the same active layer should not mark a change");
+        assert!(
+            !slot.switch_to(&layer, false),
+            "re-applying the same active layer should not mark a change"
+        );
     }
 
     #[test]
@@ -1146,7 +1242,11 @@ mod assignment_tests {
         let (_, track) = make_video_track(
             pid,
             mid,
-            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+            vec![
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("m"),
+                SimulcastLayer::new("l"),
+            ],
         );
         let mut track = track;
         for layer in &mut track.layers {
@@ -1163,7 +1263,10 @@ mod assignment_tests {
         slot.paused = false;
 
         assert!(slot.switch_to(&new_stage, false));
-        assert_eq!(slot.staging.as_ref().unwrap().stream_id(), new_stage.stream_id());
+        assert_eq!(
+            slot.staging.as_ref().unwrap().stream_id(),
+            new_stage.stream_id()
+        );
     }
 
     #[test]
@@ -1175,7 +1278,11 @@ mod assignment_tests {
         let (_, track) = make_video_track(
             pid,
             mid,
-            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+            vec![
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("m"),
+                SimulcastLayer::new("l"),
+            ],
         );
         let mut track = track;
         for layer in &mut track.layers {
@@ -1193,7 +1300,10 @@ mod assignment_tests {
 
         assert!(slot.switch_to(&active, false));
         assert!(slot.staging.is_none());
-        assert_eq!(slot.active.as_ref().unwrap().stream_id(), active.stream_id());
+        assert_eq!(
+            slot.active.as_ref().unwrap().stream_id(),
+            active.stream_id()
+        );
     }
 
     #[test]
@@ -1205,7 +1315,11 @@ mod assignment_tests {
         let (_, track) = make_video_track(
             pid,
             mid,
-            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+            vec![
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("m"),
+                SimulcastLayer::new("l"),
+            ],
         );
         let mut track = track;
         for layer in &mut track.layers {
@@ -1222,7 +1336,10 @@ mod assignment_tests {
         slot.paused = false;
 
         assert!(slot.switch_to(&new_stage, false));
-        assert_eq!(slot.staging.as_ref().unwrap().stream_id(), new_stage.stream_id());
+        assert_eq!(
+            slot.staging.as_ref().unwrap().stream_id(),
+            new_stage.stream_id()
+        );
     }
 
     #[test]
@@ -1238,7 +1355,10 @@ mod assignment_tests {
         }
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
-        allocator.add_track(Track { meta, layers: track.layers });
+        allocator.add_track(Track {
+            meta,
+            layers: track.layers,
+        });
         assert_eq!(allocator.slots().count(), 3);
     }
 }
@@ -1266,7 +1386,11 @@ mod allocation_tests {
         let (tx, track) = make_video_track(
             ParticipantId::new(),
             Mid::from("t"),
-            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+            vec![
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("m"),
+                SimulcastLayer::new("l"),
+            ],
         );
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
