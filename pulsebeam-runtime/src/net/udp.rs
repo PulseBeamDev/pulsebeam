@@ -164,6 +164,13 @@ impl UdpTransportReader {
                             continue;
                         }
 
+                        debug_assert!(m.len <= CHUNK_SIZE, "RecvMeta.len exceeds UDP chunk size");
+                        debug_assert!(m.stride <= CHUNK_SIZE, "RecvMeta.stride exceeds UDP chunk size");
+                        debug_assert!(base + m.len <= self.batch_buffer.len());
+                        if base + m.len > self.batch_buffer.len() {
+                            continue;
+                        }
+
                         // Iterate GRO segments: each becomes one pool slot + RecvPacketBatch.
                         // One memcpy per segment is unavoidable when de-bundling GRO;
                         // the batch_buffer itself is reused across calls (no allocation).

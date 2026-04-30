@@ -541,6 +541,11 @@ impl Slot {
         // allocation logs when the desired allocation is re-applied.
         let old_target = self.target().map(|l| l.stream_id());
         if self.target().as_ref() != Some(&new_layer) {
+            if matches!(self.state(), SlotState::Starting | SlotState::Switching) {
+                tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "deferring layer switch while existing transition is in flight");
+                return false;
+            }
+
             self.staging = Some(new_layer.clone());
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
@@ -854,9 +859,9 @@ mod assignment_tests {
     use super::*;
     use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId};
     use crate::participant::event::{ControlEvent, EventQueue, ParticipantEvent};
-    use crate::track::{UpstreamTrack, test_utils::make_video_track};
+    use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
     use str0m::bwe::Bitrate;
-    use str0m::media::Mid;
+    use str0m::media::{Mid, SimulcastLayer};
     use std::collections::VecDeque;
 
     #[derive(Default)]
@@ -1001,6 +1006,87 @@ mod assignment_tests {
     }
 
     #[test]
+    fn staging_preserves_old_route_until_switch_complete() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+
+        let mid = Mid::from("v0");
+        let track_layers = vec![
+            SimulcastLayer::new("h"),
+            SimulcastLayer::new("m"),
+            SimulcastLayer::new("l"),
+        ];
+        let (tx, track) = make_video_track(pid, mid, track_layers);
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        let track_id = tx.meta.id;
+        allocator.add_track(Track { meta: tx.meta.clone(), layers: track.layers });
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.tracks.get(&track_id).unwrap();
+        let low = track.lowest_quality().clone();
+        let high = track.by_quality(LayerQuality::High).unwrap().clone();
+
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.active = Some(low.clone());
+        slot.staging = Some(high.clone());
+        slot.paused = false;
+
+        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
+        let mut events = VecDeque::new();
+        let mut rtp_events = VecDeque::new();
+        let now = Instant::now();
+
+        {
+            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
+            allocator.reconcile_routes(now, &mut queue);
+        }
+
+        assert!(allocator.routes.contains_key(&low.stream_id()));
+        assert!(allocator.routes.contains_key(&high.stream_id()));
+        assert_eq!(
+            events.iter().filter(|event| matches!(event, ParticipantEvent::Topology(_))).count(),
+            2
+        );
+        assert_eq!(
+            events.iter().filter(|event| matches!(event, ParticipantEvent::Control(ControlEvent::KeyframeRequested(_)))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn route_removed_only_when_slot_has_no_active_or_staging_target() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
+        let old_stream_id = track.lowest_quality().stream_id();
+        let slot_key = allocator.slots.keys().next().unwrap().clone();
+        allocator.routes.insert(old_stream_id, slot_key);
+
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.active = None;
+        slot.staging = None;
+        slot.paused = false;
+
+        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
+        let mut events = VecDeque::new();
+        let mut rtp_events = VecDeque::new();
+        let now = Instant::now();
+
+        {
+            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
+            allocator.reconcile_routes(now, &mut queue);
+        }
+
+        assert!(allocator.routes.is_empty());
+        assert!(events.iter().any(|event| matches!(event, ParticipantEvent::Topology(_))));
+    }
+
+    #[test]
     fn removing_track_releases_slot() {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
@@ -1048,6 +1134,35 @@ mod assignment_tests {
         slot.paused = false;
 
         assert!(!slot.switch_to(&layer, false), "re-applying the same active layer should not mark a change");
+    }
+
+    #[test]
+    fn switch_to_does_not_override_ongoing_transition() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+
+        let mid = Mid::from("v0");
+        let (tx, track) = make_video_track(
+            pid,
+            mid,
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+        );
+        let mut track = track;
+        for layer in &mut track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        allocator.add_slot(mid, SlotConfig::default());
+        let slot = allocator.slots.values_mut().next().unwrap();
+        let staging = track.by_quality(LayerQuality::Medium).unwrap().clone();
+        let new_stage = track.by_quality(LayerQuality::High).unwrap().clone();
+
+        slot.active = None;
+        slot.staging = Some(staging.clone());
+        slot.paused = false;
+
+        assert!(!slot.switch_to(&new_stage, false));
+        assert_eq!(slot.staging.as_ref().unwrap().stream_id(), staging.stream_id());
     }
 
     #[test]

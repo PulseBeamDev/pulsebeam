@@ -36,7 +36,10 @@ impl RecvPacketBatch {
     /// Returns the exact byte slice for this packet (accounts for `offset`).
     #[inline]
     pub fn data(&self) -> &[u8] {
-        &self.buf[self.offset..self.offset + self.len]
+        match self.offset.checked_add(self.len) {
+            Some(end) => self.buf.get(self.offset..end).unwrap_or(&[]),
+            None => &[],
+        }
     }
 
     pub fn iter(&self) -> RecvPacketBatchIter<'_> {
@@ -83,8 +86,13 @@ impl<'a> Iterator for RecvPacketBatchIter<'a> {
             return None;
         }
         let abs_start = self.batch.offset + self.offset;
+        let abs_end = abs_start.checked_add(seg_len)?;
+        if abs_end > self.batch.buf.len() {
+            return None;
+        }
+
         self.offset += seg_len;
-        Some(&self.batch.buf[abs_start..abs_start + seg_len])
+        Some(&self.batch.buf[abs_start..abs_end])
     }
 }
 
@@ -203,5 +211,67 @@ fn fmt_bytes(b: usize) -> String {
         format!("{}KB", b / KB)
     } else {
         format!("{}B", b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:1234".parse().unwrap()
+    }
+
+    #[test]
+    fn recv_packet_batch_data_returns_exact_slice() {
+        let batch = RecvPacketBatch {
+            src: test_addr(),
+            dst: test_addr(),
+            buf: vec![1, 2, 3, 4, 5],
+            offset: 1,
+            stride: 0,
+            len: 3,
+            transport: Transport::Udp(UdpMode::Scalar),
+        };
+
+        assert_eq!(batch.data(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn recv_packet_batch_iter_yields_multiple_segments_without_off_by_one() {
+        let batch = RecvPacketBatch {
+            src: test_addr(),
+            dst: test_addr(),
+            buf: (0u8..20).collect(),
+            offset: 0,
+            stride: 6,
+            len: 20,
+            transport: Transport::Udp(UdpMode::Scalar),
+        };
+
+        let chunks: Vec<&[u8]> = batch.iter().collect();
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0], &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(chunks[1], &[6, 7, 8, 9, 10, 11]);
+        assert_eq!(chunks[2], &[12, 13, 14, 15, 16, 17]);
+        assert_eq!(chunks[3], &[18, 19]);
+    }
+
+    #[test]
+    fn recv_packet_batch_iter_single_segment_stride_zero() {
+        let batch = RecvPacketBatch {
+            src: test_addr(),
+            dst: test_addr(),
+            buf: (0u8..10).collect(),
+            offset: 0,
+            stride: 0,
+            len: 10,
+            transport: Transport::Udp(UdpMode::Scalar),
+        };
+
+        let chunks: Vec<&[u8]> = batch.iter().collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 }
