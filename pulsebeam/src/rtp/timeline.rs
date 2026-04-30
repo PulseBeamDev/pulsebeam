@@ -28,9 +28,9 @@ pub struct Timeline {
     /// Whether any packet has been forwarded yet.
     started: bool,
     /// The last output rtp_ts written (used to compute `ts_base` on rebase).
-    max_output_ts: u32,
+    max_output_ts: u64,
     /// Additive offset for RTP timestamps.
-    ts_base: u32,
+    ts_base: u64,
     /// The playout time of the last output packet.
     last_playout_time: Option<Instant>,
 }
@@ -88,11 +88,11 @@ impl Timeline {
             .into();
         self.started = false;
 
-        let input_ts = packet.rtp_ts.numer() as u32;
+        let input_ts = packet.rtp_ts.numer();
 
         if let Some(last_playout) = self.last_playout_time {
             let time_delta = packet.playout_time.saturating_duration_since(last_playout);
-            let ts_delta = (time_delta.as_secs_f64() * (self.clock_rate.get() as f64)) as u32;
+            let ts_delta = (time_delta.as_secs_f64() * (self.clock_rate.get() as f64)) as u64;
             let expected_ts = self.max_output_ts.wrapping_add(ts_delta);
             self.ts_base = expected_ts.wrapping_sub(input_ts);
         } else {
@@ -118,9 +118,9 @@ impl Timeline {
         }
         self.started = true;
 
-        let input_ts = pkt.rtp_ts.numer() as u32;
+        let input_ts = pkt.rtp_ts.numer();
         let output_ts = input_ts.wrapping_add(self.ts_base);
-        pkt.rtp_ts = MediaTime::new(output_ts as u64, self.clock_rate);
+        pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);
 
         self.max_output_ts = output_ts;
         self.last_playout_time = Some(pkt.playout_time);
