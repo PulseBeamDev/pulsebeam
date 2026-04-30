@@ -273,7 +273,7 @@ impl ShardCore {
     fn on_cluster_command(
         &mut self,
         cmd: ClusterCommand,
-        router: &impl CrossShardSend,
+        _router: &impl CrossShardSend,
     ) -> Option<()> {
         match cmd {
             ClusterCommand::PublishTrack(track, room_id) => {

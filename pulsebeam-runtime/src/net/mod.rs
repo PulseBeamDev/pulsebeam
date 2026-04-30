@@ -36,8 +36,14 @@ impl RecvPacketBatch {
     /// Returns the exact byte slice for this packet (accounts for `offset`).
     #[inline]
     pub fn data(&self) -> &[u8] {
-        debug_assert!(self.offset <= self.buf.len(), "RecvPacketBatch.offset is out of bounds");
-        debug_assert!(self.len <= self.buf.len().saturating_sub(self.offset), "RecvPacketBatch.len is out of bounds");
+        debug_assert!(
+            self.offset <= self.buf.len(),
+            "RecvPacketBatch.offset is out of bounds"
+        );
+        debug_assert!(
+            self.len <= self.buf.len().saturating_sub(self.offset),
+            "RecvPacketBatch.len is out of bounds"
+        );
         match self.offset.checked_add(self.len) {
             Some(end) => self.buf.get(self.offset..end).unwrap_or(&[]),
             None => &[],

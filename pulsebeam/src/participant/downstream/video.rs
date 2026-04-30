@@ -371,7 +371,7 @@ impl VideoAllocator {
                     Some(slot) => !slot.matches_stream_id(sid),
                     None => true,
                 };
-                remove.then_some(sid.clone())
+                remove.then_some(*sid)
             })
             .collect();
 
@@ -465,7 +465,7 @@ impl VideoAllocator {
         self.routes.iter().all(|(sid, slot_key)| {
             self.slots
                 .get(*slot_key)
-                .map_or(false, |slot| slot.matches_stream_id(sid))
+                .is_some_and(|slot| slot.matches_stream_id(sid))
         })
     }
 }

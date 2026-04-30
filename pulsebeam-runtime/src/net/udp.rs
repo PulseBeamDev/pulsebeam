@@ -165,7 +165,10 @@ impl UdpTransportReader {
                         }
 
                         debug_assert!(m.len <= CHUNK_SIZE, "RecvMeta.len exceeds UDP chunk size");
-                        debug_assert!(m.stride <= CHUNK_SIZE, "RecvMeta.stride exceeds UDP chunk size");
+                        debug_assert!(
+                            m.stride <= CHUNK_SIZE,
+                            "RecvMeta.stride exceeds UDP chunk size"
+                        );
                         debug_assert!(base + m.len <= self.batch_buffer.len());
                         if base + m.len > self.batch_buffer.len() {
                             continue;
@@ -177,7 +180,10 @@ impl UdpTransportReader {
                         let mut seg_off = 0;
                         while seg_off < m.len {
                             let seg_len = stride.min(m.len - seg_off);
-                            debug_assert!(seg_len > 0, "computed UDP segment length must be nonzero");
+                            debug_assert!(
+                                seg_len > 0,
+                                "computed UDP segment length must be nonzero"
+                            );
                             let src = &self.batch_buffer[base + seg_off..base + seg_off + seg_len];
                             out.push(RecvPacketBatch {
                                 src: m.addr,
@@ -224,8 +230,14 @@ impl UdpTransportWriter {
     #[inline]
     pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
-        debug_assert!(!batch.buf.is_empty(), "SendPacketBatch buffer must not be empty");
-        debug_assert!(batch.segment_size <= batch.buf.len(), "SendPacketBatch segment_size must not exceed total buffer length");
+        debug_assert!(
+            !batch.buf.is_empty(),
+            "SendPacketBatch buffer must not be empty"
+        );
+        debug_assert!(
+            batch.segment_size <= batch.buf.len(),
+            "SendPacketBatch segment_size must not exceed total buffer length"
+        );
         let transmit = quinn_udp::Transmit {
             destination: batch.dst,
             ecn: None,
@@ -261,7 +273,10 @@ mod tests {
         let local_addr = transport.local_addr();
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender.send_to(b"test-udp-payload", &local_addr).await.unwrap();
+        sender
+            .send_to(b"test-udp-payload", &local_addr)
+            .await
+            .unwrap();
 
         transport.readable().await.unwrap();
         let mut out = Vec::new();
@@ -298,10 +313,11 @@ mod tests {
         let mut received = Vec::with_capacity(payload.len());
 
         while received.len() < payload.len() {
-            let (n, peer) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
-                .await
-                .expect("timed out waiting for UDP packet")
-                .expect("failed to receive UDP packet");
+            let (n, peer) =
+                tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+                    .await
+                    .expect("timed out waiting for UDP packet")
+                    .expect("failed to receive UDP packet");
             assert_eq!(peer, send_addr);
             received.extend_from_slice(&buf[..n]);
         }

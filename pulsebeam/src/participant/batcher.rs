@@ -76,8 +76,14 @@ impl Batcher {
     pub fn flush(&mut self, socket: &net::UnifiedSocket) {
         while let Some(state) = self.front() {
             debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
-            debug_assert!(state.segment_size != 0, "BatcherState must have a nonzero segment_size before flush");
-            debug_assert!(state.buf.len() <= state.max_segments * BatcherState::MAX_MTU, "Batch exceeds configured UDP batch capacity");
+            debug_assert!(
+                state.segment_size != 0,
+                "BatcherState must have a nonzero segment_size before flush"
+            );
+            debug_assert!(
+                state.buf.len() <= state.max_segments * BatcherState::MAX_MTU,
+                "Batch exceeds configured UDP batch capacity"
+            );
             let res = socket.try_send_batch(&net::SendPacketBatch {
                 dst: state.dst,
                 buf: &state.buf,
@@ -125,7 +131,10 @@ impl BatcherState {
     /// Attempts to append a content slice to the buffer. Returns true on success.
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
         debug_assert!(!content.is_empty(), "Segment content must not be empty");
-        debug_assert!(content.len() <= Self::MAX_MTU, "Segment content exceeds maximum supported MTU");
+        debug_assert!(
+            content.len() <= Self::MAX_MTU,
+            "Segment content exceeds maximum supported MTU"
+        );
 
         if self.sealed {
             return false;
