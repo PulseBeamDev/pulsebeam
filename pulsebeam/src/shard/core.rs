@@ -300,8 +300,9 @@ impl ShardCore {
                 track_ids,
             } => {
                 for (participant_id, participant) in self.participants.iter_mut() {
-                    participant.on_tracks_unpublished(track_ids.as_slice());
-                    self.input_dirty.insert(*participant_id);
+                    if participant.on_tracks_unpublished(track_ids.as_slice()) {
+                        self.input_dirty.insert(*participant_id);
+                    }
                 }
             }
         }

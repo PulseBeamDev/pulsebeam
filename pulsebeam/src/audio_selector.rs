@@ -273,8 +273,8 @@ mod tests {
     /// A single loud packet from an unknown stream should claim an empty slot.
     #[test]
     fn loud_packet_claims_empty_slot() {
-        let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
+        let base = Instant::now();
         let id = make_stream();
         let result = sel.filter(id, &mut pkt_at(base, 0, 0));
         assert!(result.is_some(), "loud packet must claim an empty slot");
@@ -296,8 +296,8 @@ mod tests {
     /// After owning a slot, a quiet (DTX) packet from the owner must still be forwarded.
     #[test]
     fn owner_dtx_packet_forwarded() {
-        let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
+        let base = Instant::now();
         let id = make_stream();
         // Claim a slot with a loud packet.
         sel.filter(id, &mut pkt_at(base, 0, 0));
@@ -367,8 +367,8 @@ mod tests {
     /// A much louder newcomer (>+5dB) must evict the quietest active slot.
     #[test]
     fn much_louder_newcomer_steals_active_slot() {
-        let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
+        let base = Instant::now();
         // All 5 slots active with moderate level (-20 dBov).
         // Send continuous loud packets to keep last_loud_ts fresh (within 500ms).
         let incumbents = fill_slots(&mut sel, base, 0);
@@ -449,8 +449,8 @@ mod tests {
 
     #[test]
     fn remove_track_frees_slot() {
-        let base = Instant::now();
         let mut sel = TopNAudioSelector::new();
+        let base = Instant::now();
         let id = make_stream();
         sel.filter(id, &mut pkt_at(base, 0, 0));
         assert!(slot_owners(&sel).contains(&Some(id)));

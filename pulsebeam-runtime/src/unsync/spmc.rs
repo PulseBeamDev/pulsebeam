@@ -106,6 +106,15 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        unsafe {
+            *self.ring.closed.get() = true;
+        }
+        self.ring.event.notify(usize::MAX);
+    }
+}
+
 pub struct Receiver<T> {
     ring: Rc<Ring<T>>,
     next_seq: usize,

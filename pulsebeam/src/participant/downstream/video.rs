@@ -64,7 +64,10 @@ impl VideoAllocator {
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
         for slot in self.slots.values_mut() {
-            if slot.staging.as_ref().is_some_and(|l| l.meta.id == *track_id)
+            if slot
+                .staging
+                .as_ref()
+                .is_some_and(|l| l.meta.id == *track_id)
                 || slot.active.as_ref().is_some_and(|l| l.meta.id == *track_id)
             {
                 slot.stop();
@@ -591,7 +594,7 @@ pub struct SlotView<'a> {
     pub current_quality: LayerQuality,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AllocationDecision<'a> {
     Forward(&'a TrackLayer, Bitrate),
     Pause(&'a TrackLayer),
@@ -763,10 +766,6 @@ impl AllocationEngine {
     }
 }
 
-// NOTE: assignment_tests and allocation_tests were written against an older
-// VideoAllocator API and do not compile against the current codebase.
-// They are disabled until the tests are updated to match the new API.
-#[cfg(any())]
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
@@ -806,7 +805,7 @@ mod assignment_tests {
             }
 
             ids.push(meta.id);
-            allocator.add_track(meta, track.layers);
+            allocator.add_track(Track { meta, layers: track.layers });
             senders.push(tx);
         }
 
@@ -906,7 +905,7 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
-        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000));
+        let desired = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
     }
 
@@ -923,12 +922,11 @@ mod assignment_tests {
         }
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
-        allocator.add_track(meta, track.layers);
+        allocator.add_track(Track { meta, layers: track.layers });
         assert_eq!(allocator.slots().count(), 3);
     }
 }
 
-#[cfg(any())]
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
@@ -939,15 +937,27 @@ mod allocation_tests {
     use str0m::bwe::Bitrate;
     use str0m::media::Mid;
 
+    fn next_slot_key() -> SlotKey {
+        use std::cell::RefCell;
+        thread_local! {
+            static KEY_SM: RefCell<SlotMap<SlotKey, ()>> = RefCell::new(SlotMap::with_key());
+        }
+        KEY_SM.with(|sm| sm.borrow_mut().insert(()))
+    }
+
     fn healthy_track() -> Track {
-        let (tx, track) = make_video_track(ParticipantId::new(), Mid::from("t"), vec![]);
+        use str0m::media::SimulcastLayer;
+        let (tx, track) = make_video_track(
+            ParticipantId::new(),
+            Mid::from("t"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+        );
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
         Track {
             meta: tx.meta,
             layers: track.layers,
-            shard_id: 0,
         }
     }
 
@@ -963,6 +973,7 @@ mod allocation_tests {
 
     fn slot<'a>(mid: &str, priority: u32, track: &'a Track, current: LayerQuality) -> SlotView<'a> {
         SlotView {
+            key: next_slot_key(),
             mid: Mid::from(mid),
             max_height: priority,
             track,
@@ -991,7 +1002,7 @@ mod allocation_tests {
         let (decisions, _) = AllocationEngine::compute(bw(10_000), &slots);
         for s in &slots {
             assert!(
-                decisions.contains_key(&s.mid),
+                decisions.contains_key(&s.key),
                 "slot {} has no decision",
                 s.mid
             );
@@ -1042,7 +1053,7 @@ mod allocation_tests {
         let (decisions, _) = AllocationEngine::compute(bw(100_000), &slots);
         for s in &slots {
             assert!(
-                matches!(decisions[&s.mid], AllocationDecision::Forward(..)),
+                matches!(decisions[&s.key], AllocationDecision::Forward(..)),
                 "slot {} was not forwarded with unlimited bandwidth",
                 s.mid
             );
@@ -1061,7 +1072,7 @@ mod allocation_tests {
         let (decisions, _) = AllocationEngine::compute(bw(0), &slots);
         for s in &slots {
             assert!(
-                matches!(decisions[&s.mid], AllocationDecision::Pause(..)),
+                matches!(decisions[&s.key], AllocationDecision::Pause(..)),
                 "slot {} was not paused with zero bandwidth",
                 s.mid
             );
@@ -1081,13 +1092,13 @@ mod allocation_tests {
             slot("b", 360, &t, LayerQuality::Low),
         ];
         let (decisions, _) = AllocationEngine::compute(bw(0), &slots);
-        for (mid, d) in &decisions {
+        for (key, d) in &decisions {
             if let AllocationDecision::Pause(receiver) = d {
                 // The receiver field must point somewhere meaningful (non-null
                 // is the only invariant we can assert structurally).
                 let _ = receiver; // just asserting it exists via pattern match
             } else if matches!(d, AllocationDecision::Pause(..)) {
-                panic!("Pause for {} is missing its resume receiver", mid);
+                panic!("Pause for {:?} is missing its resume receiver", key);
             }
         }
     }
@@ -1100,18 +1111,18 @@ mod allocation_tests {
     #[test]
     fn bad_high_layer_falls_back_rather_than_pausing() {
         let t = track_with_bad_layer(LayerQuality::High);
-        let mid = Mid::from("a");
         let slots = vec![SlotView {
-            mid,
+            key: next_slot_key(),
+            mid: Mid::from("a"),
             max_height: 1080,
             track: &t,
             current_quality: LayerQuality::High,
         }];
         let (decisions, _) = AllocationEngine::compute(bw(10_000), &slots);
         assert!(
-            matches!(decisions[&mid], AllocationDecision::Forward(..)),
+            matches!(decisions[&slots[0].key], AllocationDecision::Forward(..)),
             "expected Forward fallback when High is bad, got {:?}",
-            decisions[&mid]
+            decisions[&slots[0].key]
         );
     }
 
@@ -1122,7 +1133,7 @@ mod allocation_tests {
         let t = track_with_bad_layer(LayerQuality::High);
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
         let (decisions, _) = AllocationEngine::compute(bw(10_000), &slots);
-        if let AllocationDecision::Forward(receiver, _) = &decisions[&Mid::from("a")] {
+        if let AllocationDecision::Forward(receiver, _) = &decisions[&slots[0].key] {
             assert!(
                 receiver.state.is_healthy(),
                 "engine forwarded to an unhealthy layer: {:?}",
@@ -1144,17 +1155,17 @@ mod allocation_tests {
         // Budget just fits one Low layer (no headroom for downgrade guard).
         let available = bw((low_bps as u64) / 1_000 + 5);
 
-        let mid_high_pri = Mid::from("h");
-        let mid_low_pri = Mid::from("l");
         let slots = vec![
             SlotView {
-                mid: mid_high_pri,
+                key: next_slot_key(),
+                mid: Mid::from("h"),
                 max_height: 1080,
                 track: &t,
                 current_quality: LayerQuality::Low,
             },
             SlotView {
-                mid: mid_low_pri,
+                key: next_slot_key(),
+                mid: Mid::from("l"),
                 max_height: 360,
                 track: &t,
                 current_quality: LayerQuality::Low,
@@ -1164,11 +1175,11 @@ mod allocation_tests {
         let (decisions, _) = AllocationEngine::compute(available, &slots);
 
         assert!(
-            matches!(decisions[&mid_high_pri], AllocationDecision::Forward(..)),
+            matches!(decisions[&slots[0].key], AllocationDecision::Forward(..)),
             "high-priority slot should be forwarded first"
         );
         assert!(
-            matches!(decisions[&mid_low_pri], AllocationDecision::Pause(..)),
+            matches!(decisions[&slots[1].key], AllocationDecision::Pause(..)),
             "low-priority slot should be paused when budget is tight"
         );
     }
@@ -1197,13 +1208,12 @@ mod allocation_tests {
             let (decisions2, _) = AllocationEngine::compute(available, &slots);
 
             prop_assert_eq!(decisions1.len(), decisions2.len());
-            for name in mid_names {
-                let mid = Mid::from(name.as_str());
+            for s in &slots {
                 prop_assert_eq!(
-                    decisions1.get(&mid),
-                    decisions2.get(&mid),
+                    decisions1.get(&s.key),
+                    decisions2.get(&s.key),
                     "decisions differ for slot {} when input order changes",
-                    mid
+                    s.mid
                 );
             }
         }
@@ -1285,7 +1295,6 @@ mod allocation_tests {
     #[test]
     fn downgrade_hysteresis_absorbs_minor_bandwidth_noise() {
         let t = healthy_track();
-        let mid = Mid::from("a");
         let low_bps = layer_bps(&t, LayerQuality::Low);
 
         // 5% below Low cost — inside the 10% dead-band; no downgrade should fire.
@@ -1295,7 +1304,7 @@ mod allocation_tests {
         let (decisions, _) = AllocationEngine::compute(available, &slots);
 
         assert!(
-            matches!(decisions[&mid], AllocationDecision::Forward(..)),
+            matches!(decisions[&slots[0].key], AllocationDecision::Forward(..)),
             "engine downgraded or paused inside the hysteresis dead-band"
         );
     }
@@ -1329,7 +1338,6 @@ mod allocation_tests {
             .quality(StreamQuality::Bad);
 
         let low_bps = layer_bps(&t, LayerQuality::Low);
-        let mid = Mid::from("a");
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
 
         // Bandwidth comfortably covers the only healthy layer.
@@ -1337,7 +1345,7 @@ mod allocation_tests {
         let (decisions, _) = AllocationEngine::compute(available, &slots);
 
         assert!(
-            matches!(decisions[&mid], AllocationDecision::Forward(..)),
+            matches!(decisions[&slots[0].key], AllocationDecision::Forward(..)),
             "single healthy layer should always be forwarded when budget allows"
         );
     }

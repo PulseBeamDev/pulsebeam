@@ -172,13 +172,16 @@ impl ParticipantCore {
         self.signaling.reconcile(&mut self.downstream);
     }
 
-    pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) {
-        for track_id in tracks {
-            self.downstream.remove_track(track_id);
+    pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
+        let removed = tracks
+            .iter()
+            .any(|track_id| self.downstream.remove_track(track_id));
+        if removed {
+            self.signaling.mark_tracks_dirty();
+            self.signaling.mark_assignments_dirty();
+            self.signaling.reconcile(&mut self.downstream);
         }
-        self.signaling.mark_tracks_dirty();
-        self.signaling.mark_assignments_dirty();
-        self.signaling.reconcile(&mut self.downstream);
+        removed
     }
 
     pub fn ufrag(&mut self) -> String {
