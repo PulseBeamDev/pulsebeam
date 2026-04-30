@@ -542,8 +542,14 @@ impl Slot {
         let old_target = self.target().map(|l| l.stream_id());
         if self.target().as_ref() != Some(&new_layer) {
             if matches!(self.state(), SlotState::Starting | SlotState::Switching) {
-                tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "deferring layer switch while existing transition is in flight");
-                return false;
+                let current_quality = self.target().map(|l| l.quality);
+                let should_defer = current_quality
+                    .map(|current_quality| new_layer.quality > current_quality)
+                    .unwrap_or(false);
+                if should_defer {
+                    tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "deferring upgrade while existing transition is in flight");
+                    return false;
+                }
             }
 
             self.staging = Some(new_layer.clone());
@@ -1137,12 +1143,12 @@ mod assignment_tests {
     }
 
     #[test]
-    fn switch_to_does_not_override_ongoing_transition() {
+    fn switch_to_does_not_override_ongoing_upgrade() {
         let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
-        let (tx, track) = make_video_track(
+        let (_, track) = make_video_track(
             pid,
             mid,
             vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
@@ -1163,6 +1169,35 @@ mod assignment_tests {
 
         assert!(!slot.switch_to(&new_stage, false));
         assert_eq!(slot.staging.as_ref().unwrap().stream_id(), staging.stream_id());
+    }
+
+    #[test]
+    fn switch_to_allows_downgrade_during_transition() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+
+        let mid = Mid::from("v0");
+        let (_, track) = make_video_track(
+            pid,
+            mid,
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+        );
+        let mut track = track;
+        for layer in &mut track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        allocator.add_slot(mid, SlotConfig::default());
+        let slot = allocator.slots.values_mut().next().unwrap();
+        let staging = track.by_quality(LayerQuality::High).unwrap().clone();
+        let new_stage = track.by_quality(LayerQuality::Low).unwrap().clone();
+
+        slot.active = None;
+        slot.staging = Some(staging.clone());
+        slot.paused = false;
+
+        assert!(slot.switch_to(&new_stage, false));
+        assert_eq!(slot.staging.as_ref().unwrap().stream_id(), new_stage.stream_id());
     }
 
     #[test]
