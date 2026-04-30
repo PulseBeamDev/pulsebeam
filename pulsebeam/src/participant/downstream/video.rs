@@ -533,25 +533,21 @@ impl Slot {
     }
 
     fn switch_to(&mut self, new_layer: &TrackLayer, _force: bool) -> bool {
-        // TODO: check old staging, and buffer keyframe.
         let mut changed = false;
-
-        // Check if the current effective target already matches the requested layer.
-        // This avoids re-staging an already-active layer and emitting duplicate
-        // allocation logs when the desired allocation is re-applied.
         let old_target = self.target().map(|l| l.stream_id());
-        if self.target().as_ref() != Some(&new_layer) {
-            if matches!(self.state(), SlotState::Starting | SlotState::Switching) {
-                let current_quality = self.target().map(|l| l.quality);
-                let should_defer = current_quality
-                    .map(|current_quality| new_layer.quality > current_quality)
-                    .unwrap_or(false);
-                if should_defer {
-                    tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "deferring upgrade while existing transition is in flight");
-                    return false;
-                }
-            }
 
+        if self.active.as_ref() == Some(new_layer) {
+            if self.staging.is_some() {
+                self.staging = None;
+                self.switcher.clear();
+                self.staging_packet_seen = false;
+                self.staging_keyframe_retries = 0;
+                self.staging_keyframe_last_at = None;
+                self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+                changed = true;
+                tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
+            }
+        } else if self.target().as_ref() != Some(&new_layer) {
             self.staging = Some(new_layer.clone());
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
@@ -565,7 +561,6 @@ impl Slot {
             tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
         }
 
-        // Check if we were previously paused
         if self.paused {
             self.paused = false;
             changed = true;
@@ -1143,7 +1138,7 @@ mod assignment_tests {
     }
 
     #[test]
-    fn switch_to_does_not_override_ongoing_upgrade() {
+    fn switch_to_accepts_ongoing_upgrade() {
         let pid = ParticipantId::new();
         let mut allocator = setup_allocator();
 
@@ -1164,11 +1159,41 @@ mod assignment_tests {
         let new_stage = track.by_quality(LayerQuality::High).unwrap().clone();
 
         slot.active = None;
-        slot.staging = Some(staging.clone());
+        slot.staging = Some(staging);
         slot.paused = false;
 
-        assert!(!slot.switch_to(&new_stage, false));
-        assert_eq!(slot.staging.as_ref().unwrap().stream_id(), staging.stream_id());
+        assert!(slot.switch_to(&new_stage, false));
+        assert_eq!(slot.staging.as_ref().unwrap().stream_id(), new_stage.stream_id());
+    }
+
+    #[test]
+    fn switch_to_cancels_transition_when_target_reverts_to_active() {
+        let pid = ParticipantId::new();
+        let mut allocator = setup_allocator();
+
+        let mid = Mid::from("v0");
+        let (_, track) = make_video_track(
+            pid,
+            mid,
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m"), SimulcastLayer::new("l")],
+        );
+        let mut track = track;
+        for layer in &mut track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        allocator.add_slot(mid, SlotConfig::default());
+        let slot = allocator.slots.values_mut().next().unwrap();
+        let active = track.by_quality(LayerQuality::Low).unwrap().clone();
+        let staging = track.by_quality(LayerQuality::High).unwrap().clone();
+
+        slot.active = Some(active.clone());
+        slot.staging = Some(staging);
+        slot.paused = false;
+
+        assert!(slot.switch_to(&active, false));
+        assert!(slot.staging.is_none());
+        assert_eq!(slot.active.as_ref().unwrap().stream_id(), active.stream_id());
     }
 
     #[test]
