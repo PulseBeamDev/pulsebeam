@@ -106,7 +106,10 @@ impl VideoAllocator {
         if let Some(track_id) = track_id
             && max_height > 0
         {
-            let track_state = tracks.get_mut(track_id)?;
+            let Some(track_state) = tracks.get_mut(track_id) else {
+                tracing::warn!(track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
+                return None;
+            };
 
             // Keep current layer if slot already targets this track to avoid
             // unnecessary PLI requests; otherwise start at lowest quality.
@@ -357,20 +360,30 @@ impl VideoAllocator {
     }
 
     pub fn reconcile_routes(&mut self, now: Instant, events: &mut EventQueue) {
-        // Pass 1: remove routes that no longer match any active slot.
+        // Pass 1: remove routes that no longer match any active or staging slot.
         let to_remove: Vec<StreamId> = self
             .routes
             .keys()
             .filter(|sid| {
-                !self
-                    .slots
-                    .values()
-                    .any(|s| !s.paused && s.target().is_some_and(|l| &l.stream_id() == *sid))
+                !self.slots.values().any(|s| {
+                            if s.paused {
+                        return false;
+                    }
+                    s.active
+                        .as_ref()
+                        .map(|l| l.stream_id() == (*sid).clone())
+                        .unwrap_or(false)
+                        || s.staging
+                            .as_ref()
+                            .map(|l| l.stream_id() == (*sid).clone())
+                            .unwrap_or(false)
+                })
             })
             .copied()
             .collect();
 
         for sid in &to_remove {
+            tracing::debug!(stream_id=?sid, "route removed: no matching active or staging slot");
             self.routes.remove(sid);
             // TODO: check how safe this is
             let Some(track) = self.tracks.get(&sid.0) else {
@@ -382,23 +395,52 @@ impl VideoAllocator {
             events.unsubscribe(layer);
         }
 
-        // Pass 2: add routes for active slots not yet in the table.
+        // Pass 2: add routes for active and staging slot streams not yet in the table.
         let keys: Vec<_> = self.slots.keys().collect();
         for key in keys {
-            let slot = &self.slots[key];
-            if slot.paused {
-                continue;
-            }
-            let Some(layer) = slot.target() else { continue };
-            let sid = layer.stream_id();
-            if let std::collections::hash_map::Entry::Vacant(e) = self.routes.entry(sid) {
-                e.insert(key);
-                events.subscribe(layer);
-                events.request_keyframe(layer);
+            let route_candidates: Vec<(StreamId, bool)> = {
+                let slot = &self.slots[key];
+                if slot.paused {
+                    Vec::new()
+                } else {
+                    let mut ids = Vec::new();
+                    if let Some(active) = slot.active.as_ref() {
+                        ids.push((active.stream_id(), false));
+                    }
+                    if let Some(staging) = slot.staging.as_ref() {
+                        let sid = staging.stream_id();
+                        if ids.last().map(|(id, _)| id != &sid).unwrap_or(true) {
+                            ids.push((sid, true));
+                        }
+                    }
+                    ids
+                }
+            };
 
-                if let Some(slot) = self.slots.get_mut(key) {
-                    slot.staging_keyframe_retries = 1;
-                    slot.staging_keyframe_last_at = Some(now);
+            for (sid, is_staging) in route_candidates {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.routes.entry(sid) {
+                    let layer = {
+                        let slot = &self.slots[key];
+                        if let Some(active) = slot.active.as_ref()
+                            && active.stream_id() == sid
+                        {
+                            active.clone()
+                        } else {
+                            slot.staging.as_ref().unwrap().clone()
+                        }
+                    };
+
+                    tracing::debug!(stream_id=?sid, mid=%self.slots[key].mid, "route added for slot stream");
+                    e.insert(key);
+                    events.subscribe(&layer);
+
+                    if is_staging {
+                        events.request_keyframe(&layer);
+                        if let Some(slot) = self.slots.get_mut(key) {
+                            slot.staging_keyframe_retries = 1;
+                            slot.staging_keyframe_last_at = Some(now);
+                        }
+                    }
                 }
             }
         }
@@ -497,6 +539,7 @@ impl Slot {
         // Check if the current effective target already matches the requested layer.
         // This avoids re-staging an already-active layer and emitting duplicate
         // allocation logs when the desired allocation is re-applied.
+        let old_target = self.target().map(|l| l.stream_id());
         if self.target().as_ref() != Some(&new_layer) {
             self.staging = Some(new_layer.clone());
             // Reset the switcher staging buffer so stale seq-no state from a
@@ -508,18 +551,21 @@ impl Slot {
             self.staging_keyframe_last_at = None;
             self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
             changed = true;
+            tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
         }
 
         // Check if we were previously paused
         if self.paused {
             self.paused = false;
             changed = true;
+            tracing::debug!(mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
         }
 
         changed
     }
 
     fn stop(&mut self) {
+        tracing::debug!(mid=%self.mid, "slot stopped");
         self.active = None;
         self.staging = None;
         self.staging_packet_seen = false;
@@ -542,11 +588,13 @@ impl Slot {
             self.staging = Some(layer.clone());
             self.staging_packet_seen = false;
             changed = true;
+            tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
         }
 
         if !self.paused {
             self.paused = true;
             changed = true;
+            tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot paused");
         }
 
         changed
@@ -554,6 +602,7 @@ impl Slot {
 
     fn process(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
         if self.paused {
+            tracing::trace!(mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
             return;
         }
 
@@ -566,6 +615,8 @@ impl Slot {
         {
             self.staging_packet_seen = true;
             self.switcher.stage(pkt.clone());
+        } else {
+            tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
         }
     }
 }
