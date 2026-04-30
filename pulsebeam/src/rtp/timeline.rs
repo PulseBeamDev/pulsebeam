@@ -22,9 +22,9 @@ use tokio::time::Instant;
 pub struct Timeline {
     clock_rate: Frequency,
     /// The last output seq_no actually written (used to compute `base` on rebase).
-    max_output: u64,
+    max_output: SeqNo,
     /// Additive offset: output = input + base.
-    seq_base: u64,
+    seq_base: SeqNo,
     /// Whether any packet has been forwarded yet.
     started: bool,
     /// The last output rtp_ts written (used to compute `ts_base` on rebase).
@@ -40,8 +40,8 @@ impl Timeline {
     pub fn new_with_base(clock_rate: Frequency, base_seq_no: u16) -> Self {
         Self {
             clock_rate,
-            max_output: base_seq_no as u64,
-            seq_base: 0,
+            max_output: SeqNo::from(base_seq_no as u64),
+            seq_base: SeqNo::default(),
             started: false,
             max_output_ts: 0,
             ts_base: 0,
@@ -81,7 +81,11 @@ impl Timeline {
     fn rebase_inner(&mut self, packet: &RtpPacket) {
         let input_seq = *packet.seq_no;
         // Make the first output from the new stream follow max_output.
-        self.seq_base = self.max_output.wrapping_add(1).wrapping_sub(input_seq);
+        self.seq_base = self
+            .max_output
+            .wrapping_add(1)
+            .wrapping_sub(input_seq)
+            .into();
         self.started = false;
 
         let input_ts = packet.rtp_ts.numer() as u32;
@@ -101,13 +105,13 @@ impl Timeline {
     /// never arrive here.  Call this before `rewrite` for the packet immediately
     /// following the filtered run.
     pub fn drop_count(&mut self, n: u16) {
-        self.seq_base = self.seq_base.wrapping_sub(n as u64);
+        self.seq_base = self.seq_base.wrapping_sub(n as u64).into();
     }
 
     pub fn rewrite(&mut self, pkt: &mut RtpPacket) {
         let input_seq = *pkt.seq_no;
-        let output_seq = input_seq.wrapping_add(self.seq_base);
-        pkt.seq_no = SeqNo::from(output_seq);
+        let output_seq = input_seq.wrapping_add(*self.seq_base).into();
+        pkt.seq_no = output_seq;
 
         if !self.started || output_seq > self.max_output {
             self.max_output = output_seq;
