@@ -47,6 +47,7 @@ docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.3.5 --dev
 **Open Port Requirements:**
 
 - **TCP/7070:** HTTP signaling
+- **TCP/6060:** Internal CPU & Memory profilers
 - **UDP/3478:** WebRTC traffic (Multiplexed)
 - **TCP/3478:** WebRTC over TCP fallback (Multiplexed)
 
