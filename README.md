@@ -30,7 +30,7 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 
 The architecture is highly inspired by [SDN](https://en.wikipedia.org/wiki/Software-defined_networking) architecture.
 
-![architecture](./docs/architecture.svg)
+![architecture](./docs/architecture.png)
 
 ## Quickstart
 
