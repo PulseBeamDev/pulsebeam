@@ -757,12 +757,6 @@ impl AllocationEngine {
         // 1. Guarantee everyone at least 'Low' quality
         for slot in slots {
             let lowest = slot.track.lowest_quality();
-
-            if !lowest.state.is_healthy() {
-                targets.insert(slot.key, None);
-                continue;
-            }
-
             let cost = lowest.state.bitrate_bps();
 
             let required_bps = if slot.current_quality == lowest.quality {
@@ -1839,6 +1833,20 @@ mod allocation_tests {
         assert!(
             matches!(decisions[&slots[0].key], AllocationDecision::Forward(..)),
             "single healthy layer should always be forwarded when budget allows"
+        );
+    }
+
+    #[test]
+    fn always_forward_lowest_layer() {
+        let t = track_with_bad_layer(LayerQuality::Low);
+        let low_bps = layer_bps(&t, LayerQuality::Low);
+        let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
+        let available = bw((low_bps * 2.0) as u64 / 1_000);
+        let (decisions, _) = AllocationEngine::compute(available, &slots);
+
+        assert!(
+            matches!(decisions[&slots[0].key], AllocationDecision::Forward(..)),
+            "lowest layer is always forwarded after assignment"
         );
     }
 }
