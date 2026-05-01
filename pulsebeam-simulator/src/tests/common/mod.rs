@@ -56,6 +56,7 @@ pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> an
         .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)
+        .with_current_runtime()
         .run(tokio_util::sync::CancellationToken::new())
         .await?;
     Ok(())

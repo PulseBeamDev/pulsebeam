@@ -30,6 +30,11 @@ enum ListenerSource {
     PreBound(TcpListener),
 }
 
+enum WorkerExecution {
+    ThreadPerWorker,
+    SharedRuntime,
+}
+
 pub struct NodeBuilder {
     // Configuration
     workers: usize,
@@ -43,6 +48,8 @@ pub struct NodeBuilder {
     // Services
     http_api: Option<ListenerSource>,
     internal_metrics: Option<ListenerSource>,
+
+    worker_execution: WorkerExecution,
 }
 
 impl Default for NodeBuilder {
@@ -61,6 +68,7 @@ impl NodeBuilder {
             udp_mode: UdpMode::Batch,
             http_api: None,
             internal_metrics: None,
+            worker_execution: WorkerExecution::ThreadPerWorker,
         }
     }
 
@@ -120,6 +128,12 @@ impl NodeBuilder {
         self
     }
 
+    /// Run shard workers on the current Tokio runtime instead of spawning one thread per worker.
+    pub fn with_current_runtime(mut self) -> Self {
+        self.worker_execution = WorkerExecution::SharedRuntime;
+        self
+    }
+
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let workers_count = self.workers;
@@ -139,6 +153,7 @@ impl NodeBuilder {
         let mut shard_command_txs = Vec::new();
         let mut cross_shard_event_txs = Vec::new();
         let mut cross_shard_event_rxs = Vec::new();
+        let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
         for _ in 0..udp_sockets.len() {
             // TODO: should cross shard channel capacities this big?
             let (tx, rx) = mailbox::new(1024);
@@ -152,27 +167,33 @@ impl NodeBuilder {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
-            let builder =
-                std::thread::Builder::new().name(format!("pulsebeam-worker-{}", shard_id));
-            let handle = builder
-                .spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .enable_alt_timer()
-                        .build_local(LocalOptions::default())
-                        .unwrap();
-                    let shard = ShardWorker::new(
-                        shard_id,
-                        sock,
-                        shard_command_rx,
-                        shard_event_tx,
-                        cross_shard_event_rx,
-                        cross_shard_event_txs,
-                    );
-                    rt.block_on(tokio::task::unconstrained(shard.run()));
-                })
-                .unwrap();
-            shard_handles.push(handle);
+            let shard = ShardWorker::new(
+                shard_id,
+                sock,
+                shard_command_rx,
+                shard_event_tx,
+                cross_shard_event_rx,
+                cross_shard_event_txs,
+            );
+
+            if use_shared_runtime {
+                join_set.spawn(ignore(shard.run()));
+            } else {
+                let builder =
+                    std::thread::Builder::new().name(format!("pulsebeam-worker-{}", shard_id));
+                let handle = builder
+                    .spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .enable_alt_timer()
+                            .build_local(LocalOptions::default())
+                            .unwrap();
+                        rt.block_on(tokio::task::unconstrained(shard.run()));
+                    })
+                    .unwrap();
+                shard_handles.push(handle);
+            }
+
             shard_command_txs.push(shard_command_tx);
         }
 
@@ -186,7 +207,7 @@ impl NodeBuilder {
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
 
-        join_set.spawn_local(ignore(
+        join_set.spawn(ignore(
             controller.run(controller_command_rx, shard_event_rx),
         ));
 
@@ -239,7 +260,7 @@ impl NodeBuilder {
             let api_server = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown.child_token().cancelled_owned());
 
-            join_set.spawn_local(async move {
+            join_set.spawn(async move {
                 if let Err(e) = api_server.await {
                     tracing::error!("http server error: {e}");
                 }
@@ -254,7 +275,7 @@ impl NodeBuilder {
                 ListenerSource::PreBound(l) => l,
             };
 
-            join_set.spawn_local(ignore(internal::serve_internal_http(
+            join_set.spawn(ignore(internal::serve_internal_http(
                 listener,
                 shutdown.child_token(),
             )));
@@ -270,7 +291,7 @@ impl NodeBuilder {
 
         // TODO: should we bother joining here?
         for handle in shard_handles {
-            handle.join();
+            let _ = handle.join();
         }
 
         Ok(())
