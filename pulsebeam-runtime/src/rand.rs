@@ -1,5 +1,5 @@
 pub use rand::seq::index::IndexVec;
-pub use rand::{RngCore, SeedableRng};
+pub use rand::{Rng as RngCore, SeedableRng};
 
 /// A seed for the random number generator.
 ///
@@ -10,11 +10,9 @@ pub struct RngSeed(u64);
 impl RngSeed {
     /// Creates a new random seed from OS entropy.
     pub fn new() -> Self {
-        use rand::TryRngCore as _;
+        let mut tmp: rand::rngs::StdRng = rand::make_rng();
         let mut bytes = [0u8; 8];
-        rand::rngs::OsRng
-            .try_fill_bytes(&mut bytes)
-            .expect("OsRng should always be available");
+        rand::Rng::fill_bytes(&mut tmp, &mut bytes);
         Self(u64::from_le_bytes(bytes))
     }
 
@@ -35,11 +33,6 @@ impl Default for RngSeed {
 
 /// The application RNG. Uses ChaCha20 (via [`rand::rngs::StdRng`]) for
 /// strong statistical properties across all output sizes.
-///
-/// `FastRand` (xorshift) is tokio's choice for internal scheduler bookkeeping;
-/// for application-level values (UUIDs, sequence numbers, hashing) `StdRng` is
-/// the right default — it is still very fast and avoids subtle bias issues with
-/// small RNGs.
 pub type Rng = rand::rngs::StdRng;
 
 /// Produces child seeds from a parent RNG.
@@ -80,10 +73,5 @@ pub fn sample_indices<R: RngCore>(rng: &mut R, len: usize, amount: usize) -> Ind
 ///
 /// Call once at startup and derive all other RNGs from it.
 pub fn os_rng() -> Rng {
-    use rand::TryRngCore as _;
-    let mut seed = [0u8; 32];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut seed)
-        .expect("OsRng should always be available");
-    Rng::from_seed(seed)
+    rand::make_rng()
 }

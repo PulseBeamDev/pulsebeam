@@ -168,7 +168,6 @@ impl NodeBuilder {
             )
         })?;
 
-        let api_seed = rand::RngSeed::from_u64(rng.next_u64());
         let controller_rng = rand::Rng::seed_from_u64(rng.next_u64());
         let shard_rngs: Vec<rand::Rng> = (0..udp_sockets.len())
             .map(|_| rand::Rng::seed_from_u64(rng.next_u64()))
@@ -264,7 +263,7 @@ impl NodeBuilder {
                 .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
                 .max_age(Duration::from_secs(86400));
 
-            let router = api::router(controller_command_tx, api_cfg, api_seed)
+            let router = api::router(controller_command_tx, api_cfg)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);
