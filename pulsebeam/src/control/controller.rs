@@ -146,7 +146,7 @@ impl ControllerActor {
             }
             ControllerCommand::PatchParticipant(m, reply_tx) => {
                 let answer = self
-                    .handle_create_participant(m.state, m.offer)
+                    .handle_patch_participant(m.state, m.offer)
                     .map(|res| PatchParticipantReply { answer: res });
                 let _ = reply_tx.send(answer);
             }
@@ -164,6 +164,16 @@ impl ControllerActor {
         }
     }
 
+    pub fn handle_patch_participant(
+        &mut self,
+        state: ParticipantState,
+        offer: SdpOffer,
+    ) -> Result<SdpAnswer, ControllerError> {
+        self.core
+            .delete_participant(&state.participant_id, &mut self.eq);
+        self.handle_create_participant(state, offer)
+    }
+
     pub fn handle_create_participant(
         &mut self,
         state: ParticipantState,
@@ -177,6 +187,7 @@ impl ControllerActor {
             .ok_or(ControllerError::ServiceUnavailable)?;
         let mut cfg = self.core.create_participant(rtc, state, shard_id);
         let ufrag = cfg.ufrag();
+
         self.eq.broadcast(ClusterCommand::RegisterParticipant {
             shard_id,
             participant_id: cfg.participant_id,

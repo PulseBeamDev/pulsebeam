@@ -39,7 +39,7 @@ pub(super) struct RoomState {
     pub(super) audio_selector: crate::audio_selector::TopNAudioSelector,
 }
 
-struct ParticipantMeta {
+pub struct ParticipantMeta {
     span: tracing::Span,
     core: ParticipantCore,
 }
@@ -250,20 +250,10 @@ impl ShardCore {
     ) -> Option<()> {
         match cmd {
             ShardCommand::AddParticipant(cfg) => {
-                let participant_id = cfg.participant_id;
-                let room_id = cfg.room_id;
-                self.add_participant(participant_id, cfg, router);
-                let room = self.rooms.entry(room_id).or_default();
-                let was_empty = room.members.is_empty();
-                room.members.insert(participant_id);
-                if was_empty {
-                    let shard_id = self.shard_id;
-                    router.broadcast(|| CrossShardEvent::RoomMemberJoined {
-                        room_id,
-                        from_shard_id: shard_id,
-                    });
-                }
-                self.input_dirty.insert(participant_id);
+                self.add_participant(cfg, router);
+            }
+            ShardCommand::RemoveParticipant(participant_id) => {
+                self.remove_participant(&participant_id, router);
             }
             ShardCommand::Cluster(cmd) => self.on_cluster_command(cmd, router)?,
         }
@@ -432,17 +422,14 @@ impl ShardCore {
         }
     }
 
-    fn add_participant(
-        &mut self,
-        participant_id: ParticipantId,
-        cfg: ParticipantConfig,
-        router: &impl CrossShardSend,
-    ) {
+    fn add_participant(&mut self, cfg: ParticipantConfig, router: &impl CrossShardSend) {
+        let room_id = cfg.room_id;
+        let participant_id = cfg.participant_id;
         self.remove_participant(&participant_id, router);
         let span = tracing::info_span!(
             "participant",
-            room_id = %cfg.room_id,
-            participant_id = %cfg.participant_id
+            %room_id,
+            %participant_id
         );
         let mut participant = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
         let ufrag = participant.ufrag();
@@ -454,6 +441,18 @@ impl ShardCore {
             .register_ice_ufrag(ufrag.as_bytes(), participant_id);
         self.participants.insert(participant_id, meta);
         tracing::info!(%participant_id, "participant added to shard");
+
+        let room = self.rooms.entry(room_id).or_default();
+        let was_empty = room.members.is_empty();
+        room.members.insert(participant_id);
+        if was_empty {
+            let shard_id = self.shard_id;
+            router.broadcast(|| CrossShardEvent::RoomMemberJoined {
+                room_id,
+                from_shard_id: shard_id,
+            });
+        }
+        self.input_dirty.insert(participant_id);
     }
 
     fn remove_participant(

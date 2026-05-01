@@ -165,7 +165,9 @@ impl ControllerCore {
             })
             .unwrap_or_default();
 
-        self.registry.remove_participant(participant_id);
+        if let Some(shard_id) = self.registry.remove_participant(participant_id) {
+            eq.send(shard_id, ShardCommand::RemoveParticipant(*participant_id));
+        }
         eq.broadcast(ClusterCommand::UnregisterParticipant {
             participant_id: *participant_id,
         });

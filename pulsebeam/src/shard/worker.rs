@@ -24,6 +24,7 @@ pub enum ShardError {
 #[derive(Debug)]
 pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
+    RemoveParticipant(ParticipantId),
     Cluster(ClusterCommand),
 }
 
