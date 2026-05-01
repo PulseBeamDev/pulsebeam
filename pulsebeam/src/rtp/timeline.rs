@@ -1,5 +1,5 @@
 use crate::rtp::RtpPacket;
-use pulsebeam_runtime::rand::{self, RngCore};
+use pulsebeam_runtime::rand::RngCore;
 use str0m::{
     media::{Frequency, MediaTime},
     rtp::SeqNo,
@@ -49,14 +49,8 @@ impl Timeline {
         }
     }
 
-    /// Create a new timeline using a pseudo-random base sequence number.
-    pub fn new(clock_rate: Frequency) -> Self {
-        let mut rng = rand::os_rng();
-        Self::new_with_rng(clock_rate, &mut rng)
-    }
-
-    /// Create a new timeline by drawing the base sequence number from the given RNG.
-    pub fn new_with_rng<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
+    /// Create a new timeline whose starting sequence number is drawn from `rng`.
+    pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
         let base_seq_no = (rng.next_u32() & 0xFFFF) as u16;
         Self::new_with_base(clock_rate, base_seq_no)
     }
@@ -230,7 +224,10 @@ mod test {
     #[test]
     fn test_sequence_wrapping_u64() {
         let start_time = Instant::now();
-        let mut timeline = Timeline::new(Frequency::NINETY_KHZ);
+        let mut timeline = Timeline::new(
+            Frequency::NINETY_KHZ,
+            &mut pulsebeam_runtime::rand::seeded_rng(42),
+        );
 
         // Start normally
         let mut p1 = RtpPacket {

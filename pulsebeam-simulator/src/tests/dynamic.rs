@@ -9,6 +9,7 @@ fn churn_test() {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(120))
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let subnet = common::reserve_subnet();

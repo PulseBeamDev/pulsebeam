@@ -1,6 +1,7 @@
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
+    rand::Rng,
 };
 use tokio::time::Instant;
 
@@ -138,8 +139,9 @@ impl ShardWorker {
         event_tx: mailbox::Sender<ShardEvent>,
         cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
         cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
+        rng: Rng,
     ) -> Self {
-        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments());
+        let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng);
         let router = ShardRouter {
             shard_id,
             cross_shard_event_txs,

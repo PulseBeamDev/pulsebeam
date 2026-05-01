@@ -10,6 +10,7 @@ fn declarative_subscription_test() -> turmoil::Result {
     setup_tracing();
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(30))
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let subnet = common::reserve_subnet();
@@ -126,6 +127,7 @@ fn reconnection_recovery_test() -> turmoil::Result {
     setup_tracing();
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let subnet = common::reserve_subnet();

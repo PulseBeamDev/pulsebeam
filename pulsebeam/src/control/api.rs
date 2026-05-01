@@ -25,7 +25,9 @@ use crate::{
     control::controller::{ControllerHandle, ParticipantState},
     entity::{ExternalRoomId, IdValidationError, ParticipantId, RoomId},
 };
-
+use pulsebeam_runtime::rand::{Rng, RngSeed, SeedableRng};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 pub enum HeaderExt {
     ParticipantId,
 }
@@ -58,11 +60,17 @@ impl ParticipantResponseHeaders {
     }
 }
 
-#[derive(Clone)]
-struct AppState {
+struct AppStateInner {
     controller: ControllerHandle,
     api_config: ApiConfig,
+    /// Root seed derived from the master RNG at startup.
+    rng_root: u64,
+    /// Monotonic counter; combined with rng_root to produce unique per-request seeds.
+    rng_counter: AtomicU64,
 }
+
+#[derive(Clone)]
+struct AppState(Arc<AppStateInner>);
 
 /// Configuration shared across handlers
 #[derive(Clone)]
@@ -192,22 +200,27 @@ async fn create_participant(
     raw_offer: String,
 ) -> Result<impl IntoResponse, ApiError> {
     let room_id = RoomId::from_external(&external_room_id);
-    let participant_id = ParticipantId::new();
     let offer = SdpOffer::from_sdp_string(&raw_offer)?;
+
+    let (participant_id, connection_id) = {
+        let n = s.0.rng_counter.fetch_add(1, Ordering::Relaxed);
+        let mut rng = Rng::seed_from_u64(s.0.rng_root.wrapping_add(n));
+        (ParticipantId::new(&mut rng), ConnectionId::new(&mut rng))
+    };
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let state = ParticipantState {
         manual_sub: query.manual_sub,
         room_id,
         participant_id,
-        connection_id: ConnectionId::new(),
+        connection_id,
         old_connection_id: None,
     };
     let msg = controller::CreateParticipant {
         state: state.clone(),
         offer,
     };
-    s.controller
+    s.0.controller
         .try_send((msg, reply_tx).into())
         .map_err(|e| match e {
             TrySendError::Full(_) => ApiError::RateLimited,
@@ -222,7 +235,7 @@ async fn create_participant(
         "/rooms/{}/participants/{}",
         &external_room_id, &participant_id
     );
-    let location_url = build_location(&headers, &s.api_config, &path, &state)?;
+    let location_url = build_location(&headers, &s.0.api_config, &path, &state)?;
 
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
@@ -259,7 +272,7 @@ async fn delete_participant(
     State(s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let room_id = RoomId::from_external(&external_room_id);
-    s.controller
+    s.0.controller
         .try_send(
             controller::DeleteParticipant {
                 room_id,
@@ -331,20 +344,25 @@ async fn patch_participant(
         "/rooms/{}/participants/{}",
         &external_room_id, &participant_id
     );
+    let connection_id = {
+        let n = s.0.rng_counter.fetch_add(1, Ordering::Relaxed);
+        let mut rng = Rng::seed_from_u64(s.0.rng_root.wrapping_add(n));
+        ConnectionId::new(&mut rng)
+    };
     let state = ParticipantState {
         manual_sub: query.manual_sub,
         room_id,
         participant_id,
-        connection_id: ConnectionId::new(),
+        connection_id,
         old_connection_id: Some(old_connection_id),
     };
-    let location_url = build_location(&headers, &s.api_config, &path, &state)?;
+    let location_url = build_location(&headers, &s.0.api_config, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {
         location: location_url,
         etag: state.connection_id,
     };
     let msg = controller::PatchParticipant { offer, state };
-    s.controller
+    s.0.controller
         .try_send((msg, reply_tx).into())
         .map_err(|e| match e {
             TrySendError::Full(_) => ApiError::RateLimited,
@@ -415,7 +433,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 struct ApiDoc;
 
 /// Router setup with OpenAPI documentation
-pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Router {
+pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig, seed: RngSeed) -> Router {
     let openapi = build_openapi(&cfg.base_path);
 
     let api = Router::new()
@@ -432,10 +450,12 @@ pub fn router(controller: controller::ControllerHandle, cfg: ApiConfig) -> Route
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi))
         .nest(&cfg.base_path, api)
-        .with_state(AppState {
+        .with_state(AppState(Arc::new(AppStateInner {
             controller,
             api_config: cfg,
-        })
+            rng_root: seed.as_u64(),
+            rng_counter: AtomicU64::new(0),
+        })))
 }
 
 async fn track_route_duration(req: Request<axum::body::Body>, next: Next) -> Response {

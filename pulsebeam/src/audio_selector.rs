@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use pulsebeam_runtime::rand::RngCore;
 use tokio::time::Instant;
 
 use crate::{
@@ -74,14 +75,8 @@ pub struct TopNAudioSelector {
     slots: [SlotState; SELECTOR_SLOTS],
 }
 
-impl Default for TopNAudioSelector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TopNAudioSelector {
-    pub fn new() -> Self {
+    pub fn new<R: RngCore>(rng: &mut R) -> Self {
         // immunity_expiry is set to Instant::now() at construction; any packet arriving
         // later will have now >= construction_time, so is_immune() returns false.
         let init_instant = Instant::now();
@@ -93,7 +88,7 @@ impl TopNAudioSelector {
                 immunity_expiry: init_instant,
                 last_power: 0.0,
                 slot_timeline: SlotTimeline {
-                    timeline: Timeline::new(AUDIO_FREQUENCY),
+                    timeline: Timeline::new(AUDIO_FREQUENCY, rng),
                     pending_marker: false,
                 },
             }),
@@ -224,13 +219,25 @@ mod tests {
 
     use crate::entity::ParticipantId;
     use crate::rtp::RtpPacket;
+    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
     use str0m::media::MediaKind;
 
     const TICK_MS: u64 = 20;
 
+    fn test_rng() -> impl RngCore {
+        seeded_rng(42)
+    }
+
+    fn new_sel() -> TopNAudioSelector {
+        TopNAudioSelector::new(&mut test_rng())
+    }
+
     fn make_stream() -> StreamId {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
         (
-            ParticipantId::new().derive_track_id(MediaKind::Audio, "test"),
+            ParticipantId::new(&mut seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed)))
+                .derive_track_id(MediaKind::Audio, "test"),
             None,
         )
     }
@@ -273,7 +280,7 @@ mod tests {
     /// A single loud packet from an unknown stream should claim an empty slot.
     #[test]
     fn loud_packet_claims_empty_slot() {
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         let base = Instant::now();
         let id = make_stream();
         let result = sel.filter(id, &mut pkt_at(base, 0, 0));
@@ -285,7 +292,7 @@ mod tests {
     #[test]
     fn quiet_non_owner_dropped() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         let id = make_stream();
         // -127 dBov → power = 10^(-127/10) ≈ 2e-13, well below SPEECH_THRESHOLD (1e-4)
         let result = sel.filter(id, &mut pkt_at(base, 0, -127));
@@ -296,7 +303,7 @@ mod tests {
     /// After owning a slot, a quiet (DTX) packet from the owner must still be forwarded.
     #[test]
     fn owner_dtx_packet_forwarded() {
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         let base = Instant::now();
         let id = make_stream();
         // Claim a slot with a loud packet.
@@ -311,7 +318,7 @@ mod tests {
     #[test]
     fn stream_id_occupies_single_slot() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         let id = make_stream();
         for t in 0..8u64 {
             sel.filter(id, &mut pkt_at(base, t * TICK_MS, 0));
@@ -326,7 +333,7 @@ mod tests {
     #[test]
     fn loud_newcomer_steals_dead_slot() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         fill_slots(&mut sel, base, 0);
         // All incumbents last active at base + 4*TICK_MS = base+80ms.
         // Advance time past DEAD_TIMEOUT (2000ms).
@@ -344,7 +351,7 @@ mod tests {
     #[test]
     fn loud_newcomer_steals_resting_slot() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         // Fill all slots with loud streams (last loud packet at base+80ms).
         let incumbents = fill_slots(&mut sel, base, 0);
 
@@ -367,7 +374,7 @@ mod tests {
     /// A much louder newcomer (>+5dB) must evict the quietest active slot.
     #[test]
     fn much_louder_newcomer_steals_active_slot() {
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         let base = Instant::now();
         // All 5 slots active with moderate level (-20 dBov).
         // Send continuous loud packets to keep last_loud_ts fresh (within 500ms).
@@ -393,7 +400,7 @@ mod tests {
     #[test]
     fn hysteresis_blocks_marginal_challenger() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         // All 5 slots active with level -20 dBov; refresh to keep last_loud_ts fresh.
         let incumbents = fill_slots(&mut sel, base, 0);
         for &id in &incumbents {
@@ -418,7 +425,7 @@ mod tests {
     #[test]
     fn newborn_immunity_blocks_evicted_owner() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         // Fill with 5 resting streams (last_loud = base+80ms).
         let evicted_candidates = fill_slots(&mut sel, base, 0);
         for &id in &evicted_candidates {
@@ -449,7 +456,7 @@ mod tests {
 
     #[test]
     fn remove_track_frees_slot() {
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         let base = Instant::now();
         let id = make_stream();
         sel.filter(id, &mut pkt_at(base, 0, 0));
@@ -463,7 +470,7 @@ mod tests {
     #[test]
     fn cleanup_evicts_dead_slots() {
         let base = Instant::now();
-        let mut sel = TopNAudioSelector::new();
+        let mut sel = new_sel();
         // Inject a stream that received its last packet far in the past.
         // We manipulate last_arrival_ts directly to simulate time passage.
         let id = make_stream();

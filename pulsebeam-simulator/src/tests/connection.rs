@@ -19,6 +19,7 @@ fn run_connection_scenario(
     let sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(90))
         .tick_duration(Duration::from_micros(100))
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let mut scenario = Scenario::new(name, server_ip, sim)

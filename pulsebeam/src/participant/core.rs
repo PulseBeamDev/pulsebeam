@@ -4,6 +4,7 @@ use ahash::{HashMap, HashMapExt};
 use metrics::{counter, histogram};
 use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
+use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -99,6 +100,7 @@ impl ParticipantCore {
         shard_id: usize,
         udp_gso_size: usize,
         tcp_gso_size: usize,
+        rng: &mut impl RngCore,
     ) -> Self {
         let mut rtc = cfg.rtc;
         let mut api = rtc.direct_api();
@@ -131,7 +133,7 @@ impl ParticipantCore {
             udp_batcher,
             tcp_batcher,
             upstream: UpstreamAllocator::new(),
-            downstream: DownstreamAllocator::new(cfg.participant_id, cfg.manual_sub),
+            downstream: DownstreamAllocator::new(cfg.participant_id, cfg.manual_sub, rng),
             slot_meta: HashMap::new(),
             disconnect_reason: None,
             signaling: Signaling::new(cid),

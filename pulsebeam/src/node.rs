@@ -6,6 +6,7 @@ use pulsebeam_runtime::net::Transport;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::rand;
+use pulsebeam_runtime::rand::{RngCore, SeedableRng};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -161,9 +162,26 @@ impl NodeBuilder {
             cross_shard_event_rxs.push(rx);
         }
 
-        let contexts = udp_sockets.into_iter().zip(cross_shard_event_rxs);
+        let mut rng = self.rng.ok_or_else(|| {
+            anyhow::anyhow!(
+                "NodeBuilder requires an RNG; call `.rng(...)` when constructing the node"
+            )
+        })?;
 
-        for (shard_id, (sock, cross_shard_event_rx)) in contexts.into_iter().enumerate() {
+        let api_seed = rand::RngSeed::from_u64(rng.next_u64());
+        let controller_rng = rand::Rng::seed_from_u64(rng.next_u64());
+        let shard_rngs: Vec<rand::Rng> = (0..udp_sockets.len())
+            .map(|_| rand::Rng::seed_from_u64(rng.next_u64()))
+            .collect();
+
+        let contexts = udp_sockets
+            .into_iter()
+            .zip(cross_shard_event_rxs)
+            .zip(shard_rngs);
+
+        for (shard_id, ((sock, cross_shard_event_rx), shard_rng)) in
+            contexts.into_iter().enumerate()
+        {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
@@ -174,6 +192,7 @@ impl NodeBuilder {
                 shard_event_tx,
                 cross_shard_event_rx,
                 cross_shard_event_txs,
+                shard_rng,
             );
 
             if use_shared_runtime {
@@ -197,13 +216,7 @@ impl NodeBuilder {
             shard_command_txs.push(shard_command_tx);
         }
 
-        let rng = self.rng.ok_or_else(|| {
-            anyhow::anyhow!(
-                "NodeBuilder requires an RNG; call `.rng(...)` when constructing the node"
-            )
-        })?;
-
-        let controller = ControllerActor::new(rng, shard_command_txs, candidates);
+        let controller = ControllerActor::new(controller_rng, shard_command_txs, candidates);
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
 
@@ -251,7 +264,7 @@ impl NodeBuilder {
                 .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
                 .max_age(Duration::from_secs(86400));
 
-            let router = api::router(controller_command_tx, api_cfg)
+            let router = api::router(controller_command_tx, api_cfg, api_seed)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);

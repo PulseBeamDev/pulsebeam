@@ -5,6 +5,7 @@ use std::{collections::VecDeque, ops::Deref};
 use ahash::HashMap;
 use indexmap::IndexSet;
 use pulsebeam_runtime::net::UnifiedSocket;
+use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use tokio::time::Instant;
 
 use crate::{
@@ -32,11 +33,20 @@ pub(super) struct Routing {
     pub(super) remote_shards: IndexSet<usize>,
 }
 
-#[derive(Default)]
 pub(super) struct RoomState {
     pub(super) members: IndexSet<ParticipantId>,
     pub(super) remote_shards: IndexSet<usize>,
     pub(super) audio_selector: crate::audio_selector::TopNAudioSelector,
+}
+
+impl RoomState {
+    fn new(rng: &mut impl RngCore) -> Self {
+        Self {
+            members: IndexSet::new(),
+            remote_shards: IndexSet::new(),
+            audio_selector: crate::audio_selector::TopNAudioSelector::new(rng),
+        }
+    }
 }
 
 pub struct ParticipantMeta {
@@ -84,18 +94,29 @@ pub(crate) struct ShardCore {
     pub(crate) shard_events: VecDeque<ShardEvent>,
     pub(crate) pending_cross_shard: VecDeque<CrossShardEvent>,
     pub(crate) pending_close: VecDeque<SocketAddr>,
+    rng: Rng,
 }
 
 impl ShardCore {
-    pub(crate) fn new(shard_id: usize, max_gso_segments: usize) -> Self {
+    pub(crate) fn new(shard_id: usize, max_gso_segments: usize, mut rng: Rng) -> Self {
         let timers = TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD);
         let input_dirty = IndexSet::with_capacity_and_hasher(
             MAX_PARTICIPANTS_PER_SHARD,
-            ahash::RandomState::default(),
+            ahash::RandomState::with_seeds(
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+            ),
         );
         let fanout_dirty = IndexSet::with_capacity_and_hasher(
             MAX_PARTICIPANTS_PER_SHARD,
-            ahash::RandomState::default(),
+            ahash::RandomState::with_seeds(
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+            ),
         );
         Self {
             shard_id,
@@ -114,6 +135,7 @@ impl ShardCore {
             shard_events: VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             pending_cross_shard: VecDeque::with_capacity(64),
             pending_close: VecDeque::new(),
+            rng,
         }
     }
 
@@ -387,7 +409,7 @@ impl ShardCore {
             } => {
                 self.rooms
                     .entry(room_id)
-                    .or_default()
+                    .or_insert_with(|| RoomState::new(&mut self.rng))
                     .remote_shards
                     .insert(from_shard_id);
             }
@@ -431,7 +453,14 @@ impl ShardCore {
             %room_id,
             %participant_id
         );
-        let mut participant = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
+        let mut participant_rng = Rng::seed_from_u64(self.rng.next_u64());
+        let mut participant = ParticipantCore::new(
+            cfg,
+            self.shard_id,
+            self.max_gso_segments,
+            1,
+            &mut participant_rng,
+        );
         let ufrag = participant.ufrag();
         let meta = ParticipantMeta {
             core: participant,
@@ -442,7 +471,10 @@ impl ShardCore {
         self.participants.insert(participant_id, meta);
         tracing::info!(%participant_id, "participant added to shard");
 
-        let room = self.rooms.entry(room_id).or_default();
+        let room = self
+            .rooms
+            .entry(room_id)
+            .or_insert_with(|| RoomState::new(&mut self.rng));
         let was_empty = room.members.is_empty();
         room.members.insert(participant_id);
         if was_empty {
@@ -728,7 +760,11 @@ mod tests {
     }
 
     fn pid() -> ParticipantId {
-        ParticipantId::new()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ))
     }
 
     fn video_stream(p: ParticipantId) -> StreamId {
@@ -1047,7 +1083,7 @@ mod tests {
         let rid = room_id("test");
 
         let mut rooms: HashMap<RoomId, RoomState> = HashMap::default();
-        let mut room = RoomState::default();
+        let mut room = RoomState::new(&mut pulsebeam_runtime::rand::seeded_rng(42));
         room.remote_shards.insert(1);
         room.remote_shards.insert(2);
         rooms.insert(rid, room);
@@ -1076,7 +1112,7 @@ mod tests {
     #[test]
     fn cross_shard_stream_subscribed_adds_remote_shard_to_routing() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let stream = video_stream(pid());
 
         core.pending_cross_shard
@@ -1094,7 +1130,7 @@ mod tests {
     #[test]
     fn cross_shard_stream_unsubscribed_removes_entry_when_empty() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let stream = video_stream(pid());
 
         for ev in [
@@ -1121,7 +1157,7 @@ mod tests {
     #[test]
     fn cross_shard_stream_unsubscribed_keeps_entry_with_local_subscribers() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let stream = video_stream(pid());
         let local_sub = pid();
 
@@ -1159,7 +1195,7 @@ mod tests {
     #[test]
     fn cross_shard_room_member_joined_registers_remote_shard() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let rid = room_id("r1");
 
         core.pending_cross_shard
@@ -1176,7 +1212,7 @@ mod tests {
     #[test]
     fn cross_shard_room_member_left_removes_room_when_empty() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let rid = room_id("r2");
 
         for ev in [
@@ -1202,10 +1238,10 @@ mod tests {
     #[test]
     fn cross_shard_room_member_left_keeps_room_with_local_members() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let rid = room_id("r3");
 
-        let mut room = RoomState::default();
+        let mut room = RoomState::new(&mut pulsebeam_runtime::rand::seeded_rng(42));
         room.members.insert(pid());
         room.remote_shards.insert(2);
         core.rooms.insert(rid, room);
@@ -1227,7 +1263,7 @@ mod tests {
     #[test]
     fn register_remote_participant_populates_shard_and_ufrag_maps() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
 
         core.on_command(
@@ -1246,7 +1282,7 @@ mod tests {
     #[test]
     fn register_local_shard_participant_is_no_op() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
 
         core.on_command(
@@ -1267,7 +1303,7 @@ mod tests {
     #[test]
     fn unregister_participant_removes_maps_and_queues_no_close_addrs_without_session() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
 
         core.on_command(
@@ -1396,7 +1432,7 @@ mod tests {
     #[test]
     fn participant_leave_removed_from_participants() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p = pid();
         let r = room_id("leave1");
 
@@ -1414,7 +1450,7 @@ mod tests {
     #[test]
     fn participant_leave_last_in_room_removes_room() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p = pid();
         let r = room_id("leave2");
 
@@ -1429,7 +1465,7 @@ mod tests {
     #[test]
     fn participant_leave_last_in_room_broadcasts_room_left() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p = pid();
         let r = room_id("leave3");
 
@@ -1457,7 +1493,7 @@ mod tests {
     #[test]
     fn participant_leave_not_last_member_room_persists() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p1 = pid();
         let p2 = pid();
         let r = room_id("leave4");
@@ -1488,7 +1524,7 @@ mod tests {
     #[test]
     fn participant_leave_not_last_member_no_broadcast() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p1 = pid();
         let p2 = pid();
         let r = room_id("leave5");
@@ -1507,7 +1543,7 @@ mod tests {
     #[test]
     fn participant_leave_room_kept_when_remote_shards_present() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p = pid();
         let r = room_id("leave6");
 
@@ -1533,7 +1569,7 @@ mod tests {
     #[test]
     fn participant_rejoin_removes_previous_instance() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p = pid();
         let r = room_id("leave7");
 
@@ -1559,7 +1595,7 @@ mod tests {
     #[test]
     fn lifecycle_exited_cleans_up_participant_and_emits_shard_event() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let p = pid();
         let r = room_id("leave8");
 
@@ -1590,7 +1626,7 @@ mod tests {
     #[test]
     fn participant_leave_clears_routing_subscriber_entry() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let publisher = pid();
         let subscriber = pid();
         let r = room_id("leave9");
@@ -1639,7 +1675,7 @@ mod tests {
     #[test]
     fn unpublish_tracks_removes_track_from_subscriber_downstream() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let a = pid(); // publisher (remote)
         let b = pid(); // local subscriber
         let r = room_id("unp1");
@@ -1689,7 +1725,7 @@ mod tests {
     #[test]
     fn unpublish_tracks_marks_all_local_subscribers_dirty() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let a = pid(); // publisher
         let b = pid();
         let c = pid();
@@ -1750,7 +1786,7 @@ mod tests {
     #[test]
     fn unpublish_tracks_no_op_when_no_subscriber_holds_track() {
         let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let a = pid();
         let b = pid();
         let r = room_id("unp3");

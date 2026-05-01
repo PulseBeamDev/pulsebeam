@@ -15,6 +15,7 @@ fn slots_layout_update_test() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let subnet = common::reserve_subnet();
@@ -200,6 +201,7 @@ fn slots_prioritization_test() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))
+        .rng_seed(0)
         .build();
 
     let server_ip: IpAddr = "192.168.0.1".parse().unwrap();

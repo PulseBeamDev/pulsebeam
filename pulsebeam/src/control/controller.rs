@@ -90,11 +90,11 @@ pub struct ControllerActor {
 
 impl ControllerActor {
     pub fn new(
-        _rng: pulsebeam_runtime::rand::Rng,
+        mut rng: pulsebeam_runtime::rand::Rng,
         shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
         candidates: Vec<Candidate>,
     ) -> Self {
-        let router = ShardRouter::new(shard_command_txs);
+        let router = ShardRouter::new(shard_command_txs, &mut rng);
 
         Self {
             router,

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use pulsebeam_runtime::rand::RngCore;
 use str0m::media::Frequency;
 use tokio::time::Instant;
 
@@ -28,9 +29,9 @@ pub struct Switcher {
 }
 
 impl Switcher {
-    pub fn new(clock_rate: Frequency) -> Self {
+    pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
         Self {
-            timeline: Timeline::new(clock_rate),
+            timeline: Timeline::new(clock_rate, rng),
             pending: VecDeque::new(),
             staging: KeyframeBuffer::new(),
             latest_playout: Instant::now(),
@@ -251,7 +252,13 @@ mod test {
     }
 
     pub fn run(packets: &[RtpPacket]) {
-        run_with(Switcher::new(rtp::VIDEO_FREQUENCY), packets);
+        run_with(
+            Switcher::new(
+                rtp::VIDEO_FREQUENCY,
+                &mut pulsebeam_runtime::rand::seeded_rng(42),
+            ),
+            packets,
+        );
     }
 
     pub fn print_packets(packets: &[RtpPacket]) {

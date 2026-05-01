@@ -1,4 +1,5 @@
 use pulsebeam_runtime::mailbox::{self};
+use pulsebeam_runtime::rand::RngCore;
 use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::shard::worker::{ClusterCommand, ShardCommand};
@@ -13,10 +14,15 @@ pub struct ShardRouter {
 }
 
 impl ShardRouter {
-    pub fn new(shards: Vec<mailbox::Sender<ShardCommand>>) -> Self {
+    pub fn new(shards: Vec<mailbox::Sender<ShardCommand>>, rng: &mut impl RngCore) -> Self {
         let shard_count = shards.len();
         Self {
-            hasher_config: ahash::RandomState::new(),
+            hasher_config: ahash::RandomState::with_seeds(
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+            ),
             shard_command_txs: shards,
             shard_loads: vec![0.0; shard_count],
         }

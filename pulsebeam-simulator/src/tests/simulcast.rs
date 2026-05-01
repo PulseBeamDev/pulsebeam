@@ -16,6 +16,7 @@ fn simulcast_stream_stability_test() {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(WARMUP + SOAK + Duration::from_secs(5)) // headroom
         .tick_duration(TICK)
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let subnet = common::reserve_subnet();

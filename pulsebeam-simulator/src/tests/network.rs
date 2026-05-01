@@ -9,6 +9,7 @@ fn network_impairment_test() {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))
+        .rng_seed(0xDEADBEEF)
         .build();
 
     let subnet = common::reserve_subnet();

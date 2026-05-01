@@ -8,6 +8,7 @@ use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::EventQueue;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
+use pulsebeam_runtime::rand::RngCore;
 use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
 use str0m::rtp::Ssrc;
@@ -46,10 +47,10 @@ pub struct DownstreamAllocator {
 }
 
 impl DownstreamAllocator {
-    pub fn new(_participant_id: ParticipantId, manual_sub: bool) -> Self {
+    pub fn new(_participant_id: ParticipantId, manual_sub: bool, rng: &mut impl RngCore) -> Self {
         Self {
             available_bandwidth: MIN_BANDWIDTH,
-            video: VideoAllocator::new(manual_sub),
+            video: VideoAllocator::new(manual_sub, rng),
             audio: AudioAllocator::new(),
             dirty_allocation: false,
         }

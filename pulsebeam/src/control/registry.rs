@@ -106,13 +106,16 @@ impl RoomRegistry {
 mod tests {
     use super::*;
     use crate::entity::ExternalRoomId;
+    use pulsebeam_runtime::rand::seeded_rng;
 
     fn room_id(s: &str) -> RoomId {
         RoomId::from_external(&ExternalRoomId::new(s).unwrap())
     }
 
     fn participant_id() -> ParticipantId {
-        ParticipantId::new()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        ParticipantId::new(&mut seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed)))
     }
 
     #[test]

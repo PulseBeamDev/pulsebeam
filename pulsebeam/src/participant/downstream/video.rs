@@ -3,6 +3,7 @@ use crate::participant::event::EventQueue;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use indexmap::IndexSet;
+use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -38,15 +39,17 @@ pub struct VideoAllocator {
     // Cold
     manual_sub: bool,
     tracks: HashMap<TrackId, Track>,
+    rng: Rng,
 }
 
 impl VideoAllocator {
-    pub fn new(manual_sub: bool) -> Self {
+    pub fn new<R: RngCore>(manual_sub: bool, rng: &mut R) -> Self {
         Self {
             manual_sub,
             tracks: HashMap::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
             routes: HashMap::new(),
+            rng: Rng::seed_from_u64(rng.next_u64()),
         }
     }
 
@@ -149,7 +152,7 @@ impl VideoAllocator {
     }
 
     pub fn add_slot(&mut self, mid: Mid, config: SlotConfig) {
-        let slot = Slot::new(SlotConfig { mid, ..config });
+        let slot = Slot::new(SlotConfig { mid, ..config }, &mut self.rng);
         self.slots.insert(slot);
         self.rebalance();
     }
@@ -504,7 +507,7 @@ struct Slot {
 }
 
 impl Slot {
-    pub fn new(cfg: SlotConfig) -> Self {
+    fn new<R: RngCore>(cfg: SlotConfig, rng: &mut R) -> Self {
         Self {
             mid: cfg.mid,
             rid: cfg.rid,
@@ -514,7 +517,7 @@ impl Slot {
             active: None,
             staging: None,
 
-            switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
+            switcher: Switcher::new(rtp::VIDEO_FREQUENCY, rng),
             // With no signaling, we assume users are viewing with 720p playback
             max_height: 720,
             paused: true,
@@ -883,9 +886,16 @@ mod assignment_tests {
     use crate::participant::event::{ControlEvent, EventQueue, ParticipantEvent};
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
+    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
     use std::collections::VecDeque;
     use str0m::bwe::Bitrate;
     use str0m::media::{Mid, SimulcastLayer};
+
+    fn test_rng() -> impl RngCore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
 
     #[derive(Default)]
     struct FakeRouter {
@@ -898,11 +908,11 @@ mod assignment_tests {
     }
 
     fn setup_allocator() -> VideoAllocator {
-        VideoAllocator::new(false)
+        VideoAllocator::new(false, &mut test_rng())
     }
 
     fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
 
         let mut senders = Vec::new();
         let mut ids = Vec::new();
@@ -999,7 +1009,7 @@ mod assignment_tests {
 
     #[test]
     fn route_subscription_initializes_keyframe_retry_state() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
@@ -1045,7 +1055,7 @@ mod assignment_tests {
 
     #[test]
     fn staging_preserves_old_route_until_switch_complete() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -1107,7 +1117,7 @@ mod assignment_tests {
 
     #[test]
     fn route_removed_only_when_slot_has_no_active_or_staging_target() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
@@ -1142,7 +1152,7 @@ mod assignment_tests {
 
     #[test]
     fn reconcile_routes_corrects_invalid_route_slot_mapping() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 2);
@@ -1182,7 +1192,7 @@ mod assignment_tests {
 
     #[test]
     fn does_not_promote_staging_before_staging_packets() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -1281,7 +1291,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_accepts_ongoing_upgrade() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -1317,7 +1327,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_cancels_transition_when_target_reverts_to_active() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -1354,7 +1364,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_allows_downgrade_during_transition() {
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -1394,7 +1404,7 @@ mod assignment_tests {
         let mut tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
         allocator.remove_track(&tracks.ids[1]);
-        let pid = ParticipantId::new();
+        let pid = ParticipantId::new(&mut test_rng());
         let (tx, track) = make_video_track(pid, Mid::from("new_track"), vec![]);
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
@@ -1416,8 +1426,15 @@ mod allocation_tests {
     use crate::rtp::monitor::StreamQuality;
     use crate::track::{LayerQuality, test_utils::make_video_track};
     use proptest::prelude::*;
+    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
     use str0m::bwe::Bitrate;
     use str0m::media::Mid;
+
+    fn test_rng() -> impl RngCore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
 
     fn next_slot_key() -> SlotKey {
         use std::cell::RefCell;
@@ -1430,7 +1447,7 @@ mod allocation_tests {
     fn healthy_track() -> Track {
         use str0m::media::SimulcastLayer;
         let (tx, track) = make_video_track(
-            ParticipantId::new(),
+            ParticipantId::new(&mut test_rng()),
             Mid::from("t"),
             vec![
                 SimulcastLayer::new("h"),
