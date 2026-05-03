@@ -173,7 +173,7 @@ impl TopNAudioSelector {
     #[inline]
     fn rewrite_slot_timeline(slot: &mut SlotTimeline, switched: bool, pkt: &mut RtpPacket) {
         if switched {
-            slot.timeline.rebase_audio(pkt);
+            slot.timeline.rebase(pkt);
             slot.pending_marker = true;
         }
         slot.timeline.rewrite(pkt);
