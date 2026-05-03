@@ -10,7 +10,6 @@ use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use thiserror::Error;
-use tokio_metrics::TaskMonitor;
 
 use crate::mailbox;
 
@@ -113,7 +112,6 @@ pub trait Actor<M: MessageSet>: Sized + 'static {
     fn get_observable_state(&self) -> M::ObservableState;
 
     fn kind() -> ActorKind;
-    fn monitor() -> Arc<TaskMonitor>;
 
     fn run(&mut self, ctx: &mut ActorContext<M>) -> impl Future<Output = Result<(), ActorError>> {
         async {
