@@ -3,6 +3,7 @@ pub mod macros;
 pub mod actor;
 pub mod collections;
 pub mod mailbox;
+pub mod metrics;
 pub mod net;
 pub mod prelude;
 pub mod rand;
@@ -13,3 +14,7 @@ pub mod unsync;
 
 #[cfg(test)]
 mod tests;
+
+pub fn init() {
+    metrics::init();
+}

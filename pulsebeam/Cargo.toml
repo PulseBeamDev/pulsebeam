@@ -83,7 +83,7 @@ tikv-jemallocator = { version = "0.6.0", features = [
 str0m = { workspace = true, features = ["wincrypto"] }
 
 [features]
-default = ["parking_lot"]
+default = []
 deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 parking_lot = ["once_cell/parking_lot", "pulsebeam-runtime/parking_lot"]
 tokio-console = ["console-subscriber", "tokio/tracing"]

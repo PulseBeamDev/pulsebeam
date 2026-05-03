@@ -2997,6 +2997,7 @@ dependencies = [
  "parking_lot",
  "pulsebeam-core",
  "quinn-udp",
+ "quanta",
  "rand 0.10.1",
  "socket2",
  "systemstat",
