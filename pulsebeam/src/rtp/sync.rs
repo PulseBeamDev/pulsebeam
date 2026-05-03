@@ -120,6 +120,15 @@ impl Synchronizer {
                 base_server_time = new_base;
                 self.base_server_time = Some(base_server_time);
                 expected_playout = packet.arrival_ts;
+
+                // Also pull forward the NTP anchor if it exists. This is critical for
+                // recovering from an initial NTP anchor that was established with a large
+                // network delay (e.g. startup buffering).
+                if let Some(anchor) = &mut self.ntp_anchor {
+                    if let Some(new_arrival) = anchor.arrival_ts.checked_sub(error) {
+                        anchor.arrival_ts = new_arrival;
+                    }
+                }
             }
         }
 
@@ -517,5 +526,43 @@ mod tests {
 
         // They must be perfectly aligned now!
         assert_eq!(p3.playout_time, p4.playout_time);
+    }
+    #[test]
+    fn test_ntp_anchor_recovery_is_persistent() {
+        let base_time = Instant::now();
+        let ntp_base = UNIX_EPOCH + Duration::from_secs(NTP_UNIX_OFFSET_SECS + 1000);
+        let mut sync = Synchronizer::new(VIDEO_FREQUENCY);
+
+        // 1. Initial SR arrives 5s late.
+        let mut p1 = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(0),
+            arrival_ts: base_time + Duration::from_secs(5),
+            ..Default::default()
+        };
+        sync.process(&mut p1, Some(create_sr(MediaTime::from_90khz(0), ntp_base)));
+        assert_eq!(p1.playout_time - base_time, Duration::from_secs(5));
+
+        // 2. A "fast" packet arrives (100ms delay) and pulls the anchor forward.
+        let mut p2 = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(90_000), // 1s media later
+            arrival_ts: base_time + Duration::from_secs(1) + Duration::from_millis(100),
+            ..Default::default()
+        };
+        sync.process(&mut p2, None);
+        assert_eq!(p2.playout_time - base_time, Duration::from_millis(1100));
+
+        // 3. Subsequent packets should now be correct based on the updated anchor,
+        // even without triggering the jitter filter.
+        let mut p3 = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(180_000), // 2s media later
+            arrival_ts: base_time + Duration::from_secs(2) + Duration::from_millis(100),
+            ..Default::default()
+        };
+        sync.process(&mut p3, None);
+        assert_eq!(p3.playout_time - base_time, Duration::from_millis(2100));
+        
+        // Ensure that for p3, arrival_ts matches expected_playout (no filter triggered)
+        // We can't check internal state easily, but if the anchor wasn't updated,
+        // p3 would have had an expected_playout of base_time + 7s.
     }
 }

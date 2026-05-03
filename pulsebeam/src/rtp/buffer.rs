@@ -30,23 +30,8 @@ impl KeyframeBuffer {
         }
     }
 
-    pub fn is_ready(&self, target_playout: Instant) -> bool {
-        // TODO: use target_playout to decide
-        let Some(segment) = self.segment.as_ref() else {
-            tracing::trace!("KeyframeBuffer is_ready: false (no segment)");
-            return false;
-        };
-
-        if segment.1 < target_playout {
-            tracing::trace!(
-                "segment is behind the target_playout: {:?} < {:?}",
-                segment.1,
-                target_playout
-            );
-            return false;
-        }
-
-        true
+    pub fn is_ready(&self, _target_playout: Instant) -> bool {
+        self.has_keyframe_segment()
     }
 
     pub fn has_keyframe_segment(&self) -> bool {
@@ -248,7 +233,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "we don't check playout time for now"]
     fn test_is_ready() {
         let mut buf = KeyframeBuffer::new();
         let now = Instant::now();
@@ -257,14 +241,11 @@ mod test {
         // Not ready initially
         assert!(!buf.is_ready(now));
 
-        // Push keyframe with playout = future
+        // Push keyframe
         buf.push(make(1, future, true));
 
-        // is_ready checks: segment.1 >= target
-        // future >= now -> True
+        // is_ready now just checks for presence of a keyframe
         assert!(buf.is_ready(now));
-
-        // future >= future + 100ms -> False
-        assert!(!buf.is_ready(future + Duration::from_millis(100)));
+        assert!(buf.is_ready(future + Duration::from_millis(100)));
     }
 }

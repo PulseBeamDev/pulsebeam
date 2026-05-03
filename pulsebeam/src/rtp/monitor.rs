@@ -407,9 +407,9 @@ impl BitrateEstimate {
     }
 
     pub fn poll(&mut self, now: Instant) {
-        // Headroom strategy implies that if we see a burst (like a keyframe),
-        // we likely have the bandwidth capacity for it.
-        const HEADROOM: f64 = 1.25;
+        // Headroom strategy: use a small factor to allow for some growth while 
+        // avoiding over-allocation that leads to bufferbloat on congested links.
+        const HEADROOM: f64 = 1.05;
         let elapsed = now.saturating_duration_since(self.last_update);
         if elapsed < Duration::from_millis(200) {
             return;
