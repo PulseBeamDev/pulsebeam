@@ -1,6 +1,4 @@
-use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use dashmap::DashMap;
 pub use metrics::{
@@ -9,6 +7,7 @@ pub use metrics::{
 };
 use once_cell::sync::Lazy;
 use quanta::Clock;
+use std::cell::Cell;
 
 /// Maximum number of unique metrics supported.
 const MAX_METRICS: usize = 2048;
