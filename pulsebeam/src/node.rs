@@ -371,7 +371,6 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
 }
 
 mod internal {
-
     use super::*;
     use anyhow::Result;
     use axum::{
@@ -385,9 +384,9 @@ mod internal {
         header::{CONTENT_DISPOSITION, CONTENT_TYPE},
     };
     use metrics::{Unit, describe_gauge, gauge};
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use pprof::ProfilerGuard;
     use pprof::protos::Message;
+    use pulsebeam_runtime::metrics::scrape_to_prometheus;
     use serde::Deserialize;
     use tokio::runtime::Handle;
 
@@ -409,23 +408,6 @@ mod internal {
     ) -> Result<()> {
         let addr = listener.local_addr().ok();
 
-        // Try to install the Prometheus recorder.
-        // In simulation or test environments running multiple nodes in one process,
-        // this might fail if already installed. We proceed gracefully.
-        static GLOBAL_PROMETHEUS_HANDLE: once_cell::sync::OnceCell<PrometheusHandle> =
-            once_cell::sync::OnceCell::new();
-
-        let prometheus_handle = match PrometheusBuilder::new().install_recorder() {
-            Ok(handle) => {
-                let _ = GLOBAL_PROMETHEUS_HANDLE.set(handle.clone());
-                handle
-            }
-            Err(_) => GLOBAL_PROMETHEUS_HANDLE
-                .get()
-                .cloned()
-                .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
-        };
-
         const INDEX_HTML: &str = r#"
 <ul>
   <li><a href="/healthz">Healthcheck</a></li>
@@ -437,14 +419,13 @@ mod internal {
 </ul>
 "#;
 
-        let router_prometheus = prometheus_handle.clone();
         let router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
             .route("/debug/pprof/allocs", get(heap_profile))
             .route("/healthz", get(healthcheck))
             .route("/", get(async move || Html(INDEX_HTML)))
-            .route("/metrics", get(async move || router_prometheus.render()));
-        let rt_monitor_join = tokio::spawn(rt_background_monitor(prometheus_handle));
+            .route("/metrics", get(async move || scrape_to_prometheus()));
+        let rt_monitor_join = tokio::spawn(rt_background_monitor());
 
         tracing::info!("internal metrics listening on {:?}", addr);
 
@@ -478,7 +459,7 @@ mod internal {
         Ok(())
     }
 
-    async fn rt_background_monitor(prometheus_handle: PrometheusHandle) {
+    async fn rt_background_monitor() {
         let metrics = Handle::current().metrics();
 
         describe_gauge!(
@@ -590,9 +571,6 @@ mod internal {
                 gauge!("tokio_worker_mean_poll_time_us", &labels)
                     .set(metrics.worker_mean_poll_time(i).as_micros() as f64);
             }
-
-            // Keep memory usage and CPU usage bounded per prometheus interval.
-            prometheus_handle.run_upkeep();
         }
     }
 

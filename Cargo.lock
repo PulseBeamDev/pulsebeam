@@ -3075,6 +3075,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pulsebeam-core",
+ "quanta",
  "quinn-udp 0.6.1",
  "rand 0.10.1",
  "socket2",
