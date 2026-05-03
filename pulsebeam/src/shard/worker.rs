@@ -202,11 +202,10 @@ impl ShardWorker {
             self.core.flush_cross_shard(now, &self.router);
             self.core.fire_timers(now);
 
-            let count = self
+            let _ = self
                 .udp_socket
-                .try_recv_batch(&mut self.recv_batch)
-                .unwrap_or_default();
-            for batch in self.recv_batch.drain(..count) {
+                .try_recv_batch(&mut self.recv_batch);
+            for batch in self.recv_batch.drain(..) {
                 self.core.on_udp_batch(batch, &self.router);
             }
 

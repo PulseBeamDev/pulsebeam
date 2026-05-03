@@ -154,6 +154,7 @@ impl UdpTransportReader {
 
             match res {
                 Ok(count) => {
+                    let prev_len = out.len();
                     for i in 0..count {
                         let m = &self.meta[i];
                         let base = i * CHUNK_SIZE;
@@ -197,7 +198,7 @@ impl UdpTransportReader {
                             seg_off += stride;
                         }
                     }
-                    Ok(count)
+                    Ok(out.len() - prev_len)
                 }
                 Err(e) => Err(e),
             }
