@@ -234,15 +234,15 @@ mod primitives {
         }
 
         pub unsafe fn from_raw(ptr: *const T) -> Self {
-            Self(loom::sync::Arc::from_raw(ptr))
+            unsafe { Self(loom::sync::Arc::from_raw(ptr)) }
         }
 
         pub unsafe fn increment_strong_count(ptr: *const T) {
-            loom::sync::Arc::increment_strong_count(ptr)
+            unsafe { loom::sync::Arc::increment_strong_count(ptr) }
         }
 
         pub unsafe fn decrement_strong_count(ptr: *const T) {
-            loom::sync::Arc::decrement_strong_count(ptr)
+            unsafe { loom::sync::Arc::decrement_strong_count(ptr) }
         }
 
         pub fn ptr_eq(this: &Self, other: &Self) -> bool {

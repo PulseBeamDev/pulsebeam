@@ -76,7 +76,7 @@ impl Default for ThreadRegistry {
 // Global state to manage metric names and thread-local registries.
 static METRIC_MAP: Lazy<DashMap<Key, MetricHandle>> = Lazy::new(DashMap::new);
 static METRIC_METADATA: Lazy<DashMap<KeyName, MetricMetadata>> = Lazy::new(DashMap::new);
-static NEXT_METRIC_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_METRIC_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ALL_REGISTRIES: Lazy<Mutex<Vec<Arc<ThreadRegistry>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 thread_local! {
@@ -169,17 +169,17 @@ impl Recorder for TpcRecorder {
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
         let handle = self.get_or_create_handle(key);
-        Counter::from_arc(Arc::new(TpcCounter(handle)))
+        Counter::from_arc(std::sync::Arc::new(TpcCounter(handle)))
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
         let handle = self.get_or_create_handle(key);
-        Gauge::from_arc(Arc::new(TpcGauge(handle)))
+        Gauge::from_arc(std::sync::Arc::new(TpcGauge(handle)))
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         let handle = self.get_or_create_handle(key);
-        Histogram::from_arc(Arc::new(TpcHistogram(handle)))
+        Histogram::from_arc(std::sync::Arc::new(TpcHistogram(handle)))
     }
 }
 
