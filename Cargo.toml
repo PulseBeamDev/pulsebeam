@@ -37,7 +37,7 @@ tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 tokio-util = "0.7.17"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 triomphe = "0.1.15"
-turmoil = "0.7.1"
+turmoil = "0.7.2"
 
 [patch.crates-io]
 # dimpl = { git = "https://github.com/PulseBeamDev/dimpl.git", branch = "patch/0.2.1" }
