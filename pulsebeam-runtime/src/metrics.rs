@@ -76,6 +76,7 @@ struct HistogramData {
 
 impl HistogramData {
     const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
         const ZERO_U64: SyncU64Cell = SyncU64Cell::new(0);
         Self {
             buckets: [ZERO_U64; LATENCY_BUCKETS.len() + 1],
@@ -341,22 +342,22 @@ pub fn scrape_to_prometheus() -> String {
         }
 
         // Output Help/Unit once per base metric name
-        if described_metrics.insert(base_name.clone()) {
-            if let Some(metadata) = METRIC_METADATA.get(&base_name) {
-                if !metadata.description.is_empty() {
-                    output.push_str(&format!(
-                        "# HELP {} {}\n",
-                        base_name.as_str(),
-                        metadata.description
-                    ));
-                }
-                if let Some(unit) = &metadata.unit {
-                    output.push_str(&format!(
-                        "# UNIT {} {}\n",
-                        base_name.as_str(),
-                        unit.as_canonical_label()
-                    ));
-                }
+        if described_metrics.insert(base_name.clone())
+            && let Some(metadata) = METRIC_METADATA.get(&base_name)
+        {
+            if !metadata.description.is_empty() {
+                output.push_str(&format!(
+                    "# HELP {} {}\n",
+                    base_name.as_str(),
+                    metadata.description
+                ));
+            }
+            if let Some(unit) = &metadata.unit {
+                output.push_str(&format!(
+                    "# UNIT {} {}\n",
+                    base_name.as_str(),
+                    unit.as_canonical_label()
+                ));
             }
         }
 

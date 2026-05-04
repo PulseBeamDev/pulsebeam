@@ -25,6 +25,7 @@ impl ShardRouter {
             .iter()
             .map(|ctx| ctx.metrics.snapshot())
             .collect();
+        assert!(!shard_contexts.is_empty(), "missing shard_contexts");
 
         Self {
             hasher_config: ahash::RandomState::with_seeds(
@@ -54,10 +55,15 @@ impl ShardRouter {
         }
 
         let mean_load = total_load / shard_count as f64;
-        let peak_to_mean = peak_load / mean_load;
-        metrics::gauge!("router_peak").set(peak_load);
-        metrics::gauge!("router_mean").set(mean_load);
-        metrics::gauge!("router_peak_to_mean").set(peak_to_mean);
+        let peak_to_mean = if mean_load > 0.05 {
+            peak_load / mean_load
+        } else {
+            // Not enough load yet
+            0.0
+        };
+        metrics::gauge!("shard_load_peak").set(peak_load);
+        metrics::gauge!("shard_load_mean").set(mean_load);
+        metrics::gauge!("shard_load_peak_to_mean").set(peak_to_mean);
     }
 
     /// Update the load for a specific shard.
@@ -65,11 +71,21 @@ impl ShardRouter {
     pub fn update_load(&mut self, shard_idx: usize, load: f64) -> f64 {
         debug_assert!(load >= 0.0);
         debug_assert!(load <= 1.0);
-        let load = load.clamp(0.0, 1.0);
-        if let Some(slot) = self.shard_loads.get_mut(shard_idx) {
-            *slot = load;
+
+        let new_sample = load.clamp(0.0, 1.0);
+        if let Some(current_load) = self.shard_loads.get_mut(shard_idx) {
+            let old_load = *current_load;
+
+            // If load is increasing, react fast (higher alpha)
+            // If load is decreasing, react slow (lower alpha)
+            let alpha = if new_sample > old_load { 0.8 } else { 0.1 };
+            let smoothed_load = (new_sample * alpha) + (old_load * (1.0 - alpha));
+
+            *current_load = smoothed_load;
+            smoothed_load
+        } else {
+            0.0
         }
-        load
     }
 
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<usize> {
