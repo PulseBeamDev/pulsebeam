@@ -41,24 +41,35 @@ impl ShardRouter {
 
     pub fn poll_loads(&mut self) {
         let shard_count = self.shard_contexts.len();
+        let mut peak_load = 0f64;
+        let mut total_load = 0f64;
+
         for shard_idx in 0..shard_count {
             let snapshot = self.shard_contexts[shard_idx].metrics.snapshot();
             let load = snapshot.delta_load(&self.shard_occupancy_snapshots[shard_idx]);
             self.shard_occupancy_snapshots[shard_idx] = snapshot;
-            self.update_load(shard_idx, load);
+            let load = self.update_load(shard_idx, load);
+            peak_load = peak_load.max(load);
+            total_load += load;
         }
+
+        let mean_load = total_load / shard_count as f64;
+        let peak_to_mean = peak_load / mean_load;
+        metrics::gauge!("router_peak").set(peak_load);
+        metrics::gauge!("router_mean").set(mean_load);
+        metrics::gauge!("router_peak_to_mean").set(peak_to_mean);
     }
 
     /// Update the load for a specific shard.
     /// `load` could be CPU usage (0.0 to 1.0) or active participant count.
-    pub fn update_load(&mut self, shard_idx: usize, load: f64) {
+    pub fn update_load(&mut self, shard_idx: usize, load: f64) -> f64 {
         debug_assert!(load >= 0.0);
         debug_assert!(load <= 1.0);
         let load = load.clamp(0.0, 1.0);
         if let Some(slot) = self.shard_loads.get_mut(shard_idx) {
             *slot = load;
-            metrics::gauge!("router_shard_load", "shard" => shard_idx.to_string()).set(load);
         }
+        load
     }
 
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<usize> {
