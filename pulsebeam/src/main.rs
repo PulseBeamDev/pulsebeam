@@ -1,5 +1,4 @@
 use clap::Parser;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;
 use std::{net::SocketAddr, num::NonZeroUsize};
@@ -31,11 +30,7 @@ struct Args {
 }
 
 fn main() {
-    let builder = PrometheusBuilder::new();
-    let recorder = builder.build_recorder();
-    let prometheus_handle = recorder.handle();
-    metrics::set_global_recorder(recorder).expect("failed to set global recorder");
-
+    pulsebeam_runtime::init();
     let args = Args::parse();
     let use_tokio_console = cfg!(feature = "tokio-console");
 
@@ -87,16 +82,11 @@ fn main() {
 
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers, rtc_port, prometheus_handle));
+    rt.block_on(run(shutdown.clone(), workers, rtc_port));
     shutdown.cancel();
 }
 
-pub async fn run(
-    shutdown: CancellationToken,
-    workers: usize,
-    rtc_port: u16,
-    prometheus_handle: PrometheusHandle,
-) {
+pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
     let external_ip = pulsebeam_runtime::system::select_host_address();
     let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
@@ -111,7 +101,7 @@ pub async fn run(
         .external_addr(external_addr)
         .rng(rng)
         .with_http_api(http_api_addr)
-        .with_internal_metrics(metrics_addr, prometheus_handle)
+        .with_internal_metrics(metrics_addr)
         .run(shutdown.child_token());
     let node_handle = tokio::task::spawn_local(node);
 
