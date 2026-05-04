@@ -1,6 +1,6 @@
+use crate::shard::metrics::MetricsSnapshot;
 use pulsebeam_runtime::mailbox::{self};
 use pulsebeam_runtime::rand::RngCore;
-use pulsebeam_runtime::rt::OccupancySnapshot;
 use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::{
@@ -15,7 +15,7 @@ pub struct ShardRouter {
     shard_contexts: Vec<ShardContext>,
     /// Current load of each shard (e.g., CPU % or Participant Count)
     shard_loads: Vec<f64>,
-    shard_occupancy_snapshots: Vec<OccupancySnapshot>,
+    shard_occupancy_snapshots: Vec<MetricsSnapshot>,
 }
 
 impl ShardRouter {
@@ -23,7 +23,7 @@ impl ShardRouter {
         let shard_count = shard_contexts.len();
         let shard_occupancy_snapshots = shard_contexts
             .iter()
-            .map(|ctx| ctx.occupancy.snapshot())
+            .map(|ctx| ctx.metrics.snapshot())
             .collect();
 
         Self {
@@ -42,7 +42,7 @@ impl ShardRouter {
     pub fn poll_loads(&mut self) {
         let shard_count = self.shard_contexts.len();
         for shard_idx in 0..shard_count {
-            let snapshot = self.shard_contexts[shard_idx].occupancy.snapshot();
+            let snapshot = self.shard_contexts[shard_idx].metrics.snapshot();
             let load = snapshot.delta_load(&self.shard_occupancy_snapshots[shard_idx]);
             self.shard_occupancy_snapshots[shard_idx] = snapshot;
             self.update_load(shard_idx, load);

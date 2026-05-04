@@ -5,9 +5,6 @@ pub use tokio::task::JoinSet;
 mod detector;
 pub use detector::LongRunningTaskDetector as Builder;
 
-mod occupancy;
-pub use occupancy::{OccupancySnapshot, ShardOccupancy};
-
 mod spawn;
 pub use spawn::{
     RuntimeSpawner, SpawnError, TaskFactory, TaskHandle, set_global_runtime_spawner, spawn,

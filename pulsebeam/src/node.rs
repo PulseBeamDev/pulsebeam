@@ -7,7 +7,6 @@ use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::{RngCore, SeedableRng};
-use pulsebeam_runtime::rt::ShardOccupancy;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -23,6 +22,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 use crate::control::api;
 use crate::control::controller::ControllerActor;
 use crate::shard::ShardContext;
+use crate::shard::metrics::ShardMetrics;
 use crate::shard::worker::{ShardCommand, ShardWorker};
 
 /// Defines how a service listener is acquired.
@@ -186,7 +186,7 @@ impl NodeBuilder {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
-            let occupancy = Arc::new(ShardOccupancy::new());
+            let occupancy = Arc::new(ShardMetrics::new());
             let shard = ShardWorker::new(
                 shard_id,
                 sock,
@@ -217,7 +217,7 @@ impl NodeBuilder {
 
             shard_contexts.push(ShardContext {
                 command_tx: shard_command_tx,
-                occupancy,
+                metrics: occupancy,
             });
         }
 

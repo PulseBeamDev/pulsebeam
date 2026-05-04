@@ -6,12 +6,12 @@ use std::time::Duration;
 /// This uses raw cumulative counters in microseconds to allow the controller
 /// to derive the load over any window it chooses.
 #[derive(Debug, Default)]
-pub struct ShardOccupancy {
+pub struct ShardMetrics {
     busy_time_us: AtomicU64,
     idle_time_us: AtomicU64,
 }
 
-impl ShardOccupancy {
+impl ShardMetrics {
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,9 +37,9 @@ impl ShardOccupancy {
     }
 
     /// Returns a snapshot of the current counters.
-    pub fn snapshot(&self) -> OccupancySnapshot {
+    pub fn snapshot(&self) -> MetricsSnapshot {
         let (busy, idle) = self.read_raw();
-        OccupancySnapshot {
+        MetricsSnapshot {
             busy_us: busy,
             idle_us: idle,
         }
@@ -48,12 +48,12 @@ impl ShardOccupancy {
 
 /// A frozen view of the occupancy counters at a point in time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OccupancySnapshot {
+pub struct MetricsSnapshot {
     pub busy_us: u64,
     pub idle_us: u64,
 }
 
-impl OccupancySnapshot {
+impl MetricsSnapshot {
     /// Calculates the load (0.0 to 1.0) by comparing this snapshot to a previous one.
     pub fn delta_load(&self, previous: &Self) -> f64 {
         let busy_delta = self.busy_us.wrapping_sub(previous.busy_us) as f64;
@@ -74,25 +74,25 @@ mod tests {
 
     #[test]
     fn test_delta_load() {
-        let s1 = OccupancySnapshot {
+        let s1 = MetricsSnapshot {
             busy_us: 100,
             idle_us: 100,
         };
-        let s2 = OccupancySnapshot {
+        let s2 = MetricsSnapshot {
             busy_us: 200,
             idle_us: 200,
         };
         // Delta: 100 busy, 100 idle. Total 200. Load 0.5.
         assert_eq!(s2.delta_load(&s1), 0.5);
 
-        let s3 = OccupancySnapshot {
+        let s3 = MetricsSnapshot {
             busy_us: 300,
             idle_us: 200,
         };
         // Delta: 100 busy, 0 idle. Total 100. Load 1.0.
         assert_eq!(s3.delta_load(&s2), 1.0);
 
-        let s4 = OccupancySnapshot {
+        let s4 = MetricsSnapshot {
             busy_us: 300,
             idle_us: 300,
         };
@@ -102,11 +102,11 @@ mod tests {
 
     #[test]
     fn test_wrapping() {
-        let s1 = OccupancySnapshot {
+        let s1 = MetricsSnapshot {
             busy_us: u64::MAX,
             idle_us: 0,
         };
-        let s2 = OccupancySnapshot {
+        let s2 = MetricsSnapshot {
             busy_us: 99, // Wrapped
             idle_us: 100,
         };
