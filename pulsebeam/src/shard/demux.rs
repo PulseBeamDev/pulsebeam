@@ -88,6 +88,17 @@ impl Default for Demuxer {
     }
 }
 
+/// Extract the server-side ICE ufrag (the first token before `:` in the STUN
+/// USERNAME attribute) from a raw STUN binding-request payload.
+///
+/// Returns `None` if `data` does not look like a valid STUN message or does not
+/// carry a USERNAME attribute.
+pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
+    ice::parse_stun_remote_ufrag_raw(data)
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .map(str::to_owned)
+}
+
 mod ice {
     use std::convert::TryInto;
 

@@ -1,5 +1,5 @@
 pub(crate) mod core;
-mod demux;
+pub(crate) mod demux;
 pub mod metrics;
 mod scheduler;
 mod timer;

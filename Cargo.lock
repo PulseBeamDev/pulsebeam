@@ -3033,6 +3033,7 @@ name = "pulsebeam-core"
 version = "0.3.2"
 dependencies = [
  "axum",
+ "futures",
  "http",
  "reqwest",
  "tokio",

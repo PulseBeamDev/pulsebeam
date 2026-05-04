@@ -126,8 +126,10 @@ pub async fn bind(
             UnifiedSocket::UdpScalar(transport)
         }
         Transport::Tcp => {
-            let transport = tcp::bind(addr, external_addr).await?;
-            UnifiedSocket::Tcp(transport)
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UnifiedSocket does not support TCP transports",
+            ));
         }
     };
     tracing::debug!("bound to {addr} ({transport:?})");
@@ -137,13 +139,11 @@ pub async fn bind(
 pub enum UnifiedSocket {
     Udp(udp::UdpTransport),
     UdpScalar(udp_scalar::UdpTransport),
-    Tcp(tcp::TcpTransport),
 }
 
 impl UnifiedSocket {
     pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
         match self {
-            Self::Tcp(inner) => inner.close_peer(peer_addr),
             Self::Udp(inner) => inner.close_peer(peer_addr),
             Self::UdpScalar(inner) => inner.close_peer(peer_addr),
         }
@@ -153,7 +153,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.local_addr(),
             Self::UdpScalar(inner) => inner.local_addr(),
-            Self::Tcp(inner) => inner.local_addr(),
         }
     }
 
@@ -162,7 +161,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.readable().await,
             Self::UdpScalar(inner) => inner.readable().await,
-            Self::Tcp(inner) => inner.readable().await,
         }
     }
 
@@ -171,7 +169,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.writable().await,
             Self::UdpScalar(inner) => inner.writable().await,
-            Self::Tcp(inner) => inner.writable().await,
         }
     }
 
@@ -180,7 +177,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_recv_batch(packets),
             Self::UdpScalar(inner) => inner.try_recv_batch(packets),
-            Self::Tcp(inner) => inner.try_recv_batch(packets),
         }
     }
 
@@ -189,7 +185,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::UdpScalar(inner) => inner.try_send_batch(batch),
-            Self::Tcp(inner) => inner.try_send_batch(batch),
         }
     }
 
@@ -197,7 +192,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(inner) => inner.max_gso_segments(),
             Self::UdpScalar(inner) => inner.max_gso_segments(),
-            Self::Tcp(inner) => inner.max_gso_segments(),
         }
     }
 
@@ -205,7 +199,6 @@ impl UnifiedSocket {
         match self {
             Self::Udp(_) => Transport::Udp(UdpMode::Batch),
             Self::UdpScalar(_) => Transport::Udp(UdpMode::Scalar),
-            Self::Tcp(_) => Transport::Tcp,
         }
     }
 }

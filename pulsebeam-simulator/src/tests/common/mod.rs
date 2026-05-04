@@ -62,6 +62,31 @@ pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> an
     Ok(())
 }
 
+/// Same as `start_sfu_node` but with UDP candidates suppressed so that
+/// clients must use the TCP path (TCP-only simulation tests).
+pub async fn start_sfu_node_tcp_only(
+    ip: IpAddr,
+    rng: pulsebeam_runtime::rand::Rng,
+) -> anyhow::Result<()> {
+    let rtc_port = 3478;
+    let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
+    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
+    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
+
+    pulsebeam::node::NodeBuilder::new()
+        .workers(1)
+        .local_addr(local_addr)
+        .external_addr(external_addr)
+        .rng(rng)
+        .with_udp_mode(UdpMode::Scalar)
+        .with_http_api(http_api_addr)
+        .with_current_runtime()
+        .tcp_only()
+        .run(tokio_util::sync::CancellationToken::new())
+        .await?;
+    Ok(())
+}
+
 /// Run a Turmoil simulation run with a real-time timeout.
 ///
 /// This prevents tests from hanging forever if the simulation time stops advancing.

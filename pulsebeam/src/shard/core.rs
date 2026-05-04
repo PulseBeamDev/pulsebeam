@@ -4,7 +4,7 @@ use std::{collections::VecDeque, ops::Deref};
 
 use ahash::HashMap;
 use indexmap::IndexSet;
-use pulsebeam_runtime::net::UnifiedSocket;
+use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use tokio::time::Instant;
 
@@ -246,7 +246,11 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn flush_egress(&mut self, socket: &UnifiedSocket) {
+    pub(crate) fn flush_egress(
+        &mut self,
+        udp_socket: &UnifiedSocket,
+        tcp_socket: &mut net::tcp::TcpTransport,
+    ) {
         for participant_id in self
             .input_dirty
             .drain(..)
@@ -255,13 +259,19 @@ impl ShardCore {
             let Some(participant) = self.participants.get_mut(&participant_id) else {
                 continue;
             };
-            participant.udp_batcher.flush(socket);
+            participant.udp_batcher.flush(udp_socket);
+            participant.tcp_batcher.flush_tcp(tcp_socket);
         }
     }
 
-    pub(crate) fn flush_close_peers(&mut self, socket: &mut UnifiedSocket) {
+    pub(crate) fn flush_close_peers(
+        &mut self,
+        udp_socket: &mut UnifiedSocket,
+        tcp_socket: &mut net::tcp::TcpTransport,
+    ) {
         while let Some(addr) = self.pending_close.pop_front() {
-            socket.close_peer(&addr);
+            udp_socket.close_peer(&addr);
+            tcp_socket.close_peer(&addr);
         }
     }
 
@@ -276,6 +286,9 @@ impl ShardCore {
             }
             ShardCommand::RemoveParticipant(participant_id) => {
                 self.remove_participant(&participant_id, router);
+            }
+            ShardCommand::AddTcpConnection { .. } => {
+                // TCP connection routing is handled by the shard worker; no shard core action is required.
             }
             ShardCommand::Cluster(cmd) => self.on_cluster_command(cmd, router)?,
         }

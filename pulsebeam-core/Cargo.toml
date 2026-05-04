@@ -15,10 +15,12 @@ default = []
 sim = [
     "dep:turmoil",
     "dep:axum",
+    "dep:futures",
 ]
 
 [dependencies]
 tokio = { workspace = true }
+futures = { version = "0.3", optional = true }
 http = { version = "^1" }
 
 axum = { version = "^0.8", optional = true }
