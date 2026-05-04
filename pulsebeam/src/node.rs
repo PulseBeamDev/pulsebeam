@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use metrics_exporter_prometheus::PrometheusHandle;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
@@ -50,7 +51,7 @@ pub struct NodeBuilder {
 
     // Services
     http_api: Option<ListenerSource>,
-    internal_metrics: Option<ListenerSource>,
+    internal_metrics: Option<(ListenerSource, PrometheusHandle)>,
 
     worker_execution: WorkerExecution,
 }
@@ -120,14 +121,22 @@ impl NodeBuilder {
     }
 
     /// Configure the Internal Metrics server to bind to the specified address.
-    pub fn with_internal_metrics(mut self, addr: SocketAddr) -> Self {
-        self.internal_metrics = Some(ListenerSource::Bind(addr));
+    pub fn with_internal_metrics(
+        mut self,
+        addr: SocketAddr,
+        prometheus_handle: PrometheusHandle,
+    ) -> Self {
+        self.internal_metrics = Some((ListenerSource::Bind(addr), prometheus_handle));
         self
     }
 
     /// Configure the Internal Metrics server to use a pre-bound listener.
-    pub fn with_internal_metrics_listener(mut self, listener: TcpListener) -> Self {
-        self.internal_metrics = Some(ListenerSource::PreBound(listener));
+    pub fn with_internal_metrics_listener(
+        mut self,
+        listener: TcpListener,
+        prometheus_handle: PrometheusHandle,
+    ) -> Self {
+        self.internal_metrics = Some((ListenerSource::PreBound(listener), prometheus_handle));
         self
     }
 
@@ -285,7 +294,7 @@ impl NodeBuilder {
             });
         }
 
-        if let Some(source) = self.internal_metrics {
+        if let Some((source, prometheus_handle)) = self.internal_metrics {
             let listener = match source {
                 ListenerSource::Bind(addr) => TcpListener::bind(addr)
                     .await
@@ -296,6 +305,7 @@ impl NodeBuilder {
             join_set.spawn(ignore(internal::serve_internal_http(
                 listener,
                 shutdown.child_token(),
+                prometheus_handle,
             )));
         }
 
@@ -318,8 +328,6 @@ impl NodeBuilder {
 
 pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
-
-    shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
 }
 
 async fn bind_udp_sockets(
@@ -392,7 +400,6 @@ mod internal {
     use metrics::{Unit, describe_gauge, gauge};
     use pprof::ProfilerGuard;
     use pprof::protos::Message;
-    use pulsebeam_runtime::metrics::scrape_to_prometheus;
     use serde::Deserialize;
     use tokio::runtime::Handle;
 
@@ -411,6 +418,7 @@ mod internal {
     pub async fn serve_internal_http(
         listener: TcpListener,
         shutdown: CancellationToken,
+        prometheus_handle: PrometheusHandle,
     ) -> Result<()> {
         let addr = listener.local_addr().ok();
 
@@ -425,13 +433,18 @@ mod internal {
 </ul>
 "#;
 
+        let http_prometheus_handle = prometheus_handle.clone();
         let router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
             .route("/debug/pprof/allocs", get(heap_profile))
             .route("/healthz", get(healthcheck))
             .route("/", get(async move || Html(INDEX_HTML)))
-            .route("/metrics", get(async move || scrape_to_prometheus()));
-        let rt_monitor_join = tokio::spawn(rt_background_monitor());
+            .route(
+                "/metrics",
+                get(async move || http_prometheus_handle.render()),
+            );
+        // let rt_monitor_join = tokio::spawn(rt_background_monitor());
+        let metrics_maintenance_join = tokio::spawn(metrics_maintenance(prometheus_handle));
 
         tracing::info!("internal metrics listening on {:?}", addr);
 
@@ -454,7 +467,8 @@ mod internal {
                     tracing::error!("internal http server error: {e}");
                 }
             }
-            _ = rt_monitor_join => {}
+            // _ = rt_monitor_join => {}
+            _ = metrics_maintenance_join => {}
             // _ = runtime_metrics_join => {}
             // _ = actor_monitor_join => {}
             _ = shutdown.cancelled() => {
@@ -465,7 +479,16 @@ mod internal {
         Ok(())
     }
 
-    async fn rt_background_monitor() {
+    async fn metrics_maintenance(prometheus_handle: PrometheusHandle) {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            interval.tick().await;
+            prometheus_handle.run_upkeep();
+        }
+    }
+
+    async fn rt_background_monitor(prometheus_handle: PrometheusHandle) {
         let metrics = Handle::current().metrics();
 
         describe_gauge!(
@@ -577,6 +600,8 @@ mod internal {
                 gauge!("tokio_worker_mean_poll_time_us", &labels)
                     .set(metrics.worker_mean_poll_time(i).as_micros() as f64);
             }
+
+            prometheus_handle.run_upkeep();
         }
     }
 
