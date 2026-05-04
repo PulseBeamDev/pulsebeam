@@ -390,19 +390,19 @@ pub fn scrape_to_prometheus() -> String {
 
             for (i, &limit) in LATENCY_BUCKETS.iter().enumerate() {
                 cumulative += total_buckets[i];
-                let limit_sec = limit as f64 / 1_000_000_000.0;
+                let limit_ms = limit as f64 / 1_000_000.0;
                 let le_str = if labels_str.is_empty() {
-                    format!("{{le=\"{:.3}\"}}", limit_sec)
+                    format!("{{le=\"{:.3}\"}}", limit_ms)
                 } else {
                     format!(
                         "{}, le=\"{:.3}\"}}",
                         &labels_str[..labels_str.len() - 1],
-                        limit_sec
+                        limit_ms
                     )
                 };
 
                 output.push_str(&format!(
-                    "{}{} {}\n",
+                    "{}_bucket{} {}\n",
                     base_name.as_str(),
                     le_str,
                     cumulative
@@ -417,7 +417,7 @@ pub fn scrape_to_prometheus() -> String {
             };
 
             output.push_str(&format!(
-                "{}{} {}\n",
+                "{}_bucket{} {}\n",
                 base_name.as_str(),
                 inf_str,
                 cumulative
@@ -480,6 +480,7 @@ mod tests {
         h.record(150_000_000.0); // 150ms -> bucket 5
 
         let output = scrape_to_prometheus();
+        println!("{}", output);
         assert!(output.contains("test_latency_bucket{le=\"1.000\"} 1"));
         assert!(output.contains("test_latency_bucket{le=\"5.000\"} 2"));
         assert!(output.contains("test_latency_bucket{le=\"+Inf\"} 3"));
