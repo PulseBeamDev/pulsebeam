@@ -53,6 +53,11 @@ pub struct NodeBuilder {
     internal_metrics: Option<ListenerSource>,
 
     worker_execution: WorkerExecution,
+
+    /// When `true`, UDP candidates are suppressed so that clients are forced
+    /// to use the TCP path.  Used in simulation tests that exercise TCP-only
+    /// connectivity.
+    tcp_only: bool,
 }
 
 impl Default for NodeBuilder {
@@ -72,6 +77,7 @@ impl NodeBuilder {
             http_api: None,
             internal_metrics: None,
             worker_execution: WorkerExecution::ThreadPerWorker,
+            tcp_only: false,
         }
     }
 
@@ -137,6 +143,14 @@ impl NodeBuilder {
         self
     }
 
+    /// Suppress UDP host candidates so that only the TCP passive candidate is
+    /// advertised.  Clients that support TCP active will be forced onto TCP.
+    /// Useful for integration / simulation tests that exercise the TCP path.
+    pub fn tcp_only(mut self) -> Self {
+        self.tcp_only = true;
+        self
+    }
+
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let workers_count = self.workers;
@@ -149,7 +163,30 @@ impl NodeBuilder {
         let mut join_set = JoinSet::new();
         let udp_sockets =
             bind_udp_sockets(local_addr, external_addr, workers_count, self.udp_mode).await?;
-        let candidates = sockets_to_candidates(&udp_sockets);
+
+        let tcp_listener = TcpListener::bind(local_addr)
+            .await
+            .context("binding tcp listener")?;
+        let tcp_local_addr = external_addr.unwrap_or(tcp_listener.local_addr()?);
+
+        let tcp_sockets: Vec<net::tcp::TcpTransport> = (0..workers_count)
+            .map(|_| net::tcp::TcpTransport::new(tcp_local_addr))
+            .collect();
+
+        let mut candidates = sockets_to_candidates(&udp_sockets);
+        if self.tcp_only {
+            candidates.clear();
+        }
+        if !tcp_sockets.is_empty() {
+            candidates.push(
+                Candidate::builder()
+                    .tcp()
+                    .host(tcp_local_addr)
+                    .tcptype(str0m::net::TcpType::Passive)
+                    .build()
+                    .expect("a TCP passive host candidate"),
+            );
+        }
 
         let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
         let mut shard_handles = Vec::new();
@@ -174,14 +211,14 @@ impl NodeBuilder {
             .map(|_| rand::Rng::seed_from_u64(rng.next_u64()))
             .collect();
 
-        let contexts = udp_sockets
-            .into_iter()
-            .zip(cross_shard_event_rxs)
-            .zip(shard_rngs);
         let mut shard_contexts = Vec::new();
 
-        for (shard_id, ((sock, cross_shard_event_rx), shard_rng)) in
-            contexts.into_iter().enumerate()
+        for (shard_id, (((udp_sock, tcp_sock), cross_shard_event_rx), shard_rng)) in udp_sockets
+            .into_iter()
+            .zip(tcp_sockets.into_iter())
+            .zip(cross_shard_event_rxs)
+            .zip(shard_rngs)
+            .enumerate()
         {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
@@ -189,7 +226,8 @@ impl NodeBuilder {
             let occupancy = Arc::new(ShardMetrics::new());
             let shard = ShardWorker::new(
                 shard_id,
-                sock,
+                udp_sock,
+                tcp_sock,
                 shard_command_rx,
                 shard_event_tx,
                 cross_shard_event_rx,
@@ -221,7 +259,8 @@ impl NodeBuilder {
             });
         }
 
-        let controller = ControllerActor::new(controller_rng, shard_contexts, candidates);
+        let controller =
+            ControllerActor::new(controller_rng, shard_contexts, candidates, tcp_listener);
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
 

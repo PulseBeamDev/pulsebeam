@@ -31,6 +31,24 @@ impl SimClientBuilder {
         })
     }
 
+    /// Like `bind` but also configures a TCP active stream to the server's ICE
+    /// port (3478).  Use with `start_sfu_node_tcp_only` to test TCP connectivity.
+    pub async fn bind_tcp(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
+        let client = create_http_client();
+        let server_base_uri = format!("http://{}:7070", server_ip);
+        let api = HttpApiClient::new(client, &server_base_uri)?;
+
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let server_tcp_addr: std::net::SocketAddr = format!("{}:3478", server_ip).parse()?;
+
+        Ok(Self {
+            ip,
+            agent_builder: AgentBuilder::new(api, socket)
+                .with_local_ip(ip)
+                .with_tcp_server_addr(server_tcp_addr),
+        })
+    }
+
     pub fn with_track(
         mut self,
         kind: MediaKind,

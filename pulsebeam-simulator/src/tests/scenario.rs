@@ -103,6 +103,101 @@ impl Scenario {
     }
 }
 
+/// Stage that starts an SFU host with UDP candidates suppressed (TCP-only mode).
+pub struct StartSfuTcpOnlyStage;
+
+impl Stage for StartSfuTcpOnlyStage {
+    fn name(&self) -> &'static str {
+        "start_sfu_tcp_only"
+    }
+
+    fn apply(&self, sim: &mut Sim<'_>, ctx: &mut ScenarioCtx) -> TurmoilResult<()> {
+        let server_ip = ctx.server_ip;
+        sim.host(server_ip, move || async move {
+            crate::tests::common::start_sfu_node_tcp_only(
+                server_ip,
+                pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+            )
+            .await
+            .map_err(|e| e.into())
+        });
+        Ok(())
+    }
+}
+
+/// Stage that connects N peers using the TCP active path and asserts bidirectional flow.
+pub struct ConnectPeersTcpOnlyStage {
+    pub peers: usize,
+    pub min_tx_bytes: u64,
+    pub min_rx_bytes: u64,
+    pub max_wait: Duration,
+}
+
+impl Stage for ConnectPeersTcpOnlyStage {
+    fn name(&self) -> &'static str {
+        "connect_peers_tcp_only"
+    }
+
+    fn apply(&self, sim: &mut Sim<'_>, ctx: &mut ScenarioCtx) -> TurmoilResult<()> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(self.peers));
+
+        for _ in 0..self.peers {
+            let ip = ctx.alloc_client_ip();
+            let barrier = barrier.clone();
+            let server_ip = ctx.server_ip;
+            let min_tx_bytes = self.min_tx_bytes;
+            let min_rx_bytes = self.min_rx_bytes;
+            let max_wait = self.max_wait;
+
+            let client_handle: ClientHandle = Arc::new(tokio::sync::Mutex::new(None));
+            ctx.clients.push(ClientInfo {
+                ip,
+                handle: client_handle.clone(),
+            });
+
+            sim.client(ip, async move {
+                let client = SimClientBuilder::bind_tcp(ip, server_ip)
+                    .await?
+                    .with_track(
+                        MediaKind::Video,
+                        TransceiverDirection::SendOnly,
+                        Some(vec![
+                            SimulcastLayer::new("f"),
+                            SimulcastLayer::new("h"),
+                            SimulcastLayer::new("q"),
+                        ]),
+                    )
+                    .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                    .connect("room1")
+                    .await?;
+
+                {
+                    let mut guard = client_handle.lock().await;
+                    *guard = Some(client);
+                }
+
+                {
+                    let mut guard = client_handle.lock().await;
+                    let client = guard.as_mut().expect("client must be initialized");
+                    client
+                        .drive_until(max_wait, |stats| {
+                            let Some(peer) = &stats.peer else {
+                                return false;
+                            };
+                            peer.peer_bytes_tx > min_tx_bytes && peer.peer_bytes_rx > min_rx_bytes
+                        })
+                        .await?;
+                }
+
+                barrier.wait().await;
+                Ok(())
+            });
+        }
+
+        Ok(())
+    }
+}
+
 /// Stage that starts an SFU host.
 pub struct StartSfuStage;
 

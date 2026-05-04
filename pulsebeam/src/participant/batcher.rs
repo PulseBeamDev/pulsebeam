@@ -103,6 +103,37 @@ impl Batcher {
             }
         }
     }
+
+    pub fn flush_tcp(&mut self, socket: &mut net::tcp::TcpTransport) {
+        while let Some(state) = self.front() {
+            debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
+            debug_assert!(
+                state.segment_size != 0,
+                "BatcherState must have a nonzero segment_size before flush"
+            );
+            debug_assert!(
+                state.buf.len() <= state.max_segments * BatcherState::MAX_MTU,
+                "Batch exceeds configured TCP batch capacity"
+            );
+            let res = socket.try_send_batch(&net::SendPacketBatch {
+                dst: state.dst,
+                buf: &state.buf,
+                segment_size: state.segment_size,
+            });
+            match res {
+                Ok(true) => {
+                    let state = self.pop_front().unwrap();
+                    self.reclaim(state);
+                }
+                Err(err) if err.kind() != io::ErrorKind::WouldBlock => {
+                    tracing::trace!("error on writing to TCP socket: {:?}", err);
+                    let state = self.pop_front().unwrap();
+                    self.reclaim(state);
+                }
+                _ => break,
+            }
+        }
+    }
 }
 
 /// Holds the state for a single GSO-compatible batch.
