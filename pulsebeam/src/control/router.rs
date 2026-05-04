@@ -54,9 +54,10 @@ impl ShardRouter {
     pub fn update_load(&mut self, shard_idx: usize, load: f64) {
         debug_assert!(load >= 0.0);
         debug_assert!(load <= 1.0);
-        let load = load.min(1.0).max(0.0);
+        let load = load.clamp(0.0, 1.0);
         if let Some(slot) = self.shard_loads.get_mut(shard_idx) {
             *slot = load;
+            metrics::gauge!("router_shard_load", "shard" => shard_idx.to_string()).set(load);
         }
     }
 

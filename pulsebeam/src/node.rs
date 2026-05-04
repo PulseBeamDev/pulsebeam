@@ -201,8 +201,7 @@ impl NodeBuilder {
             if use_shared_runtime {
                 join_set.spawn(ignore(shard.run()));
             } else {
-                let builder =
-                    std::thread::Builder::new().name(format!("pulsebeam-worker-{}", shard_id));
+                let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
                 let handle = builder
                     .spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
