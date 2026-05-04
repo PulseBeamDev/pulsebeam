@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
     rand::Rng,
+    rt::ShardOccupancy,
 };
 use tokio::time::Instant;
 
@@ -94,6 +97,12 @@ pub enum ShardEvent {
     KeyframeRequest(GlobalKeyframeRequest),
 }
 
+#[derive(Clone)]
+pub struct ShardContext {
+    pub command_tx: mailbox::Sender<ShardCommand>,
+    pub occupancy: Arc<ShardOccupancy>,
+}
+
 struct ShardRouter {
     shard_id: usize,
     cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
@@ -129,6 +138,7 @@ pub struct ShardWorker {
     event_tx: mailbox::Sender<ShardEvent>,
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
     router: ShardRouter,
+    occupancy: Arc<ShardOccupancy>,
 }
 
 impl ShardWorker {
@@ -139,6 +149,7 @@ impl ShardWorker {
         event_tx: mailbox::Sender<ShardEvent>,
         cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
         cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
+        occupancy: Arc<ShardOccupancy>,
         rng: Rng,
     ) -> Self {
         let core = ShardCore::new(shard_id, udp_socket.max_gso_segments(), rng);
@@ -154,6 +165,7 @@ impl ShardWorker {
             event_tx,
             cross_shard_event_rx,
             router,
+            occupancy,
         }
     }
 
@@ -165,6 +177,8 @@ impl ShardWorker {
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
         loop {
+            let loop_start = Instant::now();
+
             // Compute the deadline before the select so no borrow of self.core
             // outlives this block.
             let deadline = self.core.next_timer_deadline();
@@ -177,6 +191,7 @@ impl ShardWorker {
             };
 
             // Block until at least one source is ready.
+            // TODO: ideally, we should not do work here yet, we just want to get notifications
             tokio::select! {
                 biased;
                 Ok(_) = self.udp_socket.readable() => {}
@@ -190,6 +205,9 @@ impl ShardWorker {
                 else => break,
             }
 
+            let now = Instant::now();
+            self.occupancy.record_idle(now - loop_start);
+
             while let Ok(cmd) = self.command_rx.try_recv() {
                 self.core.on_command(cmd, &self.router);
             }
@@ -197,14 +215,10 @@ impl ShardWorker {
                 self.core.pending_cross_shard.push_back(ev);
             }
 
-            let now = Instant::now();
-
             self.core.flush_cross_shard(now, &self.router);
             self.core.fire_timers(now);
 
-            let _ = self
-                .udp_socket
-                .try_recv_batch(&mut self.recv_batch);
+            let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
             for batch in self.recv_batch.drain(..) {
                 self.core.on_udp_batch(batch, &self.router);
             }
@@ -231,6 +245,8 @@ impl ShardWorker {
                     Ok(_) => {}
                 }
             }
+
+            self.occupancy.record_busy(now.elapsed());
         }
 
         Ok(())

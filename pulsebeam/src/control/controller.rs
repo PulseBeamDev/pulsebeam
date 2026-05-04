@@ -1,4 +1,5 @@
 use std::io;
+use std::time::Duration;
 
 use crate::{
     control::{
@@ -7,6 +8,7 @@ use crate::{
         router::ShardRouter,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
+    shard::ShardContext,
     shard::worker::{ClusterCommand, ShardCommand, ShardEvent},
 };
 use pulsebeam_runtime::mailbox;
@@ -81,6 +83,8 @@ pub enum ControllerError {
     Unknown(String),
 }
 
+const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct ControllerActor {
     router: ShardRouter,
     core: ControllerCore,
@@ -91,10 +95,10 @@ pub struct ControllerActor {
 impl ControllerActor {
     pub fn new(
         mut rng: pulsebeam_runtime::rand::Rng,
-        shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
+        shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
     ) -> Self {
-        let router = ShardRouter::new(shard_command_txs, &mut rng);
+        let router = ShardRouter::new(shard_contexts, &mut rng);
 
         Self {
             router,
@@ -109,6 +113,9 @@ impl ControllerActor {
         mut command_rx: mailbox::Receiver<ControllerCommand>,
         mut shard_event_rx: mailbox::Receiver<ShardEvent>,
     ) {
+        let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 // let command to backpressure to signal clients to slow down.
@@ -119,6 +126,10 @@ impl ControllerActor {
                 }
 
                 _ = self.core.next_expired() => {}
+
+                _ = poll_interval.tick() => {
+                    self.router.poll_loads();
+                }
 
                 Some(cmd) = command_rx.recv() => {
                     self.process_command(cmd);

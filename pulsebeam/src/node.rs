@@ -7,8 +7,10 @@ use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::{RngCore, SeedableRng};
+use pulsebeam_runtime::rt::ShardOccupancy;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use str0m::Candidate;
 use tokio::runtime::LocalOptions;
@@ -20,8 +22,8 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
 use crate::control::controller::ControllerActor;
-use crate::shard::worker::ShardCommand;
-use crate::shard::worker::ShardWorker;
+use crate::shard::ShardContext;
+use crate::shard::worker::{ShardCommand, ShardWorker};
 
 /// Defines how a service listener is acquired.
 enum ListenerSource {
@@ -151,7 +153,6 @@ impl NodeBuilder {
 
         let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
         let mut shard_handles = Vec::new();
-        let mut shard_command_txs = Vec::new();
         let mut cross_shard_event_txs = Vec::new();
         let mut cross_shard_event_rxs = Vec::new();
         let use_shared_runtime = matches!(self.worker_execution, WorkerExecution::SharedRuntime);
@@ -177,6 +178,7 @@ impl NodeBuilder {
             .into_iter()
             .zip(cross_shard_event_rxs)
             .zip(shard_rngs);
+        let mut shard_contexts = Vec::new();
 
         for (shard_id, ((sock, cross_shard_event_rx), shard_rng)) in
             contexts.into_iter().enumerate()
@@ -184,6 +186,7 @@ impl NodeBuilder {
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
+            let occupancy = Arc::new(ShardOccupancy::new());
             let shard = ShardWorker::new(
                 shard_id,
                 sock,
@@ -191,6 +194,7 @@ impl NodeBuilder {
                 shard_event_tx,
                 cross_shard_event_rx,
                 cross_shard_event_txs,
+                occupancy.clone(),
                 shard_rng,
             );
 
@@ -212,10 +216,13 @@ impl NodeBuilder {
                 shard_handles.push(handle);
             }
 
-            shard_command_txs.push(shard_command_tx);
+            shard_contexts.push(ShardContext {
+                command_tx: shard_command_tx,
+                occupancy,
+            });
         }
 
-        let controller = ControllerActor::new(controller_rng, shard_command_txs, candidates);
+        let controller = ControllerActor::new(controller_rng, shard_contexts, candidates);
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
 

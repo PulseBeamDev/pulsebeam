@@ -1,4 +1,4 @@
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::atomic::Ordering;
 use crate::sync::{Arc, Mutex};
 use dashmap::DashMap;
 pub use metrics::{
@@ -104,6 +104,12 @@ pub(crate) fn init() {
 /// The TPC-optimized metrics recorder.
 pub struct TpcRecorder {
     clock: Clock,
+}
+
+impl Default for TpcRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TpcRecorder {

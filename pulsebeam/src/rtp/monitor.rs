@@ -407,7 +407,7 @@ impl BitrateEstimate {
     }
 
     pub fn poll(&mut self, now: Instant) {
-        // Headroom strategy: use a small factor to allow for some growth while 
+        // Headroom strategy: use a small factor to allow for some growth while
         // avoiding over-allocation that leads to bufferbloat on congested links.
         const HEADROOM: f64 = 1.05;
         let elapsed = now.saturating_duration_since(self.last_update);

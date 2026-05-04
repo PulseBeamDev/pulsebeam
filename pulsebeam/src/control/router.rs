@@ -1,21 +1,31 @@
 use pulsebeam_runtime::mailbox::{self};
 use pulsebeam_runtime::rand::RngCore;
+use pulsebeam_runtime::rt::OccupancySnapshot;
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use crate::shard::worker::{ClusterCommand, ShardCommand};
+use crate::{
+    shard::ShardContext,
+    shard::worker::{ClusterCommand, ShardCommand},
+};
 
 const MAX_LOAD: f64 = 0.7;
 
 pub struct ShardRouter {
     hasher_config: ahash::RandomState,
-    shard_command_txs: Vec<mailbox::Sender<ShardCommand>>,
+    shard_contexts: Vec<ShardContext>,
     /// Current load of each shard (e.g., CPU % or Participant Count)
     shard_loads: Vec<f64>,
+    shard_occupancy_snapshots: Vec<OccupancySnapshot>,
 }
 
 impl ShardRouter {
-    pub fn new(shards: Vec<mailbox::Sender<ShardCommand>>, rng: &mut impl RngCore) -> Self {
-        let shard_count = shards.len();
+    pub fn new(shard_contexts: Vec<ShardContext>, rng: &mut impl RngCore) -> Self {
+        let shard_count = shard_contexts.len();
+        let shard_occupancy_snapshots = shard_contexts
+            .iter()
+            .map(|ctx| ctx.occupancy.snapshot())
+            .collect();
+
         Self {
             hasher_config: ahash::RandomState::with_seeds(
                 rng.next_u64(),
@@ -23,8 +33,19 @@ impl ShardRouter {
                 rng.next_u64(),
                 rng.next_u64(),
             ),
-            shard_command_txs: shards,
+            shard_contexts,
             shard_loads: vec![0.0; shard_count],
+            shard_occupancy_snapshots,
+        }
+    }
+
+    pub fn poll_loads(&mut self) {
+        let shard_count = self.shard_contexts.len();
+        for shard_idx in 0..shard_count {
+            let snapshot = self.shard_contexts[shard_idx].occupancy.snapshot();
+            let load = snapshot.delta_load(&self.shard_occupancy_snapshots[shard_idx]);
+            self.shard_occupancy_snapshots[shard_idx] = snapshot;
+            self.update_load(shard_idx, load);
         }
     }
 
@@ -80,13 +101,13 @@ impl ShardRouter {
     }
 
     pub async fn broadcast(&mut self, cmd: ClusterCommand) {
-        for tx in &self.shard_command_txs {
+        for ctx in &self.shard_contexts {
             let cmd = ShardCommand::Cluster(cmd.clone());
-            tx.send(cmd).await.expect("shard to be running");
+            ctx.command_tx.send(cmd).await.expect("shard to be running");
         }
     }
 
     fn get_mut(&mut self, shard_id: usize) -> &mut mailbox::Sender<ShardCommand> {
-        &mut self.shard_command_txs[shard_id]
+        &mut self.shard_contexts[shard_id].command_tx
     }
 }
