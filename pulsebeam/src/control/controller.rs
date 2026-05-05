@@ -12,6 +12,7 @@ use crate::{
         core::{ControllerCore, ControllerEvent, ControllerEventQueue},
         negotiator::{Negotiator, NegotiatorError},
         router::ShardRouter,
+        ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
     shard::{
@@ -110,11 +111,10 @@ pub struct ControllerActor {
     negotiator: Negotiator,
     eq: ControllerEventQueue,
     tcp_listener: pulsebeam_core::net::TcpListener,
-    /// Maps server ICE ufrag → shard_id so that TCP connections are routed to
-    /// the shard that owns the participant, not just hash(peer_addr).
-    ufrag_shard: std::collections::HashMap<String, usize>,
-    /// Reverse index for cleanup on participant deletion.
-    participant_ufrag: std::collections::HashMap<ParticipantId, String>,
+    /// Routing parameters encoded into every ICE ufrag.  Single-node deployments
+    /// use 0 for both; set via `NodeBuilder` when multi-node support lands.
+    cluster_id: u16,
+    node_id: u16,
     /// In-flight futures reading the first STUN frame from newly accepted streams.
     pending_tcp: FuturesUnordered<Pin<Box<dyn Future<Output = Option<PendingTcpConn>> + Send>>>,
 }
@@ -134,8 +134,8 @@ impl ControllerActor {
             negotiator: Negotiator::new(candidates),
             eq: ControllerEventQueue::default(),
             tcp_listener,
-            ufrag_shard: Default::default(),
-            participant_ufrag: Default::default(),
+            cluster_id: 0,
+            node_id: 0,
             pending_tcp: FuturesUnordered::new(),
         }
     }
@@ -154,9 +154,6 @@ impl ControllerActor {
                 biased;
 
                 Some(ev) = shard_event_rx.recv() => {
-                    if let ShardEvent::ParticipantExited(ref id) = ev {
-                        self.remove_ufrag(id);
-                    }
                     self.core.process_shard_event(ev, &mut self.eq);
                 }
 
@@ -204,7 +201,6 @@ impl ControllerActor {
             }
 
             ControllerCommand::DeleteParticipant(m) => {
-                self.remove_ufrag(&m.participant_id);
                 self.core
                     .delete_participant(&m.participant_id, &mut self.eq);
             }
@@ -240,15 +236,15 @@ impl ControllerActor {
 
     /// Route an accepted TCP connection to the shard that owns its participant.
     ///
-    /// The server ICE ufrag extracted from the first STUN frame lets us look up
-    /// which shard the participant lives on, so the TCP stream is moved exactly
-    /// once — from the acceptor to the correct shard.  If the ufrag is not yet
-    /// known we fall back to hash(peer_addr).
+    /// The server ICE ufrag decoded from the first STUN frame directly gives us
+    /// the shard_id — no HashMap lookup needed.  Falls back to hash(peer_addr)
+    /// for any connection whose ufrag cannot be decoded (e.g. old-format clients
+    /// during a rolling upgrade).
     fn route_tcp_connection(&mut self, conn: PendingTcpConn) {
         let shard_id = conn
             .server_ufrag
             .as_deref()
-            .and_then(|u| self.ufrag_shard.get(u).copied())
+            .and_then(|u| IceUfrag::decode(u).map(|u| u.shard_id as usize))
             .or_else(|| self.router.try_route(&conn.peer_addr));
 
         let Some(shard_id) = shard_id else {
@@ -282,33 +278,39 @@ impl ControllerActor {
         self.pending_tcp.push(fut);
     }
 
-    fn remove_ufrag(&mut self, id: &ParticipantId) {
-        if let Some(ufrag) = self.participant_ufrag.remove(id) {
-            self.ufrag_shard.remove(&ufrag);
-        }
-    }
+    fn remove_ufrag(&mut self, _id: &ParticipantId) {}
 
     pub fn handle_create_participant(
         &mut self,
         state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<SdpAnswer, ControllerError> {
-        let (rtc, answer) = self.negotiator.create_answer(offer)?;
+        // Determine shard first so we can encode it into the ICE ufrag.
         let routing_key = self.core.routing_key(&state.room_id);
         let shard_id = self
             .router
             .try_route(&routing_key)
             .ok_or(ControllerError::ServiceUnavailable)?;
-        let mut cfg = self.core.create_participant(rtc, state, shard_id);
-        let ufrag = cfg.ufrag();
 
-        self.ufrag_shard.insert(ufrag.clone(), shard_id);
-        self.participant_ufrag.insert(cfg.participant_id, ufrag.clone());
+        // Encode routing metadata into the ICE ufrag.  The shard worker and
+        // demuxer can decode shard_id / participant_id directly from STUN
+        // binding requests — no distributed lookup needed.
+        let ufrag = IceUfrag::new(
+            self.cluster_id,
+            self.node_id,
+            shard_id as u8,
+            state.participant_id,
+        );
+        let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
+        let encoded_ufrag = creds.ufrag.clone();
+
+        let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
+        let cfg = self.core.create_participant(rtc, state, shard_id);
 
         self.eq.broadcast(ClusterCommand::RegisterParticipant {
             shard_id,
             participant_id: cfg.participant_id,
-            ufrag,
+            ufrag: encoded_ufrag,
         });
         self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
         Ok(answer)

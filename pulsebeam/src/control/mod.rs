@@ -5,5 +5,6 @@ mod negotiator;
 mod registry;
 mod room;
 mod router;
+pub mod ufrag;
 
 pub use negotiator::MAX_SEND_AUDIO_SLOTS;

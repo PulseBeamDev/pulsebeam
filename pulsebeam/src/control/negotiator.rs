@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use str0m::{
-    Candidate, Rtc, RtcConfig, RtcError,
+    Candidate, IceCreds, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
     format::{Codec, FormatParams},
     media::{Direction, Frequency, MediaKind, Pt},
@@ -79,7 +79,7 @@ impl Negotiator {
         Self { candidates }
     }
 
-    pub fn create_answer(&mut self, offer: SdpOffer) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
+    pub fn create_answer(&mut self, offer: SdpOffer, creds: IceCreds) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
         const PT_OPUS: Pt = Pt::new_with_value(111);
 
         tracing::debug!("{offer}");
@@ -149,6 +149,12 @@ impl Negotiator {
         // codec_config.add_h264(127.into(), Some(121.into()), true, 0x420028);
         // // Constrained Baseline Level 4.0, (pt=108, rtx=109)
         // codec_config.add_h264(108.into(), Some(109.into()), true, 0x42e028);
+
+        // Stamp the ICE credentials with routing metadata before building the Rtc
+        // so they are used by str0m's ICE agent from the start.  Using RtcConfig
+        // is the correct path — direct_api().set_local_ice_credentials() conflicts
+        // with the SDP negotiation path.
+        let rtc_config = rtc_config.set_local_ice_credentials(creds);
 
         let mut rtc = rtc_config.build(Instant::now().into());
         for c in &self.candidates {
