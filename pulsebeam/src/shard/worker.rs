@@ -30,12 +30,8 @@ pub enum ShardCommand {
     AddParticipant(ParticipantConfig),
     RemoveParticipant(ParticipantId),
     AddTcpConnection {
-        stream: pulsebeam_core::net::TcpStream,
+        stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
         peer_addr: std::net::SocketAddr,
-        /// The decoded payload of the first RFC 4571 frame already read by the
-        /// controller for ufrag-based routing.  Delivered to `try_recv_batch` on
-        /// the next tick so no data is lost.
-        initial_payload: Vec<u8>,
     },
     Cluster(ClusterCommand),
 }
@@ -203,7 +199,7 @@ impl ShardWorker {
             // AddTcpConnection commands received inside the select arm are deferred here
             // so that the `tcp_socket.readable()` future (which borrows `tcp_socket`) is
             // fully dropped before we take `&mut tcp_socket` to call `add_connection`.
-            let mut deferred_tcp: Option<(pulsebeam_core::net::TcpStream, std::net::SocketAddr, Vec<u8>)> =
+            let mut deferred_tcp: Option<(pulsebeam_runtime::net::tcp::BufferedTcpStream, std::net::SocketAddr)> =
                 None;
 
             // Block until at least one source is ready.
@@ -214,10 +210,10 @@ impl ShardWorker {
                 Ok(_) = self.tcp_socket.readable() => {}
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
-                        ShardCommand::AddTcpConnection { stream, peer_addr, initial_payload } => {
+                        ShardCommand::AddTcpConnection { stream, peer_addr } => {
                             // Defer: tcp_socket.readable() borrow is still alive in this select.
                             // Handled immediately after the select block below.
-                            deferred_tcp = Some((stream, peer_addr, initial_payload));
+                            deferred_tcp = Some((stream, peer_addr));
                         }
                         cmd => {
                             let _ = self.core.on_command(cmd, &self.router);
@@ -232,8 +228,8 @@ impl ShardWorker {
             }
 
             // tcp_socket.readable() future is now dropped; &mut tcp_socket is safe.
-            if let Some((stream, peer_addr, initial_payload)) = deferred_tcp
-                && let Err(err) = self.tcp_socket.add_connection(stream, peer_addr, initial_payload)
+            if let Some((stream, peer_addr)) = deferred_tcp
+                && let Err(err) = self.tcp_socket.add_connection(stream, peer_addr)
             {
                 tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
             }
@@ -243,8 +239,8 @@ impl ShardWorker {
 
             while let Ok(cmd) = self.command_rx.try_recv() {
                 match cmd {
-                    ShardCommand::AddTcpConnection { stream, peer_addr, initial_payload } => {
-                        if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr, initial_payload) {
+                    ShardCommand::AddTcpConnection { stream, peer_addr } => {
+                        if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
                             tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
                         }
                     }
