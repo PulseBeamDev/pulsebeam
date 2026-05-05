@@ -2,7 +2,7 @@ use crate::api::{ApiError, CreateParticipantRequest, HttpApiClient};
 use crate::manager::{Subscription, SubscriptionManager};
 use crate::media::{KeyframeNotifier, KeyframeReceiver};
 use crate::{MediaFrame, TransceiverDirection};
-use bytes::{Buf, BytesMut};
+use crate::tcp::TcpSession;
 use futures_lite::StreamExt;
 use http::Uri;
 use pulsebeam_core::net::UdpSocket;
@@ -10,7 +10,6 @@ use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{namespace, signaling};
 use std::collections::HashMap;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +22,6 @@ use str0m::{
     media::{Direction, MediaAdded, MediaKind, Mid},
     net::{Protocol, Receive, TcpType},
 };
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
@@ -686,11 +684,10 @@ impl AgentBuilder {
             stats: AgentStats::default(),
             socket: self.udp_socket,
             buf: vec![0u8; 2048],
-            tcp_stream,
-            tcp_buf: vec![0u8; 2048],
-            tcp_recv_accum: BytesMut::new(),
-            tcp_local_addr,
-            tcp_server_addr,
+            tcp: match tcp_stream {
+                Some(s) => TcpSession::new(s, tcp_local_addr, tcp_server_addr.unwrap()),
+                None => TcpSession::inactive(),
+            },
             cmd_rx,
             event_tx,
             resource_uri: resp.resource_uri,
@@ -819,16 +816,8 @@ struct AgentActor {
     rtc: Rtc,
     socket: UdpSocket,
     buf: Vec<u8>,
-    /// Optional TCP stream to the server (RFC 6544 active-side).
-    tcp_stream: Option<pulsebeam_core::net::TcpStream>,
-    /// Read buffer for raw bytes coming off the TCP stream.
-    tcp_buf: Vec<u8>,
-    /// Reassembly buffer for incomplete RFC 4571 frames.
-    tcp_recv_accum: BytesMut,
-    /// Actual local address of the TCP stream (for `Receive.destination`).
-    tcp_local_addr: Option<SocketAddr>,
-    /// Server's TCP address (for `Receive.source`).
-    tcp_server_addr: Option<SocketAddr>,
+    /// Active TCP connection to the server (RFC 6544 client role).
+    tcp: TcpSession,
     stats: AgentStats,
     cmd_rx: mpsc::Receiver<AgentCommand>,
     event_tx: mpsc::Sender<AgentEvent>,
@@ -853,22 +842,6 @@ struct AgentActor {
     retry_count: u32,
     is_reconnecting: bool,
     reconnect_deadline: Option<Instant>,
-}
-
-/// Read from a TCP stream only if one is present; otherwise park forever so
-/// that the `tokio::select!` arm never fires.
-///
-/// This is a free function (not a method) so that the caller can borrow
-/// `self.tcp_stream` and `self.tcp_buf` without borrowing all of `self`.
-async fn tcp_read(
-    stream: &mut Option<pulsebeam_core::net::TcpStream>,
-    buf: &mut Vec<u8>,
-) -> io::Result<usize> {
-    use tokio::io::AsyncReadExt;
-    match stream {
-        None => std::future::pending().await,
-        Some(s) => s.read(buf.as_mut_slice()).await,
-    }
 }
 
 impl AgentActor {
@@ -935,52 +908,8 @@ impl AgentActor {
                 }
 
                 // TCP receive path: decode RFC 4571 frames and feed to str0m.
-                tcp_n = tcp_read(&mut self.tcp_stream, &mut self.tcp_buf) => {
-                    match tcp_n {
-                        Ok(0) => {
-                            tracing::warn!("TCP stream closed by server");
-                            self.tcp_stream = None;
-                        }
-                        Ok(n) => {
-                            self.tcp_recv_accum.extend_from_slice(&self.tcp_buf[..n]);
-                            while self.tcp_recv_accum.len() >= 2 {
-                                let len = u16::from_be_bytes([
-                                    self.tcp_recv_accum[0],
-                                    self.tcp_recv_accum[1],
-                                ]) as usize;
-                                if len == 0 || len > 2048 {
-                                    tracing::warn!(len, "invalid TCP frame length, closing stream");
-                                    self.tcp_stream = None;
-                                    self.tcp_recv_accum.clear();
-                                    break;
-                                }
-                                if self.tcp_recv_accum.len() < 2 + len {
-                                    break; // incomplete frame, wait for more data
-                                }
-                                self.tcp_recv_accum.advance(2);
-                                let frame = self.tcp_recv_accum.split_to(len);
-                                if let (Ok(contents), Some(src), Some(dst)) = (
-                                    frame[..].try_into(),
-                                    self.tcp_server_addr,
-                                    self.tcp_local_addr,
-                                ) {
-                                    let _ = self.rtc.handle_input(Input::Receive(
-                                        Instant::now().into(),
-                                        Receive {
-                                            proto: Protocol::Tcp,
-                                            source: src,
-                                            destination: dst,
-                                            contents,
-                                        },
-                                    ));
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            tracing::warn!("TCP read error, closing stream");
-                            self.tcp_stream = None;
-                        }
-                    }
+                res = self.tcp.wait_recv() => {
+                    self.tcp.on_recv(res, &mut self.rtc);
                 }
 
                 // Drain paused layers so the looper task never blocks.
@@ -1040,16 +969,7 @@ impl AgentActor {
                         let _ = self.socket.send_to(&tx.contents, tx.destination).await;
                     }
                     Protocol::Tcp => {
-                        if let Some(stream) = &mut self.tcp_stream {
-                            let len = tx.contents.len() as u16;
-                            let header = len.to_be_bytes();
-                            if stream.write_all(&header).await.is_err()
-                                || stream.write_all(&tx.contents).await.is_err()
-                            {
-                                tracing::warn!("TCP write failed, closing stream");
-                                self.tcp_stream = None;
-                            }
-                        }
+                        self.tcp.send(&tx.contents).await;
                     }
                     _ => {}
                 },
