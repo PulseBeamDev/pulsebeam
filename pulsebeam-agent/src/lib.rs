@@ -9,6 +9,7 @@ pub mod actor;
 pub mod api;
 pub mod manager;
 pub mod media;
+pub(crate) mod tcp;
 
 pub struct MediaFrame {
     pub ts: MediaTime,
