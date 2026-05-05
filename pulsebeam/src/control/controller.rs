@@ -6,7 +6,6 @@ use std::future::Future;
 
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
-use tokio::io::AsyncReadExt;
 
 use crate::{
     control::{
@@ -21,7 +20,7 @@ use crate::{
         worker::{ClusterCommand, ShardCommand, ShardEvent},
     },
 };
-use pulsebeam_core::net::TcpStream;
+use pulsebeam_runtime::net::tcp::BufferedTcpStream;
 use pulsebeam_runtime::mailbox;
 use str0m::{
     Candidate,
@@ -97,14 +96,11 @@ pub enum ControllerError {
 const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How long we wait for the first STUN frame from a newly accepted TCP connection.
 const TCP_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-/// Maximum allowed size for the first STUN frame (same as MAX_FRAME_SIZE in tcp.rs).
-const MAX_FIRST_FRAME_SIZE: usize = 1500;
 
 /// Result of the async first-frame read done before routing a TCP connection.
 struct PendingTcpConn {
-    stream: TcpStream,
+    stream: BufferedTcpStream,
     peer_addr: SocketAddr,
-    payload: Vec<u8>,
     server_ufrag: Option<String>,
 }
 
@@ -265,14 +261,24 @@ impl ControllerActor {
             ShardCommand::AddTcpConnection {
                 stream: conn.stream,
                 peer_addr: conn.peer_addr,
-                initial_payload: conn.payload,
             },
         );
     }
 
-    fn queue_pending_tcp(&mut self, stream: TcpStream, peer_addr: SocketAddr) {
+    fn queue_pending_tcp(&mut self, stream: pulsebeam_core::net::TcpStream, peer_addr: SocketAddr) {
         let fut: Pin<Box<dyn Future<Output = Option<PendingTcpConn>> + Send>> =
-            Box::pin(read_first_tcp_frame(stream, peer_addr));
+            Box::pin(async move {
+                match BufferedTcpStream::read_first_frame(stream, TCP_FIRST_FRAME_TIMEOUT).await {
+                    Ok((stream, payload)) => {
+                        let server_ufrag = extract_stun_server_ufrag(&payload);
+                        Some(PendingTcpConn { stream, peer_addr, server_ufrag })
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer_addr, error = ?e, "TCP first-frame read failed");
+                        None
+                    }
+                }
+            });
         self.pending_tcp.push(fut);
     }
 
@@ -306,53 +312,6 @@ impl ControllerActor {
         });
         self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
         Ok(answer)
-    }
-}
-
-/// Read the first RFC 4571 frame from a newly accepted TCP stream so that the
-/// controller can extract the server ICE ufrag for shard routing.
-///
-/// Returns `None` on timeout or I/O error — the connection is silently dropped.
-async fn read_first_tcp_frame(
-    mut stream: TcpStream,
-    peer_addr: SocketAddr,
-) -> Option<PendingTcpConn> {
-    let result = tokio::time::timeout(TCP_FIRST_FRAME_TIMEOUT, async {
-        let mut header = [0u8; 2];
-        stream.read_exact(&mut header).await?;
-        let len = u16::from_be_bytes(header) as usize;
-
-        if len == 0 || len > MAX_FIRST_FRAME_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("first TCP frame length {len} out of range"),
-            ));
-        }
-
-        let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).await?;
-        Ok(payload)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(payload)) => {
-            let server_ufrag = extract_stun_server_ufrag(&payload);
-            Some(PendingTcpConn {
-                stream,
-                peer_addr,
-                payload,
-                server_ufrag,
-            })
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(%peer_addr, error = ?e, "Error reading first TCP frame");
-            None
-        }
-        Err(_timeout) => {
-            tracing::warn!(%peer_addr, "TCP first-frame read timed out");
-            None
-        }
     }
 }
 

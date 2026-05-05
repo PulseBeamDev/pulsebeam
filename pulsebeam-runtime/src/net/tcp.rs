@@ -9,6 +9,120 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Maximum RFC 4571 payload length accepted during the initial frame peek.
+/// Mirrors `MAX_FRAME_SIZE` below — kept as a separate constant so the method
+/// can be used before the rest of the transport is constructed.
+const MAX_PEEK_FRAME_SIZE: usize = 1_500;
+
+/// A TCP stream wrapper that replays bytes already read from the socket before
+/// delegating further reads to the kernel.
+///
+/// When the controller peeks the first RFC 4571 frame to extract the ICE ufrag
+/// for shard routing, it stores those wire bytes here.  The shard then sees
+/// the frame through the normal `try_read` / `try_recv_batch` path, with no
+/// knowledge that the bytes were pre-read.
+#[derive(Debug)]
+pub struct BufferedTcpStream {
+    stream: TcpStream,
+    pending: BytesMut,
+}
+
+impl BufferedTcpStream {
+    pub fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            pending: BytesMut::new(),
+        }
+    }
+
+    /// Wrap `stream` and pre-fill the read buffer with `bytes` — the exact
+    /// bytes that were already read from the socket (wire-format, including any
+    /// RFC 4571 length prefix).  Subsequent `try_read` calls drain these bytes
+    /// first before touching the kernel socket.
+    pub fn with_buffered(stream: TcpStream, bytes: Vec<u8>) -> Self {
+        Self {
+            stream,
+            pending: BytesMut::from(bytes.as_slice()),
+        }
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.stream.set_nodelay(nodelay)
+    }
+
+    pub async fn readable(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            return Ok(());
+        }
+        self.stream.readable().await
+    }
+
+    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.pending.is_empty() {
+            let to_copy = std::cmp::min(buf.len(), self.pending.len());
+            buf[..to_copy].copy_from_slice(&self.pending[..to_copy]);
+            self.pending.advance(to_copy);
+            return Ok(to_copy);
+        }
+        self.stream.try_read(buf)
+    }
+
+    pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.try_write(buf)
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// Read the first RFC 4571 frame from a freshly accepted `stream`, within
+    /// `timeout`, and return a `BufferedTcpStream` that will replay those bytes
+    /// plus the decoded payload for ICE ufrag extraction.
+    ///
+    /// This is the only place that knows the wire format of the framing.  The
+    /// caller only sees a ready-to-use stream and the raw payload bytes.
+    ///
+    /// Returns an error on I/O failure, malformed framing, or timeout.
+    pub async fn read_first_frame(
+        mut stream: TcpStream,
+        timeout: Duration,
+    ) -> io::Result<(BufferedTcpStream, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(timeout, async {
+            let mut header = [0u8; 2];
+            stream.read_exact(&mut header).await?;
+            let len = u16::from_be_bytes(header) as usize;
+
+            if len == 0 || len > MAX_PEEK_FRAME_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("first TCP frame length {len} out of range"),
+                ));
+            }
+
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).await?;
+
+            let mut raw = Vec::with_capacity(2 + len);
+            raw.extend_from_slice(&header);
+            raw.extend_from_slice(&payload);
+
+            Ok((BufferedTcpStream::with_buffered(stream, raw), payload))
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP first-frame read timed out"))?
+    }
+}
+
 /// Maximum RFC 4571 payload length accepted on a TCP passive connection.
 ///
 /// Each RFC 4571 frame wraps exactly one UDP-equivalent datagram (STUN, DTLS record,
@@ -33,7 +147,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-connection state — owned exclusively by the shard, no sharing across threads.
 struct TcpConn {
-    stream: TcpStream,
+    stream: BufferedTcpStream,
     /// Reassembly buffer for RFC 4571 framing on the read path.
     recv_buf: BytesMut,
     /// RFC 4571-framed bytes waiting to be flushed to the kernel on the write path.
@@ -85,9 +199,8 @@ impl TcpTransport {
     /// re-enqueued so that `try_recv_batch` delivers it on the next call.
     pub fn add_connection(
         &mut self,
-        stream: TcpStream,
+        stream: BufferedTcpStream,
         peer_addr: SocketAddr,
-        initial_payload: Vec<u8>,
     ) -> io::Result<()> {
         if self.conns.len() >= MAX_CONNECTIONS {
             return Err(io::Error::new(
@@ -117,13 +230,7 @@ impl TcpTransport {
             return Err(e);
         }
 
-        // Pre-populate recv_buf with the already-decoded first frame so that
-        // try_recv_batch delivers it on the next call without re-reading the wire.
-        let mut recv_buf = BytesMut::with_capacity(MAX_FRAME_SIZE + 2);
-        if !initial_payload.is_empty() && initial_payload.len() <= MAX_FRAME_SIZE {
-            recv_buf.put_u16(initial_payload.len() as u16);
-            recv_buf.put_slice(&initial_payload);
-        }
+        let recv_buf = BytesMut::with_capacity(MAX_FRAME_SIZE + 2);
 
         self.conns.insert(
             peer_addr,
@@ -254,7 +361,7 @@ impl TcpTransport {
                     continue 'conn;
                 }
 
-                // 3. Read the next chunk from the kernel.
+                // 3. Read the next chunk (from the stream's pending buffer or kernel).
                 let mut tmp = [0u8; 4096];
                 match conn.stream.try_read(&mut tmp) {
                     Ok(0) => {
@@ -263,6 +370,8 @@ impl TcpTransport {
                     }
                     Ok(n) => {
                         conn.recv_buf.put_slice(&tmp[..n]);
+                        // Update activity whether data came from the pending buffer or
+                        // the kernel — either way the connection is alive.
                         conn.last_activity = now;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -370,7 +479,7 @@ mod tests {
 
         let (mut client, server_stream, peer_addr) = make_pair(&listener).await;
         client.set_nodelay(true).unwrap();
-        sock.add_connection(server_stream, peer_addr, vec![]).unwrap();
+        sock.add_connection(BufferedTcpStream::new(server_stream), peer_addr).unwrap();
 
         // Ingress: client → server, RFC 4571 framing
         let p1 = b"packet1";
@@ -414,8 +523,8 @@ mod tests {
         }
     }
 
-    /// Verifies that an initial_payload passed to add_connection is delivered on
-    /// the next try_recv_batch call — this is the path used when the controller
+    /// Verifies that bytes pre-buffered via `with_buffered` are delivered on the
+    /// next `try_recv_batch` call — this is the path used when the controller
     /// pre-reads the first STUN frame for ufrag-based routing.
     #[tokio::test]
     async fn test_initial_payload_delivery() {
@@ -427,7 +536,15 @@ mod tests {
 
         let (_client, server_stream, peer_addr) = make_pair(&listener).await;
         let payload = b"stun-request-bytes".to_vec();
-        sock.add_connection(server_stream, peer_addr, payload.clone())
+
+        // Build the RFC 4571-framed wire bytes (length header + payload) exactly
+        // as read_first_tcp_frame would produce them.
+        let mut wire = Vec::with_capacity(2 + payload.len());
+        wire.push((payload.len() >> 8) as u8);
+        wire.push(payload.len() as u8);
+        wire.extend_from_slice(&payload);
+
+        sock.add_connection(BufferedTcpStream::with_buffered(server_stream, wire), peer_addr)
             .unwrap();
 
         // Must be immediately available — no bytes sent on the wire yet.
@@ -448,7 +565,7 @@ mod tests {
         let mut sock = TcpTransport::new(server_addr);
 
         let (mut client, server_stream, peer_addr) = make_pair(&listener).await;
-        sock.add_connection(server_stream, peer_addr, vec![]).unwrap();
+        sock.add_connection(BufferedTcpStream::new(server_stream), peer_addr).unwrap();
 
         // Send a 2-byte header claiming a 65535-byte payload — always > MAX_FRAME_SIZE.
         // The connection must be dropped the moment we decode the length prefix.
@@ -480,7 +597,7 @@ mod tests {
         let mut sock = TcpTransport::new(server_addr);
 
         let (client, server_stream, peer_addr) = make_pair(&listener).await;
-        sock.add_connection(server_stream, peer_addr, vec![]).unwrap();
+        sock.add_connection(BufferedTcpStream::new(server_stream), peer_addr).unwrap();
 
         // Stop reading from the client side so the kernel TX buffer fills up.
         drop(client);
@@ -515,10 +632,10 @@ mod tests {
         let mut sock = TcpTransport::new(server_addr);
 
         let (_c1, s1, p1) = make_pair(&listener).await;
-        sock.add_connection(s1, p1, vec![]).unwrap();
+        sock.add_connection(BufferedTcpStream::new(s1), p1).unwrap();
 
         let (_c2, s2, p2) = make_pair(&listener).await;
-        sock.add_connection(s2, p2, vec![]).unwrap();
+        sock.add_connection(BufferedTcpStream::new(s2), p2).unwrap();
 
         assert_eq!(sock.active_connections(), 2);
     }
