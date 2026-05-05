@@ -41,7 +41,6 @@ pub enum ClusterCommand {
     PublishTrack(Track, RoomId),
     RequestKeyframe(GlobalKeyframeRequest),
     RegisterParticipant {
-        ufrag: String,
         shard_id: usize,
         participant_id: entity::ParticipantId,
     },

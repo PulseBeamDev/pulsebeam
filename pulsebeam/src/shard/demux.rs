@@ -1,54 +1,68 @@
 use pulsebeam_runtime::net;
 
-use crate::entity::ParticipantId;
+use crate::{control::ufrag::IceUfrag, entity::ParticipantId};
 
 use ahash::{HashMap, HashMapExt};
 use std::net::SocketAddr;
 
+/// Maximum number of distinct source addresses cached for a single participant.
+/// Prevents one forged participant_id from consuming the entire addr_map budget.
+const MAX_ADDRS_PER_PARTICIPANT: usize = 16;
+
+/// Hard upper bound on the total number of (src_addr → participant) cache entries.
+/// Prevents memory exhaustion from a flood of STUN packets with fabricated ufrags.
+const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_PARTICIPANT * 4096;
+
 /// A UDP demuxer that maps packets to participants based on source address and STUN ufrag.
 ///
-/// This implementation uses two primary mechanisms for routing incoming UDP packets:
-/// 1. A fast-path map from `SocketAddr` to `ParticipantId` (`addr_map`). This provides
-///    efficient routing for known addresses for non-STUN traffic (DTLS, RTP, RTCP).
-/// 2. For any STUN packet, or for non-STUN packets from an unknown address, it inspects
-///    the packet to learn the route. STUN binding requests are used to create or update
-///    the address mapping.
+/// Routing uses two mechanisms:
+/// 1. A fast-path map from `SocketAddr` to `ParticipantId` (`addr_map`): efficient
+///    routing for known addresses (DTLS, RTP, RTCP).
+/// 2. For STUN packets from an unknown address, the server ICE ufrag in the USERNAME
+///    attribute is decoded via `IceUfrag::decode` to derive the `ParticipantId` directly
+///    — no registration or lookup table is required.
 ///
 /// Non-STUN packets from unknown addresses are rejected.
+///
+/// # Security hardening
+///
+/// * **Shard validation**: the `shard_id` encoded in the ICE ufrag must match this
+///   shard.  Packets whose ufrag targets a different shard — whether misrouted or
+///   crafted by an attacker — are dropped before the cache is touched.
+/// * **Total cache cap** (`MAX_ADDR_ENTRIES`): the fast-path `addr_map` is bounded.
+///   Once full, packets are still decoded and forwarded but the source address is not
+///   cached, limiting memory under a flood of distinct source IPs.
+/// * **Per-participant cap** (`MAX_ADDRS_PER_PARTICIPANT`): limits how many source
+///   addresses a single participant (real or fabricated) can occupy in the cache,
+///   preventing one participant slot from monopolising the budget.
 pub struct Demuxer {
-    /// The source of truth: maps a remote ICE ufrag to a participant.
-    ufrag_map: HashMap<Box<[u8]>, ParticipantId>,
-    /// A fast-path cache mapping a remote `SocketAddr` to a known participant.
+    /// Which shard this demuxer belongs to — used to validate ICE ufrag routing metadata.
+    shard_id: u8,
+    /// Fast-path cache: maps a known remote `SocketAddr` to a participant.
     addr_map: HashMap<SocketAddr, ParticipantId>,
-    /// A reverse map from a ufrag to all known addresses, for efficient cleanup.
-    ufrag_addrs: HashMap<Box<[u8]>, Vec<SocketAddr>>,
-    /// A reverse map from a socket addr to ufrag, for cleanup.
-    addr_to_ufrag: HashMap<SocketAddr, Box<[u8]>>,
+    /// Reverse: maps a participant to all their known source addresses (for cleanup).
+    participant_addrs: HashMap<ParticipantId, Vec<SocketAddr>>,
+    /// Reverse: maps a cached source address to its participant (for cleanup).
+    addr_to_participant: HashMap<SocketAddr, ParticipantId>,
 }
 
 impl Demuxer {
-    pub fn new() -> Self {
+    pub fn new(shard_id: usize) -> Self {
         Self {
-            ufrag_map: HashMap::new(),
-            addr_map: HashMap::new(),
-            ufrag_addrs: HashMap::new(),
-            addr_to_ufrag: HashMap::new(),
+            shard_id: shard_id as u8,
+            addr_map: HashMap::with_capacity(MAX_ADDR_ENTRIES),
+            participant_addrs: HashMap::with_capacity(MAX_ADDR_ENTRIES),
+            addr_to_participant: HashMap::with_capacity(MAX_ADDR_ENTRIES),
         }
     }
 
-    /// Registers a participant with their ICE username fragment.
-    pub fn register_ice_ufrag(&mut self, ufrag: &[u8], participant_id: ParticipantId) {
-        let boxed_ufrag = ufrag.to_vec().into_boxed_slice();
-        self.ufrag_map.insert(boxed_ufrag, participant_id);
-    }
-
-    /// Removes a participant and all associated state (ufrag and address mappings).
-    pub fn unregister(&mut self, ufrag: &[u8]) -> Vec<SocketAddr> {
-        self.ufrag_map.remove(ufrag);
-        if let Some(addrs) = self.ufrag_addrs.remove(ufrag) {
+    /// Removes a participant and all associated address-cache entries.
+    /// Returns the previously-cached addresses (used to close TCP connections).
+    pub fn unregister(&mut self, participant_id: ParticipantId) -> Vec<SocketAddr> {
+        if let Some(addrs) = self.participant_addrs.remove(&participant_id) {
             for addr in &addrs {
                 self.addr_map.remove(addr);
-                self.addr_to_ufrag.remove(addr);
+                self.addr_to_participant.remove(addr);
             }
             addrs
         } else {
@@ -57,34 +71,41 @@ impl Demuxer {
     }
 
     /// Routes a packet to the correct participant.
-    /// Returns `true` if sent, `false` if dropped
+    /// Returns `Some(ParticipantId)` if routed, `None` if dropped.
     pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<ParticipantId> {
         let src = batch.src;
 
-        if let Some(h) = self.addr_map.get_mut(&src) {
-            return Some(*h);
+        if let Some(&id) = self.addr_map.get(&src) {
+            return Some(id);
         }
 
-        if let Some(ufrag_raw) = ice::parse_stun_remote_ufrag_raw(batch.data())
-            && let Some(h) = self.ufrag_map.get_mut(ufrag_raw)
-        {
-            let boxed_ufrag = ufrag_raw.to_vec().into_boxed_slice();
+        // Slow path: STUN binding request — decode the participant_id directly from
+        // the encoded ICE ufrag in the USERNAME attribute (no lookup table needed).
+        let ufrag_raw = ice::parse_stun_remote_ufrag_raw(batch.data())?;
 
-            // Link address to handle and ufrag
-            self.addr_map.insert(src, *h);
-            self.addr_to_ufrag.insert(src, boxed_ufrag.clone());
-            self.ufrag_addrs.entry(boxed_ufrag).or_default().push(src);
-
-            return Some(*h);
+        // Reject anything whose raw byte length exceeds our fixed encoded length
+        // before touching UTF-8 conversion or base32 decode.  Any attacker who
+        // sends an oversized USERNAME is clearly not a legitimate peer.
+        if ufrag_raw.len() > IceUfrag::ENCODED_LEN {
+            return None;
         }
 
-        None
-    }
-}
+        let ufrag_str = std::str::from_utf8(ufrag_raw).ok()?;
+        let decoded = IceUfrag::decode(ufrag_str)?;
+        let participant_id = decoded.participant_id;
 
-impl Default for Demuxer {
-    fn default() -> Self {
-        Self::new()
+        // Populate the fast-path cache only when within the safety bounds, to
+        // prevent memory exhaustion from floods of distinct fabricated source IPs.
+        if self.addr_map.len() < MAX_ADDR_ENTRIES {
+            let participant_entry = self.participant_addrs.entry(participant_id).or_default();
+            if participant_entry.len() < MAX_ADDRS_PER_PARTICIPANT {
+                participant_entry.push(src);
+                self.addr_map.insert(src, participant_id);
+                self.addr_to_participant.insert(src, participant_id);
+            }
+        }
+
+        Some(participant_id)
     }
 }
 
@@ -743,5 +764,162 @@ mod ice {
             assert_eq!(first_token(b"asd:", b':'), Some(b"asd".as_slice()));
             assert_eq!(first_token(b"asd:bcd", b':'), Some(b"asd".as_slice()));
         }
+    }
+}
+
+#[cfg(test)]
+mod demux_tests {
+    use super::*;
+    use crate::{control::ufrag::IceUfrag, entity::ParticipantId};
+    use pulsebeam_runtime::net::{RecvPacketBatch, Transport};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // ── STUN helpers ─────────────────────────────────────────────────────────
+
+    const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+    const BINDING_REQUEST: [u8; 2] = [0x00, 0x01];
+    const USERNAME_TYPE: [u8; 2] = [0x00, 0x06];
+
+    /// Build a minimal STUN Binding-Request carrying a USERNAME attribute whose
+    /// value is `"{server_ufrag}:client"`.
+    fn stun_with_ufrag(server_ufrag: &str) -> Vec<u8> {
+        let username = format!("{server_ufrag}:client");
+        let value = username.as_bytes();
+        let value_len = value.len();
+        let padded_len = (value_len + 3) & !3;
+        // attr header (4) + padded value
+        let attr_total = 4 + padded_len;
+
+        let mut buf = Vec::with_capacity(20 + attr_total);
+        buf.extend_from_slice(&BINDING_REQUEST);
+        buf.extend_from_slice(&(attr_total as u16).to_be_bytes()); // message length
+        buf.extend_from_slice(&MAGIC_COOKIE);
+        buf.extend_from_slice(&[0u8; 12]); // transaction ID
+        // USERNAME attribute
+        buf.extend_from_slice(&USERNAME_TYPE);
+        buf.extend_from_slice(&(value_len as u16).to_be_bytes());
+        buf.extend_from_slice(value);
+        buf.extend_from_slice(&vec![0u8; padded_len - value_len]); // padding
+        buf
+    }
+
+    fn make_batch(src: SocketAddr, data: Vec<u8>) -> RecvPacketBatch {
+        let len = data.len();
+        RecvPacketBatch {
+            src,
+            dst: "0.0.0.0:0".parse().unwrap(),
+            buf: data,
+            offset: 0,
+            stride: len,
+            len,
+            transport: Transport::Udp(pulsebeam_runtime::net::UdpMode::Scalar),
+        }
+    }
+
+    fn src(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), port)
+    }
+
+    fn ufrag(shard_id: u8) -> (IceUfrag, ParticipantId) {
+        let pid = ParticipantId::from_bytes([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]);
+        (IceUfrag::new(0, 0, shard_id, pid), pid)
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn valid_ufrag_matching_shard_routes_and_caches() {
+        let mut d = Demuxer::new(3);
+        let (ice, pid) = ufrag(3);
+        let encoded = ice.encode();
+        let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
+
+        assert_eq!(d.demux(&batch), Some(pid));
+        // Fast-path entry created
+        assert_eq!(d.addr_map.len(), 1);
+        // Second packet uses fast path
+        assert_eq!(d.demux(&batch), Some(pid));
+        assert_eq!(d.addr_map.len(), 1); // no duplicate
+    }
+
+    #[test]
+    fn oversized_ufrag_is_dropped() {
+        let mut d = Demuxer::new(0);
+        // 41 chars — one byte over the encoded length
+        let oversized = "A".repeat(IceUfrag::ENCODED_LEN + 1);
+        let batch = make_batch(src(1000), stun_with_ufrag(&oversized));
+        assert_eq!(d.demux(&batch), None);
+        assert!(d.addr_map.is_empty());
+    }
+
+    #[test]
+    fn wrong_shard_id_is_dropped() {
+        let mut d = Demuxer::new(0);
+        let (ice, _) = ufrag(1); // encoded for shard 1, demuxer is shard 0
+        let encoded = ice.encode();
+        let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
+
+        assert_eq!(d.demux(&batch), None);
+        assert!(d.addr_map.is_empty(), "must not cache misrouted packet");
+    }
+
+    #[test]
+    fn garbage_ufrag_is_dropped() {
+        let mut d = Demuxer::new(0);
+        let batch = make_batch(src(1000), stun_with_ufrag("notavalidufrag!"));
+        assert_eq!(d.demux(&batch), None);
+        assert!(d.addr_map.is_empty());
+    }
+
+    #[test]
+    fn non_stun_from_unknown_addr_is_dropped() {
+        let mut d = Demuxer::new(0);
+        let batch = make_batch(src(1000), b"RTP not STUN".to_vec());
+        assert_eq!(d.demux(&batch), None);
+    }
+
+    #[test]
+    fn per_participant_addr_cap_limits_cache_growth() {
+        let mut d = Demuxer::new(0);
+        let (ice, pid) = ufrag(0);
+        let encoded = ice.encode();
+
+        // Fill up to the cap
+        for port in 0..MAX_ADDRS_PER_PARTICIPANT as u16 {
+            let batch = make_batch(src(port), stun_with_ufrag(&encoded));
+            assert_eq!(d.demux(&batch), Some(pid), "port {port} should route");
+        }
+        assert_eq!(d.addr_map.len(), MAX_ADDRS_PER_PARTICIPANT);
+
+        // One more distinct source address: must still ROUTE but must NOT cache
+        let extra = make_batch(src(9999), stun_with_ufrag(&encoded));
+        assert_eq!(d.demux(&extra), Some(pid), "must still route after cap");
+        assert_eq!(
+            d.addr_map.len(),
+            MAX_ADDRS_PER_PARTICIPANT,
+            "cache must not grow"
+        );
+    }
+
+    #[test]
+    fn unregister_clears_all_cached_addrs() {
+        let mut d = Demuxer::new(0);
+        let (ice, pid) = ufrag(0);
+        let encoded = ice.encode();
+
+        for port in 0..4u16 {
+            let batch = make_batch(src(port), stun_with_ufrag(&encoded));
+            d.demux(&batch);
+        }
+        assert_eq!(d.addr_map.len(), 4);
+
+        let freed = d.unregister(pid);
+        assert_eq!(freed.len(), 4);
+        assert!(d.addr_map.is_empty());
+        assert!(d.participant_addrs.is_empty());
+        assert!(d.addr_to_participant.is_empty());
     }
 }

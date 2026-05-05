@@ -85,7 +85,6 @@ pub(crate) struct ShardCore {
     pub(super) rooms: HashMap<RoomId, RoomState>,
     pub(super) routing: HashMap<StreamId, Routing>,
     pub(super) participant_shards: HashMap<ParticipantId, usize>,
-    remote_participant_ufrags: HashMap<ParticipantId, String>,
     timers: TimerWheel,
     pub(super) input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     pub(super) fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
@@ -121,12 +120,11 @@ impl ShardCore {
         Self {
             shard_id,
             max_gso_segments,
-            demuxer: Demuxer::default(),
+            demuxer: Demuxer::new(shard_id),
             participants: HashMap::default(),
             rooms: HashMap::default(),
             routing: HashMap::default(),
             participant_shards: HashMap::default(),
-            remote_participant_ufrags: HashMap::default(),
             timers,
             input_dirty,
             fanout_dirty,
@@ -326,21 +324,15 @@ impl ShardCore {
             ClusterCommand::RegisterParticipant {
                 shard_id,
                 participant_id,
-                ufrag,
             } => {
                 if shard_id != self.shard_id {
-                    self.demuxer
-                        .register_ice_ufrag(ufrag.as_bytes(), participant_id);
-                    self.remote_participant_ufrags.insert(participant_id, ufrag);
                     self.participant_shards.insert(participant_id, shard_id);
                 }
             }
             ClusterCommand::UnregisterParticipant { participant_id } => {
                 self.participant_shards.remove(&participant_id);
-                if let Some(ufrag) = self.remote_participant_ufrags.remove(&participant_id) {
-                    let addrs = self.demuxer.unregister(ufrag.as_bytes());
-                    self.pending_close.extend(addrs);
-                }
+                let addrs = self.demuxer.unregister(participant_id);
+                self.pending_close.extend(addrs);
             }
             ClusterCommand::UnpublishTracks {
                 origin: _,
@@ -474,13 +466,10 @@ impl ShardCore {
             1,
             &mut participant_rng,
         );
-        let ufrag = participant.ufrag();
         let meta = ParticipantMeta {
             core: participant,
             span,
         };
-        self.demuxer
-            .register_ice_ufrag(ufrag.as_bytes(), participant_id);
         self.participants.insert(participant_id, meta);
         tracing::info!(%participant_id, "participant added to shard");
 
@@ -539,7 +528,7 @@ impl ShardCore {
                 router,
             );
         }
-        let addrs = self.demuxer.unregister(participant.ufrag().as_bytes());
+        let addrs = self.demuxer.unregister(*participant_id);
         self.pending_close.extend(addrs);
         Some(participant)
     }
@@ -1274,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn register_remote_participant_populates_shard_and_ufrag_maps() {
+    fn register_remote_participant_populates_shard_map() {
         let router = TestRouter::new(0, 3);
         let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
@@ -1283,13 +1272,11 @@ mod tests {
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
                 shard_id: 2,
                 participant_id: participant,
-                ufrag: "testufrag".to_string(),
             }),
             &router,
         );
 
         assert_eq!(core.participant_shards.get(&participant), Some(&2));
-        assert!(core.remote_participant_ufrags.contains_key(&participant));
     }
 
     #[test]
@@ -1302,7 +1289,6 @@ mod tests {
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
                 shard_id: 0,
                 participant_id: participant,
-                ufrag: "localufrag".to_string(),
             }),
             &router,
         );
@@ -1323,7 +1309,6 @@ mod tests {
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
                 shard_id: 1,
                 participant_id: participant,
-                ufrag: "removeme".to_string(),
             }),
             &router,
         );
@@ -1336,7 +1321,6 @@ mod tests {
         );
 
         assert!(!core.participant_shards.contains_key(&participant));
-        assert!(!core.remote_participant_ufrags.contains_key(&participant));
         assert!(core.pending_close.is_empty());
     }
 

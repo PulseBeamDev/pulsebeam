@@ -302,7 +302,6 @@ impl ControllerActor {
             state.participant_id,
         );
         let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
-        let encoded_ufrag = creds.ufrag.clone();
 
         let (rtc, answer) = self.negotiator.create_answer(offer, creds)?;
         let cfg = self.core.create_participant(rtc, state, shard_id);
@@ -310,7 +309,6 @@ impl ControllerActor {
         self.eq.broadcast(ClusterCommand::RegisterParticipant {
             shard_id,
             participant_id: cfg.participant_id,
-            ufrag: encoded_ufrag,
         });
         self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
         Ok(answer)
