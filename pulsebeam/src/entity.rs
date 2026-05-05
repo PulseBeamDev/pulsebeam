@@ -229,6 +229,19 @@ impl ParticipantId {
         encode_with_prefix(prefix::PARTICIPANT_ID, self.uuid.as_bytes())
     }
 
+    /// Raw UUID bytes, used for compact wire encoding (e.g. ICE ufrag).
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.uuid.as_bytes()
+    }
+
+    /// Reconstruct from raw UUID bytes.  Caller is responsible for supplying
+    /// 16 bytes that came from a trusted source (e.g. decoded ICE ufrag).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            uuid: Uuid::from_bytes(bytes),
+        }
+    }
+
     pub fn derive_track_id(&self, kind: MediaKind, label: &str) -> TrackId {
         let uuid = new_v8_sha3(&self.uuid, label.as_bytes());
         TrackId { kind, uuid }
