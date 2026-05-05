@@ -23,6 +23,9 @@ use str0m::IceCreds;
 const VERSION: u8 = 0;
 const RAW_LEN: usize = 25;
 const PASS_RAW_LEN: usize = 15;
+/// Exact length (in ASCII characters) of a v0 encoded ICE ufrag:
+/// 25 bytes × 8 bits / 5 bits-per-Crockford-char = 40 chars, no padding.
+pub const ENCODED_LEN: usize = 40;
 
 /// Structured ICE ufrag that encodes all routing metadata needed to forward a
 /// STUN binding request to the correct shard — and in future, the correct
@@ -40,6 +43,9 @@ pub struct IceUfrag {
 }
 
 impl IceUfrag {
+    /// Exact encoded length in ASCII characters (Crockford base32, no padding).
+    pub const ENCODED_LEN: usize = ENCODED_LEN;
+
     pub fn new(
         cluster_id: u16,
         node_id: u16,
