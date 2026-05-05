@@ -2,6 +2,7 @@ use super::common;
 use crate::tests::scenario::{
     AssertAllDisconnectedStage, ChurnStage, ConnectPeersTcpOnlyStage, ConnectPeersStage,
     DisconnectStage, HoldStage, PartitionStage, Scenario, StartSfuStage, StartSfuTcpOnlyStage,
+    StartSfuTcpOnlyMultiShardStage,
 };
 use std::time::Duration;
 
@@ -103,4 +104,39 @@ fn tcp_simulation_test() {
         })
         .run()
         .expect("TCP simulation failed");
+}
+
+/// Reproduces the Chrome-with-UDP-disabled failure: with two shards the hash of
+/// a client's `peer_addr` and the hash of `room_id` can land on different shards,
+/// causing TCP egress to be silently dropped.
+///
+/// The fix routes egress cross-shard via `CrossShardEvent::TcpEgressForward`.
+#[test]
+fn tcp_multi_shard_simulation_test() {
+    common::setup_tracing();
+
+    let subnet = common::reserve_subnet();
+    let server_ip = common::subnet_ip(subnet, 1);
+    let sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(90))
+        .tick_duration(Duration::from_micros(100))
+        .rng_seed(0xDEADBEEF)
+        .build();
+
+    Scenario::new("tcp_multi_shard_test", server_ip, sim)
+        .add_stage(StartSfuTcpOnlyMultiShardStage)
+        .add_stage(ConnectPeersTcpOnlyStage {
+            peers: 4,
+            min_tx_bytes: 0,
+            min_rx_bytes: 1,
+            max_wait: Duration::from_secs(30),
+        })
+        .add_stage(DisconnectStage {
+            after: Duration::from_secs(50),
+        })
+        .add_stage(AssertAllDisconnectedStage {
+            after: Duration::from_secs(70),
+        })
+        .run()
+        .expect("TCP multi-shard simulation failed");
 }
