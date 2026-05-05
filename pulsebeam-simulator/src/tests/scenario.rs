@@ -545,3 +545,29 @@ impl Stage for AssertNoTcpStreamsStage {
         Ok(())
     }
 }
+
+/// Stage that starts an SFU host in TCP-only mode with two worker shards.
+///
+/// Using two shards forces the cross-shard TCP egress forwarding path: the shard
+/// that owns a TCP stream (determined by `hash(peer_addr)`) will frequently differ
+/// from the shard that owns the participant (determined by `hash(room_id)`).
+pub struct StartSfuTcpOnlyMultiShardStage;
+
+impl Stage for StartSfuTcpOnlyMultiShardStage {
+    fn name(&self) -> &'static str {
+        "start_sfu_tcp_only_multi_shard"
+    }
+
+    fn apply(&self, sim: &mut Sim<'_>, ctx: &mut ScenarioCtx) -> TurmoilResult<()> {
+        let server_ip = ctx.server_ip;
+        sim.host(server_ip, move || async move {
+            crate::tests::common::start_sfu_node_tcp_only_multi_shard(
+                server_ip,
+                pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+            )
+            .await
+            .map_err(|e| e.into())
+        });
+        Ok(())
+    }
+}
