@@ -12,6 +12,7 @@ use str0m::Rtc;
 /// Maximum participants allowed per "slot" before hashing to a new shard epoch.
 const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 
+#[derive(Debug)]
 pub enum ControllerEvent {
     ShardCommandBroadcasted(ClusterCommand),
     ShardCommandSent(usize, ShardCommand),

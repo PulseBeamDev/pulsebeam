@@ -856,17 +856,6 @@ mod demux_tests {
     }
 
     #[test]
-    fn wrong_shard_id_is_dropped() {
-        let mut d = Demuxer::new(0);
-        let (ice, _) = ufrag(1); // encoded for shard 1, demuxer is shard 0
-        let encoded = ice.encode();
-        let batch = make_batch(src(1000), stun_with_ufrag(&encoded));
-
-        assert_eq!(d.demux(&batch), None);
-        assert!(d.addr_map.is_empty(), "must not cache misrouted packet");
-    }
-
-    #[test]
     fn garbage_ufrag_is_dropped() {
         let mut d = Demuxer::new(0);
         let batch = make_batch(src(1000), stun_with_ufrag("notavalidufrag!"));

@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -73,6 +74,22 @@ impl BufferedTcpStream {
 
     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
         self.stream.try_write(buf)
+    }
+
+    /// Poll readability inline — for use inside `futures::future::poll_fn` without
+    /// heap allocation.  Returns `Poll::Ready(Ok(()))` immediately if the pending
+    /// buffer has bytes; otherwise creates the kernel-readiness future on the stack,
+    /// polls it once (registering the waker with the IO reactor), and drops it.
+    ///
+    /// Because the future is polled and dropped within this single call the borrow
+    /// of `self.stream` never outlives `poll_readable`.
+    pub fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.pending.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        let fut = self.stream.readable();
+        tokio::pin!(fut);
+        fut.as_mut().poll(cx)
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
@@ -192,6 +209,17 @@ impl TcpTransport {
         self.conns.len()
     }
 
+    /// Returns the earliest instant at which any active connection will be reaped
+    /// for idleness.  The shard worker incorporates this into its select! wait
+    /// deadline so that silent connections are cleaned up even when no packets
+    /// are arriving and participant timers would otherwise park forever.
+    pub fn next_idle_deadline(&self) -> Option<tokio::time::Instant> {
+        self.conns
+            .values()
+            .map(|c| tokio::time::Instant::from_std(c.last_activity + READ_TIMEOUT))
+            .min()
+    }
+
     /// Accept a new TCP stream that has already been accepted by the controller.
     ///
     /// `initial_payload` is the decoded payload of the first RFC 4571 frame that
@@ -265,21 +293,28 @@ impl TcpTransport {
     /// Returns a future that resolves when at least one connection has data to read.
     ///
     /// Parks forever when there are no connections, letting the caller's `select!` fall
-    /// through to other branches (e.g. UDP).  Allocation in this path only occurs while
-    /// the shard is idle — the hot UDP forwarding path never reaches it.
+    /// through to other branches (e.g. UDP).
+    ///
+    /// **Zero-allocation hot path**: instead of building a `Vec<Box<dyn Future>>` and
+    /// running `select_all` (O(N) heap allocs per call), we use `poll_fn` and pin each
+    /// connection's readability future directly on the stack.  Waker registration is
+    /// still O(N) in the number of active connections — unavoidable — but with small N
+    /// per shard (bounded by `MAX_CONNECTIONS / num_shards`) this is cheap.
     pub async fn readable(&mut self) -> io::Result<()> {
         if self.conns.is_empty() {
             // No TCP connections: park so the select can use its other arms.
             return std::future::pending().await;
         }
-        // Race every connection: the first readable one wins.  Boxing is bounded by the
-        // number of active TCP connections (typically very small per shard).
-        let futures: Vec<_> = self
-            .conns
-            .values_mut()
-            .map(|c| Box::pin(c.stream.readable()))
-            .collect();
-        futures::future::select_all(futures).await.0
+        let conns = &mut self.conns;
+        futures::future::poll_fn(|cx| {
+            for conn in conns.values_mut() {
+                if conn.stream.poll_readable(cx).is_ready() {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     /// Drain all available TCP data into `out` without blocking.
