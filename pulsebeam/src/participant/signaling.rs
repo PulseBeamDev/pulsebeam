@@ -35,7 +35,8 @@ pub struct Signaling {
     // STATE CACHE: Required to calculate removals (deltas)
     // We store the IDs of the objects sent in the last successful update.
     previous_track_ids: HashSet<String>,
-    previous_assignment_mids: HashSet<String>,
+    // Maps mid -> paused so we can detect paused-state changes on existing assignments.
+    previous_assignments: HashMap<String, bool>,
     last_client_intents: Option<HashMap<Mid, Intent>>,
 }
 
@@ -49,7 +50,7 @@ impl Signaling {
             pending_snapshot_request: true,
             // Initialize empty sets
             previous_track_ids: HashSet::new(),
-            previous_assignment_mids: HashSet::new(),
+            previous_assignments: HashMap::new(),
             last_client_intents: None,
 
             slot_count: 0,
@@ -179,15 +180,16 @@ impl Signaling {
             .map(|s| signaling::VideoAssignment {
                 mid: s.mid.to_string(),
                 track_id: s.track.id.as_str(),
-                paused: false,
+                paused: s.paused,
             })
             .collect();
 
         // 2. Identify Keys for Diffing
         let current_track_ids: HashSet<String> =
             current_tracks.iter().map(|t| t.id.clone()).collect();
-        let current_assign_mids: HashSet<String> =
-            current_assignments.iter().map(|a| a.mid.clone()).collect();
+        // Maps mid -> paused for the current state.
+        let current_assign_map: HashMap<String, bool> =
+            current_assignments.iter().map(|a| (a.mid.clone(), a.paused)).collect();
 
         // 3. Compute Deltas
         // If snapshot: removals are empty.
@@ -200,8 +202,9 @@ impl Signaling {
                     .difference(&current_track_ids)
                     .cloned()
                     .collect(),
-                self.previous_assignment_mids
-                    .difference(&current_assign_mids)
+                self.previous_assignments
+                    .keys()
+                    .filter(|mid| !current_assign_map.contains_key(*mid))
                     .cloned()
                     .collect(),
             )
@@ -213,19 +216,20 @@ impl Signaling {
                 .difference(&self.previous_track_ids)
                 .cloned()
                 .collect();
-            let assignment_mids_upsert: HashSet<String> = current_assign_mids
-                .difference(&self.previous_assignment_mids)
-                .cloned()
-                .collect();
 
             (
                 current_tracks
                     .into_iter()
                     .filter(|t| track_ids_upsert.contains(&t.id))
                     .collect(),
+                // Upsert when the mid is new OR the paused state changed.
                 current_assignments
                     .into_iter()
-                    .filter(|a| assignment_mids_upsert.contains(&a.mid))
+                    .filter(|a| {
+                        self.previous_assignments
+                            .get(&a.mid)
+                            .map_or(true, |&prev_paused| prev_paused != a.paused)
+                    })
                     .collect(),
             )
         };
@@ -258,7 +262,7 @@ impl Signaling {
 
         // Write succeeded: Update our "Previous" state to match "Current"
         self.previous_track_ids = current_track_ids;
-        self.previous_assignment_mids = current_assign_mids;
+        self.previous_assignments = current_assign_map;
 
         // Reset flags
         self.dirty_tracks = false;

@@ -143,6 +143,7 @@ impl VideoAllocator {
         self.slots.values().filter_map(|s| {
             Some(SlotAssignment {
                 mid: s.mid,
+                paused: s.paused,
                 track: {
                     let layer = s.target()?;
                     self.tracks.get(&layer.meta.id)?.meta.clone()
@@ -694,6 +695,7 @@ pub fn log_allocation(
 
 pub struct SlotAssignment {
     pub mid: Mid,
+    pub paused: bool,
     pub track: TrackMeta,
 }
 
