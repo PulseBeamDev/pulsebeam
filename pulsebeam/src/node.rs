@@ -273,12 +273,13 @@ impl NodeBuilder {
             // LocalSet context (e.g. turmoil's per-host set), so spawn_local
             // lets the TCP acceptor's inner spawn_local tasks run correctly.
             join_set.spawn_local(ignore(
-                controller.run(controller_command_rx, shard_event_rx),
+                controller.run(controller_command_rx, shard_event_rx, shutdown.child_token()),
             ));
         } else {
             // In the thread-per-worker (production) path the controller runs on
             // a dedicated thread with its own LocalRuntime so that the TCP
             // acceptor can call spawn_local for per-connection first-frame tasks.
+            let shutdown = shutdown.child_token();
             let handle = std::thread::Builder::new()
                 .name("pb-controller".to_string())
                 .spawn(move || {
@@ -286,7 +287,7 @@ impl NodeBuilder {
                         .enable_all()
                         .build_local(LocalOptions::default())
                         .unwrap();
-                    rt.block_on(controller.run(controller_command_rx, shard_event_rx));
+                    rt.block_on(controller.run(controller_command_rx, shard_event_rx, shutdown));
                 })
                 .unwrap();
             shard_handles.push(handle);

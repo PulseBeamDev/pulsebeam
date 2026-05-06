@@ -21,6 +21,7 @@ use str0m::{
     change::{SdpAnswer, SdpOffer},
 };
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct ParticipantState {
@@ -126,6 +127,7 @@ impl ControllerActor {
         mut self,
         mut command_rx: mailbox::Receiver<ControllerCommand>,
         mut shard_event_rx: mailbox::Receiver<ShardEvent>,
+        shutdown: CancellationToken,
     ) {
         // Spawn the TCP acceptor onto the current LocalSet / LocalRuntime.
         // It owns the listener, enforces caps, reads the first STUN frame from
@@ -134,7 +136,7 @@ impl ControllerActor {
             .tcp_listener
             .take()
             .expect("ControllerActor::run called twice");
-        let acceptor = TcpAcceptorHandle::spawn(listener);
+        let acceptor = TcpAcceptorHandle::spawn(listener, shutdown.child_token());
         let mut pending_rx = acceptor.event_rx;
 
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
@@ -163,6 +165,10 @@ impl ControllerActor {
 
                 Some(cmd) = command_rx.recv() => {
                     self.process_command(cmd);
+                }
+
+                _ = shutdown.cancelled() => {
+                    break;
                 }
 
                 else => break,

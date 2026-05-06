@@ -23,6 +23,7 @@ use std::{
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
 use crate::shard::demux::extract_stun_server_ufrag;
 
@@ -64,15 +65,19 @@ pub struct TcpAcceptorHandle {
 
 impl TcpAcceptorHandle {
     /// Spawn the acceptor loop onto the current `LocalSet` / `LocalRuntime`.
-    pub fn spawn(listener: TcpListener) -> Self {
+    pub fn spawn(listener: TcpListener, shutdown: CancellationToken) -> Self {
         let (event_tx, event_rx) = mailbox::new(256);
-        tokio::task::spawn_local(acceptor_loop(listener, event_tx));
+        tokio::task::spawn_local(acceptor_loop(listener, event_tx, shutdown));
         Self { event_rx }
     }
 }
 
 /// Accept loop: enforces caps and spawns one inner task per accepted stream.
-async fn acceptor_loop(listener: TcpListener, event_tx: mailbox::Sender<TcpAcceptorEvent>) {
+async fn acceptor_loop(
+    listener: TcpListener,
+    event_tx: mailbox::Sender<TcpAcceptorEvent>,
+    shutdown: CancellationToken,
+) {
     // Back-channel: inner tasks signal completion so the loop can decrement
     // in-flight counters without blocking on those tasks.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
@@ -96,9 +101,17 @@ async fn acceptor_loop(listener: TcpListener, event_tx: mailbox::Sender<TcpAccep
                 }
             }
 
+            _ = shutdown.cancelled() => {
+                tracing::debug!("tcp acceptor shutting down");
+                break;
+            }
+
             res = listener.accept() => {
                 match res {
                     Err(err) => {
+                        if shutdown.is_cancelled() {
+                            break;
+                        }
                         tracing::warn!(error = ?err, "TCP accept failed");
                     }
                     Ok((stream, peer_addr)) => {
@@ -206,7 +219,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let handle = TcpAcceptorHandle::spawn(listener);
+            let handle = TcpAcceptorHandle::spawn(listener, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             // Connect MAX_PENDING_TCP clients and hold them open.
@@ -249,7 +262,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let handle = TcpAcceptorHandle::spawn(listener);
+            let handle = TcpAcceptorHandle::spawn(listener, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             // Fill to the limit with clients that immediately close (EOF → None result).
@@ -279,6 +292,26 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_tcp_acceptor_stops_on_shutdown() {
+        local_rt().block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                .await
+                .unwrap();
+            let shutdown = CancellationToken::new();
+            let handle = TcpAcceptorHandle::spawn(listener, shutdown.clone());
+            let mut event_rx = handle.event_rx;
+
+            shutdown.cancel();
+
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                event_rx.recv().await
+            })
+            .await;
+            assert!(matches!(result, Ok(None)));
+        });
+    }
+
     // ── per-IP cap ───────────────────────────────────────────────────────────
 
     /// Connections from a single IP beyond MAX_PENDING_TCP_PER_IP are dropped.
@@ -293,7 +326,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let handle = TcpAcceptorHandle::spawn(listener);
+            let handle = TcpAcceptorHandle::spawn(listener, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             // Open MAX_PENDING_TCP_PER_IP + 1 connections from the same IP.
