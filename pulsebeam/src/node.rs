@@ -237,7 +237,11 @@ impl NodeBuilder {
             );
 
             if use_shared_runtime {
-                join_set.spawn(ignore(shard.run()));
+                // spawn_local keeps the shard (and any nested spawn_local calls, e.g.
+                // tcp_read_task) within the caller's LocalSet context (e.g. turmoil's
+                // per-host LocalSet).  Regular spawn() would detach from that context
+                // causing spawn_local panics inside add_connection.
+                join_set.spawn_local(ignore(shard.run()));
             } else {
                 let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
                 let handle = builder
