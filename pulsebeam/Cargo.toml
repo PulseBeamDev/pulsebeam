@@ -23,7 +23,6 @@ console-subscriber = { version = "0.5", optional = true }
 derive_more = { workspace = true }
 futures-concurrency = "7.7.1"
 futures-lite = { workspace = true }
-futures-util = "0.3.32"
 hyper = "1.9.0"
 indexmap = "2.14.0"
 metrics = "0.24.5"

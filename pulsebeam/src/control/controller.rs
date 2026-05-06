@@ -1,29 +1,21 @@
-use std::collections::HashMap;
-use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::time::Duration;
-
-use futures_util::stream::FuturesUnordered;
-use futures_util::{FutureExt, StreamExt};
 
 use crate::{
     control::{
         core::{ControllerCore, ControllerEvent, ControllerEventQueue},
         negotiator::{Negotiator, NegotiatorError},
         router::ShardRouter,
+        tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
     shard::{
         ShardContext,
-        demux::extract_stun_server_ufrag,
         worker::{ClusterCommand, ShardCommand, ShardEvent},
     },
 };
 use pulsebeam_runtime::mailbox;
-use pulsebeam_runtime::net::tcp::BufferedTcpStream;
 use str0m::{
     Candidate,
     change::{SdpAnswer, SdpOffer},
@@ -96,56 +88,18 @@ pub enum ControllerError {
 }
 
 const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// How long we wait for the first STUN frame from a newly accepted TCP connection.
-/// Two seconds is ample for any legitimate client; a tight window limits how long
-/// a slow-loris attacker can occupy a pending slot.
-const TCP_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
-/// Maximum number of TCP connections waiting for their first STUN frame at once.
-/// Prevents memory exhaustion from a flood of half-open connections: each
-/// in-flight future holds a kernel socket + a 2-second timer.
-#[cfg(not(test))]
-const MAX_PENDING_TCP: usize = 1_024;
-#[cfg(test)]
-const MAX_PENDING_TCP: usize = 4;
-/// Maximum pending TCP connections from a single source IP address.
-/// A single slow-loris source cannot monopolise the entire `MAX_PENDING_TCP`
-/// budget; legitimate clients behind NAT rarely open more than a handful of
-/// concurrent TCP connections simultaneously.
-const MAX_PENDING_TCP_PER_IP: usize = 16;
-/// Maximum additional `pending_tcp` completions drained per `select!` iteration.
-/// When many futures complete simultaneously (e.g., a timeout flood), processing
-/// them one per outer loop turn would keep the `pending_tcp` arm biased-selected
-/// repeatedly, starving the TCP-accept and command arms.  By draining up to this
-/// many extra completions inline — without re-entering `select!` — we bound the
-/// latency impact while still clearing the backlog quickly.
-const PENDING_TCP_DRAIN_BUDGET: usize = 63;
-
-/// Result of the async first-frame read done before routing a TCP connection.
-struct PendingTcpConn {
-    stream: BufferedTcpStream,
-    peer_addr: SocketAddr,
-    server_ufrag: Option<String>,
-}
 
 pub struct ControllerActor {
     router: ShardRouter,
     core: ControllerCore,
     negotiator: Negotiator,
     eq: ControllerEventQueue,
-    tcp_listener: pulsebeam_core::net::TcpListener,
+    /// Moved into the TCP acceptor task at the start of `run()`.
+    tcp_listener: Option<pulsebeam_core::net::TcpListener>,
     /// Routing parameters encoded into every ICE ufrag.  Single-node deployments
     /// use 0 for both; set via `NodeBuilder` when multi-node support lands.
     cluster_id: u16,
     node_id: u16,
-    /// In-flight futures reading the first STUN frame from newly accepted streams.
-    /// Each future carries `peer_addr` in its output so the per-IP counter can
-    /// always be decremented on completion, whether framing succeeded or not.
-    pending_tcp: FuturesUnordered<
-        Pin<Box<dyn Future<Output = (SocketAddr, Option<PendingTcpConn>)> + Send>>,
-    >,
-    /// Per-source-IP count of in-flight pending TCP futures.
-    /// Bounds per-IP slow-loris exposure independently of the global cap.
-    pending_tcp_per_ip: HashMap<IpAddr, usize>,
 }
 
 impl ControllerActor {
@@ -162,11 +116,9 @@ impl ControllerActor {
             core: ControllerCore::new(),
             negotiator: Negotiator::new(candidates),
             eq: ControllerEventQueue::default(),
-            tcp_listener,
+            tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
-            pending_tcp: FuturesUnordered::new(),
-            pending_tcp_per_ip: HashMap::new(),
         }
     }
 
@@ -175,6 +127,16 @@ impl ControllerActor {
         mut command_rx: mailbox::Receiver<ControllerCommand>,
         mut shard_event_rx: mailbox::Receiver<ShardEvent>,
     ) {
+        // Spawn the TCP acceptor onto the current LocalSet / LocalRuntime.
+        // It owns the listener, enforces caps, reads the first STUN frame from
+        // each connection, and sends results back through the mailbox.
+        let listener = self
+            .tcp_listener
+            .take()
+            .expect("ControllerActor::run called twice");
+        let acceptor = TcpAcceptorHandle::spawn(listener);
+        let mut pending_rx = acceptor.event_rx;
+
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -193,30 +155,9 @@ impl ControllerActor {
                     self.router.poll_loads();
                 }
 
-                res = self.tcp_listener.accept() => {
-                    match res {
-                        Ok((stream, peer_addr)) => {
-                            self.queue_pending_tcp(stream, peer_addr);
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = ?err, "TCP accept failed");
-                        }
-                    }
-                }
-
-                Some((peer_addr, maybe_conn)) = self.pending_tcp.next() => {
-                    self.on_pending_resolved(peer_addr, maybe_conn);
-                    // Drain already-ready completions without re-entering select!.
-                    // Prevents a simultaneous timeout flood from keeping the biased
-                    // select locked on this arm for O(N) outer-loop iterations,
-                    // which would starve the TCP-accept and command arms.
-                    let mut budget = PENDING_TCP_DRAIN_BUDGET;
-                    while budget > 0 {
-                        budget -= 1;
-                        match self.pending_tcp.next().now_or_never() {
-                            Some(Some((pa, mc))) => self.on_pending_resolved(pa, mc),
-                            _ => break, // nothing ready right now
-                        }
+                Some(ev) = pending_rx.recv() => {
+                    if let Some(conn) = ev.result {
+                        self.route_tcp_connection(conn);
                     }
                 }
 
@@ -322,80 +263,7 @@ impl ControllerActor {
         );
     }
 
-    /// Decrements the per-IP pending counter and routes the connection on success.
-    /// Called from `run()` whenever a pending future resolves (success or failure).
-    fn on_pending_resolved(&mut self, peer_addr: SocketAddr, maybe_conn: Option<PendingTcpConn>) {
-        let ip = peer_addr.ip();
-        if let Some(c) = self.pending_tcp_per_ip.get_mut(&ip) {
-            *c = c.saturating_sub(1);
-            if *c == 0 {
-                self.pending_tcp_per_ip.remove(&ip);
-            }
-        }
-        if let Some(conn) = maybe_conn {
-            self.route_tcp_connection(conn);
-        }
-    }
-
-    fn queue_pending_tcp(&mut self, stream: pulsebeam_core::net::TcpStream, peer_addr: SocketAddr) {
-        // Total-queue cap: drop connections when the pending queue is full.
-        // Dropping `stream` closes the OS socket immediately (TCP RST/FIN),
-        // so the peer gets an explicit signal rather than a silent timeout.
-        if self.pending_tcp.len() >= MAX_PENDING_TCP {
-            tracing::warn!(
-                %peer_addr,
-                limit = MAX_PENDING_TCP,
-                "Pending TCP limit reached, dropping connection"
-            );
-            return;
-        }
-        // Per-IP cap: a single slow-loris source cannot monopolise the budget.
-        let ip = peer_addr.ip();
-        let ip_count = self.pending_tcp_per_ip.entry(ip).or_insert(0);
-        if *ip_count >= MAX_PENDING_TCP_PER_IP {
-            tracing::warn!(
-                %peer_addr,
-                limit = MAX_PENDING_TCP_PER_IP,
-                "Per-IP pending TCP limit reached, dropping connection"
-            );
-            return;
-        }
-        *ip_count += 1;
-
-        let fut: Pin<Box<dyn Future<Output = (SocketAddr, Option<PendingTcpConn>)> + Send>> =
-            Box::pin(async move {
-                let result = match BufferedTcpStream::read_first_frame(
-                    stream,
-                    TCP_FIRST_FRAME_TIMEOUT,
-                )
-                .await
-                {
-                    Ok((stream, payload)) => {
-                        let server_ufrag = extract_stun_server_ufrag(&payload);
-                        Some(PendingTcpConn {
-                            stream,
-                            peer_addr,
-                            server_ufrag,
-                        })
-                    }
-                    Err(e) => {
-                        tracing::warn!(%peer_addr, error = ?e, "TCP first-frame read failed");
-                        None
-                    }
-                };
-                (peer_addr, result)
-            });
-        self.pending_tcp.push(fut);
-    }
-
     fn remove_ufrag(&mut self, _id: &ParticipantId) {}
-
-    /// Returns the number of in-flight pending TCP connections from `ip`.
-    /// Exposed for unit tests that exercise per-IP tracking without going through `run()`.
-    #[cfg(test)]
-    fn pending_count_for_ip(&self, ip: IpAddr) -> usize {
-        self.pending_tcp_per_ip.get(&ip).copied().unwrap_or(0)
-    }
 
     pub fn handle_create_participant(
         &mut self,
@@ -438,12 +306,12 @@ pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
 mod tests {
     use super::*;
     use crate::{
-        control::ufrag::IceUfrag,
+        control::{tcp_acceptor::PendingTcpConn, ufrag::IceUfrag},
         entity::ParticipantId,
         shard::{ShardContext, metrics::ShardMetrics},
     };
     use pulsebeam_core::net::TcpListener;
-    use pulsebeam_runtime::{mailbox, rand::seeded_rng};
+    use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream, rand::seeded_rng};
     use std::sync::Arc;
 
     fn dummy_pid() -> ParticipantId {
@@ -467,7 +335,6 @@ mod tests {
     }
 
     /// Accept one server-side TCP stream from a fresh loopback listener.
-    /// Returns the raw stream (for queue_pending_tcp) and keeps the client alive.
     async fn accept_one() -> (
         tokio::net::TcpStream,
         pulsebeam_core::net::TcpStream,
@@ -487,93 +354,7 @@ mod tests {
     /// Wrap a raw server-side stream as a `BufferedTcpStream` for route tests.
     async fn make_buffered() -> (tokio::net::TcpStream, BufferedTcpStream) {
         let (_client, server, _peer) = accept_one().await;
-        // _client is held alive for the duration of the caller's test
         (_client, BufferedTcpStream::new(server))
-    }
-
-    // ── pending_tcp cap ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_pending_tcp_cap_drops_excess_connections() {
-        let mut actor = make_actor(1).await;
-
-        // Fill to the limit; hold client sides alive so OS doesn't reset them.
-        let mut clients = Vec::new();
-        for _ in 0..MAX_PENDING_TCP {
-            let (client, server, peer_addr) = accept_one().await;
-            clients.push(client);
-            actor.queue_pending_tcp(server, peer_addr);
-        }
-        assert_eq!(actor.pending_tcp.len(), MAX_PENDING_TCP);
-
-        // The next connection must be dropped immediately (queue stays at cap).
-        let (client, server, peer_addr) = accept_one().await;
-        clients.push(client);
-        actor.queue_pending_tcp(server, peer_addr);
-        assert_eq!(
-            actor.pending_tcp.len(),
-            MAX_PENDING_TCP,
-            "excess connection must be dropped, not queued"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_pending_tcp_accepts_after_cap_frees_up() {
-        let mut actor = make_actor(1).await;
-
-        // Fill to the limit.
-        let mut clients = Vec::new();
-        for _ in 0..MAX_PENDING_TCP {
-            let (client, server, peer_addr) = accept_one().await;
-            clients.push(client);
-            actor.queue_pending_tcp(server, peer_addr);
-        }
-        assert_eq!(actor.pending_tcp.len(), MAX_PENDING_TCP);
-
-        // Drain all futures by dropping the clients (EOF → futures resolve to None).
-        clients.clear();
-        while let Some((peer_addr, maybe_conn)) = actor.pending_tcp.next().await {
-            actor.on_pending_resolved(peer_addr, maybe_conn);
-            if actor.pending_tcp.is_empty() {
-                break;
-            }
-        }
-
-        // Now a new connection should be accepted.
-        let (client, server, peer_addr) = accept_one().await;
-        actor.queue_pending_tcp(server, peer_addr);
-        drop(client);
-        assert_eq!(
-            actor.pending_tcp.len(),
-            1,
-            "new connection should be queued after cap freed up"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_per_ip_counter_increments_and_decrements() {
-        let mut actor = make_actor(1).await;
-        let (c1, s1, addr1) = accept_one().await;
-        let (c2, s2, addr2) = accept_one().await;
-        let ip = addr1.ip(); // both 127.0.0.1
-        actor.queue_pending_tcp(s1, addr1);
-        actor.queue_pending_tcp(s2, addr2);
-        assert_eq!(
-            actor.pending_count_for_ip(ip),
-            2,
-            "two in-flight from same IP"
-        );
-
-        // Resolve by dropping clients (EOF) and draining through on_pending_resolved.
-        drop(c1);
-        drop(c2);
-        while let Some((peer_addr, maybe_conn)) = actor.pending_tcp.next().await {
-            actor.on_pending_resolved(peer_addr, maybe_conn);
-            if actor.pending_tcp.is_empty() {
-                break;
-            }
-        }
-        assert_eq!(actor.pending_count_for_ip(ip), 0, "counter must reach zero");
     }
 
     // ── route_tcp_connection ─────────────────────────────────────────────────
