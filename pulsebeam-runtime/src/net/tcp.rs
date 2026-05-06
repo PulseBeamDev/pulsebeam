@@ -502,7 +502,13 @@ impl TcpTransport {
                     return Ok(true);
                 }
                 Ok(n) => buf.advance(n),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break, // drop remaining
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let dropped = count_rfc4571_frames(&buf);
+                    if dropped > 0 {
+                        metrics::counter!("tcp_egress_packets_dropped_total").increment(dropped);
+                    }
+                    break
+                }
                 Err(e) => {
                     tracing::warn!(peer_addr = %batch.dst, error = ?e, "TCP write error");
                     self.remove_conn(&batch.dst);
@@ -512,6 +518,29 @@ impl TcpTransport {
         }
         Ok(true)
     }
+}
+
+fn count_rfc4571_frames(buf: &[u8]) -> u64 {
+    let mut count = 0;
+    let mut offset = 0;
+    while offset + 2 <= buf.len() {
+        let len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+        if len == 0 {
+            count += 1;
+            break;
+        }
+        let total = 2 + len;
+        if offset + total > buf.len() {
+            count += 1;
+            break;
+        }
+        count += 1;
+        offset += total;
+    }
+    if offset < buf.len() {
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]

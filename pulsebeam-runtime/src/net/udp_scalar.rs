@@ -140,7 +140,10 @@ impl UdpTransportWriter {
         match res {
             Ok(_) => Ok(true),
             // Lossy: kernel buffer full — drop this batch rather than queue it.
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(true),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                metrics::counter!("udp_egress_packets_dropped_total").increment(1);
+                Ok(true)
+            }
             Err(err) => {
                 tracing::warn!("try_send_batch failed with {err}");
                 Err(err)
