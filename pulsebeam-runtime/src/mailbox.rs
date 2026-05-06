@@ -97,15 +97,34 @@ impl<T> Sender<T> {
 /// An actor's mailbox for receiving messages.
 pub struct Receiver<T> {
     receiver: tachyonix::Receiver<T>,
+    pending: Option<T>,
 }
 
 impl<T> Receiver<T> {
-    /// Receives the next message from the mailbox.
-    pub async fn recv(&mut self) -> Option<T> {
+    /// Each readable has to be associated with `recv` or `try_recv` as this
+    /// method stashes the next message in `pending` without consuming it.
+    pub async fn readable(&mut self) -> Option<()> {
+        let pending = self.recv_inner().await?;
+        self.pending = Some(pending);
+        Some(())
+    }
+
+    async fn recv_inner(&mut self) -> Option<T> {
         (self.receiver.recv().await).ok()
     }
 
+    /// Receives the next message from the mailbox.
+    pub async fn recv(&mut self) -> Option<T> {
+        if let Some(e) = self.pending.take() {
+            return Some(e);
+        }
+        self.recv_inner().await
+    }
+
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        if let Some(e) = self.pending.take() {
+            return Ok(e);
+        }
         self.receiver.try_recv().map_err(|e| match e {
             tachyonix::TryRecvError::Empty => TryRecvError::Empty,
             tachyonix::TryRecvError::Closed => TryRecvError::Disconnected,
@@ -121,7 +140,13 @@ impl<T> Receiver<T> {
 /// Creates a new mailbox and a corresponding sender handle.
 pub fn new<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     let (sender, receiver) = tachyonix::channel(buffer);
-    (Sender { sender }, Receiver { receiver })
+    (
+        Sender { sender },
+        Receiver {
+            receiver,
+            pending: None,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -173,9 +198,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn readable_then_recv_returns_same_message() {
+        let (sender, mut mailbox) = mailbox::new(10);
+
+        sender.send("hello".to_string()).await.unwrap();
+        sender.send("world".to_string()).await.unwrap();
+        drop(sender);
+
+        let readable = mailbox.readable().await;
+        assert_eq!(readable, Some(()));
+
+        let received = mailbox.recv().await;
+        assert_eq!(received, Some("hello".to_string()));
+
+        assert_eq!(mailbox.recv().await, Some("world".to_string()));
+        assert_eq!(mailbox.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn readable_then_try_recv_returns_same_message() {
+        let (sender, mut mailbox) = mailbox::new(10);
+
+        sender.send(42).await.unwrap();
+        drop(sender);
+
+        let readable = mailbox.readable().await;
+        assert_eq!(readable, Some(()));
+
+        let received = mailbox.try_recv();
+        assert_eq!(received, Ok(42));
+        assert_eq!(mailbox.try_recv(), Err(mailbox::TryRecvError::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn readable_returns_none_when_sender_is_dropped_and_empty() {
+        let (sender, mut mailbox) = mailbox::new::<i32>(10);
+        drop(sender);
+
+        assert_eq!(mailbox.readable().await, None);
+    }
+
     #[test]
     fn try_send_success_on_capacity() {
-        let (mut sender, _mailbox) = mailbox::new::<i32>(1);
+        let (sender, _mailbox) = mailbox::new::<i32>(1);
         let result = sender.try_send(123);
         assert!(result.is_ok());
     }
