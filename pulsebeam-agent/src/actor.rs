@@ -984,6 +984,10 @@ impl AgentActor {
                         if label == namespace::Signaling::Reliable.as_str() {
                             tracing::info!("signaling channel is now open, CID={:?}", cid);
                             self.signaling_cid = cid;
+                            // Reset stale active assignments so that the
+                            // reconciler re-sends all desired subscriptions to
+                            // the freshly-created server-side participant.
+                            self.sub_manager.reset_active_assignments();
                             self.pending.deadline.replace(Instant::now());
                         }
                     }

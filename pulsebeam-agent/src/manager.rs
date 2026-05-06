@@ -94,4 +94,12 @@ impl SubscriptionManager {
             .get(&mid)
             .map(|s| s.track_id.clone())
     }
+
+    /// Clears the cached active assignments so that the next `reconcile` will
+    /// re-send all desired subscriptions.  Call this when a new signaling
+    /// session starts (e.g. after a reconnect) because the server-side state
+    /// has been reset and no longer knows about previous assignments.
+    pub fn reset_active_assignments(&mut self) {
+        self.active_assignments.clear();
+    }
 }

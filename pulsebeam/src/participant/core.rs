@@ -492,8 +492,6 @@ impl ParticipantCore {
                 }
             }
             Direction::SendOnly => {
-                self.signaling
-                    .set_slot_count(self.downstream.video.slot_count());
                 if let Some(m) = self.rtc.media(media.mid)
                     && let Some(&pt) = m.remote_pts().first()
                 {
@@ -511,6 +509,12 @@ impl ParticipantCore {
                         });
                     }
                 }
+                // Update signaling slot count AFTER adding the slot so the
+                // server accepts ClientIntent requests up to the actual slot
+                // count (previously this was called before add_slot, so the
+                // count was always one behind and every intent was rejected).
+                self.signaling
+                    .set_slot_count(self.downstream.video.slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
