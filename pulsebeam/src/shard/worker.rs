@@ -185,15 +185,8 @@ impl ShardWorker {
         let mut loop_start = Instant::now();
         loop {
             // Compute the deadline before the select so no borrow of self.core
-            // outlives this block.  Merge participant timers with the TCP idle
-            // deadline so that connections that go silent after their first frame
-            // are reaped even when no packets arrive.
-            let participant_deadline = self.core.next_timer_deadline();
-            let tcp_idle_deadline = self.tcp_socket.next_idle_deadline();
-            let deadline = match (participant_deadline, tcp_idle_deadline) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            // outlives this block.
+            let deadline = self.core.next_timer_deadline();
             let wait = async move {
                 match deadline {
                     Some(d) => tokio::time::sleep_until(d).await,
@@ -205,8 +198,10 @@ impl ShardWorker {
             // AddTcpConnection commands received inside the select arm are deferred here
             // so that the `tcp_socket.readable()` future (which borrows `tcp_socket`) is
             // fully dropped before we take `&mut tcp_socket` to call `add_connection`.
-            let mut deferred_tcp: Option<(pulsebeam_runtime::net::tcp::BufferedTcpStream, std::net::SocketAddr)> =
-                None;
+            let mut deferred_tcp: Option<(
+                pulsebeam_runtime::net::tcp::BufferedTcpStream,
+                std::net::SocketAddr,
+            )> = None;
 
             // Block until at least one source is ready.
             // TODO: ideally, we should not do work here yet, we just want to get notifications

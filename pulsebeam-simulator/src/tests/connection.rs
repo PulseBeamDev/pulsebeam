@@ -1,8 +1,8 @@
 use super::common;
 use crate::tests::scenario::{
-    AssertAllDisconnectedStage, ChurnStage, ConnectPeersTcpOnlyStage, ConnectPeersStage,
-    DisconnectStage, HoldStage, PartitionStage, Scenario, StartSfuStage, StartSfuTcpOnlyStage,
-    StartSfuTcpOnlyMultiShardStage,
+    AssertAllDisconnectedStage, ChurnStage, ConnectPeersStage, ConnectPeersTcpOnlyStage,
+    DisconnectStage, HoldStage, PartitionStage, Scenario, StartSfuStage,
+    StartSfuTcpOnlyMultiShardStage, StartSfuTcpOnlyStage,
 };
 use std::time::Duration;
 

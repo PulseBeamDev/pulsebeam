@@ -1,8 +1,8 @@
 use crate::api::{ApiError, CreateParticipantRequest, HttpApiClient};
 use crate::manager::{Subscription, SubscriptionManager};
 use crate::media::{KeyframeNotifier, KeyframeReceiver};
-use crate::{MediaFrame, TransceiverDirection};
 use crate::tcp::TcpSession;
+use crate::{MediaFrame, TransceiverDirection};
 use futures_lite::StreamExt;
 use http::Uri;
 use pulsebeam_core::net::UdpSocket;

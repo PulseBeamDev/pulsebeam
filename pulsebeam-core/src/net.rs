@@ -9,12 +9,69 @@ pub use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "sim")]
 pub use sim::{TurmoilListener as TcpListener, TurmoilStream as TcpStream};
 
+// Non-sim TCP split halves: both wrap Arc<TcpStream> so try_read/try_write are
+// available as &self methods without any async overhead.
+#[cfg(not(feature = "sim"))]
+pub use tcp_split::{TcpReadHalf, TcpWriteHalf, split_tcp};
+
+#[cfg(not(feature = "sim"))]
+mod tcp_split {
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::TcpStream;
+
+    /// Read half of a split TCP stream.  Wraps `Arc<TcpStream>` so `readable` and
+    /// `try_read` are `&self` and require no exclusive access.
+    pub struct TcpReadHalf(pub(super) Arc<TcpStream>);
+    /// Write half of a split TCP stream.  Shares the `Arc<TcpStream>` with the
+    /// read half; `try_write` is `&self`.
+    pub struct TcpWriteHalf(pub(super) Arc<TcpStream>);
+
+    impl TcpReadHalf {
+        /// Resolves when the socket has data to read without consuming any bytes.
+        pub async fn readable(&self) -> io::Result<()> {
+            self.0.readable().await
+        }
+        /// Non-blocking read; returns `WouldBlock` when no data is available.
+        pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.try_read(buf)
+        }
+        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+            self.0.peer_addr()
+        }
+    }
+
+    impl TcpWriteHalf {
+        /// Non-blocking write; returns `WouldBlock` when the kernel buffer is full.
+        pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+            self.0.try_write(buf)
+        }
+    }
+
+    /// Split a `TcpStream` into a read half and a write half.  Both halves share
+    /// the underlying socket via `Arc`; dropping both closes the socket.
+    pub fn split_tcp(stream: TcpStream) -> (TcpReadHalf, TcpWriteHalf) {
+        let arc = Arc::new(stream);
+        (TcpReadHalf(Arc::clone(&arc)), TcpWriteHalf(arc))
+    }
+}
+
+#[cfg(feature = "sim")]
+pub use sim::{TurmoilReadHalf as TcpReadHalf, TurmoilWriteHalf as TcpWriteHalf};
+
+#[cfg(feature = "sim")]
+pub fn split_tcp(stream: TcpStream) -> (TcpReadHalf, TcpWriteHalf) {
+    stream.into_split()
+}
+
 #[cfg(feature = "sim")]
 mod sim {
     use axum::serve::Listener;
     use std::io;
     use std::net::SocketAddr;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use turmoil::net::TcpListener as InnerListener;
@@ -96,6 +153,20 @@ mod sim {
             })
             .await
         }
+
+        /// Consume the stream and return separate owned read and write halves.
+        ///
+        /// Both halves share the underlying socket via an `Arc<Mutex<...>>`.  The
+        /// mutex is never contended in the single-threaded turmoil simulator.
+        pub fn into_split(self) -> (TurmoilReadHalf, TurmoilWriteHalf) {
+            let inner = Arc::new(Mutex::new(self.0));
+            (
+                TurmoilReadHalf {
+                    inner: Arc::clone(&inner),
+                },
+                TurmoilWriteHalf { inner },
+            )
+        }
     }
 
     impl AsyncRead for TurmoilStream {
@@ -107,7 +178,66 @@ mod sim {
             Pin::new(&mut self.0).poll_read(cx, buf)
         }
     }
+    // ── Owned split halves ────────────────────────────────────────────────────
 
+    /// Read half of a split `TurmoilStream`.  Both halves share the underlying
+    /// socket via `Arc<Mutex<...>>`; the mutex is never contended in the
+    /// single-threaded turmoil simulator.
+    pub struct TurmoilReadHalf {
+        pub(super) inner: Arc<Mutex<turmoil::net::TcpStream>>,
+    }
+
+    impl TurmoilReadHalf {
+        /// Returns `WouldBlock` when no data is immediately available.
+        pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut guard = self
+                .inner
+                .try_lock()
+                .expect("TurmoilReadHalf: mutex contended in single-threaded sim");
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut read_buf = ReadBuf::new(buf);
+            match Pin::new(&mut *guard).poll_read(&mut cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Ok(read_buf.filled().len()),
+                Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                Poll::Ready(Err(e)) => Err(e),
+            }
+        }
+
+        /// Resolves when at least one byte is readable without consuming data.
+        pub async fn readable(&self) -> io::Result<()> {
+            let inner = Arc::clone(&self.inner);
+            let mut peek_buf = [0u8; 1];
+            futures::future::poll_fn(move |cx| {
+                let mut guard = inner
+                    .try_lock()
+                    .expect("TurmoilReadHalf: mutex contended in single-threaded sim");
+                let result = {
+                    let mut rb = ReadBuf::new(&mut peek_buf);
+                    Pin::new(&mut *guard).poll_peek(cx, &mut rb).map_ok(|_| ())
+                };
+                drop(guard); // release before returning Pending
+                result
+            })
+            .await
+        }
+    }
+
+    /// Write half of a split `TurmoilStream`.
+    pub struct TurmoilWriteHalf {
+        pub(super) inner: Arc<Mutex<turmoil::net::TcpStream>>,
+    }
+
+    impl TurmoilWriteHalf {
+        /// Non-blocking write: returns `WouldBlock` if the kernel buffer is full.
+        pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+            let guard = self
+                .inner
+                .try_lock()
+                .expect("TurmoilWriteHalf: mutex contended in single-threaded sim");
+            (*guard).try_write(buf)
+        }
+    }
     impl AsyncWrite for TurmoilStream {
         fn poll_write(
             mut self: Pin<&mut Self>,
@@ -117,17 +247,11 @@ mod sim {
             Pin::new(&mut self.0).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.0).poll_flush(cx)
         }
 
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.0).poll_shutdown(cx)
         }
     }
@@ -141,7 +265,10 @@ mod sim {
         }
 
         pub async fn accept(&self) -> io::Result<(TurmoilStream, SocketAddr)> {
-            self.0.accept().await.map(|(s, addr)| (TurmoilStream(s), addr))
+            self.0
+                .accept()
+                .await
+                .map(|(s, addr)| (TurmoilStream(s), addr))
         }
 
         pub fn local_addr(&self) -> io::Result<SocketAddr> {
