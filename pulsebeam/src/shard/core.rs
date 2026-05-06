@@ -459,7 +459,7 @@ impl ShardCore {
             %participant_id
         );
         let mut participant_rng = Rng::seed_from_u64(self.rng.next_u64());
-        let mut participant = ParticipantCore::new(
+        let participant = ParticipantCore::new(
             cfg,
             self.shard_id,
             self.max_gso_segments,

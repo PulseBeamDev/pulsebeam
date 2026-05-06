@@ -1,7 +1,10 @@
 use bytes::{Buf, BytesMut};
 use std::io;
 use std::net::SocketAddr;
-use str0m::{Input, Rtc, net::{Protocol, Receive}};
+use str0m::{
+    Input, Rtc,
+    net::{Protocol, Receive},
+};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
@@ -75,10 +78,7 @@ impl TcpSession {
                     if self.recv_accum.len() < 2 {
                         break;
                     }
-                    let len = u16::from_be_bytes([
-                        self.recv_accum[0],
-                        self.recv_accum[1],
-                    ]) as usize;
+                    let len = u16::from_be_bytes([self.recv_accum[0], self.recv_accum[1]]) as usize;
                     if len == 0 || len > Self::MAX_FRAME {
                         tracing::warn!(len, "invalid TCP frame length, closing stream");
                         self.close();
@@ -89,11 +89,9 @@ impl TcpSession {
                     }
                     self.recv_accum.advance(2);
                     let frame = self.recv_accum.split_to(len);
-                    if let (Ok(contents), Some(src), Some(dst)) = (
-                        frame[..].try_into(),
-                        self.server_addr,
-                        self.local_addr,
-                    ) {
+                    if let (Ok(contents), Some(src), Some(dst)) =
+                        (frame[..].try_into(), self.server_addr, self.local_addr)
+                    {
                         let _ = rtc.handle_input(Input::Receive(
                             Instant::now().into(),
                             Receive {
@@ -118,8 +116,7 @@ impl TcpSession {
     pub(crate) async fn send(&mut self, payload: &[u8]) {
         if let Some(stream) = &mut self.stream {
             let header = (payload.len() as u16).to_be_bytes();
-            if stream.write_all(&header).await.is_err()
-                || stream.write_all(payload).await.is_err()
+            if stream.write_all(&header).await.is_err() || stream.write_all(payload).await.is_err()
             {
                 tracing::warn!("TCP write failed, closing stream");
                 self.stream = None;

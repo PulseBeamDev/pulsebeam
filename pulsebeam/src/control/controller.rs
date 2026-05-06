@@ -1,9 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::time::Duration;
-use std::future::Future;
 
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
@@ -22,8 +22,8 @@ use crate::{
         worker::{ClusterCommand, ShardCommand, ShardEvent},
     },
 };
-use pulsebeam_runtime::net::tcp::BufferedTcpStream;
 use pulsebeam_runtime::mailbox;
+use pulsebeam_runtime::net::tcp::BufferedTcpStream;
 use str0m::{
     Candidate,
     change::{SdpAnswer, SdpOffer},
@@ -140,7 +140,9 @@ pub struct ControllerActor {
     /// In-flight futures reading the first STUN frame from newly accepted streams.
     /// Each future carries `peer_addr` in its output so the per-IP counter can
     /// always be decremented on completion, whether framing succeeded or not.
-    pending_tcp: FuturesUnordered<Pin<Box<dyn Future<Output = (SocketAddr, Option<PendingTcpConn>)> + Send>>>,
+    pending_tcp: FuturesUnordered<
+        Pin<Box<dyn Future<Output = (SocketAddr, Option<PendingTcpConn>)> + Send>>,
+    >,
     /// Per-source-IP count of in-flight pending TCP futures.
     /// Bounds per-IP slow-loris exposure independently of the global cap.
     pending_tcp_per_ip: HashMap<IpAddr, usize>,
@@ -287,9 +289,7 @@ impl ControllerActor {
         let shard_id = match conn.server_ufrag.as_deref() {
             Some(u) => match IceUfrag::decode(u) {
                 Some(decoded) => {
-                    if decoded.cluster_id != self.cluster_id
-                        || decoded.node_id != self.node_id
-                    {
+                    if decoded.cluster_id != self.cluster_id || decoded.node_id != self.node_id {
                         tracing::warn!(
                             peer_addr = %conn.peer_addr,
                             ufrag_cluster = decoded.cluster_id,
@@ -364,17 +364,25 @@ impl ControllerActor {
 
         let fut: Pin<Box<dyn Future<Output = (SocketAddr, Option<PendingTcpConn>)> + Send>> =
             Box::pin(async move {
-                let result =
-                    match BufferedTcpStream::read_first_frame(stream, TCP_FIRST_FRAME_TIMEOUT).await {
-                        Ok((stream, payload)) => {
-                            let server_ufrag = extract_stun_server_ufrag(&payload);
-                            Some(PendingTcpConn { stream, peer_addr, server_ufrag })
-                        }
-                        Err(e) => {
-                            tracing::warn!(%peer_addr, error = ?e, "TCP first-frame read failed");
-                            None
-                        }
-                    };
+                let result = match BufferedTcpStream::read_first_frame(
+                    stream,
+                    TCP_FIRST_FRAME_TIMEOUT,
+                )
+                .await
+                {
+                    Ok((stream, payload)) => {
+                        let server_ufrag = extract_stun_server_ufrag(&payload);
+                        Some(PendingTcpConn {
+                            stream,
+                            peer_addr,
+                            server_ufrag,
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer_addr, error = ?e, "TCP first-frame read failed");
+                        None
+                    }
+                };
                 (peer_addr, result)
             });
         self.pending_tcp.push(fut);
@@ -432,7 +440,7 @@ mod tests {
     use crate::{
         control::ufrag::IceUfrag,
         entity::ParticipantId,
-        shard::{metrics::ShardMetrics, ShardContext},
+        shard::{ShardContext, metrics::ShardMetrics},
     };
     use pulsebeam_core::net::TcpListener;
     use pulsebeam_runtime::{mailbox, rand::seeded_rng};
@@ -460,15 +468,17 @@ mod tests {
 
     /// Accept one server-side TCP stream from a fresh loopback listener.
     /// Returns the raw stream (for queue_pending_tcp) and keeps the client alive.
-    async fn accept_one() -> (tokio::net::TcpStream, pulsebeam_core::net::TcpStream, std::net::SocketAddr) {
+    async fn accept_one() -> (
+        tokio::net::TcpStream,
+        pulsebeam_core::net::TcpStream,
+        std::net::SocketAddr,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let (client, accepted) = tokio::join!(
-            tokio::net::TcpStream::connect(addr),
-            listener.accept()
-        );
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         let client = client.unwrap();
         let (server, peer_addr) = accepted.unwrap();
         (client, server, peer_addr)
@@ -533,7 +543,11 @@ mod tests {
         let (client, server, peer_addr) = accept_one().await;
         actor.queue_pending_tcp(server, peer_addr);
         drop(client);
-        assert_eq!(actor.pending_tcp.len(), 1, "new connection should be queued after cap freed up");
+        assert_eq!(
+            actor.pending_tcp.len(),
+            1,
+            "new connection should be queued after cap freed up"
+        );
     }
 
     #[tokio::test]
@@ -544,7 +558,11 @@ mod tests {
         let ip = addr1.ip(); // both 127.0.0.1
         actor.queue_pending_tcp(s1, addr1);
         actor.queue_pending_tcp(s2, addr2);
-        assert_eq!(actor.pending_count_for_ip(ip), 2, "two in-flight from same IP");
+        assert_eq!(
+            actor.pending_count_for_ip(ip),
+            2,
+            "two in-flight from same IP"
+        );
 
         // Resolve by dropping clients (EOF) and draining through on_pending_resolved.
         drop(c1);
@@ -568,12 +586,19 @@ mod tests {
 
         // Encode for cluster=0, node=0 (actor defaults), shard=2
         let ufrag = IceUfrag::new(0, 0, 2, dummy_pid()).encode();
-        let conn = PendingTcpConn { stream, peer_addr, server_ufrag: Some(ufrag) };
+        let conn = PendingTcpConn {
+            stream,
+            peer_addr,
+            server_ufrag: Some(ufrag),
+        };
         actor.route_tcp_connection(conn);
 
         let event = actor.eq.pop().expect("event must be queued");
         match event {
-            ControllerEvent::ShardCommandSent(shard_id, ShardCommand::AddTcpConnection { peer_addr: pa, .. }) => {
+            ControllerEvent::ShardCommandSent(
+                shard_id,
+                ShardCommand::AddTcpConnection { peer_addr: pa, .. },
+            ) => {
                 assert_eq!(shard_id, 2, "must route to the shard encoded in the ufrag");
                 assert_eq!(pa, peer_addr);
             }
@@ -592,7 +617,10 @@ mod tests {
             server_ufrag: Some(IceUfrag::new(1, 0, 0, dummy_pid()).encode()),
         };
         actor.route_tcp_connection(conn);
-        assert!(actor.eq.pop().is_none(), "wrong-cluster connection must be silently dropped");
+        assert!(
+            actor.eq.pop().is_none(),
+            "wrong-cluster connection must be silently dropped"
+        );
     }
 
     #[tokio::test]
@@ -606,7 +634,10 @@ mod tests {
             server_ufrag: Some(IceUfrag::new(0, 7, 0, dummy_pid()).encode()),
         };
         actor.route_tcp_connection(conn);
-        assert!(actor.eq.pop().is_none(), "wrong-node connection must be silently dropped");
+        assert!(
+            actor.eq.pop().is_none(),
+            "wrong-node connection must be silently dropped"
+        );
     }
 
     #[tokio::test]
@@ -621,7 +652,10 @@ mod tests {
         actor.route_tcp_connection(conn);
         let event = actor.eq.pop().expect("hash-fallback must produce an event");
         assert!(
-            matches!(event, ControllerEvent::ShardCommandSent(_, ShardCommand::AddTcpConnection { .. })),
+            matches!(
+                event,
+                ControllerEvent::ShardCommandSent(_, ShardCommand::AddTcpConnection { .. })
+            ),
             "must route to some shard via hash(peer_addr)"
         );
     }
@@ -638,7 +672,10 @@ mod tests {
         actor.route_tcp_connection(conn);
         let event = actor.eq.pop().expect("hash-fallback must produce an event");
         assert!(
-            matches!(event, ControllerEvent::ShardCommandSent(_, ShardCommand::AddTcpConnection { .. })),
+            matches!(
+                event,
+                ControllerEvent::ShardCommandSent(_, ShardCommand::AddTcpConnection { .. })
+            ),
             "undecodable ufrag must fall back to hash routing"
         );
     }

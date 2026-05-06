@@ -46,13 +46,11 @@ impl IceUfrag {
     /// Exact encoded length in ASCII characters (Crockford base32, no padding).
     pub const ENCODED_LEN: usize = ENCODED_LEN;
 
-    pub fn new(
-        cluster_id: u16,
-        node_id: u16,
-        shard_id: u8,
-        participant_id: ParticipantId,
-    ) -> Self {
-        debug_assert!(cluster_id < 4096, "cluster_id must fit in 12 bits (max 4095)");
+    pub fn new(cluster_id: u16, node_id: u16, shard_id: u8, participant_id: ParticipantId) -> Self {
+        debug_assert!(
+            cluster_id < 4096,
+            "cluster_id must fit in 12 bits (max 4095)"
+        );
         Self {
             cluster_id,
             node_id,
@@ -88,8 +86,7 @@ impl IceUfrag {
         let cluster_id = (((raw[0] & 0x0f) as u16) << 8) | (raw[1] as u16);
         let node_id = u16::from_be_bytes([raw[2], raw[3]]);
         let shard_id = raw[4];
-        let participant_id =
-            ParticipantId::from_bytes(raw[9..25].try_into().ok()?);
+        let participant_id = ParticipantId::from_bytes(raw[9..25].try_into().ok()?);
         Some(Self {
             cluster_id,
             node_id,
@@ -100,10 +97,7 @@ impl IceUfrag {
 
     /// Build complete `IceCreds` (encoded ufrag + random password) ready to
     /// pass to `rtc.direct_api().set_local_ice_credentials(...)`.
-    pub fn into_ice_creds(
-        self,
-        rng: &mut impl pulsebeam_runtime::rand::RngCore,
-    ) -> IceCreds {
+    pub fn into_ice_creds(self, rng: &mut impl pulsebeam_runtime::rand::RngCore) -> IceCreds {
         let mut pass_raw = [0u8; PASS_RAW_LEN];
         rng.fill_bytes(&mut pass_raw);
         let pass = base32::encode(base32::Alphabet::Crockford, &pass_raw);
@@ -121,8 +115,8 @@ mod tests {
 
     fn dummy_participant() -> ParticipantId {
         ParticipantId::from_bytes([
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
         ])
     }
 
@@ -164,6 +158,6 @@ mod tests {
         let creds = u.into_ice_creds(&mut os_rng());
         assert_eq!(creds.ufrag.len(), 40);
         assert_eq!(creds.pass.len(), 24); // 15 bytes → 24 Crockford chars
-        assert!(creds.pass.len() >= 22);  // RFC 8445 minimum
+        assert!(creds.pass.len() >= 22); // RFC 8445 minimum
     }
 }
