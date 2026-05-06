@@ -199,9 +199,9 @@ impl ShardWorker {
             tokio::select! {
                 biased;
                 Ok(_) = self.udp_socket.readable() => {}
+                Some(_) = self.cross_shard_event_rx.readable() => {}
                 Ok(_) = self.tcp_socket.readable() => {}
                 Some(_) = self.command_rx.readable() => {}
-                Some(_) = self.cross_shard_event_rx.readable() => {}
                 _ = wait => {}
                 else => break,
             }
