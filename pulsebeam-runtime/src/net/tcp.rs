@@ -1,4 +1,5 @@
 use super::{RecvPacketBatch, SendPacketBatch};
+use crate::mailbox;
 use crate::net::Transport;
 use bytes::{Buf, BufMut, BytesMut};
 use pulsebeam_core::net::{TcpReadHalf, TcpStream, TcpWriteHalf, split_tcp};
@@ -8,7 +9,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum RFC 4571 payload length accepted during the initial frame peek.
@@ -152,7 +152,7 @@ async fn tcp_read_task(
     peer_addr: SocketAddr,
     read: TcpReadHalf,
     mut pending: BytesMut,
-    tx: mpsc::Sender<TcpEvent>,
+    tx: mailbox::Sender<TcpEvent>,
     cancel: CancellationToken,
 ) {
     let mut recv_buf = BytesMut::with_capacity(MAX_FRAME_SIZE + 2);
@@ -256,16 +256,16 @@ pub struct TcpTransport {
     /// Per-IP connection counts for `MAX_CONNS_PER_IP` enforcement.
     ip_counts: HashMap<IpAddr, usize>,
     /// Sender cloned into each read task.
-    event_tx: mpsc::Sender<TcpEvent>,
+    event_tx: mailbox::Sender<TcpEvent>,
     /// Receiver drained by `try_recv_batch`.
-    event_rx: mpsc::Receiver<TcpEvent>,
+    event_rx: mailbox::Receiver<TcpEvent>,
     /// One event stashed by `readable()` so `try_recv_batch` can always find it.
     peeked: Option<TcpEvent>,
 }
 
 impl TcpTransport {
     pub fn new(local_addr: SocketAddr) -> Self {
-        let (event_tx, event_rx) = mpsc::channel(TCP_EVENT_CAPACITY);
+        let (event_tx, event_rx) = mailbox::new(TCP_EVENT_CAPACITY);
         Self {
             local_addr,
             conns: HashMap::new(),
