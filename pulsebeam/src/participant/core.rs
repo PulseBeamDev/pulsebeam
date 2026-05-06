@@ -251,7 +251,10 @@ impl ParticipantCore {
     }
 
     fn poll_slow(&mut self, now: Instant, events: &mut EventQueue) {
-        self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
+        let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
+        if assignments_changed {
+            self.signaling.mark_assignments_dirty();
+        }
         self.upstream.poll_slow(now);
     }
 
@@ -311,7 +314,10 @@ impl ParticipantCore {
 
             if self.downstream.dirty_allocation {
                 // Make sure rtc is updated with new allocations
-                self.downstream.update_allocations(&mut self.rtc.bwe());
+                let assignments_changed = self.downstream.update_allocations(&mut self.rtc.bwe());
+                if assignments_changed {
+                    self.signaling.mark_assignments_dirty();
+                }
                 self.downstream.reconcile_routes(now, events);
                 continue;
             }

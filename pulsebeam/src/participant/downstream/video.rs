@@ -211,7 +211,7 @@ impl VideoAllocator {
         }
     }
 
-    pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> Bitrate {
+    pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, bool) {
         // 1. Prepare the input views
         let mut views: Vec<SlotView> = self
             .slots
@@ -261,7 +261,7 @@ impl VideoAllocator {
             log_allocation(available_bandwidth, desired, &decisions, &views);
         }
 
-        desired
+        (desired, changed)
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {

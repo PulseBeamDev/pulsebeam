@@ -89,19 +89,21 @@ impl DownstreamAllocator {
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self, bwe: &mut Bwe) {
+    pub fn update_allocations(&mut self, bwe: &mut Bwe) -> bool {
         self.dirty_allocation = false;
-        let desired = self.video.update_allocations(self.available_bandwidth);
+        let (desired, assignments_changed) = self.video.update_allocations(self.available_bandwidth);
         bwe.set_desired_bitrate(desired);
+        assignments_changed
     }
 
     pub fn reconcile_routes(&mut self, now: Instant, events: &mut EventQueue) {
         self.video.reconcile_routes(now, events);
     }
 
-    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, events: &mut EventQueue) {
-        self.update_allocations(bwe);
+    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, events: &mut EventQueue) -> bool {
+        let assignments_changed = self.update_allocations(bwe);
         self.video.poll_slow(now, self.available_bandwidth, events);
+        assignments_changed
     }
 
     pub fn unsubscribe_all(&mut self) -> Vec<(StreamId, usize)> {
