@@ -195,44 +195,15 @@ impl ShardWorker {
                 }
             };
 
-            // AddTcpConnection commands received inside the select arm are deferred here
-            // so that the `tcp_socket.readable()` future (which borrows `tcp_socket`) is
-            // fully dropped before we take `&mut tcp_socket` to call `add_connection`.
-            let mut deferred_tcp: Option<(
-                pulsebeam_runtime::net::tcp::BufferedTcpStream,
-                std::net::SocketAddr,
-            )> = None;
-
             // Block until at least one source is ready.
-            // TODO: ideally, we should not do work here yet, we just want to get notifications
             tokio::select! {
                 biased;
                 Ok(_) = self.udp_socket.readable() => {}
                 Ok(_) = self.tcp_socket.readable() => {}
-                Some(cmd) = self.command_rx.recv() => {
-                    match cmd {
-                        ShardCommand::AddTcpConnection { stream, peer_addr } => {
-                            // Defer: tcp_socket.readable() borrow is still alive in this select.
-                            // Handled immediately after the select block below.
-                            deferred_tcp = Some((stream, peer_addr));
-                        }
-                        cmd => {
-                            let _ = self.core.on_command(cmd, &self.router);
-                        }
-                    }
-                }
-                Some(ev) = self.cross_shard_event_rx.recv() => {
-                    self.core.pending_cross_shard.push_back(ev);
-                }
+                Some(_) = self.command_rx.readable() => {}
+                Some(_) = self.cross_shard_event_rx.readable() => {}
                 _ = wait => {}
                 else => break,
-            }
-
-            // tcp_socket.readable() future is now dropped; &mut tcp_socket is safe.
-            if let Some((stream, peer_addr)) = deferred_tcp
-                && let Err(err) = self.tcp_socket.add_connection(stream, peer_addr)
-            {
-                tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
             }
 
             let busy_start = Instant::now();
