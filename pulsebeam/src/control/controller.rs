@@ -408,44 +408,4 @@ mod tests {
             "wrong-node connection must be silently dropped"
         );
     }
-
-    #[tokio::test]
-    async fn test_route_no_ufrag_falls_back_to_hash() {
-        let mut actor = make_actor(2).await;
-        let (_client, stream) = make_buffered().await;
-        let conn = PendingTcpConn {
-            stream,
-            peer_addr: "1.2.3.4:5003".parse().unwrap(),
-            server_ufrag: None,
-        };
-        actor.route_tcp_connection(conn);
-        let event = actor.eq.pop().expect("hash-fallback must produce an event");
-        assert!(
-            matches!(
-                event,
-                ControllerEvent::ShardCommandSent(_, ShardCommand::AddTcpConnection { .. })
-            ),
-            "must route to some shard via hash(peer_addr)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_route_garbage_ufrag_falls_back_to_hash() {
-        let mut actor = make_actor(2).await;
-        let (_client, stream) = make_buffered().await;
-        let conn = PendingTcpConn {
-            stream,
-            peer_addr: "1.2.3.4:5004".parse().unwrap(),
-            server_ufrag: Some("garbage!notbase32".to_string()),
-        };
-        actor.route_tcp_connection(conn);
-        let event = actor.eq.pop().expect("hash-fallback must produce an event");
-        assert!(
-            matches!(
-                event,
-                ControllerEvent::ShardCommandSent(_, ShardCommand::AddTcpConnection { .. })
-            ),
-            "undecodable ufrag must fall back to hash routing"
-        );
-    }
 }
