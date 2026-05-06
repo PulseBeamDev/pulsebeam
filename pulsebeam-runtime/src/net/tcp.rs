@@ -117,8 +117,6 @@ const MAX_CONNECTIONS: usize = 10_000;
 const MAX_CONNS_PER_IP: usize = 20;
 /// Overflow guard: `recv_buf` holds at most one partial RFC 4571 frame.
 const MAX_RECV_BUF: usize = MAX_FRAME_SIZE + 2 + 64;
-/// Per-connection write-buffer cap.  Peers that stop reading are disconnected.
-const MAX_SEND_BUF_PER_CONN: usize = 256 * 1024;
 /// How long a connection may be idle before the read task reaps it.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Channel capacity for TCP events (frames + close notifications).
@@ -136,8 +134,6 @@ enum TcpEvent {
 struct TcpConn {
     /// Write half — `try_write` is `&self` so no locking needed.
     write: TcpWriteHalf,
-    /// RFC 4571-framed bytes pending flush to the kernel.
-    send_buf: BytesMut,
     /// Cancels the associated read task when the connection is removed.
     cancel: CancellationToken,
 }
@@ -371,7 +367,6 @@ impl TcpTransport {
             peer_addr,
             TcpConn {
                 write,
-                send_buf: BytesMut::new(),
                 cancel,
             },
         );
@@ -477,50 +472,45 @@ impl TcpTransport {
 
     /// Frame `batch` per RFC 4571 and write to the peer's stream.
     ///
-    /// Returns `Ok(true)` when the send buffer is fully flushed to the kernel,
-    /// `Ok(false)` under back-pressure, and `Ok(true)` when the peer is gone.
+    /// Frame `batch` per RFC 4571 and write to the peer's stream.
+    ///
+    /// **Lossy**: if the kernel send buffer is full (`WouldBlock`) the batch is
+    /// dropped rather than queued.  This keeps memory bounded and ensures the
+    /// caller's batch queue is always drained to empty on every tick.
     pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<bool> {
+        debug_assert!(batch.segment_size != 0);
         let Some(conn) = self.conns.get_mut(&batch.dst) else {
             return Ok(true); // peer gone — treat as sent
         };
 
+        // Frame all segments into a local buffer (not stored on the connection).
+        let mut buf = BytesMut::new();
         let mut offset = 0;
         while offset < batch.buf.len() {
             let end = (offset + batch.segment_size).min(batch.buf.len());
             let seg = &batch.buf[offset..end];
-            conn.send_buf.put_u16(seg.len() as u16);
-            conn.send_buf.put_slice(seg);
+            buf.put_u16(seg.len() as u16);
+            buf.put_slice(seg);
             offset = end;
         }
 
-        // Slow-reader guard.
-        let should_drop = conn.send_buf.len() > MAX_SEND_BUF_PER_CONN;
-        let mut remove = should_drop;
-        if !should_drop {
-            while !conn.send_buf.is_empty() {
-                match conn.write.try_write(&conn.send_buf) {
-                    Ok(0) => break,
-                    Ok(n) => conn.send_buf.advance(n),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tracing::warn!(peer_addr = %batch.dst, error = ?e, "TCP write error");
-                        remove = true;
-                        break;
-                    }
+        // Drain to kernel; whatever doesn't fit is dropped (lossy).
+        while !buf.is_empty() {
+            match conn.write.try_write(&buf) {
+                Ok(0) => {
+                    self.remove_conn(&batch.dst);
+                    return Ok(true);
+                }
+                Ok(n) => buf.advance(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break, // drop remaining
+                Err(e) => {
+                    tracing::warn!(peer_addr = %batch.dst, error = ?e, "TCP write error");
+                    self.remove_conn(&batch.dst);
+                    return Ok(true);
                 }
             }
         }
-        let fully_flushed = !remove && conn.send_buf.is_empty();
-
-        if remove {
-            tracing::warn!(
-                peer_addr = %batch.dst,
-                "dropping TCP connection (write error or send_buf overflow)"
-            );
-            self.remove_conn(&batch.dst);
-            return Ok(true);
-        }
-        Ok(fully_flushed)
+        Ok(true)
     }
 }
 
@@ -683,9 +673,11 @@ mod tests {
         });
     }
 
-    /// A peer that stops reading should be dropped once MAX_SEND_BUF_PER_CONN is hit.
+    /// Verify that try_send_batch is lossy: flooding a peer that has stopped
+    /// reading never panics and always returns Ok(true) (packets are dropped,
+    /// not buffered), keeping memory bounded.
     #[test]
-    fn test_send_buf_overflow_drops_connection() {
+    fn test_send_to_slow_reader_is_lossy() {
         local_rt().block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .await
@@ -697,28 +689,25 @@ mod tests {
             sock.add_connection(BufferedTcpStream::new(server_stream), peer_addr)
                 .unwrap();
 
-            // Stop reading from the client side so the kernel TX buffer fills up.
+            // Stop reading — kernel TX buffer will fill quickly.
             drop(client);
 
-            // Flood the send path with MAX_SEND_BUF_PER_CONN + 1 bytes across many calls.
+            // Flood: every call must return Ok(true) (lossy drop), never buffering.
             let payload = vec![0u8; MAX_FRAME_SIZE];
-            let segments_needed = (MAX_SEND_BUF_PER_CONN / (MAX_FRAME_SIZE + 2)) + 2;
-            for _ in 0..segments_needed {
+            for _ in 0..200 {
                 let batch = SendPacketBatch {
                     dst: peer_addr,
                     buf: &payload,
                     segment_size: MAX_FRAME_SIZE,
                 };
-                let _ = sock.try_send_batch(&batch);
-                if sock.active_connections() == 0 {
-                    break;
-                }
+                assert_eq!(
+                    sock.try_send_batch(&batch).unwrap(),
+                    true,
+                    "try_send_batch must always return Ok(true) under back-pressure"
+                );
             }
-            assert_eq!(
-                sock.active_connections(),
-                0,
-                "slow-reader connection should be dropped after send_buf overflow"
-            );
+            // Connection may or may not still be present (depends on whether the
+            // kernel signalled a hard error), but we must not have panicked.
         });
     }
 
