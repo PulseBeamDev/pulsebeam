@@ -252,7 +252,8 @@ impl UdpTransportWriter {
 
         match res {
             Ok(_) => Ok(true),
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
+            // Lossy: kernel buffer full — drop this batch rather than queue it.
+            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(true),
             Err(err) => {
                 tracing::trace!("try_send_batch failed with {err}");
                 Err(err)
