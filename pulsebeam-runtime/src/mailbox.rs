@@ -104,6 +104,9 @@ impl<T> Receiver<T> {
     /// Each readable has to be associated with `recv` or `try_recv` as this
     /// method stashes the next message in `pending` without consuming it.
     pub async fn readable(&mut self) -> Option<()> {
+        if self.pending.is_some() {
+            return Some(());
+        }
         let pending = self.recv_inner().await?;
         self.pending = Some(pending);
         Some(())
@@ -225,6 +228,24 @@ mod tests {
 
         let readable = mailbox.readable().await;
         assert_eq!(readable, Some(()));
+
+        let received = mailbox.try_recv();
+        assert_eq!(received, Ok(42));
+        assert_eq!(mailbox.try_recv(), Err(mailbox::TryRecvError::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn readable_twice_preserves_pending_message() {
+        let (sender, mut mailbox) = mailbox::new(10);
+
+        sender.send(42).await.unwrap();
+        drop(sender);
+
+        let readable1 = mailbox.readable().await;
+        assert_eq!(readable1, Some(()));
+
+        let readable2 = mailbox.readable().await;
+        assert_eq!(readable2, Some(()));
 
         let received = mailbox.try_recv();
         assert_eq!(received, Ok(42));
