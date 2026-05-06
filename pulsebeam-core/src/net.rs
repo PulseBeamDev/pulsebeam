@@ -9,52 +9,12 @@ pub use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "sim")]
 pub use sim::{TurmoilListener as TcpListener, TurmoilStream as TcpStream};
 
-// Non-sim TCP split halves: both wrap Arc<TcpStream> so try_read/try_write are
-// available as &self methods without any async overhead.
 #[cfg(not(feature = "sim"))]
-pub use tcp_split::{TcpReadHalf, TcpWriteHalf, split_tcp};
+pub use tokio::net::tcp::{OwnedReadHalf as TcpReadHalf, OwnedWriteHalf as TcpWriteHalf};
 
 #[cfg(not(feature = "sim"))]
-mod tcp_split {
-    use std::io;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use tokio::net::TcpStream;
-
-    /// Read half of a split TCP stream.  Wraps `Arc<TcpStream>` so `readable` and
-    /// `try_read` are `&self` and require no exclusive access.
-    pub struct TcpReadHalf(pub(super) Arc<TcpStream>);
-    /// Write half of a split TCP stream.  Shares the `Arc<TcpStream>` with the
-    /// read half; `try_write` is `&self`.
-    pub struct TcpWriteHalf(pub(super) Arc<TcpStream>);
-
-    impl TcpReadHalf {
-        /// Resolves when the socket has data to read without consuming any bytes.
-        pub async fn readable(&self) -> io::Result<()> {
-            self.0.readable().await
-        }
-        /// Non-blocking read; returns `WouldBlock` when no data is available.
-        pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.try_read(buf)
-        }
-        pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-            self.0.peer_addr()
-        }
-    }
-
-    impl TcpWriteHalf {
-        /// Non-blocking write; returns `WouldBlock` when the kernel buffer is full.
-        pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
-            self.0.try_write(buf)
-        }
-    }
-
-    /// Split a `TcpStream` into a read half and a write half.  Both halves share
-    /// the underlying socket via `Arc`; dropping both closes the socket.
-    pub fn split_tcp(stream: TcpStream) -> (TcpReadHalf, TcpWriteHalf) {
-        let arc = Arc::new(stream);
-        (TcpReadHalf(Arc::clone(&arc)), TcpWriteHalf(arc))
-    }
+pub fn split_tcp(stream: TcpStream) -> (TcpReadHalf, TcpWriteHalf) {
+    stream.into_split()
 }
 
 #[cfg(feature = "sim")]
