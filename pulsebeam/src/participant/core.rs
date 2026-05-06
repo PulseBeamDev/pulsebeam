@@ -26,7 +26,7 @@ use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
-use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, Track};
+use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Track};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -153,6 +153,22 @@ impl ParticipantCore {
 
     pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+    }
+
+    #[inline]
+    pub fn on_forward_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
+        let mut writer = StreamWriter(&mut self.rtc);
+        let promoted = self.downstream.on_forward_rtp(stream_id, pkt, &mut writer);
+        if promoted {
+            self.signaling.mark_assignments_dirty();
+        }
+    }
+
+    #[inline]
+    pub fn on_forward_audio_rtp(&mut self, slot_idx: usize, pkt: &RtpPacket) {
+        let mut writer = StreamWriter(&mut self.rtc);
+        self.downstream
+            .on_forward_audio_rtp(slot_idx, pkt, &mut writer);
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]

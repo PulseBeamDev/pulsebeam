@@ -143,7 +143,7 @@ impl VideoAllocator {
         self.slots.values().filter_map(|s| {
             Some(SlotAssignment {
                 mid: s.mid,
-                paused: s.paused,
+                paused: s.paused || matches!(s.state(), SlotState::Idle | SlotState::Starting),
                 track: {
                     let layer = s.target()?;
                     self.tracks.get(&layer.meta.id)?.meta.clone()
@@ -277,16 +277,17 @@ impl VideoAllocator {
     }
 
     #[inline]
-    pub fn on_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket, writer: &mut StreamWriter) {
+    pub fn on_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket, writer: &mut StreamWriter) -> bool {
         let Some(slot_key) = self.routes.get(stream_id) else {
-            return;
+            return false;
         };
 
         let Some(slot) = self.slots.get_mut(*slot_key) else {
             tracing::warn!("no slot found for {:?}", stream_id);
-            return;
+            return false;
         };
 
+        let mut state_changed = false;
         slot.process(stream_id, pkt);
         while let Some(pkt) = slot.switcher.pop() {
             writer.write_owned(pkt, &slot.ssrc, slot.pt);
@@ -297,7 +298,10 @@ impl VideoAllocator {
         if slot.should_promote_staging() {
             slot.active = slot.staging.take();
             slot.staging_packet_seen = false;
+            state_changed = true;
         }
+
+        state_changed
     }
 
     pub fn poll_slow(&mut self, now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {

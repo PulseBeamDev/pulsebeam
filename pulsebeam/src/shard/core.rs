@@ -567,10 +567,7 @@ pub(super) fn handle_rtp(
                 let Some(sub) = participants.get_mut(participant_id) else {
                     continue;
                 };
-                let mut writer = StreamWriter(&mut sub.core.rtc);
-                sub.core
-                    .downstream
-                    .on_forward_rtp(&stream_id, pkt, &mut writer);
+                sub.core.on_forward_rtp(&stream_id, pkt);
                 dirty.insert(*participant_id);
             }
             for &shard_id in &route.remote_shards {
@@ -624,10 +621,7 @@ pub(super) fn handle_audio_rtp(
         let Some(sub) = participants.get_mut(&participant_id) else {
             continue;
         };
-        let mut writer = StreamWriter(&mut sub.core.rtc);
-        sub.core
-            .downstream
-            .on_forward_audio_rtp(slot_idx, &ev.pkt, &mut writer);
+        sub.core.on_forward_audio_rtp(slot_idx, &ev.pkt);
         dirty.insert(participant_id);
     }
 }

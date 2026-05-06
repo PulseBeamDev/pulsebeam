@@ -114,8 +114,8 @@ impl DownstreamAllocator {
         stream_id: &StreamId,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
-    ) {
-        self.video.on_rtp(stream_id, pkt, writer);
+    ) -> bool {
+        self.video.on_rtp(stream_id, pkt, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.
