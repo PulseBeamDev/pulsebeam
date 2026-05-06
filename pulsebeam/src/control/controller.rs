@@ -227,43 +227,31 @@ impl ControllerActor {
     ///    upgrade), fall back to hash(peer_addr) routing.
     /// 4. If no ufrag at all, fall back to hash(peer_addr) routing.
     fn route_tcp_connection(&mut self, conn: PendingTcpConn) {
-        let shard_id = match conn.server_ufrag.as_deref() {
-            Some(u) => match IceUfrag::decode(u) {
-                Some(decoded) => {
-                    if decoded.cluster_id != self.cluster_id || decoded.node_id != self.node_id {
-                        tracing::warn!(
-                            peer_addr = %conn.peer_addr,
-                            ufrag_cluster = decoded.cluster_id,
-                            ufrag_node    = decoded.node_id,
-                            our_cluster   = self.cluster_id,
-                            our_node      = self.node_id,
-                            "TCP connection ufrag targets a different node, dropping"
-                        );
-                        return; // stream dropped here, OS socket closed
-                    }
-                    Some(decoded.shard_id as usize)
-                }
-                // Unrecognised format (e.g. old client during rolling upgrade).
-                None => self.router.try_route(&conn.peer_addr),
-            },
-            None => self.router.try_route(&conn.peer_addr),
-        };
-
-        let Some(shard_id) = shard_id else {
-            tracing::warn!(peer_addr = %conn.peer_addr, "No shard available for TCP connection");
+        let Some(ufrag) = conn.server_ufrag.and_then(|ufrag| IceUfrag::decode(&ufrag)) else {
+            tracing::warn!("invalid ufrag, disconnecting due to likely a malicous actor");
             return;
         };
 
+        if ufrag.cluster_id != self.cluster_id || ufrag.node_id != self.node_id {
+            tracing::warn!(
+                peer_addr = %conn.peer_addr,
+                ufrag_cluster = ufrag.cluster_id,
+                ufrag_node    = ufrag.node_id,
+                our_cluster   = self.cluster_id,
+                our_node      = self.node_id,
+                "TCP connection ufrag targets a different node, dropping"
+            );
+            return; // stream dropped here, OS socket closed
+        }
+
         self.eq.send(
-            shard_id,
+            ufrag.shard_id as usize,
             ShardCommand::AddTcpConnection {
                 stream: conn.stream,
                 peer_addr: conn.peer_addr,
             },
         );
     }
-
-    fn remove_ufrag(&mut self, _id: &ParticipantId) {}
 
     pub fn handle_create_participant(
         &mut self,
