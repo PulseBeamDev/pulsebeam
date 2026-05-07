@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.1] - 2026-05-07
 
 * Separate lossy vs lossless events
 * Stream subscription is now at track level
