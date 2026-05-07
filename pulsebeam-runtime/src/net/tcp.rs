@@ -363,13 +363,7 @@ impl TcpTransport {
             cancel.clone(),
         ));
 
-        self.conns.insert(
-            peer_addr,
-            TcpConn {
-                write,
-                cancel,
-            },
-        );
+        self.conns.insert(peer_addr, TcpConn { write, cancel });
         tracing::debug!(%peer_addr, "TCP connection added to shard");
         Ok(())
     }
@@ -507,7 +501,7 @@ impl TcpTransport {
                     if dropped > 0 {
                         metrics::counter!("tcp_egress_packets_dropped_total").increment(dropped);
                     }
-                    break
+                    break;
                 }
                 Err(e) => {
                     tracing::warn!(peer_addr = %batch.dst, error = ?e, "TCP write error");
@@ -543,7 +537,7 @@ fn count_rfc4571_frames(buf: &[u8]) -> u64 {
     count
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
     use pulsebeam_core::net::TcpListener;

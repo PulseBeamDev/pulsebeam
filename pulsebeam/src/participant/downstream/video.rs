@@ -2,10 +2,10 @@ use crate::participant::downstream::SlotConfig;
 use crate::participant::event::EventQueue;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
 use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use slotmap::SlotMap;
-use std::collections::HashMap;
 use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
@@ -33,13 +33,14 @@ slotmap::new_key_type! {
 
 pub struct VideoAllocator {
     // Hot
-    routes: HashMap<StreamId, SlotKey>,
+    routes: HashMap<TrackId, SlotKey>,
     slots: SlotMap<SlotKey, Slot>,
 
     // Cold
     manual_sub: bool,
     tracks: HashMap<TrackId, Track>,
     rng: Rng,
+    last_reconciled: HashSet<(TrackId, SlotKey)>,
 }
 
 impl VideoAllocator {
@@ -50,6 +51,7 @@ impl VideoAllocator {
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
             routes: HashMap::new(),
             rng: Rng::seed_from_u64(rng.next_u64()),
+            last_reconciled: HashSet::new(),
         }
     }
 
@@ -283,7 +285,7 @@ impl VideoAllocator {
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) -> bool {
-        let Some(slot_key) = self.routes.get(stream_id) else {
+        let Some(slot_key) = self.routes.get(&stream_id.0) else {
             return false;
         };
 
@@ -310,147 +312,46 @@ impl VideoAllocator {
     }
 
     pub fn poll_slow(&mut self, now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {
-        self.reconcile_routes(now, events);
+        self.reconcile_routes(events);
         self.retry_keyframe_requests(now, events);
     }
 
     fn retry_keyframe_requests(&mut self, now: Instant, events: &mut EventQueue) {
-        let mut to_request: Vec<TrackLayer> = Vec::new();
-
         for (_, slot) in self.slots.iter_mut() {
-            if slot.paused {
-                continue;
-            }
-            if !matches!(slot.state(), SlotState::Starting | SlotState::Switching) {
-                continue;
-            }
-
-            // Clone staging layer before mutating the slot.
-            let Some(staging_clone) = slot.staging.clone() else {
-                continue;
-            };
-            let last_at = slot.staging_keyframe_last_at;
-            let retries = slot.staging_keyframe_retries;
-
-            let should_request = last_at
-                .is_none_or(|last| now.duration_since(last) >= slot.staging_keyframe_interval);
-            if !should_request {
-                continue;
-            }
-
-            let staging_has_packets = slot.staging_packet_seen;
-            let keepalive_mode = retries >= KEYFRAME_MAX_RETRIES;
-            let reached_keepalive = !keepalive_mode && retries + 1 == KEYFRAME_MAX_RETRIES;
-            if !keepalive_mode {
-                slot.staging_keyframe_retries += 1;
-            }
-            slot.staging_keyframe_last_at = Some(now);
-
-            if reached_keepalive {
-                slot.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
-                if staging_has_packets {
-                    tracing::warn!(
-                        mid = %slot.mid,
-                        retries = KEYFRAME_MAX_RETRIES,
-                        interval = ?slot.staging_keyframe_interval,
-                        "slot transition stalled; switching to low-frequency keep-alive PLIs while waiting for a natural keyframe"
-                    );
-                } else {
-                    tracing::debug!(
-                        mid = %slot.mid,
-                        retries = KEYFRAME_MAX_RETRIES,
-                        interval = ?slot.staging_keyframe_interval,
-                        "slot transition still waiting for any packets on the staged stream; using low-frequency keep-alive PLIs"
-                    );
-                }
-            }
-
-            to_request.push(staging_clone);
-        }
-
-        for layer in &to_request {
-            events.request_keyframe(layer);
+            slot.pli_retry(now, events);
         }
     }
 
-    pub fn reconcile_routes(&mut self, now: Instant, events: &mut EventQueue) {
-        // Pass 1: remove routes that no longer match the slot they point to.
-        // This also removes stale route mappings that were pointing at a slot
-        // that no longer claims the stream.
-        let to_remove: Vec<StreamId> = self
-            .routes
-            .iter()
-            .filter_map(|(sid, slot_key)| {
-                let remove = match self.slots.get(*slot_key) {
-                    Some(slot) => !slot.matches_stream_id(sid),
-                    None => true,
-                };
-                remove.then_some(*sid)
-            })
-            .collect();
+    pub fn reconcile_routes(&mut self, events: &mut EventQueue) {
+        let mut current = HashSet::new();
+        for (slot_key, slot) in &self.slots {
+            if let Some(staging) = slot.staging.as_ref() {
+                current.insert((staging.meta.id, slot_key));
+            }
 
-        for sid in &to_remove {
-            tracing::debug!(stream_id=?sid, "route removed: route no longer matches its mapped slot");
-            self.routes.remove(sid);
-            // TODO: check how safe this is
-            let Some(track) = self.tracks.get(&sid.0) else {
-                continue;
-            };
-            let Some(layer) = track.layers.iter().find(|l| l.rid == sid.1) else {
-                continue;
-            };
-            events.unsubscribe(layer);
-        }
-
-        // Pass 2: add routes for active and staging slot streams not yet in the table.
-        let keys: Vec<_> = self.slots.keys().collect();
-        for key in keys {
-            let route_candidates: Vec<(StreamId, bool)> = {
-                let slot = &self.slots[key];
-                if slot.paused {
-                    Vec::new()
-                } else {
-                    let mut ids = Vec::new();
-                    if let Some(active) = slot.active.as_ref() {
-                        ids.push((active.stream_id(), false));
-                    }
-                    if let Some(staging) = slot.staging.as_ref() {
-                        let sid = staging.stream_id();
-                        if ids.last().map(|(id, _)| id != &sid).unwrap_or(true) {
-                            ids.push((sid, true));
-                        }
-                    }
-                    ids
-                }
-            };
-
-            for (sid, is_staging) in route_candidates {
-                if let std::collections::hash_map::Entry::Vacant(e) = self.routes.entry(sid) {
-                    let layer = {
-                        let slot = &self.slots[key];
-                        if let Some(active) = slot.active.as_ref()
-                            && active.stream_id() == sid
-                        {
-                            active.clone()
-                        } else {
-                            slot.staging.as_ref().unwrap().clone()
-                        }
-                    };
-
-                    tracing::debug!(stream_id=?sid, mid=%self.slots[key].mid, "route added for slot stream");
-                    e.insert(key);
-                    events.subscribe(&layer);
-
-                    if is_staging {
-                        events.request_keyframe(&layer);
-                        if let Some(slot) = self.slots.get_mut(key) {
-                            slot.staging_keyframe_retries = 1;
-                            slot.staging_keyframe_last_at = Some(now);
-                        }
-                    }
-                }
+            if let Some(active) = slot.active.as_ref() {
+                current.insert((active.meta.id, slot_key));
             }
         }
+
+        let to_remove_streams = self.last_reconciled.difference(&current);
+        let to_add_streams = current.difference(&self.last_reconciled);
+
+        for (track_id, _slot_key) in to_remove_streams {
+            self.routes.remove(track_id);
+            if let Some(track) = self.tracks.get(track_id) {
+                events.unsubscribe(track.meta.clone());
+            }
+        }
+
+        for (track_id, slot_key) in to_add_streams {
+            self.routes.insert(*track_id, *slot_key);
+            if let Some(track) = self.tracks.get(track_id) {
+                events.subscribe(track.meta.clone());
+            }
+        }
+
+        self.last_reconciled = current;
 
         debug_assert!(
             self.routes_consistent(),
@@ -458,28 +359,11 @@ impl VideoAllocator {
         );
     }
 
-    pub fn unsubscribe_all(&mut self) -> Vec<(StreamId, usize)> {
-        let subs: Vec<(StreamId, usize)> = self
-            .routes
-            .keys()
-            .filter_map(|sid| {
-                let track = self.tracks.get(&sid.0)?;
-                let layer = track.layers.iter().find(|l| l.rid == sid.1)?;
-                Some((*sid, layer.meta.shard_id))
-            })
-            .collect();
-        self.routes.clear();
-        for slot in self.slots.values_mut() {
-            slot.stop();
-        }
-        subs
-    }
-
     fn routes_consistent(&self) -> bool {
         self.routes.iter().all(|(sid, slot_key)| {
             self.slots
                 .get(*slot_key)
-                .is_some_and(|slot| slot.matches_stream_id(sid))
+                .is_some_and(|slot| slot.matches_track_id(sid))
         })
     }
 }
@@ -552,6 +436,63 @@ impl Slot {
         }
     }
 
+    fn pli_reset(&mut self) {
+        self.staging_packet_seen = false;
+        self.staging_keyframe_retries = 0;
+        self.staging_keyframe_last_at = None;
+        self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+    }
+
+    fn pli_retry(&mut self, now: Instant, events: &mut EventQueue) {
+        if self.paused {
+            return;
+        }
+        if !matches!(self.state(), SlotState::Starting | SlotState::Switching) {
+            return;
+        }
+
+        let Some(staging) = self.staging.as_ref() else {
+            return;
+        };
+        let last_at = self.staging_keyframe_last_at;
+        let retries = self.staging_keyframe_retries;
+
+        let should_request =
+            last_at.is_none_or(|last| now.duration_since(last) >= self.staging_keyframe_interval);
+        if !should_request {
+            return;
+        }
+
+        let staging_has_packets = self.staging_packet_seen;
+        let keepalive_mode = retries >= KEYFRAME_MAX_RETRIES;
+        let reached_keepalive = !keepalive_mode && retries + 1 == KEYFRAME_MAX_RETRIES;
+        if !keepalive_mode {
+            self.staging_keyframe_retries += 1;
+        }
+        self.staging_keyframe_last_at = Some(now);
+
+        if reached_keepalive {
+            self.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
+            if staging_has_packets {
+                tracing::warn!(
+                    mid = %self.mid,
+                    retries = KEYFRAME_MAX_RETRIES,
+                    interval = ?self.staging_keyframe_interval,
+                    "slot transition stalled; switching to low-frequency keep-alive PLIs while waiting for a natural keyframe"
+                );
+            } else {
+                tracing::debug!(
+                    mid = %self.mid,
+                    retries = KEYFRAME_MAX_RETRIES,
+                    interval = ?self.staging_keyframe_interval,
+                    "slot transition still waiting for any packets on the staged stream; using low-frequency keep-alive PLIs"
+                );
+            }
+        }
+
+        events.request_keyframe(staging);
+    }
+
     fn switch_to(&mut self, new_layer: &TrackLayer, _force: bool) -> bool {
         let mut changed = false;
         let old_target = self.target().map(|l| l.stream_id());
@@ -560,10 +501,7 @@ impl Slot {
             if self.staging.is_some() {
                 self.staging = None;
                 self.switcher.clear();
-                self.staging_packet_seen = false;
-                self.staging_keyframe_retries = 0;
-                self.staging_keyframe_last_at = None;
-                self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+                self.pli_reset();
                 changed = true;
                 tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
             }
@@ -573,10 +511,7 @@ impl Slot {
             // previous stream doesn't mix with the new stream's packets.
             self.switcher.clear();
             // Reset retry state so the new staging layer gets fresh PLI attempts.
-            self.staging_packet_seen = false;
-            self.staging_keyframe_retries = 0;
-            self.staging_keyframe_last_at = None;
-            self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+            self.pli_reset();
             changed = true;
             tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
         }
@@ -594,10 +529,7 @@ impl Slot {
         tracing::debug!(mid=%self.mid, "slot stopped");
         self.active = None;
         self.staging = None;
-        self.staging_packet_seen = false;
-        self.staging_keyframe_retries = 0;
-        self.staging_keyframe_last_at = None;
-        self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+        self.pli_reset();
     }
 
     fn pause_at(&mut self, layer: &TrackLayer) -> bool {
@@ -650,19 +582,15 @@ impl Slot {
         self.staging_packet_seen && self.switcher.ready_to_switch() && self.staging.is_some()
     }
 
-    fn matches_stream_id(&self, stream_id: &StreamId) -> bool {
-        if self.paused {
-            return false;
-        }
-
+    fn matches_track_id(&self, track_id: &TrackId) -> bool {
         self.active
             .as_ref()
-            .map(|l| l.stream_id() == *stream_id)
+            .map(|l| l.meta.id == *track_id)
             .unwrap_or(false)
             || self
                 .staging
                 .as_ref()
-                .map(|l| l.stream_id() == *stream_id)
+                .map(|l| l.meta.id == *track_id)
                 .unwrap_or(false)
     }
 }
@@ -894,7 +822,7 @@ impl AllocationEngine {
 mod assignment_tests {
     use super::*;
     use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId};
-    use crate::participant::event::{ControlEvent, EventQueue, ParticipantEvent};
+    use crate::participant::event::{EventQueue, ParticipantControlEvent, ParticipantEvent};
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
@@ -1022,8 +950,15 @@ mod assignment_tests {
     fn route_subscription_initializes_keyframe_retry_state() {
         let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
+
+        let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
+        let low = track.lowest_quality().clone();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.active = None;
+        slot.staging = Some(low);
+        slot.paused = false;
 
         let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
         let mut events = VecDeque::new();
@@ -1032,7 +967,7 @@ mod assignment_tests {
 
         {
             let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(now, &mut queue);
+            allocator.reconcile_routes(&mut queue);
         }
 
         assert_eq!(
@@ -1040,10 +975,11 @@ mod assignment_tests {
                 .iter()
                 .filter(|event| matches!(
                     event,
-                    ParticipantEvent::Control(ControlEvent::KeyframeRequested(_))
+                    ParticipantEvent::Control(ParticipantControlEvent::KeyframeRequested(_))
                 ))
                 .count(),
-            1
+            0,
+            "reconcile_routes no longer emits an immediate keyframe request"
         );
 
         {
@@ -1056,7 +992,7 @@ mod assignment_tests {
                 .iter()
                 .filter(|event| matches!(
                     event,
-                    ParticipantEvent::Control(ControlEvent::KeyframeRequested(_))
+                    ParticipantEvent::Control(ParticipantControlEvent::KeyframeRequested(_))
                 ))
                 .count(),
             1,
@@ -1098,31 +1034,32 @@ mod assignment_tests {
         let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
         let mut events = VecDeque::new();
         let mut rtp_events = VecDeque::new();
-        let now = Instant::now();
 
         {
             let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(now, &mut queue);
+            allocator.reconcile_routes(&mut queue);
         }
 
-        assert!(allocator.routes.contains_key(&low.stream_id()));
-        assert!(allocator.routes.contains_key(&high.stream_id()));
+        assert!(allocator.routes.contains_key(&low.meta.id));
+        assert!(allocator.routes.contains_key(&high.meta.id));
         assert_eq!(
             events
                 .iter()
                 .filter(|event| matches!(event, ParticipantEvent::Topology(_)))
                 .count(),
-            2
+            1,
+            "routes are tracked per track, so staging and active layers share one subscription"
         );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| matches!(
                     event,
-                    ParticipantEvent::Control(ControlEvent::KeyframeRequested(_))
+                    ParticipantEvent::Control(ParticipantControlEvent::KeyframeRequested(_))
                 ))
                 .count(),
-            1
+            0,
+            "reconcile_routes does not request keyframes directly"
         );
     }
 
@@ -1136,7 +1073,8 @@ mod assignment_tests {
         let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let old_stream_id = track.lowest_quality().stream_id();
         let slot_key = allocator.slots.keys().next().unwrap().clone();
-        allocator.routes.insert(old_stream_id, slot_key);
+        allocator.routes.insert(old_stream_id.0, slot_key);
+        allocator.last_reconciled.insert((old_stream_id.0, slot_key));
 
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.active = None;
@@ -1146,11 +1084,10 @@ mod assignment_tests {
         let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
         let mut events = VecDeque::new();
         let mut rtp_events = VecDeque::new();
-        let now = Instant::now();
 
         {
             let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(now, &mut queue);
+            allocator.reconcile_routes(&mut queue);
         }
 
         assert!(allocator.routes.is_empty());
@@ -1178,20 +1115,19 @@ mod assignment_tests {
         slot.active = Some(low.clone());
         slot.paused = false;
 
-        allocator.routes.insert(low.stream_id(), stale_slot_key);
+        allocator.routes.insert(low.meta.id, stale_slot_key);
 
         let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
         let mut events = VecDeque::new();
         let mut rtp_events = VecDeque::new();
-        let now = Instant::now();
 
         {
             let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(now, &mut queue);
+            allocator.reconcile_routes(&mut queue);
         }
 
         assert_eq!(
-            allocator.routes.get(&low.stream_id()),
+            allocator.routes.get(&low.meta.id),
             Some(&correct_slot_key)
         );
         assert!(

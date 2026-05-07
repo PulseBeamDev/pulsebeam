@@ -4,7 +4,7 @@ use crate::{
     control::{controller::ParticipantState, registry::RoomRegistry},
     entity::{ParticipantId, RoomId},
     participant::ParticipantConfig,
-    shard::worker::{ClusterCommand, ShardCommand, ShardEvent},
+    shard::worker::{ClusterCommand, ShardCommand, ShardEvent, ShardEventWrapper},
 };
 use indexmap::IndexMap;
 use str0m::Rtc;
@@ -64,24 +64,12 @@ impl ControllerCore {
         }
     }
 
-    pub fn process_shard_event(&mut self, ev: ShardEvent, eq: &mut ControllerEventQueue) {
-        match ev {
+    pub fn process_shard_event(&mut self, e: ShardEventWrapper, eq: &mut ControllerEventQueue) {
+        match e.ev {
             ShardEvent::TrackPublished(track) => {
-                let origin = track.meta.origin;
-
-                let (room_id, other_participants) = {
-                    let Some(room) = self.registry.room_mut_for(&origin) else {
-                        return;
-                    };
-                    room.publish_track(track.clone());
-
-                    let ids: Vec<ParticipantId> = room
-                        .participants_iter()
-                        .filter(|&&id| id != origin)
-                        .cloned()
-                        .collect();
-
-                    (room.room_id, ids)
+                let Some((room_id, other_participants)) = self.registry.add_track(track.clone())
+                else {
+                    return;
                 };
 
                 // TODO: should we make room shard aware?
@@ -109,6 +97,25 @@ impl ControllerCore {
                     return;
                 };
                 eq.send_cluster(meta.shard_id, ClusterCommand::RequestKeyframe(req))
+            }
+
+            ShardEvent::TrackSubscribed(track) => {
+                eq.send_cluster(
+                    track.shard_id,
+                    ClusterCommand::SubscribeTrack {
+                        from_shard_id: e.from_shard_id,
+                        track,
+                    },
+                );
+            }
+            ShardEvent::TrackUnsubscribed(track) => {
+                eq.send_cluster(
+                    track.shard_id,
+                    ClusterCommand::SubscribeTrack {
+                        from_shard_id: e.from_shard_id,
+                        track,
+                    },
+                );
             }
         }
     }
@@ -153,18 +160,17 @@ impl ControllerCore {
         participant_id: &ParticipantId,
         eq: &mut ControllerEventQueue,
     ) {
+        let Some(meta) = self.registry.get_participant(participant_id) else {
+            return;
+        };
+
+        let Some(room) = self.registry.get_room(&meta.room_id) else {
+            return;
+        };
         // Collect track IDs before removing from registry so we can notify all shards.
-        let track_ids: Vec<_> = self
-            .registry
-            .get_participant(participant_id)
-            .and_then(|meta| self.registry.get_room(&meta.room_id))
-            .map(|room| {
-                room.tracks_published_by(participant_id)
-                    .into_iter()
-                    .map(|t| t.meta.id)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let tracks: Vec<_> = room.tracks_published_by(participant_id);
+        let track_ids = tracks.iter().map(|t| t.meta.id).collect();
+        let room_id = meta.room_id;
 
         if let Some(shard_id) = self.registry.remove_participant(participant_id) {
             eq.send(shard_id, ShardCommand::RemoveParticipant(*participant_id));
@@ -172,8 +178,9 @@ impl ControllerCore {
         eq.broadcast(ClusterCommand::UnregisterParticipant {
             participant_id: *participant_id,
         });
-        if !track_ids.is_empty() {
+        if !tracks.is_empty() {
             eq.broadcast(ClusterCommand::UnpublishTracks {
+                room_id,
                 origin: *participant_id,
                 track_ids,
             });

@@ -254,7 +254,7 @@ impl UdpTransportWriter {
             Ok(_) => Ok(true),
             // Lossy: kernel buffer full — drop this batch rather than queue it.
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                let dropped = (batch.buf.len() + batch.segment_size - 1) / batch.segment_size;
+                let dropped = batch.buf.len().div_ceil(batch.segment_size);
                 metrics::counter!("udp_egress_packets_dropped_total").increment(dropped as u64);
                 Ok(true)
             }

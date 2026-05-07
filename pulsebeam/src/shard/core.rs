@@ -8,18 +8,19 @@ use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use tokio::time::Instant;
 
+use crate::entity::TrackId;
 use crate::{
     entity::{ParticipantId, RoomId},
     participant::{
         ParticipantConfig, ParticipantCore,
         event::{
-            ControlEvent, EventQueue, LifecycleEvent, ParticipantEvent, RtpEvent, TimerEvent,
-            TopologyEvent,
+            EventQueue, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
+            ParticipantTimerEvent, ParticipantTopologyEvent, RtpEvent,
         },
     },
     rtp::RtpPacket,
     shard::{demux::Demuxer, timer::TimerWheel},
-    track::{StreamId, StreamWriter},
+    track::StreamId,
 };
 use str0m::media::MediaKind;
 
@@ -75,6 +76,12 @@ pub(crate) trait CrossShardSend {
     fn shard_id(&self) -> usize;
 }
 
+#[derive(Debug)]
+struct ParticipantShardMeta {
+    shard_id: usize,
+    room_id: RoomId,
+}
+
 /// Pure shard state — no I/O handles.
 /// Methods that emit cross-shard messages accept `&impl CrossShardSend`.
 pub(crate) struct ShardCore {
@@ -83,15 +90,14 @@ pub(crate) struct ShardCore {
     pub(super) demuxer: Demuxer,
     pub(super) participants: HashMap<ParticipantId, ParticipantMeta>,
     pub(super) rooms: HashMap<RoomId, RoomState>,
-    pub(super) routing: HashMap<StreamId, Routing>,
-    pub(super) participant_shards: HashMap<ParticipantId, usize>,
+    pub(super) routing: HashMap<TrackId, Routing>,
+    pub(super) participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
     timers: TimerWheel,
     pub(super) input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     pub(super) fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     events: VecDeque<ParticipantEvent>,
     rtp_events: VecDeque<RtpEvent>,
     pub(crate) shard_events: VecDeque<ShardEvent>,
-    pub(crate) pending_cross_shard: VecDeque<CrossShardEvent>,
     pub(crate) pending_close: VecDeque<SocketAddr>,
     rng: Rng,
 }
@@ -131,7 +137,6 @@ impl ShardCore {
             events: VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rtp_events: VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             shard_events: VecDeque::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
-            pending_cross_shard: VecDeque::with_capacity(64),
             pending_close: VecDeque::new(),
             rng,
         }
@@ -139,12 +144,6 @@ impl ShardCore {
 
     pub(crate) fn next_timer_deadline(&mut self) -> Option<Instant> {
         self.timers.next_deadline()
-    }
-
-    pub(crate) fn flush_cross_shard(&mut self, now: Instant, router: &impl CrossShardSend) {
-        while let Some(ev) = self.pending_cross_shard.pop_front() {
-            self.on_cross_shard_event(ev, now, router);
-        }
     }
 
     pub(crate) fn fire_timers(&mut self, now: Instant) {
@@ -167,9 +166,9 @@ impl ShardCore {
         if let Some(participant) = self.participants.get_mut(&participant_id) {
             participant.on_ingress(batch);
             self.input_dirty.insert(participant_id);
-        } else if let Some(&shard_id) = self.participant_shards.get(&participant_id) {
+        } else if let Some(meta) = self.participant_shards.get(&participant_id) {
             router.send(
-                shard_id,
+                meta.shard_id,
                 CrossShardEvent::UdpPacket {
                     participant_id,
                     batch,
@@ -225,12 +224,17 @@ impl ShardCore {
         while let Some(event) = self.events.pop_front() {
             match event {
                 ParticipantEvent::Topology(ev) => {
-                    handle_participant_topology(ev, &mut self.routing, router);
+                    handle_participant_topology(ev, &mut self.routing, &mut self.shard_events);
                 }
-                ParticipantEvent::Timer(TimerEvent::DeadlineUpdated { at, participant_id }) => {
+                ParticipantEvent::Timer(ParticipantTimerEvent::DeadlineUpdated {
+                    at,
+                    participant_id,
+                }) => {
                     self.timers.schedule(participant_id, at);
                 }
-                ParticipantEvent::Lifecycle(LifecycleEvent::Exited { participant_id }) => {
+                ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
+                    participant_id,
+                }) => {
                     self.remove_participant(&participant_id, router);
                     self.timers.cancel(&participant_id);
                     self.input_dirty.swap_remove(&participant_id);
@@ -299,6 +303,42 @@ impl ShardCore {
         _router: &impl CrossShardSend,
     ) -> Option<()> {
         match cmd {
+            ClusterCommand::RequestKeyframe(req) => {
+                let p = self.participants.get_mut(&req.origin)?;
+                let _guard = p.span.enter();
+                p.core
+                    .handle_remote_keyframe_request(req.stream_id, req.kind);
+                self.input_dirty.insert(req.origin);
+            }
+
+            ClusterCommand::RegisterParticipant {
+                shard_id,
+                room_id,
+                participant_id,
+            } => {
+                if shard_id != self.shard_id {
+                    self.participant_shards
+                        .insert(participant_id, ParticipantShardMeta { room_id, shard_id });
+                    self.rooms
+                        .entry(room_id)
+                        .or_insert_with(|| RoomState::new(&mut self.rng))
+                        .remote_shards
+                        .insert(shard_id);
+                }
+            }
+            ClusterCommand::UnregisterParticipant { participant_id } => {
+                if let Some(meta) = self.participant_shards.remove(&participant_id)
+                    && let Some(room) = self.rooms.get_mut(&meta.room_id)
+                {
+                    room.remote_shards.swap_remove(&meta.shard_id);
+                    if room.members.is_empty() && room.remote_shards.is_empty() {
+                        self.rooms.remove(&meta.room_id);
+                    }
+                }
+                let addrs = self.demuxer.unregister(participant_id);
+                self.pending_close.extend(addrs);
+            }
+
             ClusterCommand::PublishTrack(track, room_id) => {
                 let publisher = track.meta.origin;
                 let tracks = &[track];
@@ -314,70 +354,53 @@ impl ShardCore {
                     self.input_dirty.insert(participant_id);
                 }
             }
-            ClusterCommand::RequestKeyframe(req) => {
-                let p = self.participants.get_mut(&req.origin)?;
-                let _guard = p.span.enter();
-                p.core
-                    .handle_remote_keyframe_request(req.stream_id, req.kind);
-                self.input_dirty.insert(req.origin);
-            }
-            ClusterCommand::RegisterParticipant {
-                shard_id,
-                participant_id,
-            } => {
-                if shard_id != self.shard_id {
-                    self.participant_shards.insert(participant_id, shard_id);
-                }
-            }
-            ClusterCommand::UnregisterParticipant { participant_id } => {
-                self.participant_shards.remove(&participant_id);
-                let addrs = self.demuxer.unregister(participant_id);
-                self.pending_close.extend(addrs);
-            }
             ClusterCommand::UnpublishTracks {
                 origin: _,
+                room_id,
                 track_ids,
             } => {
-                for (participant_id, participant) in self.participants.iter_mut() {
-                    if participant.on_tracks_unpublished(track_ids.as_slice()) {
+                let room = self.rooms.get(&room_id)?;
+                for participant_id in &room.members {
+                    let Some(p) = self.participants.get_mut(participant_id) else {
+                        continue;
+                    };
+
+                    if p.on_tracks_unpublished(track_ids.as_slice()) {
                         self.input_dirty.insert(*participant_id);
                     }
+                }
+            }
+
+            ClusterCommand::SubscribeTrack {
+                from_shard_id,
+                track,
+            } => {
+                let routing = self.routing.entry(track.id).or_insert_with(|| Routing {
+                    kind: track.kind,
+                    subscribers: IndexSet::new(),
+                    remote_shards: IndexSet::new(),
+                });
+                routing.remote_shards.insert(from_shard_id);
+            }
+            ClusterCommand::UnsubscribeTrack {
+                from_shard_id,
+                track,
+            } => {
+                if let Some(routing) = self.routing.get_mut(&track.id) {
+                    routing.remote_shards.swap_remove(&from_shard_id);
                 }
             }
         }
         Some(())
     }
 
-    fn on_cross_shard_event(
+    pub fn on_cross_shard_event(
         &mut self,
         ev: CrossShardEvent,
         _now: Instant,
         router: &impl CrossShardSend,
     ) {
         match ev {
-            CrossShardEvent::StreamSubscribed {
-                stream_id,
-                kind,
-                from_shard_id,
-            } => {
-                let routing = self.routing.entry(stream_id).or_insert_with(|| Routing {
-                    kind,
-                    subscribers: IndexSet::new(),
-                    remote_shards: IndexSet::new(),
-                });
-                routing.remote_shards.insert(from_shard_id);
-            }
-            CrossShardEvent::StreamUnsubscribed {
-                stream_id,
-                from_shard_id,
-            } => {
-                if let Some(routing) = self.routing.get_mut(&stream_id) {
-                    routing.remote_shards.swap_remove(&from_shard_id);
-                    if routing.subscribers.is_empty() && routing.remote_shards.is_empty() {
-                        self.routing.remove(&stream_id);
-                    }
-                }
-            }
             CrossShardEvent::RtpPublished { stream_id, pkt } => {
                 handle_rtp(
                     stream_id,
@@ -407,27 +430,6 @@ impl ShardCore {
                     &mut self.fanout_dirty,
                     router,
                 );
-            }
-            CrossShardEvent::RoomMemberJoined {
-                room_id,
-                from_shard_id,
-            } => {
-                self.rooms
-                    .entry(room_id)
-                    .or_insert_with(|| RoomState::new(&mut self.rng))
-                    .remote_shards
-                    .insert(from_shard_id);
-            }
-            CrossShardEvent::RoomMemberLeft {
-                room_id,
-                from_shard_id,
-            } => {
-                if let Some(room) = self.rooms.get_mut(&room_id) {
-                    room.remote_shards.swap_remove(&from_shard_id);
-                    if room.members.is_empty() && room.remote_shards.is_empty() {
-                        self.rooms.remove(&room_id);
-                    }
-                }
             }
             CrossShardEvent::UdpPacket {
                 participant_id,
@@ -477,36 +479,20 @@ impl ShardCore {
             .rooms
             .entry(room_id)
             .or_insert_with(|| RoomState::new(&mut self.rng));
-        let was_empty = room.members.is_empty();
         room.members.insert(participant_id);
-        if was_empty {
-            let shard_id = self.shard_id;
-            router.broadcast(|| CrossShardEvent::RoomMemberJoined {
-                room_id,
-                from_shard_id: shard_id,
-            });
-        }
         self.input_dirty.insert(participant_id);
     }
 
     fn remove_participant(
         &mut self,
         participant_id: &ParticipantId,
-        router: &impl CrossShardSend,
+        _router: &impl CrossShardSend,
     ) -> Option<ParticipantMeta> {
         let mut participant = self.participants.remove(participant_id)?;
         if let Some(room) = self.rooms.get_mut(&participant.room_id) {
             room.members.swap_remove(participant_id);
-            if room.members.is_empty() {
-                let room_id = participant.room_id;
-                let shard_id = self.shard_id;
-                router.broadcast(|| CrossShardEvent::RoomMemberLeft {
-                    room_id,
-                    from_shard_id: shard_id,
-                });
-                if room.remote_shards.is_empty() {
-                    self.rooms.remove(&participant.room_id);
-                }
+            if room.members.is_empty() && room.remote_shards.is_empty() {
+                self.rooms.remove(&participant.room_id);
             }
         }
         // Evict audio tracks from room selector.
@@ -515,18 +501,6 @@ impl ShardCore {
             for id in audio_ids {
                 room.audio_selector.remove_track((id, None));
             }
-        }
-        let unsubs = participant.downstream.unsubscribe_all();
-        for (stream_id, shard_id) in unsubs {
-            handle_participant_topology(
-                TopologyEvent::StreamUnsubscribed {
-                    shard_id,
-                    participant_id: *participant_id,
-                    stream_id,
-                },
-                &mut self.routing,
-                router,
-            );
         }
         let addrs = self.demuxer.unregister(*participant_id);
         self.pending_close.extend(addrs);
@@ -555,12 +529,12 @@ pub(super) fn poll_participants(
 pub(super) fn handle_rtp(
     stream_id: StreamId,
     pkt: &RtpPacket,
-    routing: &HashMap<StreamId, Routing>,
+    routing: &HashMap<TrackId, Routing>,
     participants: &mut HashMap<ParticipantId, ParticipantMeta>,
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
     router: &impl CrossShardSend,
 ) -> Option<()> {
-    let route = routing.get(&stream_id)?;
+    let route = routing.get(&stream_id.0)?;
     match route.kind {
         MediaKind::Video => {
             for participant_id in &route.subscribers {
@@ -627,53 +601,28 @@ pub(super) fn handle_audio_rtp(
 }
 
 pub(super) fn handle_participant_topology(
-    ev: TopologyEvent,
-    routing: &mut HashMap<StreamId, Routing>,
-    router: &impl CrossShardSend,
+    ev: ParticipantTopologyEvent,
+    routing: &mut HashMap<TrackId, Routing>,
+    shard_events: &mut VecDeque<ShardEvent>,
 ) -> Option<()> {
     match ev {
-        TopologyEvent::StreamSubscribed {
-            shard_id,
-            participant_id,
-            stream_id,
-            kind,
-        } => {
-            let entry = routing.entry(stream_id).or_insert_with(|| Routing {
-                kind,
+        ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
+            let entry = routing.entry(track.id).or_insert_with(|| Routing {
+                kind: track.kind,
                 subscribers: IndexSet::with_capacity(256),
                 remote_shards: IndexSet::new(),
             });
             let was_empty = entry.subscribers.is_empty();
-            entry.subscribers.insert(participant_id);
+            entry.subscribers.insert(subscriber);
             if was_empty {
-                router.send(
-                    shard_id,
-                    CrossShardEvent::StreamSubscribed {
-                        stream_id,
-                        kind,
-                        from_shard_id: router.shard_id(),
-                    },
-                );
+                shard_events.push_back(ShardEvent::TrackSubscribed(track));
             }
         }
-        TopologyEvent::StreamUnsubscribed {
-            shard_id,
-            participant_id,
-            stream_id,
-        } => {
-            if let Some(entry) = routing.get_mut(&stream_id) {
-                entry.subscribers.swap_remove(&participant_id);
+        ParticipantTopologyEvent::TrackUnsubscribed { track, subscriber } => {
+            if let Some(entry) = routing.get_mut(&track.id) {
+                entry.subscribers.swap_remove(&subscriber);
                 if entry.subscribers.is_empty() {
-                    router.send(
-                        shard_id,
-                        CrossShardEvent::StreamUnsubscribed {
-                            stream_id,
-                            from_shard_id: router.shard_id(),
-                        },
-                    );
-                    if entry.remote_shards.is_empty() {
-                        routing.remove(&stream_id);
-                    }
+                    shard_events.push_back(ShardEvent::TrackUnsubscribed(track));
                 }
             }
         }
@@ -683,15 +632,15 @@ pub(super) fn handle_participant_topology(
 }
 
 pub(super) fn handle_participant_control(
-    ev: ControlEvent,
+    ev: ParticipantControlEvent,
     shard_events: &mut VecDeque<ShardEvent>,
     router: &impl CrossShardSend,
 ) {
     match ev {
-        ControlEvent::TrackPublished(track) => {
+        ParticipantControlEvent::TrackPublished(track) => {
             shard_events.push_back(ShardEvent::TrackPublished(track));
         }
-        ControlEvent::KeyframeRequested(req) => {
+        ParticipantControlEvent::KeyframeRequested(req) => {
             if req.shard_id == router.shard_id() {
                 shard_events.push_back(ShardEvent::KeyframeRequest(req));
             } else {
@@ -706,7 +655,8 @@ mod tests {
     use std::cell::RefCell;
 
     use crate::{
-        entity::ExternalRoomId, participant::event::TopologyEvent, track::GlobalKeyframeRequest,
+        entity::ExternalRoomId, participant::event::ParticipantTopologyEvent,
+        track::{GlobalKeyframeRequest, TrackMeta},
     };
     use str0m::media::{KeyframeRequestKind, MediaKind};
 
@@ -771,6 +721,15 @@ mod tests {
         (p.derive_track_id(MediaKind::Audio, "a"), None)
     }
 
+    fn video_track(origin: ParticipantId, shard_id: usize) -> TrackMeta {
+        TrackMeta {
+            shard_id,
+            id: origin.derive_track_id(MediaKind::Video, "v"),
+            origin,
+            kind: MediaKind::Video,
+        }
+    }
+
     fn empty_routing(kind: MediaKind) -> Routing {
         Routing {
             kind,
@@ -781,217 +740,177 @@ mod tests {
 
     #[test]
     fn topology_subscribe_creates_routing_entry() {
-        let router = TestRouter::new(1, 3);
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        let stream = video_stream(pid());
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        let track = video_track(pid(), 1);
         let subscriber = pid();
 
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 0,
-                participant_id: subscriber,
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber,
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut VecDeque::new(),
         );
 
-        assert!(routing.contains_key(&stream));
-        assert!(routing[&stream].subscribers.contains(&subscriber));
+        assert!(routing.contains_key(&track.id));
+        assert!(routing[&track.id].subscribers.contains(&subscriber));
     }
 
     #[test]
     fn topology_first_subscriber_notifies_publisher_shard() {
-        let router = TestRouter::new(1, 3);
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        let stream = video_stream(pid());
-
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        let track = video_track(pid(), 1);
+        let mut events = VecDeque::new();
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 0,
-                participant_id: pid(),
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber: pid(),
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
 
-        let sent = router.take_sent();
-        assert_eq!(sent.len(), 1);
-        let (target, ev) = &sent[0];
-        assert_eq!(*target, 0);
+        assert_eq!(events.len(), 1);
+        let ev = events.get(0).unwrap();
         assert!(
-            matches!(
-                ev,
-                CrossShardEvent::StreamSubscribed {
-                    from_shard_id: 1,
-                    ..
-                }
-            ),
-            "first subscriber must send StreamSubscribed to publisher shard"
+            matches!(ev, ShardEvent::TrackSubscribed(meta) if *meta == track),
+            "first subscriber must emit TrackSubscribed for the publisher track"
         );
     }
 
     #[test]
     fn topology_second_subscriber_does_not_notify_publisher() {
-        let router = TestRouter::new(1, 3);
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        let stream = video_stream(pid());
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        let track = video_track(pid(), 1);
+        let mut events = VecDeque::new();
 
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 0,
-                participant_id: pid(),
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber: pid(),
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
-        router.take_sent();
+        events.clear();
 
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 0,
-                participant_id: pid(),
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber: pid(),
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
 
         assert!(
-            router.take_sent().is_empty(),
+            events.is_empty(),
             "second subscriber must not re-notify the publisher"
         );
-        assert_eq!(routing[&stream].subscribers.len(), 2);
+        assert_eq!(routing[&track.id].subscribers.len(), 2);
     }
 
     #[test]
-    fn topology_last_unsubscribe_notifies_publisher_and_removes_entry() {
-        let router = TestRouter::new(1, 3);
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        let stream = video_stream(pid());
+    fn topology_last_unsubscribe_emits_shard_event_and_clears_subscribers() {
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        let track = video_track(pid(), 1);
         let subscriber = pid();
+        let mut events = VecDeque::new();
 
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 0,
-                participant_id: subscriber,
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber,
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
-        router.take_sent();
+        events.clear();
 
         handle_participant_topology(
-            TopologyEvent::StreamUnsubscribed {
-                shard_id: 0,
-                participant_id: subscriber,
-                stream_id: stream,
+            ParticipantTopologyEvent::TrackUnsubscribed {
+                subscriber,
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
 
-        let sent = router.take_sent();
-        assert_eq!(
-            sent.len(),
-            1,
-            "must send exactly one unsubscribe notification"
-        );
+        assert_eq!(events.len(), 1, "must emit exactly one unsubscribe event");
         assert!(
-            matches!(
-                &sent[0].1,
-                CrossShardEvent::StreamUnsubscribed {
-                    from_shard_id: 1,
-                    ..
-                }
-            ),
-            "last subscriber must send StreamUnsubscribed to publisher shard"
+            matches!(&events[0], ShardEvent::TrackUnsubscribed(meta) if *meta == track),
+            "last subscriber must emit TrackUnsubscribed for the publisher track"
         );
-        assert!(
-            !routing.contains_key(&stream),
-            "entry must be removed when no subscribers and no remote shards remain"
-        );
+        assert!(routing.contains_key(&track.id));
+        assert!(routing[&track.id].subscribers.is_empty());
     }
 
     #[test]
     fn topology_unsubscribe_with_remaining_subscriber_does_not_notify() {
-        let router = TestRouter::new(1, 3);
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        let stream = video_stream(pid());
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        let track = video_track(pid(), 1);
         let s1 = pid();
         let s2 = pid();
+        let mut events = VecDeque::new();
 
         for s in [s1, s2] {
             handle_participant_topology(
-                TopologyEvent::StreamSubscribed {
-                    shard_id: 0,
-                    participant_id: s,
-                    stream_id: stream,
-                    kind: MediaKind::Video,
+                ParticipantTopologyEvent::TrackSubscribed {
+                    subscriber: s,
+                    track: track.clone(),
                 },
                 &mut routing,
-                &router,
+                &mut events,
             );
         }
-        router.take_sent();
+        events.clear();
 
         handle_participant_topology(
-            TopologyEvent::StreamUnsubscribed {
-                shard_id: 0,
-                participant_id: s1,
-                stream_id: stream,
+            ParticipantTopologyEvent::TrackUnsubscribed {
+                subscriber: s1,
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
 
         assert!(
-            router.take_sent().is_empty(),
+            events.is_empty(),
             "must not notify while a local subscriber remains"
         );
-        assert_eq!(routing[&stream].subscribers.len(), 1);
+        assert_eq!(routing[&track.id].subscribers.len(), 1);
     }
 
     #[test]
     fn topology_unsubscribe_keeps_entry_while_remote_shards_remain() {
-        let router = TestRouter::new(1, 3);
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        let stream = video_stream(pid());
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        let track = video_track(pid(), 1);
         let subscriber = pid();
+        let mut events = VecDeque::new();
 
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 0,
-                participant_id: subscriber,
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber,
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
-        routing.get_mut(&stream).unwrap().remote_shards.insert(2);
-        router.take_sent();
+        routing.get_mut(&track.id).unwrap().remote_shards.insert(2);
+        events.clear();
 
         handle_participant_topology(
-            TopologyEvent::StreamUnsubscribed {
-                shard_id: 0,
-                participant_id: subscriber,
-                stream_id: stream,
+            ParticipantTopologyEvent::TrackUnsubscribed {
+                subscriber,
+                track: track.clone(),
             },
             &mut routing,
-            &router,
+            &mut events,
         );
 
         assert!(
-            routing.contains_key(&stream),
+            routing.contains_key(&track.id),
             "entry must remain while remote shards are subscribed"
         );
     }
@@ -1000,11 +919,11 @@ mod tests {
     fn handle_rtp_sends_to_all_remote_shards() {
         let router = TestRouter::new(0, 3);
         let stream = video_stream(pid());
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
         let mut route = empty_routing(MediaKind::Video);
         route.remote_shards.insert(1);
         route.remote_shards.insert(2);
-        routing.insert(stream, route);
+        routing.insert(stream.0, route);
 
         let pkt = RtpPacket::default();
         let mut participants: HashMap<ParticipantId, ParticipantMeta> = HashMap::default();
@@ -1037,8 +956,8 @@ mod tests {
     fn handle_rtp_no_send_for_empty_remote_shards() {
         let router = TestRouter::new(0, 3);
         let stream = video_stream(pid());
-        let mut routing: HashMap<StreamId, Routing> = HashMap::default();
-        routing.insert(stream, empty_routing(MediaKind::Video)); // no remote_shards
+        let mut routing: HashMap<TrackId, Routing> = HashMap::default();
+        routing.insert(stream.0, empty_routing(MediaKind::Video)); // no remote_shards
 
         handle_rtp(
             stream,
@@ -1056,7 +975,7 @@ mod tests {
     fn handle_rtp_ignores_unknown_stream() {
         let router = TestRouter::new(0, 3);
         let stream = video_stream(pid());
-        let routing: HashMap<StreamId, Routing> = HashMap::default();
+        let routing: HashMap<TrackId, Routing> = HashMap::default();
 
         handle_rtp(
             stream,
@@ -1106,59 +1025,57 @@ mod tests {
     }
 
     #[test]
-    fn cross_shard_stream_subscribed_adds_remote_shard_to_routing() {
+    fn cluster_subscribe_track_adds_remote_shard_to_routing() {
         let router = TestRouter::new(0, 3);
         let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
-        let stream = video_stream(pid());
+        let track = video_track(pid(), 2);
 
-        core.pending_cross_shard
-            .push_back(CrossShardEvent::StreamSubscribed {
-                stream_id: stream,
-                kind: MediaKind::Video,
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::SubscribeTrack {
                 from_shard_id: 2,
-            });
-        core.flush_cross_shard(Instant::now(), &router);
-
-        assert!(core.routing.contains_key(&stream));
-        assert!(core.routing[&stream].remote_shards.contains(&2));
-    }
-
-    #[test]
-    fn cross_shard_stream_unsubscribed_removes_entry_when_empty() {
-        let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
-        let stream = video_stream(pid());
-
-        for ev in [
-            CrossShardEvent::StreamSubscribed {
-                stream_id: stream,
-                kind: MediaKind::Video,
-                from_shard_id: 2,
-            },
-            CrossShardEvent::StreamUnsubscribed {
-                stream_id: stream,
-                from_shard_id: 2,
-            },
-        ] {
-            core.pending_cross_shard.push_back(ev);
-        }
-        core.flush_cross_shard(Instant::now(), &router);
-
-        assert!(
-            !core.routing.contains_key(&stream),
-            "routing entry must be removed when no subscribers and no remote shards remain"
+                track: track.clone(),
+            }),
+            &router,
         );
+
+        assert!(core.routing.contains_key(&track.id));
+        assert!(core.routing[&track.id].remote_shards.contains(&2));
     }
 
     #[test]
-    fn cross_shard_stream_unsubscribed_keeps_entry_with_local_subscribers() {
+    fn cluster_unsubscribe_track_clears_remote_shard() {
         let router = TestRouter::new(0, 3);
         let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
-        let stream = video_stream(pid());
+        let track = video_track(pid(), 2);
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::SubscribeTrack {
+                from_shard_id: 2,
+                track: track.clone(),
+            }),
+            &router,
+        );
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnsubscribeTrack {
+                from_shard_id: 2,
+                track: track.clone(),
+            }),
+            &router,
+        );
+
+        assert!(core.routing.contains_key(&track.id));
+        assert!(core.routing[&track.id].remote_shards.is_empty());
+    }
+
+    #[test]
+    fn cluster_unsubscribe_track_keeps_local_subscribers() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let track = video_track(pid(), 2);
         let local_sub = pid();
 
         core.routing.insert(
-            stream,
+            track.id,
             Routing {
                 kind: MediaKind::Video,
                 subscribers: {
@@ -1174,86 +1091,19 @@ mod tests {
             },
         );
 
-        core.pending_cross_shard
-            .push_back(CrossShardEvent::StreamUnsubscribed {
-                stream_id: stream,
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnsubscribeTrack {
                 from_shard_id: 2,
-            });
-        core.flush_cross_shard(Instant::now(), &router);
+                track: track.clone(),
+            }),
+            &router,
+        );
 
         assert!(
-            core.routing.contains_key(&stream),
+            core.routing.contains_key(&track.id),
             "entry must remain while a local subscriber exists"
         );
-        assert!(core.routing[&stream].remote_shards.is_empty());
-    }
-
-    #[test]
-    fn cross_shard_room_member_joined_registers_remote_shard() {
-        let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
-        let rid = room_id("r1");
-
-        core.pending_cross_shard
-            .push_back(CrossShardEvent::RoomMemberJoined {
-                room_id: rid,
-                from_shard_id: 1,
-            });
-        core.flush_cross_shard(Instant::now(), &router);
-
-        assert!(core.rooms.contains_key(&rid));
-        assert!(core.rooms[&rid].remote_shards.contains(&1));
-    }
-
-    #[test]
-    fn cross_shard_room_member_left_removes_room_when_empty() {
-        let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
-        let rid = room_id("r2");
-
-        for ev in [
-            CrossShardEvent::RoomMemberJoined {
-                room_id: rid,
-                from_shard_id: 1,
-            },
-            CrossShardEvent::RoomMemberLeft {
-                room_id: rid,
-                from_shard_id: 1,
-            },
-        ] {
-            core.pending_cross_shard.push_back(ev);
-        }
-        core.flush_cross_shard(Instant::now(), &router);
-
-        assert!(
-            !core.rooms.contains_key(&rid),
-            "empty room (no local members, no remote shards) must be removed"
-        );
-    }
-
-    #[test]
-    fn cross_shard_room_member_left_keeps_room_with_local_members() {
-        let router = TestRouter::new(0, 3);
-        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
-        let rid = room_id("r3");
-
-        let mut room = RoomState::new(&mut pulsebeam_runtime::rand::seeded_rng(42));
-        room.members.insert(pid());
-        room.remote_shards.insert(2);
-        core.rooms.insert(rid, room);
-
-        core.pending_cross_shard
-            .push_back(CrossShardEvent::RoomMemberLeft {
-                room_id: rid,
-                from_shard_id: 2,
-            });
-        core.flush_cross_shard(Instant::now(), &router);
-
-        assert!(
-            core.rooms.contains_key(&rid),
-            "room must remain while local members exist"
-        );
-        assert!(core.rooms[&rid].remote_shards.is_empty());
+        assert!(core.routing[&track.id].remote_shards.is_empty());
     }
 
     #[test]
@@ -1261,16 +1111,23 @@ mod tests {
         let router = TestRouter::new(0, 3);
         let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
+        let rid = room_id("r1");
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
                 shard_id: 2,
+                room_id: rid,
                 participant_id: participant,
             }),
             &router,
         );
 
-        assert_eq!(core.participant_shards.get(&participant), Some(&2));
+        assert!(core.rooms.contains_key(&rid));
+        assert!(core.rooms[&rid].remote_shards.contains(&2));
+        assert!(matches!(
+            core.participant_shards.get(&participant),
+            Some(meta) if meta.shard_id == 2 && meta.room_id == rid
+        ));
     }
 
     #[test]
@@ -1278,10 +1135,12 @@ mod tests {
         let router = TestRouter::new(0, 3);
         let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
+        let rid = room_id("local-noop");
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
                 shard_id: 0,
+                room_id: rid,
                 participant_id: participant,
             }),
             &router,
@@ -1298,10 +1157,12 @@ mod tests {
         let router = TestRouter::new(0, 3);
         let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
         let participant = pid();
+        let rid = room_id("unregister");
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
                 shard_id: 1,
+                room_id: rid,
                 participant_id: participant,
             }),
             &router,
@@ -1315,6 +1176,7 @@ mod tests {
         );
 
         assert!(!core.participant_shards.contains_key(&participant));
+        assert!(!core.rooms.contains_key(&rid));
         assert!(core.pending_close.is_empty());
     }
 
@@ -1324,7 +1186,7 @@ mod tests {
         let mut shard_events: VecDeque<ShardEvent> = VecDeque::new();
 
         handle_participant_control(
-            ControlEvent::KeyframeRequested(GlobalKeyframeRequest {
+            ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
                 shard_id: 1, // same shard → local
                 origin: pid(),
                 stream_id: video_stream(pid()),
@@ -1348,7 +1210,7 @@ mod tests {
         let mut shard_events: VecDeque<ShardEvent> = VecDeque::new();
 
         handle_participant_control(
-            ControlEvent::KeyframeRequested(GlobalKeyframeRequest {
+            ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
                 shard_id: 0, // different shard → remote
                 origin: pid(),
                 stream_id: video_stream(pid()),
@@ -1461,24 +1323,13 @@ mod tests {
         let r = room_id("leave3");
 
         add_participant(&mut core, &router, p, r);
-        // Keep the room alive after the last local member leaves so we can
-        // inspect room state afterwards.
-        core.rooms.get_mut(&r).unwrap().remote_shards.insert(1);
 
         core.remove_participant(&p, &router);
 
-        let sent = router.take_sent();
-        assert_eq!(
-            sent.len(),
-            2,
-            "must broadcast RoomMemberLeft to all other shards"
+        assert!(
+            router.take_sent().is_empty(),
+            "participant removal no longer emits cross-shard room membership events"
         );
-        for (_, ev) in &sent {
-            assert!(
-                matches!(ev, CrossShardEvent::RoomMemberLeft { .. }),
-                "broadcast must be RoomMemberLeft"
-            );
-        }
     }
 
     #[test]
@@ -1592,10 +1443,9 @@ mod tests {
 
         add_participant(&mut core, &router, p, r);
 
-        core.events
-            .push_back(ParticipantEvent::Lifecycle(LifecycleEvent::Exited {
-                participant_id: p,
-            }));
+        core.events.push_back(ParticipantEvent::Lifecycle(
+            ParticipantLifecycleEvent::Exited { participant_id: p },
+        ));
         core.flush_participant_events(&router);
 
         assert!(
@@ -1628,34 +1478,31 @@ mod tests {
         // Simulate the subscriber having a routing entry (as produced by reconcile_routes
         // → TopologyEvent::StreamSubscribed → flush_participant_events in the normal flow).
         handle_participant_topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: 1,
-                participant_id: subscriber,
-                stream_id: stream,
-                kind: MediaKind::Video,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber,
+                track: video_track(publisher, 1),
             },
             &mut core.routing,
-            &router,
+            &mut core.shard_events,
         );
-        router.take_sent();
+        core.shard_events.clear();
 
-        assert!(core.routing[&stream].subscribers.contains(&subscriber));
+        assert!(core.routing[&stream.0].subscribers.contains(&subscriber));
 
         // Simulate the downstream emitting StreamUnsubscribed on cleanup, as it does
         // when participant.downstream.unsubscribe_all() returns routes and
         // flush_participant_events processes them.
         core.events.push_back(ParticipantEvent::Topology(
-            TopologyEvent::StreamUnsubscribed {
-                shard_id: 1,
-                participant_id: subscriber,
-                stream_id: stream,
+            ParticipantTopologyEvent::TrackUnsubscribed {
+                subscriber,
+                track: video_track(publisher, 1),
             },
         ));
         core.flush_participant_events(&router);
 
         assert!(
-            !core.routing.contains_key(&stream),
-            "routing entry must be cleaned up when subscriber unsubscribes"
+            core.routing[&stream.0].subscribers.is_empty(),
+            "routing subscribers must be cleaned up when subscriber unsubscribes"
         );
     }
 
@@ -1693,6 +1540,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                room_id: r,
                 origin: a,
                 track_ids: vec![track_id],
             }),
@@ -1742,6 +1590,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                room_id: r,
                 origin: a,
                 track_ids: vec![track_id],
             }),
@@ -1789,6 +1638,7 @@ mod tests {
         let unknown_track_id = a.derive_track_id(MediaKind::Video, "v");
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                room_id: r,
                 origin: a,
                 track_ids: vec![unknown_track_id],
             }),

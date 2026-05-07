@@ -2,7 +2,8 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    entity::{ParticipantId, RoomId},
+    entity::{self, ParticipantId, RoomId},
+    track::{StreamId, Track},
 };
 use futures_lite::StreamExt;
 use tokio_util::time::DelayQueue;
@@ -79,6 +80,20 @@ impl RoomRegistry {
             }
         }
         Some(meta.shard_id)
+    }
+
+    pub fn add_track(&mut self, track: Track) -> Option<(RoomId, Vec<entity::ParticipantId>)> {
+        let origin = track.meta.origin;
+        let room = self.room_mut_for(&track.meta.origin)?;
+        room.add_track(track.clone());
+        let ids = room
+            .participants_iter()
+            .filter(|&id| *id != origin)
+            .copied()
+            .collect();
+        let room_id = room.room_id;
+
+        Some((room_id, ids))
     }
 
     pub async fn next_expired(&mut self) {

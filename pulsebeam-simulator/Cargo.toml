@@ -19,10 +19,10 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
 pin-project-lite = "0.2.17"
 proptest = "1.11.0"
-pulsebeam = { path = "../pulsebeam" }
+pulsebeam = { path = "../pulsebeam", features = ["sim"] }
 pulsebeam-agent = { path = "../pulsebeam-agent" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
-pulsebeam-runtime = { path = "../pulsebeam-runtime" }
+pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["sim"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 reqwest = "0.13.3"
 tokio.workspace = true

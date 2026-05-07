@@ -176,18 +176,21 @@ async fn first_frame_task(
     let _ = done_tx.send(peer_addr);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
     use pulsebeam_core::net::TcpListener;
+    use std::future::Future;
     use std::time::Duration;
     use tokio::time::timeout;
 
-    fn local_rt() -> tokio::runtime::LocalRuntime {
-        tokio::runtime::Builder::new_current_thread()
+    fn run_local(test: impl Future<Output = ()> + 'static) {
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build_local(tokio::runtime::LocalOptions::default())
-            .unwrap()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, test);
     }
 
     /// Accept one server-side TCP stream from a dedicated loopback listener.
@@ -213,7 +216,7 @@ mod tests {
     /// The acceptor drops connections when `MAX_PENDING_TCP` is already reached.
     #[test]
     fn test_pending_tcp_cap_drops_excess_connections() {
-        local_rt().block_on(async {
+        run_local(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .await
                 .unwrap();
@@ -256,7 +259,7 @@ mod tests {
     /// After in-flight connections complete, the acceptor accepts new ones.
     #[test]
     fn test_pending_tcp_accepts_after_cap_frees_up() {
-        local_rt().block_on(async {
+        run_local(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .await
                 .unwrap();
@@ -280,7 +283,10 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(resolved, MAX_PENDING_TCP, "all pending tasks should resolve");
+            assert_eq!(
+                resolved, MAX_PENDING_TCP,
+                "all pending tasks should resolve"
+            );
 
             // Give the acceptor loop time to process done signals.
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -294,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_tcp_acceptor_stops_on_shutdown() {
-        local_rt().block_on(async {
+        run_local(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .await
                 .unwrap();
@@ -304,10 +310,8 @@ mod tests {
 
             shutdown.cancel();
 
-            let result = tokio::time::timeout(Duration::from_secs(1), async {
-                event_rx.recv().await
-            })
-            .await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), async { event_rx.recv().await }).await;
             assert!(matches!(result, Ok(None)));
         });
     }
@@ -320,7 +324,7 @@ mod tests {
         // This test only makes sense if per-IP limit < global limit.
         assert!(MAX_PENDING_TCP_PER_IP < MAX_PENDING_TCP);
 
-        local_rt().block_on(async {
+        run_local(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
                 .await
                 .unwrap();

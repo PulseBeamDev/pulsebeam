@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use crate::entity::TrackId;
 use crate::participant::downstream::{DownstreamAllocator, Intent};
@@ -188,8 +188,10 @@ impl Signaling {
         let current_track_ids: HashSet<String> =
             current_tracks.iter().map(|t| t.id.clone()).collect();
         // Maps mid -> paused for the current state.
-        let current_assign_map: HashMap<String, bool> =
-            current_assignments.iter().map(|a| (a.mid.clone(), a.paused)).collect();
+        let current_assign_map: HashMap<String, bool> = current_assignments
+            .iter()
+            .map(|a| (a.mid.clone(), a.paused))
+            .collect();
 
         // 3. Compute Deltas
         // If snapshot: removals are empty.
@@ -228,7 +230,7 @@ impl Signaling {
                     .filter(|a| {
                         self.previous_assignments
                             .get(&a.mid)
-                            .map_or(true, |&prev_paused| prev_paused != a.paused)
+                            .is_none_or(|&prev_paused| prev_paused != a.paused)
                     })
                     .collect(),
             )

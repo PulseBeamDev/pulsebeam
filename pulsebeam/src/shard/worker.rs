@@ -10,11 +10,11 @@ use tokio::time::Instant;
 use str0m::media::MediaKind;
 
 use crate::{
-    entity::{self, ParticipantId, RoomId},
+    entity::{self, ParticipantId, RoomId, TrackId},
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
-    track::{GlobalKeyframeRequest, StreamId, Track},
+    track::{GlobalKeyframeRequest, StreamId, Track, TrackMeta},
 };
 
 use super::core::{CrossShardSend, ShardCore};
@@ -38,33 +38,34 @@ pub enum ShardCommand {
 
 #[derive(Debug, Clone)]
 pub enum ClusterCommand {
-    PublishTrack(Track, RoomId),
     RequestKeyframe(GlobalKeyframeRequest),
     RegisterParticipant {
         shard_id: usize,
+        room_id: RoomId,
         participant_id: entity::ParticipantId,
     },
     UnregisterParticipant {
         participant_id: ParticipantId,
     },
+    PublishTrack(Track, RoomId),
     UnpublishTracks {
+        room_id: RoomId,
         origin: ParticipantId,
-        track_ids: Vec<crate::entity::TrackId>,
+        track_ids: Vec<TrackId>,
+    },
+    /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.
+    SubscribeTrack {
+        from_shard_id: usize,
+        track: TrackMeta,
+    },
+    /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
+    UnsubscribeTrack {
+        from_shard_id: usize,
+        track: TrackMeta,
     },
 }
 
 pub enum CrossShardEvent {
-    /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.
-    StreamSubscribed {
-        stream_id: StreamId,
-        kind: MediaKind,
-        from_shard_id: usize,
-    },
-    /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
-    StreamUnsubscribed {
-        stream_id: StreamId,
-        from_shard_id: usize,
-    },
     /// Publisher shard → Subscriber shards: carry a video RTP packet across the shard boundary.
     RtpPublished { stream_id: StreamId, pkt: RtpPacket },
     /// Publisher shard → all other shards in the same room: carry an audio RTP packet.
@@ -73,16 +74,6 @@ pub enum CrossShardEvent {
         origin: ParticipantId,
         stream_id: StreamId,
         pkt: RtpPacket,
-    },
-    /// Shard → all others: this shard now has at least one member of `room_id`.
-    RoomMemberJoined {
-        room_id: RoomId,
-        from_shard_id: usize,
-    },
-    /// Shard → all others: this shard no longer has any members of `room_id`.
-    RoomMemberLeft {
-        room_id: RoomId,
-        from_shard_id: usize,
     },
     /// Subscriber shard → Publisher shard: keyframe request.
     KeyframeRequested(GlobalKeyframeRequest),
@@ -94,10 +85,20 @@ pub enum CrossShardEvent {
 }
 
 #[derive(Debug)]
+pub struct ShardEventWrapper {
+    pub from_shard_id: usize,
+    pub ev: ShardEvent,
+}
+
+#[derive(Debug)]
 pub enum ShardEvent {
     TrackPublished(Track),
     ParticipantExited(ParticipantId),
     KeyframeRequest(GlobalKeyframeRequest),
+    /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.
+    TrackSubscribed(TrackMeta),
+    /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
+    TrackUnsubscribed(TrackMeta),
 }
 
 #[derive(Clone)]
@@ -139,7 +140,7 @@ pub struct ShardWorker {
     udp_socket: UnifiedSocket,
     tcp_socket: net::tcp::TcpTransport,
     command_rx: mailbox::Receiver<ShardCommand>,
-    event_tx: mailbox::Sender<ShardEvent>,
+    event_tx: mailbox::Sender<ShardEventWrapper>,
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
     router: ShardRouter,
     metrics: Arc<ShardMetrics>,
@@ -151,7 +152,7 @@ impl ShardWorker {
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
-        event_tx: mailbox::Sender<ShardEvent>,
+        event_tx: mailbox::Sender<ShardEventWrapper>,
         cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
         cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
         metrics: Arc<ShardMetrics>,
@@ -183,7 +184,7 @@ impl ShardWorker {
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
         let mut loop_start = Instant::now();
-        loop {
+        'outer: loop {
             // Compute the deadline before the select so no borrow of self.core
             // outlives this block.
             let deadline = self.core.next_timer_deadline();
@@ -209,63 +210,65 @@ impl ShardWorker {
             let busy_start = Instant::now();
             self.metrics.record_idle(busy_start - loop_start);
 
-            while let Ok(cmd) = self.command_rx.try_recv() {
-                match cmd {
-                    ShardCommand::AddTcpConnection { stream, peer_addr } => {
-                        if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
-                            tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
-                        }
-                    }
-                    cmd => {
-                        let _ = self.core.on_command(cmd, &self.router);
-                    }
-                }
-            }
-            while let Ok(ev) = self.cross_shard_event_rx.try_recv() {
-                self.core.pending_cross_shard.push_back(ev);
-            }
-
-            self.core.flush_cross_shard(busy_start, &self.router);
-            self.core.fire_timers(busy_start);
-
-            let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
-            let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
-            for batch in self.recv_batch.drain(..) {
-                self.core.on_udp_batch(batch, &self.router);
-            }
-
-            self.core.poll_input(busy_start);
-            self.core.flush_rtp_events(&self.router);
-            self.core.poll_fanout(busy_start);
-            self.core.flush_participant_events(&self.router);
-            self.core
-                .flush_egress(&self.udp_socket, &mut self.tcp_socket);
-            self.core
-                .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
-
-            while let Some(event) = self.core.shard_events.pop_front() {
-                match self.event_tx.try_send(event) {
-                    Err(mailbox::TrySendError::Full(e)) => {
-                        tracing::warn!("shard event channel is full, piling up shard events");
-                        self.core.shard_events.push_front(e);
-                        break;
-                    }
-                    Err(mailbox::TrySendError::Closed(e)) => {
-                        tracing::warn!("shard event channel is closed, piling up shard events");
-                        self.core.shard_events.push_front(e);
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-            }
+            self.tick(busy_start);
 
             // TODO: record forwarding latency
             let busy_end = Instant::now();
             let _forwarding_latency = busy_end - busy_start;
             loop_start = busy_end;
             self.metrics.record_busy(busy_start.elapsed());
+
+            while let Some(event) = self.core.shard_events.pop_front() {
+                let wrapped = ShardEventWrapper {
+                    from_shard_id: self.router.shard_id,
+                    ev: event,
+                };
+                if let Err(err) = self.event_tx.send(wrapped).await {
+                    tracing::warn!("shard event channel is closed, exiting: {}", err);
+                    break 'outer;
+                }
+            }
         }
 
         Ok(())
+    }
+
+    fn tick(&mut self, now: Instant) {
+        // phase 1: input
+        while let Ok(cmd) = self.command_rx.try_recv() {
+            match cmd {
+                ShardCommand::AddTcpConnection { stream, peer_addr } => {
+                    if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
+                        tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
+                    }
+                }
+                cmd => {
+                    let _ = self.core.on_command(cmd, &self.router);
+                }
+            }
+        }
+        while let Ok(ev) = self.cross_shard_event_rx.try_recv() {
+            self.core.on_cross_shard_event(ev, now, &self.router);
+        }
+
+        self.core.fire_timers(now);
+
+        let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
+        let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
+        for batch in self.recv_batch.drain(..) {
+            self.core.on_udp_batch(batch, &self.router);
+        }
+
+        // phase 2: compute
+        self.core.poll_input(now);
+        self.core.flush_rtp_events(&self.router);
+        self.core.poll_fanout(now);
+        self.core.flush_participant_events(&self.router);
+
+        // phase 3: output
+        self.core
+            .flush_egress(&self.udp_socket, &mut self.tcp_socket);
+        self.core
+            .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
     }
 }

@@ -28,7 +28,7 @@ impl Room {
         self.participants.swap_remove(participant_id);
     }
 
-    pub fn publish_track(&mut self, track: Track) {
+    pub(super) fn add_track(&mut self, track: Track) {
         let tracks = self.participants.entry(track.meta.origin).or_default();
 
         if !tracks.iter().any(|t| t.meta.id == track.meta.id) {

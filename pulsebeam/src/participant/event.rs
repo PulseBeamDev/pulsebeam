@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
-use str0m::media::{KeyframeRequestKind, MediaKind};
+use str0m::media::{KeyframeRequestKind, MediaKind, Rid};
 use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, RoomId};
 use crate::rtp::RtpPacket;
-use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer};
+use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer, TrackMeta};
 
 pub struct RtpEvent {
     pub stream_id: StreamId,
@@ -16,38 +16,35 @@ pub struct RtpEvent {
 }
 
 pub enum ParticipantEvent {
-    Topology(TopologyEvent),
-    Timer(TimerEvent),
-    Lifecycle(LifecycleEvent),
-    Control(ControlEvent),
+    Topology(ParticipantTopologyEvent),
+    Timer(ParticipantTimerEvent),
+    Lifecycle(ParticipantLifecycleEvent),
+    Control(ParticipantControlEvent),
 }
 
-pub enum TopologyEvent {
-    StreamSubscribed {
-        shard_id: usize,
-        participant_id: ParticipantId,
-        stream_id: StreamId,
-        kind: MediaKind,
+pub enum ParticipantTopologyEvent {
+    TrackSubscribed {
+        subscriber: ParticipantId,
+        track: TrackMeta,
     },
-    StreamUnsubscribed {
-        shard_id: usize,
-        participant_id: ParticipantId,
-        stream_id: StreamId,
+    TrackUnsubscribed {
+        subscriber: ParticipantId,
+        track: TrackMeta,
     },
 }
 
-pub enum TimerEvent {
+pub enum ParticipantTimerEvent {
     DeadlineUpdated {
         at: Instant,
         participant_id: ParticipantId,
     },
 }
 
-pub enum LifecycleEvent {
+pub enum ParticipantLifecycleEvent {
     Exited { participant_id: ParticipantId },
 }
 
-pub enum ControlEvent {
+pub enum ParticipantControlEvent {
     TrackPublished(Track),
     KeyframeRequested(GlobalKeyframeRequest),
 }
@@ -74,23 +71,20 @@ impl<'a> EventQueue<'a> {
         }
     }
 
-    pub fn subscribe(&mut self, layer: &TrackLayer) {
+    pub fn subscribe(&mut self, track: TrackMeta) {
         self.queue.push_back(ParticipantEvent::Topology(
-            TopologyEvent::StreamSubscribed {
-                shard_id: layer.meta.shard_id,
-                participant_id: *self.id,
-                stream_id: layer.stream_id(),
-                kind: layer.meta.kind,
+            ParticipantTopologyEvent::TrackSubscribed {
+                subscriber: *self.id,
+                track,
             },
         ));
     }
 
-    pub fn unsubscribe(&mut self, layer: &TrackLayer) {
+    pub fn unsubscribe(&mut self, track: TrackMeta) {
         self.queue.push_back(ParticipantEvent::Topology(
-            TopologyEvent::StreamUnsubscribed {
-                shard_id: layer.meta.shard_id,
-                participant_id: *self.id,
-                stream_id: layer.stream_id(),
+            ParticipantTopologyEvent::TrackUnsubscribed {
+                subscriber: *self.id,
+                track,
             },
         ));
     }
@@ -105,36 +99,36 @@ impl<'a> EventQueue<'a> {
     }
 
     pub fn publish_track(&mut self, track: Track) {
-        self.queue
-            .push_back(ParticipantEvent::Control(ControlEvent::TrackPublished(
-                track,
-            )));
+        self.queue.push_back(ParticipantEvent::Control(
+            ParticipantControlEvent::TrackPublished(track),
+        ));
     }
 
     pub fn request_keyframe(&mut self, layer: &TrackLayer) {
-        self.queue
-            .push_back(ParticipantEvent::Control(ControlEvent::KeyframeRequested(
-                GlobalKeyframeRequest {
-                    shard_id: layer.meta.shard_id,
-                    origin: layer.meta.origin,
-                    stream_id: layer.stream_id(),
-                    kind: KeyframeRequestKind::Pli,
-                },
-            )));
+        self.queue.push_back(ParticipantEvent::Control(
+            ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
+                shard_id: layer.meta.shard_id,
+                origin: layer.meta.origin,
+                stream_id: layer.stream_id(),
+                kind: KeyframeRequestKind::Pli,
+            }),
+        ));
     }
 
     pub fn update_deadline(&mut self, deadline: Instant) {
-        self.queue
-            .push_back(ParticipantEvent::Timer(TimerEvent::DeadlineUpdated {
+        self.queue.push_back(ParticipantEvent::Timer(
+            ParticipantTimerEvent::DeadlineUpdated {
                 at: deadline,
                 participant_id: *self.id,
-            }));
+            },
+        ));
     }
 
     pub fn exit(&mut self) {
-        self.queue
-            .push_back(ParticipantEvent::Lifecycle(LifecycleEvent::Exited {
+        self.queue.push_back(ParticipantEvent::Lifecycle(
+            ParticipantLifecycleEvent::Exited {
                 participant_id: *self.id,
-            }));
+            },
+        ));
     }
 }

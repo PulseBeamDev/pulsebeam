@@ -84,4 +84,5 @@ str0m = { workspace = true, features = ["wincrypto"] }
 default = []
 deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 parking_lot = ["once_cell/parking_lot", "pulsebeam-runtime/parking_lot"]
+sim = ["pulsebeam-core/sim"]
 tokio-console = ["console-subscriber", "tokio/tracing"]

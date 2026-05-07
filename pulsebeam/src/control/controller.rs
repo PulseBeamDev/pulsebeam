@@ -12,7 +12,7 @@ use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
     shard::{
         ShardContext,
-        worker::{ClusterCommand, ShardCommand, ShardEvent},
+        worker::{ClusterCommand, ShardCommand, ShardEvent, ShardEventWrapper},
     },
 };
 use pulsebeam_runtime::mailbox;
@@ -126,7 +126,7 @@ impl ControllerActor {
     pub async fn run(
         mut self,
         mut command_rx: mailbox::Receiver<ControllerCommand>,
-        mut shard_event_rx: mailbox::Receiver<ShardEvent>,
+        mut shard_event_rx: mailbox::Receiver<ShardEventWrapper>,
         shutdown: CancellationToken,
     ) {
         // Spawn the TCP acceptor onto the current LocalSet / LocalRuntime.
@@ -147,8 +147,8 @@ impl ControllerActor {
                 // let command to backpressure to signal clients to slow down.
                 biased;
 
-                Some(ev) = shard_event_rx.recv() => {
-                    self.core.process_shard_event(ev, &mut self.eq);
+                Some(e) = shard_event_rx.recv() => {
+                    self.core.process_shard_event(e, &mut self.eq);
                 }
 
                 _ = self.core.next_expired() => {}
@@ -287,6 +287,7 @@ impl ControllerActor {
 
         self.eq.broadcast(ClusterCommand::RegisterParticipant {
             shard_id,
+            room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         });
         self.eq.send(shard_id, ShardCommand::AddParticipant(cfg));
@@ -296,7 +297,7 @@ impl ControllerActor {
 
 pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
     use crate::{
@@ -306,7 +307,17 @@ mod tests {
     };
     use pulsebeam_core::net::TcpListener;
     use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream, rand::seeded_rng};
+    use std::future::Future;
     use std::sync::Arc;
+
+    fn run_local(test: impl Future<Output = ()> + 'static) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, test);
+    }
 
     fn dummy_pid() -> ParticipantId {
         ParticipantId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
@@ -353,65 +364,71 @@ mod tests {
 
     // ── route_tcp_connection ─────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_route_valid_ufrag_routes_to_correct_shard() {
-        let mut actor = make_actor(3).await;
-        let (_client, stream) = make_buffered().await;
-        let peer_addr = "1.2.3.4:5000".parse().unwrap();
+    #[test]
+    fn test_route_valid_ufrag_routes_to_correct_shard() {
+        run_local(async {
+            let mut actor = make_actor(3).await;
+            let (_client, stream) = make_buffered().await;
+            let peer_addr = "1.2.3.4:5000".parse().unwrap();
 
-        // Encode for cluster=0, node=0 (actor defaults), shard=2
-        let ufrag = IceUfrag::new(0, 0, 2, dummy_pid()).encode();
-        let conn = PendingTcpConn {
-            stream,
-            peer_addr,
-            server_ufrag: Some(ufrag),
-        };
-        actor.route_tcp_connection(conn);
+            // Encode for cluster=0, node=0 (actor defaults), shard=2
+            let ufrag = IceUfrag::new(0, 0, 2, dummy_pid()).encode();
+            let conn = PendingTcpConn {
+                stream,
+                peer_addr,
+                server_ufrag: Some(ufrag),
+            };
+            actor.route_tcp_connection(conn);
 
-        let event = actor.eq.pop().expect("event must be queued");
-        match event {
-            ControllerEvent::ShardCommandSent(
-                shard_id,
-                ShardCommand::AddTcpConnection { peer_addr: pa, .. },
-            ) => {
-                assert_eq!(shard_id, 2, "must route to the shard encoded in the ufrag");
-                assert_eq!(pa, peer_addr);
+            let event = actor.eq.pop().expect("event must be queued");
+            match event {
+                ControllerEvent::ShardCommandSent(
+                    shard_id,
+                    ShardCommand::AddTcpConnection { peer_addr: pa, .. },
+                ) => {
+                    assert_eq!(shard_id, 2, "must route to the shard encoded in the ufrag");
+                    assert_eq!(pa, peer_addr);
+                }
+                _ => panic!("unexpected event: {event:?}"),
             }
-            _ => panic!("unexpected event: {event:?}"),
-        }
+        });
     }
 
-    #[tokio::test]
-    async fn test_route_wrong_cluster_drops_connection() {
-        let mut actor = make_actor(2).await;
-        // actor.cluster_id = 0, ufrag encodes cluster_id = 1
-        let (_client, stream) = make_buffered().await;
-        let conn = PendingTcpConn {
-            stream,
-            peer_addr: "1.2.3.4:5001".parse().unwrap(),
-            server_ufrag: Some(IceUfrag::new(1, 0, 0, dummy_pid()).encode()),
-        };
-        actor.route_tcp_connection(conn);
-        assert!(
-            actor.eq.pop().is_none(),
-            "wrong-cluster connection must be silently dropped"
-        );
+    #[test]
+    fn test_route_wrong_cluster_drops_connection() {
+        run_local(async {
+            let mut actor = make_actor(2).await;
+            // actor.cluster_id = 0, ufrag encodes cluster_id = 1
+            let (_client, stream) = make_buffered().await;
+            let conn = PendingTcpConn {
+                stream,
+                peer_addr: "1.2.3.4:5001".parse().unwrap(),
+                server_ufrag: Some(IceUfrag::new(1, 0, 0, dummy_pid()).encode()),
+            };
+            actor.route_tcp_connection(conn);
+            assert!(
+                actor.eq.pop().is_none(),
+                "wrong-cluster connection must be silently dropped"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn test_route_wrong_node_drops_connection() {
-        let mut actor = make_actor(2).await;
-        // actor.node_id = 0, ufrag encodes node_id = 7
-        let (_client, stream) = make_buffered().await;
-        let conn = PendingTcpConn {
-            stream,
-            peer_addr: "1.2.3.4:5002".parse().unwrap(),
-            server_ufrag: Some(IceUfrag::new(0, 7, 0, dummy_pid()).encode()),
-        };
-        actor.route_tcp_connection(conn);
-        assert!(
-            actor.eq.pop().is_none(),
-            "wrong-node connection must be silently dropped"
-        );
+    #[test]
+    fn test_route_wrong_node_drops_connection() {
+        run_local(async {
+            let mut actor = make_actor(2).await;
+            // actor.node_id = 0, ufrag encodes node_id = 7
+            let (_client, stream) = make_buffered().await;
+            let conn = PendingTcpConn {
+                stream,
+                peer_addr: "1.2.3.4:5002".parse().unwrap(),
+                server_ufrag: Some(IceUfrag::new(0, 7, 0, dummy_pid()).encode()),
+            };
+            actor.route_tcp_connection(conn);
+            assert!(
+                actor.eq.pop().is_none(),
+                "wrong-node connection must be silently dropped"
+            );
+        });
     }
 }
