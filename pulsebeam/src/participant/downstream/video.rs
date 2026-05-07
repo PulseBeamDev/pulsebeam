@@ -277,7 +277,12 @@ impl VideoAllocator {
     }
 
     #[inline]
-    pub fn on_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket, writer: &mut StreamWriter) -> bool {
+    pub fn on_rtp(
+        &mut self,
+        stream_id: &StreamId,
+        pkt: &RtpPacket,
+        writer: &mut StreamWriter,
+    ) -> bool {
         let Some(slot_key) = self.routes.get(stream_id) else {
             return false;
         };
@@ -1266,7 +1271,7 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
-        let desired = allocator.update_allocations(Bitrate::from(5_000_000));
+        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
     }
 
