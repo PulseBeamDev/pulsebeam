@@ -14,6 +14,6 @@
 #   "{{tag_name}}"
 # ]
 pre-release-replacements = [
-  { file = "./CHANGELOG.md", search = "## \\[unreleased\\]", replace = "## [{{version}}] - {{date}}" },
+  { file = "./CHANGELOG.md", search = "## \\[unreleased\\]", replace = "## [{{tag_name}}] - {{date}}" },
 ]
 tag = true
