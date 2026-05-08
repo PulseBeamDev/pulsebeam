@@ -1,11 +1,8 @@
-use pulsebeam_runtime::sync::Arc;
 use std::fmt::{Debug, Display};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use str0m::rtp::Ssrc;
 
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
-use tokio::sync::Notify;
+use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
 use tokio::time::Instant;
 
 use crate::entity::ParticipantId;
@@ -88,67 +85,6 @@ impl<'a> StreamWriter<'a> {
                 target: crate::log::TARGET_AUDIO,
                 %ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
-    }
-}
-
-/// Sends keyframe requests to the upstream publisher.
-///
-/// Always requests PLI — the publisher decides the exact RTCP feedback type.
-#[derive(Clone, Debug)]
-pub struct KeyframeRequester {
-    signal: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-    #[cfg(test)]
-    pub request_count: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl KeyframeRequester {
-    /// Signal that a PLI keyframe is needed.
-    pub fn request(&self) {
-        self.signal.store(true, Ordering::Relaxed);
-        self.notify.notify_one();
-        #[cfg(test)]
-        {
-            self.request_count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Polls a pending keyframe request with leading-edge debounce.
-///
-/// Owned by `UpstreamAllocator`; the corresponding [`KeyframeRequester`] is held
-/// by each [`TrackLayer`].
-#[derive(Debug)]
-pub struct KeyframePoll {
-    signal: Arc<AtomicBool>,
-    pub mid: Mid,
-    pub rid: Option<Rid>,
-    debounce: Duration,
-    last_sent: Option<Instant>,
-}
-
-impl KeyframePoll {
-    /// Return a pending PLI [`KeyframeRequest`] if one is flagged and debounce permits.
-    ///
-    /// Leading-edge semantics: the first request in any window passes through
-    /// immediately; subsequent requests within the same window are discarded.
-    pub fn take_pending(&mut self, now: Instant) -> Option<KeyframeRequest> {
-        if !self.signal.load(Ordering::Relaxed) {
-            return None;
-        }
-        self.signal.store(false, Ordering::Relaxed);
-        // Within debounce window: discard.
-        if let Some(last) = self.last_sent
-            && now.duration_since(last) < self.debounce
-        {
-            return None;
-        }
-        self.last_sent = Some(now);
-        Some(KeyframeRequest {
-            kind: KeyframeRequestKind::Pli,
-            rid: self.rid,
-            mid: self.mid,
-        })
     }
 }
 
@@ -369,10 +305,8 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
         layers.iter().map(|l| Some(l.rid)).collect()
     };
 
-    let _keyframe_notify = Arc::new(Notify::new());
     let mut senders = Vec::new();
     let mut layers = Vec::with_capacity(simulcast_rids.len());
-    let mut keyframe_polls = Vec::new();
 
     for (index, &rid) in simulcast_rids.iter().enumerate() {
         let (bitrate, quality) = match (rid, index) {
@@ -382,18 +316,9 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             (Some(_), _) => (150_000, LayerQuality::Low),
         };
 
-        let signal = Arc::new(AtomicBool::new(false));
         let stream_state = StreamState::new(true, bitrate);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
-
-        keyframe_polls.push(KeyframePoll {
-            signal: signal.clone(),
-            mid,
-            rid,
-            debounce: KEYFRAME_DEBOUNCE,
-            last_sent: None,
-        });
 
         senders.push(UpstreamTrackLayer {
             mid,
