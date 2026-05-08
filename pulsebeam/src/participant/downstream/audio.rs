@@ -4,6 +4,7 @@ use str0m::media::{Mid, Pt};
 use str0m::rtp::Ssrc;
 
 use crate::audio_selector::SELECTOR_SLOTS;
+use crate::participant::downstream::SlotConfig;
 use crate::rtp::RtpPacket;
 use crate::track::StreamWriter;
 
@@ -33,20 +34,20 @@ impl AudioAllocator {
         }
     }
 
-    pub fn add_slot(&mut self, mid: Mid, pt: Pt, ssrc: Ssrc) {
+    pub fn add_slot(&mut self, slot: SlotConfig) {
         if let Some(entry) = self.slots.iter_mut().find(|s| s.is_none()) {
             *entry = Some(Slot {
-                mid,
-                pt,
-                ssrc,
+                mid: slot.mid,
+                pt: slot.pt,
+                ssrc: slot.ssrc,
                 pending_marker: true,
             });
         } else {
             tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
-                %mid,
-                %pt,
-                %ssrc,
+                mid = %slot.mid,
+                pt = %slot.pt,
+                ssrc = %slot.ssrc,
                 slots = SELECTOR_SLOTS,
                 "audio allocator has no free slot; dropping slot provisioning"
             );

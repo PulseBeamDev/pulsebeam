@@ -154,8 +154,8 @@ impl VideoAllocator {
         })
     }
 
-    pub fn add_slot(&mut self, mid: Mid, config: SlotConfig) {
-        let slot = Slot::new(SlotConfig { mid, ..config }, &mut self.rng);
+    pub fn add_slot(&mut self, config: SlotConfig) {
+        let slot = Slot::new(config, &mut self.rng);
         self.slots.insert(slot);
         self.rebalance();
     }
@@ -879,8 +879,7 @@ mod assignment_tests {
 
     fn add_slots(allocator: &mut VideoAllocator, count: usize) {
         for i in 0..count {
-            let mid = Mid::from(&format!("s{i}")[..]);
-            allocator.add_slot(mid, SlotConfig::default());
+            allocator.add_slot(SlotConfig::default());
         }
     }
 
@@ -1255,7 +1254,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_slot(mid, SlotConfig::default());
+        allocator.add_slot(SlotConfig::default());
         let slot = allocator.slots.values_mut().next().unwrap();
         let staging = track.by_quality(LayerQuality::Medium).unwrap().clone();
         let new_stage = track.by_quality(LayerQuality::High).unwrap().clone();
@@ -1291,7 +1290,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_slot(mid, SlotConfig::default());
+        allocator.add_slot(SlotConfig::default());
         let slot = allocator.slots.values_mut().next().unwrap();
         let active = track.by_quality(LayerQuality::Low).unwrap().clone();
         let staging = track.by_quality(LayerQuality::High).unwrap().clone();
@@ -1328,7 +1327,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_slot(mid, SlotConfig::default());
+        allocator.add_slot(SlotConfig::default());
         let slot = allocator.slots.values_mut().next().unwrap();
         let staging = track.by_quality(LayerQuality::High).unwrap().clone();
         let new_stage = track.by_quality(LayerQuality::Low).unwrap().clone();

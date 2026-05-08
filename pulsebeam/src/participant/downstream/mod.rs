@@ -75,10 +75,10 @@ impl DownstreamAllocator {
     pub fn add_slot(&mut self, slot: SlotConfig) {
         match slot.kind {
             MediaKind::Video => {
-                self.video.add_slot(slot.mid, slot);
+                self.video.add_slot(slot);
             }
             MediaKind::Audio => {
-                self.audio.add_slot(slot.mid, slot.pt, slot.ssrc);
+                self.audio.add_slot(slot);
             }
         }
         self.dirty_allocation = true;
