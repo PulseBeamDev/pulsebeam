@@ -581,7 +581,7 @@ pub(super) fn handle_audio_rtp(
     );
 
     let Some(room) = rooms.get_mut(&ev.room_id) else {
-        tracing::trace!(
+        tracing::warn!(
             target: crate::log::TARGET_AUDIO,
             room_id = %ev.room_id,
             "audio packet dropped: room missing"
@@ -605,12 +605,6 @@ pub(super) fn handle_audio_rtp(
 
     let selection = room.audio_selector.filter(ev.stream_id, &mut ev.pkt);
     let Some(slot_idx) = selection else {
-        tracing::trace!(
-            target: crate::log::TARGET_AUDIO,
-            room_id = %ev.room_id,
-            stream_id = %ev.stream_id.0,
-            "audio packet dropped by selector"
-        );
         return;
     };
     tracing::trace!(

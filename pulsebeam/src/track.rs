@@ -34,16 +34,17 @@ pub struct GlobalKeyframeRequest {
 pub struct StreamWriter<'a>(pub &'a mut str0m::Rtc);
 
 impl<'a> StreamWriter<'a> {
-    pub fn write(&mut self, pkt: &RtpPacket, ssrc: &Ssrc, pt: Pt) {
-        self.write_owned(pkt.clone(), ssrc, pt);
-    }
-
-    pub fn write_owned(&mut self, pkt: RtpPacket, ssrc: &Ssrc, pt: Pt) {
+    pub fn write_video_owned(&mut self, pkt: RtpPacket, ssrc: &Ssrc, pt: Pt) {
         let mut api = self.0.direct_api();
         let Some(stream) = api.stream_tx(ssrc) else {
-            tracing::warn!("no stream_tx found for {}", ssrc);
+            tracing::warn!(
+                target: crate::log::TARGET_VIDEO,
+                "no stream_tx found for {}", ssrc);
             return;
         };
+        tracing::trace!(
+            target: crate::log::TARGET_VIDEO,
+            %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
         let res = stream.write_rtp(
             pt,
             pkt.seq_no,
@@ -55,7 +56,37 @@ impl<'a> StreamWriter<'a> {
             pkt.payload,
         );
         if let Err(err) = res {
-            tracing::warn!(%ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+            tracing::warn!(
+                target: crate::log::TARGET_VIDEO,
+                %ssrc, "Dropping RTP for invalid rtp header: {err:?}");
+        }
+    }
+
+    pub fn write_audio_owned(&mut self, pkt: RtpPacket, ssrc: &Ssrc, pt: Pt) {
+        let mut api = self.0.direct_api();
+        let Some(stream) = api.stream_tx(ssrc) else {
+            tracing::warn!(
+                target: crate::log::TARGET_AUDIO,
+                "no stream_tx found for {}", ssrc);
+            return;
+        };
+        tracing::trace!(
+            target: crate::log::TARGET_AUDIO,
+            %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
+        let res = stream.write_rtp(
+            pt,
+            pkt.seq_no,
+            pkt.rtp_ts.numer() as u32,
+            pkt.playout_time.into(),
+            pkt.marker,
+            pkt.ext_vals.clone(),
+            true,
+            pkt.payload,
+        );
+        if let Err(err) = res {
+            tracing::warn!(
+                target: crate::log::TARGET_AUDIO,
+                %ssrc, "Dropping RTP for invalid rtp header: {err:?}");
         }
     }
 }

@@ -297,7 +297,7 @@ impl VideoAllocator {
         let mut state_changed = false;
         slot.process(stream_id, pkt);
         while let Some(pkt) = slot.switcher.pop() {
-            writer.write_owned(pkt, &slot.ssrc, slot.pt);
+            writer.write_video_owned(pkt, &slot.ssrc, slot.pt);
         }
         // Only promote staging→active once we have actually seen packets for the
         // current staging layer. Otherwise an empty staging buffer will appear
@@ -1074,7 +1074,9 @@ mod assignment_tests {
         let old_stream_id = track.lowest_quality().stream_id();
         let slot_key = allocator.slots.keys().next().unwrap().clone();
         allocator.routes.insert(old_stream_id.0, slot_key);
-        allocator.last_reconciled.insert((old_stream_id.0, slot_key));
+        allocator
+            .last_reconciled
+            .insert((old_stream_id.0, slot_key));
 
         let slot = allocator.slots.values_mut().next().unwrap();
         slot.active = None;
@@ -1126,10 +1128,7 @@ mod assignment_tests {
             allocator.reconcile_routes(&mut queue);
         }
 
-        assert_eq!(
-            allocator.routes.get(&low.meta.id),
-            Some(&correct_slot_key)
-        );
+        assert_eq!(allocator.routes.get(&low.meta.id), Some(&correct_slot_key));
         assert!(
             events
                 .iter()
