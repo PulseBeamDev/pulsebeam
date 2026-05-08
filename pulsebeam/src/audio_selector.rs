@@ -81,7 +81,16 @@ impl TopNAudioSelector {
     #[inline]
     pub fn filter(&mut self, stream_id: StreamId, pkt: &mut RtpPacket) -> Option<usize> {
         // Step 1: Parse relative power and wall-clock arrival time.
-        let power = rfc6464_to_power(pkt.ext_vals.audio_level.unwrap_or(-127));
+        let Some(audio_level) = pkt.ext_vals.audio_level else {
+            tracing::warn!(
+                target: crate::log::TARGET_AUDIO,
+                stream_id = %stream_id.0,
+                "audio selector dropped packet due to missing audio level"
+            );
+            return None;
+        };
+        let power = rfc6464_to_power(audio_level);
+
         let now = pkt.arrival_ts;
 
         // Step 1.5: Decay all slot powers to keep ranking fresh over time.
