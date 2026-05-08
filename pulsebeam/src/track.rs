@@ -156,7 +156,6 @@ pub struct UpstreamTrackLayer {
     pub quality: LayerQuality,
     pub monitor: StreamMonitor,
     synchronizer: Synchronizer,
-    filter: PacketFilter,
 }
 
 impl PartialEq for UpstreamTrackLayer {
@@ -176,7 +175,8 @@ impl UpstreamTrackLayer {
         self.synchronizer.process(pkt, sr);
         self.monitor
             .process_packet(pkt, pkt.payload.len() + pkt.header_len);
-        (self.filter)(pkt)
+        // audio will only be filtered at the centralized audio_selector
+        true
     }
 }
 
@@ -316,7 +316,6 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             mid,
             rid: None,
             quality: LayerQuality::Low,
-            filter: should_forward_audio,
             synchronizer: Synchronizer::new(rtp::AUDIO_FREQUENCY),
             monitor,
         }],
@@ -369,7 +368,6 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             mid,
             rid,
             quality,
-            filter: should_forward_noop,
             synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor,
         });
@@ -396,43 +394,6 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
         },
         track,
     )
-}
-
-type PacketFilter = fn(packet: &RtpPacket) -> bool;
-
-/// Determines if an audio packet is essential (Speech or DTX) and should be forwarded.
-#[inline]
-pub fn should_forward_audio(packet: &RtpPacket) -> bool {
-    const DTX_THRESHOLD: usize = 12;
-    // -50dBov is a standard noise floor. Anything quieter is background hiss.
-    const NOISE_FLOOR_DB: i8 = -50;
-
-    // 1. Always drop tiny packets (Comfort Noise / DTX)
-    if packet.payload.len() < DTX_THRESHOLD {
-        return false;
-    }
-
-    let ext = &packet.ext_vals;
-
-    // 2. Strict VAD Check (Priority)
-    // If the V bit is present, trust it explicitly.
-    if let Some(vad) = ext.voice_activity {
-        return vad;
-    }
-
-    // 3. Noise Gate Fallback
-    // If VAD is missing but we have levels, drop silence/background noise.
-    if let Some(level) = ext.audio_level {
-        return level > NOISE_FLOOR_DB;
-    }
-
-    // 4. Fallback: No metadata, assumed active.
-    true
-}
-
-#[inline]
-fn should_forward_noop(_: &RtpPacket) -> bool {
-    true
 }
 
 #[cfg(test)]
