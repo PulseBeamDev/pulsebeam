@@ -359,6 +359,11 @@ impl ShardCore {
                 room_id,
                 track_ids,
             } => {
+                if let Some(room) = self.rooms.get_mut(&room_id) {
+                    for &track_id in &track_ids {
+                        room.audio_selector.remove_track((track_id, None));
+                    }
+                }
                 let room = self.rooms.get(&room_id)?;
                 for participant_id in &room.members {
                     let Some(p) = self.participants.get_mut(participant_id) else {
@@ -566,7 +571,21 @@ pub(super) fn handle_audio_rtp(
     dirty: &mut IndexSet<ParticipantId, ahash::RandomState>,
     router: &impl CrossShardSend,
 ) {
+    tracing::trace!(
+        target: crate::log::TARGET_AUDIO,
+        room_id = %ev.room_id,
+        origin = %ev.origin,
+        stream_id = %ev.stream_id.0,
+        seq_no = %ev.pkt.seq_no,
+        "audio packet entered shard audio fanout"
+    );
+
     let Some(room) = rooms.get_mut(&ev.room_id) else {
+        tracing::trace!(
+            target: crate::log::TARGET_AUDIO,
+            room_id = %ev.room_id,
+            "audio packet dropped: room missing"
+        );
         return;
     };
 
@@ -586,8 +605,22 @@ pub(super) fn handle_audio_rtp(
 
     let selection = room.audio_selector.filter(ev.stream_id, &mut ev.pkt);
     let Some(slot_idx) = selection else {
+        tracing::trace!(
+            target: crate::log::TARGET_AUDIO,
+            room_id = %ev.room_id,
+            stream_id = %ev.stream_id.0,
+            "audio packet dropped by selector"
+        );
         return;
     };
+    tracing::trace!(
+        target: crate::log::TARGET_AUDIO,
+        room_id = %ev.room_id,
+        stream_id = %ev.stream_id.0,
+        slot_idx,
+        members = room.members.len(),
+        "audio selector produced slot"
+    );
     for &participant_id in &room.members {
         if participant_id == ev.origin {
             continue;
@@ -595,6 +628,13 @@ pub(super) fn handle_audio_rtp(
         let Some(sub) = participants.get_mut(&participant_id) else {
             continue;
         };
+        tracing::trace!(
+            target: crate::log::TARGET_AUDIO,
+            %participant_id,
+            slot_idx,
+            stream_id = %ev.stream_id.0,
+            "forwarding audio packet to participant"
+        );
         sub.core.on_forward_audio_rtp(slot_idx, &ev.pkt);
         dirty.insert(participant_id);
     }
@@ -655,7 +695,8 @@ mod tests {
     use std::cell::RefCell;
 
     use crate::{
-        entity::ExternalRoomId, participant::event::ParticipantTopologyEvent,
+        entity::ExternalRoomId,
+        participant::event::ParticipantTopologyEvent,
         track::{GlobalKeyframeRequest, TrackMeta},
     };
     use str0m::media::{KeyframeRequestKind, MediaKind};
