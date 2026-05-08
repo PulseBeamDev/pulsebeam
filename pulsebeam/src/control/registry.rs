@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Duration};
 use crate::{
     control::room::Room,
     entity::{self, ParticipantId, RoomId},
-    track::{StreamId, Track},
+    track::Track,
 };
 use futures_lite::StreamExt;
 use tokio_util::time::DelayQueue;
@@ -57,13 +57,21 @@ impl RoomRegistry {
         room_id: RoomId,
         shard_id: usize,
     ) {
+        if let Some(previous) = self
+            .participants
+            .insert(participant_id, ParticipantMeta { shard_id, room_id })
+            && let Some(room) = self.rooms.get_mut(&previous.room_id)
+        {
+            room.remove_participant(&participant_id);
+            if room.participant_count() == 0 {
+                self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
+            }
+        }
         let room = self
             .rooms
             .entry(room_id)
             .or_insert_with(|| Room::new(room_id));
         room.add_participant(&participant_id);
-        self.participants
-            .insert(participant_id, ParticipantMeta { shard_id, room_id });
     }
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
@@ -176,6 +184,23 @@ mod tests {
 
         let room = reg.get_room(&rid).unwrap();
         assert_eq!(room.participant_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn add_participant_moves_existing_participant_to_new_room() {
+        let mut reg = RoomRegistry::new();
+        let old_room = room_id("room-b-old");
+        let new_room = room_id("room-b-new");
+        let pid = participant_id();
+
+        reg.add_participant(pid, old_room, 0);
+        reg.add_participant(pid, new_room, 1);
+
+        assert_eq!(reg.get_room(&old_room).unwrap().participant_count(), 0);
+        assert_eq!(reg.get_room(&new_room).unwrap().participant_count(), 1);
+        let meta = reg.get_participant(&pid).unwrap();
+        assert_eq!(meta.room_id, new_room);
+        assert_eq!(meta.shard_id, 1);
     }
 
     #[tokio::test]

@@ -170,12 +170,18 @@ impl ControllerCore {
         // Collect track IDs before removing from registry so we can notify all shards.
         let tracks: Vec<_> = room.tracks_published_by(participant_id);
         let track_ids = tracks.iter().map(|t| t.meta.id).collect();
+        let shard_id = meta.shard_id;
         let room_id = meta.room_id;
 
-        if let Some(shard_id) = self.registry.remove_participant(participant_id) {
-            eq.send(shard_id, ShardCommand::RemoveParticipant(*participant_id));
+        if let Some(removed_shard_id) = self.registry.remove_participant(participant_id) {
+            eq.send(
+                removed_shard_id,
+                ShardCommand::RemoveParticipant(*participant_id),
+            );
         }
         eq.broadcast(ClusterCommand::UnregisterParticipant {
+            shard_id,
+            room_id,
             participant_id: *participant_id,
         });
         if !tracks.is_empty() {
@@ -230,7 +236,8 @@ mod tests {
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) = eq.pop()
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
+            eq.pop()
         else {
             panic!("expected one cluster command");
         };
@@ -256,7 +263,8 @@ mod tests {
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) = eq.pop()
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
+            eq.pop()
         else {
             panic!("expected one cluster command");
         };
@@ -299,13 +307,92 @@ mod tests {
             &mut eq,
         );
 
-        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) = eq.pop()
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
+            eq.pop()
         else {
             panic!("expected publish cluster command");
         };
 
         assert_eq!(shard_id, 2);
-        assert!(matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room));
+        assert!(
+            matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
+        );
+        assert!(eq.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_participant_broadcasts_scoped_unregister() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let room = room_id(2);
+        let participant = pid(20);
+
+        core.registry.add_participant(participant, room, 6);
+        core.delete_participant(&participant, &mut eq);
+
+        let Some(ControllerEvent::ShardCommandSent(
+            shard_id,
+            ShardCommand::RemoveParticipant(removed),
+        )) = eq.pop()
+        else {
+            panic!("expected local shard removal command");
+        };
+        assert_eq!(shard_id, 6);
+        assert_eq!(removed, participant);
+
+        let Some(ControllerEvent::ShardCommandBroadcasted(ClusterCommand::UnregisterParticipant {
+            shard_id,
+            room_id,
+            participant_id,
+        })) = eq.pop()
+        else {
+            panic!("expected scoped unregister broadcast");
+        };
+        assert_eq!(shard_id, 6);
+        assert_eq!(room_id, room);
+        assert_eq!(participant_id, participant);
+    }
+
+    #[test]
+    fn track_published_targets_latest_subscriber_shard_after_move() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let room = room_id(3);
+        let publisher = pid(30);
+        let subscriber = pid(31);
+
+        core.registry.add_participant(publisher, room, 0);
+        core.registry.add_participant(subscriber, room, 1);
+        core.registry.add_participant(subscriber, room, 2);
+
+        let track = crate::track::Track {
+            meta: TrackMeta {
+                shard_id: 0,
+                id: publisher.derive_track_id(MediaKind::Audio, "a"),
+                origin: publisher,
+                kind: MediaKind::Audio,
+            },
+            layers: Vec::new(),
+        };
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: 0,
+                ev: ShardEvent::TrackPublished(track.clone()),
+            },
+            &mut eq,
+        );
+
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
+            eq.pop()
+        else {
+            panic!("expected publish cluster command");
+        };
+
+        assert_eq!(shard_id, 2);
+        assert!(
+            matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
+        );
         assert!(eq.pop().is_none());
     }
 }

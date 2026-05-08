@@ -35,6 +35,14 @@ impl AudioAllocator {
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
+        if self.has_slot(slot.mid) {
+            tracing::debug!(
+                target: crate::log::TARGET_AUDIO,
+                mid = %slot.mid,
+                "audio slot already provisioned; skipping duplicate"
+            );
+            return;
+        }
         if let Some(entry) = self.slots.iter_mut().find(|s| s.is_none()) {
             *entry = Some(Slot {
                 mid: slot.mid,
@@ -52,6 +60,10 @@ impl AudioAllocator {
                 "audio allocator has no free slot; dropping slot provisioning"
             );
         }
+    }
+
+    pub fn has_slot(&self, mid: Mid) -> bool {
+        self.slots.iter().flatten().any(|slot| slot.mid == mid)
     }
 
     pub fn on_rtp(
@@ -85,5 +97,84 @@ impl AudioAllocator {
         }
         writer.write_audio_owned(pkt, &slot.ssrc, slot.pt);
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::participant::downstream::SlotConfig;
+    use crate::rtp::RtpPacket;
+    use crate::track::StreamWriter;
+    use str0m::RtcConfig;
+    use str0m::media::{MediaKind, Mid, Pt};
+    use str0m::rtp::Ssrc;
+
+    fn make_audio_slot() -> SlotConfig {
+        SlotConfig {
+            mid: Mid::from("a0"),
+            rid: None,
+            ssrc: Ssrc::from(1234_u32),
+            pt: Pt::from(111_u8),
+            kind: MediaKind::Audio,
+        }
+    }
+
+    #[test]
+    fn first_forwarded_packet_clears_pending_marker() {
+        let mut alloc = AudioAllocator::new();
+        alloc.add_slot(make_audio_slot());
+        assert!(
+            alloc.slots[0].as_ref().is_some_and(|s| s.pending_marker),
+            "new audio slot must start with pending marker"
+        );
+
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut writer = StreamWriter(&mut rtc);
+
+        let first = RtpPacket::default();
+        let _ = alloc.on_rtp(0, &first, &mut writer);
+        assert!(
+            alloc.slots[0].as_ref().is_some_and(|s| !s.pending_marker),
+            "first forwarded packet must consume pending marker"
+        );
+
+        let second = RtpPacket::default();
+        let _ = alloc.on_rtp(0, &second, &mut writer);
+        assert!(
+            alloc.slots[0].as_ref().is_some_and(|s| !s.pending_marker),
+            "pending marker must stay cleared for subsequent packets"
+        );
+    }
+
+    #[test]
+    fn unprovisioned_slot_does_not_toggle_other_slots() {
+        let mut alloc = AudioAllocator::new();
+        alloc.add_slot(make_audio_slot());
+
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut writer = StreamWriter(&mut rtc);
+
+        let pkt = RtpPacket::default();
+        let res = alloc.on_rtp(1, &pkt, &mut writer);
+        assert!(res.is_none(), "unprovisioned slot must be dropped");
+        assert!(
+            alloc.slots[0].as_ref().is_some_and(|s| s.pending_marker),
+            "dropping another slot must not consume pending marker"
+        );
+    }
+
+    #[test]
+    fn duplicate_mid_is_ignored() {
+        let mut alloc = AudioAllocator::new();
+        let slot = make_audio_slot();
+        alloc.add_slot(slot.clone());
+        alloc.add_slot(slot);
+
+        let provisioned = alloc.slots.iter().flatten().count();
+        assert_eq!(
+            provisioned, 1,
+            "duplicate mid must not consume a second slot"
+        );
     }
 }

@@ -258,6 +258,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn first_packet_after_slot_claim_has_marker() {
+        let mut sel = new_sel();
+        let s = make_stream();
+        let base = Instant::now();
+
+        let mut first = pkt_at(base, 0, -20);
+        let slot = sel
+            .filter(s, &mut first)
+            .expect("packet should be selected");
+        assert!(
+            first.marker,
+            "first packet on a newly claimed slot must set marker"
+        );
+
+        let mut second = pkt_at(base, TICK_MS, -20);
+        let slot2 = sel
+            .filter(s, &mut second)
+            .expect("packet should be selected");
+        assert_eq!(slot, slot2, "owner should remain in same slot");
+        assert!(
+            !second.marker,
+            "subsequent packets from the same owner must not keep forcing marker"
+        );
+    }
+
+    #[test]
+    fn marker_is_set_when_slot_owner_switches() {
+        let mut sel = new_sel();
+        let a = make_stream();
+        let b = make_stream();
+        let base = Instant::now();
+
+        let mut first = pkt_at(base, 0, -20);
+        let slot = sel
+            .filter(a, &mut first)
+            .expect("first packet should be selected");
+        assert!(first.marker);
+
+        // After DEAD_TIMEOUT the old owner is considered dead, so the new owner can steal the slot.
+        let mut switched = pkt_at(base, 2500, -10);
+        let slot2 = sel
+            .filter(b, &mut switched)
+            .expect("second owner packet should be selected");
+        assert_eq!(slot, slot2, "new owner should reuse the dead slot");
+        assert!(
+            switched.marker,
+            "first packet after a slot owner switch must set marker"
+        );
+    }
+
     /// Helper: send `n` packets at the provided level, return the StreamId.
     fn add_stream_at_level(
         sel: &mut TopNAudioSelector,

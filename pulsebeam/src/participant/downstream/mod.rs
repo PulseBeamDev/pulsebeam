@@ -84,6 +84,13 @@ impl DownstreamAllocator {
         self.dirty_allocation = true;
     }
 
+    pub fn has_slot(&self, kind: MediaKind, mid: Mid) -> bool {
+        match kind {
+            MediaKind::Video => self.video.has_slot(mid),
+            MediaKind::Audio => self.audio.has_slot(mid),
+        }
+    }
+
     pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
         self.available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         self.dirty_allocation = true;
@@ -97,7 +104,7 @@ impl DownstreamAllocator {
         assignments_changed
     }
 
-    pub fn reconcile_routes(&mut self, now: Instant, events: &mut EventQueue) {
+    pub fn reconcile_routes(&mut self, _now: Instant, events: &mut EventQueue) {
         self.video.reconcile_routes(events);
     }
 

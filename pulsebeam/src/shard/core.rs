@@ -76,7 +76,7 @@ pub(crate) trait CrossShardSend {
     fn shard_id(&self) -> usize;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ParticipantShardMeta {
     shard_id: usize,
     room_id: RoomId,
@@ -317,29 +317,18 @@ impl ShardCore {
                 participant_id,
             } => {
                 if shard_id != self.shard_id {
-                    self.participant_shards
-                        .insert(participant_id, ParticipantShardMeta { room_id, shard_id });
-                    self.rooms
-                        .entry(room_id)
-                        .or_insert_with(|| RoomState::new(&mut self.rng))
-                        .remote_shards
-                        .insert(shard_id);
+                    self.register_remote_participant(participant_id, room_id, shard_id);
                 }
             }
-            ClusterCommand::UnregisterParticipant { participant_id } => {
-                if let Some(meta) = self.participant_shards.remove(&participant_id)
-                    && let Some(room) = self.rooms.get_mut(&meta.room_id)
-                {
-                    let shard_still_has_room_participants = self.participant_shards.values().any(|other| {
-                        other.room_id == meta.room_id && other.shard_id == meta.shard_id
-                    });
-                    if !shard_still_has_room_participants {
-                        room.remote_shards.swap_remove(&meta.shard_id);
-                    }
-                    if room.members.is_empty() && room.remote_shards.is_empty() {
-                        self.rooms.remove(&meta.room_id);
-                    }
-                }
+            ClusterCommand::UnregisterParticipant {
+                shard_id,
+                room_id,
+                participant_id,
+            } => {
+                self.unregister_remote_participant(
+                    participant_id,
+                    ParticipantShardMeta { shard_id, room_id },
+                );
                 let addrs = self.demuxer.unregister(participant_id);
                 self.pending_close.extend(addrs);
             }
@@ -493,12 +482,82 @@ impl ShardCore {
         self.input_dirty.insert(participant_id);
     }
 
+    fn register_remote_participant(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        shard_id: usize,
+    ) {
+        let next = ParticipantShardMeta { room_id, shard_id };
+        if self.participant_shards.get(&participant_id).copied() == Some(next) {
+            self.rooms
+                .entry(room_id)
+                .or_insert_with(|| RoomState::new(&mut self.rng))
+                .remote_shards
+                .insert(shard_id);
+            return;
+        }
+        if let Some(previous) = self.participant_shards.remove(&participant_id) {
+            self.cleanup_remote_participant_membership(participant_id, previous);
+        }
+        self.participant_shards.insert(participant_id, next);
+        self.rooms
+            .entry(room_id)
+            .or_insert_with(|| RoomState::new(&mut self.rng))
+            .remote_shards
+            .insert(shard_id);
+    }
+
+    fn unregister_remote_participant(
+        &mut self,
+        participant_id: ParticipantId,
+        expected: ParticipantShardMeta,
+    ) {
+        let Some(current) = self.participant_shards.get(&participant_id).copied() else {
+            return;
+        };
+        if current != expected {
+            tracing::warn!(
+                %participant_id,
+                current_shard = current.shard_id,
+                current_room = %current.room_id,
+                expected_shard = expected.shard_id,
+                expected_room = %expected.room_id,
+                "ignoring stale remote participant unregister"
+            );
+            return;
+        }
+        self.participant_shards.remove(&participant_id);
+        self.cleanup_remote_participant_membership(participant_id, current);
+    }
+
+    fn cleanup_remote_participant_membership(
+        &mut self,
+        participant_id: ParticipantId,
+        meta: ParticipantShardMeta,
+    ) {
+        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
+            let shard_still_has_room_participants =
+                self.participant_shards.iter().any(|(other_id, other)| {
+                    *other_id != participant_id
+                        && other.room_id == meta.room_id
+                        && other.shard_id == meta.shard_id
+                });
+            if !shard_still_has_room_participants {
+                room.remote_shards.swap_remove(&meta.shard_id);
+            }
+            if room.members.is_empty() && room.remote_shards.is_empty() {
+                self.rooms.remove(&meta.room_id);
+            }
+        }
+    }
+
     fn remove_participant(
         &mut self,
         participant_id: &ParticipantId,
         _router: &impl CrossShardSend,
     ) -> Option<ParticipantMeta> {
-        let mut participant = self.participants.remove(participant_id)?;
+        let participant = self.participants.remove(participant_id)?;
         if let Some(room) = self.rooms.get_mut(&participant.room_id) {
             room.members.swap_remove(participant_id);
             if room.members.is_empty() && room.remote_shards.is_empty() {
@@ -1210,6 +1269,8 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                shard_id: 1,
+                room_id: rid,
                 participant_id: participant,
             }),
             &router,
@@ -1247,6 +1308,8 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                shard_id: 1,
+                room_id: rid,
                 participant_id: participant_a,
             }),
             &router,
@@ -1263,6 +1326,8 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                shard_id: 1,
+                room_id: rid,
                 participant_id: participant_b,
             }),
             &router,
@@ -1272,6 +1337,166 @@ mod tests {
             !core.rooms.contains_key(&rid),
             "room must be removed once the final remote participant leaves"
         );
+    }
+
+    #[test]
+    fn register_remote_participant_replaces_previous_shard_membership() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let participant = pid();
+        let rid = room_id("remote-move");
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: rid,
+                participant_id: participant,
+            }),
+            &router,
+        );
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 2,
+                room_id: rid,
+                participant_id: participant,
+            }),
+            &router,
+        );
+
+        assert!(!core.rooms[&rid].remote_shards.contains(&1));
+        assert!(core.rooms[&rid].remote_shards.contains(&2));
+        assert!(matches!(
+            core.participant_shards.get(&participant),
+            Some(meta) if meta.shard_id == 2 && meta.room_id == rid
+        ));
+    }
+
+    #[test]
+    fn register_remote_participant_duplicate_is_idempotent() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let participant = pid();
+        let rid = room_id("remote-dup");
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: rid,
+                participant_id: participant,
+            }),
+            &router,
+        );
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: rid,
+                participant_id: participant,
+            }),
+            &router,
+        );
+
+        assert_eq!(core.participant_shards.len(), 1);
+        assert!(core.rooms.contains_key(&rid));
+        assert_eq!(core.rooms[&rid].remote_shards.len(), 1);
+        assert!(core.rooms[&rid].remote_shards.contains(&1));
+    }
+
+    #[test]
+    fn audio_rtp_from_remote_origin_fans_out_to_local_subscriber_first() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let subscriber = pid();
+        let origin_remote = pid();
+        let rid = room_id("audio-subscriber-first");
+
+        add_participant(&mut core, &router, subscriber, rid);
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: rid,
+                participant_id: origin_remote,
+            }),
+            &router,
+        );
+
+        let mut pkt = RtpPacket::default();
+        pkt.ext_vals.audio_level = Some(-30);
+        pkt.arrival_ts = tokio::time::Instant::now();
+        pkt.playout_time = pkt.arrival_ts;
+
+        core.on_cross_shard_event(
+            CrossShardEvent::AudioRtpPublished {
+                room_id: rid,
+                origin: origin_remote,
+                stream_id: audio_stream(origin_remote),
+                pkt,
+            },
+            tokio::time::Instant::now(),
+            &router,
+        );
+
+        assert!(
+            core.fanout_dirty.contains(&subscriber),
+            "remote-origin audio must still be fanned out to local subscribers"
+        );
+        assert!(
+            router.take_sent().is_empty(),
+            "remote-origin audio on subscriber shard must not be re-broadcast"
+        );
+    }
+
+    #[test]
+    fn unregister_participant_ignores_stale_remote_registration() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let participant = pid();
+        let old_room = room_id("remote-old");
+        let new_room = room_id("remote-new");
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: old_room,
+                participant_id: participant,
+            }),
+            &router,
+        );
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 2,
+                room_id: new_room,
+                participant_id: participant,
+            }),
+            &router,
+        );
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                shard_id: 1,
+                room_id: old_room,
+                participant_id: participant,
+            }),
+            &router,
+        );
+
+        assert!(matches!(
+            core.participant_shards.get(&participant),
+            Some(meta) if meta.shard_id == 2 && meta.room_id == new_room
+        ));
+        assert!(!core.rooms.contains_key(&old_room));
+        assert!(core.rooms[&new_room].remote_shards.contains(&2));
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                shard_id: 2,
+                room_id: new_room,
+                participant_id: participant,
+            }),
+            &router,
+        );
+
+        assert!(!core.participant_shards.contains_key(&participant));
+        assert!(!core.rooms.contains_key(&new_room));
     }
 
     #[test]

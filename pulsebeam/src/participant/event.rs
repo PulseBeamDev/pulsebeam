@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use str0m::media::{KeyframeRequestKind, MediaKind, Rid};
+use str0m::media::KeyframeRequestKind;
 use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, RoomId};

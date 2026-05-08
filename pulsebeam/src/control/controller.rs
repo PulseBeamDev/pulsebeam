@@ -12,7 +12,7 @@ use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
     shard::{
         ShardContext,
-        worker::{ClusterCommand, ShardCommand, ShardEvent, ShardEventWrapper},
+        worker::{ClusterCommand, ShardCommand, ShardEventWrapper},
     },
 };
 use pulsebeam_runtime::mailbox;

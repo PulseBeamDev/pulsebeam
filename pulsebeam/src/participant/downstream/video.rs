@@ -154,7 +154,15 @@ impl VideoAllocator {
         })
     }
 
+    pub fn has_slot(&self, mid: Mid) -> bool {
+        self.slots.values().any(|s| s.mid == mid)
+    }
+
     pub fn add_slot(&mut self, config: SlotConfig) {
+        if self.has_slot(config.mid) {
+            tracing::debug!(mid = %config.mid, "video slot already provisioned; skipping duplicate");
+            return;
+        }
         let slot = Slot::new(config, &mut self.rng);
         self.slots.insert(slot);
         self.rebalance();

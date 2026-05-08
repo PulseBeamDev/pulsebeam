@@ -7,8 +7,6 @@ use pulsebeam_runtime::{
 };
 use tokio::time::Instant;
 
-use str0m::media::MediaKind;
-
 use crate::{
     entity::{self, ParticipantId, RoomId, TrackId},
     participant::ParticipantConfig,
@@ -45,6 +43,8 @@ pub enum ClusterCommand {
         participant_id: entity::ParticipantId,
     },
     UnregisterParticipant {
+        shard_id: usize,
+        room_id: RoomId,
         participant_id: ParticipantId,
     },
     PublishTrack(Track, RoomId),

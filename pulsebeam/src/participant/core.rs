@@ -9,9 +9,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::Protocol;
-use str0m::rtp::Ssrc;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
