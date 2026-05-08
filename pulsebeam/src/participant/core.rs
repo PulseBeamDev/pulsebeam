@@ -77,8 +77,6 @@ pub struct ParticipantCore {
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
-    slot_meta: HashMap<Mid, (Pt, Ssrc)>,
-    first_poll: bool,
     pending_ingress: VecDeque<RecvPacketBatch>,
 
     // Warm: touched per poll cycle
@@ -127,14 +125,12 @@ impl ParticipantCore {
 
         let mut p = Self {
             pending_ingress: VecDeque::new(),
-            first_poll: true,
             participant_id: cfg.participant_id,
             rtc,
             udp_batcher,
             tcp_batcher,
             upstream: UpstreamAllocator::new(),
             downstream: DownstreamAllocator::new(cfg.participant_id, cfg.manual_sub, rng),
-            slot_meta: HashMap::new(),
             disconnect_reason: None,
             signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
@@ -401,38 +397,6 @@ impl ParticipantCore {
         result
     }
 
-    pub fn handle_forward_rtp(&mut self, mid: Mid, pkt: &RtpPacket) {
-        let Some(&(pt, ssrc)) = self.slot_meta.get(&mid) else {
-            tracing::warn!(%mid, "Dropping RTP: mid not in slot_meta (slot not yet negotiated)");
-            return;
-        };
-
-        let mut api = self.rtc.direct_api();
-        let Some(writer) = api.stream_tx(&ssrc) else {
-            tracing::warn!(%mid, %ssrc, "Dropping RTP for invalid stream mid");
-            return;
-        };
-
-        tracing::trace!(
-            "forward rtp: seqno={},rtp_ts={:?},playout_time={:?}",
-            pkt.seq_no,
-            pkt.rtp_ts,
-            pkt.playout_time
-        );
-        if let Err(err) = writer.write_rtp(
-            pt,
-            pkt.seq_no,
-            pkt.rtp_ts.numer() as u32,
-            pkt.playout_time.into(),
-            pkt.marker,
-            pkt.ext_vals.clone(),
-            true,
-            pkt.payload.to_vec(),
-        ) {
-            tracing::warn!(%mid, %ssrc, "Dropping RTP for invalid rtp header: {err:?}");
-        }
-    }
-
     fn handle_event(&mut self, e: Event, events: &mut EventQueue) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
@@ -519,8 +483,6 @@ impl ParticipantCore {
                 {
                     let mut api = self.rtc.direct_api();
                     if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
-                        self.slot_meta.insert(media.mid, (pt, stream.ssrc()));
-
                         self.downstream.add_slot(SlotConfig {
                             mid: media.mid,
                             // TODO: don't ignore simulcast receivers
