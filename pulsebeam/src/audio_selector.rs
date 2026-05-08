@@ -11,18 +11,14 @@ use crate::{
 
 pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
 
-/// -40 dBov → linear power: 10^(-40/10) = 0.0001
-const SPEECH_THRESHOLD: f32 = 1e-4;
 /// Slot is considered dead if no packet has arrived within this window.
 const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
-/// Slot is considered resting (DTX) if no *loud* packet has arrived within this window.
-const DTX_REST_TIMEOUT: Duration = Duration::from_millis(500);
 /// After a slot is stolen, this window protects the new owner from being immediately
 /// evicted by delayed packets from the previous owner.
 const NEWBORN_IMMUNITY: Duration = Duration::from_millis(300);
-/// +5 dB power ratio: 10^(5/10) ≈ 3.1623. The incoming packet must be this much
-/// louder than the quietest active slot to steal it during active contention.
-const HYSTERESIS_MULTIPLIER: f32 = 3.1623;
+/// Half-life for contention power decay. This keeps ranking relative, but avoids
+/// slot thrash from single low-power packets (e.g. transient DTX/silence frames).
+const POWER_HALF_LIFE: Duration = Duration::from_millis(300);
 
 struct SlotTimeline {
     timeline: Timeline,
@@ -31,15 +27,12 @@ struct SlotTimeline {
 
 struct SlotState {
     owner: Option<StreamId>,
-    /// Wall-clock time of the most recent packet (loud or quiet). `None` means the
+    /// Wall-clock time of the most recent packet. `None` means the
     /// slot has never been used.
     last_arrival_ts: Option<Instant>,
-    /// Wall-clock time of the most recent packet that exceeded SPEECH_THRESHOLD.
-    /// `None` means the slot has never received a loud packet.
-    last_loud_ts: Option<Instant>,
     /// Wall-clock time until which this slot cannot be stolen (newborn immunity).
     immunity_expiry: Instant,
-    /// Power of the most recent packet, used for Active Contention (Priority C).
+    /// Power of the most recent packet, used for relative contention ranking.
     last_power: f32,
     slot_timeline: SlotTimeline,
 }
@@ -52,15 +45,6 @@ impl SlotState {
             (None, _) => true,
             (Some(_), None) => true,
             (Some(_), Some(ts)) => now.duration_since(ts) > DEAD_TIMEOUT,
-        }
-    }
-
-    /// A slot is "resting" (DTX mode) if its owner has sent no loud packet recently.
-    #[inline]
-    fn is_resting(&self, now: Instant) -> bool {
-        match self.last_loud_ts {
-            None => true,
-            Some(ts) => now.duration_since(ts) > DTX_REST_TIMEOUT,
         }
     }
 
@@ -84,7 +68,6 @@ impl TopNAudioSelector {
             slots: std::array::from_fn(|_| SlotState {
                 owner: None,
                 last_arrival_ts: None,
-                last_loud_ts: None,
                 immunity_expiry: init_instant,
                 last_power: 0.0,
                 slot_timeline: SlotTimeline {
@@ -97,31 +80,27 @@ impl TopNAudioSelector {
 
     #[inline]
     pub fn filter(&mut self, stream_id: StreamId, pkt: &mut RtpPacket) -> Option<usize> {
-        // Step 1: Parse power and wall-clock arrival time.
+        // Step 1: Parse relative power and wall-clock arrival time.
         let power = rfc6464_to_power(pkt.ext_vals.audio_level.unwrap_or(-127));
-        let is_loud = power > SPEECH_THRESHOLD;
         let now = pkt.arrival_ts;
 
-        // Step 2: Gatekeeper — non-owners that are not loud are dropped immediately.
-        let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
-        if owner_slot.is_none() && !is_loud {
-            return None;
+        // Step 1.5: Decay all slot powers to keep ranking fresh over time.
+        for slot in &mut self.slots {
+            slot.last_power = decayed_power(slot.last_power, slot.last_arrival_ts, now);
         }
 
-        // Step 3: Owner fast-path — update timestamps and forward.
+        // Step 2: Owner fast-path — update timestamps and forward.
+        let owner_slot = self.slots.iter().position(|s| s.owner == Some(stream_id));
         if let Some(idx) = owner_slot {
             let slot = &mut self.slots[idx];
             slot.last_arrival_ts = Some(now);
-            slot.last_power = power;
-            if is_loud {
-                slot.last_loud_ts = Some(now);
-            }
+            // Peak-hold with decay: a single quiet packet must not instantly demote rank.
+            slot.last_power = slot.last_power.max(power);
             Self::rewrite_slot_timeline(&mut slot.slot_timeline, false, pkt);
             return Some(idx);
         }
 
-        // Step 4: Slot stealing — we have a loud non-owner. Find a victim.
-        // Filter out immune slots first, then apply priority order.
+        // Step 3: Slot stealing, in priority order among non-immune slots.
 
         // Priority A: Dead slot (no owner, or silent for >DEAD_TIMEOUT).
         let victim = self
@@ -129,17 +108,7 @@ impl TopNAudioSelector {
             .iter()
             .position(|s| !s.is_immune(now) && s.is_dead(now));
 
-        // Priority B: Resting (DTX) slot — pick the one that has been resting longest.
-        let victim = victim.or_else(|| {
-            self.slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.is_immune(now) && s.is_resting(now))
-                .min_by_key(|(_, s)| s.last_loud_ts)
-                .map(|(i, _)| i)
-        });
-
-        // Priority C: Active contention — find the quietest non-immune slot and compare.
+        // Priority B: Active contention — strict relative rank by power.
         let victim = victim.or_else(|| {
             let (quietest_idx, quietest_slot) = self
                 .slots
@@ -151,9 +120,17 @@ impl TopNAudioSelector {
                         .partial_cmp(&b.last_power)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })?;
-            if power > quietest_slot.last_power * HYSTERESIS_MULTIPLIER {
+            if power > quietest_slot.last_power {
                 Some(quietest_idx)
             } else {
+                tracing::warn!(
+                    target: crate::log::TARGET_AUDIO,
+                    stream_id = %stream_id.0,
+                    incoming_power = power,
+                    quietest_power = quietest_slot.last_power,
+                    quietest_slot = quietest_idx,
+                    "audio selector dropped packet in contention"
+                );
                 None
             }
         });
@@ -163,7 +140,6 @@ impl TopNAudioSelector {
         let slot = &mut self.slots[victim_idx];
         slot.owner = Some(stream_id);
         slot.last_arrival_ts = Some(now);
-        slot.last_loud_ts = Some(now);
         slot.immunity_expiry = now + NEWBORN_IMMUNITY;
         slot.last_power = power;
         Self::rewrite_slot_timeline(&mut slot.slot_timeline, true, pkt);
@@ -207,6 +183,25 @@ impl TopNAudioSelector {
 fn rfc6464_to_power(level: i8) -> f32 {
     let clamped = level.clamp(-127, 0) as f32;
     10.0_f32.powf(clamped / 10.0)
+}
+
+#[inline(always)]
+fn decayed_power(power: f32, last_arrival_ts: Option<Instant>, now: Instant) -> f32 {
+    let Some(last) = last_arrival_ts else {
+        return 0.0;
+    };
+    let dt = now
+        .checked_duration_since(last)
+        .unwrap_or(Duration::from_millis(0));
+    if dt.is_zero() {
+        return power;
+    }
+    let half_life = POWER_HALF_LIFE.as_secs_f32();
+    if half_life <= 0.0 {
+        return power;
+    }
+    let decay = 2.0_f32.powf(-(dt.as_secs_f32() / half_life));
+    power * decay
 }
 
 #[cfg(test)]
@@ -254,20 +249,29 @@ mod tests {
         }
     }
 
-    /// Helper: send `n` loud packets spaced TICK_MS apart, return the StreamId.
-    fn add_loud_stream(sel: &mut TopNAudioSelector, base: Instant, start_ms: u64) -> StreamId {
+    /// Helper: send `n` packets at the provided level, return the StreamId.
+    fn add_stream_at_level(
+        sel: &mut TopNAudioSelector,
+        base: Instant,
+        start_ms: u64,
+        level: i8,
+    ) -> StreamId {
         let id = make_stream();
         for t in 0..5u64 {
-            sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, 0));
+            sel.filter(id, &mut pkt_at(base, start_ms + t * TICK_MS, level));
         }
         id
     }
 
-    /// Fill all SELECTOR_SLOTS with active loud streams.
-    /// All streams send their last packet at `base + start_ms + 4*TICK_MS`.
-    fn fill_slots(sel: &mut TopNAudioSelector, base: Instant, start_ms: u64) -> Vec<StreamId> {
+    /// Fill all SELECTOR_SLOTS with streams at a fixed level.
+    fn fill_slots_at_level(
+        sel: &mut TopNAudioSelector,
+        base: Instant,
+        start_ms: u64,
+        level: i8,
+    ) -> Vec<StreamId> {
         (0..SELECTOR_SLOTS)
-            .map(|_| add_loud_stream(sel, base, start_ms))
+            .map(|_| add_stream_at_level(sel, base, start_ms, level))
             .collect()
     }
 
@@ -277,40 +281,40 @@ mod tests {
 
     // ── 1. Basic admission ────────────────────────────────────────────────────
 
-    /// A single loud packet from an unknown stream should claim an empty slot.
+    /// A single packet from an unknown stream should claim an empty slot.
     #[test]
-    fn loud_packet_claims_empty_slot() {
+    fn packet_claims_empty_slot() {
         let mut sel = new_sel();
         let base = Instant::now();
         let id = make_stream();
         let result = sel.filter(id, &mut pkt_at(base, 0, 0));
-        assert!(result.is_some(), "loud packet must claim an empty slot");
+        assert!(result.is_some(), "packet must claim an empty slot");
         assert!(slot_owners(&sel).contains(&Some(id)));
     }
 
-    /// A quiet (sub-threshold) packet from a non-owner must be dropped at the gatekeeper.
+    /// A very quiet packet still claims an empty slot when capacity exists.
     #[test]
-    fn quiet_non_owner_dropped() {
-        let base = Instant::now();
+    fn quiet_packet_claims_empty_slot() {
         let mut sel = new_sel();
+        let base = Instant::now();
         let id = make_stream();
-        // -127 dBov → power = 10^(-127/10) ≈ 2e-13, well below SPEECH_THRESHOLD (1e-4)
         let result = sel.filter(id, &mut pkt_at(base, 0, -127));
-        assert!(result.is_none(), "quiet non-owner must be dropped");
-        assert!(!slot_owners(&sel).contains(&Some(id)));
+        assert!(result.is_some(), "quiet packet must claim an empty slot");
+        assert!(slot_owners(&sel).contains(&Some(id)));
     }
 
-    /// After owning a slot, a quiet (DTX) packet from the owner must still be forwarded.
+    /// After owning a slot, a quiet packet from the owner must still be forwarded.
     #[test]
-    fn owner_dtx_packet_forwarded() {
+    fn owner_quiet_packet_forwarded() {
         let mut sel = new_sel();
         let base = Instant::now();
         let id = make_stream();
-        // Claim a slot with a loud packet.
         sel.filter(id, &mut pkt_at(base, 0, 0));
-        // Then send a DTX (quiet) packet — must be forwarded since id is the owner.
         let result = sel.filter(id, &mut pkt_at(base, 100, -127));
-        assert!(result.is_some(), "DTX packet from owner must be forwarded");
+        assert!(
+            result.is_some(),
+            "quiet packet from owner must be forwarded"
+        );
     }
 
     // ── 2. Stream occupies exactly one slot ───────────────────────────────────
@@ -329,12 +333,12 @@ mod tests {
 
     // ── 3. Slot stealing — Priority A (dead slot) ─────────────────────────────
 
-    /// A loud newcomer steals a dead slot (silent for >DEAD_TIMEOUT).
+    /// A newcomer steals a dead slot (silent for >DEAD_TIMEOUT).
     #[test]
-    fn loud_newcomer_steals_dead_slot() {
+    fn newcomer_steals_dead_slot() {
         let base = Instant::now();
         let mut sel = new_sel();
-        fill_slots(&mut sel, base, 0);
+        fill_slots_at_level(&mut sel, base, 0, -20);
         // All incumbents last active at base + 4*TICK_MS = base+80ms.
         // Advance time past DEAD_TIMEOUT (2000ms).
         let newcomer = make_stream();
@@ -344,81 +348,72 @@ mod tests {
         assert!(slot_owners(&sel).contains(&Some(newcomer)));
     }
 
-    // ── 4. Slot stealing — Priority B (DTX resting slot) ─────────────────────
+    // ── 4. Slot stealing — Relative active contention ─────────────────────────
 
-    /// A loud newcomer steals the longest-resting DTX slot when all slots have owners
-    /// but none have been loud recently.
+    /// A louder newcomer must evict the quietest active non-immune slot.
     #[test]
-    fn loud_newcomer_steals_resting_slot() {
-        let base = Instant::now();
-        let mut sel = new_sel();
-        // Fill all slots with loud streams (last loud packet at base+80ms).
-        let incumbents = fill_slots(&mut sel, base, 0);
-
-        // Keep all incumbents alive with quiet DTX pings at base+200ms so they're
-        // not dead, but their last_loud_ts stays at base+80ms (>500ms DTX_REST_TIMEOUT
-        // from the steal attempt at base+700ms).
-        for &id in &incumbents {
-            sel.filter(id, &mut pkt_at(base, 200, -127));
-        }
-
-        // At base+700ms all slots are resting (last_loud = base+80ms, 620ms ago > 500ms).
-        let newcomer = make_stream();
-        let result = sel.filter(newcomer, &mut pkt_at(base, 700, 0));
-        assert!(result.is_some(), "newcomer must steal a resting slot");
-        assert!(slot_owners(&sel).contains(&Some(newcomer)));
-    }
-
-    // ── 5. Slot stealing — Priority C (active contention) ────────────────────
-
-    /// A much louder newcomer (>+5dB) must evict the quietest active slot.
-    #[test]
-    fn much_louder_newcomer_steals_active_slot() {
+    fn louder_newcomer_steals_active_slot() {
         let mut sel = new_sel();
         let base = Instant::now();
-        // All 5 slots active with moderate level (-20 dBov).
-        // Send continuous loud packets to keep last_loud_ts fresh (within 500ms).
-        let incumbents = fill_slots(&mut sel, base, 0);
-        // Refresh at t=200ms to ensure slots are not resting at t=300ms.
+        let incumbents = fill_slots_at_level(&mut sel, base, 0, -20);
         for &id in &incumbents {
             sel.filter(id, &mut pkt_at(base, 200, -20));
         }
 
-        // Newcomer arrives at t=300ms with 0 dBov (full power = 1.0).
-        // Incumbents last_power ≈ rfc6464_to_power(-20) = 10^(-2) = 0.01.
-        // 1.0 > 0.01 * 3.1623 (≈ 0.032) → steal succeeds.
         let newcomer = make_stream();
-        let result = sel.filter(newcomer, &mut pkt_at(base, 300, 0));
+        let result = sel.filter(newcomer, &mut pkt_at(base, 300, -10));
         assert!(
             result.is_some(),
-            "much louder newcomer must steal an active slot"
+            "louder newcomer must steal an active slot"
         );
         assert!(slot_owners(&sel).contains(&Some(newcomer)));
     }
 
-    /// A newcomer just slightly louder than all incumbents must be blocked by hysteresis.
+    /// A newcomer with equal power must not steal under contention.
     #[test]
-    fn hysteresis_blocks_marginal_challenger() {
+    fn equal_power_challenger_is_blocked() {
         let base = Instant::now();
         let mut sel = new_sel();
-        // All 5 slots active with level -20 dBov; refresh to keep last_loud_ts fresh.
-        let incumbents = fill_slots(&mut sel, base, 0);
+        let incumbents = fill_slots_at_level(&mut sel, base, 0, -20);
         for &id in &incumbents {
             sel.filter(id, &mut pkt_at(base, 200, -20));
         }
 
-        // Challenger at -17 dBov: power = 10^(-17/10) ≈ 0.02.
-        // Quietest incumbent power ≈ 0.01.
-        // 0.02 > 0.01 * 3.1623 (≈ 0.032)? No (0.02 < 0.032) → blocked.
         let challenger = make_stream();
-        let result = sel.filter(challenger, &mut pkt_at(base, 300, -17));
+        let result = sel.filter(challenger, &mut pkt_at(base, 300, -20));
+        assert!(result.is_none(), "equal-power challenger must be blocked");
+    }
+
+    #[test]
+    fn transient_quiet_packet_does_not_cause_immediate_steal() {
+        let base = Instant::now();
+        let mut sel = new_sel();
+
+        // Force contention by filling all slots with strong incumbents.
+        let incumbents = fill_slots_at_level(&mut sel, base, 0, -5);
+        for &id in &incumbents {
+            sel.filter(id, &mut pkt_at(base, 400, -5));
+        }
+
+        let incumbent = incumbents[0];
+        let challenger = make_stream();
+
+        // Incumbent has one quiet packet after being strong.
+        sel.filter(incumbent, &mut pkt_at(base, 500, -127));
+
+        // Shortly after, a weaker challenger should not steal due to peak-hold decay.
+        let result = sel.filter(challenger, &mut pkt_at(base, 520, -20));
         assert!(
             result.is_none(),
-            "marginally louder challenger must be blocked by hysteresis"
+            "weaker challenger must not steal after one quiet packet"
+        );
+        assert!(
+            slot_owners(&sel).contains(&Some(incumbent)),
+            "incumbent should retain ownership"
         );
     }
 
-    // ── 6. Newborn immunity ───────────────────────────────────────────────────
+    // ── 5. Newborn immunity ───────────────────────────────────────────────────
 
     /// Delayed packets from the evicted stream must NOT re-steal the slot during
     /// the NEWBORN_IMMUNITY window.
@@ -426,24 +421,16 @@ mod tests {
     fn newborn_immunity_blocks_evicted_owner() {
         let base = Instant::now();
         let mut sel = new_sel();
-        // Fill with 5 resting streams (last_loud = base+80ms).
-        let evicted_candidates = fill_slots(&mut sel, base, 0);
-        for &id in &evicted_candidates {
-            sel.filter(id, &mut pkt_at(base, 200, -127));
-        }
-
-        // Newcomer steals at base+700ms (slots are resting, >500ms DTX_REST_TIMEOUT).
+        let evicted_candidates = fill_slots_at_level(&mut sel, base, 0, -20);
         let newcomer = make_stream();
         let stolen_idx = sel
-            .filter(newcomer, &mut pkt_at(base, 700, 0))
+            .filter(newcomer, &mut pkt_at(base, 500, -10))
             .expect("newcomer must steal a slot");
 
-        // 50ms later (well within 300ms immunity), the evicted stream sends a loud packet.
-        // It should NOT be able to steal back the slot.
+        // 50ms later (well within 300ms immunity), the evicted stream sends a stronger packet.
+        // It must not steal back the slot while immunity is active.
         let evicted_id = evicted_candidates[stolen_idx];
-        let result = sel.filter(evicted_id, &mut pkt_at(base, 750, 0));
-        // evicted_id may own a different slot (not the stolen one), but it must not
-        // have displaced the newcomer from the stolen slot.
+        let result = sel.filter(evicted_id, &mut pkt_at(base, 550, 0));
         assert_eq!(
             sel.slots[stolen_idx].owner,
             Some(newcomer),
@@ -452,7 +439,7 @@ mod tests {
         let _ = result;
     }
 
-    // ── 7. remove_track ───────────────────────────────────────────────────────
+    // ── 6. remove_track ───────────────────────────────────────────────────────
 
     #[test]
     fn remove_track_frees_slot() {
@@ -465,7 +452,7 @@ mod tests {
         assert!(!slot_owners(&sel).contains(&Some(id)));
     }
 
-    // ── 8. cleanup ────────────────────────────────────────────────────────────
+    // ── 7. cleanup ────────────────────────────────────────────────────────────
 
     #[test]
     fn cleanup_evicts_dead_slots() {

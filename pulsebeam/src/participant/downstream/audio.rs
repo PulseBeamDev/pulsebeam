@@ -41,6 +41,15 @@ impl AudioAllocator {
                 ssrc,
                 pending_marker: true,
             });
+        } else {
+            tracing::warn!(
+                target: crate::log::TARGET_AUDIO,
+                %mid,
+                %pt,
+                %ssrc,
+                slots = SELECTOR_SLOTS,
+                "audio allocator has no free slot; dropping slot provisioning"
+            );
         }
     }
 
@@ -50,7 +59,24 @@ impl AudioAllocator {
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) -> Option<()> {
-        let slot = self.slots.get_mut(slot_idx)?.as_mut()?;
+        let Some(slot_entry) = self.slots.get_mut(slot_idx) else {
+            tracing::warn!(
+                target: crate::log::TARGET_AUDIO,
+                slot_idx,
+                slots = self.slots.len(),
+                "audio allocator received out-of-range slot index"
+            );
+            return None;
+        };
+        let Some(slot) = slot_entry.as_mut() else {
+            tracing::warn!(
+                target: crate::log::TARGET_AUDIO,
+                slot_idx,
+                slots = self.slots.len(),
+                "audio allocator received packet for unprovisioned slot"
+            );
+            return None;
+        };
         let mut pkt = pkt.clone();
         if slot.pending_marker {
             pkt.marker = true;
