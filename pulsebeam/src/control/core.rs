@@ -111,7 +111,7 @@ impl ControllerCore {
             ShardEvent::TrackUnsubscribed(track) => {
                 eq.send_cluster(
                     track.shard_id,
-                    ClusterCommand::SubscribeTrack {
+                    ClusterCommand::UnsubscribeTrack {
                         from_shard_id: e.from_shard_id,
                         track,
                     },
@@ -185,5 +185,127 @@ impl ControllerCore {
                 track_ids,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        entity::{ExternalRoomId, ParticipantId, RoomId},
+        shard::worker::ClusterCommand,
+        track::TrackMeta,
+    };
+    use str0m::media::MediaKind;
+
+    fn pid(seed: u8) -> ParticipantId {
+        ParticipantId::from_bytes([seed; 16])
+    }
+
+    fn room_id(seed: u8) -> RoomId {
+        let external = ExternalRoomId::new(&format!("room-{seed}")).unwrap();
+        RoomId::from_external(&external)
+    }
+
+    fn track_meta(origin: ParticipantId, shard_id: usize) -> TrackMeta {
+        TrackMeta {
+            shard_id,
+            id: origin.derive_track_id(MediaKind::Video, "v"),
+            origin,
+            kind: MediaKind::Video,
+        }
+    }
+
+    #[test]
+    fn track_subscribed_routes_subscribe_command() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let track = track_meta(pid(1), 7);
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: 3,
+                ev: ShardEvent::TrackSubscribed(track.clone()),
+            },
+            &mut eq,
+        );
+
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) = eq.pop()
+        else {
+            panic!("expected one cluster command");
+        };
+
+        assert_eq!(shard_id, track.shard_id);
+        assert!(matches!(
+            cmd,
+            ClusterCommand::SubscribeTrack { from_shard_id: 3, track: routed } if routed == track
+        ));
+    }
+
+    #[test]
+    fn track_unsubscribed_routes_unsubscribe_command() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let track = track_meta(pid(2), 9);
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: 4,
+                ev: ShardEvent::TrackUnsubscribed(track.clone()),
+            },
+            &mut eq,
+        );
+
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) = eq.pop()
+        else {
+            panic!("expected one cluster command");
+        };
+
+        assert_eq!(shard_id, track.shard_id);
+        assert!(matches!(
+            cmd,
+            ClusterCommand::UnsubscribeTrack { from_shard_id: 4, track: routed } if routed == track
+        ));
+    }
+
+    #[test]
+    fn track_published_targets_existing_participant_shards_once() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let room = room_id(1);
+        let publisher = pid(10);
+        let subscriber_a = pid(11);
+        let subscriber_b = pid(12);
+
+        core.registry.add_participant(publisher, room, 0);
+        core.registry.add_participant(subscriber_a, room, 2);
+        core.registry.add_participant(subscriber_b, room, 2);
+
+        let track = crate::track::Track {
+            meta: TrackMeta {
+                shard_id: 0,
+                id: publisher.derive_track_id(MediaKind::Audio, "a"),
+                origin: publisher,
+                kind: MediaKind::Audio,
+            },
+            layers: Vec::new(),
+        };
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: 0,
+                ev: ShardEvent::TrackPublished(track.clone()),
+            },
+            &mut eq,
+        );
+
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) = eq.pop()
+        else {
+            panic!("expected publish cluster command");
+        };
+
+        assert_eq!(shard_id, 2);
+        assert!(matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room));
+        assert!(eq.pop().is_none());
     }
 }

@@ -330,7 +330,12 @@ impl ShardCore {
                 if let Some(meta) = self.participant_shards.remove(&participant_id)
                     && let Some(room) = self.rooms.get_mut(&meta.room_id)
                 {
-                    room.remote_shards.swap_remove(&meta.shard_id);
+                    let shard_still_has_room_participants = self.participant_shards.values().any(|other| {
+                        other.room_id == meta.room_id && other.shard_id == meta.shard_id
+                    });
+                    if !shard_still_has_room_participants {
+                        room.remote_shards.swap_remove(&meta.shard_id);
+                    }
                     if room.members.is_empty() && room.remote_shards.is_empty() {
                         self.rooms.remove(&meta.room_id);
                     }
@@ -1213,6 +1218,60 @@ mod tests {
         assert!(!core.participant_shards.contains_key(&participant));
         assert!(!core.rooms.contains_key(&rid));
         assert!(core.pending_close.is_empty());
+    }
+
+    #[test]
+    fn unregister_participant_keeps_remote_shard_until_last_peer_leaves() {
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let participant_a = pid();
+        let participant_b = pid();
+        let rid = room_id("unregister-keep-shard");
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: rid,
+                participant_id: participant_a,
+            }),
+            &router,
+        );
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
+                shard_id: 1,
+                room_id: rid,
+                participant_id: participant_b,
+            }),
+            &router,
+        );
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                participant_id: participant_a,
+            }),
+            &router,
+        );
+
+        assert!(
+            core.rooms[&rid].remote_shards.contains(&1),
+            "room must keep shard 1 while another remote participant remains there"
+        );
+        assert!(
+            core.participant_shards.contains_key(&participant_b),
+            "remaining remote participant must still be tracked"
+        );
+
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
+                participant_id: participant_b,
+            }),
+            &router,
+        );
+
+        assert!(
+            !core.rooms.contains_key(&rid),
+            "room must be removed once the final remote participant leaves"
+        );
     }
 
     #[test]
