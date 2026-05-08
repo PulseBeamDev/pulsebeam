@@ -80,7 +80,7 @@ impl<'a> StreamWriter<'a> {
             pkt.playout_time.into(),
             pkt.marker,
             pkt.ext_vals.clone(),
-            true,
+            false, // audio is not nackable
             pkt.payload,
         );
         if let Err(err) = res {
