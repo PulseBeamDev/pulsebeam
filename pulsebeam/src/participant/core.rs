@@ -9,11 +9,12 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
+use str0m::format::Codec;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::Protocol;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
-    media::{Direction, MediaAdded},
+    media::{Direction, MediaAdded, Pt},
 };
 use tokio::time::Instant;
 
@@ -477,21 +478,7 @@ impl ParticipantCore {
                 }
             }
             Direction::SendOnly => {
-                if let Some(m) = self.rtc.media(media.mid)
-                    && let Some(&pt) = m.remote_pts().first()
-                {
-                    let mut api = self.rtc.direct_api();
-                    if let Some(stream) = api.stream_tx_by_mid(media.mid, None) {
-                        self.downstream.add_slot(SlotConfig {
-                            mid: media.mid,
-                            // TODO: don't ignore simulcast receivers
-                            rid: None,
-                            pt,
-                            ssrc: stream.ssrc(),
-                            kind: media.kind,
-                        });
-                    }
-                }
+                self.try_add_downstream_slot(media.mid, media.kind);
                 // Update signaling slot count AFTER adding the slot so the
                 // server accepts ClientIntent requests up to the actual slot
                 // count (previously this was called before add_slot, so the
@@ -501,6 +488,66 @@ impl ParticipantCore {
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
+    }
+
+    fn preferred_send_pt(&self, mid: Mid, kind: MediaKind) -> Option<Pt> {
+        let media = self.rtc.media(mid)?;
+        let remote_pts = media.remote_pts();
+        if remote_pts.is_empty() {
+            return None;
+        }
+
+        let expected_codec = match kind {
+            MediaKind::Audio => Codec::Opus,
+            MediaKind::Video => Codec::H264,
+        };
+
+        let codec_config = self.rtc.codec_config();
+        remote_pts
+            .iter()
+            .copied()
+            .find(|pt| {
+                codec_config
+                    .params()
+                    .iter()
+                    .any(|params| params.pt() == *pt && params.spec().codec == expected_codec)
+            })
+            .or_else(|| {
+                if kind.is_video() {
+                    remote_pts.first().copied()
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn try_add_downstream_slot(&mut self, mid: Mid, kind: MediaKind) {
+        if self.downstream.has_slot(kind, mid) {
+            return;
+        }
+
+        let Some(pt) = self.preferred_send_pt(mid, kind) else {
+            tracing::warn!(%mid, ?kind, "no negotiated PT available for downstream slot");
+            return;
+        };
+
+        let ssrc = {
+            let mut api = self.rtc.direct_api();
+            let Some(stream) = api.stream_tx_by_mid(mid, None) else {
+                tracing::warn!(%mid, ?kind, "missing stream_tx_by_mid while adding downstream slot");
+                return;
+            };
+            stream.ssrc()
+        };
+
+        self.downstream.add_slot(SlotConfig {
+            mid,
+            // TODO: don't ignore simulcast receivers
+            rid: None,
+            pt,
+            ssrc,
+            kind,
+        });
     }
 
     fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket, events: &mut EventQueue) {
