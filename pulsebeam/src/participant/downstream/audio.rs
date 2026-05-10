@@ -95,7 +95,7 @@ impl AudioAllocator {
             pkt.marker = true;
             slot.pending_marker = false;
         }
-        writer.write_audio_owned(pkt, &slot.ssrc, slot.pt);
+        writer.write_audio_owned(pkt, slot.mid, slot.pt);
         Some(())
     }
 }

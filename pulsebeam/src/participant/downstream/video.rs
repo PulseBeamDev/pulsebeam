@@ -305,7 +305,7 @@ impl VideoAllocator {
         let mut state_changed = false;
         slot.process(stream_id, pkt);
         while let Some(pkt) = slot.switcher.pop() {
-            writer.write_video_owned(pkt, &slot.ssrc, slot.pt);
+            writer.write_video_owned(pkt, slot.mid, slot.rid, slot.pt);
         }
         // Only promote staging→active once we have actually seen packets for the
         // current staging layer. Otherwise an empty staging buffer will appear
