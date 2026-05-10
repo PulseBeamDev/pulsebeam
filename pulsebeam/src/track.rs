@@ -69,7 +69,7 @@ impl<'a> StreamWriter<'a> {
         };
         tracing::trace!(
             target: crate::log::TARGET_AUDIO,
-            %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
+            %ssrc, %pt, seq = %pkt.seq_no, ts = pkt.rtp_ts.numer(), len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
         let res = stream.write_rtp(
             pt,
             pkt.seq_no,
