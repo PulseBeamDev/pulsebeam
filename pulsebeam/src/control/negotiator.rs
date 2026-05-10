@@ -8,8 +8,8 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-pub const MAX_RECV_VIDEO_SLOTS: usize = 1;
-pub const MAX_RECV_AUDIO_SLOTS: usize = 1;
+pub const MAX_RECV_VIDEO_SLOTS: usize = 2;
+pub const MAX_RECV_AUDIO_SLOTS: usize = 2;
 pub const MAX_SEND_VIDEO_SLOTS: usize = 16;
 pub const MAX_SEND_AUDIO_SLOTS: usize = 5;
 pub const MAX_DATA_CHANNELS: usize = 1;

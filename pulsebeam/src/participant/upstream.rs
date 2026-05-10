@@ -4,7 +4,7 @@ use tokio::time::Instant;
 use crate::{entity::TrackId, rtp::RtpPacket, track::UpstreamTrack};
 use str0m::media::{MediaKind, Mid};
 
-const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 1;
+const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 2;
 
 struct UpstreamSlot {
     mid: Mid,

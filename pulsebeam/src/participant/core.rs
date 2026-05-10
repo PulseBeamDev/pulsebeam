@@ -47,7 +47,7 @@ pub enum DisconnectReason {
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
     InvalidMediaDirection,
-    #[error("Exceeded maximum upstream tracks: only 1 video and 1 audio allowed")]
+    #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
     #[error("Room closed")]
     RoomClosed,
@@ -83,6 +83,7 @@ pub struct ParticipantCore {
     pub upstream: UpstreamAllocator,
     pub participant_id: entity::ParticipantId,
     last_keyframe_request: HashMap<StreamId, Instant>,
+    pending_publish_tracks: HashMap<Mid, Track>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -135,6 +136,7 @@ impl ParticipantCore {
             signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
+            pending_publish_tracks: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -422,20 +424,10 @@ impl ParticipantCore {
                     self.disconnect(err.into());
                 }
             }
-            // rtp monitor handles this
-            Event::StreamPaused(_) => {
-                //     if e.paused {
-                //         return;
-                //     }
-                //
-                //     let Some(track) = self.upstream_allocator.get_track_mut(&e.mid) else {
-                //         return;
-                //     };
-                //     let Some(layer) = track.by_rid_mut(&e.rid) else {
-                //         return;
-                //     };
-                //
-                //     layer.monitor.set_manual_pause(e.paused);
+            Event::StreamPaused(stream) => {
+                if !stream.paused {
+                    self.publish_on_first_unpause(stream.mid, events);
+                }
             }
             _ => {
                 // tracing::warn!("unhandled event: {e:?}");
@@ -444,7 +436,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id, mid = %media.mid))]
-    fn handle_media_added(&mut self, media: MediaAdded, events: &mut EventQueue) {
+    fn handle_media_added(&mut self, media: MediaAdded, _events: &mut EventQueue) {
         match media.direction {
             Direction::RecvOnly => {
                 let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
@@ -460,8 +452,9 @@ impl ParticipantCore {
                         let accepted = self.upstream.add_published_track(media.mid, tx);
                         if !accepted {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+                            return;
                         }
-                        events.publish_track(track);
+                        self.pending_publish_tracks.insert(media.mid, track);
                     }
                     MediaKind::Video => {
                         let (tx, track) = track::new_video(
@@ -472,8 +465,9 @@ impl ParticipantCore {
                         let accepted = self.upstream.add_published_track(media.mid, tx);
                         if !accepted {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+                            return;
                         }
-                        events.publish_track(track);
+                        self.pending_publish_tracks.insert(media.mid, track);
                     }
                 }
             }
@@ -487,6 +481,12 @@ impl ParticipantCore {
                     .set_slot_count(self.downstream.video.slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
+        }
+    }
+
+    fn publish_on_first_unpause(&mut self, mid: Mid, events: &mut EventQueue) {
+        if let Some(track) = self.pending_publish_tracks.remove(&mid) {
+            events.publish_track(track);
         }
     }
 
