@@ -887,7 +887,10 @@ mod assignment_tests {
 
     fn add_slots(allocator: &mut VideoAllocator, count: usize) {
         for i in 0..count {
-            allocator.add_slot(SlotConfig::default());
+            allocator.add_slot(SlotConfig {
+                mid: Mid::from(&format!("s{i}")[..]),
+                ..SlotConfig::default()
+            });
         }
     }
 

@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display};
 use std::time::Duration;
-use str0m::rtp::Ssrc;
 
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
 use tokio::time::Instant;
