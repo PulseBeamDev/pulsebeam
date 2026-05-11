@@ -68,8 +68,6 @@ message UpstreamIntent {
   // - active=false: explicit stop/unpublish intent from publisher.
   // - active=true: advisory publish intent; server may also publish implicitly.
   bool active = 2;
-  // Metadata like "Screen Share" vs "Camera" can go here.
-  map<string, string> meta = 3;
 }
 
 message ClientIntent {

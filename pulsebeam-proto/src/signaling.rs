@@ -57,7 +57,7 @@ pub struct VideoRequest {
     #[prost(uint32, tag = "3")]
     pub height: u32,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpstreamIntent {
     #[prost(string, tag = "1")]
     pub mid: ::prost::alloc::string::String,
@@ -66,12 +66,6 @@ pub struct UpstreamIntent {
     /// - active=true: advisory publish intent; server may also publish implicitly.
     #[prost(bool, tag = "2")]
     pub active: bool,
-    /// Metadata like "Screen Share" vs "Camera" can go here.
-    #[prost(map = "string, string", tag = "3")]
-    pub meta: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientIntent {
