@@ -9,7 +9,10 @@ pub struct KeyframeBuffer {
     ring: Vec<Option<RtpPacket>>,
     head: SeqNo,
     tail: SeqNo,
-    segment: Option<(SeqNo, Instant)>,
+    /// (seq_no of the first packet in the keyframe group, rtp_ts numerator of that group).
+    /// Two packets belong to the same H264 access unit when they share the same rtp_ts,
+    /// so we only advance this pointer on a timestamp change (new GOP).
+    segment: Option<(SeqNo, u64)>,
     initialized: bool,
 }
 
@@ -96,8 +99,14 @@ impl KeyframeBuffer {
 
         if pkt.is_keyframe_start {
             self.segment = match self.segment.take() {
-                Some(segment) if pkt.seq_no > segment.0 => Some((pkt.seq_no, pkt.playout_time)),
-                None => Some((pkt.seq_no, pkt.playout_time)),
+                // Advance only when a keyframe from a *new* GOP arrives (different rtp_ts).
+                // H264 SPS, PPS, and IDR all have is_keyframe_start=true but share the same
+                // rtp_ts within one access unit; keeping the segment at the SPS ensures they
+                // are all forwarded and the decoder receives the parameter sets it needs.
+                Some(seg) if pkt.seq_no > seg.0 && pkt.rtp_ts.numer() != seg.1 => {
+                    Some((pkt.seq_no, pkt.rtp_ts.numer()))
+                }
+                None => Some((pkt.seq_no, pkt.rtp_ts.numer())),
                 res => res,
             };
         }
@@ -154,6 +163,7 @@ impl KeyframeBuffer {
 mod test {
     use super::*;
     use std::time::Duration;
+    use str0m::media::{Frequency, MediaTime};
 
     fn make(seq: u64, playout: Instant, is_keyframe: bool) -> RtpPacket {
         RtpPacket {
@@ -162,6 +172,59 @@ mod test {
             is_keyframe_start: is_keyframe,
             ..Default::default()
         }
+    }
+
+    /// Build a packet with an explicit RTP timestamp, for H264 GOP-boundary tests.
+    fn make_with_ts(seq: u64, rtp_ts_val: u64, is_keyframe: bool) -> RtpPacket {
+        RtpPacket {
+            seq_no: seq.into(),
+            rtp_ts: MediaTime::new(rtp_ts_val, Frequency::NINETY_KHZ),
+            is_keyframe_start: is_keyframe,
+            ..Default::default()
+        }
+    }
+
+    /// H264 often sends SPS, PPS, and IDR as three *separate* RTP packets that
+    /// all carry the same RTP timestamp and all have `is_keyframe_start = true`.
+    /// The buffer must preserve ALL THREE so the downstream decoder receives the
+    /// parameter sets it needs.  Without the fix the segment pointer advances
+    /// past SPS and PPS to IDR, causing them to be silently dropped.
+    #[test]
+    fn test_h264_sps_pps_idr_same_ts_all_preserved() {
+        let mut buf = KeyframeBuffer::new();
+        let ts = 90_000u64;
+
+        buf.push(make_with_ts(100, ts, true)); // SPS
+        buf.push(make_with_ts(101, ts, true)); // PPS
+        buf.push(make_with_ts(102, ts, true)); // IDR
+
+        assert_eq!(buf.pop().unwrap().seq_no, 100.into(), "SPS must not be dropped");
+        assert_eq!(buf.pop().unwrap().seq_no, 101.into(), "PPS must not be dropped");
+        assert_eq!(buf.pop().unwrap().seq_no, 102.into(), "IDR must be returned");
+        assert!(buf.pop().is_none());
+    }
+
+    /// A new GOP (different RTP timestamp) must advance the segment, dropping
+    /// the previous GOP's packets so the decoder always starts at a clean boundary.
+    #[test]
+    fn test_h264_new_gop_advances_segment() {
+        let mut buf = KeyframeBuffer::new();
+        let ts_a = 90_000u64;
+        let ts_b = 180_000u64;
+
+        buf.push(make_with_ts(100, ts_a, true)); // GOP A: IDR
+        buf.push(make_with_ts(101, ts_a, false)); // GOP A: P-frame
+
+        // New GOP arrives (different timestamp).
+        buf.push(make_with_ts(102, ts_b, true)); // GOP B: SPS
+        buf.push(make_with_ts(103, ts_b, true)); // GOP B: PPS
+        buf.push(make_with_ts(104, ts_b, true)); // GOP B: IDR
+
+        // Segment must have advanced to GOP B; GOP A packets dropped.
+        assert_eq!(buf.pop().unwrap().seq_no, 102.into(), "GOP B SPS first");
+        assert_eq!(buf.pop().unwrap().seq_no, 103.into(), "GOP B PPS second");
+        assert_eq!(buf.pop().unwrap().seq_no, 104.into(), "GOP B IDR third");
+        assert!(buf.pop().is_none());
     }
 
     #[test]

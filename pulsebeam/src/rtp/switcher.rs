@@ -570,4 +570,92 @@ mod test {
         run(&packets);
         // Expect: The stale, old keyframe packets are correctly identified as late and dropped.
     }
+
+    /// When H264 sends SPS, PPS, and IDR as three *separate* RTP packets they all
+    /// share the same `rtp_ts` and all have `is_keyframe_start = true`.  If all
+    /// three land in the staging buffer before any drain (e.g. during a burst or
+    /// in a test harness), the buffer must still forward all of them so the
+    /// downstream decoder receives the parameter sets it needs before the IDR.
+    ///
+    /// With the old code the segment pointer advanced SPS→PPS→IDR, causing SPS
+    /// and PPS to be silently dropped and delivering only the IDR — broken video.
+    #[test]
+    fn h264_separate_sps_pps_idr_all_forwarded_from_staging() {
+        use pulsebeam_runtime::rand::seeded_rng;
+        use tokio::time::Instant;
+
+        let ts = MediaTime::new(90_000, Frequency::NINETY_KHZ);
+        let now = Instant::now();
+        let ssrc = Ssrc::from(2u32);
+
+        let sps = RtpPacket {
+            ssrc,
+            seq_no: 1000.into(),
+            rtp_ts: ts,
+            is_keyframe_start: true,
+            playout_time: now,
+            ..Default::default()
+        };
+        let pps = RtpPacket {
+            ssrc,
+            seq_no: 1001.into(),
+            rtp_ts: ts,
+            is_keyframe_start: true,
+            playout_time: now,
+            ..Default::default()
+        };
+        let idr = RtpPacket {
+            ssrc,
+            seq_no: 1002.into(),
+            rtp_ts: ts,
+            is_keyframe_start: true,
+            playout_time: now,
+            ..Default::default()
+        };
+        let fua = RtpPacket {
+            ssrc,
+            seq_no: 1003.into(),
+            rtp_ts: ts,
+            is_keyframe_start: false,
+            marker: true,
+            playout_time: now,
+            ..Default::default()
+        };
+
+        let mut switcher =
+            Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(42));
+
+        // Stage all four without any intervening pops — simulates a burst arrival.
+        switcher.stage(sps.clone());
+        switcher.stage(pps.clone());
+        switcher.stage(idr.clone());
+        switcher.stage(fua.clone());
+
+        assert!(
+            switcher.ready_to_stream(),
+            "staging buffer must be ready after receiving the keyframe group"
+        );
+
+        let out: Vec<RtpPacket> = std::iter::from_fn(|| switcher.pop()).collect();
+
+        // With the old code the segment pointer would advance SPS→PPS→IDR so only IDR
+        // and FUA came out (2 packets).  With the fix all four are forwarded.
+        assert_eq!(
+            out.len(),
+            4,
+            "all four packets (SPS, PPS, IDR, FU-A) must be forwarded; only got {} packet(s)",
+            out.len()
+        );
+
+        // The first forwarded packet must be the keyframe-start (SPS in this case).
+        assert!(
+            out[0].is_keyframe_start,
+            "first output packet must be is_keyframe_start (SPS), not IDR"
+        );
+
+        // Output sequence numbers must be strictly contiguous after timeline rewriting.
+        let seq_nos: Vec<u64> = out.iter().map(|p| *p.seq_no).collect();
+        let contiguous = seq_nos.windows(2).all(|w| w[1] == w[0] + 1);
+        assert!(contiguous, "output seq_nos must be contiguous: {:?}", seq_nos);
+    }
 }
