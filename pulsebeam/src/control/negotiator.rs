@@ -111,6 +111,7 @@ impl Negotiator {
                 min_p_time: Some(10),
                 use_inband_fec: Some(true),
                 use_dtx: Some(true),
+                stereo: Some(true),
                 ..Default::default()
             },
         );
