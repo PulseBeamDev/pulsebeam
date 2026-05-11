@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    entity::{self, ParticipantId, RoomId},
+    entity::{self, ParticipantId, RoomId, TrackId},
     track::Track,
 };
 use futures_lite::StreamExt;
@@ -94,6 +94,26 @@ impl RoomRegistry {
         let origin = track.meta.origin;
         let room = self.room_mut_for(&track.meta.origin)?;
         room.add_track(track.clone());
+        let ids = room
+            .participants_iter()
+            .filter(|&id| *id != origin)
+            .copied()
+            .collect();
+        let room_id = room.room_id;
+
+        Some((room_id, ids))
+    }
+
+    pub fn remove_track(
+        &mut self,
+        origin: ParticipantId,
+        track_id: TrackId,
+    ) -> Option<(RoomId, Vec<entity::ParticipantId>)> {
+        let room = self.room_mut_for(&origin)?;
+        if !room.remove_track(&origin, &track_id) {
+            return None;
+        }
+
         let ids = room
             .participants_iter()
             .filter(|&id| *id != origin)

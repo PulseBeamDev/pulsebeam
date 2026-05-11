@@ -87,6 +87,32 @@ impl ControllerCore {
                     );
                 }
             }
+            ShardEvent::TrackUnpublished { origin, track_id } => {
+                let Some((room_id, other_participants)) = self.registry.remove_track(origin, track_id)
+                else {
+                    return;
+                };
+
+                // TODO: should we make room shard aware?
+                let mut shard_ids: IndexMap<usize, ()> = IndexMap::new();
+                for participant_id in other_participants {
+                    if let Some(p) = self.registry.get_participant(&participant_id) {
+                        shard_ids.entry(p.shard_id).or_default();
+                    }
+                }
+
+                let track_ids = vec![track_id];
+                for (shard_id, _) in shard_ids {
+                    eq.send_cluster(
+                        shard_id,
+                        ClusterCommand::UnpublishTracks {
+                            room_id,
+                            origin,
+                            track_ids: track_ids.clone(),
+                        },
+                    );
+                }
+            }
 
             ShardEvent::ParticipantExited(participant_id) => {
                 self.delete_participant(&participant_id, eq);
@@ -317,6 +343,65 @@ mod tests {
         assert!(
             matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
         );
+        assert!(eq.pop().is_none());
+    }
+
+    #[test]
+    fn track_unpublished_targets_existing_participant_shards_once() {
+        let mut core = ControllerCore::new();
+        let mut eq = ControllerEventQueue::default();
+        let room = room_id(4);
+        let publisher = pid(40);
+        let subscriber_a = pid(41);
+        let subscriber_b = pid(42);
+
+        core.registry.add_participant(publisher, room, 0);
+        core.registry.add_participant(subscriber_a, room, 2);
+        core.registry.add_participant(subscriber_b, room, 2);
+
+        let track_id = publisher.derive_track_id(MediaKind::Audio, "a");
+        let track = crate::track::Track {
+            meta: TrackMeta {
+                shard_id: 0,
+                id: track_id,
+                origin: publisher,
+                kind: MediaKind::Audio,
+            },
+            layers: Vec::new(),
+        };
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: 0,
+                ev: ShardEvent::TrackPublished(track),
+            },
+            &mut eq,
+        );
+        let _ = eq.pop();
+
+        core.process_shard_event(
+            ShardEventWrapper {
+                from_shard_id: 0,
+                ev: ShardEvent::TrackUnpublished {
+                    origin: publisher,
+                    track_id,
+                },
+            },
+            &mut eq,
+        );
+
+        let Some(ControllerEvent::ShardCommandSent(shard_id, ShardCommand::Cluster(cmd))) =
+            eq.pop()
+        else {
+            panic!("expected unpublish cluster command");
+        };
+
+        assert_eq!(shard_id, 2);
+        assert!(matches!(
+            cmd,
+            ClusterCommand::UnpublishTracks { room_id, origin, track_ids }
+                if room_id == room && origin == publisher && track_ids == vec![track_id]
+        ));
         assert!(eq.pop().is_none());
     }
 

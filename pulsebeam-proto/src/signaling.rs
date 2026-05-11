@@ -58,9 +58,27 @@ pub struct VideoRequest {
     pub height: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpstreamIntent {
+    #[prost(string, tag = "1")]
+    pub mid: ::prost::alloc::string::String,
+    /// Publisher intent for explicit stop behavior.
+    /// - active=false: explicit stop/unpublish intent from publisher.
+    /// - active=true: advisory publish intent; server may also publish implicitly.
+    #[prost(bool, tag = "2")]
+    pub active: bool,
+    /// Metadata like "Screen Share" vs "Camera" can go here.
+    #[prost(map = "string, string", tag = "3")]
+    pub meta: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientIntent {
     #[prost(message, repeated, tag = "1")]
-    pub requests: ::prost::alloc::vec::Vec<VideoRequest>,
+    pub downstream_requests: ::prost::alloc::vec::Vec<VideoRequest>,
+    #[prost(message, repeated, tag = "2")]
+    pub upstream_intents: ::prost::alloc::vec::Vec<UpstreamIntent>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientMessage {

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use str0m::media::KeyframeRequestKind;
 use tokio::time::Instant;
 
-use crate::entity::{ParticipantId, RoomId};
+use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::rtp::RtpPacket;
 use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer, TrackMeta};
 
@@ -46,6 +46,7 @@ pub enum ParticipantLifecycleEvent {
 
 pub enum ParticipantControlEvent {
     TrackPublished(Track),
+    TrackUnpublished { origin: ParticipantId, track_id: TrackId },
     KeyframeRequested(GlobalKeyframeRequest),
 }
 
@@ -101,6 +102,15 @@ impl<'a> EventQueue<'a> {
     pub fn publish_track(&mut self, track: Track) {
         self.queue.push_back(ParticipantEvent::Control(
             ParticipantControlEvent::TrackPublished(track),
+        ));
+    }
+
+    pub fn unpublish_track(&mut self, track_id: TrackId) {
+        self.queue.push_back(ParticipantEvent::Control(
+            ParticipantControlEvent::TrackUnpublished {
+                origin: *self.id,
+                track_id,
+            },
         ));
     }
 

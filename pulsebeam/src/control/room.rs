@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 
-use crate::entity::{ParticipantId, RoomId};
+use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::track::Track;
 
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +34,16 @@ impl Room {
         if !tracks.iter().any(|t| t.meta.id == track.meta.id) {
             tracks.push(track);
         }
+    }
+
+    pub(super) fn remove_track(&mut self, origin: &ParticipantId, track_id: &TrackId) -> bool {
+        let Some(tracks) = self.participants.get_mut(origin) else {
+            return false;
+        };
+
+        let before = tracks.len();
+        tracks.retain(|t| t.meta.id != *track_id);
+        before != tracks.len()
     }
 
     pub fn participants_iter(&self) -> impl Iterator<Item = &ParticipantId> {

@@ -20,6 +20,10 @@ pub enum SignalingError {
     ComplexityExceeded,
 }
 
+pub enum SignalingInputEvent {
+    UpstreamTrackState { mid: Mid, active: bool },
+}
+
 pub struct Signaling {
     pub cid: ChannelId,
     seq: u64,
@@ -72,7 +76,8 @@ impl Signaling {
         &mut self,
         data: &[u8],
         downstream: &mut DownstreamAllocator,
-    ) -> Result<(), SignalingError> {
+    ) -> Result<Vec<SignalingInputEvent>, SignalingError> {
+        let mut events = Vec::new();
         if data.len() > MAX_SIGNALING_MSG_SIZE {
             tracing::warn!(len = data.len(), "Fatal: Oversized signaling message");
             return Err(SignalingError::OversizedPacket);
@@ -85,9 +90,15 @@ impl Signaling {
 
         match msg.payload {
             Some(signaling::client_message::Payload::Intent(intent)) => {
-                if intent.requests.len() > self.slot_count {
+                if intent.downstream_requests.len() > self.slot_count {
                     tracing::warn!("Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
+                }
+                for state in &intent.upstream_intents {
+                    events.push(SignalingInputEvent::UpstreamTrackState {
+                        mid: Mid::from(state.mid.as_str()),
+                        active: state.active,
+                    });
                 }
                 tracing::info!("received client intent: {:?}", intent);
                 self.apply_client_intent(intent, downstream);
@@ -99,7 +110,7 @@ impl Signaling {
             None => {}
         }
 
-        Ok(())
+        Ok(events)
     }
 
     fn apply_client_intent(
@@ -107,8 +118,8 @@ impl Signaling {
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
     ) {
-        let mut intents = HashMap::with_capacity(intent.requests.len());
-        for req in intent.requests {
+        let mut intents = HashMap::with_capacity(intent.downstream_requests.len());
+        for req in intent.downstream_requests {
             let track_id_str = req.track_id.clone();
             let track_id = match TrackId::try_from(track_id_str.clone()) {
                 Ok(id) => id,

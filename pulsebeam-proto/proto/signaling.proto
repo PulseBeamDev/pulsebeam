@@ -62,8 +62,19 @@ message VideoRequest {
   uint32 height = 3;
 }
 
+message UpstreamIntent {
+  string mid = 1;
+  // Publisher intent for explicit stop behavior.
+  // - active=false: explicit stop/unpublish intent from publisher.
+  // - active=true: advisory publish intent; server may also publish implicitly.
+  bool active = 2;
+  // Metadata like "Screen Share" vs "Camera" can go here.
+  map<string, string> meta = 3;
+}
+
 message ClientIntent {
-  repeated VideoRequest requests = 1;
+  repeated VideoRequest downstream_requests = 1;
+  repeated UpstreamIntent upstream_intents = 2;
 }
 
 // ========================================================================

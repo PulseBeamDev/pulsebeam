@@ -738,6 +738,9 @@ pub(super) fn handle_participant_control(
         ParticipantControlEvent::TrackPublished(track) => {
             shard_events.push_back(ShardEvent::TrackPublished(track));
         }
+        ParticipantControlEvent::TrackUnpublished { origin, track_id } => {
+            shard_events.push_back(ShardEvent::TrackUnpublished { origin, track_id });
+        }
         ParticipantControlEvent::KeyframeRequested(req) => {
             if req.shard_id == router.shard_id() {
                 shard_events.push_back(ShardEvent::KeyframeRequest(req));

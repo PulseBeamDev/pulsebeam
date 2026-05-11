@@ -93,6 +93,10 @@ pub struct ShardEventWrapper {
 #[derive(Debug)]
 pub enum ShardEvent {
     TrackPublished(Track),
+    TrackUnpublished {
+        origin: ParticipantId,
+        track_id: TrackId,
+    },
     ParticipantExited(ParticipantId),
     KeyframeRequest(GlobalKeyframeRequest),
     /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.

@@ -31,6 +31,20 @@ use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Track};
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+struct TrackAvailability {
+    in_topology: bool,
+}
+
+impl TrackAvailability {
+    fn unpublished() -> Self {
+        Self { in_topology: false }
+    }
+
+    fn published() -> Self {
+        Self { in_topology: true }
+    }
+}
+
 pub struct TrackMapping {
     pub mid: Mid,
     pub track_id: TrackId,
@@ -83,7 +97,9 @@ pub struct ParticipantCore {
     pub upstream: UpstreamAllocator,
     pub participant_id: entity::ParticipantId,
     last_keyframe_request: HashMap<StreamId, Instant>,
-    pending_publish_tracks: HashMap<Mid, Track>,
+
+    published_tracks: HashMap<TrackId, Track>,
+    track_availability: HashMap<TrackId, TrackAvailability>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -136,7 +152,8 @@ impl ParticipantCore {
             signaling: Signaling::new(cid),
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
-            pending_publish_tracks: HashMap::new(),
+            published_tracks: HashMap::new(),
+            track_availability: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -420,18 +437,72 @@ impl ParticipantCore {
                     && let Err(err) = self
                         .signaling
                         .handle_input(&data.data, &mut self.downstream)
+                        .map(|input_events| {
+                            for input_event in input_events {
+                                self.handle_signaling_input(input_event, events);
+                            }
+                        })
                 {
                     self.disconnect(err.into());
                 }
             }
             Event::StreamPaused(stream) => {
-                if !stream.paused {
-                    self.publish_on_first_unpause(stream.mid, events);
-                }
+                self.handle_stream_paused(stream.mid, stream.paused, events);
             }
             _ => {
                 // tracing::warn!("unhandled event: {e:?}");
             }
+        }
+    }
+
+    fn handle_signaling_input(
+        &mut self,
+        event: signaling::SignalingInputEvent,
+        events: &mut EventQueue,
+    ) {
+        match event {
+            signaling::SignalingInputEvent::UpstreamTrackState { mid, active } => {
+                self.handle_upstream_track_state(mid, active, events);
+            }
+        }
+    }
+
+    fn handle_upstream_track_state(&mut self, mid: Mid, active: bool, events: &mut EventQueue) {
+        let Some(track_id) = self.upstream.track_id_for_mid(mid) else {
+            return;
+        };
+
+        let state = self
+            .track_availability
+            .entry(track_id)
+            .or_insert_with(TrackAvailability::unpublished);
+
+        if active {
+            if state.in_topology {
+                return;
+            }
+
+            if let Some(track) = self.published_tracks.get(&track_id) {
+                events.publish_track(track.clone());
+                state.in_topology = true;
+            }
+            return;
+        }
+
+        if !state.in_topology {
+            return;
+        }
+
+        events.unpublish_track(track_id);
+        state.in_topology = false;
+    }
+
+    fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut EventQueue) {
+        // Treat unpaused as an implicit publish signal from str0m.
+        // We intentionally do not unpublish on paused=true here; explicit
+        // client intent is authoritative for stop/unpublish transitions.
+        if !paused {
+            self.handle_upstream_track_state(mid, true, events);
         }
     }
 
@@ -454,7 +525,9 @@ impl ParticipantCore {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                             return;
                         }
-                        self.pending_publish_tracks.insert(media.mid, track);
+                        self.published_tracks.insert(track.meta.id, track.clone());
+                        self.track_availability
+                            .insert(track.meta.id, TrackAvailability::unpublished());
                     }
                     MediaKind::Video => {
                         let (tx, track) = track::new_video(
@@ -467,7 +540,9 @@ impl ParticipantCore {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                             return;
                         }
-                        self.pending_publish_tracks.insert(media.mid, track);
+                        self.published_tracks.insert(track.meta.id, track.clone());
+                        self.track_availability
+                            .insert(track.meta.id, TrackAvailability::unpublished());
                     }
                 }
             }
@@ -481,12 +556,6 @@ impl ParticipantCore {
                     .set_slot_count(self.downstream.video.slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
-        }
-    }
-
-    fn publish_on_first_unpause(&mut self, mid: Mid, events: &mut EventQueue) {
-        if let Some(track) = self.pending_publish_tracks.remove(&mid) {
-            events.publish_track(track);
         }
     }
 
