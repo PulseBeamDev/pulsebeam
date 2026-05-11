@@ -1174,7 +1174,10 @@ impl AgentActor {
         tracing::debug!("sending subscription requests: {:?}", requests);
         let msg = signaling::ClientMessage {
             payload: Some(signaling::client_message::Payload::Intent(
-                signaling::ClientIntent { requests },
+                signaling::ClientIntent {
+                    upstream_intents: vec![],
+                    downstream_requests: requests,
+                },
             )),
         };
         let encoded = msg.encode_to_vec();
