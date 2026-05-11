@@ -46,7 +46,10 @@ pub enum ParticipantLifecycleEvent {
 
 pub enum ParticipantControlEvent {
     TrackPublished(Track),
-    TrackUnpublished { origin: ParticipantId, track_id: TrackId },
+    TrackUnpublished {
+        origin: ParticipantId,
+        track_id: TrackId,
+    },
     KeyframeRequested(GlobalKeyframeRequest),
 }
 

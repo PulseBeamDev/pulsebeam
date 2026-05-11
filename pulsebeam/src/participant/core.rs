@@ -206,9 +206,10 @@ impl ParticipantCore {
     }
 
     pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
-        let removed = tracks
-            .iter()
-            .any(|track_id| self.downstream.remove_track(track_id));
+        let mut removed = false;
+        for track_id in tracks {
+            removed |= self.downstream.remove_track(track_id);
+        }
         if removed {
             self.signaling.mark_tracks_dirty();
             self.signaling.mark_assignments_dirty();

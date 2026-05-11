@@ -1972,4 +1972,72 @@ mod tests {
             "must not dirty participants when no subscriber held the track"
         );
     }
+
+    #[test]
+    fn unpublish_tracks_removes_all_tracks_in_batch_not_just_first() {
+        // Regression test: when a publisher with multiple tracks (e.g. camera
+        // + screenshare) exits, ALL tracks must be removed from the
+        // subscriber's downstream — not just the first one in the batch.
+        let router = TestRouter::new(0, 3);
+        let mut core = ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42));
+        let a = pid(); // publisher (remote)
+        let b = pid(); // local subscriber
+        let r = room_id("unp-multi");
+
+        add_participant(&mut core, &router, b, r);
+
+        let camera_track = make_video_track(a, 1);
+        let screenshare_track = make_video_track(a, 2);
+        let camera_id = camera_track.meta.id;
+        let screenshare_id = screenshare_track.meta.id;
+
+        let p = core.participants.get_mut(&b).unwrap();
+        p.downstream.add_track(camera_track);
+        p.downstream.add_track(screenshare_track);
+
+        assert!(
+            core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == camera_id),
+            "B must have camera before UnpublishTracks"
+        );
+        assert!(
+            core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == screenshare_id),
+            "B must have screenshare before UnpublishTracks"
+        );
+
+        // Both tracks are unpublished in a single batch (as happens when a
+        // participant exits and delete_participant broadcasts UnpublishTracks).
+        core.on_command(
+            ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
+                room_id: r,
+                origin: a,
+                track_ids: vec![camera_id, screenshare_id],
+            }),
+            &router,
+        );
+
+        assert!(
+            !core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == camera_id),
+            "camera must be removed after UnpublishTracks"
+        );
+        assert!(
+            !core.participants[&b]
+                .downstream
+                .video
+                .tracks()
+                .any(|t| t.id == screenshare_id),
+            "screenshare must be removed after UnpublishTracks - ghost participant bug"
+        );
+    }
 }

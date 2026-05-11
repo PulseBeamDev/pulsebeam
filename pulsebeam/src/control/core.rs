@@ -88,7 +88,8 @@ impl ControllerCore {
                 }
             }
             ShardEvent::TrackUnpublished { origin, track_id } => {
-                let Some((room_id, other_participants)) = self.registry.remove_track(origin, track_id)
+                let Some((room_id, other_participants)) =
+                    self.registry.remove_track(origin, track_id)
                 else {
                     return;
                 };
