@@ -271,24 +271,59 @@ impl StreamMonitor {
         self.smoothed_loss_ratio =
             (self.smoothed_loss_ratio * (1.0 - alpha)) + (interval_loss * alpha);
 
-        // Step D: Threshold-Based Quality Evaluation
-        let new_quality = match self.kind {
-            MediaKind::Audio => {
-                if self.smoothed_loss_ratio >= 0.10 {
+        // Step D: Threshold-Based Quality Evaluation with hysteresis.
+        //
+        // Downgrade thresholds are the same regardless of current state (react fast).
+        // Upgrade thresholds are tighter than the downgrade thresholds to prevent flapping:
+        let new_quality = match (self.kind, self.current_quality) {
+            (MediaKind::Video, StreamQuality::Bad) => {
+                if self.smoothed_loss_ratio <= 0.025 {
+                    StreamQuality::Good
+                } else {
                     StreamQuality::Bad
-                } else if self.smoothed_loss_ratio <= 0.03 {
+                }
+            }
+            (MediaKind::Video, StreamQuality::Good) => {
+                if self.smoothed_loss_ratio >= 0.05 {
+                    StreamQuality::Bad
+                } else if self.smoothed_loss_ratio <= 0.005 {
                     StreamQuality::Excellent
                 } else {
                     StreamQuality::Good
                 }
             }
-            MediaKind::Video => {
+            (MediaKind::Video, StreamQuality::Excellent) => {
                 if self.smoothed_loss_ratio >= 0.05 {
                     StreamQuality::Bad
-                } else if self.smoothed_loss_ratio <= 0.01 {
+                } else if self.smoothed_loss_ratio >= 0.02 {
+                    StreamQuality::Good
+                } else {
+                    StreamQuality::Excellent
+                }
+            }
+            (MediaKind::Audio, StreamQuality::Bad) => {
+                if self.smoothed_loss_ratio <= 0.06 {
+                    StreamQuality::Good
+                } else {
+                    StreamQuality::Bad
+                }
+            }
+            (MediaKind::Audio, StreamQuality::Good) => {
+                if self.smoothed_loss_ratio >= 0.10 {
+                    StreamQuality::Bad
+                } else if self.smoothed_loss_ratio <= 0.02 {
                     StreamQuality::Excellent
                 } else {
                     StreamQuality::Good
+                }
+            }
+            (MediaKind::Audio, StreamQuality::Excellent) => {
+                if self.smoothed_loss_ratio >= 0.10 {
+                    StreamQuality::Bad
+                } else if self.smoothed_loss_ratio >= 0.06 {
+                    StreamQuality::Good
+                } else {
+                    StreamQuality::Excellent
                 }
             }
         };
@@ -296,11 +331,11 @@ impl StreamMonitor {
         if new_quality != self.current_quality {
             tracing::info!(
                 stream_id = %self.stream_id,
-                "Stream quality transition: {:?} -> {:?} (smoothed_loss_ratio: {:.4}, interval_loss: {:.4}, expected: {}, actual: {}, bitrate: {})",
+                "Stream quality transition: {:?} -> {:?} (smoothed_loss_ratio: {:.2}%, interval_loss: {:.2}%, expected: {}, actual: {}, bitrate: {})",
                 self.current_quality,
                 new_quality,
-                self.smoothed_loss_ratio,
-                interval_loss,
+                self.smoothed_loss_ratio * 100.0,
+                interval_loss * 100.0,
                 expected,
                 actual,
                 Bitrate::from(self.bwe.estimate_bps()),
@@ -544,8 +579,8 @@ impl AudioMonitor {
 mod test {
     use super::*;
     use more_asserts::{assert_gt, assert_le};
-    use str0m::media::{Frequency, MediaTime};
     use std::time::Duration;
+    use str0m::media::{Frequency, MediaTime};
     use tokio::time::Instant;
 
     fn packet(seq: u64, arrival_ts: Instant) -> RtpPacket {
@@ -621,6 +656,61 @@ mod test {
 
         let after_recover_tick = monitor.smoothed_loss_ratio;
         assert!((after_recover_tick - 0.38).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stream_monitor_hysteresis_prevents_flop() {
+        let shared = StreamState::new(false, 0);
+        let mut monitor = StreamMonitor::new(MediaKind::Video, "v4".into(), shared.clone());
+        let now = Instant::now();
+
+        // Drive quality Bad: 9 gaps out of 10 expected (loss=0.8, smoothed=0.4 >= 0.05)
+        monitor.process_packet(&packet(1, now), 800);
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 800);
+        monitor.poll(now + Duration::from_millis(20), false);
+        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert!(
+            monitor.smoothed_loss_ratio > 0.025,
+            "smoothed={} should still be above the Bad-exit threshold",
+            monitor.smoothed_loss_ratio
+        );
+
+        // One fully clean tick: smoothed decays from 0.4 * 0.95 = 0.38 — still above 0.025
+        for seq in 12u64..=22 {
+            monitor.process_packet(
+                &packet(seq, now + Duration::from_millis(30 + seq - 12)),
+                800,
+            );
+        }
+        monitor.poll(now + Duration::from_millis(50), false);
+        assert_eq!(
+            shared.quality(),
+            StreamQuality::Bad,
+            "a single clean tick must not flip quality back to Good (hysteresis)"
+        );
+
+        // Sustain clean traffic until smoothed_loss_ratio falls below 0.025
+        let mut tick_now = now + Duration::from_millis(100);
+        let mut base_seq = 23u64;
+        for _ in 0..100 {
+            for seq in base_seq..(base_seq + 10) {
+                monitor.process_packet(
+                    &packet(seq, tick_now + Duration::from_millis(seq - base_seq)),
+                    800,
+                );
+            }
+            base_seq += 10;
+            tick_now += Duration::from_millis(100);
+            monitor.poll(tick_now, false);
+            if shared.quality() == StreamQuality::Good {
+                break;
+            }
+        }
+        assert_eq!(
+            shared.quality(),
+            StreamQuality::Good,
+            "quality must eventually recover to Good after sustained clean network"
+        );
     }
 
     #[test]
