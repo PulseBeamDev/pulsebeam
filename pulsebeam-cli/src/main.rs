@@ -21,8 +21,6 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
 struct Cli {
     #[arg(short, long, default_value = "http://localhost:7070")]
@@ -83,8 +81,6 @@ enum StatReport {
     },
 }
 
-// ── Shared state ──────────────────────────────────────────────────────────────
-
 struct SharedState {
     active_rooms: AtomicUsize,
     active_agents: AtomicUsize,
@@ -108,8 +104,6 @@ impl SharedState {
         })
     }
 }
-
-// ── Latency histogram (lock-free buckets) ─────────────────────────────────────
 
 #[derive(Default)]
 struct LatencyHistogram {
@@ -197,8 +191,6 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
-
-// ── Bench orchestrator ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 async fn run_bench(
@@ -310,8 +302,6 @@ async fn run_bench(
     Ok(())
 }
 
-// ── Room spawner ──────────────────────────────────────────────────────────────
-
 async fn spawn_room(
     join_set: &mut JoinSet<()>,
     api_url: &str,
@@ -368,8 +358,6 @@ async fn spawn_room(
         room_state.active_rooms.fetch_sub(1, Ordering::Relaxed);
     });
 }
-
-// ── Monitor task ──────────────────────────────────────────────────────────────
 
 async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<SharedState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -532,8 +520,6 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
     }
 }
 
-// ── Agent ─────────────────────────────────────────────────────────────────────
-
 /// How many consecutive silent ticks before a VBR layer is considered inactive.
 /// At 1-second poll intervals, 3 ticks = 3 s of silence, which is a safe margin
 /// for typical VBR gaps while still catching genuinely dead streams.
@@ -580,7 +566,7 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
     }
 
-    for _ in 0..9 {
+    for _ in 0..5 {
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
