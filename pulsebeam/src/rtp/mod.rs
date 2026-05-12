@@ -116,8 +116,11 @@ impl RtpPacket {
 /// - IDR (5): Instantaneous Decoding Refresh (Keyframe pixel data)
 /// - SPS (7): Sequence Parameter Set (Critical configuration)
 /// - PPS (8): Picture Parameter Set (Critical configuration)
-/// - AUD (9): Access Unit Delimiter (Marks the start of a frame)
-/// - SEI (6): Supplemental Enhancement Information (Often precedes keyframes)
+///
+/// AUD (9) and SEI (6) are intentionally excluded: both can appear before any access
+/// unit (I-frame or P-frame).  Treating them as keyframe markers causes P-frames to be
+/// forwarded without a preceding IDR during simulcast layer switches, corrupting the
+/// downstream H.264 decoder.
 pub fn is_h264_keyframe_start(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
@@ -125,10 +128,8 @@ pub fn is_h264_keyframe_start(payload: &[u8]) -> bool {
 
     // --- Constants (RFC 6184) ---
     const NAL_IDR: u8 = 5;
-    const NAL_SEI: u8 = 6;
     const NAL_SPS: u8 = 7;
     const NAL_PPS: u8 = 8;
-    const NAL_AUD: u8 = 9;
 
     const NAL_STAPA: u8 = 24;
     const NAL_FUA: u8 = 28;
@@ -136,9 +137,9 @@ pub fn is_h264_keyframe_start(payload: &[u8]) -> bool {
     const NAL_TYPE_MASK: u8 = 0x1F;
     const FU_START_BITMASK: u8 = 0x80;
 
-    // Helper to identify anchor NALs
-    let is_anchor =
-        |t: u8| -> bool { matches!(t, NAL_IDR | NAL_SEI | NAL_SPS | NAL_PPS | NAL_AUD) };
+    // Only IDR/SPS/PPS are exclusive to keyframe access units.
+    // AUD (9) and SEI (6) appear before *every* frame on many encoders.
+    let is_anchor = |t: u8| -> bool { matches!(t, NAL_IDR | NAL_SPS | NAL_PPS) };
 
     let b0 = payload[0];
     let nal_type = b0 & NAL_TYPE_MASK;
@@ -308,5 +309,110 @@ pub mod test_utils {
             packets.push(current.clone());
         }
         packets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_h264_keyframe_start;
+
+    fn single_nal(nal_type: u8) -> Vec<u8> {
+        // Forbidden bit = 0, NRI = 3, type = nal_type
+        vec![0x60 | (nal_type & 0x1F), 0xDE, 0xAD]
+    }
+
+    fn stap_a(nal_types: &[u8]) -> Vec<u8> {
+        // STAP-A header byte
+        let mut payload = vec![0x60 | 24u8];
+        for &nt in nal_types {
+            let nal = [0x60 | (nt & 0x1F), 0xDE, 0xAD];
+            payload.push(0);
+            payload.push(nal.len() as u8);
+            payload.extend_from_slice(&nal);
+        }
+        payload
+    }
+
+    fn fua(nal_type: u8, start: bool) -> Vec<u8> {
+        // FU indicator: NRI=3, type=28
+        let fu_indicator = 0x60 | 28u8;
+        let s_bit = if start { 0x80 } else { 0x00 };
+        let fu_header = s_bit | (nal_type & 0x1F);
+        vec![fu_indicator, fu_header, 0xDE, 0xAD]
+    }
+
+    // --- True keyframe cases ---
+
+    #[test]
+    fn idr_is_keyframe() {
+        assert!(is_h264_keyframe_start(&single_nal(5)));
+    }
+
+    #[test]
+    fn sps_is_keyframe() {
+        assert!(is_h264_keyframe_start(&single_nal(7)));
+    }
+
+    #[test]
+    fn pps_is_keyframe() {
+        assert!(is_h264_keyframe_start(&single_nal(8)));
+    }
+
+    #[test]
+    fn stap_a_with_sps_pps_is_keyframe() {
+        assert!(is_h264_keyframe_start(&stap_a(&[7, 8])));
+    }
+
+    #[test]
+    fn stap_a_sei_before_sps_is_keyframe() {
+        // Chrome sometimes bundles a timing SEI before SPS in a STAP-A for keyframes.
+        // The loop must continue past the SEI and find SPS.
+        assert!(is_h264_keyframe_start(&stap_a(&[6, 7])));
+    }
+
+    #[test]
+    fn fua_idr_start_is_keyframe() {
+        assert!(is_h264_keyframe_start(&fua(5, true)));
+    }
+
+    #[test]
+    fn fua_idr_continuation_is_not_keyframe() {
+        assert!(!is_h264_keyframe_start(&fua(5, false)));
+    }
+
+    // --- False positive guard: P-frame NAL types must NOT be keyframes ---
+
+    #[test]
+    fn sei_single_nal_is_not_keyframe() {
+        // SEI (type 6) appears before P-frames on many encoders; must not be treated as keyframe.
+        assert!(!is_h264_keyframe_start(&single_nal(6)));
+    }
+
+    #[test]
+    fn aud_single_nal_is_not_keyframe() {
+        // AUD (type 9) marks ANY access unit boundary, not only IDR frames.
+        assert!(!is_h264_keyframe_start(&single_nal(9)));
+    }
+
+    #[test]
+    fn p_frame_nal_is_not_keyframe() {
+        assert!(!is_h264_keyframe_start(&single_nal(1)));
+    }
+
+    #[test]
+    fn stap_a_with_only_sei_is_not_keyframe() {
+        assert!(!is_h264_keyframe_start(&stap_a(&[6])));
+    }
+
+    #[test]
+    fn stap_a_with_aud_and_p_frame_is_not_keyframe() {
+        // AUD + P-frame in a STAP-A should NOT be a keyframe.
+        assert!(!is_h264_keyframe_start(&stap_a(&[9, 1])));
+    }
+
+    #[test]
+    fn fua_p_frame_start_is_not_keyframe() {
+        // FU-A carrying a P-frame (NAL type 1) is not a keyframe even at start bit.
+        assert!(!is_h264_keyframe_start(&fua(1, true)));
     }
 }
