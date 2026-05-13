@@ -28,7 +28,7 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 
 ## Architecture
 
-This is a **thread-per-core** system that isolates the data plane from the control plane. It follows a shared-nothing design; all synchronization is handled via explicit message passing to keep the fast path lock-free and cache-local.
+This is a **thread-per-core** system that isolates the data plane from the control plane. It follows a shared-nothing design, keeping the fast path lock-free and cache-local.
 
 ![architecture](./docs/architecture.png)
 
