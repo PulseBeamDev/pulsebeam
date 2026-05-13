@@ -2,6 +2,7 @@ pub mod audio_selector;
 mod bitrate;
 pub mod control;
 pub mod entity;
+pub mod id;
 pub(crate) mod log;
 pub mod message;
 pub mod node;

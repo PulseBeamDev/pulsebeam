@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 use crate::{
     control::{controller::ParticipantState, registry::RoomRegistry},
     entity::{ParticipantId, RoomId},
+    id::ShardId,
     participant::ParticipantConfig,
     shard::worker::{ClusterCommand, ShardCommand, ShardEvent, ShardEventWrapper},
 };
-use indexmap::IndexMap;
 use str0m::Rtc;
 
 /// Maximum participants allowed per "slot" before hashing to a new shard epoch.
@@ -15,7 +15,7 @@ const MAX_PARTICIPANTS_PER_SHARD_SLOT: usize = 16;
 #[derive(Debug)]
 pub enum ControllerEvent {
     ShardCommandBroadcasted(ClusterCommand),
-    ShardCommandSent(usize, ShardCommand),
+    ShardCommandSent(ShardId, ShardCommand),
 }
 
 pub struct ControllerEventQueue {
@@ -41,11 +41,11 @@ impl ControllerEventQueue {
         self.push(ControllerEvent::ShardCommandBroadcasted(cmd));
     }
 
-    pub fn send(&mut self, shard_id: usize, cmd: ShardCommand) {
+    pub fn send(&mut self, shard_id: ShardId, cmd: ShardCommand) {
         self.push(ControllerEvent::ShardCommandSent(shard_id, cmd));
     }
 
-    pub fn send_cluster(&mut self, shard_id: usize, cmd: ClusterCommand) {
+    pub fn send_cluster(&mut self, shard_id: ShardId, cmd: ClusterCommand) {
         self.push(ControllerEvent::ShardCommandSent(
             shard_id,
             ShardCommand::Cluster(cmd),
@@ -72,15 +72,7 @@ impl ControllerCore {
                     return;
                 };
 
-                // TODO: should we make room shard aware?
-                let mut shard_ids: IndexMap<usize, ()> = IndexMap::new();
-                for participant_id in other_participants {
-                    if let Some(p) = self.registry.get_participant(&participant_id) {
-                        shard_ids.entry(p.shard_id).or_default();
-                    }
-                }
-
-                for (shard_id, _) in shard_ids {
+                for shard_id in other_participants {
                     eq.send_cluster(
                         shard_id,
                         ClusterCommand::PublishTrack(track.clone(), room_id),
@@ -94,16 +86,8 @@ impl ControllerCore {
                     return;
                 };
 
-                // TODO: should we make room shard aware?
-                let mut shard_ids: IndexMap<usize, ()> = IndexMap::new();
-                for participant_id in other_participants {
-                    if let Some(p) = self.registry.get_participant(&participant_id) {
-                        shard_ids.entry(p.shard_id).or_default();
-                    }
-                }
-
                 let track_ids = vec![track_id];
-                for (shard_id, _) in shard_ids {
+                for shard_id in other_participants {
                     eq.send_cluster(
                         shard_id,
                         ClusterCommand::UnpublishTracks {
@@ -165,11 +149,11 @@ impl ControllerCore {
         &mut self,
         rtc: Rtc,
         state: ParticipantState,
-        shard_id: usize,
+        shard_id: ShardId,
     ) -> ParticipantConfig {
         let tracks = {
             let room = self.registry.get_or_create_room(state.room_id);
-            room.tracks_for(&state.participant_id).cloned().collect()
+            room.tracks().cloned().collect()
         };
         self.registry
             .add_participant(state.participant_id, state.room_id, shard_id);
@@ -240,7 +224,7 @@ mod tests {
         RoomId::from_external(&external)
     }
 
-    fn track_meta(origin: ParticipantId, shard_id: usize) -> TrackMeta {
+    fn track_meta(origin: ParticipantId, shard_id: ShardId) -> TrackMeta {
         TrackMeta {
             shard_id,
             id: origin.derive_track_id(MediaKind::Video, "v"),
@@ -253,11 +237,11 @@ mod tests {
     fn track_subscribed_routes_subscribe_command() {
         let mut core = ControllerCore::new();
         let mut eq = ControllerEventQueue::default();
-        let track = track_meta(pid(1), 7);
+        let track = track_meta(pid(1), ShardId::new(7));
 
         core.process_shard_event(
             ShardEventWrapper {
-                from_shard_id: 3,
+                from_shard_id: ShardId::new(3),
                 ev: ShardEvent::TrackSubscribed(track.clone()),
             },
             &mut eq,
@@ -272,7 +256,8 @@ mod tests {
         assert_eq!(shard_id, track.shard_id);
         assert!(matches!(
             cmd,
-            ClusterCommand::SubscribeTrack { from_shard_id: 3, track: routed } if routed == track
+            ClusterCommand::SubscribeTrack { from_shard_id, track: routed }
+                if from_shard_id == ShardId::new(3) && routed == track
         ));
     }
 
@@ -280,11 +265,11 @@ mod tests {
     fn track_unsubscribed_routes_unsubscribe_command() {
         let mut core = ControllerCore::new();
         let mut eq = ControllerEventQueue::default();
-        let track = track_meta(pid(2), 9);
+        let track = track_meta(pid(2), ShardId::new(9));
 
         core.process_shard_event(
             ShardEventWrapper {
-                from_shard_id: 4,
+                from_shard_id: ShardId::new(4),
                 ev: ShardEvent::TrackUnsubscribed(track.clone()),
             },
             &mut eq,
@@ -299,7 +284,8 @@ mod tests {
         assert_eq!(shard_id, track.shard_id);
         assert!(matches!(
             cmd,
-            ClusterCommand::UnsubscribeTrack { from_shard_id: 4, track: routed } if routed == track
+            ClusterCommand::UnsubscribeTrack { from_shard_id, track: routed }
+                if from_shard_id == ShardId::new(4) && routed == track
         ));
     }
 
@@ -312,13 +298,16 @@ mod tests {
         let subscriber_a = pid(11);
         let subscriber_b = pid(12);
 
-        core.registry.add_participant(publisher, room, 0);
-        core.registry.add_participant(subscriber_a, room, 2);
-        core.registry.add_participant(subscriber_b, room, 2);
+        core.registry
+            .add_participant(publisher, room, ShardId::new(0));
+        core.registry
+            .add_participant(subscriber_a, room, ShardId::new(2));
+        core.registry
+            .add_participant(subscriber_b, room, ShardId::new(2));
 
         let track = crate::track::Track {
             meta: TrackMeta {
-                shard_id: 0,
+                shard_id: ShardId::new(0),
                 id: publisher.derive_track_id(MediaKind::Audio, "a"),
                 origin: publisher,
                 kind: MediaKind::Audio,
@@ -328,7 +317,7 @@ mod tests {
 
         core.process_shard_event(
             ShardEventWrapper {
-                from_shard_id: 0,
+                from_shard_id: ShardId::new(0),
                 ev: ShardEvent::TrackPublished(track.clone()),
             },
             &mut eq,
@@ -340,7 +329,7 @@ mod tests {
             panic!("expected publish cluster command");
         };
 
-        assert_eq!(shard_id, 2);
+        assert_eq!(shard_id, ShardId::new(2));
         assert!(
             matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
         );
@@ -356,14 +345,17 @@ mod tests {
         let subscriber_a = pid(41);
         let subscriber_b = pid(42);
 
-        core.registry.add_participant(publisher, room, 0);
-        core.registry.add_participant(subscriber_a, room, 2);
-        core.registry.add_participant(subscriber_b, room, 2);
+        core.registry
+            .add_participant(publisher, room, ShardId::new(0));
+        core.registry
+            .add_participant(subscriber_a, room, ShardId::new(2));
+        core.registry
+            .add_participant(subscriber_b, room, ShardId::new(2));
 
         let track_id = publisher.derive_track_id(MediaKind::Audio, "a");
         let track = crate::track::Track {
             meta: TrackMeta {
-                shard_id: 0,
+                shard_id: ShardId::new(0),
                 id: track_id,
                 origin: publisher,
                 kind: MediaKind::Audio,
@@ -373,7 +365,7 @@ mod tests {
 
         core.process_shard_event(
             ShardEventWrapper {
-                from_shard_id: 0,
+                from_shard_id: ShardId::new(0),
                 ev: ShardEvent::TrackPublished(track),
             },
             &mut eq,
@@ -382,7 +374,7 @@ mod tests {
 
         core.process_shard_event(
             ShardEventWrapper {
-                from_shard_id: 0,
+                from_shard_id: ShardId::new(0),
                 ev: ShardEvent::TrackUnpublished {
                     origin: publisher,
                     track_id,
@@ -397,7 +389,7 @@ mod tests {
             panic!("expected unpublish cluster command");
         };
 
-        assert_eq!(shard_id, 2);
+        assert_eq!(shard_id, ShardId::new(2));
         assert!(matches!(
             cmd,
             ClusterCommand::UnpublishTracks { room_id, origin, track_ids }
@@ -413,7 +405,8 @@ mod tests {
         let room = room_id(2);
         let participant = pid(20);
 
-        core.registry.add_participant(participant, room, 6);
+        core.registry
+            .add_participant(participant, room, ShardId::new(6));
         core.delete_participant(&participant, &mut eq);
 
         let Some(ControllerEvent::ShardCommandSent(
@@ -423,7 +416,7 @@ mod tests {
         else {
             panic!("expected local shard removal command");
         };
-        assert_eq!(shard_id, 6);
+        assert_eq!(shard_id, ShardId::new(6));
         assert_eq!(removed, participant);
 
         let Some(ControllerEvent::ShardCommandBroadcasted(ClusterCommand::UnregisterParticipant {
@@ -434,7 +427,7 @@ mod tests {
         else {
             panic!("expected scoped unregister broadcast");
         };
-        assert_eq!(shard_id, 6);
+        assert_eq!(shard_id, ShardId::new(6));
         assert_eq!(room_id, room);
         assert_eq!(participant_id, participant);
     }
@@ -447,13 +440,16 @@ mod tests {
         let publisher = pid(30);
         let subscriber = pid(31);
 
-        core.registry.add_participant(publisher, room, 0);
-        core.registry.add_participant(subscriber, room, 1);
-        core.registry.add_participant(subscriber, room, 2);
+        core.registry
+            .add_participant(publisher, room, ShardId::new(0));
+        core.registry
+            .add_participant(subscriber, room, ShardId::new(1));
+        core.registry
+            .add_participant(subscriber, room, ShardId::new(2));
 
         let track = crate::track::Track {
             meta: TrackMeta {
-                shard_id: 0,
+                shard_id: ShardId::new(0),
                 id: publisher.derive_track_id(MediaKind::Audio, "a"),
                 origin: publisher,
                 kind: MediaKind::Audio,
@@ -463,7 +459,7 @@ mod tests {
 
         core.process_shard_event(
             ShardEventWrapper {
-                from_shard_id: 0,
+                from_shard_id: ShardId::new(0),
                 ev: ShardEvent::TrackPublished(track.clone()),
             },
             &mut eq,
@@ -475,7 +471,7 @@ mod tests {
             panic!("expected publish cluster command");
         };
 
-        assert_eq!(shard_id, 2);
+        assert_eq!(shard_id, ShardId::new(2));
         assert!(
             matches!(cmd, ClusterCommand::PublishTrack(routed, routed_room) if routed.meta.id == track.meta.id && routed_room == room)
         );

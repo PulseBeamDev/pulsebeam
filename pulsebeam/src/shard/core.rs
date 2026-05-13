@@ -11,6 +11,7 @@ use tokio::time::Instant;
 use crate::entity::TrackId;
 use crate::{
     entity::{ParticipantId, RoomId},
+    id::ShardId,
     participant::{
         ParticipantConfig, ParticipantCore,
         event::{
@@ -31,12 +32,12 @@ const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 pub(super) struct Routing {
     pub(super) kind: MediaKind,
     pub(super) subscribers: IndexSet<ParticipantId>,
-    pub(super) remote_shards: IndexSet<usize>,
+    pub(super) remote_shards: IndexSet<ShardId>,
 }
 
 pub(super) struct RoomState {
     pub(super) members: IndexSet<ParticipantId>,
-    pub(super) remote_shards: IndexSet<usize>,
+    pub(super) remote_shards: IndexSet<ShardId>,
     pub(super) audio_selector: crate::audio_selector::TopNAudioSelector,
 }
 
@@ -71,27 +72,28 @@ impl DerefMut for ParticipantMeta {
 
 /// Abstraction over the cross-shard message bus.
 pub(crate) trait CrossShardSend {
-    fn send(&self, shard_id: usize, ev: CrossShardEvent);
+    fn send(&self, shard_id: ShardId, ev: CrossShardEvent);
     fn broadcast<F: Fn() -> CrossShardEvent>(&self, make_ev: F);
-    fn shard_id(&self) -> usize;
+    fn shard_id(&self) -> ShardId;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ParticipantShardMeta {
-    shard_id: usize,
+    shard_id: ShardId,
     room_id: RoomId,
 }
 
 /// Pure shard state — no I/O handles.
 /// Methods that emit cross-shard messages accept `&impl CrossShardSend`.
 pub(crate) struct ShardCore {
-    pub(crate) shard_id: usize,
+    pub(crate) shard_id: ShardId,
     max_gso_segments: usize,
     pub(super) demuxer: Demuxer,
     pub(super) participants: HashMap<ParticipantId, ParticipantMeta>,
     pub(super) rooms: HashMap<RoomId, RoomState>,
     pub(super) routing: HashMap<TrackId, Routing>,
-    pub(super) participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
+    participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
+    remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
     timers: TimerWheel,
     pub(super) input_dirty: IndexSet<ParticipantId, ahash::RandomState>,
     pub(super) fanout_dirty: IndexSet<ParticipantId, ahash::RandomState>,
@@ -103,7 +105,8 @@ pub(crate) struct ShardCore {
 }
 
 impl ShardCore {
-    pub(crate) fn new(shard_id: usize, max_gso_segments: usize, mut rng: Rng) -> Self {
+    pub(crate) fn new(shard_id: impl Into<ShardId>, max_gso_segments: usize, mut rng: Rng) -> Self {
+        let shard_id = shard_id.into();
         let timers = TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD);
         let input_dirty = IndexSet::with_capacity_and_hasher(
             MAX_PARTICIPANTS_PER_SHARD,
@@ -126,11 +129,12 @@ impl ShardCore {
         Self {
             shard_id,
             max_gso_segments,
-            demuxer: Demuxer::new(shard_id),
+            demuxer: Demuxer::new(shard_id.into()),
             participants: HashMap::default(),
             rooms: HashMap::default(),
             routing: HashMap::default(),
             participant_shards: HashMap::default(),
+            remote_participant_counts: HashMap::default(),
             timers,
             input_dirty,
             fanout_dirty,
@@ -486,7 +490,7 @@ impl ShardCore {
         &mut self,
         participant_id: ParticipantId,
         room_id: RoomId,
-        shard_id: usize,
+        shard_id: ShardId,
     ) {
         let next = ParticipantShardMeta { room_id, shard_id };
         if self.participant_shards.get(&participant_id).copied() == Some(next) {
@@ -495,10 +499,14 @@ impl ShardCore {
                 .or_insert_with(|| RoomState::new(&mut self.rng))
                 .remote_shards
                 .insert(shard_id);
+            *self
+                .remote_participant_counts
+                .entry((room_id, shard_id))
+                .or_insert(0) += 1;
             return;
         }
         if let Some(previous) = self.participant_shards.remove(&participant_id) {
-            self.cleanup_remote_participant_membership(participant_id, previous);
+            self.cleanup_remote_participant_membership(previous);
         }
         self.participant_shards.insert(participant_id, next);
         self.rooms
@@ -506,6 +514,10 @@ impl ShardCore {
             .or_insert_with(|| RoomState::new(&mut self.rng))
             .remote_shards
             .insert(shard_id);
+        *self
+            .remote_participant_counts
+            .entry((room_id, shard_id))
+            .or_insert(0) += 1;
     }
 
     fn unregister_remote_participant(
@@ -519,33 +531,35 @@ impl ShardCore {
         if current != expected {
             tracing::warn!(
                 %participant_id,
-                current_shard = current.shard_id,
+                current_shard = %current.shard_id,
                 current_room = %current.room_id,
-                expected_shard = expected.shard_id,
+                expected_shard = %expected.shard_id,
                 expected_room = %expected.room_id,
                 "ignoring stale remote participant unregister"
             );
             return;
         }
         self.participant_shards.remove(&participant_id);
-        self.cleanup_remote_participant_membership(participant_id, current);
+        self.cleanup_remote_participant_membership(current);
     }
 
-    fn cleanup_remote_participant_membership(
-        &mut self,
-        participant_id: ParticipantId,
-        meta: ParticipantShardMeta,
-    ) {
-        if let Some(room) = self.rooms.get_mut(&meta.room_id) {
-            let shard_still_has_room_participants =
-                self.participant_shards.iter().any(|(other_id, other)| {
-                    *other_id != participant_id
-                        && other.room_id == meta.room_id
-                        && other.shard_id == meta.shard_id
-                });
-            if !shard_still_has_room_participants {
-                room.remote_shards.swap_remove(&meta.shard_id);
+    fn cleanup_remote_participant_membership(&mut self, meta: ParticipantShardMeta) {
+        let key = (meta.room_id, meta.shard_id);
+        let should_remove_shard = match self.remote_participant_counts.get_mut(&key) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.remote_participant_counts.remove(&key);
+                    true
+                } else {
+                    false
+                }
             }
+            None => true,
+        };
+
+        if should_remove_shard && let Some(room) = self.rooms.get_mut(&meta.room_id) {
+            room.remote_shards.swap_remove(&meta.shard_id);
             if room.members.is_empty() && room.remote_shards.is_empty() {
                 self.rooms.remove(&meta.room_id);
             }
@@ -675,7 +689,7 @@ pub(super) fn handle_audio_rtp(
         target: crate::log::TARGET_AUDIO,
         room_id = %ev.room_id,
         stream_id = %ev.stream_id.0,
-        slot_idx,
+        slot_idx = %slot_idx,
         members = room.members.len(),
         "audio selector produced slot"
     );
@@ -689,7 +703,7 @@ pub(super) fn handle_audio_rtp(
         tracing::trace!(
             target: crate::log::TARGET_AUDIO,
             %participant_id,
-            slot_idx,
+            slot_idx = %slot_idx,
             stream_id = %ev.stream_id.0,
             "forwarding audio packet to participant"
         );
@@ -765,40 +779,40 @@ mod tests {
     use super::*;
 
     struct TestRouter {
-        shard_id: usize,
+        shard_id: ShardId,
         shard_count: usize,
-        sent: RefCell<Vec<(usize, CrossShardEvent)>>,
+        sent: RefCell<Vec<(ShardId, CrossShardEvent)>>,
     }
 
     impl TestRouter {
         fn new(shard_id: usize, shard_count: usize) -> Self {
             Self {
-                shard_id,
+                shard_id: ShardId::new(shard_id),
                 shard_count,
                 sent: RefCell::new(Vec::new()),
             }
         }
 
-        fn take_sent(&self) -> Vec<(usize, CrossShardEvent)> {
+        fn take_sent(&self) -> Vec<(ShardId, CrossShardEvent)> {
             std::mem::take(&mut *self.sent.borrow_mut())
         }
     }
 
     impl CrossShardSend for TestRouter {
-        fn send(&self, shard_id: usize, ev: CrossShardEvent) {
+        fn send(&self, shard_id: ShardId, ev: CrossShardEvent) {
             self.sent.borrow_mut().push((shard_id, ev));
         }
 
         fn broadcast<F: Fn() -> CrossShardEvent>(&self, make_ev: F) {
             let mut sent = self.sent.borrow_mut();
             for i in 0..self.shard_count {
-                if i != self.shard_id {
-                    sent.push((i, make_ev()));
+                if ShardId::new(i) != self.shard_id {
+                    sent.push((ShardId::new(i), make_ev()));
                 }
             }
         }
 
-        fn shard_id(&self) -> usize {
+        fn shard_id(&self) -> ShardId {
             self.shard_id
         }
     }
@@ -825,7 +839,7 @@ mod tests {
 
     fn video_track(origin: ParticipantId, shard_id: usize) -> TrackMeta {
         TrackMeta {
-            shard_id,
+            shard_id: ShardId::new(shard_id),
             id: origin.derive_track_id(MediaKind::Video, "v"),
             origin,
             kind: MediaKind::Video,
@@ -999,7 +1013,11 @@ mod tests {
             &mut routing,
             &mut events,
         );
-        routing.get_mut(&track.id).unwrap().remote_shards.insert(2);
+        routing
+            .get_mut(&track.id)
+            .unwrap()
+            .remote_shards
+            .insert(ShardId::new(2));
         events.clear();
 
         handle_participant_topology(
@@ -1023,8 +1041,8 @@ mod tests {
         let stream = video_stream(pid());
         let mut routing: HashMap<TrackId, Routing> = HashMap::default();
         let mut route = empty_routing(MediaKind::Video);
-        route.remote_shards.insert(1);
-        route.remote_shards.insert(2);
+        route.remote_shards.insert(ShardId::new(1));
+        route.remote_shards.insert(ShardId::new(2));
         routing.insert(stream.0, route);
 
         let pkt = RtpPacket::default();
@@ -1043,9 +1061,9 @@ mod tests {
 
         let sent = router.take_sent();
         assert_eq!(sent.len(), 2, "must forward to both remote shards");
-        let targets: Vec<usize> = sent.iter().map(|(id, _)| *id).collect();
-        assert!(targets.contains(&1));
-        assert!(targets.contains(&2));
+        let targets: Vec<ShardId> = sent.iter().map(|(id, _)| *id).collect();
+        assert!(targets.contains(&ShardId::new(1)));
+        assert!(targets.contains(&ShardId::new(2)));
         for (_, ev) in &sent {
             assert!(
                 matches!(ev, CrossShardEvent::RtpPublished { .. }),
@@ -1101,8 +1119,8 @@ mod tests {
 
         let mut rooms: HashMap<RoomId, RoomState> = HashMap::default();
         let mut room = RoomState::new(&mut pulsebeam_runtime::rand::seeded_rng(42));
-        room.remote_shards.insert(1);
-        room.remote_shards.insert(2);
+        room.remote_shards.insert(ShardId::new(1));
+        room.remote_shards.insert(ShardId::new(2));
         rooms.insert(rid, room);
 
         let ev = RtpEvent {
@@ -1134,14 +1152,18 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::SubscribeTrack {
-                from_shard_id: 2,
+                from_shard_id: ShardId::new(2),
                 track: track.clone(),
             }),
             &router,
         );
 
         assert!(core.routing.contains_key(&track.id));
-        assert!(core.routing[&track.id].remote_shards.contains(&2));
+        assert!(
+            core.routing[&track.id]
+                .remote_shards
+                .contains(&ShardId::new(2))
+        );
     }
 
     #[test]
@@ -1152,14 +1174,14 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::SubscribeTrack {
-                from_shard_id: 2,
+                from_shard_id: ShardId::new(2),
                 track: track.clone(),
             }),
             &router,
         );
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnsubscribeTrack {
-                from_shard_id: 2,
+                from_shard_id: ShardId::new(2),
                 track: track.clone(),
             }),
             &router,
@@ -1187,7 +1209,7 @@ mod tests {
                 },
                 remote_shards: {
                     let mut s = IndexSet::new();
-                    s.insert(2usize);
+                    s.insert(ShardId::new(2));
                     s
                 },
             },
@@ -1195,7 +1217,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnsubscribeTrack {
-                from_shard_id: 2,
+                from_shard_id: ShardId::new(2),
                 track: track.clone(),
             }),
             &router,
@@ -1217,7 +1239,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 2,
+                shard_id: ShardId::new(2),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1225,10 +1247,10 @@ mod tests {
         );
 
         assert!(core.rooms.contains_key(&rid));
-        assert!(core.rooms[&rid].remote_shards.contains(&2));
+        assert!(core.rooms[&rid].remote_shards.contains(&ShardId::new(2)));
         assert!(matches!(
             core.participant_shards.get(&participant),
-            Some(meta) if meta.shard_id == 2 && meta.room_id == rid
+            Some(meta) if meta.shard_id == ShardId::new(2) && meta.room_id == rid
         ));
     }
 
@@ -1241,7 +1263,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 0,
+                shard_id: ShardId::new(0),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1263,7 +1285,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1272,7 +1294,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1294,7 +1316,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant_a,
             }),
@@ -1302,7 +1324,7 @@ mod tests {
         );
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant_b,
             }),
@@ -1311,7 +1333,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant_a,
             }),
@@ -1319,7 +1341,7 @@ mod tests {
         );
 
         assert!(
-            core.rooms[&rid].remote_shards.contains(&1),
+            core.rooms[&rid].remote_shards.contains(&ShardId::new(1)),
             "room must keep shard 1 while another remote participant remains there"
         );
         assert!(
@@ -1329,7 +1351,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant_b,
             }),
@@ -1351,7 +1373,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1359,18 +1381,18 @@ mod tests {
         );
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 2,
+                shard_id: ShardId::new(2),
                 room_id: rid,
                 participant_id: participant,
             }),
             &router,
         );
 
-        assert!(!core.rooms[&rid].remote_shards.contains(&1));
-        assert!(core.rooms[&rid].remote_shards.contains(&2));
+        assert!(!core.rooms[&rid].remote_shards.contains(&ShardId::new(1)));
+        assert!(core.rooms[&rid].remote_shards.contains(&ShardId::new(2)));
         assert!(matches!(
             core.participant_shards.get(&participant),
-            Some(meta) if meta.shard_id == 2 && meta.room_id == rid
+            Some(meta) if meta.shard_id == ShardId::new(2) && meta.room_id == rid
         ));
     }
 
@@ -1383,7 +1405,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1391,7 +1413,7 @@ mod tests {
         );
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: participant,
             }),
@@ -1401,7 +1423,7 @@ mod tests {
         assert_eq!(core.participant_shards.len(), 1);
         assert!(core.rooms.contains_key(&rid));
         assert_eq!(core.rooms[&rid].remote_shards.len(), 1);
-        assert!(core.rooms[&rid].remote_shards.contains(&1));
+        assert!(core.rooms[&rid].remote_shards.contains(&ShardId::new(1)));
     }
 
     #[test]
@@ -1415,7 +1437,7 @@ mod tests {
         add_participant(&mut core, &router, subscriber, rid);
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: rid,
                 participant_id: origin_remote,
             }),
@@ -1458,7 +1480,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: old_room,
                 participant_id: participant,
             }),
@@ -1466,7 +1488,7 @@ mod tests {
         );
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::RegisterParticipant {
-                shard_id: 2,
+                shard_id: ShardId::new(2),
                 room_id: new_room,
                 participant_id: participant,
             }),
@@ -1475,7 +1497,7 @@ mod tests {
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
-                shard_id: 1,
+                shard_id: ShardId::new(1),
                 room_id: old_room,
                 participant_id: participant,
             }),
@@ -1484,14 +1506,18 @@ mod tests {
 
         assert!(matches!(
             core.participant_shards.get(&participant),
-            Some(meta) if meta.shard_id == 2 && meta.room_id == new_room
+            Some(meta) if meta.shard_id == ShardId::new(2) && meta.room_id == new_room
         ));
         assert!(!core.rooms.contains_key(&old_room));
-        assert!(core.rooms[&new_room].remote_shards.contains(&2));
+        assert!(
+            core.rooms[&new_room]
+                .remote_shards
+                .contains(&ShardId::new(2))
+        );
 
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnregisterParticipant {
-                shard_id: 2,
+                shard_id: ShardId::new(2),
                 room_id: new_room,
                 participant_id: participant,
             }),
@@ -1509,7 +1535,7 @@ mod tests {
 
         handle_participant_control(
             ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
-                shard_id: 1, // same shard → local
+                shard_id: ShardId::new(1), // same shard → local
                 origin: pid(),
                 stream_id: video_stream(pid()),
                 kind: KeyframeRequestKind::Pli,
@@ -1533,7 +1559,7 @@ mod tests {
 
         handle_participant_control(
             ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
-                shard_id: 0, // different shard → remote
+                shard_id: ShardId::new(0), // different shard → remote
                 origin: pid(),
                 stream_id: video_stream(pid()),
                 kind: KeyframeRequestKind::Pli,
@@ -1548,7 +1574,11 @@ mod tests {
         );
         let sent = router.take_sent();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, 0, "must be directed to the publisher's shard");
+        assert_eq!(
+            sent[0].0,
+            ShardId::new(0),
+            "must be directed to the publisher's shard"
+        );
         assert!(matches!(sent[0].1, CrossShardEvent::KeyframeRequested(_)));
     }
 
@@ -1566,7 +1596,7 @@ mod tests {
         }
     }
 
-    fn make_video_track(origin: ParticipantId, shard_id: usize) -> crate::track::Track {
+    fn make_video_track(origin: ParticipantId, shard_id: ShardId) -> crate::track::Track {
         use crate::rtp::monitor::StreamState;
         use crate::track::{LayerQuality, Track, TrackLayer, TrackMeta};
         let meta = TrackMeta {
@@ -1712,7 +1742,11 @@ mod tests {
         let r = room_id("leave6");
 
         add_participant(&mut core, &router, p, r);
-        core.rooms.get_mut(&r).unwrap().remote_shards.insert(2);
+        core.rooms
+            .get_mut(&r)
+            .unwrap()
+            .remote_shards
+            .insert(ShardId::new(2));
 
         core.remove_participant(&p, &router);
 
@@ -1725,7 +1759,7 @@ mod tests {
             "local members list must be empty"
         );
         assert!(
-            core.rooms[&r].remote_shards.contains(&2),
+            core.rooms[&r].remote_shards.contains(&ShardId::new(2)),
             "remote shard must remain registered"
         );
     }
@@ -1843,7 +1877,7 @@ mod tests {
         add_participant(&mut core, &router, b, r);
 
         // Simulate B having A's video track (delivered earlier via PublishTrack).
-        let a_track = make_video_track(a, 1);
+        let a_track = make_video_track(a, ShardId::new(1));
         let track_id = a_track.meta.id;
         core.participants
             .get_mut(&b)
@@ -1895,7 +1929,7 @@ mod tests {
         add_participant(&mut core, &router, b, r);
         add_participant(&mut core, &router, c, r);
 
-        let a_track = make_video_track(a, 1);
+        let a_track = make_video_track(a, ShardId::new(1));
         let track_id = a_track.meta.id;
         // Both B and C are subscribed to A's track.
         core.participants
@@ -1986,8 +2020,8 @@ mod tests {
 
         add_participant(&mut core, &router, b, r);
 
-        let camera_track = make_video_track(a, 1);
-        let screenshare_track = make_video_track(a, 2);
+        let camera_track = make_video_track(a, ShardId::new(1));
+        let screenshare_track = make_video_track(a, ShardId::new(2));
         let camera_id = camera_track.meta.id;
         let screenshare_id = screenshare_track.meta.id;
 

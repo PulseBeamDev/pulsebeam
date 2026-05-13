@@ -1,4 +1,4 @@
-use crate::entity::ParticipantId;
+use crate::{entity::ParticipantId, id::ShardId};
 use str0m::IceCreds;
 
 /// Wire layout — 25 bytes → 40 Crockford base32 chars (200 bits / 5 = 40, exact):
@@ -37,7 +37,7 @@ pub struct IceUfrag {
     /// Which node within the cluster.  0 for single-node deployments.
     pub node_id: u16,
     /// Which shard (thread-per-core worker) on this node owns the participant.
-    pub shard_id: u8,
+    pub shard_id: ShardId,
     /// Stable participant identity that survives reconnects / ICE restarts.
     pub participant_id: ParticipantId,
 }
@@ -46,11 +46,18 @@ impl IceUfrag {
     /// Exact encoded length in ASCII characters (Crockford base32, no padding).
     pub const ENCODED_LEN: usize = ENCODED_LEN;
 
-    pub fn new(cluster_id: u16, node_id: u16, shard_id: u8, participant_id: ParticipantId) -> Self {
+    pub fn new(
+        cluster_id: u16,
+        node_id: u16,
+        shard_id: impl Into<ShardId>,
+        participant_id: ParticipantId,
+    ) -> Self {
+        let shard_id = shard_id.into();
         debug_assert!(
             cluster_id < 4096,
             "cluster_id must fit in 12 bits (max 4095)"
         );
+        debug_assert!(shard_id.index() < 256, "shard_id must fit in 8 bits");
         Self {
             cluster_id,
             node_id,
@@ -66,7 +73,7 @@ impl IceUfrag {
         raw[0] = (VERSION << 4) | ((self.cluster_id >> 8) as u8 & 0x0f);
         raw[1] = (self.cluster_id & 0xff) as u8;
         raw[2..4].copy_from_slice(&self.node_id.to_be_bytes());
-        raw[4] = self.shard_id;
+        raw[4] = self.shard_id.index() as u8;
         // bytes 5-8: reserved, already zero
         raw[9..25].copy_from_slice(self.participant_id.as_bytes());
         base32::encode(base32::Alphabet::Crockford, &raw)
@@ -85,7 +92,7 @@ impl IceUfrag {
         }
         let cluster_id = (((raw[0] & 0x0f) as u16) << 8) | (raw[1] as u16);
         let node_id = u16::from_be_bytes([raw[2], raw[3]]);
-        let shard_id = raw[4];
+        let shard_id = ShardId::new(raw[4] as usize);
         let participant_id = ParticipantId::from_bytes(raw[9..25].try_into().ok()?);
         Some(Self {
             cluster_id,

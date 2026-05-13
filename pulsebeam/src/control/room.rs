@@ -1,15 +1,15 @@
-use std::time::Duration;
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
 use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::id::ShardId;
 use crate::track::Track;
-
-const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Room {
     pub room_id: RoomId,
     participants: IndexMap<ParticipantId, Vec<Track>>,
+    participant_shards: HashMap<ShardId, usize>,
 }
 
 impl Room {
@@ -17,15 +17,23 @@ impl Room {
         Self {
             room_id,
             participants: IndexMap::new(),
+            participant_shards: HashMap::new(),
         }
     }
 
-    pub fn add_participant(&mut self, participant_id: &ParticipantId) {
+    pub fn add_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
         self.participants.insert(*participant_id, Vec::new());
+        *self.participant_shards.entry(shard_id).or_insert(0) += 1;
     }
 
-    pub fn remove_participant(&mut self, participant_id: &ParticipantId) {
+    pub fn remove_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
         self.participants.swap_remove(participant_id);
+        if let Some(count) = self.participant_shards.get_mut(&shard_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.participant_shards.remove(&shard_id);
+            }
+        }
     }
 
     pub(super) fn add_track(&mut self, track: Track) {
@@ -46,8 +54,14 @@ impl Room {
         before != tracks.len()
     }
 
-    pub fn participants_iter(&self) -> impl Iterator<Item = &ParticipantId> {
-        self.participants.keys()
+    pub fn recipient_shard_ids(
+        &self,
+        origin_shard_id: ShardId,
+    ) -> impl Iterator<Item = ShardId> + '_ {
+        self.participant_shards
+            .iter()
+            .filter(move |(shard_id, count)| **shard_id != origin_shard_id || **count > 1)
+            .map(|(shard_id, _)| *shard_id)
     }
 
     pub fn participant_count(&self) -> usize {
@@ -56,13 +70,6 @@ impl Room {
 
     pub fn tracks(&self) -> impl Iterator<Item = &Track> {
         self.participants.values().flatten()
-    }
-
-    pub fn tracks_for(&self, participant_id: &ParticipantId) -> impl Iterator<Item = &Track> {
-        self.participants
-            .iter()
-            .filter(move |(p_id, _)| *p_id != participant_id)
-            .flat_map(|(_, tracks)| tracks.iter())
     }
 
     pub fn tracks_published_by(&self, participant_id: &ParticipantId) -> Vec<Track> {

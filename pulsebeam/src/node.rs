@@ -21,6 +21,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
 use crate::control::controller::ControllerActor;
+use crate::id::ShardId;
 use crate::shard::ShardContext;
 use crate::shard::metrics::ShardMetrics;
 use crate::shard::worker::{ShardCommand, ShardWorker};
@@ -213,13 +214,14 @@ impl NodeBuilder {
 
         let mut shard_contexts = Vec::new();
 
-        for (shard_id, (((udp_sock, tcp_sock), cross_shard_event_rx), shard_rng)) in udp_sockets
+        for (shard_idx, (((udp_sock, tcp_sock), cross_shard_event_rx), shard_rng)) in udp_sockets
             .into_iter()
             .zip(tcp_sockets.into_iter())
             .zip(cross_shard_event_rxs)
             .zip(shard_rngs)
             .enumerate()
         {
+            let shard_id = ShardId::new(shard_idx);
             let (shard_command_tx, shard_command_rx) = mailbox::new(1024);
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();

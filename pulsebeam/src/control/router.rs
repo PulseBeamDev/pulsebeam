@@ -4,6 +4,7 @@ use pulsebeam_runtime::rand::RngCore;
 use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::{
+    id::ShardId,
     shard::ShardContext,
     shard::worker::{ClusterCommand, ShardCommand},
 };
@@ -68,12 +69,13 @@ impl ShardRouter {
 
     /// Update the load for a specific shard.
     /// `load` could be CPU usage (0.0 to 1.0) or active participant count.
-    pub fn update_load(&mut self, shard_idx: usize, load: f64) -> f64 {
+    pub fn update_load(&mut self, shard_id: impl Into<ShardId>, load: f64) -> f64 {
+        let shard_id = shard_id.into();
         debug_assert!(load >= 0.0);
         debug_assert!(load <= 1.0);
 
         let new_sample = load.clamp(0.0, 1.0);
-        if let Some(current_load) = self.shard_loads.get_mut(shard_idx) {
+        if let Some(current_load) = self.shard_loads.get_mut(shard_id.index()) {
             let old_load = *current_load;
 
             // If load is increasing, react fast (higher alpha)
@@ -88,7 +90,7 @@ impl ShardRouter {
         }
     }
 
-    pub fn try_route<K: Hash>(&self, key: &K) -> Option<usize> {
+    pub fn try_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
         let mut best_index = None;
         let mut max_score = -1.0;
 
@@ -112,7 +114,7 @@ impl ShardRouter {
 
             if score > max_score {
                 max_score = score;
-                best_index = Some(i);
+                best_index = Some(ShardId::new(i));
             }
         }
 
@@ -121,7 +123,7 @@ impl ShardRouter {
         best_index
     }
 
-    pub async fn send(&mut self, shard_id: usize, cmd: ShardCommand) {
+    pub async fn send(&mut self, shard_id: ShardId, cmd: ShardCommand) {
         self.get_mut(shard_id)
             .send(cmd)
             .await
@@ -135,7 +137,7 @@ impl ShardRouter {
         }
     }
 
-    fn get_mut(&mut self, shard_id: usize) -> &mut mailbox::Sender<ShardCommand> {
-        &mut self.shard_contexts[shard_id].command_tx
+    fn get_mut(&mut self, shard_id: ShardId) -> &mut mailbox::Sender<ShardCommand> {
+        &mut self.shard_contexts[shard_id.index()].command_tx
     }
 }

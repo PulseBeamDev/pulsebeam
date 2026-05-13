@@ -4,6 +4,7 @@ use str0m::media::{Mid, Pt};
 use str0m::rtp::Ssrc;
 
 use crate::audio_selector::SELECTOR_SLOTS;
+use crate::id::AudioSelectorSlotId;
 use crate::participant::downstream::SlotConfig;
 use crate::rtp::RtpPacket;
 use crate::track::StreamWriter;
@@ -68,14 +69,14 @@ impl AudioAllocator {
 
     pub fn on_rtp(
         &mut self,
-        slot_idx: usize,
+        slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) -> Option<()> {
-        let Some(slot_entry) = self.slots.get_mut(slot_idx) else {
+        let Some(slot_entry) = self.slots.get_mut(slot_idx.index()) else {
             tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
-                slot_idx,
+                slot_idx = %slot_idx,
                 slots = self.slots.len(),
                 "audio allocator received out-of-range slot index"
             );
@@ -84,7 +85,7 @@ impl AudioAllocator {
         let Some(slot) = slot_entry.as_mut() else {
             tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
-                slot_idx,
+                slot_idx = %slot_idx,
                 slots = self.slots.len(),
                 "audio allocator received packet for unprovisioned slot"
             );
@@ -133,14 +134,14 @@ mod tests {
         let mut writer = StreamWriter(&mut rtc);
 
         let first = RtpPacket::default();
-        let _ = alloc.on_rtp(0, &first, &mut writer);
+        let _ = alloc.on_rtp(AudioSelectorSlotId::new(0), &first, &mut writer);
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| !s.pending_marker),
             "first forwarded packet must consume pending marker"
         );
 
         let second = RtpPacket::default();
-        let _ = alloc.on_rtp(0, &second, &mut writer);
+        let _ = alloc.on_rtp(AudioSelectorSlotId::new(0), &second, &mut writer);
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| !s.pending_marker),
             "pending marker must stay cleared for subsequent packets"
@@ -156,7 +157,7 @@ mod tests {
         let mut writer = StreamWriter(&mut rtc);
 
         let pkt = RtpPacket::default();
-        let res = alloc.on_rtp(1, &pkt, &mut writer);
+        let res = alloc.on_rtp(AudioSelectorSlotId::new(1), &pkt, &mut writer);
         assert!(res.is_none(), "unprovisioned slot must be dropped");
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| s.pending_marker),

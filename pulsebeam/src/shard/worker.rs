@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::{
     entity::{self, ParticipantId, RoomId, TrackId},
+    id::ShardId,
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
@@ -38,12 +39,12 @@ pub enum ShardCommand {
 pub enum ClusterCommand {
     RequestKeyframe(GlobalKeyframeRequest),
     RegisterParticipant {
-        shard_id: usize,
+        shard_id: ShardId,
         room_id: RoomId,
         participant_id: entity::ParticipantId,
     },
     UnregisterParticipant {
-        shard_id: usize,
+        shard_id: ShardId,
         room_id: RoomId,
         participant_id: ParticipantId,
     },
@@ -55,12 +56,12 @@ pub enum ClusterCommand {
     },
     /// Subscriber shard → Publisher shard: begin forwarding this stream to `from_shard_id`.
     SubscribeTrack {
-        from_shard_id: usize,
+        from_shard_id: ShardId,
         track: TrackMeta,
     },
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     UnsubscribeTrack {
-        from_shard_id: usize,
+        from_shard_id: ShardId,
         track: TrackMeta,
     },
 }
@@ -86,7 +87,7 @@ pub enum CrossShardEvent {
 
 #[derive(Debug)]
 pub struct ShardEventWrapper {
-    pub from_shard_id: usize,
+    pub from_shard_id: ShardId,
     pub ev: ShardEvent,
 }
 
@@ -112,28 +113,28 @@ pub struct ShardContext {
 }
 
 struct ShardRouter {
-    shard_id: usize,
+    shard_id: ShardId,
     cross_shard_event_txs: Vec<mailbox::Sender<CrossShardEvent>>,
 }
 
 impl CrossShardSend for ShardRouter {
-    fn send(&self, shard_id: usize, ev: CrossShardEvent) {
+    fn send(&self, shard_id: ShardId, ev: CrossShardEvent) {
         if shard_id == self.shard_id {
             return;
         }
-        let _ = self.cross_shard_event_txs[shard_id].try_send(ev);
+        let _ = self.cross_shard_event_txs[shard_id.index()].try_send(ev);
     }
 
     fn broadcast<F: Fn() -> CrossShardEvent>(&self, make_ev: F) {
         for (shard_id, tx) in self.cross_shard_event_txs.iter().enumerate() {
-            if shard_id == self.shard_id {
+            if ShardId::new(shard_id) == self.shard_id {
                 continue;
             }
             let _ = tx.try_send(make_ev());
         }
     }
 
-    fn shard_id(&self) -> usize {
+    fn shard_id(&self) -> ShardId {
         self.shard_id
     }
 }
@@ -152,7 +153,7 @@ pub struct ShardWorker {
 
 impl ShardWorker {
     pub fn new(
-        shard_id: usize,
+        shard_id: ShardId,
         udp_socket: UnifiedSocket,
         tcp_socket: net::tcp::TcpTransport,
         command_rx: mailbox::Receiver<ShardCommand>,
@@ -180,7 +181,7 @@ impl ShardWorker {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(shard_id = self.router.shard_id))]
+    #[tracing::instrument(skip(self), fields(shard_id = %self.router.shard_id))]
     pub async fn run(self) {
         let res = self.run_inner().await;
         tracing::info!("shard exited: {:?}", res);

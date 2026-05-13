@@ -19,6 +19,7 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::entity::{self, TrackId};
+use crate::id::ShardId;
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::EventQueue;
 use crate::participant::signaling;
@@ -106,13 +107,13 @@ pub struct ParticipantCore {
     signaling: Signaling,
     last_slow_poll: Instant,
     pub room_id: entity::RoomId,
-    pub shard_id: usize,
+    pub shard_id: ShardId,
 }
 
 impl ParticipantCore {
     pub fn new(
         cfg: ParticipantConfig,
-        shard_id: usize,
+        shard_id: ShardId,
         udp_gso_size: usize,
         tcp_gso_size: usize,
         rng: &mut impl RngCore,
@@ -180,7 +181,11 @@ impl ParticipantCore {
     }
 
     #[inline]
-    pub fn on_forward_audio_rtp(&mut self, slot_idx: usize, pkt: &RtpPacket) {
+    pub fn on_forward_audio_rtp(
+        &mut self,
+        slot_idx: crate::id::AudioSelectorSlotId,
+        pkt: &RtpPacket,
+    ) {
         let mut writer = StreamWriter(&mut self.rtc);
         self.downstream
             .on_forward_audio_rtp(slot_idx, pkt, &mut writer);

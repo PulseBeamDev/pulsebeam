@@ -198,9 +198,21 @@ mod test {
         buf.push(make_with_ts(101, ts, true)); // PPS
         buf.push(make_with_ts(102, ts, true)); // IDR
 
-        assert_eq!(buf.pop().unwrap().seq_no, 100.into(), "SPS must not be dropped");
-        assert_eq!(buf.pop().unwrap().seq_no, 101.into(), "PPS must not be dropped");
-        assert_eq!(buf.pop().unwrap().seq_no, 102.into(), "IDR must be returned");
+        assert_eq!(
+            buf.pop().unwrap().seq_no,
+            100.into(),
+            "SPS must not be dropped"
+        );
+        assert_eq!(
+            buf.pop().unwrap().seq_no,
+            101.into(),
+            "PPS must not be dropped"
+        );
+        assert_eq!(
+            buf.pop().unwrap().seq_no,
+            102.into(),
+            "IDR must be returned"
+        );
         assert!(buf.pop().is_none());
     }
 

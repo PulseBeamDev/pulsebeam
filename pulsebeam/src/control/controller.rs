@@ -251,7 +251,7 @@ impl ControllerActor {
         }
 
         self.eq.send(
-            ufrag.shard_id as usize,
+            ufrag.shard_id,
             ShardCommand::AddTcpConnection {
                 stream: conn.stream,
                 peer_addr: conn.peer_addr,
@@ -277,7 +277,7 @@ impl ControllerActor {
         let ufrag = IceUfrag::new(
             self.cluster_id,
             self.node_id,
-            shard_id as u8,
+            shard_id,
             state.participant_id,
         );
         let creds = ufrag.into_ice_creds(&mut pulsebeam_runtime::rand::os_rng());
@@ -300,6 +300,7 @@ pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
+    use crate::id::ShardId;
     use crate::{
         control::{tcp_acceptor::PendingTcpConn, ufrag::IceUfrag},
         entity::ParticipantId,
@@ -386,7 +387,11 @@ mod tests {
                     shard_id,
                     ShardCommand::AddTcpConnection { peer_addr: pa, .. },
                 ) => {
-                    assert_eq!(shard_id, 2, "must route to the shard encoded in the ufrag");
+                    assert_eq!(
+                        shard_id,
+                        ShardId::new(2),
+                        "must route to the shard encoded in the ufrag"
+                    );
                     assert_eq!(pa, peer_addr);
                 }
                 _ => panic!("unexpected event: {event:?}"),

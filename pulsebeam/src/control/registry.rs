@@ -2,7 +2,8 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{
     control::room::Room,
-    entity::{self, ParticipantId, RoomId, TrackId},
+    entity::{ParticipantId, RoomId, TrackId},
+    id::ShardId,
     track::Track,
 };
 use futures_lite::StreamExt;
@@ -11,7 +12,7 @@ use tokio_util::time::DelayQueue;
 const EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ParticipantMeta {
-    pub shard_id: usize,
+    pub shard_id: ShardId,
     pub room_id: RoomId,
 }
 
@@ -55,14 +56,14 @@ impl RoomRegistry {
         &mut self,
         participant_id: ParticipantId,
         room_id: RoomId,
-        shard_id: usize,
+        shard_id: ShardId,
     ) {
         if let Some(previous) = self
             .participants
             .insert(participant_id, ParticipantMeta { shard_id, room_id })
             && let Some(room) = self.rooms.get_mut(&previous.room_id)
         {
-            room.remove_participant(&participant_id);
+            room.remove_participant(&participant_id, previous.shard_id);
             if room.participant_count() == 0 {
                 self.sweeper.insert(previous.room_id, EMPTY_ROOM_TIMEOUT);
             }
@@ -71,7 +72,7 @@ impl RoomRegistry {
             .rooms
             .entry(room_id)
             .or_insert_with(|| Room::new(room_id));
-        room.add_participant(&participant_id);
+        room.add_participant(&participant_id, shard_id);
     }
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
@@ -79,10 +80,10 @@ impl RoomRegistry {
     }
 
     /// Returns the shard_id that was hosting the participant, if found.
-    pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<usize> {
+    pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
         if let Some(room) = self.rooms.get_mut(&meta.room_id) {
-            room.remove_participant(participant_id);
+            room.remove_participant(participant_id, meta.shard_id);
             if room.participant_count() == 0 {
                 self.sweeper.insert(meta.room_id, EMPTY_ROOM_TIMEOUT);
             }
@@ -90,15 +91,11 @@ impl RoomRegistry {
         Some(meta.shard_id)
     }
 
-    pub fn add_track(&mut self, track: Track) -> Option<(RoomId, Vec<entity::ParticipantId>)> {
-        let origin = track.meta.origin;
+    pub fn add_track(&mut self, track: Track) -> Option<(RoomId, Vec<ShardId>)> {
+        let origin_shard = self.participants.get(&track.meta.origin)?.shard_id;
         let room = self.room_mut_for(&track.meta.origin)?;
         room.add_track(track.clone());
-        let ids = room
-            .participants_iter()
-            .filter(|&id| *id != origin)
-            .copied()
-            .collect();
+        let ids = room.recipient_shard_ids(origin_shard).collect();
         let room_id = room.room_id;
 
         Some((room_id, ids))
@@ -108,17 +105,14 @@ impl RoomRegistry {
         &mut self,
         origin: ParticipantId,
         track_id: TrackId,
-    ) -> Option<(RoomId, Vec<entity::ParticipantId>)> {
+    ) -> Option<(RoomId, Vec<ShardId>)> {
+        let origin_shard = self.participants.get(&origin)?.shard_id;
         let room = self.room_mut_for(&origin)?;
         if !room.remove_track(&origin, &track_id) {
             return None;
         }
 
-        let ids = room
-            .participants_iter()
-            .filter(|&id| *id != origin)
-            .copied()
-            .collect();
+        let ids = room.recipient_shard_ids(origin_shard).collect();
         let room_id = room.room_id;
 
         Some((room_id, ids))
@@ -184,12 +178,12 @@ mod tests {
         let rid = room_id("room-a");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, 0);
+        reg.add_participant(pid, rid, ShardId::new(0));
 
         reg.get_room(&rid).unwrap();
         let meta = reg.get_participant(&pid).expect("participant should exist");
         assert_eq!(meta.room_id, rid);
-        assert_eq!(meta.shard_id, 0);
+        assert_eq!(meta.shard_id, ShardId::new(0));
     }
 
     #[test]
@@ -199,8 +193,8 @@ mod tests {
         let pid1 = participant_id();
         let pid2 = participant_id();
 
-        reg.add_participant(pid1, rid, 0);
-        reg.add_participant(pid2, rid, 1);
+        reg.add_participant(pid1, rid, ShardId::new(0));
+        reg.add_participant(pid2, rid, ShardId::new(1));
 
         let room = reg.get_room(&rid).unwrap();
         assert_eq!(room.participant_count(), 2);
@@ -213,14 +207,14 @@ mod tests {
         let new_room = room_id("room-b-new");
         let pid = participant_id();
 
-        reg.add_participant(pid, old_room, 0);
-        reg.add_participant(pid, new_room, 1);
+        reg.add_participant(pid, old_room, ShardId::new(0));
+        reg.add_participant(pid, new_room, ShardId::new(1));
 
         assert_eq!(reg.get_room(&old_room).unwrap().participant_count(), 0);
         assert_eq!(reg.get_room(&new_room).unwrap().participant_count(), 1);
         let meta = reg.get_participant(&pid).unwrap();
         assert_eq!(meta.room_id, new_room);
-        assert_eq!(meta.shard_id, 1);
+        assert_eq!(meta.shard_id, ShardId::new(1));
     }
 
     #[tokio::test]
@@ -229,10 +223,10 @@ mod tests {
         let rid = room_id("room-c");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, 3);
+        reg.add_participant(pid, rid, ShardId::new(3));
         let shard = reg.remove_participant(&pid);
 
-        assert_eq!(shard, Some(3));
+        assert_eq!(shard, Some(ShardId::new(3)));
     }
 
     #[test]
@@ -249,7 +243,7 @@ mod tests {
         let rid = room_id("room-d");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, 0);
+        reg.add_participant(pid, rid, ShardId::new(0));
         reg.remove_participant(&pid);
 
         // Room still present; deletion is deferred via the sweeper.
@@ -266,7 +260,7 @@ mod tests {
         let rid = room_id("room-e");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, 0);
+        reg.add_participant(pid, rid, ShardId::new(0));
         reg.remove_participant(&pid);
 
         // Simulate the sweeper firing.
@@ -284,11 +278,11 @@ mod tests {
         let pid1 = participant_id();
         let pid2 = participant_id();
 
-        reg.add_participant(pid1, rid, 0);
+        reg.add_participant(pid1, rid, ShardId::new(0));
         reg.remove_participant(&pid1);
 
         // A new participant joins before the sweeper fires.
-        reg.add_participant(pid2, rid, 1);
+        reg.add_participant(pid2, rid, ShardId::new(1));
 
         // Sweeper fires — room should survive because it is not empty.
         reg.maybe_delete_room(&rid);
@@ -303,7 +297,7 @@ mod tests {
         let rid = room_id("room-h");
         let pid = participant_id();
 
-        reg.add_participant(pid, rid, 0);
+        reg.add_participant(pid, rid, ShardId::new(0));
         reg.remove_participant(&pid);
 
         assert!(reg.get_participant(&pid).is_none());
@@ -317,8 +311,8 @@ mod tests {
         let pid1 = participant_id();
         let pid2 = participant_id();
 
-        reg.add_participant(pid1, rid1, 0);
-        reg.add_participant(pid2, rid2, 1);
+        reg.add_participant(pid1, rid1, ShardId::new(0));
+        reg.add_participant(pid2, rid2, ShardId::new(1));
         reg.remove_participant(&pid1);
         reg.maybe_delete_room(&rid1);
 

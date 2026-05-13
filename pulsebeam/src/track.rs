@@ -6,6 +6,7 @@ use tokio::time::Instant;
 
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
+use crate::id::ShardId;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
@@ -21,7 +22,7 @@ pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct GlobalKeyframeRequest {
-    pub shard_id: usize,
+    pub shard_id: ShardId,
     pub origin: ParticipantId,
     pub stream_id: StreamId,
     pub kind: KeyframeRequestKind,
@@ -117,7 +118,7 @@ impl std::fmt::Debug for LayerQuality {
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
     /// The shard ID that hosts this track's publisher.
-    pub shard_id: usize,
+    pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
     pub kind: MediaKind,
@@ -370,7 +371,7 @@ pub mod test_utils {
     ) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(MediaKind::Video, &mid);
         let meta = TrackMeta {
-            shard_id: 0,
+            shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
             kind: MediaKind::Video,
@@ -381,7 +382,7 @@ pub mod test_utils {
     pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(MediaKind::Audio, &mid);
         let meta = TrackMeta {
-            shard_id: 0,
+            shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
             kind: MediaKind::Audio,

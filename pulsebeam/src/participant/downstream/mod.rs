@@ -3,6 +3,7 @@ mod video;
 
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
+use crate::id::AudioSelectorSlotId;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::EventQueue;
@@ -128,7 +129,7 @@ impl DownstreamAllocator {
     #[inline]
     pub fn on_forward_audio_rtp(
         &mut self,
-        slot_idx: usize,
+        slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
         writer: &mut StreamWriter,
     ) {

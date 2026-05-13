@@ -5,6 +5,7 @@ use tokio::time::Instant;
 
 use crate::{
     control::MAX_SEND_AUDIO_SLOTS,
+    id::AudioSelectorSlotId,
     rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline},
     track::StreamId,
 };
@@ -79,7 +80,11 @@ impl TopNAudioSelector {
     }
 
     #[inline]
-    pub fn filter(&mut self, stream_id: StreamId, pkt: &mut RtpPacket) -> Option<usize> {
+    pub fn filter(
+        &mut self,
+        stream_id: StreamId,
+        pkt: &mut RtpPacket,
+    ) -> Option<AudioSelectorSlotId> {
         // Step 1: Parse relative power and wall-clock arrival time.
         let Some(audio_level) = pkt.ext_vals.audio_level else {
             tracing::warn!(
@@ -106,7 +111,7 @@ impl TopNAudioSelector {
             // Peak-hold with decay: a single quiet packet must not instantly demote rank.
             slot.last_power = slot.last_power.max(power);
             Self::rewrite_slot_timeline(&mut slot.slot_timeline, false, pkt);
-            return Some(idx);
+            return Some(AudioSelectorSlotId::new(idx));
         }
 
         // Step 3: Slot stealing, in priority order among non-immune slots.
@@ -152,7 +157,7 @@ impl TopNAudioSelector {
         slot.immunity_expiry = now + NEWBORN_IMMUNITY;
         slot.last_power = power;
         Self::rewrite_slot_timeline(&mut slot.slot_timeline, true, pkt);
-        Some(victim_idx)
+        Some(AudioSelectorSlotId::new(victim_idx))
     }
 
     #[inline]
@@ -489,10 +494,10 @@ mod tests {
 
         // 50ms later (well within 300ms immunity), the evicted stream sends a stronger packet.
         // It must not steal back the slot while immunity is active.
-        let evicted_id = evicted_candidates[stolen_idx];
+        let evicted_id = evicted_candidates[stolen_idx.index()];
         let result = sel.filter(evicted_id, &mut pkt_at(base, 550, 0));
         assert_eq!(
-            sel.slots[stolen_idx].owner,
+            sel.slots[stolen_idx.index()].owner,
             Some(newcomer),
             "newcomer must retain its immune slot"
         );

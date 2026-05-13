@@ -622,8 +622,7 @@ mod test {
             ..Default::default()
         };
 
-        let mut switcher =
-            Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(42));
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(42));
 
         // Stage all four without any intervening pops — simulates a burst arrival.
         switcher.stage(sps.clone());
@@ -656,6 +655,10 @@ mod test {
         // Output sequence numbers must be strictly contiguous after timeline rewriting.
         let seq_nos: Vec<u64> = out.iter().map(|p| *p.seq_no).collect();
         let contiguous = seq_nos.windows(2).all(|w| w[1] == w[0] + 1);
-        assert!(contiguous, "output seq_nos must be contiguous: {:?}", seq_nos);
+        assert!(
+            contiguous,
+            "output seq_nos must be contiguous: {:?}",
+            seq_nos
+        );
     }
 }
