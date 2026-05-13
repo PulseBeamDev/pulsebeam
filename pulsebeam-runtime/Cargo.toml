@@ -44,16 +44,18 @@ tokio = { workspace = true }
 tokio-util = "0.7.18"
 tracing = { workspace = true }
 triomphe = { workspace = true }
+turmoil = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-stream = "0.3.6"
 criterion = { version = "0.8.2", features = ["async", "async_tokio"] }
 futures-concurrency = "7.7.1"
 futures-test = "0.3.32"
+loom = { version = "0.7", features = ["checkpoint", "futures"] }
 
 [features]
 default = ["parking_lot"]
 deep-metrics = []
 loom = ["dep:loom", "event-listener/loom"]
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
-sim = ["pulsebeam-core/sim"]
+sim = ["pulsebeam-core/sim", "dep:turmoil"]

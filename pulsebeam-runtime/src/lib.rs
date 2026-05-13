@@ -10,6 +10,7 @@ pub mod rand;
 pub mod rt;
 pub mod sync;
 pub mod system;
+pub mod testing;
 pub mod unsync;
 
 #[cfg(test)]

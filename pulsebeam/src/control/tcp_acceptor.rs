@@ -176,36 +176,37 @@ async fn first_frame_task(
     let _ = done_tx.send(peer_addr);
 }
 
-#[cfg(all(test, not(feature = "sim")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use pulsebeam_core::net::TcpListener;
-    use std::future::Future;
-    use std::time::Duration;
+    use std::{net::IpAddr, time::Duration};
     use tokio::time::timeout;
 
-    fn run_local(test: impl Future<Output = ()> + 'static) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, test);
+    fn run_local<Fut>(test: Fut)
+    where
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        pulsebeam_runtime::testing::run_local(test_host_ip(), test);
+    }
+
+    fn test_host_ip() -> IpAddr {
+        pulsebeam_runtime::testing::test_host_ip("192.168.250.11")
     }
 
     /// Accept one server-side TCP stream from a dedicated loopback listener.
     /// Returns (client, server, peer_addr) keeping both sides alive.
     async fn accept_one() -> (
-        tokio::net::TcpStream,
+        pulsebeam_core::net::TcpStream,
         pulsebeam_core::net::TcpStream,
         SocketAddr,
     ) {
-        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let (client, accepted) =
-            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+            tokio::join!(pulsebeam_core::net::TcpStream::connect(addr), listener.accept());
         let client = client.unwrap();
         let (server, peer_addr) = accepted.unwrap();
         (client, server, peer_addr)
@@ -217,7 +218,7 @@ mod tests {
     #[test]
     fn test_pending_tcp_cap_drops_excess_connections() {
         run_local(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -228,7 +229,7 @@ mod tests {
             // Connect MAX_PENDING_TCP clients and hold them open.
             let mut clients = Vec::new();
             for _ in 0..MAX_PENDING_TCP {
-                let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let client = pulsebeam_core::net::TcpStream::connect(addr).await.unwrap();
                 clients.push(client);
             }
 
@@ -237,7 +238,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             // The extra connection — server drops it, client EOF or RST.
-            let extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let extra = pulsebeam_core::net::TcpStream::connect(addr).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             // The event channel should have received at most MAX_PENDING_TCP
@@ -260,7 +261,7 @@ mod tests {
     #[test]
     fn test_pending_tcp_accepts_after_cap_frees_up() {
         run_local(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -270,7 +271,7 @@ mod tests {
 
             // Fill to the limit with clients that immediately close (EOF → None result).
             for _ in 0..MAX_PENDING_TCP {
-                let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let _client = pulsebeam_core::net::TcpStream::connect(addr).await.unwrap();
                 // drop immediately so the first-frame task gets EOF quickly
             }
 
@@ -292,7 +293,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             // Now a new connection should be accepted (no cap hit).
-            let _new_client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _new_client = pulsebeam_core::net::TcpStream::connect(addr).await.unwrap();
             // No event yet because the first-frame read is still pending —
             // we just verify no panic and the connection was accepted by the OS.
         });
@@ -301,7 +302,7 @@ mod tests {
     #[test]
     fn test_tcp_acceptor_stops_on_shutdown() {
         run_local(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let shutdown = CancellationToken::new();
@@ -325,7 +326,7 @@ mod tests {
         assert!(MAX_PENDING_TCP_PER_IP < MAX_PENDING_TCP);
 
         run_local(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -336,7 +337,7 @@ mod tests {
             // Open MAX_PENDING_TCP_PER_IP + 1 connections from the same IP.
             let mut clients = Vec::new();
             for _ in 0..=MAX_PENDING_TCP_PER_IP {
-                let c = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let c = pulsebeam_core::net::TcpStream::connect(addr).await.unwrap();
                 clients.push(c);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

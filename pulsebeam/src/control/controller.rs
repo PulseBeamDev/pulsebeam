@@ -297,7 +297,7 @@ impl ControllerActor {
 
 pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
 
-#[cfg(all(test, not(feature = "sim")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::id::ShardId;
@@ -308,16 +308,17 @@ mod tests {
     };
     use pulsebeam_core::net::TcpListener;
     use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream, rand::seeded_rng};
-    use std::future::Future;
-    use std::sync::Arc;
+    use std::{net::IpAddr, sync::Arc};
 
-    fn run_local(test: impl Future<Output = ()> + 'static) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, test);
+    fn run_local<Fut>(test: Fut)
+    where
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        pulsebeam_runtime::testing::run_local(test_host_ip(), test);
+    }
+
+    fn test_host_ip() -> IpAddr {
+        pulsebeam_runtime::testing::test_host_ip("192.168.250.10")
     }
 
     fn dummy_pid() -> ParticipantId {
@@ -325,7 +326,7 @@ mod tests {
     }
 
     async fn make_actor(num_shards: usize) -> ControllerActor {
-        let listener = TcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        let listener = TcpListener::bind(std::net::SocketAddr::new(test_host_ip(), 0))
             .await
             .unwrap();
         let shard_contexts: Vec<ShardContext> = (0..num_shards)
@@ -342,23 +343,23 @@ mod tests {
 
     /// Accept one server-side TCP stream from a fresh loopback listener.
     async fn accept_one() -> (
-        tokio::net::TcpStream,
+        pulsebeam_core::net::TcpStream,
         pulsebeam_core::net::TcpStream,
         std::net::SocketAddr,
     ) {
-        let listener = TcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        let listener = TcpListener::bind(std::net::SocketAddr::new(test_host_ip(), 0))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let (client, accepted) =
-            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+            tokio::join!(pulsebeam_core::net::TcpStream::connect(addr), listener.accept());
         let client = client.unwrap();
         let (server, peer_addr) = accepted.unwrap();
         (client, server, peer_addr)
     }
 
     /// Wrap a raw server-side stream as a `BufferedTcpStream` for route tests.
-    async fn make_buffered() -> (tokio::net::TcpStream, BufferedTcpStream) {
+    async fn make_buffered() -> (pulsebeam_core::net::TcpStream, BufferedTcpStream) {
         let (_client, server, _peer) = accept_one().await;
         (_client, BufferedTcpStream::new(server))
     }

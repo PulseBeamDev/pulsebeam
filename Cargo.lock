@@ -3048,6 +3048,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "turmoil",
  "url",
  "utoipa",
  "utoipa-swagger-ui",
@@ -3146,6 +3147,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "triomphe",
+ "turmoil",
 ]
 
 [[package]]

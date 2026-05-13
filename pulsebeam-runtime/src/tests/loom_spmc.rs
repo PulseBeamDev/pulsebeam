@@ -1,9 +1,10 @@
 //! Loom model-checking tests for the SPMC ring buffer.
 //!
 //! These tests run against the real `spmc` module — no reimplementation.
-//! All concurrency primitives in `crate::sync` resolve to their loom
-//! counterparts under `cfg(loom)`, and `event_listener` is compiled with
-//! its `loom` feature so `Event`/`EventListener` are also instrumented.
+//! They are compiled in normal test builds too; with `--features loom`, all
+//! concurrency primitives in `crate::sync` resolve to their loom counterparts
+//! and `event_listener` is compiled with its `loom` feature so
+//! `Event`/`EventListener` are also instrumented.
 //!
 //! Run with:
 //!   LOOM_MAX_PREEMPTIONS=3 cargo test --test spmc_loom --features loom

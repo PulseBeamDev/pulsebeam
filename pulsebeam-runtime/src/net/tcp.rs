@@ -537,25 +537,31 @@ fn count_rfc4571_frames(buf: &[u8]) -> u64 {
     count
 }
 
-#[cfg(all(test, not(feature = "sim")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use pulsebeam_core::net::TcpListener;
-    use std::time::Duration;
+    use std::{net::IpAddr, time::Duration};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn local_rt() -> tokio::runtime::LocalRuntime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build_local(tokio::runtime::LocalOptions::default())
-            .unwrap()
+    fn run_local<Fut>(test: Fut)
+    where
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        crate::testing::run_local(test_host_ip(), test);
+    }
+
+    fn test_host_ip() -> IpAddr {
+        crate::testing::test_host_ip("192.168.250.12")
     }
 
     /// Connect a client to `listener`, accept the server-side stream, return both.
-    async fn make_pair(listener: &TcpListener) -> (tokio::net::TcpStream, TcpStream, SocketAddr) {
+    async fn make_pair(
+        listener: &TcpListener,
+    ) -> (pulsebeam_core::net::TcpStream, TcpStream, SocketAddr) {
         let server_addr = listener.local_addr().unwrap();
         let (cli, srv) = tokio::join!(
-            tokio::net::TcpStream::connect(server_addr),
+            pulsebeam_core::net::TcpStream::connect(server_addr),
             listener.accept()
         );
         let client = cli.unwrap();
@@ -565,8 +571,8 @@ mod tests {
 
     #[test]
     fn test_tcp_rfc_compliance() {
-        local_rt().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let server_addr = listener.local_addr().unwrap();
@@ -625,8 +631,8 @@ mod tests {
     /// pre-reads the first STUN frame for ufrag-based routing.
     #[test]
     fn test_initial_payload_delivery() {
-        local_rt().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let server_addr = listener.local_addr().unwrap();
@@ -660,8 +666,8 @@ mod tests {
     /// We use 0xFFFF (65535) as the length prefix which always exceeds MAX_FRAME_SIZE.
     #[test]
     fn test_recv_buf_overflow_drops_connection() {
-        local_rt().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let server_addr = listener.local_addr().unwrap();
@@ -701,8 +707,8 @@ mod tests {
     /// not buffered), keeping memory bounded.
     #[test]
     fn test_send_to_slow_reader_is_lossy() {
-        local_rt().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let server_addr = listener.local_addr().unwrap();
@@ -736,8 +742,8 @@ mod tests {
 
     #[test]
     fn test_tcp_multi_peer_isolation() {
-        local_rt().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
                 .await
                 .unwrap();
             let server_addr = listener.local_addr().unwrap();
@@ -753,16 +759,18 @@ mod tests {
         });
     }
 
-    #[tokio::test]
-    async fn test_access_local_addr() {
-        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-            .await
-            .unwrap();
-        let local_addr = listener.local_addr().unwrap();
-        let sock = TcpTransport::new(local_addr);
+    #[test]
+    fn test_access_local_addr() {
+        run_local(async {
+            let listener = TcpListener::bind(SocketAddr::new(test_host_ip(), 0))
+                .await
+                .unwrap();
+            let local_addr = listener.local_addr().unwrap();
+            let sock = TcpTransport::new(local_addr);
 
-        // TcpTransport is Send; it can be moved to another thread.
-        let handle = tokio::spawn(async move { sock.local_addr() });
-        assert_eq!(handle.await.unwrap(), local_addr);
+            // TcpTransport is Send; it can be moved to another thread.
+            let handle = tokio::spawn(async move { sock.local_addr() });
+            assert_eq!(handle.await.unwrap(), local_addr);
+        });
     }
 }

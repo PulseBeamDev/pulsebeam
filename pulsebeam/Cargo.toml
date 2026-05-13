@@ -67,6 +67,7 @@ hex = "0.4.3"
 more-asserts = { workspace = true }
 proptest = "1.11.0"
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+turmoil = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemalloc_pprof = { version = "0.8.2", features = ["flamegraph", "symbolize"] }
@@ -84,5 +85,5 @@ str0m = { workspace = true, features = ["wincrypto"] }
 default = []
 deep-metrics = ["pulsebeam-runtime/deep-metrics"]
 parking_lot = ["once_cell/parking_lot", "pulsebeam-runtime/parking_lot"]
-sim = ["pulsebeam-core/sim"]
+sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim"]
 tokio-console = ["console-subscriber", "tokio/tracing"]
