@@ -355,7 +355,7 @@ impl TcpTransport {
 
         // Spawn the read task on the same thread.  It owns `read` and forwards
         // decoded frames through `event_tx` until cancelled or the stream closes.
-        tokio::task::spawn_local(tcp_read_task(
+        tokio::task::spawn(tcp_read_task(
             peer_addr,
             read,
             pending, // empty at this point

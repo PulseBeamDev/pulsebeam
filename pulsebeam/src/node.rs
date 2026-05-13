@@ -243,7 +243,7 @@ impl NodeBuilder {
                 // tcp_read_task) within the caller's LocalSet context (e.g. turmoil's
                 // per-host LocalSet).  Regular spawn() would detach from that context
                 // causing spawn_local panics inside add_connection.
-                join_set.spawn_local(ignore(shard.run()));
+                join_set.spawn(ignore(shard.run()));
             } else {
                 let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
                 let handle = builder
@@ -276,7 +276,7 @@ impl NodeBuilder {
         // intentionally small so backpressure is applied early
         let (controller_command_tx, controller_command_rx) = mailbox::new(64);
 
-        join_set.spawn_local(ignore(controller.run(
+        join_set.spawn(ignore(controller.run(
             controller_command_rx,
             shard_event_rx,
             shutdown.child_token(),

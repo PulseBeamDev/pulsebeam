@@ -27,6 +27,28 @@ struct Args {
     /// Enable development mode preset
     #[arg(short, long)]
     dev: bool,
+
+    /// Enable thread-per-core runtime mode
+    #[arg(short, long)]
+    tpc: bool,
+}
+
+trait Runtime {
+    fn block_on<F: Future>(&self, future: F) -> F::Output;
+}
+
+enum PulsebeamRuntime {
+    LocalRuntime(tokio::runtime::LocalRuntime),
+    MultiThreadedRuntime(tokio::runtime::Runtime),
+}
+
+impl Runtime for PulsebeamRuntime {
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        match self {
+            Self::LocalRuntime(rt) => rt.block_on(future),
+            Self::MultiThreadedRuntime(rt) => rt.block_on(future),
+        }
+    }
 }
 
 fn main() {
@@ -59,32 +81,42 @@ fn main() {
         total_cores
     );
 
-    // let (ltrd, mut rt_builder) = pulsebeam_runtime::rt::Builder::new_multi_threaded(
-    //     Duration::from_secs(1),
-    //     Duration::from_micros(100),
-    // );
-
-    let mut rt_builder = tokio::runtime::Builder::new_current_thread();
-    let rt = rt_builder
-        .enable_all()
-        .event_interval(255)
-        // .worker_threads(workers)
-        // .disable_lifo_slot()
-        // https://github.com/tokio-rs/tokio/issues/7745
-        .enable_alt_timer()
-        .build_local(LocalOptions::default())
-        .unwrap();
-
-    // let rt = Arc::new(rt);
-    // ltrd.start(rt.clone());
+    let rt = if args.tpc {
+        let mut rt_builder = tokio::runtime::Builder::new_current_thread();
+        let rt = rt_builder
+            .enable_all()
+            // .worker_threads(workers)
+            // .disable_lifo_slot()
+            // https://github.com/tokio-rs/tokio/issues/7745
+            .enable_alt_timer()
+            .build_local(LocalOptions::default())
+            .unwrap();
+        PulsebeamRuntime::LocalRuntime(rt)
+    } else {
+        let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+        let rt = rt_builder
+            .enable_all()
+            // .worker_threads(workers)
+            // .disable_lifo_slot()
+            // https://github.com/tokio-rs/tokio/issues/7745
+            .enable_alt_timer()
+            .build()
+            .unwrap();
+        PulsebeamRuntime::MultiThreadedRuntime(rt)
+    };
 
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers, rtc_port));
+    rt.block_on(run(shutdown.clone(), workers, rtc_port, !args.tpc));
     shutdown.cancel();
 }
 
-pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
+pub async fn run(
+    shutdown: CancellationToken,
+    workers: usize,
+    rtc_port: u16,
+    use_shared_runtime: bool,
+) {
     let external_ip = pulsebeam_runtime::system::select_host_address();
     let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
@@ -93,15 +125,19 @@ pub async fn run(shutdown: CancellationToken, workers: usize, rtc_port: u16) {
 
     tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
     let rng = rand::os_rng();
-    let node = NodeBuilder::new()
+    let mut node_builder = NodeBuilder::new()
         .workers(workers)
         .local_addr(local_addr)
         .external_addr(external_addr)
         .rng(rng)
         .with_http_api(http_api_addr)
-        .with_internal_metrics(metrics_addr)
-        .run(shutdown.child_token());
-    let node_handle = tokio::task::spawn_local(node);
+        .with_internal_metrics(metrics_addr);
+
+    if use_shared_runtime {
+        node_builder = node_builder.with_current_runtime();
+    }
+    let node = node_builder.run(shutdown.child_token());
+    let node_handle = tokio::task::spawn(node);
 
     tracing::info!("server started...");
 

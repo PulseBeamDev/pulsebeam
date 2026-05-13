@@ -67,7 +67,7 @@ impl TcpAcceptorHandle {
     /// Spawn the acceptor loop onto the current `LocalSet` / `LocalRuntime`.
     pub fn spawn(listener: TcpListener, shutdown: CancellationToken) -> Self {
         let (event_tx, event_rx) = mailbox::new(256);
-        tokio::task::spawn_local(acceptor_loop(listener, event_tx, shutdown));
+        tokio::task::spawn(acceptor_loop(listener, event_tx, shutdown));
         Self { event_rx }
     }
 }
@@ -138,7 +138,7 @@ async fn acceptor_loop(
 
                         let tx = event_tx.clone();
                         let done = done_tx.clone();
-                        tokio::task::spawn_local(first_frame_task(stream, peer_addr, tx, done));
+                        tokio::task::spawn(first_frame_task(stream, peer_addr, tx, done));
                     }
                 }
             }
@@ -205,8 +205,10 @@ mod tests {
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let (client, accepted) =
-            tokio::join!(pulsebeam_core::net::TcpStream::connect(addr), listener.accept());
+        let (client, accepted) = tokio::join!(
+            pulsebeam_core::net::TcpStream::connect(addr),
+            listener.accept()
+        );
         let client = client.unwrap();
         let (server, peer_addr) = accepted.unwrap();
         (client, server, peer_addr)
