@@ -217,12 +217,6 @@ impl ShardWorker {
 
             self.tick(busy_start);
 
-            // TODO: record forwarding latency
-            let busy_end = Instant::now();
-            let _forwarding_latency = busy_end - busy_start;
-            loop_start = busy_end;
-            self.metrics.record_busy(busy_start.elapsed());
-
             while let Some(event) = self.core.shard_events.pop_front() {
                 let wrapped = ShardEventWrapper {
                     from_shard_id: self.router.shard_id,
@@ -233,6 +227,12 @@ impl ShardWorker {
                     break 'outer;
                 }
             }
+
+            // TODO: record forwarding latency
+            let busy_end = Instant::now();
+            loop_start = busy_end;
+            let busy_duration = busy_end.duration_since(busy_start);
+            self.metrics.record_busy(busy_duration);
         }
 
         Ok(())
