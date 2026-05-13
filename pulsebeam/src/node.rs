@@ -265,6 +265,12 @@ impl NodeBuilder {
             });
         }
 
+        // set current thread to lower priority after spawning worker threads so
+        // we don't lower the worker threads' priorities
+        if matches!(self.worker_execution, WorkerExecution::ThreadPerWorker) {
+            set_lower_current_thread_priority();
+        }
+
         let controller =
             ControllerActor::new(controller_rng, shard_contexts, candidates, tcp_listener);
         // intentionally small so backpressure is applied early
@@ -421,6 +427,21 @@ fn sockets_to_candidates(sockets: &[UnifiedSocket]) -> Vec<Candidate> {
 
 pub async fn ignore<T>(fut: impl Future<Output = T>) {
     let _ = fut.await;
+}
+
+fn set_lower_current_thread_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        match rustix::process::setpriority_process(None, 5) {
+            Ok(_) => tracing::info!("Lowered control thread nice value to +5 to yield to workers"),
+            Err(e) => tracing::warn!("Failed to lower control thread priority: {}", e),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::debug!("Control thread de-prioritization is only active on Linux");
+    }
 }
 
 mod internal {
