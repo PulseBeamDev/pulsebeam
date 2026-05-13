@@ -9,7 +9,7 @@ use crate::{
     shard::worker::{ClusterCommand, ShardCommand},
 };
 
-const MAX_LOAD: f64 = 0.7;
+const MAX_LOAD: f64 = 0.8;
 
 pub struct ShardRouter {
     hasher_config: ahash::RandomState,

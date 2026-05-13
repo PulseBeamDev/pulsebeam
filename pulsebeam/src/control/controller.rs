@@ -88,7 +88,7 @@ pub enum ControllerError {
     Unknown(String),
 }
 
-const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct ControllerActor {
     router: ShardRouter,
@@ -351,8 +351,10 @@ mod tests {
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let (client, accepted) =
-            tokio::join!(pulsebeam_core::net::TcpStream::connect(addr), listener.accept());
+        let (client, accepted) = tokio::join!(
+            pulsebeam_core::net::TcpStream::connect(addr),
+            listener.accept()
+        );
         let client = client.unwrap();
         let (server, peer_addr) = accepted.unwrap();
         (client, server, peer_addr)
