@@ -562,11 +562,11 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::SendOnly, None);
     }
 
-    for _ in 0..16 {
+    for _ in 0..7 {
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
     }
 
-    for _ in 0..5 {
+    for _ in 0..3 {
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 

@@ -10,8 +10,9 @@ use tokio::time::Instant;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 2;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 2;
-pub const MAX_SEND_VIDEO_SLOTS: usize = 16;
-pub const MAX_SEND_AUDIO_SLOTS: usize = 5;
+// https://github.com/PulseBeamDev/pulsebeam/issues/133
+pub const MAX_SEND_VIDEO_SLOTS: usize = 7;
+pub const MAX_SEND_AUDIO_SLOTS: usize = 3;
 pub const MAX_DATA_CHANNELS: usize = 1;
 
 #[derive(Debug)]
@@ -112,6 +113,7 @@ impl Negotiator {
                 use_inband_fec: Some(true),
                 use_dtx: Some(true),
                 stereo: Some(true),
+                sprop_stereo: Some(true),
                 ..Default::default()
             },
         );
