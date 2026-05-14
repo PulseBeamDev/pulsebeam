@@ -83,7 +83,7 @@ impl AudioAllocator {
             return None;
         };
         let Some(slot) = slot_entry.as_mut() else {
-            tracing::warn!(
+            tracing::debug!(
                 target: crate::log::TARGET_AUDIO,
                 slot_idx = %slot_idx,
                 slots = self.slots.len(),

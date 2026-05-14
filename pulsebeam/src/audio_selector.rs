@@ -137,7 +137,7 @@ impl TopNAudioSelector {
             if power > quietest_slot.last_power {
                 Some(quietest_idx)
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     target: crate::log::TARGET_AUDIO,
                     stream_id = %stream_id.0,
                     incoming_power = power,

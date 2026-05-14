@@ -58,10 +58,6 @@ impl Timeline {
     /// Re-aligns the timeline to a new video stream starting with `packet`.
     /// `packet` must be a keyframe (start of a new GOP).
     pub fn rebase(&mut self, packet: &RtpPacket) {
-        debug_assert!(
-            packet.is_keyframe_start,
-            "Rebase should only happen on keyframe boundaries"
-        );
         self.rebase_inner(packet);
     }
 
@@ -136,7 +132,7 @@ mod test {
             seq_no: 100.into(),
             rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
             playout_time: start_time,
-            is_keyframe_start: true,
+            is_keyframe: true,
             ..Default::default()
         };
 
@@ -149,7 +145,7 @@ mod test {
             seq_no: 101.into(),
             rtp_ts: MediaTime::new(19000, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(100),
-            is_keyframe_start: false,
+            is_keyframe: false,
             ..Default::default()
         };
 
@@ -177,7 +173,7 @@ mod test {
             seq_no: 1000.into(),
             rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
             playout_time: start_time,
-            is_keyframe_start: true,
+            is_keyframe: true,
             ..Default::default()
         };
 
@@ -188,7 +184,7 @@ mod test {
             seq_no: 1001.into(),
             rtp_ts: MediaTime::new(13000, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(33),
-            is_keyframe_start: false,
+            is_keyframe: false,
             ..Default::default()
         };
         timeline.rewrite(&mut p_a2);
@@ -199,7 +195,7 @@ mod test {
             seq_no: 5000.into(),
             rtp_ts: MediaTime::new(80000, Frequency::NINETY_KHZ), // Random initial timestamp
             playout_time: start_time + Duration::from_millis(100),
-            is_keyframe_start: true,
+            is_keyframe: true,
             ..Default::default()
         };
 
@@ -233,7 +229,7 @@ mod test {
         let mut p1 = RtpPacket {
             seq_no: 10.into(),
             playout_time: start_time,
-            is_keyframe_start: true,
+            is_keyframe: true,
             ..Default::default()
         };
         timeline.rebase(&p1);
@@ -254,7 +250,7 @@ mod test {
         let mut p_next = RtpPacket {
             seq_no: u64::MAX.into(), // Input at boundary
             playout_time: start_time + Duration::from_millis(33),
-            is_keyframe_start: true,
+            is_keyframe: true,
             ..Default::default()
         };
 
@@ -268,7 +264,7 @@ mod test {
         let mut p_wrap = RtpPacket {
             seq_no: 0.into(),
             playout_time: start_time + Duration::from_millis(66),
-            is_keyframe_start: false,
+            is_keyframe: false,
             ..Default::default()
         };
 
@@ -290,7 +286,7 @@ mod test {
             seq_no: 10.into(),
             rtp_ts: MediaTime::new(1000, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(100),
-            is_keyframe_start: true,
+            is_keyframe: true,
             ..Default::default()
         };
         timeline.rebase(&p1);
@@ -300,7 +296,7 @@ mod test {
             seq_no: 11.into(),
             rtp_ts: MediaTime::new(1500, Frequency::NINETY_KHZ),
             playout_time: start_time + Duration::from_millis(50),
-            is_keyframe_start: false,
+            is_keyframe: false,
             ..Default::default()
         };
 

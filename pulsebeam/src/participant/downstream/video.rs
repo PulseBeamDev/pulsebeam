@@ -312,7 +312,6 @@ impl VideoAllocator {
         // ready immediately and can prematurely switch away from the old stream.
         if slot.should_promote_staging() {
             slot.active = slot.staging.take();
-            slot.staging_packet_seen = false;
             state_changed = true;
         }
 
@@ -398,8 +397,6 @@ struct Slot {
     max_height: u32,
     paused: bool,
 
-    /// Whether we have observed any packets for the current staging layer.
-    staging_packet_seen: bool,
     /// Number of PLI retries sent for the current staging layer.
     staging_keyframe_retries: u32,
     /// When the last PLI retry was sent for the current staging layer.
@@ -424,7 +421,6 @@ impl Slot {
             max_height: 720,
             paused: true,
 
-            staging_packet_seen: false,
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
             staging_keyframe_interval: KEYFRAME_RETRY_INTERVAL,
@@ -445,7 +441,6 @@ impl Slot {
     }
 
     fn pli_reset(&mut self) {
-        self.staging_packet_seen = false;
         self.staging_keyframe_retries = 0;
         self.staging_keyframe_last_at = None;
         self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
@@ -471,7 +466,6 @@ impl Slot {
             return;
         }
 
-        let staging_has_packets = self.staging_packet_seen;
         let keepalive_mode = retries >= KEYFRAME_MAX_RETRIES;
         let reached_keepalive = !keepalive_mode && retries + 1 == KEYFRAME_MAX_RETRIES;
         if !keepalive_mode {
@@ -481,21 +475,12 @@ impl Slot {
 
         if reached_keepalive {
             self.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
-            if staging_has_packets {
-                tracing::warn!(
-                    mid = %self.mid,
-                    retries = KEYFRAME_MAX_RETRIES,
-                    interval = ?self.staging_keyframe_interval,
-                    "slot transition stalled; switching to low-frequency keep-alive PLIs while waiting for a natural keyframe"
-                );
-            } else {
-                tracing::debug!(
-                    mid = %self.mid,
-                    retries = KEYFRAME_MAX_RETRIES,
-                    interval = ?self.staging_keyframe_interval,
-                    "slot transition still waiting for any packets on the staged stream; using low-frequency keep-alive PLIs"
-                );
-            }
+            tracing::debug!(
+                mid = %self.mid,
+                retries = KEYFRAME_MAX_RETRIES,
+                interval = ?self.staging_keyframe_interval,
+                "slot transition still waiting for any packets on the staged stream; using low-frequency keep-alive PLIs"
+            );
         }
 
         events.request_keyframe(staging);
@@ -508,7 +493,7 @@ impl Slot {
         if self.active.as_ref() == Some(new_layer) {
             if self.staging.is_some() {
                 self.staging = None;
-                self.switcher.clear();
+                self.switcher.clear_staging();
                 self.pli_reset();
                 changed = true;
                 tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
@@ -517,7 +502,7 @@ impl Slot {
             self.staging = Some(new_layer.clone());
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
-            self.switcher.clear();
+            self.switcher.clear_staging();
             // Reset retry state so the new staging layer gets fresh PLI attempts.
             self.pli_reset();
             changed = true;
@@ -552,7 +537,6 @@ impl Slot {
 
         if self.staging.as_ref() != Some(layer) {
             self.staging = Some(layer.clone());
-            self.staging_packet_seen = false;
             changed = true;
             tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
         }
@@ -579,7 +563,6 @@ impl Slot {
         } else if let Some(staging) = self.staging.as_ref()
             && staging.is(stream_id)
         {
-            self.staging_packet_seen = true;
             self.switcher.stage(pkt.clone());
         } else {
             tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
@@ -587,7 +570,7 @@ impl Slot {
     }
 
     fn should_promote_staging(&self) -> bool {
-        self.staging_packet_seen && self.switcher.ready_to_switch() && self.staging.is_some()
+        self.switcher.ready_to_switch() && self.staging.is_some()
     }
 
     fn matches_track_id(&self, track_id: &TrackId) -> bool {
