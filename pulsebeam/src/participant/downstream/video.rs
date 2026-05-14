@@ -486,9 +486,18 @@ impl Slot {
         events.request_keyframe(staging);
     }
 
-    fn switch_to(&mut self, new_layer: &TrackLayer, _force: bool) -> bool {
+    fn switch_to(&mut self, new_layer: &TrackLayer, force: bool) -> bool {
         let mut changed = false;
         let old_target = self.target().map(|l| l.stream_id());
+        let is_track_change = self
+            .target()
+            .map(|l| l.meta.id)
+            .is_none_or(|id| id != new_layer.meta.id);
+
+        if force && is_track_change {
+            changed |= self.active.take().is_some();
+            self.switcher.clear();
+        }
 
         if self.active.as_ref() == Some(new_layer) {
             if self.staging.is_some() {
@@ -1334,6 +1343,34 @@ mod assignment_tests {
         assert_eq!(
             slot.staging.as_ref().unwrap().stream_id(),
             new_stage.stream_id()
+        );
+    }
+
+    #[test]
+    fn force_switch_to_different_track_clears_active_immediately() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+
+        let t0 = allocator.tracks.get(&tracks.ids[0]).unwrap();
+        let t1 = allocator.tracks.get(&tracks.ids[1]).unwrap();
+        let active = t0.lowest_quality().clone();
+        let new_target = t1.lowest_quality().clone();
+
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.active = Some(active);
+        slot.staging = None;
+        slot.paused = false;
+
+        assert!(slot.switch_to(&new_target, true));
+        assert!(
+            slot.active.is_none(),
+            "force switch must clear active stream"
+        );
+        assert_eq!(
+            slot.staging.as_ref().unwrap().meta.id,
+            new_target.meta.id,
+            "new track must become staging target"
         );
     }
 
