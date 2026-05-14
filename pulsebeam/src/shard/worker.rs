@@ -22,6 +22,8 @@ use super::core::{CrossShardSend, ShardCore};
 pub enum ShardError {
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
+    #[error("Manager hung up")]
+    ManagerDisconnected,
 }
 
 #[derive(Debug)]
@@ -189,50 +191,44 @@ impl ShardWorker {
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
         let mut loop_start = Instant::now();
-        'outer: loop {
-            // Compute the deadline before the select so no borrow of self.core
-            // outlives this block.
-            let deadline = self.core.next_timer_deadline();
-            let wait = async move {
-                match deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    // No pending timers: park forever until socket wakes us.
-                    None => std::future::pending::<()>().await,
-                }
-            };
-
-            // Block until at least one source is ready.
-            tokio::select! {
-                biased;
-                Ok(_) = self.udp_socket.readable() => {}
-                Some(_) = self.cross_shard_event_rx.readable() => {}
-                Ok(_) = self.tcp_socket.readable() => {}
-                Some(_) = self.command_rx.readable() => {}
-                _ = wait => {}
-                else => break,
-            }
+        loop {
+            self.wait_for_inputs().await?;
 
             let busy_start = Instant::now();
             self.metrics.record_idle(busy_start - loop_start);
 
             self.tick(busy_start);
-
-            while let Some(event) = self.core.shard_events.pop_front() {
-                let wrapped = ShardEventWrapper {
-                    from_shard_id: self.router.shard_id,
-                    ev: event,
-                };
-                if let Err(err) = self.event_tx.send(wrapped).await {
-                    tracing::warn!("shard event channel is closed, exiting: {}", err);
-                    break 'outer;
-                }
-            }
+            self.flush_shard_events().await?;
 
             // TODO: record forwarding latency
             let busy_end = Instant::now();
             loop_start = busy_end;
             let busy_duration = busy_end.duration_since(busy_start);
             self.metrics.record_busy(busy_duration);
+        }
+    }
+
+    async fn wait_for_inputs(&mut self) -> Result<(), ShardError> {
+        // Compute the deadline before the select so no borrow of self.core
+        // outlives this block.
+        let deadline = self.core.next_timer_deadline();
+        let wait = async move {
+            match deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                // No pending timers: park forever until socket wakes us.
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        // Block until at least one source is ready.
+        tokio::select! {
+            biased;
+            Ok(_) = self.udp_socket.readable() => {}
+            Some(_) = self.cross_shard_event_rx.readable() => {}
+            Ok(_) = self.tcp_socket.readable() => {}
+            Some(_) = self.command_rx.readable() => {}
+            _ = wait => {}
+            else => return Err(ShardError::ManagerDisconnected),
         }
 
         Ok(())
@@ -275,5 +271,20 @@ impl ShardWorker {
             .flush_egress(&self.udp_socket, &mut self.tcp_socket);
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
+    }
+
+    async fn flush_shard_events(&mut self) -> Result<(), ShardError> {
+        while let Some(event) = self.core.shard_events.pop_front() {
+            let wrapped = ShardEventWrapper {
+                from_shard_id: self.router.shard_id,
+                ev: event,
+            };
+            if let Err(err) = self.event_tx.send(wrapped).await {
+                tracing::warn!("shard event channel is closed, exiting: {}", err);
+                return Err(ShardError::ManagerDisconnected);
+            }
+        }
+
+        Ok(())
     }
 }
