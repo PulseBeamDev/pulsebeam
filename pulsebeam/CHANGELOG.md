@@ -1,3 +1,15 @@
+## [unreleased]
+
+* Allow changing isolated vs shared runtime
+* Allow control thread floats with lower priority
+* Explicit ShardId and AudioSelectorId type
+* Added stereo mode
+* Exclude AUD and SEI for keyframe detection
+* StreamMonitor v2 based on a windowed packet loss
+* Support main and aux MediaStreams
+* Support explicit unpublish track signals
+* Removed upstream audio filter
+
 ## [pulsebeam-v0.4.1] - 2026-05-07
 
 * Separate lossy vs lossless events
