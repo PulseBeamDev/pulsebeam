@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.2] - 2026-05-14
 
 * Allow changing isolated vs shared runtime
 * Allow control thread floats with lower priority
