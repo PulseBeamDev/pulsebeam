@@ -48,6 +48,9 @@ enum Commands {
         session_jitter: u64,
         #[arg(long, default_value_t = 30)]
         drain_duration: u64,
+
+        #[arg(long)]
+        simulcast: bool,
     },
 }
 
@@ -174,6 +177,7 @@ async fn main() -> Result<()> {
             session_duration,
             session_jitter,
             drain_duration,
+            simulcast,
         } => {
             run_bench(
                 cli.api_url,
@@ -185,6 +189,7 @@ async fn main() -> Result<()> {
                 session_duration,
                 session_jitter,
                 drain_duration,
+                simulcast,
             )
             .await?
         }
@@ -203,6 +208,7 @@ async fn run_bench(
     session_duration: u64,
     session_jitter: u64,
     drain_duration: u64,
+    simulcast: bool,
 ) -> Result<()> {
     let (stats_tx, stats_rx) = mpsc::channel::<StatReport>(16_000);
     let state = SharedState::new();
@@ -243,6 +249,7 @@ async fn run_bench(
             session_jitter,
             &stats_tx,
             &state,
+            simulcast,
         )
         .await;
         total_rooms += 1;
@@ -273,6 +280,7 @@ async fn run_bench(
                         session_jitter,
                         &stats_tx,
                         &state,
+                        simulcast
                     )
                     .await;
                     total_rooms += 1;
@@ -311,6 +319,7 @@ async fn spawn_room(
     session_jitter: u64,
     stats_tx: &mpsc::Sender<StatReport>,
     state: &Arc<SharedState>,
+    simulcast: bool,
 ) {
     let room_id = room_counter.fetch_add(1, Ordering::Relaxed);
     let room = format!("bench-room-{}", room_id);
@@ -338,6 +347,7 @@ async fn spawn_room(
                 url,
                 r,
                 true,
+                simulcast,
                 Duration::from_secs(this_session),
                 tx,
                 users_per_room,
@@ -540,6 +550,7 @@ async fn spawn_agent(
     api_url: String,
     room: String,
     is_pub: bool,
+    simulcast: bool,
     session_duration: Duration,
     stats_tx: mpsc::Sender<StatReport>,
     _users_per_room: usize,
@@ -550,15 +561,19 @@ async fn spawn_agent(
     let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
 
     if is_pub {
-        builder = builder.with_track(
-            MediaKind::Video,
-            TransceiverDirection::SendOnly,
-            Some(vec![
-                SimulcastLayer::new("f"),
-                SimulcastLayer::new("h"),
-                SimulcastLayer::new("q"),
-            ]),
-        );
+        if simulcast {
+            builder = builder.with_track(
+                MediaKind::Video,
+                TransceiverDirection::SendOnly,
+                Some(vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ]),
+            );
+        } else {
+            builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
+        }
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::SendOnly, None);
     }
 
