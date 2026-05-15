@@ -169,9 +169,9 @@ impl StreamMonitor {
         }
     }
 
-    pub fn process_packet(&mut self, packet: &RtpPacket, size_bytes: usize) {
+    pub fn process_packet(&mut self, packet: &RtpPacket) {
         self.last_packet_at = packet.arrival_ts;
-        self.bwe.record(size_bytes);
+        self.bwe.record(packet);
 
         let seq = *packet.seq_no;
         if self.window_highest_seq.is_none() {
@@ -386,93 +386,86 @@ impl StreamMonitor {
 }
 
 #[derive(Debug)]
-struct Snapshot {
-    ts: Instant,
-    bytes: usize,
-}
-
-#[derive(Debug)]
 pub struct BitrateEstimate {
-    controller: BitrateController,
-    last_update: Instant,
+    tick_start: Option<Instant>,
     accumulated_bytes: usize,
-
-    history: VecDeque<Snapshot>,
-    window_sum: usize,
-    max_window_duration: Duration,
+    window: VecDeque<f64>,
+    max_window_ticks: usize,
+    ewma_estimate: f64,
+    alpha_fall: f64,
 }
 
 impl BitrateEstimate {
-    pub fn new(now: Instant) -> Self {
-        let config = BitrateControllerConfig {
-            min_bitrate: Bitrate::kbps(10),
-            max_bitrate: Bitrate::mbps(5),
-            default_bitrate: Bitrate::kbps(100),
-            ..Default::default()
-        };
+    const HEADROOM: f64 = 1.20;
+    const TICK_MS: f64 = 500.0; // Larger ticks naturally smooth massive VBR I-frame spikes
 
+    pub fn new(_now: Instant) -> Self {
         Self {
-            controller: BitrateController::new(config),
-            last_update: now,
+            tick_start: None,
             accumulated_bytes: 0,
-            history: VecDeque::new(),
-            window_sum: 0,
-            max_window_duration: Duration::from_secs(5),
+            window: VecDeque::new(),
+            max_window_ticks: 10, // 5s peak-hold window (10 ticks * 500ms)
+            ewma_estimate: 0.0,
+            alpha_fall: 0.01, // Extremely slow decay ensures VBR gaps stay CBR-like
         }
     }
 
-    pub fn record(&mut self, packet_len: usize) {
-        self.accumulated_bytes += packet_len;
+    pub fn record(&mut self, pkt: &RtpPacket) {
+        // Drive timing from receiver-scheduled playout_time to ignore network jitter
+        self.advance_time(pkt.playout_time);
+        self.accumulated_bytes += pkt.header_len + pkt.payload.len();
     }
 
-    pub fn poll(&mut self, now: Instant) {
-        // Headroom strategy: use a small factor to allow for some growth while
-        // avoiding over-allocation that leads to bufferbloat on congested links.
-        const HEADROOM: f64 = 1.05;
-        let elapsed = now.saturating_duration_since(self.last_update);
-        if elapsed < Duration::from_millis(200) {
+    pub fn poll(&mut self, current_time: Instant) {
+        // Allows decaying the estimate forward gracefully during extended stream silence
+        self.advance_time(current_time);
+    }
+
+    fn advance_time(&mut self, time: Instant) {
+        let mut current_tick = *self.tick_start.get_or_insert(time);
+
+        if time < current_tick + Duration::from_millis(Self::TICK_MS as u64) {
             return;
         }
 
-        let snapshot = Snapshot {
-            ts: now,
-            bytes: self.accumulated_bytes,
-        };
-        self.window_sum += snapshot.bytes;
-        self.history.push_back(snapshot);
+        let elapsed = time.saturating_duration_since(current_tick);
+        let ticks_passed = (elapsed.as_millis() / Self::TICK_MS as u128) as usize;
 
-        while let Some(front) = self.history.front() {
-            if now.saturating_duration_since(front.ts) > self.max_window_duration {
-                let removed = self.history.pop_front().unwrap();
-                self.window_sum = self.window_sum.saturating_sub(removed.bytes);
-            } else {
-                break;
-            }
+        // First tick absorbs all historically accumulated bytes
+        let instant_bps = (self.accumulated_bytes as f64 * 8.0 * 1000.0) / Self::TICK_MS;
+        self.push_tick(instant_bps);
+
+        // Submits pure silence for any remaining missed ticks (capped to avoid CPU stalls on huge jumps)
+        let empty_ticks = ticks_passed.saturating_sub(1).min(1000);
+        for _ in 0..empty_ticks {
+            self.push_tick(0.0);
         }
 
-        let actual_window_duration = if let Some(front) = self.history.front() {
-            now.saturating_duration_since(front.ts)
-        } else {
-            Duration::ZERO
-        };
-
-        // Safety: ensure we don't divide by zero at the very start
-        let valid_duration = actual_window_duration.max(elapsed).as_secs_f64();
-
-        // sliding window average
-        let bps = if valid_duration > 0.001 {
-            (self.window_sum as f64 * 8.0) / valid_duration * HEADROOM
-        } else {
-            0.0
-        };
-
-        self.controller.update(Bitrate::from(bps));
-        self.last_update = now;
         self.accumulated_bytes = 0;
+        self.tick_start = Some(
+            current_tick + Duration::from_millis((ticks_passed as u64) * Self::TICK_MS as u64),
+        );
+    }
+
+    fn push_tick(&mut self, bps: f64) {
+        self.window.push_back(bps);
+        if self.window.len() > self.max_window_ticks {
+            self.window.pop_front();
+        }
+
+        let peak_bps = self.window.iter().copied().fold(0.0_f64, f64::max);
+
+        if peak_bps >= self.ewma_estimate {
+            self.ewma_estimate = peak_bps; // Instant attack stays strictly above actual bitrate
+        } else {
+            // Decays very slowly to convert VBR drops into a persistent CBR ceiling
+            self.ewma_estimate =
+                self.alpha_fall * peak_bps + (1.0 - self.alpha_fall) * self.ewma_estimate;
+        }
     }
 
     pub fn estimate_bps(&self) -> f64 {
-        self.controller.current().as_f64()
+        self.ewma_estimate * Self::HEADROOM
     }
 }
 

@@ -148,8 +148,7 @@ impl UpstreamTrackLayer {
 
     pub fn process(&mut self, pkt: &mut RtpPacket, sr: Option<SenderInfo>) -> bool {
         self.synchronizer.process(pkt, sr);
-        self.monitor
-            .process_packet(pkt, pkt.payload.len() + pkt.header_len);
+        self.monitor.process_packet(pkt);
         // audio will only be filtered at the centralized audio_selector
         true
     }
