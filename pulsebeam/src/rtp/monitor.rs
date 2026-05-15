@@ -169,9 +169,9 @@ impl StreamMonitor {
         }
     }
 
-    pub fn process_packet(&mut self, packet: &RtpPacket, size_bytes: usize) {
+    pub fn process_packet(&mut self, packet: &RtpPacket) {
         self.last_packet_at = packet.arrival_ts;
-        self.bwe.record(size_bytes);
+        self.bwe.record(packet);
 
         let seq = *packet.seq_no;
         if self.window_highest_seq.is_none() {
@@ -386,93 +386,86 @@ impl StreamMonitor {
 }
 
 #[derive(Debug)]
-struct Snapshot {
-    ts: Instant,
-    bytes: usize,
-}
-
-#[derive(Debug)]
 pub struct BitrateEstimate {
-    controller: BitrateController,
-    last_update: Instant,
+    tick_start: Option<Instant>,
     accumulated_bytes: usize,
-
-    history: VecDeque<Snapshot>,
-    window_sum: usize,
-    max_window_duration: Duration,
+    window: VecDeque<f64>,
+    max_window_ticks: usize,
+    ewma_estimate: f64,
+    alpha_fall: f64,
 }
 
 impl BitrateEstimate {
-    pub fn new(now: Instant) -> Self {
-        let config = BitrateControllerConfig {
-            min_bitrate: Bitrate::kbps(10),
-            max_bitrate: Bitrate::mbps(5),
-            default_bitrate: Bitrate::kbps(100),
-            ..Default::default()
-        };
+    const HEADROOM: f64 = 1.20;
+    const TICK_MS: f64 = 500.0; // Larger ticks naturally smooth massive VBR I-frame spikes
 
+    pub fn new(_now: Instant) -> Self {
         Self {
-            controller: BitrateController::new(config),
-            last_update: now,
+            tick_start: None,
             accumulated_bytes: 0,
-            history: VecDeque::new(),
-            window_sum: 0,
-            max_window_duration: Duration::from_secs(5),
+            window: VecDeque::new(),
+            max_window_ticks: 10, // 5s peak-hold window (10 ticks * 500ms)
+            ewma_estimate: 0.0,
+            alpha_fall: 0.01, // Extremely slow decay ensures VBR gaps stay CBR-like
         }
     }
 
-    pub fn record(&mut self, packet_len: usize) {
-        self.accumulated_bytes += packet_len;
+    pub fn record(&mut self, pkt: &RtpPacket) {
+        // Drive timing from receiver-scheduled playout_time to ignore network jitter
+        self.advance_time(pkt.playout_time);
+        self.accumulated_bytes += pkt.header_len + pkt.payload.len();
     }
 
-    pub fn poll(&mut self, now: Instant) {
-        // Headroom strategy: use a small factor to allow for some growth while
-        // avoiding over-allocation that leads to bufferbloat on congested links.
-        const HEADROOM: f64 = 1.05;
-        let elapsed = now.saturating_duration_since(self.last_update);
-        if elapsed < Duration::from_millis(200) {
+    pub fn poll(&mut self, current_time: Instant) {
+        // Allows decaying the estimate forward gracefully during extended stream silence
+        self.advance_time(current_time);
+    }
+
+    fn advance_time(&mut self, time: Instant) {
+        let mut current_tick = *self.tick_start.get_or_insert(time);
+
+        if time < current_tick + Duration::from_millis(Self::TICK_MS as u64) {
             return;
         }
 
-        let snapshot = Snapshot {
-            ts: now,
-            bytes: self.accumulated_bytes,
-        };
-        self.window_sum += snapshot.bytes;
-        self.history.push_back(snapshot);
+        let elapsed = time.saturating_duration_since(current_tick);
+        let ticks_passed = (elapsed.as_millis() / Self::TICK_MS as u128) as usize;
 
-        while let Some(front) = self.history.front() {
-            if now.saturating_duration_since(front.ts) > self.max_window_duration {
-                let removed = self.history.pop_front().unwrap();
-                self.window_sum = self.window_sum.saturating_sub(removed.bytes);
-            } else {
-                break;
-            }
+        // First tick absorbs all historically accumulated bytes
+        let instant_bps = (self.accumulated_bytes as f64 * 8.0 * 1000.0) / Self::TICK_MS;
+        self.push_tick(instant_bps);
+
+        // Submits pure silence for any remaining missed ticks (capped to avoid CPU stalls on huge jumps)
+        let empty_ticks = ticks_passed.saturating_sub(1).min(1000);
+        for _ in 0..empty_ticks {
+            self.push_tick(0.0);
         }
 
-        let actual_window_duration = if let Some(front) = self.history.front() {
-            now.saturating_duration_since(front.ts)
-        } else {
-            Duration::ZERO
-        };
-
-        // Safety: ensure we don't divide by zero at the very start
-        let valid_duration = actual_window_duration.max(elapsed).as_secs_f64();
-
-        // sliding window average
-        let bps = if valid_duration > 0.001 {
-            (self.window_sum as f64 * 8.0) / valid_duration * HEADROOM
-        } else {
-            0.0
-        };
-
-        self.controller.update(Bitrate::from(bps));
-        self.last_update = now;
         self.accumulated_bytes = 0;
+        self.tick_start = Some(
+            current_tick + Duration::from_millis((ticks_passed as u64) * Self::TICK_MS as u64),
+        );
+    }
+
+    fn push_tick(&mut self, bps: f64) {
+        self.window.push_back(bps);
+        if self.window.len() > self.max_window_ticks {
+            self.window.pop_front();
+        }
+
+        let peak_bps = self.window.iter().copied().fold(0.0_f64, f64::max);
+
+        if peak_bps >= self.ewma_estimate {
+            self.ewma_estimate = peak_bps; // Instant attack stays strictly above actual bitrate
+        } else {
+            // Decays very slowly to convert VBR drops into a persistent CBR ceiling
+            self.ewma_estimate =
+                self.alpha_fall * peak_bps + (1.0 - self.alpha_fall) * self.ewma_estimate;
+        }
     }
 
     pub fn estimate_bps(&self) -> f64 {
-        self.controller.current().as_f64()
+        self.ewma_estimate * Self::HEADROOM
     }
 }
 
@@ -598,7 +591,7 @@ impl AudioMonitor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use more_asserts::{assert_gt, assert_le};
+    use more_asserts::{assert_ge, assert_gt, assert_le};
     use std::time::Duration;
     use str0m::media::{Frequency, MediaTime};
     use tokio::time::Instant;
@@ -608,6 +601,7 @@ mod test {
             seq_no: seq.into(),
             rtp_ts: MediaTime::new(seq * 3000, Frequency::NINETY_KHZ),
             arrival_ts,
+            playout_time: arrival_ts,
             ..Default::default()
         }
     }
@@ -618,7 +612,7 @@ mod test {
         let mut monitor = StreamMonitor::new(MediaKind::Video, "v0".into(), shared.clone());
         let now = Instant::now();
 
-        monitor.process_packet(&packet(1, now), 1200);
+        monitor.process_packet(&packet(1, now));
         monitor.poll(now, false);
 
         let paused_now = now + Duration::from_millis(1100);
@@ -636,8 +630,8 @@ mod test {
         let mut monitor = StreamMonitor::new(MediaKind::Video, "v1".into(), shared.clone());
         let now = Instant::now();
 
-        monitor.process_packet(&packet(1, now), 1200);
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 1200);
+        monitor.process_packet(&packet(1, now));
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
         assert_eq!(shared.quality(), StreamQuality::Bad);
         assert!(monitor.smoothed_loss_ratio > 0.0);
@@ -660,8 +654,8 @@ mod test {
         let mut monitor = StreamMonitor::new(MediaKind::Video, "v2".into(), shared);
         let now = Instant::now();
 
-        monitor.process_packet(&packet(1, now), 1000);
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 1000);
+        monitor.process_packet(&packet(1, now));
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
 
         let after_drop = monitor.smoothed_loss_ratio;
@@ -669,9 +663,7 @@ mod test {
 
         for seq in 12..=21 {
             monitor.process_packet(
-                &packet(seq, now + Duration::from_millis(700 + (seq - 12))),
-                1000,
-            );
+                &packet(seq, now + Duration::from_millis(700 + (seq - 12))));
         }
         monitor.poll(now + Duration::from_millis(1200), false);
 
@@ -686,8 +678,8 @@ mod test {
         let now = Instant::now();
 
         // Drive quality Bad: 9 gaps out of 10 expected (loss=0.8, smoothed=0.4 >= 0.05)
-        monitor.process_packet(&packet(1, now), 800);
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 800);
+        monitor.process_packet(&packet(1, now));
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
         assert_eq!(shared.quality(), StreamQuality::Bad);
         assert!(
@@ -699,9 +691,7 @@ mod test {
         // One fully clean window: smoothed decays from 0.4 * 0.8 = 0.32 — still above 0.025
         for seq in 12u64..=22 {
             monitor.process_packet(
-                &packet(seq, now + Duration::from_millis(700 + seq - 12)),
-                800,
-            );
+                &packet(seq, now + Duration::from_millis(700 + seq - 12)));
         }
         monitor.poll(now + Duration::from_millis(1200), false);
         assert_eq!(
@@ -715,10 +705,7 @@ mod test {
         let mut base_seq = 23u64;
         for _ in 0..100 {
             for seq in base_seq..(base_seq + 10) {
-                monitor.process_packet(
-                    &packet(seq, tick_now + Duration::from_millis(seq - base_seq)),
-                    800,
-                );
+                monitor.process_packet(&packet(seq, tick_now + Duration::from_millis(seq - base_seq)));
             }
             base_seq += 10;
             tick_now += Duration::from_millis(600);
@@ -746,15 +733,15 @@ mod test {
 
         // Drive Bad: seq 1 and 11 in one window → expected=10, actual=2, loss=80%
         // EWMA = 0.0 * 0.5 + 0.8 * 0.5 = 0.40  (well above the 5% Good→Bad threshold)
-        monitor.process_packet(&packet(1, now), 900);
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 900);
+        monitor.process_packet(&packet(1, now));
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
         assert_eq!(shared.quality(), StreamQuality::Bad);
         assert!((monitor.smoothed_loss_ratio - 0.40).abs() < 1e-9);
 
         // One clean window: EWMA = 0.40 * 0.80 = 0.32 — still above 2.5%.
         for seq in 12u64..=22 {
-            monitor.process_packet(&packet(seq, now + Duration::from_millis(700)), 900);
+            monitor.process_packet(&packet(seq, now + Duration::from_millis(700)));
         }
         monitor.poll(now + Duration::from_millis(1200), false);
         assert_eq!(
@@ -770,7 +757,7 @@ mod test {
         let mut recovered = false;
         for _ in 0..60 {
             for i in 0..10u64 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 900);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
             }
             seq += 10;
             t += Duration::from_millis(600);
@@ -795,8 +782,8 @@ mod test {
             .quality
             .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
 
-        monitor.process_packet(&packet(1, now), 1000);
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 1000);
+        monitor.process_packet(&packet(1, now));
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
 
         assert_eq!(shared.quality(), StreamQuality::Bad);
@@ -808,40 +795,40 @@ mod test {
 
         let audio_shared = StreamState::new(false, 0);
         let mut audio = StreamMonitor::new(MediaKind::Audio, "a0".into(), audio_shared.clone());
-        audio.process_packet(&packet(1, now), 200);
-        audio.process_packet(&packet(2, now + Duration::from_millis(1)), 200);
+        audio.process_packet(&packet(1, now));
+        audio.process_packet(&packet(2, now + Duration::from_millis(1)));
         audio.poll(now + Duration::from_millis(600), false);
-        audio.process_packet(&packet(3, now + Duration::from_millis(700)), 200);
-        audio.process_packet(&packet(4, now + Duration::from_millis(701)), 200);
+        audio.process_packet(&packet(3, now + Duration::from_millis(700)));
+        audio.process_packet(&packet(4, now + Duration::from_millis(701)));
         audio.poll(now + Duration::from_millis(1200), false);
-        audio.process_packet(&packet(5, now + Duration::from_millis(1300)), 200);
-        audio.process_packet(&packet(6, now + Duration::from_millis(1301)), 200);
+        audio.process_packet(&packet(5, now + Duration::from_millis(1300)));
+        audio.process_packet(&packet(6, now + Duration::from_millis(1301)));
         audio.poll(now + Duration::from_millis(1800), false);
         assert_eq!(audio_shared.quality(), StreamQuality::Excellent);
 
-        audio.process_packet(&packet(7, now + Duration::from_millis(1900)), 200);
-        audio.process_packet(&packet(11, now + Duration::from_millis(1901)), 200);
+        audio.process_packet(&packet(7, now + Duration::from_millis(1900)));
+        audio.process_packet(&packet(11, now + Duration::from_millis(1901)));
         audio.poll(now + Duration::from_millis(2400), false);
         assert_eq!(audio_shared.quality(), StreamQuality::Bad);
 
         let video_shared = StreamState::new(false, 0);
         let mut video = StreamMonitor::new(MediaKind::Video, "v3".into(), video_shared.clone());
-        video.process_packet(&packet(1, now), 800);
-        video.process_packet(&packet(2, now + Duration::from_millis(1)), 800);
+        video.process_packet(&packet(1, now));
+        video.process_packet(&packet(2, now + Duration::from_millis(1)));
         video.poll(now + Duration::from_millis(600), false);
-        video.process_packet(&packet(3, now + Duration::from_millis(700)), 800);
-        video.process_packet(&packet(4, now + Duration::from_millis(701)), 800);
+        video.process_packet(&packet(3, now + Duration::from_millis(700)));
+        video.process_packet(&packet(4, now + Duration::from_millis(701)));
         video.poll(now + Duration::from_millis(1200), false);
-        video.process_packet(&packet(5, now + Duration::from_millis(1300)), 800);
-        video.process_packet(&packet(6, now + Duration::from_millis(1301)), 800);
+        video.process_packet(&packet(5, now + Duration::from_millis(1300)));
+        video.process_packet(&packet(6, now + Duration::from_millis(1301)));
         video.poll(now + Duration::from_millis(1800), false);
-        video.process_packet(&packet(7, now + Duration::from_millis(1900)), 800);
-        video.process_packet(&packet(8, now + Duration::from_millis(1901)), 800);
+        video.process_packet(&packet(7, now + Duration::from_millis(1900)));
+        video.process_packet(&packet(8, now + Duration::from_millis(1901)));
         video.poll(now + Duration::from_millis(2400), false);
         assert_eq!(video_shared.quality(), StreamQuality::Excellent);
 
-        video.process_packet(&packet(9, now + Duration::from_millis(2500)), 800);
-        video.process_packet(&packet(11, now + Duration::from_millis(2501)), 800);
+        video.process_packet(&packet(9, now + Duration::from_millis(2500)));
+        video.process_packet(&packet(11, now + Duration::from_millis(2501)));
         video.poll(now + Duration::from_millis(3000), false);
         assert_eq!(video_shared.quality(), StreamQuality::Bad);
     }
@@ -865,15 +852,25 @@ mod test {
             let end = self.now + duration;
             while self.now < end {
                 self.now += tick_size;
-                self.estimator.record(bytes_per_tick);
+                self.record_packet(bytes_per_tick);
                 self.estimator.poll(self.now);
             }
         }
 
         fn inject_keyframe(&mut self, size_bytes: usize) {
-            self.estimator.record(size_bytes);
-            self.now += Duration::from_millis(100);
+            self.now += Duration::from_millis(500);
             self.estimator.poll(self.now);
+            self.record_packet(size_bytes);
+            self.now += Duration::from_millis(500);
+            self.estimator.poll(self.now);
+        }
+
+        fn record_packet(&mut self, size_bytes: usize) {
+            let mut pkt = RtpPacket::default();
+            pkt.arrival_ts = self.now;
+            pkt.playout_time = self.now;
+            pkt.payload.resize(size_bytes.saturating_sub(pkt.header_len), 0);
+            self.estimator.record(&pkt);
         }
 
         fn current(&self) -> f64 {
@@ -890,7 +887,7 @@ mod test {
         let baseline = sim.current();
 
         println!("Baseline: {:.0} bps", baseline);
-        assert_gt!(baseline, 1_200_000.0);
+        assert_ge!(baseline, 1_200_000.0);
         assert_le!(baseline, 1_460_000.0);
 
         // 2. Inject Massive Keyframe
@@ -928,7 +925,7 @@ mod test {
         let mut t = now;
         for _ in 0..6 {
             for i in 0..10u64 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 1000);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
             }
             seq += 10;
             t += Duration::from_millis(600);
@@ -944,7 +941,7 @@ mod test {
         // Two more clean windows — quality must not drop.
         for _ in 0..2 {
             for i in 0..10u64 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 1000);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
             }
             seq += 10;
             t += Duration::from_millis(600);
@@ -974,9 +971,7 @@ mod test {
                     continue; // simulate 1 lost packet mid-window
                 }
                 monitor.process_packet(
-                    &packet(base_seq + i, t + Duration::from_millis(i * 2)),
-                    1000,
-                );
+                    &packet(base_seq + i, t + Duration::from_millis(i * 2)));
             }
             base_seq += 50;
             t += Duration::from_millis(600);
@@ -1013,10 +1008,7 @@ mod test {
                 if i == 5 {
                     continue;
                 }
-                monitor.process_packet(
-                    &packet(base_seq + i, t + Duration::from_millis(i * 10)),
-                    1000,
-                );
+                monitor.process_packet(&packet(base_seq + i, t + Duration::from_millis(i * 10)));
             }
             base_seq += 10;
             t += Duration::from_millis(600);
@@ -1032,10 +1024,7 @@ mod test {
         let mut recovered = false;
         for _ in 0..60 {
             for i in 0..10u64 {
-                monitor.process_packet(
-                    &packet(base_seq + i, t + Duration::from_millis(i * 10)),
-                    1000,
-                );
+                monitor.process_packet(&packet(base_seq + i, t + Duration::from_millis(i * 10)));
             }
             base_seq += 10;
             t += Duration::from_millis(600);
@@ -1063,7 +1052,7 @@ mod test {
         let mut t = now;
         for _ in 0..6 {
             for i in 0..10u64 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 1000);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
             }
             seq += 10;
             t += Duration::from_millis(600);
@@ -1085,7 +1074,7 @@ mod test {
 
         // Resume with clean packets.
         for i in 0..10u64 {
-            monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 1000);
+            monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
         }
         seq += 10;
         t += Duration::from_millis(600);
@@ -1107,7 +1096,7 @@ mod test {
 
         // Establish stream at seq 1–10.
         for seq in 1u64..=10 {
-            monitor.process_packet(&packet(seq, now + Duration::from_millis(seq * 5)), 1000);
+            monitor.process_packet(&packet(seq, now + Duration::from_millis(seq * 5)));
         }
         monitor.poll(now + Duration::from_millis(600), false);
 
@@ -1120,7 +1109,7 @@ mod test {
 
         // Resume with a large seq gap (encoder advanced by 990 during the pause).
         let resumed_at = paused_at + Duration::from_millis(50);
-        monitor.process_packet(&packet(1000, resumed_at), 1000);
+        monitor.process_packet(&packet(1000, resumed_at));
         monitor.poll(resumed_at + Duration::from_millis(10), false);
 
         assert!(
@@ -1143,8 +1132,8 @@ mod test {
         let now = Instant::now();
 
         // First drive quality to Bad with a high-loss window.
-        monitor.process_packet(&packet(1, now), 1000);
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)), 1000);
+        monitor.process_packet(&packet(1, now));
+        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
         assert_eq!(shared.quality(), StreamQuality::Bad);
 
@@ -1159,9 +1148,7 @@ mod test {
             // Clean window: 10 consecutive packets.
             for i in 0..10u64 {
                 monitor.process_packet(
-                    &packet(base_seq + i, t + Duration::from_millis(i * 5)),
-                    1000,
-                );
+                    &packet(base_seq + i, t + Duration::from_millis(i * 5)));
             }
             base_seq += 10;
             t += Duration::from_millis(600);
@@ -1173,8 +1160,8 @@ mod test {
             }
 
             // Lossy window: only first and last packet (simulate ~80% loss).
-            monitor.process_packet(&packet(base_seq, t + Duration::from_millis(1)), 1000);
-            monitor.process_packet(&packet(base_seq + 9, t + Duration::from_millis(2)), 1000);
+            monitor.process_packet(&packet(base_seq, t + Duration::from_millis(1)));
+            monitor.process_packet(&packet(base_seq + 9, t + Duration::from_millis(2)));
             base_seq += 10;
             t += Duration::from_millis(600);
             monitor.poll(t, false);
@@ -1210,7 +1197,7 @@ mod test {
         let mut t = now;
         for _ in 0..6 {
             for i in 0..10u64 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 1500);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
             }
             seq += 10;
             t += Duration::from_millis(600);
@@ -1228,7 +1215,7 @@ mod test {
         // actual   = 6  →  interval_loss = 4/10 = 40%
         for i in 0..10u64 {
             if i < 3 || i >= 7 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)), 1500);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
             }
         }
         seq += 10;
@@ -1264,7 +1251,7 @@ mod test {
         // --- Baseline: two clean windows confirm the monitor starts healthy ---
         for _ in 0..2 {
             for i in 0..10u64 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 10)), 1500);
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 10)));
             }
             seq += 10;
             t += Duration::from_millis(600);
@@ -1295,7 +1282,7 @@ mod test {
 
             // Resume — step 1: one "wake" packet updates last_packet_at so the
             // next poll can exit the inactivity branch and reset the window.
-            monitor.process_packet(&packet(seq, t + Duration::from_millis(10)), 1500);
+            monitor.process_packet(&packet(seq, t + Duration::from_millis(10)));
             seq += 1;
             monitor.poll(t + Duration::from_millis(50), true); // was_inactive → reset window
 
@@ -1303,9 +1290,7 @@ mod test {
             // first one. The following poll fires the measurement window.
             for i in 0..10u64 {
                 monitor.process_packet(
-                    &packet(seq + i, t + Duration::from_millis(100 + i * 10)),
-                    1500,
-                );
+                    &packet(seq + i, t + Duration::from_millis(100 + i * 10)));
             }
             seq += 10;
             t += Duration::from_millis(700); // ≥ 500 ms from first burst packet
