@@ -4,11 +4,14 @@ version = "0.4.2"
 authors.workspace = true
 edition.workspace = true
 description = "Lightweight WebRTC SFU for Mobile, IoT, and Web"
-changelog = "CHANGELOG.md"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
+
+[package.metadata.dist]
+tag-prefix = "pulsebeam-v"
+changelog = "CHANGELOG.md"
 
 [dependencies]
 ahash = "0.8.12"
