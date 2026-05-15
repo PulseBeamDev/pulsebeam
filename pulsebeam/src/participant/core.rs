@@ -280,7 +280,11 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut EventQueue) {
-        let next_deadline = self.poll_until_deadline(now, events);
+        let mut next_deadline = self.poll_until_deadline(now, events);
+        while next_deadline <= Some(now) {
+            self.on_timeout(now);
+            next_deadline = self.poll_until_deadline(now, events);
+        }
 
         if let Some(next_deadline) = next_deadline {
             events.update_deadline(next_deadline);
