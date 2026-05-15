@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.3] - 2026-05-15
 
 * Force switch on a different track
 * feat: keyframe switching v2
