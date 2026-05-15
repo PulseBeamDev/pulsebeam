@@ -3,6 +3,7 @@ use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
 };
+use tokio::time::Instant;
 
 use pulsebeam_core::net::UdpSocket;
 
@@ -97,6 +98,7 @@ impl UdpTransportReader {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
+                    received_at: Instant::now(),
                     buf: slot,
                     offset: 0,
                     stride: 0,

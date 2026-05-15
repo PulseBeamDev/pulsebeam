@@ -808,6 +808,7 @@ mod demux_tests {
         RecvPacketBatch {
             src,
             dst: "0.0.0.0:0".parse().unwrap(),
+            received_at: tokio::time::Instant::now(),
             buf: data,
             offset: 0,
             stride: len,

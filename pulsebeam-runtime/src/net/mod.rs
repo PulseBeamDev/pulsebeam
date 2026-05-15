@@ -3,6 +3,7 @@ pub mod udp;
 pub mod udp_scalar;
 
 use std::{io, net::SocketAddr};
+use tokio::time::Instant;
 
 pub const BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 pub const CHUNK_SIZE: usize = 64 * 1024;
@@ -25,6 +26,7 @@ pub enum Transport {
 pub struct RecvPacketBatch {
     pub src: SocketAddr,
     pub dst: SocketAddr,
+    pub received_at: Instant,
     pub buf: Vec<u8>,
     pub offset: usize,
     pub stride: usize,
@@ -229,6 +231,7 @@ mod tests {
         let batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
+            received_at: Instant::now(),
             buf: vec![1, 2, 3, 4, 5],
             offset: 1,
             stride: 0,
@@ -244,6 +247,7 @@ mod tests {
         let batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
+            received_at: Instant::now(),
             buf: (0u8..20).collect(),
             offset: 0,
             stride: 6,
@@ -264,6 +268,7 @@ mod tests {
         let batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
+            received_at: Instant::now(),
             buf: (0u8..10).collect(),
             offset: 0,
             stride: 0,

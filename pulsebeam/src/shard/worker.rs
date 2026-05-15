@@ -222,7 +222,6 @@ impl ShardWorker {
 
         // Block until at least one source is ready.
         tokio::select! {
-            biased;
             Ok(_) = self.udp_socket.readable() => {}
             Some(_) = self.cross_shard_event_rx.readable() => {}
             Ok(_) = self.tcp_socket.readable() => {}

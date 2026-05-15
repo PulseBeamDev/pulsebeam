@@ -31,6 +31,7 @@ use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Track};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_TIMEOUT_CATCHUP_TICKS: usize = 4;
 
 struct TrackAvailability {
     in_topology: bool,
@@ -281,9 +282,18 @@ impl ParticipantCore {
 
     pub fn poll(&mut self, now: Instant, events: &mut EventQueue) {
         let mut next_deadline = self.poll_until_deadline(now, events);
-        while next_deadline <= Some(now) {
-            self.on_timeout(now);
+
+        let mut catchup = 0;
+        while let Some(deadline) = next_deadline {
+            if deadline > now || catchup >= MAX_TIMEOUT_CATCHUP_TICKS {
+                break;
+            }
+
+            // Replay overdue deadlines at their scheduled instant instead of collapsing
+            // all catch-up timeouts to `now`, which causes packet bursts.
+            self.on_timeout(deadline);
             next_deadline = self.poll_until_deadline(now, events);
+            catchup += 1;
         }
 
         if let Some(next_deadline) = next_deadline {
@@ -304,6 +314,7 @@ impl ParticipantCore {
                 Transport::Udp(_) => str0m::net::Protocol::Udp,
                 Transport::Tcp => str0m::net::Protocol::Tcp,
             };
+            let receive_time = batch.received_at;
 
             for pkt in batch.into_iter() {
                 if let Ok(contents) = (*pkt).try_into() {
@@ -315,7 +326,7 @@ impl ParticipantCore {
                     };
                     if self
                         .rtc
-                        .handle_input(Input::Receive(now.into(), recv))
+                        .handle_input(Input::Receive(receive_time.into(), recv))
                         .is_err()
                     {
                         continue;

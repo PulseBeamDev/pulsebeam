@@ -151,9 +151,9 @@ impl ShardCore {
     }
 
     pub(crate) fn fire_timers(&mut self, now: Instant) {
-        self.timers.drain_expired(now, |participant_id| {
+        self.timers.drain_expired(now, |participant_id, deadline| {
             if let Some(participant) = self.participants.get_mut(&participant_id) {
-                participant.on_timeout(now);
+                participant.on_timeout(deadline);
                 self.input_dirty.insert(participant_id);
             }
         });

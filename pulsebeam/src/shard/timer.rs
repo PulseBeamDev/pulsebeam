@@ -63,10 +63,10 @@ impl TimerWheel {
 
     /// Drain all entries whose deadline has passed as of `now`.
     ///
-    /// Calls `f(id)` once per participant whose **latest** deadline has fired.
+    /// Calls `f(id, deadline)` once per participant whose **latest** deadline has fired.
     /// Stale heap entries (superseded by a later `schedule` call) are silently
     /// discarded and `f` is **not** called for them.
-    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantId)) {
+    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantId, Instant)) {
         while let Some(Reverse((t, _))) = self.heap.peek() {
             if *t > now {
                 break;
@@ -77,7 +77,7 @@ impl TimerWheel {
                 continue;
             }
             self.deadlines.remove(&id);
-            f(id);
+            f(id, deadline);
         }
     }
 }

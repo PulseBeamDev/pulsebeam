@@ -7,6 +7,7 @@ use std::{
     io::{self, ErrorKind, IoSliceMut},
     net::SocketAddr,
 };
+use tokio::time::Instant;
 
 // Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
 // With 1ms scheduling delay, this is capped to 8ms latency.
@@ -189,6 +190,7 @@ impl UdpTransportReader {
                             out.push(RecvPacketBatch {
                                 src: m.addr,
                                 dst: self.local_addr,
+                                received_at: Instant::now(),
                                 buf: src.to_vec(),
                                 offset: 0,
                                 stride: seg_len,

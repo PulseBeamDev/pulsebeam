@@ -9,6 +9,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum RFC 4571 payload length accepted during the initial frame peek.
@@ -125,7 +126,11 @@ const TCP_EVENT_CAPACITY: usize = 8_192;
 /// Events produced by per-connection read tasks and consumed by `TcpTransport`.
 enum TcpEvent {
     /// A fully-decoded RFC 4571 payload ready to hand to the shard.
-    Frame { src: SocketAddr, payload: Vec<u8> },
+    Frame {
+        src: SocketAddr,
+        received_at: Instant,
+        payload: Vec<u8>,
+    },
     /// The read task exited (EOF, error, idle timeout, or cancellation).
     Closed(SocketAddr),
 }
@@ -177,6 +182,7 @@ async fn tcp_read_task(
             if tx
                 .send(TcpEvent::Frame {
                     src: peer_addr,
+                    received_at: Instant::now(),
                     payload,
                 })
                 .await
@@ -345,6 +351,7 @@ impl TcpTransport {
                 // try_send never blocks; the channel has capacity for this.
                 let _ = self.event_tx.try_send(TcpEvent::Frame {
                     src: peer_addr,
+                    received_at: Instant::now(),
                     payload,
                 });
             }
@@ -442,7 +449,11 @@ impl TcpTransport {
         local_addr: SocketAddr,
     ) {
         match event {
-            TcpEvent::Frame { src, payload } => {
+            TcpEvent::Frame {
+                src,
+                received_at,
+                payload,
+            } => {
                 // Discard stale events from already-removed connections.
                 if !self.conns.contains_key(&src) {
                     return;
@@ -451,6 +462,7 @@ impl TcpTransport {
                 out.push(RecvPacketBatch {
                     src,
                     dst: local_addr,
+                    received_at,
                     buf: payload,
                     offset: 0,
                     stride: len,
