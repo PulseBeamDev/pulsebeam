@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use pulsebeam_agent::{
     MediaKind, Rid, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack},
@@ -29,6 +29,13 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Human,
+    Csv,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Bench {
@@ -48,13 +55,32 @@ enum Commands {
         session_jitter: u64,
         #[arg(long, default_value_t = 30)]
         drain_duration: u64,
-
         #[arg(long)]
         simulcast: bool,
+        /// Output format: 'human' (default) for a pretty table, 'csv' for
+        /// machine-readable rows on stdout (logs remain on stderr).
+        #[arg(long, default_value = "human")]
+        output_format: OutputFormat,
+    },
+    /// Join a single room and print live stats until Ctrl-C.  Useful for
+    /// manual debugging or smoke-testing a running SFU.
+    Connect {
+        #[arg(long)]
+        room: String,
+        /// Publish video (H.264 looper).
+        #[arg(long)]
+        publish: bool,
+        /// Use three simulcast layers when publishing.
+        #[arg(long)]
+        simulcast: bool,
+        /// Number of downstream video slots to open.
+        #[arg(long, default_value_t = 7)]
+        recv_video: usize,
+        /// Number of downstream audio slots to open.
+        #[arg(long, default_value_t = 3)]
+        recv_audio: usize,
     },
 }
-
-// ── Stats ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 enum StatReport {
@@ -157,7 +183,9 @@ impl LatencyHistogram {
 async fn main() -> Result<()> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+    // Always send log output to stderr so stdout can carry clean CSV data.
     let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
         .with_target(true)
         .with_ansi(true);
 
@@ -178,6 +206,7 @@ async fn main() -> Result<()> {
             session_jitter,
             drain_duration,
             simulcast,
+            output_format,
         } => {
             run_bench(
                 cli.api_url,
@@ -190,9 +219,17 @@ async fn main() -> Result<()> {
                 session_jitter,
                 drain_duration,
                 simulcast,
+                output_format,
             )
             .await?
         }
+        Commands::Connect {
+            room,
+            publish,
+            simulcast,
+            recv_video,
+            recv_audio,
+        } => run_connect(cli.api_url, room, publish, simulcast, recv_video, recv_audio).await?,
     }
     Ok(())
 }
@@ -209,33 +246,36 @@ async fn run_bench(
     session_jitter: u64,
     drain_duration: u64,
     simulcast: bool,
+    output_format: OutputFormat,
 ) -> Result<()> {
     let (stats_tx, stats_rx) = mpsc::channel::<StatReport>(16_000);
     let state = SharedState::new();
     let mut join_set = JoinSet::new();
     let room_counter = Arc::new(AtomicUsize::new(0));
 
-    println!(
-        "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
-    );
-    println!(
-        "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                        │"
-    );
-    println!(
-        "├───────┬───────┬────────┬─────────┬─────────┬──────────┬──────────┬───────┬──────┬──────┬──────┬───────┬────────┬──────────────────────┤"
-    );
-    println!(
-        "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │FPS tot│FPS/stm│FPS std│Tx PLI │ Rx PLI │  TX streams  RX streams  │"
-    );
-    println!(
-        "│       │       │        │         │         │          │          │       │      │      │      │       │       │       │       │       │ actv/hlth    actv/hlth   │"
-    );
-    println!(
-        "├───────┼───────┼────────┼─────────┼─────────┼──────────┼──────────┼───────┼──────┼──────┼──────┼───────┼────────┼──────────────────────────┤"
-    );
+    if matches!(output_format, OutputFormat::Human) {
+        println!(
+            "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+        );
+        println!(
+            "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                     │"
+        );
+        println!(
+            "├───────┬───────┬────────┬─────────┬─────────┬──────────┬──────────┬───────┬──────┬──────┬──────┬───────┬────────┬──────────────────────┤"
+        );
+        println!(
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │FPS tot│FPS/stm│FPS std│Tx PLI │ Rx PLI │  TX streams  RX streams  │"
+        );
+        println!(
+            "│       │       │        │         │         │          │          │       │      │      │      │       │       │       │       │       │ actv/hlth    actv/hlth   │"
+        );
+        println!(
+            "├───────┼───────┼────────┼─────────┼─────────┼──────────┼──────────┼───────┼──────┼──────┼──────┼───────┼────────┼──────────────────────────┤"
+        );
+    }
 
     let monitor_state = state.clone();
-    let monitor_handle = tokio::spawn(monitor_task(stats_rx, monitor_state));
+    let monitor_handle = tokio::spawn(monitor_task(stats_rx, monitor_state, output_format));
 
     let mut total_rooms = 0usize;
 
@@ -262,11 +302,19 @@ async fn run_bench(
         tokio::select! {
             _ = ramp_ticker.tick() => {
                 if state.degraded.load(Ordering::Relaxed) {
-                    println!("│ ⚠  DEGRADATION DETECTED — stopping ramp                                                                                              │");
+                    if matches!(output_format, OutputFormat::Human) {
+                        println!("│ ⚠  DEGRADATION DETECTED — stopping ramp                                                                                          │");
+                    } else {
+                        eprintln!("DEGRADATION DETECTED — stopping ramp");
+                    }
                     break;
                 }
                 if total_rooms >= max_rooms {
-                    println!("│ ✓  Max rooms reached ({}) — stopping ramp                                                                                           │", max_rooms);
+                    if matches!(output_format, OutputFormat::Human) {
+                        println!("│ ✓  Max rooms reached ({}) — stopping ramp                                                                                        │", max_rooms);
+                    } else {
+                        eprintln!("Max rooms reached ({}) — stopping ramp", max_rooms);
+                    }
                     break;
                 }
                 for _ in 0..ramp_step {
@@ -291,17 +339,25 @@ async fn run_bench(
 
     tokio::time::sleep(Duration::from_secs(drain_duration)).await;
 
-    println!(
-        "├───────┴───────┴────────┴─────────┴─────────┴──────────┴──────────┴───────┴──────┴──────┴──────┴───────┴────────┴──────────────────────────┤"
-    );
-    println!(
-        "│  Benchmark complete. Peak rooms: {:<5}  Peak agents: {:<6}                                                                              │",
-        total_rooms,
-        state.active_agents.load(Ordering::Relaxed),
-    );
-    println!(
-        "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-    );
+    if matches!(output_format, OutputFormat::Human) {
+        println!(
+            "├───────┴───────┴────────┴─────────┴─────────┴──────────┴──────────┴───────┴──────┴──────┴──────┴───────┴────────┴──────────────────────────┤"
+        );
+        println!(
+            "│  Benchmark complete. Peak rooms: {:<5}  Peak agents: {:<6}                                                                          │",
+            total_rooms,
+            state.active_agents.load(Ordering::Relaxed),
+        );
+        println!(
+            "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+        );
+    } else {
+        eprintln!(
+            "Benchmark complete. Peak rooms: {}  Peak agents: {}",
+            total_rooms,
+            state.active_agents.load(Ordering::Relaxed),
+        );
+    }
 
     join_set.shutdown().await;
     drop(stats_tx);
@@ -369,7 +425,11 @@ async fn spawn_room(
     });
 }
 
-async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<SharedState>) {
+async fn monitor_task(
+    mut stats_rx: mpsc::Receiver<StatReport>,
+    state: Arc<SharedState>,
+    output_format: OutputFormat,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
 
@@ -394,6 +454,11 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
     let mut fps_history: std::collections::VecDeque<f32> =
         std::collections::VecDeque::with_capacity(60);
     let mut consecutive_fps_drops = 0u32;
+
+    // Print CSV header once before the first tick.
+    if matches!(output_format, OutputFormat::Csv) {
+        println!("timestamp_s,rooms,agents,tx_mbps,rx_mbps,rtt_p50_ms,rtt_p99_ms,rtt_p999_ms,fps_per_stream,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,tx_active,tx_healthy,rx_active,rx_healthy");
+    }
 
     loop {
         tokio::select! {
@@ -421,7 +486,11 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                         if rx_healthy { rx_healthy_streams += 1; }
                     }
                     StatReport::DegradationDetected { reason } => {
-                        println!("│ ⚠  {:<133}│", reason);
+                        if matches!(output_format, OutputFormat::Human) {
+                            println!("│ ⚠  {:<133}│", reason);
+                        } else {
+                            eprintln!("DEGRADATION: {}", reason);
+                        }
                     }
                     _ => {}
                 }
@@ -465,25 +534,40 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                     fps_history.pop_front();
                 }
 
-                // Update shared state so degradation checks can see stream health
                 state.tx_active_streams.store(tx_active_streams, Ordering::Relaxed);
                 state.tx_healthy_streams.store(tx_healthy_streams, Ordering::Relaxed);
                 state.rx_active_streams.store(rx_active_streams, Ordering::Relaxed);
                 state.rx_healthy_streams.store(rx_healthy_streams, Ordering::Relaxed);
 
-                println!(
-                    "│ {}s │ {} │ {} │ {:.2} │ {:.2} │ {:.1} │ {} │ {} │ {} │ {} │ {} │ {:.1} │ {:.1} │ {:.1} │ {} │ {} │ {} / {} │ {} / {} │",
-                    elapsed, rooms, agents,
-                    tx_mbps, rx_mbps,
-                    rx_loss, tx_nacks + rx_nacks,
-                    p50, p99, p999, mean,
-                    fps_per_stream, fps_mean, fps_std,
-                    tx_plis, rx_plis,
-                    tx_active_streams, tx_healthy_streams,
-                    rx_active_streams, rx_healthy_streams,
-                );
+                match output_format {
+                    OutputFormat::Human => {
+                        println!(
+                            "│ {}s │ {} │ {} │ {:.2} │ {:.2} │ {:.1} │ {} │ {} │ {} │ {} │ {} │ {:.1} │ {:.1} │ {:.1} │ {} │ {} │ {} / {} │ {} / {} │",
+                            elapsed, rooms, agents,
+                            tx_mbps, rx_mbps,
+                            rx_loss, tx_nacks + rx_nacks,
+                            p50, p99, p999, mean,
+                            fps_per_stream, fps_mean, fps_std,
+                            tx_plis, rx_plis,
+                            tx_active_streams, tx_healthy_streams,
+                            rx_active_streams, rx_healthy_streams,
+                        );
+                    }
+                    OutputFormat::Csv => {
+                        println!(
+                            "{},{},{},{:.3},{:.3},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{},{}",
+                            elapsed, rooms, agents,
+                            tx_mbps, rx_mbps,
+                            p50, p99, p999,
+                            fps_per_stream, rx_loss,
+                            tx_nacks, rx_nacks,
+                            tx_plis, rx_plis,
+                            tx_active_streams, tx_healthy_streams,
+                            rx_active_streams, rx_healthy_streams,
+                        );
+                    }
+                }
 
-                // ── Degradation heuristics ────────────────────────────────
                 if p99 > 300 {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
@@ -510,7 +594,6 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                     state.degraded.store(true, Ordering::Relaxed);
                 }
 
-                // If more than 20% of active rx streams are unhealthy, flag it
                 if rx_active_streams > 0 {
                     let unhealthy = rx_active_streams.saturating_sub(rx_healthy_streams);
                     if unhealthy * 5 > rx_active_streams {
@@ -518,7 +601,6 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<StatReport>, state: Arc<Share
                     }
                 }
 
-                // Reset accumulators
                 tx_bytes = 0; rx_bytes = 0; rx_loss = 0.0;
                 tx_nacks = 0; rx_nacks = 0;
                 tx_plis  = 0; rx_plis  = 0;
@@ -606,10 +688,11 @@ async fn spawn_agent(
             _ = stats_interval.tick() => {
                 let Some(stats) = agent.get_stats().await else { continue };
 
-                // ── Peer-level RTT + byte counters ────────────────────────
                 let peer = stats.peer.as_ref();
                 let rtt_ms = peer.and_then(|p| p.rtt).map(|r| r.as_millis());
-                let _ = stats_tx.try_send(StatReport::Peer { rtt_ms });
+                if stats_tx.try_send(StatReport::Peer { rtt_ms }).is_err() {
+                    tracing::warn!("stats channel full, dropping Peer report");
+                }
 
                 let peer_tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let peer_rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
@@ -624,21 +707,29 @@ async fn spawn_agent(
                 prev_rx.insert("peer".into(), CounterSnapshot { bytes: peer_rx_bytes, ..Default::default() });
 
                 if tx_bytes_delta > 0 {
-                    let _ = stats_tx.try_send(StatReport::Tx { bytes: tx_bytes_delta, nacks: 0, plis: 0 });
+                    if stats_tx
+                        .try_send(StatReport::Tx { bytes: tx_bytes_delta, nacks: 0, plis: 0 })
+                        .is_err()
+                    {
+                        tracing::warn!("stats channel full, dropping Tx bytes report");
+                    }
                 }
                 if rx_bytes_delta > 0 {
-                    let _ = stats_tx.try_send(StatReport::Rx { bytes: rx_bytes_delta, packets: 0, packets_lost: 0.0, nacks: 0, plis: 0 });
+                    if stats_tx
+                        .try_send(StatReport::Rx {
+                            bytes: rx_bytes_delta,
+                            packets: 0,
+                            packets_lost: 0.0,
+                            nacks: 0,
+                            plis: 0,
+                        })
+                        .is_err()
+                    {
+                        tracing::warn!("stats channel full, dropping Rx bytes report");
+                    }
                 }
 
-                // ── Per-track NACK/PLI/loss + stream health ───────────────
                 for (mid, track_stat) in &stats.tracks {
-                    // ── TX layers ─────────────────────────────────────────
-                    //
-                    // A layer is "active" when it has ever emitted packets AND
-                    // has not been continuously silent for SILENT_TICKS_THRESHOLD
-                    // consecutive poll intervals. This tolerates VBR gaps (e.g.
-                    // low-motion scenes, keyframe pauses) without mis-reporting
-                    // the stream as dead.
                     let mut tx_active = false;
                     let mut tx_active_layers = 0;
                     let mut tx_healthy_layers = 0;
@@ -651,14 +742,12 @@ async fn spawn_agent(
                         let nacks = egress.nacks.saturating_sub(prev.nacks);
                         let plis = egress.plis.saturating_sub(prev.plis);
 
-                        // Update silence counter based on this tick's delta.
                         prev.silent_ticks = if packets == 0 {
                             prev.silent_ticks.saturating_add(1)
                         } else {
                             0
                         };
 
-                        // Active = has ever sent packets AND not persistently silent.
                         let layer_active = egress.packets > 0
                             && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
 
@@ -684,18 +773,10 @@ async fn spawn_agent(
                         tx_active |= layer_active;
                     }
 
-                    // Healthy implies active, but paused simulcast layers (e.g. h/f) should
-                    // not downgrade health when a lower-quality layer is intentionally silent.
                     let tx_healthy = tx_active
                         && tx_active_layers > 0
                         && tx_active_layers == tx_healthy_layers;
 
-                    // ── RX layers ─────────────────────────────────────────
-                    //
-                    // Same VBR-tolerant liveness logic as TX. Additionally,
-                    // the loss-ratio health check is skipped during silent ticks
-                    // because `packets == 0` would make the ratio trivially pass
-                    // even if the stream is genuinely stalled.
                     let mut rx_active = false;
                     let mut rx_active_layers = 0;
                     let mut rx_healthy_layers = 0;
@@ -709,14 +790,12 @@ async fn spawn_agent(
                         let plis = ingress.plis.saturating_sub(prev.plis);
                         let packets_lost = ingress.loss.unwrap_or(0.0) * packets as f32;
 
-                        // Update silence counter based on this tick's delta.
                         prev.silent_ticks = if packets == 0 {
                             prev.silent_ticks.saturating_add(1)
                         } else {
                             0
                         };
 
-                        // Active = has ever received packets AND not persistently silent.
                         let layer_active = ingress.packets > 0
                             && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
 
@@ -738,9 +817,6 @@ async fn spawn_agent(
                             });
                         }
 
-                        // Only evaluate loss ratio when the layer is actively
-                        // delivering packets this tick; a zero-packet VBR gap
-                        // should not be mistaken for a healthy stream.
                         let loss_ok = if packets > 0 {
                             packets_lost < 0.05 * packets as f32
                         } else {
@@ -757,8 +833,6 @@ async fn spawn_agent(
                         rx_active |= layer_active;
                     }
 
-                    // Healthy implies active, but paused/idle simulcast layers should
-                    // not cause the whole stream to be reported as unhealthy.
                     let rx_healthy = rx_active
                         && rx_active_layers > 0
                         && rx_active_layers == rx_healthy_layers;
@@ -796,5 +870,146 @@ async fn handle_local_track(track: LocalTrack) {
         _ => pulsebeam_testdata::RAW_H264_HALF,
     };
     let looper = H264Looper::new(data, 30);
-    let _ = looper.run(track).await;
+    looper.run(track).await;
+}
+
+/// Join a single room and stream live stats to stderr every second.
+/// Exits cleanly on Ctrl-C or when the agent disconnects.
+#[allow(clippy::too_many_arguments)]
+async fn run_connect(
+    api_url: String,
+    room: String,
+    publish: bool,
+    simulcast: bool,
+    recv_video: usize,
+    recv_audio: usize,
+) -> Result<()> {
+    let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+    let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
+
+    if publish {
+        if simulcast {
+            builder = builder.with_track(
+                MediaKind::Video,
+                TransceiverDirection::SendOnly,
+                Some(vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ]),
+            );
+        } else {
+            builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
+        }
+    }
+
+    for _ in 0..recv_video {
+        builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
+    }
+    for _ in 0..recv_audio {
+        builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
+    }
+
+    let mut agent = builder.connect(&room).await?;
+    eprintln!("Connected to room '{}' (participant: {})", room, agent.participant_id());
+    eprintln!("Press Ctrl-C to disconnect.");
+    eprintln!("{:>8} {:>8} {:>8} {:>9} {:>9} {:>9}  streams (rx actv/hlth)",
+              "time(s)", "tx_mbps", "rx_mbps", "rtt_p50ms", "rtt_p99ms", "fps/stm");
+
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+    let start = Instant::now();
+    let mut rtt_hist = LatencyHistogram::default();
+    let mut prev_tx_bytes = 0u64;
+    let mut prev_rx_bytes = 0u64;
+    let mut prev_rx: HashMap<String, CounterSnapshot> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nDisconnecting…");
+                agent.disconnect().await?;
+                break;
+            }
+
+            Some(event) = agent.next_event() => {
+                match event {
+                    AgentEvent::LocalTrackAdded(track) => {
+                        tokio::spawn(handle_local_track(track));
+                    }
+                    AgentEvent::Disconnected(reason) => {
+                        eprintln!("Disconnected: {reason}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            _ = stats_interval.tick() => {
+                let elapsed = start.elapsed().as_secs();
+                let Some(stats) = agent.get_stats().await else { continue };
+
+                let peer = stats.peer.as_ref();
+                if let Some(rtt) = peer.and_then(|p| p.rtt).map(|r| r.as_millis()) {
+                    rtt_hist.record(rtt);
+                }
+
+                let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
+                let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
+                let tx_mbps = (tx_bytes.saturating_sub(prev_tx_bytes) * 8) as f64 / 1_000_000.0;
+                let rx_mbps = (rx_bytes.saturating_sub(prev_rx_bytes) * 8) as f64 / 1_000_000.0;
+                prev_tx_bytes = tx_bytes;
+                prev_rx_bytes = rx_bytes;
+
+                let p50 = rtt_hist.percentile(50.0);
+                let p99 = rtt_hist.percentile(99.0);
+
+                let mut rx_active = 0usize;
+                let mut rx_healthy = 0usize;
+                let mut rx_packets_delta = 0u64;
+
+                for (mid, track_stat) in &stats.tracks {
+                    for (rid, ingress) in &track_stat.rx_layers {
+                        let key = format!("rx_{}_{}", mid, rid_key(rid));
+                        let prev = prev_rx.get(&key).cloned().unwrap_or_default();
+                        let packets = ingress.packets.saturating_sub(prev.packets);
+                        let nacks = ingress.nacks.saturating_sub(prev.nacks);
+                        let plis = ingress.plis.saturating_sub(prev.plis);
+                        let silent_ticks = if packets == 0 {
+                            prev.silent_ticks.saturating_add(1)
+                        } else {
+                            0
+                        };
+                        prev_rx.insert(key, CounterSnapshot {
+                            packets: ingress.packets,
+                            nacks: ingress.nacks,
+                            plis: ingress.plis,
+                            silent_ticks,
+                            ..Default::default()
+                        });
+                        if ingress.packets > 0 && silent_ticks < SILENT_TICKS_THRESHOLD {
+                            rx_active += 1;
+                            let loss_ok = ingress.loss.unwrap_or(0.0) < 0.05;
+                            if loss_ok && plis == 0 && nacks == 0 {
+                                rx_healthy += 1;
+                            }
+                        }
+                        rx_packets_delta += packets;
+                    }
+                }
+
+                const ESTIMATED_PACKETS_PER_FRAME: f32 = 4.0;
+                let fps = (rx_packets_delta as f32) / ESTIMATED_PACKETS_PER_FRAME
+                    / rx_active.max(1) as f32;
+
+                rtt_hist.reset();
+                eprintln!("{:>8} {:>8.2} {:>8.2} {:>9} {:>9} {:>9.1}  {}/{}",
+                          elapsed, tx_mbps, rx_mbps, p50, p99, fps,
+                          rx_active, rx_healthy);
+            }
+        }
+    }
+
+    Ok(())
 }

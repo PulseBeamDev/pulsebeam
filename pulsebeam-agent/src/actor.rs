@@ -660,7 +660,9 @@ impl AgentBuilder {
                 simulcast,
             });
         }
-        let (offer, pending) = sdp.apply().expect("offer is required");
+        let (offer, pending) = sdp
+            .apply()
+            .ok_or_else(|| AgentError::Protocol("SDP apply produced no offer".into()))?;
         tracing::debug!("Generated SDP Offer:\n{}", offer);
         let resp = self
             .api
@@ -895,15 +897,22 @@ impl AgentActor {
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
-                         let _ = self.rtc.handle_input(Input::Receive(
-                            Instant::now().into(),
-                            Receive {
-                                proto: Protocol::Udp,
-                                source,
-                                destination: self.addr,
-                                contents: self.buf[..n].try_into().unwrap(),
+                        match self.buf[..n].try_into() {
+                            Ok(contents) => {
+                                let _ = self.rtc.handle_input(Input::Receive(
+                                    Instant::now().into(),
+                                    Receive {
+                                        proto: Protocol::Udp,
+                                        source,
+                                        destination: self.addr,
+                                        contents,
+                                    }
+                                ));
                             }
-                        ));
+                            Err(_) => {
+                                tracing::warn!(n, "UDP datagram too large for RTC buffer, discarding");
+                            }
+                        }
                     }
                 }
 
@@ -955,10 +964,13 @@ impl AgentActor {
             }
         }
 
-        let _ = self
+        if let Err(e) = self
             .api
             .delete_participant_by_uri(self.resource_uri.clone())
-            .await;
+            .await
+        {
+            tracing::warn!(error = ?e, "failed to delete participant on shutdown");
+        }
     }
 
     async fn poll_rtc(&mut self) -> Option<Instant> {
@@ -1142,7 +1154,9 @@ impl AgentActor {
     }
 
     fn emit(&self, event: AgentEvent) {
-        let _ = self.event_tx.try_send(event);
+        if self.event_tx.try_send(event).is_err() {
+            tracing::warn!("agent event channel full or closed; event dropped");
+        }
     }
 
     fn flush_pending_state(&mut self, now: Instant) {
@@ -1213,6 +1227,8 @@ impl AgentActor {
     async fn perform_reconnect(&mut self) {
         self.is_reconnecting = true;
         self.reconnect_deadline = None;
+        // Clear stale peer stats so callers don't read pre-reconnect RTT.
+        self.stats.peer = None;
 
         tracing::info!("performing reconnect (attempt {})", self.retry_count);
 
