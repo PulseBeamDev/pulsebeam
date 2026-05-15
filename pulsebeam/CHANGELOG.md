@@ -1,3 +1,9 @@
+## [unreleased]
+
+* Force switch on a different track
+* feat: keyframe switching v2
+* Simulcast flag to bench cli
+
 ## [pulsebeam-v0.4.2] - 2026-05-14
 
 * Allow changing isolated vs shared runtime
