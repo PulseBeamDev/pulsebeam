@@ -50,6 +50,13 @@ pub struct VideoAllocator {
 
 impl VideoAllocator {
     pub fn new<R: RngCore>(manual_sub: bool, rng: &mut R) -> Self {
+        let desired_ctrl = BitrateControllerConfig {
+            min_bitrate: MIN_BANDWIDTH,
+            max_bitrate: MAX_BANDWIDTH,
+            default_bitrate: MIN_BANDWIDTH,
+            ..BitrateControllerConfig::desired_bitrate()
+        }
+        .build();
         Self {
             manual_sub,
             tracks: HashMap::new(),
@@ -57,7 +64,7 @@ impl VideoAllocator {
             routes: HashMap::new(),
             rng: Rng::seed_from_u64(rng.next_u64()),
             last_reconciled: HashSet::new(),
-            desired_ctrl: BitrateControllerConfig::desired_bitrate().build(),
+            desired_ctrl,
         }
     }
 

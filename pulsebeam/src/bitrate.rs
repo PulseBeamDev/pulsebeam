@@ -46,7 +46,7 @@ impl BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(30),
             max_bitrate: Bitrate::mbps(10),
             default_bitrate: Bitrate::kbps(30),
-            headroom_factor: 1.0,
+            headroom_factor: 1.15,
             max_decay_factor: 0.95, // max 5% drop per tick (~10%/s)
             emergency_drop_threshold: 0.50,
             // React immediately to increases: BitrateEstimate's cascaded SMA
@@ -109,10 +109,7 @@ impl BitrateController {
 
         let safe_bw = self.smoothed_input * self.config.headroom_factor;
 
-        let step = self.config.quantization_step.as_f64();
-        let quantized_target = (safe_bw / step).ceil() * step;
-
-        let target = quantized_target.clamp(
+        let target = safe_bw.clamp(
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
@@ -198,7 +195,12 @@ impl BitrateController {
     }
 
     pub fn current(&self) -> Bitrate {
-        Bitrate::from(self.current_bitrate)
+        let step = self.config.quantization_step.as_f64();
+        let quantized = ((self.current_bitrate / step).ceil() * step).clamp(
+            self.config.min_bitrate.as_f64(),
+            self.config.max_bitrate.as_f64(),
+        );
+        Bitrate::from(quantized)
     }
 }
 
