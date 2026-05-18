@@ -807,6 +807,8 @@ impl AllocationEngine {
                     .map(|l| l.state.bitrate_bps())
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0)
+                    // Lowest layer is always included.
+                    .max(s.track.lowest_quality().state.bitrate_bps())
             })
             .sum();
         let total_desired_bps = Bitrate::from(total_desired_bps as u64);
