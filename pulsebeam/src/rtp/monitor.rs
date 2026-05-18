@@ -199,9 +199,15 @@ impl StreamMonitor {
 
     pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
+        let bitrate_estimate = self.bwe.estimate_bps() as u64;
+        tracing::debug!(
+            stream_id = self.stream_id,
+            "upstream bwe={}",
+            Bitrate::from(bitrate_estimate)
+        );
         self.shared_state
             .bitrate_bps
-            .store(self.bwe.estimate_bps() as u64, Ordering::Relaxed);
+            .store(bitrate_estimate, Ordering::Relaxed);
 
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
@@ -389,24 +395,26 @@ impl StreamMonitor {
 pub struct BitrateEstimate {
     tick_start: Option<Instant>,
     accumulated_bytes: usize,
-    window: VecDeque<f64>,
+    raw_ticks: VecDeque<f64>,
+    sma1_ticks: VecDeque<f64>,
     max_window_ticks: usize,
-    ewma_estimate: f64,
-    alpha_fall: f64,
+    baseline_bps: f64,
+    fast_trend_bps: f64,
 }
 
 impl BitrateEstimate {
-    const HEADROOM: f64 = 1.20;
-    const TICK_MS: f64 = 500.0; // Larger ticks naturally smooth massive VBR I-frame spikes
+    const HEADROOM: f64 = 1.05;
+    const TICK_MS: f64 = 500.0;
 
     pub fn new(_now: Instant) -> Self {
         Self {
             tick_start: None,
             accumulated_bytes: 0,
-            window: VecDeque::new(),
-            max_window_ticks: 10, // 5s peak-hold window (10 ticks * 500ms)
-            ewma_estimate: 0.0,
-            alpha_fall: 0.01, // Extremely slow decay ensures VBR gaps stay CBR-like
+            raw_ticks: VecDeque::with_capacity(6),
+            sma1_ticks: VecDeque::with_capacity(6),
+            max_window_ticks: 6, // 3s per stage (6s total triangular spread)
+            baseline_bps: 0.0,
+            fast_trend_bps: 0.0,
         }
     }
 
@@ -417,7 +425,6 @@ impl BitrateEstimate {
     }
 
     pub fn poll(&mut self, current_time: Instant) {
-        // Allows decaying the estimate forward gracefully during extended stream silence
         self.advance_time(current_time);
     }
 
@@ -431,11 +438,10 @@ impl BitrateEstimate {
         let elapsed = time.saturating_duration_since(current_tick);
         let ticks_passed = (elapsed.as_millis() / Self::TICK_MS as u128) as usize;
 
-        // First tick absorbs all historically accumulated bytes
         let instant_bps = (self.accumulated_bytes as f64 * 8.0 * 1000.0) / Self::TICK_MS;
         self.push_tick(instant_bps);
 
-        // Submits pure silence for any remaining missed ticks (capped to avoid CPU stalls on huge jumps)
+        // Submit pure silence for missed ticks
         let empty_ticks = ticks_passed.saturating_sub(1).min(1000);
         for _ in 0..empty_ticks {
             self.push_tick(0.0);
@@ -448,24 +454,37 @@ impl BitrateEstimate {
     }
 
     fn push_tick(&mut self, bps: f64) {
-        self.window.push_back(bps);
-        if self.window.len() > self.max_window_ticks {
-            self.window.pop_front();
+        if self.raw_ticks.len() == self.max_window_ticks {
+            self.raw_ticks.pop_front();
         }
+        self.raw_ticks.push_back(bps);
 
-        let peak_bps = self.window.iter().copied().fold(0.0_f64, f64::max);
+        // Stage 1 SMA
+        let sma1 = self.raw_ticks.iter().sum::<f64>() / self.raw_ticks.len() as f64;
 
-        if peak_bps >= self.ewma_estimate {
-            self.ewma_estimate = peak_bps; // Instant attack stays strictly above actual bitrate
+        // Stage 2 SMA (Cascaded to form a triangular window, eliminating cliff drops)
+        if self.sma1_ticks.len() == self.max_window_ticks {
+            self.sma1_ticks.pop_front();
+        }
+        self.sma1_ticks.push_back(sma1);
+
+        self.baseline_bps = self.sma1_ticks.iter().sum::<f64>() / self.sma1_ticks.len() as f64;
+
+        // Fast trend detection: median of last 3 ticks (1.5s)
+        // Ignores 1-tick I-frame spikes but instantly reacts to sustained step-ups
+        let recent_len = self.raw_ticks.len();
+        if recent_len >= 3 {
+            let a = self.raw_ticks[recent_len - 1];
+            let b = self.raw_ticks[recent_len - 2];
+            let c = self.raw_ticks[recent_len - 3];
+            self.fast_trend_bps = a.max(b.min(c)).min(b.max(c));
         } else {
-            // Decays very slowly to convert VBR drops into a persistent CBR ceiling
-            self.ewma_estimate =
-                self.alpha_fall * peak_bps + (1.0 - self.alpha_fall) * self.ewma_estimate;
+            self.fast_trend_bps = 0.0;
         }
     }
 
     pub fn estimate_bps(&self) -> f64 {
-        self.ewma_estimate * Self::HEADROOM
+        self.baseline_bps.max(self.fast_trend_bps) * Self::HEADROOM
     }
 }
 
@@ -592,6 +611,7 @@ impl AudioMonitor {
 mod test {
     use super::*;
     use more_asserts::{assert_ge, assert_gt, assert_le};
+    use pulsebeam_testdata;
     use std::time::Duration;
     use str0m::media::{Frequency, MediaTime};
     use tokio::time::Instant;
@@ -662,8 +682,7 @@ mod test {
         assert!((after_drop - 0.4).abs() < 1e-9);
 
         for seq in 12..=21 {
-            monitor.process_packet(
-                &packet(seq, now + Duration::from_millis(700 + (seq - 12))));
+            monitor.process_packet(&packet(seq, now + Duration::from_millis(700 + (seq - 12))));
         }
         monitor.poll(now + Duration::from_millis(1200), false);
 
@@ -690,8 +709,7 @@ mod test {
 
         // One fully clean window: smoothed decays from 0.4 * 0.8 = 0.32 — still above 0.025
         for seq in 12u64..=22 {
-            monitor.process_packet(
-                &packet(seq, now + Duration::from_millis(700 + seq - 12)));
+            monitor.process_packet(&packet(seq, now + Duration::from_millis(700 + seq - 12)));
         }
         monitor.poll(now + Duration::from_millis(1200), false);
         assert_eq!(
@@ -705,7 +723,10 @@ mod test {
         let mut base_seq = 23u64;
         for _ in 0..100 {
             for seq in base_seq..(base_seq + 10) {
-                monitor.process_packet(&packet(seq, tick_now + Duration::from_millis(seq - base_seq)));
+                monitor.process_packet(&packet(
+                    seq,
+                    tick_now + Duration::from_millis(seq - base_seq),
+                ));
             }
             base_seq += 10;
             tick_now += Duration::from_millis(600);
@@ -869,7 +890,8 @@ mod test {
             let mut pkt = RtpPacket::default();
             pkt.arrival_ts = self.now;
             pkt.playout_time = self.now;
-            pkt.payload.resize(size_bytes.saturating_sub(pkt.header_len), 0);
+            pkt.payload
+                .resize(size_bytes.saturating_sub(pkt.header_len), 0);
             self.estimator.record(&pkt);
         }
 
@@ -887,8 +909,8 @@ mod test {
         let baseline = sim.current();
 
         println!("Baseline: {:.0} bps", baseline);
-        assert_ge!(baseline, 1_200_000.0);
-        assert_le!(baseline, 1_460_000.0);
+        assert_ge!(baseline, 1_050_000.0);
+        assert_le!(baseline, 1_200_000.0);
 
         // 2. Inject Massive Keyframe
         // Normal 100ms = 12,500 bytes. Keyframe = 62,500 bytes (5x spike).
@@ -970,8 +992,7 @@ mod test {
                 if i == 25 {
                     continue; // simulate 1 lost packet mid-window
                 }
-                monitor.process_packet(
-                    &packet(base_seq + i, t + Duration::from_millis(i * 2)));
+                monitor.process_packet(&packet(base_seq + i, t + Duration::from_millis(i * 2)));
             }
             base_seq += 50;
             t += Duration::from_millis(600);
@@ -1147,8 +1168,7 @@ mod test {
         for _ in 0..20 {
             // Clean window: 10 consecutive packets.
             for i in 0..10u64 {
-                monitor.process_packet(
-                    &packet(base_seq + i, t + Duration::from_millis(i * 5)));
+                monitor.process_packet(&packet(base_seq + i, t + Duration::from_millis(i * 5)));
             }
             base_seq += 10;
             t += Duration::from_millis(600);
@@ -1289,8 +1309,7 @@ mod test {
             // Resume — step 2: 10 clean packets spanning > 500 ms from the
             // first one. The following poll fires the measurement window.
             for i in 0..10u64 {
-                monitor.process_packet(
-                    &packet(seq + i, t + Duration::from_millis(100 + i * 10)));
+                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(100 + i * 10)));
             }
             seq += 10;
             t += Duration::from_millis(700); // ≥ 500 ms from first burst packet
@@ -1316,6 +1335,238 @@ mod test {
             shared.quality(),
             StreamQuality::Bad,
             "must remain Bad after all oscillation cycles"
+        );
+    }
+
+    // ── BitrateEstimate stability: real H.264 testdata ──────────────────────
+
+    /// Feed a sequence of frame byte-sizes into a fresh `BitrateEstimate` at
+    /// `fps` frames per second.  Each entry is sent as a single RTP packet so
+    /// the estimator sees the correct byte count without fragmentation noise.
+    ///
+    /// Returns one `estimate_bps()` sample per 500 ms tick window, captured
+    /// immediately after each tick fires.
+    fn replay_frames_into_bwe(frame_sizes: &[usize], fps: u64) -> Vec<f64> {
+        let frame_interval = Duration::from_micros(1_000_000 / fps);
+        let tick_dur = Duration::from_millis(500);
+        let t0 = Instant::now();
+        let mut bwe = BitrateEstimate::new(t0);
+        let mut now = t0;
+        let mut next_sample = t0 + tick_dur;
+        let mut samples: Vec<f64> = Vec::new();
+
+        for &frame_bytes in frame_sizes {
+            now += frame_interval;
+            let mut pkt = RtpPacket::default();
+            pkt.arrival_ts = now;
+            pkt.playout_time = now;
+            // Set payload so header_len + payload.len() == frame_bytes total.
+            pkt.payload
+                .resize(frame_bytes.saturating_sub(pkt.header_len), 0);
+            bwe.record(&pkt);
+
+            // Capture one sample per elapsed 500 ms window.
+            while now >= next_sample {
+                bwe.poll(next_sample);
+                samples.push(bwe.estimate_bps());
+                next_sample += tick_dur;
+            }
+        }
+        samples
+    }
+
+    /// Verify that `BitrateEstimate` produces a stable, CBR-like output when
+    /// fed the quarter H.264 stream (CBR target 150 kbps).
+    ///
+    /// Ground truth (from `make estimate INPUT_H264=quarter_q.h264`):
+    ///   avg ≈ 149.76 kbps, min ≈ 97 kbps, max ≈ 225 kbps → raw ratio ≈ 2.33×
+    ///
+    /// After warmup the estimator must:
+    /// 1. Track the right order of magnitude (within 0.8× … 3× of target).
+    /// 2. Be MORE STABLE than the raw 1-second rolling window – i.e. the
+    ///    max/min ratio of sampled estimates must beat the raw 2.33× ratio.
+    #[test]
+    fn bwe_quarter_h264_stable_cbr_estimate() {
+        // Ground truth from `make estimate`: raw 1-second rolling-window ratio.
+        const RAW_MAX_KBPS: f64 = 225.86;
+        const RAW_MIN_KBPS: f64 = 97.01;
+        const RAW_RATIO: f64 = RAW_MAX_KBPS / RAW_MIN_KBPS; // ≈ 2.33×
+
+        const TARGET_BPS: f64 = 150_000.0;
+
+        let frames = pulsebeam_testdata::h264_frame_sizes(pulsebeam_testdata::RAW_H264_QUARTER);
+        let samples = replay_frames_into_bwe(&frames, 30);
+
+        // 45 s @ 30 fps → ~90 ticks; skip first 10 (5 s warmup).
+        assert!(
+            samples.len() >= 20,
+            "expected ≥ 20 samples, got {}",
+            samples.len()
+        );
+        let steady: &[f64] = &samples[10..];
+
+        let mean = steady.iter().sum::<f64>() / steady.len() as f64;
+        let max = steady.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = steady.iter().copied().fold(f64::INFINITY, f64::min);
+
+        // Rough range check: mean must be in [target×0.8, target×3].
+        assert_ge!(
+            mean,
+            TARGET_BPS * 1.05,
+            "mean estimate too low: {:.0} bps (target {:.0})",
+            mean,
+            TARGET_BPS
+        );
+        assert_le!(
+            mean,
+            TARGET_BPS * 1.15,
+            "mean estimate too high: {:.0} bps (target {:.0})",
+            mean,
+            TARGET_BPS
+        );
+
+        // Stability: BitrateEstimate must be tighter than the raw per-second
+        // rolling window.  The peak-hold + EWMA should absorb the 97–225 kbps
+        // fluctuation into a near-flat line.
+        let ratio = max / min.max(1.0);
+        assert!(
+            ratio < RAW_RATIO,
+            "estimate less stable than raw 1 s window: \
+             min={:.0} max={:.0} ratio={:.2}× > raw_ratio={:.2}×",
+            min,
+            max,
+            ratio,
+            RAW_RATIO
+        );
+    }
+
+    // ── BitrateEstimate stability: synthetic VBR / screen-share patterns ────
+
+    /// A VBR stream with a large I-frame every `gop` frames (e.g. every 30 frames
+    /// = 1 s at 30 fps).  The estimator must absorb the I-frame spike and produce
+    /// a stable flat line — consecutive 500 ms samples must not differ by more
+    /// than 2× from one another.
+    #[test]
+    fn bwe_vbr_periodic_keyframes_no_oscillation() {
+        // GOP = 30 frames (1 s at 30 fps); I-frame 20× larger than P-frame.
+        const FPS: u64 = 30;
+        const GOP: usize = 30;
+        const P_FRAME_BYTES: usize = 3_000;
+        const I_FRAME_BYTES: usize = P_FRAME_BYTES * 20; // 60 KB spike
+
+        // 60 seconds of content.
+        let nal_sizes: Vec<usize> = (0..FPS as usize * 60)
+            .map(|i| {
+                if i % GOP == 0 {
+                    I_FRAME_BYTES
+                } else {
+                    P_FRAME_BYTES
+                }
+            })
+            .collect();
+
+        let samples = replay_frames_into_bwe(&nal_sizes, FPS);
+
+        // Skip 5 s warmup.
+        assert!(samples.len() >= 20, "too few samples: {}", samples.len());
+        let steady = &samples[10..];
+
+        // No two consecutive 500 ms windows may differ by more than 2×.
+        // A naive instantaneous tracker would see alternating ~60 kbps (P-frames)
+        // and ~480 kbps (I-frame tick) windows — a 8× swing.
+        for pair in steady.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let ratio = if a > b {
+                a / b.max(1.0)
+            } else {
+                b / a.max(1.0)
+            };
+            assert!(
+                ratio < 2.0,
+                "consecutive sample oscillation: {:.0} → {:.0} bps (ratio {:.2}×)",
+                a,
+                b,
+                ratio
+            );
+        }
+    }
+
+    /// Screen-sharing pattern: burst of active content followed by a "still"
+    /// idle phase at 2 fps (the minimum real-world screen-share send rate).
+    /// The estimator must correctly track the lower 2 fps bitrate after the
+    /// window slides past the active burst — neither stuck high nor dropping
+    /// to zero.
+    #[test]
+    fn bwe_screen_share_idle_2fps_tracks_bitrate() {
+        // Phase 1: 5 s active at ~500 kbps (30 fps, ~2 KB P-frames + 40 KB
+        //   I-frame every 30 frames).
+        const FPS: u64 = 30;
+        const GOP: usize = 30;
+        const P_BYTES: usize = 2_083; // ≈ 500 kbps / 30 fps / 8 bits
+        const I_BYTES: usize = 40_000;
+        // Phase 2: static screen at 2 fps — one ~2 KB P-frame every 500 ms.
+        // instant_bps per tick = 2000 × 8 / 0.5 s = 32 000 bps.
+        const IDLE_FRAME_BYTES: usize = 2_000;
+        const IDLE_BPS: f64 = IDLE_FRAME_BYTES as f64 * 8.0 * 2.0; // 32 000 bps
+
+        let active_frames = FPS as usize * 5;
+        let active_nals: Vec<usize> = (0..active_frames)
+            .map(|i| if i % GOP == 0 { I_BYTES } else { P_BYTES })
+            .collect();
+
+        let tick_dur = Duration::from_millis(500);
+        let t0 = Instant::now();
+        let mut bwe = BitrateEstimate::new(t0);
+        let mut now = t0;
+
+        // Warm the estimator with active frames.
+        for &sz in &active_nals {
+            now += Duration::from_micros(1_000_000 / FPS);
+            let mut pkt = RtpPacket::default();
+            pkt.arrival_ts = now;
+            pkt.playout_time = now;
+            pkt.payload.resize(sz.saturating_sub(pkt.header_len), 0);
+            bwe.record(&pkt);
+        }
+        let post_active = bwe.estimate_bps();
+
+        // Phase 2: 10 s idle at 2 fps — one IDLE_FRAME_BYTES packet per tick.
+        let idle_ticks = 20usize; // 10 s
+        let mut idle_samples = Vec::with_capacity(idle_ticks);
+        for _ in 0..idle_ticks {
+            now += tick_dur;
+            let mut pkt = RtpPacket::default();
+            pkt.arrival_ts = now;
+            pkt.playout_time = now;
+            pkt.payload
+                .resize(IDLE_FRAME_BYTES.saturating_sub(pkt.header_len), 0);
+            bwe.record(&pkt);
+            bwe.poll(now);
+            idle_samples.push(bwe.estimate_bps());
+        }
+
+        let final_idle = *idle_samples.last().unwrap();
+
+        // After the 5 s window has fully slid to idle content, the estimate
+        // must converge to the 2 fps bitrate with the usual 10 % headroom.
+        assert!(
+            final_idle >= IDLE_BPS * 1.05,
+            "estimate undershot idle 2fps bitrate: final_idle={:.0} idle_bps={:.0}",
+            final_idle,
+            IDLE_BPS
+        );
+        assert!(
+            final_idle <= IDLE_BPS * 2.0,
+            "estimate did not converge to idle bitrate: final_idle={:.0} idle_bps={:.0}",
+            final_idle,
+            IDLE_BPS
+        );
+
+        // Sanity: active phase must have been well above idle.
+        assert!(
+            post_active > 200_000.0,
+            "post-active estimate unexpectedly low: {:.0} bps",
+            post_active
         );
     }
 }
