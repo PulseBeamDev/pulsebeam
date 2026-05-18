@@ -1,4 +1,5 @@
 INPUT_VIDEO = video.mp4
+INPUT_H264 = quarter_q.h264
 OUT_DIR     = .
 FPS         = 30
 DURATION    = 45
@@ -78,6 +79,28 @@ $(OUT_DIR)/quarter_q.h264: $(OUT_DIR)/trimmed.mp4
 		x264enc $(COMMON) bitrate=$(BITRATE_Q) ! \
 		video/x-h264,profile=baseline,stream-format=byte-stream ! \
 		filesink location=$@
+
+estimate:
+	@if [ ! -f "$(INPUT_H264)" ]; then \
+		echo "Error: Input file '$(INPUT_H264)' not found." >&2; \
+		exit 1; \
+	fi
+	@echo "timestamp_seconds,frame_count,bitrate_kbps"
+	@ffprobe -v error -framerate $(FPS) -i $(INPUT_H264) -show_entries packet=size -of compact=p=0:nk=1 | \
+	awk \
+		-v window=$(FPS) \
+		-v fps=$(FPS) \
+		'BEGIN { sum=0 } \
+		{ \
+			idx = NR % window; \
+			sum -= history[idx]; \
+			history[idx] = $$1; \
+			sum += $$1; \
+			if (NR >= window) { \
+				timestamp = NR / fps; \
+				printf "%.3f,%d,%.2f\n", timestamp, NR, (sum * 8) / 1000; \
+			} \
+		}'
 
 clean:
 	rm -f $(OUT_DIR)/trimmed.mp4 \

@@ -318,8 +318,8 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     for (index, &rid) in simulcast_rids.iter().enumerate() {
         let (bitrate, quality) = match (rid, index) {
             (None, _) => (150_000, LayerQuality::Low),
-            (Some(_), 0) => (2_500_000, LayerQuality::High),
-            (Some(_), 1) => (750_000, LayerQuality::Medium),
+            (Some(_), 0) => (1_250_000, LayerQuality::High),
+            (Some(_), 1) => (400_000, LayerQuality::Medium),
             (Some(_), _) => (150_000, LayerQuality::Low),
         };
 
