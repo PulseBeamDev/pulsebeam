@@ -46,16 +46,22 @@ impl BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(30),
             max_bitrate: Bitrate::mbps(10),
             default_bitrate: Bitrate::kbps(30),
-            // No headroom shave: the probe signal in video.rs is already set above the upgrade
-            // gate (UPGRADE_HYSTERESIS_FACTOR). Applying a <1.0 factor here makes the BWE
-            // converge *below* the gate threshold, so the upgrade never fires.
             headroom_factor: 1.0,
-            max_decay_factor: 0.95, // max 5% drop per tick
+            max_decay_factor: 0.95, // max 5% drop per tick (~10%/s)
             emergency_drop_threshold: 0.50,
+            // React immediately to increases: BitrateEstimate's cascaded SMA
+            // already filters I-frame spikes, so upward moves are genuine.
+            // Fast up = probing starts as soon as capacity may be available.
             required_up_samples: 1,
-            required_down_samples: 1, // react immediately to drops (BWE already filtered)
-            quantization_step: Bitrate::kbps(10),
-            ema_alpha: 1.0, // no EMA for desired bitrate, we output sharp target steps
+            // 3 ticks (1.5s) of confirmed lower before reducing desired.
+            // A single VBR quiet tick must not lower desired: str0m's
+            // ProbeControl::maybe_increase_alr fires a new probe every time
+            // desired increases, so a down+up oscillation wastes padding bw.
+            required_down_samples: 3,
+            // 50 kbps deadband: at 2 Mbit/s ≈ 2.5% granularity, prevents
+            // sub-50 kbps noise from triggering probe clusters.
+            quantization_step: Bitrate::kbps(50),
+            ema_alpha: 1.0, // BitrateEstimate already smooths; pass through
         }
     }
 
@@ -104,7 +110,7 @@ impl BitrateController {
         let safe_bw = self.smoothed_input * self.config.headroom_factor;
 
         let step = self.config.quantization_step.as_f64();
-        let quantized_target = (safe_bw / step).floor() * step;
+        let quantized_target = (safe_bw / step).ceil() * step;
 
         let target = quantized_target.clamp(
             self.config.min_bitrate.as_f64(),

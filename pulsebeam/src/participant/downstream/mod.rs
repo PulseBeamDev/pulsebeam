@@ -1,6 +1,7 @@
 mod audio;
 mod video;
 
+use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::id::AudioSelectorSlotId;

@@ -1,3 +1,4 @@
+use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::EventQueue;
 use crate::rtp::switcher::Switcher;
@@ -44,6 +45,7 @@ pub struct VideoAllocator {
     tracks: HashMap<TrackId, Track>,
     rng: Rng,
     last_reconciled: HashSet<(TrackId, SlotKey)>,
+    desired_ctrl: BitrateController,
 }
 
 impl VideoAllocator {
@@ -55,6 +57,7 @@ impl VideoAllocator {
             routes: HashMap::new(),
             rng: Rng::seed_from_u64(rng.next_u64()),
             last_reconciled: HashSet::new(),
+            desired_ctrl: BitrateControllerConfig::desired_bitrate().build(),
         }
     }
 
@@ -251,7 +254,7 @@ impl VideoAllocator {
         });
 
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
-        let desired = desired.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
+        let desired = self.desired_ctrl.update(desired);
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
