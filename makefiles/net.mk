@@ -72,6 +72,22 @@ net-apply: net-clear net-verify
 # --- Simulation Presets ---
 # All presets specify target end-to-end RTT - net-apply handles localhost division automatically
 
+# Simulates a participant on good broadband connecting to a cloud SFU in the same
+# geographic region (e.g. residential → EU-West, US-East client → US-East-1 SFU).
+# High bandwidth ceiling so the loopback is not the bottleneck; the point is to
+# give TWCC/GCC a realistic RTT and low jitter so its estimates are meaningful
+# rather than near-zero loopback timing causing oscillation.
+# Target RTT: ~25ms
+net-regional-server:
+	@$(MAKE) net-apply \
+		TARGET_RTT="25ms" \
+		UPLOAD_RATE="10000mbit" \
+		DOWNLOAD_RATE="10000mbit" \
+		UPLOAD_JITTER="3ms" \
+		DOWNLOAD_JITTER="3ms" \
+		UPLOAD_PACKET_LOSS="0%" \
+		DOWNLOAD_PACKET_LOSS="0%"
+
 # Pristine network with minimal issues.
 # Target RTT: ~40ms
 net-good-home-wifi:
@@ -199,6 +215,7 @@ help:
 	@echo "  make net-status       Show current tc configuration"
 	@echo ""
 	@echo "Available presets:"
+	@echo "  net-regional-server      Regional cloud server, good broadband (~25ms RTT)"
 	@echo "  net-good-home-wifi       Pristine home WiFi (~40ms RTT)"
 	@echo "  net-congested-wifi       Congested home WiFi (~50ms+ RTT)"
 	@echo "  net-stable-mobile        Stable 4G/5G (~80ms RTT)"
