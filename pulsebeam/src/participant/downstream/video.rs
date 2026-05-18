@@ -286,7 +286,7 @@ impl VideoAllocator {
                 AllocationDecision::Forward(layer, _) => {
                     changed |= slot.switch_to(layer, false);
                 }
-                AllocationDecision::Pause(layer) => {
+                AllocationDecision::Pause(layer, _) => {
                     changed |= slot.pause_at(layer);
                     let _stream_id = layer.stream_id();
                 }
@@ -662,7 +662,7 @@ pub fn log_allocation(
                 };
                 format!("{}:{}({})", slot.mid, q, bw)
             }
-            Some(AllocationDecision::Pause(_)) => format!("{}:PAUSE", slot.mid),
+            Some(AllocationDecision::Pause(_, needed)) => format!("{}:PAUSE({})", slot.mid, needed),
             _ => format!("{}:IDLE", slot.mid),
         };
         reports.push(entry);
@@ -702,7 +702,7 @@ pub struct SlotView<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AllocationDecision<'a> {
     Forward(&'a TrackLayer, Bitrate),
-    Pause(&'a TrackLayer),
+    Pause(&'a TrackLayer, Bitrate),
 }
 
 impl<'a> std::fmt::Display for AllocationDecision<'a> {
@@ -711,8 +711,8 @@ impl<'a> std::fmt::Display for AllocationDecision<'a> {
             AllocationDecision::Forward(layer, bitrate) => {
                 write!(f, "Forward({} @ {})", layer, bitrate)
             }
-            AllocationDecision::Pause(layer) => {
-                write!(f, "Pause({})", layer)
+            AllocationDecision::Pause(layer, needed) => {
+                write!(f, "Pause({} needs {})", layer, needed)
             }
         }
     }
@@ -833,9 +833,10 @@ impl AllocationEngine {
                 used_bps += bw.as_f64();
                 decisions.insert(slot.key, AllocationDecision::Forward(layer, bw));
             } else {
+                let needed = Bitrate::from(slot.track.lowest_quality().state.bitrate_bps());
                 decisions.insert(
                     slot.key,
-                    AllocationDecision::Pause(slot.track.lowest_quality()),
+                    AllocationDecision::Pause(slot.track.lowest_quality(), needed),
                 );
             }
         }
@@ -1721,10 +1722,11 @@ mod allocation_tests {
         ];
         let (decisions, _) = AllocationEngine::compute(bw(0), &slots);
         for (key, d) in &decisions {
-            if let AllocationDecision::Pause(receiver) = d {
+            if let AllocationDecision::Pause(receiver, needed) = d {
                 // The receiver field must point somewhere meaningful (non-null
                 // is the only invariant we can assert structurally).
                 let _ = receiver; // just asserting it exists via pattern match
+                assert!(needed.as_f64() > 0.0, "Pause bitrate must be positive");
             } else if matches!(d, AllocationDecision::Pause(..)) {
                 panic!("Pause for {:?} is missing its resume receiver", key);
             }
