@@ -182,7 +182,13 @@ impl VideoAllocator {
         let already_assigned: IndexSet<TrackId> = self
             .slots
             .values()
-            .filter_map(|s| s.staging.as_ref().map(|t| t.meta.id))
+            .flat_map(|s| {
+                s.staging
+                    .as_ref()
+                    .map(|t| t.meta.id)
+                    .into_iter()
+                    .chain(s.active.as_ref().map(|t| t.meta.id))
+            })
             .collect();
 
         let mut pending_tracks = self
@@ -225,6 +231,11 @@ impl VideoAllocator {
                 "rebalance: staged tracks into idle slots, awaiting BWE to activate"
             );
         }
+
+        debug_assert!(
+            self.no_duplicate_slot_assignments(),
+            "rebalance produced duplicate track assignments: each track must map to at most one slot"
+        );
     }
 
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, bool) {
@@ -380,6 +391,27 @@ impl VideoAllocator {
                 .get(*slot_key)
                 .is_some_and(|slot| slot.matches_track_id(sid))
         })
+    }
+
+    /// Returns `true` if every track ID appears in at most one slot's
+    /// active or staging layer.  A track must never be assigned to two
+    /// slots simultaneously, because that would cause duplicate stream
+    /// forwarding and corrupt the routing table.
+    fn no_duplicate_slot_assignments(&self) -> bool {
+        let mut seen: HashSet<TrackId> = HashSet::new();
+        for slot in self.slots.values() {
+            for layer in slot
+                .staging
+                .as_ref()
+                .into_iter()
+                .chain(slot.active.as_ref())
+            {
+                if !seen.insert(layer.meta.id) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -1383,6 +1415,105 @@ mod assignment_tests {
             new_target.meta.id,
             "new track must become staging target"
         );
+    }
+
+    /// Regression test for the bug where `rebalance` only checked `staging`
+    /// when building `already_assigned`, so tracks that had been promoted from
+    /// staging → active (Stable state, staging=None) were treated as
+    /// unassigned and re-allocated to idle slots on the next `rebalance` call.
+    #[test]
+    fn no_double_assignment_after_staging_promoted_to_active() {
+        let mut allocator = setup_allocator();
+        // 4 senders publishing into a 5-person room → 4 tracks, 7 recv slots.
+        let tracks = add_tracks(&mut allocator, 4);
+        add_slots(&mut allocator, 7);
+
+        // Manually promote every staged slot to Stable (simulate the normal
+        // on_rtp path that sets active = staging.take()).
+        for slot in allocator.slots.values_mut() {
+            if let Some(layer) = slot.staging.take() {
+                slot.active = Some(layer);
+            }
+        }
+
+        // Adding a new slot triggers rebalance().  Before the fix this would
+        // double-assign the active tracks into the newly-idle slots.
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("extra"),
+            ..SlotConfig::default()
+        });
+
+        // Every track must appear in at most one slot.
+        assert!(
+            allocator.no_duplicate_slot_assignments(),
+            "rebalance double-assigned at least one track after staging was promoted to active"
+        );
+
+        // None of the original 4 tracks should have been re-staged in a second slot.
+        let assignment_count = |id: &TrackId| {
+            allocator
+                .slots
+                .values()
+                .filter(|s| {
+                    s.staging.as_ref().map_or(false, |l| l.meta.id == *id)
+                        || s.active.as_ref().map_or(false, |l| l.meta.id == *id)
+                })
+                .count()
+        };
+        for id in &tracks.ids {
+            assert_eq!(
+                assignment_count(id),
+                1,
+                "track {:?} was assigned to more than one slot",
+                id
+            );
+        }
+    }
+
+    /// Variant: adding a *new track* after existing tracks have been promoted
+    /// to active must assign the new track to a fresh idle slot without
+    /// disturbing the already-active assignments.
+    #[test]
+    fn no_double_assignment_when_new_track_added_after_stabilisation() {
+        let mut allocator = setup_allocator();
+        let existing = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 7);
+
+        // Promote all staged slots to Stable.
+        for slot in allocator.slots.values_mut() {
+            if let Some(layer) = slot.staging.take() {
+                slot.active = Some(layer);
+            }
+        }
+
+        // Trigger rebalance with a new incoming track.
+        let pid = ParticipantId::new(&mut test_rng());
+        let (tx, track) = make_video_track(pid, Mid::from("late"), vec![]);
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        allocator.add_track(Track {
+            meta: tx.meta.clone(),
+            layers: track.layers,
+        });
+
+        assert!(
+            allocator.no_duplicate_slot_assignments(),
+            "rebalance double-assigned a track when a new track arrived post-stabilisation"
+        );
+
+        // Existing tracks must still each be in exactly one slot.
+        for id in &existing.ids {
+            let count = allocator
+                .slots
+                .values()
+                .filter(|s| {
+                    s.staging.as_ref().map_or(false, |l| l.meta.id == *id)
+                        || s.active.as_ref().map_or(false, |l| l.meta.id == *id)
+                })
+                .count();
+            assert_eq!(count, 1, "existing track {:?} was double-assigned", id);
+        }
     }
 
     #[test]
