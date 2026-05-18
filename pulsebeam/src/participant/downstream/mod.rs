@@ -101,6 +101,7 @@ impl DownstreamAllocator {
         self.dirty_allocation = false;
         let (desired, assignments_changed) =
             self.video.update_allocations(self.available_bandwidth);
+        let desired = desired.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         bwe.set_desired_bitrate(desired);
         assignments_changed
     }
