@@ -27,6 +27,9 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
+pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
+
 slotmap::new_key_type! {
     pub struct SlotKey;
 }
@@ -222,6 +225,7 @@ impl VideoAllocator {
     }
 
     pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, bool) {
+        let available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         // 1. Prepare the input views
         let mut views: Vec<SlotView> = self
             .slots
@@ -247,6 +251,7 @@ impl VideoAllocator {
         });
 
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
+        let desired = desired.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
@@ -804,6 +809,7 @@ impl AllocationEngine {
                     .unwrap_or(0.0)
             })
             .sum();
+        let total_desired_bps = Bitrate::from(total_desired_bps as u64);
 
         let max_allowed = available_bw.as_f64() / Self::DOWNGRADE_FACTOR;
         debug_assert!(
@@ -814,7 +820,7 @@ impl AllocationEngine {
             available_bw.as_f64()
         );
 
-        (decisions, Bitrate::from(total_desired_bps as u64))
+        (decisions, total_desired_bps)
     }
 }
 
