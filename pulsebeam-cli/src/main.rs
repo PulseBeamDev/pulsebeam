@@ -82,42 +82,10 @@ enum Commands {
     },
 }
 
-#[derive(Debug)]
-enum StatReport {
-    Peer {
-        rtt_ms: Option<u128>,
-    },
-    Tx {
-        bytes: u64,
-        nacks: u64,
-        plis: u64,
-    },
-    Rx {
-        bytes: u64,
-        packets: u64,
-        packets_lost: f32,
-        nacks: u64,
-        plis: u64,
-    },
-    StreamHealth {
-        tx_active: bool,
-        tx_healthy: bool,
-        rx_active: bool,
-        rx_healthy: bool,
-    },
-    DegradationDetected {
-        reason: String,
-    },
-}
-
 struct SharedState {
     active_rooms: AtomicUsize,
     active_agents: AtomicUsize,
     degraded: AtomicBool,
-    tx_active_streams: AtomicUsize,
-    tx_healthy_streams: AtomicUsize,
-    rx_active_streams: AtomicUsize,
-    rx_healthy_streams: AtomicUsize,
 }
 
 impl SharedState {
@@ -126,17 +94,112 @@ impl SharedState {
             active_rooms: AtomicUsize::new(0),
             active_agents: AtomicUsize::new(0),
             degraded: AtomicBool::new(false),
-            tx_active_streams: AtomicUsize::new(0),
-            tx_healthy_streams: AtomicUsize::new(0),
-            rx_active_streams: AtomicUsize::new(0),
-            rx_healthy_streams: AtomicUsize::new(0),
         })
+    }
+}
+
+/// How many consecutive silent ticks before a stream is considered inactive.
+const SILENT_TICKS_THRESHOLD: u32 = 3;
+
+#[derive(Default, Debug, PartialEq)]
+pub struct AgentDelta {
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_nacks: u64,
+    pub rx_nacks: u64,
+    pub tx_plis: u64,
+    pub rx_plis: u64,
+    pub tx_active: usize,
+    pub rx_active: usize,
+    pub rx_loss_sum: f32,
+    pub rx_loss_count: usize,
+}
+
+#[derive(Debug)]
+pub struct AgentStatReport {
+    pub rtt_ms: Option<u128>,
+    pub delta: AgentDelta,
+}
+
+#[derive(Default)]
+pub struct StatsProcessor {
+    prev_tx_bytes: u64,
+    prev_rx_bytes: u64,
+    prev_tx_layers: HashMap<String, LayerState>,
+    prev_rx_layers: HashMap<String, LayerState>,
+}
+
+#[derive(Default, Clone)]
+struct LayerState {
+    packets: u64,
+    nacks: u64,
+    plis: u64,
+    silent_ticks: u32,
+}
+
+impl StatsProcessor {
+    pub fn process(
+        &mut self,
+        tx_bytes: u64,
+        rx_bytes: u64,
+        tx_layers: impl Iterator<Item = (String, u64, u64, u64)>,
+        rx_layers: impl Iterator<Item = (String, u64, u64, u64, Option<f32>)>,
+    ) -> AgentDelta {
+        let mut delta = AgentDelta::default();
+
+        delta.tx_bytes = tx_bytes.saturating_sub(self.prev_tx_bytes);
+        delta.rx_bytes = rx_bytes.saturating_sub(self.prev_rx_bytes);
+        self.prev_tx_bytes = tx_bytes;
+        self.prev_rx_bytes = rx_bytes;
+
+        for (key, packets, nacks, plis) in tx_layers {
+            let prev = self.prev_tx_layers.entry(key).or_default();
+            let d_packets = packets.saturating_sub(prev.packets);
+            delta.tx_nacks += nacks.saturating_sub(prev.nacks);
+            delta.tx_plis += plis.saturating_sub(prev.plis);
+
+            prev.silent_ticks = if d_packets == 0 {
+                prev.silent_ticks.saturating_add(1)
+            } else {
+                0
+            };
+            if d_packets > 0 || prev.silent_ticks < SILENT_TICKS_THRESHOLD {
+                delta.tx_active += 1;
+            }
+            prev.packets = packets;
+            prev.nacks = nacks;
+            prev.plis = plis;
+        }
+
+        for (key, packets, nacks, plis, loss) in rx_layers {
+            let prev = self.prev_rx_layers.entry(key).or_default();
+            let d_packets = packets.saturating_sub(prev.packets);
+            delta.rx_nacks += nacks.saturating_sub(prev.nacks);
+            delta.rx_plis += plis.saturating_sub(prev.plis);
+
+            prev.silent_ticks = if d_packets == 0 {
+                prev.silent_ticks.saturating_add(1)
+            } else {
+                0
+            };
+            if d_packets > 0 || prev.silent_ticks < SILENT_TICKS_THRESHOLD {
+                delta.rx_active += 1;
+                if let Some(l) = loss {
+                    delta.rx_loss_sum += l;
+                    delta.rx_loss_count += 1;
+                }
+            }
+            prev.packets = packets;
+            prev.nacks = nacks;
+            prev.plis = plis;
+        }
+
+        delta
     }
 }
 
 #[derive(Default)]
 struct LatencyHistogram {
-    // buckets: [0,1), [1,2), [2,4), [4,8) ... [512,1024), [1024,∞) ms
     buckets: [u64; 12],
     count: u64,
     sum: u128,
@@ -183,7 +246,6 @@ impl LatencyHistogram {
 async fn main() -> Result<()> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-    // Always send log output to stderr so stdout can carry clean CSV data.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(true)
@@ -229,7 +291,17 @@ async fn main() -> Result<()> {
             simulcast,
             recv_video,
             recv_audio,
-        } => run_connect(cli.api_url, room, publish, simulcast, recv_video, recv_audio).await?,
+        } => {
+            run_connect(
+                cli.api_url,
+                room,
+                publish,
+                simulcast,
+                recv_video,
+                recv_audio,
+            )
+            .await?
+        }
     }
     Ok(())
 }
@@ -248,29 +320,26 @@ async fn run_bench(
     simulcast: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let (stats_tx, stats_rx) = mpsc::channel::<StatReport>(16_000);
+    let (stats_tx, stats_rx) = mpsc::channel::<AgentStatReport>(16_000);
     let state = SharedState::new();
     let mut join_set = JoinSet::new();
     let room_counter = Arc::new(AtomicUsize::new(0));
 
     if matches!(output_format, OutputFormat::Human) {
         println!(
-            "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+            "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
         );
         println!(
-            "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                     │"
+            "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                                 │"
         );
         println!(
-            "├───────┬───────┬────────┬─────────┬─────────┬──────────┬──────────┬───────┬──────┬──────┬──────┬───────┬────────┬──────────────────────┤"
+            "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬───────┬───────┬────────┬────────┬─────────┬─────────┤"
         );
         println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss p/s │ NACK t/s │ p50ms │ p99ms│p999ms│ mean │FPS tot│FPS/stm│FPS std│Tx PLI │ Rx PLI │  TX streams  RX streams  │"
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ p50ms │ p99ms │ p999ms │ meanms │ Tx Actv │ Rx Actv │"
         );
         println!(
-            "│       │       │        │         │         │          │          │       │      │      │      │       │       │       │       │       │ actv/hlth    actv/hlth   │"
-        );
-        println!(
-            "├───────┼───────┼────────┼─────────┼─────────┼──────────┼──────────┼───────┼──────┼──────┼──────┼───────┼────────┼──────────────────────────┤"
+            "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼───────┼───────┼────────┼────────┼─────────┼─────────┤"
         );
     }
 
@@ -303,7 +372,7 @@ async fn run_bench(
             _ = ramp_ticker.tick() => {
                 if state.degraded.load(Ordering::Relaxed) {
                     if matches!(output_format, OutputFormat::Human) {
-                        println!("│ ⚠  DEGRADATION DETECTED — stopping ramp                                                                                          │");
+                        println!("│ {:<140} │", "⚠  DEGRADATION DETECTED — stopping ramp");
                     } else {
                         eprintln!("DEGRADATION DETECTED — stopping ramp");
                     }
@@ -311,7 +380,7 @@ async fn run_bench(
                 }
                 if total_rooms >= max_rooms {
                     if matches!(output_format, OutputFormat::Human) {
-                        println!("│ ✓  Max rooms reached ({}) — stopping ramp                                                                                        │", max_rooms);
+                        println!("│ {:<140} │", format!("✓  Max rooms reached ({}) — stopping ramp", max_rooms));
                     } else {
                         eprintln!("Max rooms reached ({}) — stopping ramp", max_rooms);
                     }
@@ -341,15 +410,18 @@ async fn run_bench(
 
     if matches!(output_format, OutputFormat::Human) {
         println!(
-            "├───────┴───────┴────────┴─────────┴─────────┴──────────┴──────────┴───────┴──────┴──────┴──────┴───────┴────────┴──────────────────────────┤"
+            "├───────┴───────┴────────┴─────────┴─────────┴────────┴────────┴────────┴────────┴────────┴───────┴───────┴────────┴────────┴─────────┴─────────┤"
         );
         println!(
-            "│  Benchmark complete. Peak rooms: {:<5}  Peak agents: {:<6}                                                                          │",
-            total_rooms,
-            state.active_agents.load(Ordering::Relaxed),
+            "│ {:<140} │",
+            format!(
+                "Benchmark complete. Peak rooms: {}  Peak agents: {}",
+                total_rooms,
+                state.active_agents.load(Ordering::Relaxed)
+            )
         );
         println!(
-            "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+            "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
         );
     } else {
         eprintln!(
@@ -373,7 +445,7 @@ async fn spawn_room(
     users_per_room: usize,
     session_duration: u64,
     session_jitter: u64,
-    stats_tx: &mpsc::Sender<StatReport>,
+    stats_tx: &mpsc::Sender<AgentStatReport>,
     state: &Arc<SharedState>,
     simulcast: bool,
 ) {
@@ -426,7 +498,7 @@ async fn spawn_room(
 }
 
 async fn monitor_task(
-    mut stats_rx: mpsc::Receiver<StatReport>,
+    mut stats_rx: mpsc::Receiver<AgentStatReport>,
     state: Arc<SharedState>,
     output_format: OutputFormat,
 ) {
@@ -435,65 +507,43 @@ async fn monitor_task(
 
     let mut tx_bytes = 0u64;
     let mut rx_bytes = 0u64;
-    let mut rx_packets = 0u64;
-    let mut rx_loss = 0.0f32;
     let mut tx_nacks = 0u64;
     let mut rx_nacks = 0u64;
     let mut tx_plis = 0u64;
     let mut rx_plis = 0u64;
 
     let mut tx_active_streams = 0usize;
-    let mut tx_healthy_streams = 0usize;
     let mut rx_active_streams = 0usize;
-    let mut rx_healthy_streams = 0usize;
+
+    let mut rx_loss_sum = 0.0f32;
+    let mut rx_loss_count = 0usize;
 
     let mut rtt_hist = LatencyHistogram::default();
     let mut consecutive_high_p99 = 0u32;
+    let mut consecutive_high_loss = 0u32;
 
-    const ESTIMATED_PACKETS_PER_FRAME: f32 = 4.0;
-    let mut fps_history: std::collections::VecDeque<f32> =
-        std::collections::VecDeque::with_capacity(60);
-    let mut consecutive_fps_drops = 0u32;
-
-    // Print CSV header once before the first tick.
     if matches!(output_format, OutputFormat::Csv) {
-        println!("timestamp_s,rooms,agents,tx_mbps,rx_mbps,rtt_p50_ms,rtt_p99_ms,rtt_p999_ms,fps_per_stream,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,tx_active,tx_healthy,rx_active,rx_healthy");
+        println!(
+            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,rtt_p50_ms,rtt_p99_ms,rtt_p999_ms,rtt_mean_ms,tx_active,rx_active"
+        );
     }
 
     loop {
         tokio::select! {
             Some(report) = stats_rx.recv() => {
-                match report {
-                    StatReport::Peer { rtt_ms: Some(rtt) } => {
-                        rtt_hist.record(rtt);
-                    }
-                    StatReport::Tx { bytes, nacks, plis } => {
-                        tx_bytes += bytes;
-                        tx_nacks += nacks;
-                        tx_plis  += plis;
-                    }
-                    StatReport::Rx { bytes, packets, packets_lost, nacks, plis } => {
-                        rx_bytes += bytes;
-                        rx_packets += packets;
-                        rx_loss += packets_lost;
-                        rx_nacks += nacks;
-                        rx_plis += plis;
-                    }
-                    StatReport::StreamHealth { tx_active, tx_healthy, rx_active, rx_healthy } => {
-                        if tx_active  { tx_active_streams  += 1; }
-                        if tx_healthy { tx_healthy_streams += 1; }
-                        if rx_active  { rx_active_streams  += 1; }
-                        if rx_healthy { rx_healthy_streams += 1; }
-                    }
-                    StatReport::DegradationDetected { reason } => {
-                        if matches!(output_format, OutputFormat::Human) {
-                            println!("│ ⚠  {:<133}│", reason);
-                        } else {
-                            eprintln!("DEGRADATION: {}", reason);
-                        }
-                    }
-                    _ => {}
+                if let Some(rtt) = report.rtt_ms {
+                    rtt_hist.record(rtt);
                 }
+                tx_bytes += report.delta.tx_bytes;
+                rx_bytes += report.delta.rx_bytes;
+                tx_nacks += report.delta.tx_nacks;
+                rx_nacks += report.delta.rx_nacks;
+                tx_plis += report.delta.tx_plis;
+                rx_plis += report.delta.rx_plis;
+                tx_active_streams += report.delta.tx_active;
+                rx_active_streams += report.delta.rx_active;
+                rx_loss_sum += report.delta.rx_loss_sum;
+                rx_loss_count += report.delta.rx_loss_count;
             }
 
             _ = interval.tick() => {
@@ -511,59 +561,31 @@ async fn monitor_task(
                 let p999 = rtt_hist.percentile(99.9);
                 let mean = rtt_hist.mean();
 
-                let fps_total = (rx_packets as f32) / ESTIMATED_PACKETS_PER_FRAME;
-                let stream_count = (rx_active_streams.max(1)) as f32;
-                let fps_per_stream = fps_total / stream_count;
-
-                let fps_mean = if fps_history.is_empty() {
-                    fps_per_stream
+                let avg_loss_pct = if rx_loss_count > 0 {
+                    rx_loss_sum / rx_loss_count as f32 * 100.0
                 } else {
-                    fps_history.iter().sum::<f32>() / fps_history.len() as f32
+                    0.0
                 };
-                let fps_std = {
-                    let m = fps_mean;
-                    let variance: f32 = fps_history
-                        .iter()
-                        .map(|x| { let d = x - m; d * d })
-                        .sum::<f32>()
-                        / (fps_history.len().max(1) as f32);
-                    variance.sqrt()
-                };
-                fps_history.push_back(fps_per_stream);
-                if fps_history.len() > 60 {
-                    fps_history.pop_front();
-                }
-
-                state.tx_active_streams.store(tx_active_streams, Ordering::Relaxed);
-                state.tx_healthy_streams.store(tx_healthy_streams, Ordering::Relaxed);
-                state.rx_active_streams.store(rx_active_streams, Ordering::Relaxed);
-                state.rx_healthy_streams.store(rx_healthy_streams, Ordering::Relaxed);
 
                 match output_format {
                     OutputFormat::Human => {
                         println!(
-                            "│ {}s │ {} │ {} │ {:.2} │ {:.2} │ {:.1} │ {} │ {} │ {} │ {} │ {} │ {:.1} │ {:.1} │ {:.1} │ {} │ {} │ {} / {} │ {} / {} │",
+                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │ {:>7} │ {:>7} │",
                             elapsed, rooms, agents,
-                            tx_mbps, rx_mbps,
-                            rx_loss, tx_nacks + rx_nacks,
+                            tx_mbps, rx_mbps, avg_loss_pct,
+                            tx_nacks, rx_nacks, tx_plis, rx_plis,
                             p50, p99, p999, mean,
-                            fps_per_stream, fps_mean, fps_std,
-                            tx_plis, rx_plis,
-                            tx_active_streams, tx_healthy_streams,
-                            rx_active_streams, rx_healthy_streams,
+                            tx_active_streams, rx_active_streams,
                         );
                     }
                     OutputFormat::Csv => {
                         println!(
-                            "{},{},{},{:.3},{:.3},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{},{}",
+                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{},{},{},{},{},{}",
                             elapsed, rooms, agents,
-                            tx_mbps, rx_mbps,
-                            p50, p99, p999,
-                            fps_per_stream, rx_loss,
-                            tx_nacks, rx_nacks,
-                            tx_plis, rx_plis,
-                            tx_active_streams, tx_healthy_streams,
-                            rx_active_streams, rx_healthy_streams,
+                            tx_mbps, rx_mbps, avg_loss_pct,
+                            tx_nacks, rx_nacks, tx_plis, rx_plis,
+                            p50, p99, p999, mean,
+                            tx_active_streams, rx_active_streams,
                         );
                     }
                 }
@@ -577,54 +599,24 @@ async fn monitor_task(
                     consecutive_high_p99 = 0;
                 }
 
-                if fps_mean > 0.0 {
-                    let drop_factor = (fps_mean - fps_per_stream) / fps_mean;
-                    if drop_factor > 0.3 {
-                        consecutive_fps_drops += 1;
-                    } else {
-                        consecutive_fps_drops = 0;
-                    }
-                }
-
-                if consecutive_fps_drops >= 3 {
-                    state.degraded.store(true, Ordering::Relaxed);
-                }
-
-                if rx_loss > 5.0 && agents > 0 {
-                    state.degraded.store(true, Ordering::Relaxed);
-                }
-
-                if rx_active_streams > 0 {
-                    let unhealthy = rx_active_streams.saturating_sub(rx_healthy_streams);
-                    if unhealthy * 5 > rx_active_streams {
+                if avg_loss_pct > 5.0 && agents > 0 {
+                    consecutive_high_loss += 1;
+                    if consecutive_high_loss >= 3 {
                         state.degraded.store(true, Ordering::Relaxed);
                     }
+                } else {
+                    consecutive_high_loss = 0;
                 }
 
-                tx_bytes = 0; rx_bytes = 0; rx_loss = 0.0;
+                tx_bytes = 0; rx_bytes = 0;
                 tx_nacks = 0; rx_nacks = 0;
                 tx_plis  = 0; rx_plis  = 0;
-                tx_active_streams  = 0; tx_healthy_streams = 0;
-                rx_active_streams  = 0; rx_healthy_streams = 0;
+                tx_active_streams  = 0; rx_active_streams = 0;
+                rx_loss_sum = 0.0; rx_loss_count = 0;
                 rtt_hist.reset();
             }
         }
     }
-}
-
-/// How many consecutive silent ticks before a VBR layer is considered inactive.
-/// At 1-second poll intervals, 3 ticks = 3 s of silence, which is a safe margin
-/// for typical VBR gaps while still catching genuinely dead streams.
-const SILENT_TICKS_THRESHOLD: u32 = 3;
-
-#[derive(Default, Clone)]
-struct CounterSnapshot {
-    bytes: u64,
-    packets: u64,
-    nacks: u64,
-    plis: u64,
-    /// Consecutive ticks with zero packet delta. Resets to 0 on any activity.
-    silent_ticks: u32,
 }
 
 async fn spawn_agent(
@@ -634,7 +626,7 @@ async fn spawn_agent(
     is_pub: bool,
     simulcast: bool,
     session_duration: Duration,
-    stats_tx: mpsc::Sender<StatReport>,
+    stats_tx: mpsc::Sender<AgentStatReport>,
     _users_per_room: usize,
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
@@ -668,12 +660,11 @@ async fn spawn_agent(
     }
 
     let mut agent = builder.connect(&room).await?;
+    let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+
     let session_end = tokio::time::sleep(session_duration);
     tokio::pin!(session_end);
-
-    let mut prev_tx: HashMap<String, CounterSnapshot> = HashMap::new();
-    let mut prev_rx: HashMap<String, CounterSnapshot> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -690,159 +681,25 @@ async fn spawn_agent(
 
                 let peer = stats.peer.as_ref();
                 let rtt_ms = peer.and_then(|p| p.rtt).map(|r| r.as_millis());
-                if stats_tx.try_send(StatReport::Peer { rtt_ms }).is_err() {
-                    tracing::warn!("stats channel full, dropping Peer report");
-                }
+                let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
+                let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
-                let peer_tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
-                let peer_rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
+                let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                    track.tx_layers.iter().map(move |(rid, egress)| {
+                        (format!("tx_{}_{}", mid, rid_key(rid)), egress.packets, egress.nacks, egress.plis)
+                    })
+                });
 
-                let prev_peer_tx = prev_tx.get("peer").map(|s| s.bytes).unwrap_or(0);
-                let prev_peer_rx = prev_rx.get("peer").map(|s| s.bytes).unwrap_or(0);
+                let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                    track.rx_layers.iter().map(move |(rid, ingress)| {
+                        (format!("rx_{}_{}", mid, rid_key(rid)), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                    })
+                });
 
-                let tx_bytes_delta = peer_tx_bytes.saturating_sub(prev_peer_tx);
-                let rx_bytes_delta = peer_rx_bytes.saturating_sub(prev_peer_rx);
+                let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
-                prev_tx.insert("peer".into(), CounterSnapshot { bytes: peer_tx_bytes, ..Default::default() });
-                prev_rx.insert("peer".into(), CounterSnapshot { bytes: peer_rx_bytes, ..Default::default() });
-
-                if tx_bytes_delta > 0 {
-                    if stats_tx
-                        .try_send(StatReport::Tx { bytes: tx_bytes_delta, nacks: 0, plis: 0 })
-                        .is_err()
-                    {
-                        tracing::warn!("stats channel full, dropping Tx bytes report");
-                    }
-                }
-                if rx_bytes_delta > 0 {
-                    if stats_tx
-                        .try_send(StatReport::Rx {
-                            bytes: rx_bytes_delta,
-                            packets: 0,
-                            packets_lost: 0.0,
-                            nacks: 0,
-                            plis: 0,
-                        })
-                        .is_err()
-                    {
-                        tracing::warn!("stats channel full, dropping Rx bytes report");
-                    }
-                }
-
-                for (mid, track_stat) in &stats.tracks {
-                    let mut tx_active = false;
-                    let mut tx_active_layers = 0;
-                    let mut tx_healthy_layers = 0;
-
-                    for (rid, egress) in &track_stat.tx_layers {
-                        let key = format!("tx_{}_{}", mid, rid_key(rid));
-                        let mut prev = prev_tx.get(&key).cloned().unwrap_or_default();
-
-                        let packets = egress.packets.saturating_sub(prev.packets);
-                        let nacks = egress.nacks.saturating_sub(prev.nacks);
-                        let plis = egress.plis.saturating_sub(prev.plis);
-
-                        prev.silent_ticks = if packets == 0 {
-                            prev.silent_ticks.saturating_add(1)
-                        } else {
-                            0
-                        };
-
-                        let layer_active = egress.packets > 0
-                            && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
-
-                        prev_tx.insert(key, CounterSnapshot {
-                            packets: egress.packets,
-                            nacks: egress.nacks,
-                            plis: egress.plis,
-                            silent_ticks: prev.silent_ticks,
-                            ..Default::default()
-                        });
-
-                        if nacks > 0 || plis > 0 {
-                            let _ = stats_tx.try_send(StatReport::Tx { bytes: 0, nacks, plis });
-                        }
-
-                        if layer_active {
-                            tx_active_layers += 1;
-                            if plis == 0 && nacks < 3 {
-                                tx_healthy_layers += 1;
-                            }
-                        }
-
-                        tx_active |= layer_active;
-                    }
-
-                    let tx_healthy = tx_active
-                        && tx_active_layers > 0
-                        && tx_active_layers == tx_healthy_layers;
-
-                    let mut rx_active = false;
-                    let mut rx_active_layers = 0;
-                    let mut rx_healthy_layers = 0;
-
-                    for (rid, ingress) in &track_stat.rx_layers {
-                        let key = format!("rx_{}_{}", mid, rid_key(rid));
-                        let mut prev = prev_rx.get(&key).cloned().unwrap_or_default();
-
-                        let packets = ingress.packets.saturating_sub(prev.packets);
-                        let nacks = ingress.nacks.saturating_sub(prev.nacks);
-                        let plis = ingress.plis.saturating_sub(prev.plis);
-                        let packets_lost = ingress.loss.unwrap_or(0.0) * packets as f32;
-
-                        prev.silent_ticks = if packets == 0 {
-                            prev.silent_ticks.saturating_add(1)
-                        } else {
-                            0
-                        };
-
-                        let layer_active = ingress.packets > 0
-                            && prev.silent_ticks < SILENT_TICKS_THRESHOLD;
-
-                        prev_rx.insert(key, CounterSnapshot {
-                            packets: ingress.packets,
-                            nacks: ingress.nacks,
-                            plis: ingress.plis,
-                            silent_ticks: prev.silent_ticks,
-                            ..Default::default()
-                        });
-
-                        if packets > 0 || packets_lost > 0.0 || nacks > 0 || plis > 0 {
-                            let _ = stats_tx.try_send(StatReport::Rx {
-                                bytes: 0,
-                                packets,
-                                packets_lost,
-                                nacks,
-                                plis,
-                            });
-                        }
-
-                        let loss_ok = if packets > 0 {
-                            packets_lost < 0.05 * packets as f32
-                        } else {
-                            true
-                        };
-
-                        if layer_active {
-                            rx_active_layers += 1;
-                            if loss_ok && plis == 0 {
-                                rx_healthy_layers += 1;
-                            }
-                        }
-
-                        rx_active |= layer_active;
-                    }
-
-                    let rx_healthy = rx_active
-                        && rx_active_layers > 0
-                        && rx_active_layers == rx_healthy_layers;
-
-                    let _ = stats_tx.try_send(StatReport::StreamHealth {
-                        tx_active,
-                        tx_healthy,
-                        rx_active,
-                        rx_healthy,
-                    });
+                if stats_tx.try_send(AgentStatReport { rtt_ms, delta }).is_err() {
+                    tracing::warn!("stats channel full, dropping report");
                 }
             }
         }
@@ -867,14 +724,12 @@ async fn handle_local_track(track: LocalTrack) {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL,
         Some("h") => pulsebeam_testdata::RAW_H264_HALF,
         Some("q") => pulsebeam_testdata::RAW_H264_QUARTER,
-        _ => pulsebeam_testdata::RAW_H264_HALF,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER,
     };
     let looper = H264Looper::new(data, 30);
     looper.run(track).await;
 }
 
-/// Join a single room and stream live stats to stderr every second.
-/// Exits cleanly on Ctrl-C or when the agent disconnects.
 #[allow(clippy::too_many_arguments)]
 async fn run_connect(
     api_url: String,
@@ -913,17 +768,21 @@ async fn run_connect(
     }
 
     let mut agent = builder.connect(&room).await?;
-    eprintln!("Connected to room '{}' (participant: {})", room, agent.participant_id());
+    eprintln!(
+        "Connected to room '{}' (participant: {})",
+        room,
+        agent.participant_id()
+    );
     eprintln!("Press Ctrl-C to disconnect.");
-    eprintln!("{:>8} {:>8} {:>8} {:>9} {:>9} {:>9}  streams (rx actv/hlth)",
-              "time(s)", "tx_mbps", "rx_mbps", "rtt_p50ms", "rtt_p99ms", "fps/stm");
+    eprintln!(
+        "{:>8} {:>8} {:>8} {:>9} {:>9} {:>9}  streams (tx/rx)",
+        "time(s)", "tx_mbps", "rx_mbps", "rtt_p50ms", "rtt_p99ms", "loss%"
+    );
 
+    let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
     let mut rtt_hist = LatencyHistogram::default();
-    let mut prev_tx_bytes = 0u64;
-    let mut prev_rx_bytes = 0u64;
-    let mut prev_rx: HashMap<String, CounterSnapshot> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -957,59 +816,90 @@ async fn run_connect(
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
-                let tx_mbps = (tx_bytes.saturating_sub(prev_tx_bytes) * 8) as f64 / 1_000_000.0;
-                let rx_mbps = (rx_bytes.saturating_sub(prev_rx_bytes) * 8) as f64 / 1_000_000.0;
-                prev_tx_bytes = tx_bytes;
-                prev_rx_bytes = rx_bytes;
+
+                let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                    track.tx_layers.iter().map(move |(rid, egress)| {
+                        (format!("tx_{}_{}", mid, rid_key(rid)), egress.packets, egress.nacks, egress.plis)
+                    })
+                });
+
+                let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                    track.rx_layers.iter().map(move |(rid, ingress)| {
+                        (format!("rx_{}_{}", mid, rid_key(rid)), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                    })
+                });
+
+                let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
+
+                let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
+                let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
 
                 let p50 = rtt_hist.percentile(50.0);
                 let p99 = rtt_hist.percentile(99.0);
-
-                let mut rx_active = 0usize;
-                let mut rx_healthy = 0usize;
-                let mut rx_packets_delta = 0u64;
-
-                for (mid, track_stat) in &stats.tracks {
-                    for (rid, ingress) in &track_stat.rx_layers {
-                        let key = format!("rx_{}_{}", mid, rid_key(rid));
-                        let prev = prev_rx.get(&key).cloned().unwrap_or_default();
-                        let packets = ingress.packets.saturating_sub(prev.packets);
-                        let nacks = ingress.nacks.saturating_sub(prev.nacks);
-                        let plis = ingress.plis.saturating_sub(prev.plis);
-                        let silent_ticks = if packets == 0 {
-                            prev.silent_ticks.saturating_add(1)
-                        } else {
-                            0
-                        };
-                        prev_rx.insert(key, CounterSnapshot {
-                            packets: ingress.packets,
-                            nacks: ingress.nacks,
-                            plis: ingress.plis,
-                            silent_ticks,
-                            ..Default::default()
-                        });
-                        if ingress.packets > 0 && silent_ticks < SILENT_TICKS_THRESHOLD {
-                            rx_active += 1;
-                            let loss_ok = ingress.loss.unwrap_or(0.0) < 0.05;
-                            if loss_ok && plis == 0 && nacks == 0 {
-                                rx_healthy += 1;
-                            }
-                        }
-                        rx_packets_delta += packets;
-                    }
-                }
-
-                const ESTIMATED_PACKETS_PER_FRAME: f32 = 4.0;
-                let fps = (rx_packets_delta as f32) / ESTIMATED_PACKETS_PER_FRAME
-                    / rx_active.max(1) as f32;
-
                 rtt_hist.reset();
-                eprintln!("{:>8} {:>8.2} {:>8.2} {:>9} {:>9} {:>9.1}  {}/{}",
-                          elapsed, tx_mbps, rx_mbps, p50, p99, fps,
-                          rx_active, rx_healthy);
+
+                let avg_loss_pct = if delta.rx_loss_count > 0 {
+                    delta.rx_loss_sum / delta.rx_loss_count as f32 * 100.0
+                } else {
+                    0.0
+                };
+
+                eprintln!("{:>8} {:>8.2} {:>8.2} {:>9} {:>9} {:>8.1}%  {}/{}",
+                          elapsed, tx_mbps, rx_mbps, p50, p99, avg_loss_pct,
+                          delta.tx_active, delta.rx_active);
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stats_processor_deltas() {
+        let mut p = StatsProcessor::default();
+
+        let tx_layers = vec![("tx_1".to_string(), 100, 1, 2)];
+        let rx_layers = vec![("rx_1".to_string(), 200, 3, 4, Some(0.05))];
+
+        let delta = p.process(1000, 2000, tx_layers.into_iter(), rx_layers.into_iter());
+
+        assert_eq!(delta.tx_bytes, 1000);
+        assert_eq!(delta.rx_bytes, 2000);
+        assert_eq!(delta.tx_nacks, 1);
+        assert_eq!(delta.tx_plis, 2);
+        assert_eq!(delta.rx_nacks, 3);
+        assert_eq!(delta.rx_plis, 4);
+        assert_eq!(delta.tx_active, 1);
+        assert_eq!(delta.rx_active, 1);
+        assert_eq!(delta.rx_loss_sum, 0.05);
+        assert_eq!(delta.rx_loss_count, 1);
+
+        // Next tick: no new packets, still active due to grace period
+        let tx_layers2 = vec![("tx_1".to_string(), 100, 1, 2)];
+        let rx_layers2 = vec![("rx_1".to_string(), 200, 3, 4, Some(0.05))];
+
+        let delta2 = p.process(1000, 2000, tx_layers2.into_iter(), rx_layers2.into_iter());
+        assert_eq!(delta2.tx_bytes, 0);
+        assert_eq!(delta2.tx_active, 1);
+    }
+
+    #[test]
+    fn test_silent_ticks() {
+        let mut p = StatsProcessor::default();
+
+        for i in 0..SILENT_TICKS_THRESHOLD {
+            let tx = vec![("tx_1".to_string(), 100, 0, 0)];
+            let delta = p.process(0, 0, tx.into_iter(), std::iter::empty());
+            assert_eq!(delta.tx_active, 1, "tick {}", i);
+        }
+
+        // Silent longer than threshold -> inactive
+        let tx = vec![("tx_1".to_string(), 100, 0, 0)];
+        let delta = p.process(0, 0, tx.into_iter(), std::iter::empty());
+        assert_eq!(delta.tx_active, 0);
+    }
 }

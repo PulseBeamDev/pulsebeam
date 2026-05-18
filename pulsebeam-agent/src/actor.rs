@@ -346,6 +346,7 @@ impl AgentStats {
 
 #[derive(Debug, Default, Clone)]
 pub struct TrackStats {
+    pub kind: Option<MediaKind>,
     pub rx_layers: HashMap<Option<Rid>, str0m::stats::MediaIngressStats>,
     pub tx_layers: HashMap<Option<Rid>, str0m::stats::MediaEgressStats>,
 }
@@ -1061,6 +1062,8 @@ impl AgentActor {
     fn handle_media_added(&mut self, media: MediaAdded) {
         let mid = media.mid;
         tracing::info!("new media added: {:?}", media);
+        // Record the kind so the CLI can distinguish video from audio streams.
+        self.stats.tracks.entry(mid).or_default().kind = Some(media.kind);
         match media.direction {
             Direction::SendOnly => {
                 let rids = if let Some(layers) = media.simulcast {
