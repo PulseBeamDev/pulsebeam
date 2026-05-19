@@ -372,7 +372,7 @@ fn slots_prioritization_test() -> turmoil::Result {
                 stats
                     .tracks
                     .values()
-                    .any(|t| t.rx_layers.values().any(|l| l.bytes > 0))
+                    .all(|t| t.rx_layers.values().any(|l| l.bytes > 0))
             })
             .await?;
 

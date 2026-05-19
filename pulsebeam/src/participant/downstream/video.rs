@@ -126,6 +126,8 @@ impl VideoAllocator {
         {
             let Some(track_state) = tracks.get_mut(track_id) else {
                 tracing::warn!(track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
+                slot.max_height = 0;
+                slot.stop();
                 return None;
             };
 
@@ -405,16 +407,26 @@ impl VideoAllocator {
     /// slots simultaneously, because that would cause duplicate stream
     /// forwarding and corrupt the routing table.
     fn no_duplicate_slot_assignments(&self) -> bool {
-        let mut seen: HashSet<TrackId> = HashSet::new();
-        for slot in self.slots.values() {
+        let mut seen: HashMap<TrackId, SlotKey> = HashMap::new();
+        for (slot_key, slot) in self.slots.iter() {
             for layer in slot
                 .staging
                 .as_ref()
                 .into_iter()
                 .chain(slot.active.as_ref())
             {
-                if !seen.insert(layer.meta.id) {
-                    return false;
+                if let Some(existing_slot) = seen.get(&layer.meta.id) {
+                    if existing_slot != &slot_key {
+                        tracing::error!(
+                            track = %layer.meta.id,
+                            first_slot = ?existing_slot,
+                            second_slot = ?slot_key,
+                            "duplicate track assigned to multiple slots"
+                        );
+                        return false;
+                    }
+                } else {
+                    seen.insert(layer.meta.id, slot_key);
                 }
             }
         }
@@ -879,7 +891,7 @@ mod assignment_tests {
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
     use std::collections::VecDeque;
     use str0m::bwe::Bitrate;
-    use str0m::media::{Mid, SimulcastLayer};
+    use str0m::media::{Mid, MediaKind, SimulcastLayer};
 
     fn test_rng() -> impl RngCore {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -981,6 +993,29 @@ mod assignment_tests {
 
         allocator.configure(&intents);
         assert_eq!(allocator.slots().count(), 3);
+    }
+
+    #[test]
+    fn configure_missing_requested_track_stops_slot() {
+        let mut allocator = setup_allocator();
+        let _tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+
+        allocator.rebalance();
+
+        let missing_track_id = ParticipantId::new(&mut test_rng())
+            .derive_track_id(MediaKind::Video, &Mid::from("missing"));
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id: missing_track_id,
+                max_height: 720,
+            },
+        );
+
+        allocator.configure(&intents);
+        assert!(allocator.slots.values().all(|s| matches!(s.state(), SlotState::Idle)));
     }
 
     #[test]
@@ -1542,6 +1577,51 @@ mod assignment_tests {
             layers: track.layers,
         });
         assert_eq!(allocator.slots().count(), 3);
+    }
+
+    #[test]
+    fn same_slot_switching_same_track_is_not_duplicate_assignment() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new(&mut test_rng());
+        let (tx, track) = make_video_track(
+            pid,
+            Mid::from("t"),
+            vec![
+                SimulcastLayer::new("f"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("q"),
+            ],
+        );
+
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        allocator.add_track(Track {
+            meta: tx.meta.clone(),
+            layers: track.layers.clone(),
+        });
+        add_slots(&mut allocator, 1);
+
+        allocator.rebalance();
+        let upgraded_layer = track
+            .by_quality(LayerQuality::Medium)
+            .expect("track should have an upgrade layer")
+            .clone();
+
+        {
+            let slot = allocator.slots.values_mut().next().unwrap();
+            slot.active = slot.staging.take();
+            slot.paused = false;
+            // Force a quality transition for the same track, leaving active + staging in one slot.
+            slot.switch_to(&upgraded_layer, true);
+            assert!(slot.active.is_some());
+            assert!(slot.staging.is_some());
+            assert_eq!(slot.active.as_ref().unwrap().meta.id, slot.staging.as_ref().unwrap().meta.id);
+        }
+
+        assert!(allocator.no_duplicate_slot_assignments());
+        assert_eq!(allocator.slots.len(), 1);
     }
 }
 
