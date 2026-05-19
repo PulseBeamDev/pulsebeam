@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.4] - 2026-05-19
 
 * More stable and tighter stream bitrate estimate
 * Various bench cli fixes
