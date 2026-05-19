@@ -8,11 +8,8 @@ use std::{
     net::SocketAddr,
 };
 
-// Up to 8x IO loop latency, a bit of headroom for keyframe bursts.
-// With 1ms scheduling delay, this is capped to 8ms latency.
-pub const SOCKET_RECV_SIZE: usize = 8 * BATCH_SIZE * CHUNK_SIZE;
-// per-client-pacer handles the latency bloat. But, big enough for keyframe bursts to many subscribers
-pub const SOCKET_SEND_SIZE: usize = 32 * BATCH_SIZE * CHUNK_SIZE;
+pub const SOCKET_SEND_SIZE: usize = 2 * 1024 * 1024;
+pub const SOCKET_RECV_SIZE: usize = 4 * 1024 * 1024;
 
 pub struct UdpTransport {
     reader: UdpTransportReader,
@@ -85,7 +82,7 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
         state: state.clone(),
         local_addr,
         meta: [RecvMeta::default(); BATCH_SIZE],
-        batch_buffer: Vec::with_capacity(BATCH_SIZE * CHUNK_SIZE),
+        batch_buffer: vec![0u8; BATCH_SIZE * CHUNK_SIZE],
     };
 
     let writer = UdpTransportWriter {
@@ -134,23 +131,15 @@ impl UdpTransportReader {
     #[inline]
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
         self.sock.try_io(tokio::io::Interest::READABLE, || {
-            // Prepare the pointers for the kernel
-            // We set len=capacity so we can take mutable slices of the uninitialized memory
-            unsafe { self.batch_buffer.set_len(self.batch_buffer.capacity()) };
-            let ptr = self.batch_buffer.as_mut_ptr();
-
-            let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|i| {
-                let offset = i * CHUNK_SIZE;
-                // SAFETY: We know the buffer is BATCH_SIZE * CHUNK_SIZE large
-                unsafe {
-                    IoSliceMut::new(std::slice::from_raw_parts_mut(ptr.add(offset), CHUNK_SIZE))
-                }
+            let mut chunks = self.batch_buffer.chunks_exact_mut(CHUNK_SIZE);
+            let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|_| {
+                let chunk = chunks.next().expect("batch_buffer is sized correctly");
+                IoSliceMut::new(chunk)
             });
 
             let res = self
                 .state
                 .recv((&*self.sock).into(), &mut slices, &mut self.meta);
-            let _ = slices; // slices is no longer safe to use
 
             match res {
                 Ok(count) => {
