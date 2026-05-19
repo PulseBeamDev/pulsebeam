@@ -1,3 +1,11 @@
+## [unreleased]
+
+* More stable and tighter stream bitrate estimate
+* Various bench cli fixes
+* Apply filters to desired bitrate to be quantized and conservative
+* Add realistic join pattern in bench cli
+* Tweak UDP socket sizes and remove unsafe
+
 ## [pulsebeam-v0.4.3] - 2026-05-15
 
 * Force switch on a different track
