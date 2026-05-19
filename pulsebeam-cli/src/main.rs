@@ -39,20 +39,25 @@ enum OutputFormat {
 #[derive(Subcommand)]
 enum Commands {
     Bench {
+        /// Number of rooms created immediately at startup.
         #[arg(long, default_value_t = 5)]
         rooms: usize,
         #[arg(long, default_value_t = 4)]
         users_per_room: usize,
-        #[arg(long, default_value_t = 5)]
-        ramp_step: usize,
-        #[arg(long, default_value_t = 20)]
-        ramp_interval: u64,
+        /// Poisson arrival rate for new rooms after the initial burst (rooms/second).
+        /// Inter-arrival times are exponentially distributed: mean = 1/arrival_rate seconds.
+        /// e.g. 0.05 = one new room every ~20 s on average.
+        #[arg(long, default_value_t = 0.05)]
+        arrival_rate: f64,
         #[arg(long, default_value_t = 200)]
         max_rooms: usize,
+        /// Mean participant session duration in seconds (exponential distribution).
         #[arg(long, default_value_t = 120)]
         session_duration: u64,
-        #[arg(long, default_value_t = 30)]
-        session_jitter: u64,
+        /// Seconds over which participants in a room stagger their joins (uniform).
+        /// Simulates participants arriving gradually rather than all at once.
+        #[arg(long, default_value_t = 60)]
+        join_spread_secs: u64,
         #[arg(long, default_value_t = 30)]
         drain_duration: u64,
         #[arg(long)]
@@ -261,11 +266,10 @@ async fn main() -> Result<()> {
         Commands::Bench {
             rooms,
             users_per_room,
-            ramp_step,
-            ramp_interval,
+            arrival_rate,
             max_rooms,
             session_duration,
-            session_jitter,
+            join_spread_secs,
             drain_duration,
             simulcast,
             output_format,
@@ -274,11 +278,10 @@ async fn main() -> Result<()> {
                 cli.api_url,
                 rooms,
                 users_per_room,
-                ramp_step,
-                ramp_interval,
+                arrival_rate,
                 max_rooms,
                 session_duration,
-                session_jitter,
+                join_spread_secs,
                 drain_duration,
                 simulcast,
                 output_format,
@@ -311,11 +314,10 @@ async fn run_bench(
     api_url: String,
     initial_rooms: usize,
     users_per_room: usize,
-    ramp_step: usize,
-    ramp_interval: u64,
+    arrival_rate: f64,
     max_rooms: usize,
     session_duration: u64,
-    session_jitter: u64,
+    join_spread_secs: u64,
     drain_duration: u64,
     simulcast: bool,
     output_format: OutputFormat,
@@ -355,7 +357,7 @@ async fn run_bench(
             &room_counter,
             users_per_room,
             session_duration,
-            session_jitter,
+            join_spread_secs,
             &stats_tx,
             &state,
             simulcast,
@@ -364,46 +366,42 @@ async fn run_bench(
         total_rooms += 1;
     }
 
-    let mut ramp_ticker = tokio::time::interval(Duration::from_secs(ramp_interval));
-    ramp_ticker.tick().await;
-
+    // Poisson room arrivals: draw exponential inter-arrival times so room
+    // creation events are independent and memoryless rather than periodic.
     loop {
-        tokio::select! {
-            _ = ramp_ticker.tick() => {
-                if state.degraded.load(Ordering::Relaxed) {
-                    if matches!(output_format, OutputFormat::Human) {
-                        println!("│ {:<140} │", "⚠  DEGRADATION DETECTED — stopping ramp");
-                    } else {
-                        eprintln!("DEGRADATION DETECTED — stopping ramp");
-                    }
-                    break;
-                }
-                if total_rooms >= max_rooms {
-                    if matches!(output_format, OutputFormat::Human) {
-                        println!("│ {:<140} │", format!("✓  Max rooms reached ({}) — stopping ramp", max_rooms));
-                    } else {
-                        eprintln!("Max rooms reached ({}) — stopping ramp", max_rooms);
-                    }
-                    break;
-                }
-                for _ in 0..ramp_step {
-                    if total_rooms >= max_rooms { break; }
-                    spawn_room(
-                        &mut join_set,
-                        &api_url,
-                        &room_counter,
-                        users_per_room,
-                        session_duration,
-                        session_jitter,
-                        &stats_tx,
-                        &state,
-                        simulcast
-                    )
-                    .await;
-                    total_rooms += 1;
-                }
+        let u = (rand::random_range(1u64..u64::MAX) as f64) / (u64::MAX as f64);
+        let delay = Duration::from_secs_f64((-u.ln() / arrival_rate).max(0.001));
+        tokio::time::sleep(delay).await;
+
+        if state.degraded.load(Ordering::Relaxed) {
+            if matches!(output_format, OutputFormat::Human) {
+                println!("│ {:<140} │", "⚠  DEGRADATION DETECTED — stopping ramp");
+            } else {
+                eprintln!("DEGRADATION DETECTED — stopping ramp");
             }
+            break;
         }
+        if total_rooms >= max_rooms {
+            if matches!(output_format, OutputFormat::Human) {
+                println!("│ {:<140} │", format!("✓  Max rooms reached ({}) — stopping ramp", max_rooms));
+            } else {
+                eprintln!("Max rooms reached ({}) — stopping ramp", max_rooms);
+            }
+            break;
+        }
+        spawn_room(
+            &mut join_set,
+            &api_url,
+            &room_counter,
+            users_per_room,
+            session_duration,
+            join_spread_secs,
+            &stats_tx,
+            &state,
+            simulcast,
+        )
+        .await;
+        total_rooms += 1;
     }
 
     tokio::time::sleep(Duration::from_secs(drain_duration)).await;
@@ -444,7 +442,7 @@ async fn spawn_room(
     room_counter: &Arc<AtomicUsize>,
     users_per_room: usize,
     session_duration: u64,
-    session_jitter: u64,
+    join_spread_secs: u64,
     stats_tx: &mpsc::Sender<AgentStatReport>,
     state: &Arc<SharedState>,
     simulcast: bool,
@@ -459,12 +457,15 @@ async fn spawn_room(
         let tx = stats_tx.clone();
         let st = state.clone();
 
-        let join_delay_ms = rand::random_range(0u64..5_000);
-        let jitter_a = rand::random_range(0u64..session_jitter);
-        let jitter_b = rand::random_range(0u64..session_jitter);
-        let this_session = session_duration
-            .saturating_add(jitter_a)
-            .saturating_sub(jitter_b);
+        // Participants join uniformly within the first join_spread_secs seconds,
+        // simulating people arriving gradually rather than all at once.
+        let join_delay_ms = rand::random_range(0u64..(join_spread_secs * 1_000).max(1));
+
+        // Exponential session duration: mean = session_duration, minimum 30 s.
+        // Models realistic variability where some participants leave early and
+        // others stay much longer than the average.
+        let u = (rand::random_range(1u64..u64::MAX) as f64) / (u64::MAX as f64);
+        let duration_secs = ((-u.ln()) * session_duration as f64).max(30.0) as u64;
 
         join_set.spawn(async move {
             tokio::time::sleep(Duration::from_millis(join_delay_ms)).await;
@@ -476,7 +477,7 @@ async fn spawn_room(
                 r,
                 true,
                 simulcast,
-                Duration::from_secs(this_session),
+                Duration::from_secs(duration_secs),
                 tx,
                 users_per_room,
             )
@@ -490,7 +491,9 @@ async fn spawn_room(
     }
 
     let room_state = state.clone();
-    let expire_after = Duration::from_secs(session_duration + session_jitter * 2 + 6);
+    // Expire the room counter after join_spread + 5× mean session duration
+    // (covers >99% of exponential session tail).
+    let expire_after = Duration::from_secs(join_spread_secs + session_duration * 5 + 10);
     join_set.spawn(async move {
         tokio::time::sleep(expire_after).await;
         room_state.active_rooms.fetch_sub(1, Ordering::Relaxed);
