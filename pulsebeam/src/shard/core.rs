@@ -70,6 +70,13 @@ impl DerefMut for ParticipantMeta {
     }
 }
 
+impl ParticipantMeta {
+    fn with_span<R>(&mut self, f: impl FnOnce(&mut ParticipantCore) -> R) -> R {
+        let _guard = self.span.enter();
+        f(&mut self.core)
+    }
+}
+
 /// Abstraction over the cross-shard message bus.
 pub(crate) trait CrossShardSend {
     fn send(&self, shard_id: ShardId, ev: CrossShardEvent);
@@ -153,7 +160,7 @@ impl ShardCore {
     pub(crate) fn fire_timers(&mut self, now: Instant) {
         self.timers.drain_expired(now, |participant_id| {
             if let Some(participant) = self.participants.get_mut(&participant_id) {
-                participant.on_timeout(now);
+                participant.with_span(|core| core.on_timeout(now));
                 self.input_dirty.insert(participant_id);
             }
         });
@@ -168,7 +175,7 @@ impl ShardCore {
             return;
         };
         if let Some(participant) = self.participants.get_mut(&participant_id) {
-            participant.on_ingress(batch);
+            participant.with_span(|core| core.on_ingress(batch));
             self.input_dirty.insert(participant_id);
         } else if let Some(meta) = self.participant_shards.get(&participant_id) {
             router.send(
@@ -309,9 +316,9 @@ impl ShardCore {
         match cmd {
             ClusterCommand::RequestKeyframe(req) => {
                 let p = self.participants.get_mut(&req.origin)?;
-                let _guard = p.span.enter();
-                p.core
-                    .handle_remote_keyframe_request(req.stream_id, req.kind);
+                p.with_span(|core| {
+                    core.handle_remote_keyframe_request(req.stream_id, req.kind);
+                });
                 self.input_dirty.insert(req.origin);
             }
 
@@ -439,15 +446,15 @@ impl ShardCore {
                 batch,
             } => {
                 if let Some(participant) = self.participants.get_mut(&participant_id) {
-                    participant.on_ingress(batch);
+                    participant.with_span(|core| core.on_ingress(batch));
                     self.input_dirty.insert(participant_id);
                 }
             }
             CrossShardEvent::KeyframeRequested(req) => {
                 if let Some(p) = self.participants.get_mut(&req.origin) {
-                    let _guard = p.span.enter();
-                    p.core
-                        .handle_remote_keyframe_request(req.stream_id, req.kind);
+                    p.with_span(|core| {
+                        core.handle_remote_keyframe_request(req.stream_id, req.kind);
+                    });
                     self.input_dirty.insert(req.origin);
                 }
             }
@@ -604,8 +611,7 @@ pub(super) fn poll_participants(
         };
         let room_id = participant.room_id;
         let mut queue = EventQueue::new(participant_id, room_id, events, rtp_events);
-        let _guard = participant.span.enter();
-        participant.core.poll(now, &mut queue);
+        participant.with_span(|core| core.poll(now, &mut queue));
     }
 }
 
@@ -624,7 +630,7 @@ pub(super) fn handle_rtp(
                 let Some(sub) = participants.get_mut(participant_id) else {
                     continue;
                 };
-                sub.core.on_forward_rtp(&stream_id, pkt);
+                sub.with_span(|core| core.on_forward_rtp(&stream_id, pkt));
                 dirty.insert(*participant_id);
             }
             for &shard_id in &route.remote_shards {
@@ -707,7 +713,7 @@ pub(super) fn handle_audio_rtp(
             stream_id = %ev.stream_id.0,
             "forwarding audio packet to participant"
         );
-        sub.core.on_forward_audio_rtp(slot_idx, &ev.pkt);
+        sub.with_span(|core| core.on_forward_audio_rtp(slot_idx, &ev.pkt));
         dirty.insert(participant_id);
     }
 }
