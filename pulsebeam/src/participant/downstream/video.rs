@@ -54,7 +54,7 @@ impl VideoAllocator {
             min_bitrate: MIN_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
             default_bitrate: MIN_BANDWIDTH,
-            ..BitrateControllerConfig::desired_bitrate()
+            ..Default::default()
         }
         .build();
         Self {

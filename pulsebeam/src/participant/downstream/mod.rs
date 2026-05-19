@@ -1,7 +1,6 @@
 mod audio;
 mod video;
 
-use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::id::AudioSelectorSlotId;
@@ -40,18 +39,22 @@ impl Default for SlotConfig {
 
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
-    available_bandwidth: Bitrate,
     pub video: VideoAllocator,
     audio: AudioAllocator,
+
+    available_bandwidth: Bitrate,
+    last_desired: Bitrate,
 }
 
 impl DownstreamAllocator {
     pub fn new(_participant_id: ParticipantId, manual_sub: bool, rng: &mut impl RngCore) -> Self {
         Self {
-            available_bandwidth: video::MIN_BANDWIDTH,
             video: VideoAllocator::new(manual_sub, rng),
             audio: AudioAllocator::new(),
             dirty_allocation: false,
+
+            available_bandwidth: video::MIN_BANDWIDTH,
+            last_desired: video::MIN_BANDWIDTH,
         }
     }
 
@@ -99,7 +102,10 @@ impl DownstreamAllocator {
         self.dirty_allocation = false;
         let (desired, assignments_changed) =
             self.video.update_allocations(self.available_bandwidth);
-        bwe.set_desired_bitrate(desired);
+        if self.last_desired != desired {
+            bwe.set_desired_bitrate(desired);
+            self.last_desired = desired;
+        }
         assignments_changed
     }
 
