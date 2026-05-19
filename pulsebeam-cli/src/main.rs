@@ -66,6 +66,9 @@ enum Commands {
         /// machine-readable rows on stdout (logs remain on stderr).
         #[arg(long, default_value = "human")]
         output_format: OutputFormat,
+        /// Use fixed session duration instead of exponential (default: false)
+        #[arg(long, default_value_t = false)]
+        fixed_session: bool,
     },
     /// Join a single room and print live stats until Ctrl-C.  Useful for
     /// manual debugging or smoke-testing a running SFU.
@@ -273,6 +276,7 @@ async fn main() -> Result<()> {
             drain_duration,
             simulcast,
             output_format,
+            fixed_session,
         } => {
             run_bench(
                 cli.api_url,
@@ -285,6 +289,7 @@ async fn main() -> Result<()> {
                 drain_duration,
                 simulcast,
                 output_format,
+                fixed_session,
             )
             .await?
         }
@@ -321,6 +326,7 @@ async fn run_bench(
     drain_duration: u64,
     simulcast: bool,
     output_format: OutputFormat,
+    fixed_session: bool,
 ) -> Result<()> {
     let (stats_tx, stats_rx) = mpsc::channel::<AgentStatReport>(16_000);
     let state = SharedState::new();
@@ -361,6 +367,7 @@ async fn run_bench(
             &stats_tx,
             &state,
             simulcast,
+            fixed_session,
         )
         .await;
         total_rooms += 1;
@@ -383,7 +390,10 @@ async fn run_bench(
         }
         if total_rooms >= max_rooms {
             if matches!(output_format, OutputFormat::Human) {
-                println!("│ {:<140} │", format!("✓  Max rooms reached ({}) — stopping ramp", max_rooms));
+                println!(
+                    "│ {:<140} │",
+                    format!("✓  Max rooms reached ({}) — stopping ramp", max_rooms)
+                );
             } else {
                 eprintln!("Max rooms reached ({}) — stopping ramp", max_rooms);
             }
@@ -399,6 +409,7 @@ async fn run_bench(
             &stats_tx,
             &state,
             simulcast,
+            fixed_session,
         )
         .await;
         total_rooms += 1;
@@ -446,6 +457,7 @@ async fn spawn_room(
     stats_tx: &mpsc::Sender<AgentStatReport>,
     state: &Arc<SharedState>,
     simulcast: bool,
+    fixed_session: bool,
 ) {
     let room_id = room_counter.fetch_add(1, Ordering::Relaxed);
     let room = format!("bench-room-{}", room_id);
@@ -461,11 +473,13 @@ async fn spawn_room(
         // simulating people arriving gradually rather than all at once.
         let join_delay_ms = rand::random_range(0u64..(join_spread_secs * 1_000).max(1));
 
-        // Exponential session duration: mean = session_duration, minimum 30 s.
-        // Models realistic variability where some participants leave early and
-        // others stay much longer than the average.
-        let u = (rand::random_range(1u64..u64::MAX) as f64) / (u64::MAX as f64);
-        let duration_secs = ((-u.ln()) * session_duration as f64).max(30.0) as u64;
+        // Session duration: exponential (default) or fixed.
+        let duration_secs = if fixed_session {
+            session_duration.max(30)
+        } else {
+            let u = (rand::random_range(1u64..u64::MAX) as f64) / (u64::MAX as f64);
+            ((-u.ln()) * session_duration as f64).max(30.0) as u64
+        };
 
         join_set.spawn(async move {
             tokio::time::sleep(Duration::from_millis(join_delay_ms)).await;
