@@ -891,7 +891,7 @@ mod assignment_tests {
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
     use std::collections::VecDeque;
     use str0m::bwe::Bitrate;
-    use str0m::media::{Mid, MediaKind, SimulcastLayer};
+    use str0m::media::{MediaKind, Mid, SimulcastLayer};
 
     fn test_rng() -> impl RngCore {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1015,7 +1015,12 @@ mod assignment_tests {
         );
 
         allocator.configure(&intents);
-        assert!(allocator.slots.values().all(|s| matches!(s.state(), SlotState::Idle)));
+        assert!(
+            allocator
+                .slots
+                .values()
+                .all(|s| matches!(s.state(), SlotState::Idle))
+        );
     }
 
     #[test]
@@ -1617,7 +1622,10 @@ mod assignment_tests {
             slot.switch_to(&upgraded_layer, true);
             assert!(slot.active.is_some());
             assert!(slot.staging.is_some());
-            assert_eq!(slot.active.as_ref().unwrap().meta.id, slot.staging.as_ref().unwrap().meta.id);
+            assert_eq!(
+                slot.active.as_ref().unwrap().meta.id,
+                slot.staging.as_ref().unwrap().meta.id
+            );
         }
 
         assert!(allocator.no_duplicate_slot_assignments());

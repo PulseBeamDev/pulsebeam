@@ -6,7 +6,6 @@ use std::time::Duration;
 use str0m::{bwe::Bitrate, media::MediaKind};
 use tokio::time::Instant;
 
-use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::rtp::RtpPacket;
 
 const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -429,7 +428,7 @@ impl BitrateEstimate {
     }
 
     fn advance_time(&mut self, time: Instant) {
-        let mut current_tick = *self.tick_start.get_or_insert(time);
+        let current_tick = *self.tick_start.get_or_insert(time);
 
         if time < current_tick + Duration::from_millis(Self::TICK_MS as u64) {
             return;

@@ -30,7 +30,11 @@ where
             move || {
                 let test = Arc::clone(&test);
                 async move {
-                    let test = test.lock().unwrap().take().expect("test future already used");
+                    let test = test
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("test future already used");
                     Box::pin(test).await;
                     Ok(())
                 }
