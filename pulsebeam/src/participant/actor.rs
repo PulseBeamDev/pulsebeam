@@ -20,7 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub use crate::participant::core::TrackMapping;
 
-const MIN_QUANTA: Duration = Duration::from_millis(1);
+const MIN_QUANTA: Duration = Duration::from_millis(0);
 
 /// Unified control signal for all low-frequency / non-data-plane wakeups.
 /// Grouping these into a single `SelectAll` arm keeps them off the hot path
