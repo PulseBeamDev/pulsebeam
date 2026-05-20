@@ -1,3 +1,4 @@
+use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use pulsebeam_runtime::sync::slot_group::SlotGroup;
@@ -13,6 +14,9 @@ use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::track::{SimulcastQuality, SimulcastReceiver, TrackMeta, TrackReceiver};
+
+pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
 /// Per-slot construction parameters.  Pass one of these to [`VideoAllocator::add_slot`].
 #[derive(Clone, Debug)]
@@ -42,15 +46,24 @@ pub struct VideoAllocator {
     slots: SlotGroup<SlotDriver>,
     /// Reverse map from `Mid` to slot index for O(1) cold-path lookup.
     mid_to_idx: HashMap<Mid, usize>,
+    desired_ctrl: BitrateController,
 }
 
 impl VideoAllocator {
     pub fn new(manual_sub: bool) -> Self {
+        let desired_ctrl = BitrateControllerConfig {
+            min_bitrate: MIN_BANDWIDTH,
+            max_bitrate: MAX_BANDWIDTH,
+            default_bitrate: MIN_BANDWIDTH,
+            ..Default::default()
+        }
+        .build();
         Self {
             manual_sub,
             tracks: HashMap::new(),
             slots: SlotGroup::with_capacity(VIDEO_MAX_SLOTS),
             mid_to_idx: HashMap::new(),
+            desired_ctrl,
         }
     }
 
@@ -251,6 +264,7 @@ impl VideoAllocator {
 
         // 2. Run the pure allocation logic.
         let (decisions, desired) = AllocationEngine::compute(available_bandwidth, &views);
+        let desired = self.desired_ctrl.update(desired);
 
         // 3. Apply the results to the drivers.
         let mut changed = false;
