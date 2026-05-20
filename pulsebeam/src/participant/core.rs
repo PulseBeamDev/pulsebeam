@@ -59,7 +59,7 @@ pub enum CoreEvent {
 
 pub struct ParticipantCore {
     // Hot: touched on every packet
-    pub rtc: Rtc,
+    pub rtc: Box<Rtc>,
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
@@ -107,7 +107,7 @@ impl ParticipantCore {
 
         Self {
             participant_id,
-            rtc,
+            rtc: Box::new(rtc),
             udp_batcher,
             tcp_batcher,
             upstream: UpstreamAllocator::new(),

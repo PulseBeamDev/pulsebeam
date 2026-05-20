@@ -59,7 +59,7 @@ impl UdpTransportReader {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: slot.freeze(n),
+                    buf: slot.freeze(n).to_vec(),
                     offset: 0,
                     stride: n,
                     len: n,
