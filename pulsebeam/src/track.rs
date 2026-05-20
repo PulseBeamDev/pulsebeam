@@ -173,8 +173,7 @@ impl SimulcastSender {
     pub fn forward(&mut self, mut pkt: RtpPacket, sr: Option<SenderInfo>) {
         // Synchronizer stamps playout_time in-place — no move-in/move-out round trip.
         self.synchronizer.process(&mut pkt, sr);
-        self.monitor
-            .process_packet(&pkt, pkt.payload.len() + pkt.header_len);
+        self.monitor.process_packet(&pkt);
         if (self.filter)(&pkt) {
             // Move packet into the broadcast ring — zero copies, zero arc bumps.
             self.channel.send(pkt);
