@@ -295,9 +295,9 @@ impl VideoAllocator {
             }
         }
 
-        if changed {
-            log_allocation(available_bandwidth, desired, &decisions, &views);
-        }
+        // if changed {
+        log_allocation(available_bandwidth, desired, &decisions, &views);
+        // }
 
         (desired, changed)
     }
