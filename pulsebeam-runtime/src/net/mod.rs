@@ -29,7 +29,7 @@ pub struct RecvPacketBatch {
     pub dst: SocketAddr,
     /// Backing buffer for this packet's bytes (pool-backed, refcounted).
     /// Always index via `data()` — `offset` addresses within it.
-    pub buf: PoolBuf,
+    pub buf: Vec<u8>,
     /// Byte offset into `buf` where this packet's data begins.
     pub offset: usize,
     pub stride: usize,

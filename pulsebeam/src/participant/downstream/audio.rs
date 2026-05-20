@@ -226,7 +226,7 @@ impl AudioSlot {
             self.last_ssrc = Some(p.packet.ssrc);
             self.timeline.rebase(&p.packet);
         }
-        p.packet = self.timeline.rewrite(p.packet);
+        self.timeline.rewrite(&mut p.packet);
         (self.mid, p)
     }
 }

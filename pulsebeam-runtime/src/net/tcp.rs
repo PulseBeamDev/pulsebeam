@@ -268,15 +268,11 @@ fn handle_new_connection(
                         recv_buf.advance(2);
                         let data = recv_buf.split_to(len);
 
-                        // Copy from BytesMut staging buffer into a pool slot.
-                        // One memcpy, zero jemalloc after warmup.
-                        let buf = net_recv_pool().checkout(&data);
-
                         // Use try_send to prevent reader task from blocking if SFU logic lags
                         if let Err(_) = packet_tx.try_send(RecvPacketBatch {
                             src: peer_addr,
                             dst: local_addr,
-                            buf,
+                            buf: data.to_vec(),
                             offset: 0,
                             stride: len,
                             len,
