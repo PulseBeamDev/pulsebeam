@@ -1,5 +1,8 @@
-INPUT_VIDEO = video.mov
-INPUT_H264 = quarter_q_cbr.h264
+# Source Configuration
+SOURCE_URL  = https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_720p_h264.mov
+INPUT_VIDEO = BigBuckBunny_720p.mov
+
+INPUT_H264  = quarter_q_cbr.h264
 OUT_DIR     = .
 FPS         = 30
 DURATION    = 360
@@ -24,15 +27,22 @@ BASE_COMMON = tune=zerolatency \
 CBR_FLAGS   = pass=cbr nal-hrd=cbr
 VBR_FLAGS   = # Intentionally blank. x264enc defaults to VBR/ABR when pass=cbr is omitted.
 
-.PHONY: all clean prepare estimate
+.PHONY: all clean prepare estimate download
 
-all: prepare \
+all: prepare $(INPUT_VIDEO) \
      $(OUT_DIR)/full_f_vbr.h264 $(OUT_DIR)/full_f_cbr.h264 \
      $(OUT_DIR)/half_h_vbr.h264 $(OUT_DIR)/half_h_cbr.h264 \
      $(OUT_DIR)/quarter_q_vbr.h264 $(OUT_DIR)/quarter_q_cbr.h264
 
 prepare:
 	mkdir -p $(OUT_DIR)
+
+# Target to download the source video if it doesn't exist
+download: $(INPUT_VIDEO)
+
+$(INPUT_VIDEO):
+	@echo "Downloading source video from Blender network..."
+	curl -L -o $(INPUT_VIDEO) $(SOURCE_URL)
 
 # Trim to 45s — Handled via VBR for the mezzanine file to capture source complexity accurately
 $(OUT_DIR)/trimmed.mp4: $(INPUT_VIDEO)
@@ -142,3 +152,7 @@ clean:
 	rm -f $(OUT_DIR)/trimmed.mp4 \
 	      $(OUT_DIR)/*_vbr.h264 \
 	      $(OUT_DIR)/*_cbr.h264
+
+# Deep clean to drop the large source video file
+distclean: clean
+	rm -f $(INPUT_VIDEO)
