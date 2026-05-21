@@ -319,9 +319,9 @@ pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
 
 pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
     let data = match rid {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF,
-        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER,
+        Some("f") => pulsebeam_testdata::RAW_H264_FULL_VBR,
+        Some("h") => pulsebeam_testdata::RAW_H264_HALF_VBR,
+        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_VBR,
     };
     H264Looper::new(data, 30)
 }

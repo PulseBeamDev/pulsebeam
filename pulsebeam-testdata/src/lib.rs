@@ -1,6 +1,9 @@
-pub const RAW_H264_FULL: &[u8] = include_bytes!("full_f.h264");
-pub const RAW_H264_HALF: &[u8] = include_bytes!("half_h.h264");
-pub const RAW_H264_QUARTER: &[u8] = include_bytes!("quarter_q.h264");
+pub const RAW_H264_FULL_VBR: &[u8] = include_bytes!("full_f_vbr.h264");
+pub const RAW_H264_FULL_CBR: &[u8] = include_bytes!("full_f_cbr.h264");
+pub const RAW_H264_HALF_VBR: &[u8] = include_bytes!("half_h_vbr.h264");
+pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
+pub const RAW_H264_QUARTER_VBR: &[u8] = include_bytes!("quarter_q_vbr.h264");
+pub const RAW_H264_QUARTER_CBR: &[u8] = include_bytes!("quarter_q_cbr.h264");
 
 // 16 video and 5 audio downstream slots
 pub const RAW_CHROME_SDP: &str = include_str!("chrome.sdp");

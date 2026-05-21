@@ -738,10 +738,10 @@ async fn handle_local_track(track: LocalTrack) {
 
     let rid_str = track.rid.as_ref().map(|r| r.as_ref());
     let data = match rid_str {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF,
-        Some("q") => pulsebeam_testdata::RAW_H264_QUARTER,
-        _ => pulsebeam_testdata::RAW_H264_QUARTER,
+        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
+        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
+        Some("q") => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
     };
     let looper = H264Looper::new(data, 30);
     looper.run(track).await;

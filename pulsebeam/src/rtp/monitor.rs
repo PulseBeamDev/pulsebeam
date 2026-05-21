@@ -1393,7 +1393,7 @@ mod test {
 
         const TARGET_BPS: f64 = 150_000.0;
 
-        let frames = pulsebeam_testdata::h264_frame_sizes(pulsebeam_testdata::RAW_H264_QUARTER);
+        let frames = pulsebeam_testdata::h264_frame_sizes(pulsebeam_testdata::RAW_H264_QUARTER_VBR);
         let samples = replay_frames_into_bwe(&frames, 30);
 
         // 45 s @ 30 fps → ~90 ticks; skip first 10 (5 s warmup).
