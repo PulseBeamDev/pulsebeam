@@ -915,9 +915,9 @@ impl AllocationEngine {
     /// Upgrade hysteresis: Require 30% surplus to absorb the Keyframe/PLI burst.
     const UPGRADE_FACTOR: f64 = 1.3;
     /// Downgrade hysteresis: Ignore 10% BWE noise; only drop if truly over budget.
-    const DOWNGRADE_FACTOR: f64 = 0.9;
+    const DOWNGRADE_FACTOR: f64 = 0.8;
     /// Serializes upgrades to prevent simultaneous Keyframe Storms.
-    const MAX_UPGRADES_PER_TICK: usize = 1;
+    const MAX_UPGRADES_PER_TICK: usize = 2;
 
     pub fn compute<'a>(
         available_bw: Bitrate,
@@ -926,43 +926,33 @@ impl AllocationEngine {
         let mut decisions: HashMap<Mid, AllocationDecision<'a>> = HashMap::new();
         let mut remaining_bps = available_bw.as_f64();
 
-        // 1. Maintain or Downgrade
+        // Track the target quality we are building up for each slot
+        let mut targets: HashMap<Mid, Option<&SimulcastReceiver>> = HashMap::new();
+
+        // 1. Guarantee everyone at least 'Low' quality
         for slot in slots {
-            let current = slot.track.by_quality(slot.current_quality);
+            let lowest = slot.track.lowest_quality();
+            let cost = lowest.state.bitrate_bps();
 
-            let stay_layer = current.filter(|l| {
-                l.state.is_healthy()
-                    && (l.state.bitrate_bps() * Self::DOWNGRADE_FACTOR) <= remaining_bps
-            });
-
-            let final_layer = stay_layer.or_else(|| {
-                slot.track
-                    .lower_quality(slot.current_quality)
-                    .filter(|l| l.state.is_healthy() && l.state.bitrate_bps() <= remaining_bps)
-            });
-
-            if let Some(layer) = final_layer {
-                // Snapshot the bitrate immediately
-                let layer_bitrate = Bitrate::from(layer.state.bitrate_bps());
-                let bps = layer_bitrate.as_f64();
-
-                remaining_bps -= bps;
-                decisions.insert(slot.mid, AllocationDecision::Forward(layer, layer_bitrate));
+            let required_bps = if slot.current_quality == lowest.quality {
+                cost * Self::DOWNGRADE_FACTOR
             } else {
-                decisions.insert(
-                    slot.mid,
-                    AllocationDecision::Pause(slot.track.lowest_quality()),
-                );
+                cost
+            };
+
+            if remaining_bps >= required_bps {
+                remaining_bps -= cost;
+                targets.insert(slot.mid, Some(lowest));
+            } else {
+                // Starvation: Not enough bandwidth even for the lowest layer
+                targets.insert(slot.mid, None);
             }
         }
 
-        // 2. Upgrade
+        // 2. Distribute excess to Medium, then High
         let mut upgrades_performed = 0;
-        for tier in [
-            SimulcastQuality::Low,
-            SimulcastQuality::Medium,
-            SimulcastQuality::High,
-        ] {
+
+        for tier in [SimulcastQuality::Medium, SimulcastQuality::High] {
             if upgrades_performed >= Self::MAX_UPGRADES_PER_TICK {
                 break;
             }
@@ -972,35 +962,61 @@ impl AllocationEngine {
                     break;
                 }
 
-                let Some(AllocationDecision::Forward(current_layer, current_bw)) =
-                    decisions.get(&slot.mid).copied()
-                else {
+                // If this slot didn't even get the baseline, or couldn't get the previous tier, skip it.
+                let Some(current_target) = targets.get(&slot.mid).copied().flatten() else {
                     continue;
                 };
 
-                if current_layer.quality >= tier {
-                    continue;
-                }
-                let Some(target) = slot.track.by_quality(tier) else {
+                let Some(next_layer) = slot.track.by_quality(tier) else {
                     continue;
                 };
-                if !target.state.is_healthy() {
+                if !next_layer.state.is_healthy() {
                     continue;
                 }
 
-                let target_bw = Bitrate::from(target.state.bitrate_bps());
-                let incremental_cost = target_bw.as_f64() - current_bw.as_f64();
+                let next_cost = next_layer.state.bitrate_bps();
+                let current_cost = current_target.state.bitrate_bps();
+                let incremental_cost = next_cost - current_cost;
 
-                // Check against the 30% upgrade headroom (UPGRADE_FACTOR = 1.3)
-                if remaining_bps >= (incremental_cost * Self::UPGRADE_FACTOR) {
+                // Apply Hysteresis
+                // If we are trying to upgrade beyond what the slot CURRENTLY has, apply UPGRADE_FACTOR.
+                // If we are just rebuilding the state they ALREADY had, apply DOWNGRADE_FACTOR so we don't drop them too eagerly.
+                let required_budget = if tier > slot.current_quality {
+                    incremental_cost * Self::UPGRADE_FACTOR
+                } else if tier == slot.current_quality {
+                    incremental_cost * Self::DOWNGRADE_FACTOR
+                } else {
+                    incremental_cost
+                };
+
+                if remaining_bps >= required_budget {
                     remaining_bps -= incremental_cost;
-                    decisions.insert(slot.mid, AllocationDecision::Forward(target, target_bw));
-                    upgrades_performed += 1;
+                    targets.insert(slot.mid, Some(next_layer));
+
+                    if tier > slot.current_quality {
+                        upgrades_performed += 1;
+                    }
                 }
             }
         }
 
-        // 3. Demand Calculation (The "Want" Bitrate)
+        // 3. Finalize allocations
+        let mut used_bps: f64 = 0.0;
+
+        for slot in slots {
+            if let Some(Some(layer)) = targets.get(&slot.mid) {
+                let bw = Bitrate::from(layer.state.bitrate_bps());
+                used_bps += bw.as_f64();
+                decisions.insert(slot.mid, AllocationDecision::Forward(layer, bw));
+            } else {
+                decisions.insert(
+                    slot.mid,
+                    AllocationDecision::Pause(slot.track.lowest_quality()),
+                );
+            }
+        }
+
+        // 4. Demand Calculation (The "Want" Bitrate)
         let total_desired_bps: f64 = slots
             .iter()
             .map(|s| {
@@ -1011,32 +1027,23 @@ impl AllocationEngine {
                     .map(|l| l.state.bitrate_bps())
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0)
+                    // Lowest layer is always included.
+                    .max(s.track.lowest_quality().state.bitrate_bps())
             })
             .sum();
+        let total_desired_bps = Bitrate::from(total_desired_bps as u64);
 
-        let used_bps: f64 = decisions
-            .values()
-            .filter_map(|d| match d {
-                AllocationDecision::Forward(_, bw) => Some(bw.as_f64()),
-                AllocationDecision::Pause(_) => None,
-            })
-            .sum();
-
-        // The allocator uses hysteresis (DOWNGRADE_FACTOR / UPGRADE_FACTOR) to
-        // prevent frequent bitrate churning. This can result in allocating slightly
-        // more than the estimated available bandwidth. Allow a small overshoot
-        // bound to prevent debug builds from panicking while still catching
-        // gross allocation bugs.
+        // Sanity Check
         let max_allowed = available_bw.as_f64() / Self::DOWNGRADE_FACTOR;
         debug_assert!(
             used_bps <= max_allowed + f64::EPSILON,
-            "AllocationEngine allocated more bandwidth than allowed: used {} > allowed {} (available {} )",
+            "AllocationEngine allocated more bandwidth than allowed: used {} > allowed {} (available {})",
             used_bps,
             max_allowed,
             available_bw.as_f64()
         );
 
-        (decisions, Bitrate::from(total_desired_bps as u64))
+        (decisions, total_desired_bps)
     }
 }
 
