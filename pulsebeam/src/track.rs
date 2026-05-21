@@ -300,13 +300,13 @@ pub fn new(mid: Mid, meta: Arc<TrackMeta>) -> (TrackSender, TrackReceiver) {
 
         let (quality, bitrate, cap_tier) = match (meta.kind, rid, index) {
             (MediaKind::Audio, _, _) => (SimulcastQuality::Low, 64_000, 1),
-            (MediaKind::Video, None, _) => (SimulcastQuality::Low, 500_000, 4),
+            (MediaKind::Video, None, _) => (SimulcastQuality::Low, 150_000, 4),
 
             // Ordering here determines the highest quality first.
             // https://datatracker.ietf.org/doc/html/rfc8853#section-5.2
             // https://github.com/obsproject/obs-studio/pull/10885
-            (MediaKind::Video, Some(_), 0) => (SimulcastQuality::High, 2_500_000, 4),
-            (MediaKind::Video, Some(_), 1) => (SimulcastQuality::Medium, 750_000, 2),
+            (MediaKind::Video, Some(_), 0) => (SimulcastQuality::High, 1_250_000, 4),
+            (MediaKind::Video, Some(_), 1) => (SimulcastQuality::Medium, 400_000, 2),
             (MediaKind::Video, Some(_), _) => (SimulcastQuality::Low, 150_000, 1),
         };
 
