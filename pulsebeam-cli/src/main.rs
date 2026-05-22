@@ -3,9 +3,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hdrhistogram::Histogram;
 use pulsebeam_agent::{
     MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
-    actor::{AgentBuilder, AgentEvent, LocalTrack},
+    actor::{AgentBuilder, AgentEvent, LocalTrack, RemoteTrackRx},
     api::HttpApiClient,
     media::H264Looper,
+    wallclock_at,
 };
 use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
@@ -109,7 +110,7 @@ pub struct AgentDelta {
 
 #[derive(Debug)]
 pub struct AgentStatReport {
-    pub rtt: Option<Duration>,
+    pub forwarding_latencies: Vec<Duration>,
     pub delta: AgentDelta,
 }
 
@@ -288,7 +289,7 @@ async fn run_bench(
             "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬─────────┬─────────┤"
         );
         println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ TWCC50  │ TWCC95  │ TWCC99  │ Tx Actv │ Rx Actv │"
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50   │ FWD95   │ FWD99   │ Tx Actv │ Rx Actv │"
         );
         println!(
             "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼─────────┼─────────┤"
@@ -472,13 +473,13 @@ async fn monitor_task(
     let mut rx_loss_sum = 0.0f32;
     let mut rx_loss_count = 0usize;
 
-    let mut rtt_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
+    let mut fwd_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
     let mut consecutive_high_p99 = 0u32;
     let mut consecutive_high_loss = 0u32;
 
     if matches!(output_format, OutputFormat::Csv) {
         println!(
-            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,twcc_p50_ms,twcc_p95_ms,twcc_p99_ms,tx_active,rx_active"
+            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_us,fwd_p95_us,fwd_p99_us,tx_active,rx_active"
         );
     }
 
@@ -496,9 +497,9 @@ async fn monitor_task(
                 let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let p50 = rtt_hist.value_at_quantile(0.50) as f64 / 1000.0;
-                let p95 = rtt_hist.value_at_quantile(0.95) as f64 / 1000.0;
-                let p99 = rtt_hist.value_at_quantile(0.99) as f64 / 1000.0;
+                let p50 = fwd_hist.value_at_quantile(0.50) as f64;
+                let p95 = fwd_hist.value_at_quantile(0.95) as f64;
+                let p99 = fwd_hist.value_at_quantile(0.99) as f64;
 
                 let avg_loss_pct = if rx_loss_count > 0 {
                     rx_loss_sum / rx_loss_count as f32 * 100.0
@@ -552,18 +553,12 @@ async fn monitor_task(
                 tx_plis  = 0; rx_plis  = 0;
                 tx_active_streams  = 0; rx_active_streams = 0;
                 rx_loss_sum = 0.0; rx_loss_count = 0;
-                rtt_hist.reset();
+                fwd_hist.reset();
             }
 
             Some(report) = stats_rx.recv() => {
-                if let Some(rtt) = report.rtt {
-                    // Note: this RTT is derived from TWCC feedback latency,
-                    // i.e. the time between sending a packet and receiving the
-                    // corresponding transport feedback report. It is not the
-                    // same as WebRTC ICE candidate pair currentRoundTripTime.
-                    let rtt_micros = rtt.as_micros();
-                    tracing::info!("{}ms", rtt.as_millis());
-                    let _ = rtt_hist.record(rtt_micros as u64);
+                for latency in report.forwarding_latencies {
+                    let _ = fwd_hist.record(latency.as_micros() as u64);
                 }
                 tx_bytes += report.delta.tx_bytes;
                 rx_bytes += report.delta.rx_bytes;
@@ -623,6 +618,7 @@ async fn spawn_agent(
     let mut agent = builder.connect(&room).await?;
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
+    let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
 
     let session_end = tokio::time::sleep(session_duration);
     tokio::pin!(session_end);
@@ -632,8 +628,15 @@ async fn spawn_agent(
             _ = &mut session_end => break,
 
             Some(event) = agent.next_event() => {
-                if let AgentEvent::LocalTrackAdded(track) = event {
-                    tokio::spawn(handle_local_track(track));
+                match event {
+                    AgentEvent::LocalTrackAdded(track) => {
+                        tokio::spawn(handle_local_track(track));
+                    }
+                    AgentEvent::RemoteTrackAdded(recv) => {
+                        let latency_tx = latency_tx.clone();
+                        tokio::spawn(handle_remote_track(recv, latency_tx));
+                    }
+                    _ => {}
                 }
             }
 
@@ -641,7 +644,6 @@ async fn spawn_agent(
                 let Some(stats) = agent.get_stats().await else { continue };
 
                 let peer = stats.peer.as_ref();
-                let rtt = peer.and_then(|p| p.rtt).map(|r| r);
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
@@ -659,7 +661,12 @@ async fn spawn_agent(
 
                 let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
-                if stats_tx.try_send(AgentStatReport { rtt, delta }).is_err() {
+                let mut forwarding_latencies = Vec::new();
+                while let Ok(sample) = latency_rx.try_recv() {
+                    forwarding_latencies.push(sample);
+                }
+
+                if stats_tx.try_send(AgentStatReport { forwarding_latencies, delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
                 }
             }
@@ -714,13 +721,14 @@ async fn run_connect(
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
         "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>9}  streams (tx/rx)",
-        "time(s)", "tx_mbps", "rx_mbps", "TWCC50ms", "TWCC95ms", "TWCC99ms", "loss%"
+        "time(s)", "tx_mbps", "rx_mbps", "FWD50us", "FWD95us", "FWD99us", "loss%"
     );
 
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
-    let mut rtt_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
+    let mut fwd_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
+    let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
 
     loop {
         tokio::select! {
@@ -735,6 +743,10 @@ async fn run_connect(
                     AgentEvent::LocalTrackAdded(track) => {
                         tokio::spawn(handle_local_track(track));
                     }
+                    AgentEvent::RemoteTrackAdded(recv) => {
+                        let latency_tx = latency_tx.clone();
+                        tokio::spawn(handle_remote_track(recv, latency_tx));
+                    }
                     AgentEvent::Disconnected(reason) => {
                         eprintln!("Disconnected: {reason}");
                         break;
@@ -747,11 +759,11 @@ async fn run_connect(
                 let elapsed = start.elapsed().as_secs();
                 let Some(stats) = agent.get_stats().await else { continue };
 
-                let peer = stats.peer.as_ref();
-                if let Some(micros) = peer.and_then(|p| p.rtt).map(|r| r.as_micros() as u64) {
-                    let _ = rtt_hist.record(micros);
+                while let Ok(sample) = latency_rx.try_recv() {
+                    let _ = fwd_hist.record(sample.as_micros() as u64);
                 }
 
+                let peer = stats.peer.as_ref();
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
@@ -772,10 +784,10 @@ async fn run_connect(
                 let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let p50 = rtt_hist.value_at_quantile(0.50) as f64 / 1000.0;
-                let p95 = rtt_hist.value_at_quantile(0.95) as f64 / 1000.0;
-                let p99 = rtt_hist.value_at_quantile(0.99) as f64 / 1000.0;
-                rtt_hist.reset();
+                let p50 = fwd_hist.value_at_quantile(0.50) as f64;
+                let p95 = fwd_hist.value_at_quantile(0.95) as f64;
+                let p99 = fwd_hist.value_at_quantile(0.99) as f64;
+                fwd_hist.reset();
 
                 let avg_loss_pct = if delta.rx_loss_count > 0 {
                     delta.rx_loss_sum / delta.rx_loss_count as f32 * 100.0
@@ -807,6 +819,17 @@ async fn handle_local_track(track: LocalTrack) {
     };
     let looper = H264Looper::new(data, 30);
     let _ = looper.run(track).await;
+}
+
+async fn handle_remote_track(mut recv: RemoteTrackRx, latency_tx: tokio::sync::mpsc::UnboundedSender<Duration>) {
+    while let Some(frame) = recv.recv().await {
+        if let Some(abs_capture_time) = frame.abs_capture_time {
+            let receive_time = wallclock_at(frame.capture_time);
+            if let Ok(latency) = receive_time.duration_since(abs_capture_time) {
+                let _ = latency_tx.send(latency);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
