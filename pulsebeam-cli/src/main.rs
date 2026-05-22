@@ -806,9 +806,9 @@ async fn run_connect(
 
                 let (p50, p95, p99) = if fwd_has_samples {
                     (
-                        Some(fwd_hist.value_at_quantile(0.50) as f64),
-                        Some(fwd_hist.value_at_quantile(0.95) as f64),
-                        Some(fwd_hist.value_at_quantile(0.99) as f64),
+                        Some(fwd_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                        Some(fwd_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                        Some(fwd_hist.value_at_quantile(0.99) as f64 / 1000.0),
                     )
                 } else {
                     (None, None, None)
@@ -822,9 +822,9 @@ async fn run_connect(
                     0.0
                 };
 
-                let p50_str = p50.map(|v| format!("{:>10.0}", v)).unwrap_or_else(|| "         NA".to_string());
-                let p95_str = p95.map(|v| format!("{:>10.0}", v)).unwrap_or_else(|| "         NA".to_string());
-                let p99_str = p99.map(|v| format!("{:>10.0}", v)).unwrap_or_else(|| "         NA".to_string());
+                let p50_str = p50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
+                let p95_str = p95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
+                let p99_str = p99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
                 eprintln!("{:>8} {:>8.2} {:>8.2} {} {} {} {:>8.1}%  {}/{}",
                           elapsed, tx_mbps, rx_mbps, p50_str, p95_str, p99_str, avg_loss_pct,
                           delta.tx_active, delta.rx_active);
