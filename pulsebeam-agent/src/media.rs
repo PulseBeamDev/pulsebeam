@@ -121,6 +121,7 @@ impl H264Looper {
                 ts: MediaTime::from_90khz(next_ts),
                 data: frame_data,
                 capture_time: tick_time,
+                abs_capture_time: Some(crate::clock::capture_wallclock()),
             };
 
             // backpressure: await the channel rather than drop frames

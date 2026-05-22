@@ -7,6 +7,7 @@ use futures_lite::StreamExt;
 use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::prelude::*;
+use pulsebeam_proto::rtp_extensions;
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{namespace, signaling};
 use std::collections::HashMap;
@@ -14,7 +15,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
-use pulsebeam_proto::rtp_extensions;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{KeyframeRequestKind, Rid, Simulcast, SimulcastLayer};
@@ -526,7 +526,10 @@ impl AgentBuilder {
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
             .enable_bwe(Some(Bitrate::kbps(300)))
-            .set_extension(rtp_extensions::ABS_CAPTURE_TIME, Extension::AbsoluteCaptureTime)
+            .set_extension(
+                rtp_extensions::ABS_CAPTURE_TIME,
+                Extension::AbsoluteCaptureTime,
+            )
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
@@ -942,6 +945,9 @@ impl AgentActor {
                             if let Some(rid) = rid {
                                 writer = writer.rid(rid);
                             }
+                            if let Some(abs_capture_time) = frame.abs_capture_time {
+                                writer = writer.abs_capture_time(abs_capture_time);
+                            }
                             let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                         } else {
                             tracing::warn!(?mid, "no writer found for mid");
@@ -949,16 +955,9 @@ impl AgentActor {
                     }
                 }
 
-                _ = bwe_slow_timer.tick(), if self.layer_ctrl.has_layers() => {
-                    let desired_bps = self.layer_ctrl.tick(Instant::now());
-                    let desired = Bitrate::bps((desired_bps * 1.5) as u64);
-                    tracing::debug!("desired bitrate: {}", desired);
-                    self.rtc.bwe().set_desired_bitrate(desired);
-                }
-
-                 _ = &mut sleep => {
+                _ = &mut sleep => {
                     if self.rtc.handle_input(Input::Timeout(Instant::now().into())).is_err() {
-                         self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
+                        self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                     }
                 }
 

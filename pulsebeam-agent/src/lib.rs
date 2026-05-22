@@ -3,7 +3,12 @@ pub use str0m;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;
 pub use str0m::media::{MediaData, MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
+use std::time::SystemTime;
 use tokio::time::Instant;
+
+pub mod clock;
+
+pub use clock::wallclock_at;
 
 pub mod actor;
 pub mod api;
@@ -15,6 +20,7 @@ pub struct MediaFrame {
     pub ts: MediaTime,
     pub data: Bytes,
     pub capture_time: Instant,
+    pub abs_capture_time: Option<SystemTime>,
 }
 
 impl From<MediaData> for MediaFrame {
@@ -23,6 +29,7 @@ impl From<MediaData> for MediaFrame {
             ts: value.time,
             data: value.data.into(),
             capture_time: value.network_time.into(),
+            abs_capture_time: value.ext_vals.abs_capture_time.map(|act| act.capture_time),
         }
     }
 }

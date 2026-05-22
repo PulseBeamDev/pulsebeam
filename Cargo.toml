@@ -29,8 +29,8 @@ more-asserts = "0.3.1"
 rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/stereo" }
-str0m = { git = "https://github.com/algesten/str0m.git", rev = "a46d057c1160cecb141eca55eeb5d36fe82ba28f" }
-# str0m = { path = "../str0m" }
+# str0m = { git = "https://github.com/algesten/str0m.git", rev = "a46d057c1160cecb141eca55eeb5d36fe82ba28f" }
+str0m = { path = "../str0m" }
 # str0m = { version = "0.19.0" }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
