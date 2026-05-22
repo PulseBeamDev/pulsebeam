@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use core_affinity::get_core_ids;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
@@ -162,6 +163,18 @@ impl NodeBuilder {
         let external_addr = self.external_addr;
 
         let mut join_set = JoinSet::new();
+        let cpu_cores = get_core_ids().unwrap_or_default();
+        if cpu_cores.is_empty() {
+            tracing::warn!(
+                "no CPU cores detected for thread affinity; worker threads will not be pinned"
+            );
+        } else {
+            tracing::info!(
+                count = cpu_cores.len(),
+                "detected CPU cores for thread affinity"
+            );
+        }
+
         let udp_sockets =
             bind_udp_sockets(local_addr, external_addr, workers_count, self.udp_mode).await?;
 
@@ -245,9 +258,15 @@ impl NodeBuilder {
                 // causing spawn_local panics inside add_connection.
                 join_set.spawn(ignore(shard.run()));
             } else {
+                let core_id = if cpu_cores.is_empty() {
+                    None
+                } else {
+                    cpu_cores.get(shard_idx % cpu_cores.len()).copied()
+                };
                 let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
                 let handle = builder
                     .spawn(move || {
+                        tune_current_data_thread(core_id);
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .enable_alt_timer()
@@ -268,7 +287,7 @@ impl NodeBuilder {
         // set current thread to lower priority after spawning worker threads so
         // we don't lower the worker threads' priorities
         if matches!(self.worker_execution, WorkerExecution::ThreadPerWorker) {
-            set_lower_current_thread_priority();
+            tune_current_control_thread();
         }
 
         let controller =
@@ -429,18 +448,39 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
     let _ = fut.await;
 }
 
-fn set_lower_current_thread_priority() {
-    #[cfg(target_os = "linux")]
-    {
-        match rustix::process::setpriority_process(None, 5) {
-            Ok(_) => tracing::info!("Lowered control thread nice value to +5 to yield to workers"),
-            Err(e) => tracing::warn!("Failed to lower control thread priority: {}", e),
+pub fn tune_current_control_thread() {
+    let result = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
+
+    if let Err(e) = result {
+        tracing::warn!("Failed to lower Control Thread priority: {:?}", e);
+    } else {
+        tracing::info!("Control thread tuned: Minimum Priority");
+    }
+}
+
+pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
+    use rustix::thread::{current_timer_slack, set_current_timer_slack};
+
+    if let Some(core) = core_id {
+        if core_affinity::set_for_current(core) {
+            tracing::info!(?core, "Data thread pinned to CPU core");
+        } else {
+            tracing::warn!(?core, "Failed to pin Data thread to CPU core");
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
-        tracing::debug!("Control thread de-prioritization is only active on Linux");
+        use std::num::NonZero;
+
+        // attempt to get closer to SCHED_FIFO without CAP_SYS_ADMIN
+        let slack_value = NonZero::new(1);
+        if let Err(err) = set_current_timer_slack(slack_value) {
+            tracing::warn!(?err, "Failed to set timer slack on data thread");
+        } else {
+            let current_slack = current_timer_slack().unwrap_or(0);
+            tracing::info!(current_slack, "Data thread timer slack successfully tuned");
+        }
     }
 }
 
