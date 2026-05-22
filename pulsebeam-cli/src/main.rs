@@ -289,7 +289,7 @@ async fn run_bench(
             "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬─────────┬─────────┤"
         );
         println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50   │ FWD95   │ FWD99   │ Tx Actv │ Rx Actv │"
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50us │ FWD95us │ FWD99us │ Tx Actv │ Rx Actv │"
         );
         println!(
             "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼─────────┼─────────┤"
@@ -474,6 +474,7 @@ async fn monitor_task(
     let mut rx_loss_count = 0usize;
 
     let mut fwd_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
+    let mut fwd_has_samples = false;
     let mut consecutive_high_p99 = 0u32;
     let mut consecutive_high_loss = 0u32;
 
@@ -497,9 +498,15 @@ async fn monitor_task(
                 let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let p50 = fwd_hist.value_at_quantile(0.50) as f64;
-                let p95 = fwd_hist.value_at_quantile(0.95) as f64;
-                let p99 = fwd_hist.value_at_quantile(0.99) as f64;
+                let (p50, p95, p99) = if fwd_has_samples {
+                    (
+                        Some(fwd_hist.value_at_quantile(0.50) as f64),
+                        Some(fwd_hist.value_at_quantile(0.95) as f64),
+                        Some(fwd_hist.value_at_quantile(0.99) as f64),
+                    )
+                } else {
+                    (None, None, None)
+                };
 
                 let avg_loss_pct = if rx_loss_count > 0 {
                     rx_loss_sum / rx_loss_count as f32 * 100.0
@@ -509,28 +516,34 @@ async fn monitor_task(
 
                 match output_format {
                     OutputFormat::Human => {
+                        let p50_str = p50.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
+                        let p95_str = p95.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
+                        let p99_str = p99.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
                         println!(
-                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>7.3} │ {:>7.3} │ {:>7.3} │ {:>7} │ {:>7} │",
+                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │{} │{} │{} │ {:>7} │ {:>7} │",
                             elapsed, rooms, agents,
                             tx_mbps, rx_mbps, avg_loss_pct,
                             tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50, p95, p99,
+                            p50_str, p95_str, p99_str,
                             tx_active_streams, rx_active_streams,
                         );
                     }
                     OutputFormat::Csv => {
+                        let p50_str = p50.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "NA".to_string());
+                        let p95_str = p95.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "NA".to_string());
+                        let p99_str = p99.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "NA".to_string());
                         println!(
-                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{:.3},{:.3},{:.3},{},{}",
+                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{},{},{},{},{}",
                             elapsed, rooms, agents,
                             tx_mbps, rx_mbps, avg_loss_pct,
                             tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50, p95, p99,
+                            p50_str, p95_str, p99_str,
                             tx_active_streams, rx_active_streams,
                         );
                     }
                 }
 
-                if p99 > 300.0 {
+                if p99.map_or(false, |v| v > 300.0) {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
                         state.degraded.store(true, Ordering::Relaxed);
@@ -538,6 +551,8 @@ async fn monitor_task(
                 } else {
                     consecutive_high_p99 = 0;
                 }
+
+                fwd_has_samples = false;
 
                 if avg_loss_pct > 5.0 && agents > 0 {
                     consecutive_high_loss += 1;
@@ -558,7 +573,9 @@ async fn monitor_task(
 
             Some(report) = stats_rx.recv() => {
                 for latency in report.forwarding_latencies {
-                    let _ = fwd_hist.record(latency.as_micros() as u64);
+                    if fwd_hist.record(latency.as_micros() as u64).is_ok() {
+                        fwd_has_samples = true;
+                    }
                 }
                 tx_bytes += report.delta.tx_bytes;
                 rx_bytes += report.delta.rx_bytes;
@@ -728,6 +745,7 @@ async fn run_connect(
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
     let mut fwd_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
+    let mut fwd_has_samples = false;
     let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
 
     loop {
@@ -760,7 +778,9 @@ async fn run_connect(
                 let Some(stats) = agent.get_stats().await else { continue };
 
                 while let Ok(sample) = latency_rx.try_recv() {
-                    let _ = fwd_hist.record(sample.as_micros() as u64);
+                    if fwd_hist.record(sample.as_micros() as u64).is_ok() {
+                        fwd_has_samples = true;
+                    }
                 }
 
                 let peer = stats.peer.as_ref();
@@ -784,10 +804,17 @@ async fn run_connect(
                 let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let p50 = fwd_hist.value_at_quantile(0.50) as f64;
-                let p95 = fwd_hist.value_at_quantile(0.95) as f64;
-                let p99 = fwd_hist.value_at_quantile(0.99) as f64;
+                let (p50, p95, p99) = if fwd_has_samples {
+                    (
+                        Some(fwd_hist.value_at_quantile(0.50) as f64),
+                        Some(fwd_hist.value_at_quantile(0.95) as f64),
+                        Some(fwd_hist.value_at_quantile(0.99) as f64),
+                    )
+                } else {
+                    (None, None, None)
+                };
                 fwd_hist.reset();
+                fwd_has_samples = false;
 
                 let avg_loss_pct = if delta.rx_loss_count > 0 {
                     delta.rx_loss_sum / delta.rx_loss_count as f32 * 100.0
@@ -795,8 +822,11 @@ async fn run_connect(
                     0.0
                 };
 
-                eprintln!("{:>8} {:>8.2} {:>8.2} {:>10.3} {:>10.3} {:>10.3} {:>8.1}%  {}/{}",
-                          elapsed, tx_mbps, rx_mbps, p50, p95, p99, avg_loss_pct,
+                let p50_str = p50.map(|v| format!("{:>10.0}", v)).unwrap_or_else(|| "         NA".to_string());
+                let p95_str = p95.map(|v| format!("{:>10.0}", v)).unwrap_or_else(|| "         NA".to_string());
+                let p99_str = p99.map(|v| format!("{:>10.0}", v)).unwrap_or_else(|| "         NA".to_string());
+                eprintln!("{:>8} {:>8.2} {:>8.2} {} {} {} {:>8.1}%  {}/{}",
+                          elapsed, tx_mbps, rx_mbps, p50_str, p95_str, p99_str, avg_loss_pct,
                           delta.tx_active, delta.rx_active);
             }
         }
@@ -821,7 +851,10 @@ async fn handle_local_track(track: LocalTrack) {
     let _ = looper.run(track).await;
 }
 
-async fn handle_remote_track(mut recv: RemoteTrackRx, latency_tx: tokio::sync::mpsc::UnboundedSender<Duration>) {
+async fn handle_remote_track(
+    mut recv: RemoteTrackRx,
+    latency_tx: tokio::sync::mpsc::UnboundedSender<Duration>,
+) {
     while let Some(frame) = recv.recv().await {
         if let Some(abs_capture_time) = frame.abs_capture_time {
             let receive_time = wallclock_at(frame.capture_time);
