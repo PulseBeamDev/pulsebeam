@@ -29,9 +29,9 @@ futures-concurrency = "7.7.1"
 futures-lite = { workspace = true }
 hyper = "1.9.0"
 indexmap = "2.14.0"
-metrics = "0.24.5"
+metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
-mimalloc = { version = "0.1.50" }
+mimalloc = { version = "0.1.51" }
 once_cell = "1.21.4"
 pin-project = "1"
 pprof = { version = "0.15.0", features = [
@@ -45,8 +45,8 @@ pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 rand = { workspace = true }
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { workspace = true }
-serde_json = "1.0.149"
-sha3 = "0.11.0"
+serde_json = "1.0.150"
+sha3 = "0.12.0"
 slotmap = "1.1.1"
 str0m = { workspace = true }
 tachyonix = "0.3.1"
@@ -54,7 +54,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tokio-util = { workspace = true, features = ["time"] }
-tower-http = { version = "0.6.8", features = [
+tower-http = { version = "0.6.11", features = [
   "compression-zstd",
   "cors",
   "decompression-gzip",
@@ -63,7 +63,7 @@ tower-http = { version = "0.6.8", features = [
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5.8"
-utoipa = { version = "5.4.0", features = ["axum_extras", "uuid"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
 
