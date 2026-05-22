@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use hdrhistogram::Histogram;
 use pulsebeam_agent::{
-    MediaKind, Rid, SimulcastLayer, TransceiverDirection,
+    MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack},
     api::HttpApiClient,
     media::H264Looper,
@@ -39,52 +40,36 @@ enum OutputFormat {
 #[derive(Subcommand)]
 enum Commands {
     Bench {
-        /// Number of rooms created immediately at startup.
         #[arg(long, default_value_t = 5)]
         rooms: usize,
         #[arg(long, default_value_t = 4)]
         users_per_room: usize,
-        /// Poisson arrival rate for new rooms after the initial burst (rooms/second).
-        /// Inter-arrival times are exponentially distributed: mean = 1/arrival_rate seconds.
-        /// e.g. 0.05 = one new room every ~20 s on average.
         #[arg(long, default_value_t = 0.05)]
         arrival_rate: f64,
         #[arg(long, default_value_t = 200)]
         max_rooms: usize,
-        /// Mean participant session duration in seconds (exponential distribution).
         #[arg(long, default_value_t = 120)]
         session_duration: u64,
-        /// Seconds over which participants in a room stagger their joins (uniform).
-        /// Simulates participants arriving gradually rather than all at once.
         #[arg(long, default_value_t = 60)]
         join_spread_secs: u64,
         #[arg(long, default_value_t = 30)]
         drain_duration: u64,
         #[arg(long)]
         simulcast: bool,
-        /// Output format: 'human' (default) for a pretty table, 'csv' for
-        /// machine-readable rows on stdout (logs remain on stderr).
         #[arg(long, default_value = "human")]
         output_format: OutputFormat,
-        /// Use fixed session duration instead of exponential (default: false)
         #[arg(long, default_value_t = false)]
         fixed_session: bool,
     },
-    /// Join a single room and print live stats until Ctrl-C.  Useful for
-    /// manual debugging or smoke-testing a running SFU.
     Connect {
         #[arg(long)]
         room: String,
-        /// Publish video (H.264 looper).
         #[arg(long)]
         publish: bool,
-        /// Use three simulcast layers when publishing.
         #[arg(long)]
         simulcast: bool,
-        /// Number of downstream video slots to open.
         #[arg(long, default_value_t = 7)]
         recv_video: usize,
-        /// Number of downstream audio slots to open.
         #[arg(long, default_value_t = 3)]
         recv_audio: usize,
     },
@@ -106,7 +91,6 @@ impl SharedState {
     }
 }
 
-/// How many consecutive silent ticks before a stream is considered inactive.
 const SILENT_TICKS_THRESHOLD: u32 = 3;
 
 #[derive(Default, Debug, PartialEq)]
@@ -125,7 +109,7 @@ pub struct AgentDelta {
 
 #[derive(Debug)]
 pub struct AgentStatReport {
-    pub rtt_ms: Option<u128>,
+    pub rtt: Option<Duration>,
     pub delta: AgentDelta,
 }
 
@@ -133,8 +117,8 @@ pub struct AgentStatReport {
 pub struct StatsProcessor {
     prev_tx_bytes: u64,
     prev_rx_bytes: u64,
-    prev_tx_layers: HashMap<String, LayerState>,
-    prev_rx_layers: HashMap<String, LayerState>,
+    prev_tx_layers: HashMap<(Mid, Option<Rid>), LayerState>,
+    prev_rx_layers: HashMap<(Mid, Option<Rid>), LayerState>,
 }
 
 #[derive(Default, Clone)]
@@ -150,8 +134,8 @@ impl StatsProcessor {
         &mut self,
         tx_bytes: u64,
         rx_bytes: u64,
-        tx_layers: impl Iterator<Item = (String, u64, u64, u64)>,
-        rx_layers: impl Iterator<Item = (String, u64, u64, u64, Option<f32>)>,
+        tx_layers: impl Iterator<Item = (Mid, Option<Rid>, u64, u64, u64)>,
+        rx_layers: impl Iterator<Item = (Mid, Option<Rid>, u64, u64, u64, Option<f32>)>,
     ) -> AgentDelta {
         let mut delta = AgentDelta::default();
 
@@ -160,8 +144,8 @@ impl StatsProcessor {
         self.prev_tx_bytes = tx_bytes;
         self.prev_rx_bytes = rx_bytes;
 
-        for (key, packets, nacks, plis) in tx_layers {
-            let prev = self.prev_tx_layers.entry(key).or_default();
+        for (mid, rid, packets, nacks, plis) in tx_layers {
+            let prev = self.prev_tx_layers.entry((mid, rid)).or_default();
             let d_packets = packets.saturating_sub(prev.packets);
             delta.tx_nacks += nacks.saturating_sub(prev.nacks);
             delta.tx_plis += plis.saturating_sub(prev.plis);
@@ -179,8 +163,8 @@ impl StatsProcessor {
             prev.plis = plis;
         }
 
-        for (key, packets, nacks, plis, loss) in rx_layers {
-            let prev = self.prev_rx_layers.entry(key).or_default();
+        for (mid, rid, packets, nacks, plis, loss) in rx_layers {
+            let prev = self.prev_rx_layers.entry((mid, rid)).or_default();
             let d_packets = packets.saturating_sub(prev.packets);
             delta.rx_nacks += nacks.saturating_sub(prev.nacks);
             delta.rx_plis += plis.saturating_sub(prev.plis);
@@ -206,49 +190,9 @@ impl StatsProcessor {
     }
 }
 
-#[derive(Default)]
-struct LatencyHistogram {
-    buckets: [u64; 12],
-    count: u64,
-    sum: u128,
-}
-
-impl LatencyHistogram {
-    fn record(&mut self, ms: u128) {
-        self.sum += ms;
-        self.count += 1;
-        let bucket = if ms == 0 {
-            0
-        } else {
-            ((ms as f64).log2().ceil() as usize).min(11)
-        };
-        self.buckets[bucket] += 1;
-    }
-
-    fn percentile(&self, p: f64) -> u64 {
-        let target = (self.count as f64 * p / 100.0).ceil() as u64;
-        let mut acc = 0u64;
-        for (i, &b) in self.buckets.iter().enumerate() {
-            acc += b;
-            if acc >= target {
-                return if i == 0 { 1 } else { 1u64 << i };
-            }
-        }
-        1024
-    }
-
-    fn mean(&self) -> u128 {
-        if self.count == 0 {
-            0
-        } else {
-            self.sum / self.count as u128
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
+#[derive(Parser)]
+#[allow(dead_code)]
+struct FakeUnused {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -328,7 +272,7 @@ async fn run_bench(
     output_format: OutputFormat,
     fixed_session: bool,
 ) -> Result<()> {
-    let (stats_tx, stats_rx) = mpsc::channel::<AgentStatReport>(16_000);
+    let (stats_tx, stats_rx) = mpsc::channel::<AgentStatReport>(64_000);
     let state = SharedState::new();
     let mut join_set = JoinSet::new();
     let room_counter = Arc::new(AtomicUsize::new(0));
@@ -338,16 +282,16 @@ async fn run_bench(
             "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
         );
         println!(
-            "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                                 │"
+            "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                                  │"
         );
         println!(
-            "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬───────┬───────┬────────┬────────┬─────────┬─────────┤"
+            "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬─────────┬─────────┤"
         );
         println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ p50ms │ p99ms │ p999ms │ meanms │ Tx Actv │ Rx Actv │"
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ TWCC50  │ TWCC95  │ TWCC99  │ Tx Actv │ Rx Actv │"
         );
         println!(
-            "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼───────┼───────┼────────┼────────┼─────────┼─────────┤"
+            "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼─────────┼─────────┤"
         );
     }
 
@@ -373,8 +317,6 @@ async fn run_bench(
         total_rooms += 1;
     }
 
-    // Poisson room arrivals: draw exponential inter-arrival times so room
-    // creation events are independent and memoryless rather than periodic.
     loop {
         let u = (rand::random_range(1u64..u64::MAX) as f64) / (u64::MAX as f64);
         let delay = Duration::from_secs_f64((-u.ln() / arrival_rate).max(0.001));
@@ -419,7 +361,7 @@ async fn run_bench(
 
     if matches!(output_format, OutputFormat::Human) {
         println!(
-            "├───────┴───────┴────────┴─────────┴─────────┴────────┴────────┴────────┴────────┴────────┴───────┴───────┴────────┴────────┴─────────┴─────────┤"
+            "├───────┴───────┴────────┴─────────┴─────────┴────────┴────────┴────────┴────────┴────────┴─────────┴─────────┴─────────┴─────────┴─────────┤"
         );
         println!(
             "│ {:<140} │",
@@ -469,11 +411,8 @@ async fn spawn_room(
         let tx = stats_tx.clone();
         let st = state.clone();
 
-        // Participants join uniformly within the first join_spread_secs seconds,
-        // simulating people arriving gradually rather than all at once.
         let join_delay_ms = rand::random_range(0u64..(join_spread_secs * 1_000).max(1));
 
-        // Session duration: exponential (default) or fixed.
         let duration_secs = if fixed_session {
             session_duration.max(30)
         } else {
@@ -505,8 +444,6 @@ async fn spawn_room(
     }
 
     let room_state = state.clone();
-    // Expire the room counter after join_spread + 5× mean session duration
-    // (covers >99% of exponential session tail).
     let expire_after = Duration::from_secs(join_spread_secs + session_duration * 5 + 10);
     join_set.spawn(async move {
         tokio::time::sleep(expire_after).await;
@@ -535,33 +472,19 @@ async fn monitor_task(
     let mut rx_loss_sum = 0.0f32;
     let mut rx_loss_count = 0usize;
 
-    let mut rtt_hist = LatencyHistogram::default();
+    let mut rtt_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
     let mut consecutive_high_p99 = 0u32;
     let mut consecutive_high_loss = 0u32;
 
     if matches!(output_format, OutputFormat::Csv) {
         println!(
-            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,rtt_p50_ms,rtt_p99_ms,rtt_p999_ms,rtt_mean_ms,tx_active,rx_active"
+            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,twcc_p50_ms,twcc_p95_ms,twcc_p99_ms,tx_active,rx_active"
         );
     }
 
     loop {
         tokio::select! {
-            Some(report) = stats_rx.recv() => {
-                if let Some(rtt) = report.rtt_ms {
-                    rtt_hist.record(rtt);
-                }
-                tx_bytes += report.delta.tx_bytes;
-                rx_bytes += report.delta.rx_bytes;
-                tx_nacks += report.delta.tx_nacks;
-                rx_nacks += report.delta.rx_nacks;
-                tx_plis += report.delta.tx_plis;
-                rx_plis += report.delta.rx_plis;
-                tx_active_streams += report.delta.tx_active;
-                rx_active_streams += report.delta.rx_active;
-                rx_loss_sum += report.delta.rx_loss_sum;
-                rx_loss_count += report.delta.rx_loss_count;
-            }
+            biased;
 
             _ = interval.tick() => {
                 let elapsed = start.elapsed().as_secs();
@@ -573,10 +496,9 @@ async fn monitor_task(
                 let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let p50  = rtt_hist.percentile(50.0);
-                let p99  = rtt_hist.percentile(99.0);
-                let p999 = rtt_hist.percentile(99.9);
-                let mean = rtt_hist.mean();
+                let p50 = rtt_hist.value_at_quantile(0.50) as f64 / 1000.0;
+                let p95 = rtt_hist.value_at_quantile(0.95) as f64 / 1000.0;
+                let p99 = rtt_hist.value_at_quantile(0.99) as f64 / 1000.0;
 
                 let avg_loss_pct = if rx_loss_count > 0 {
                     rx_loss_sum / rx_loss_count as f32 * 100.0
@@ -587,27 +509,27 @@ async fn monitor_task(
                 match output_format {
                     OutputFormat::Human => {
                         println!(
-                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>5} │ {:>5} │ {:>6} │ {:>6} │ {:>7} │ {:>7} │",
+                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │ {:>7.3} │ {:>7.3} │ {:>7.3} │ {:>7} │ {:>7} │",
                             elapsed, rooms, agents,
                             tx_mbps, rx_mbps, avg_loss_pct,
                             tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50, p99, p999, mean,
+                            p50, p95, p99,
                             tx_active_streams, rx_active_streams,
                         );
                     }
                     OutputFormat::Csv => {
                         println!(
-                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{},{},{},{},{},{}",
+                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{:.3},{:.3},{:.3},{},{}",
                             elapsed, rooms, agents,
                             tx_mbps, rx_mbps, avg_loss_pct,
                             tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50, p99, p999, mean,
+                            p50, p95, p99,
                             tx_active_streams, rx_active_streams,
                         );
                     }
                 }
 
-                if p99 > 300 {
+                if p99 > 300.0 {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
                         state.degraded.store(true, Ordering::Relaxed);
@@ -631,6 +553,28 @@ async fn monitor_task(
                 tx_active_streams  = 0; rx_active_streams = 0;
                 rx_loss_sum = 0.0; rx_loss_count = 0;
                 rtt_hist.reset();
+            }
+
+            Some(report) = stats_rx.recv() => {
+                if let Some(rtt) = report.rtt {
+                    // Note: this RTT is derived from TWCC feedback latency,
+                    // i.e. the time between sending a packet and receiving the
+                    // corresponding transport feedback report. It is not the
+                    // same as WebRTC ICE candidate pair currentRoundTripTime.
+                    let rtt_micros = rtt.as_micros();
+                    tracing::info!("{}ms", rtt.as_millis());
+                    let _ = rtt_hist.record(rtt_micros as u64);
+                }
+                tx_bytes += report.delta.tx_bytes;
+                rx_bytes += report.delta.rx_bytes;
+                tx_nacks += report.delta.tx_nacks;
+                rx_nacks += report.delta.rx_nacks;
+                tx_plis += report.delta.tx_plis;
+                rx_plis += report.delta.rx_plis;
+                tx_active_streams += report.delta.tx_active;
+                rx_active_streams += report.delta.rx_active;
+                rx_loss_sum += report.delta.rx_loss_sum;
+                rx_loss_count += report.delta.rx_loss_count;
             }
         }
     }
@@ -697,25 +641,25 @@ async fn spawn_agent(
                 let Some(stats) = agent.get_stats().await else { continue };
 
                 let peer = stats.peer.as_ref();
-                let rtt_ms = peer.and_then(|p| p.rtt).map(|r| r.as_millis());
+                let rtt = peer.and_then(|p| p.rtt).map(|r| r);
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
                 let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.tx_layers.iter().map(move |(rid, egress)| {
-                        (format!("tx_{}_{}", mid, rid_key(rid)), egress.packets, egress.nacks, egress.plis)
+                        (mid.clone(), rid.clone(), egress.packets, egress.nacks, egress.plis)
                     })
                 });
 
                 let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.rx_layers.iter().map(move |(rid, ingress)| {
-                        (format!("rx_{}_{}", mid, rid_key(rid)), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                        (mid.clone(), rid.clone(), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
                     })
                 });
 
                 let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
-                if stats_tx.try_send(AgentStatReport { rtt_ms, delta }).is_err() {
+                if stats_tx.try_send(AgentStatReport { rtt, delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
                 }
             }
@@ -725,29 +669,6 @@ async fn spawn_agent(
     Ok(())
 }
 
-fn rid_key(rid: &Option<Rid>) -> String {
-    rid.as_ref()
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-async fn handle_local_track(track: LocalTrack) {
-    if track.kind.is_audio() {
-        return;
-    }
-
-    let rid_str = track.rid.as_ref().map(|r| r.as_ref());
-    let data = match rid_str {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        Some("q") => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
-        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
-    };
-    let looper = H264Looper::new(data, 30);
-    looper.run(track).await;
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_connect(
     api_url: String,
     room: String,
@@ -792,14 +713,14 @@ async fn run_connect(
     );
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
-        "{:>8} {:>8} {:>8} {:>9} {:>9} {:>9}  streams (tx/rx)",
-        "time(s)", "tx_mbps", "rx_mbps", "rtt_p50ms", "rtt_p99ms", "loss%"
+        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>9}  streams (tx/rx)",
+        "time(s)", "tx_mbps", "rx_mbps", "TWCC50ms", "TWCC95ms", "TWCC99ms", "loss%"
     );
 
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
-    let mut rtt_hist = LatencyHistogram::default();
+    let mut rtt_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
 
     loop {
         tokio::select! {
@@ -827,8 +748,8 @@ async fn run_connect(
                 let Some(stats) = agent.get_stats().await else { continue };
 
                 let peer = stats.peer.as_ref();
-                if let Some(rtt) = peer.and_then(|p| p.rtt).map(|r| r.as_millis()) {
-                    rtt_hist.record(rtt);
+                if let Some(micros) = peer.and_then(|p| p.rtt).map(|r| r.as_micros() as u64) {
+                    let _ = rtt_hist.record(micros);
                 }
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
@@ -836,13 +757,13 @@ async fn run_connect(
 
                 let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.tx_layers.iter().map(move |(rid, egress)| {
-                        (format!("tx_{}_{}", mid, rid_key(rid)), egress.packets, egress.nacks, egress.plis)
+                        (mid.clone(), rid.clone(), egress.packets, egress.nacks, egress.plis)
                     })
                 });
 
                 let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.rx_layers.iter().map(move |(rid, ingress)| {
-                        (format!("rx_{}_{}", mid, rid_key(rid)), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                        (mid.clone(), rid.clone(), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
                     })
                 });
 
@@ -851,8 +772,9 @@ async fn run_connect(
                 let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let p50 = rtt_hist.percentile(50.0);
-                let p99 = rtt_hist.percentile(99.0);
+                let p50 = rtt_hist.value_at_quantile(0.50) as f64 / 1000.0;
+                let p95 = rtt_hist.value_at_quantile(0.95) as f64 / 1000.0;
+                let p99 = rtt_hist.value_at_quantile(0.99) as f64 / 1000.0;
                 rtt_hist.reset();
 
                 let avg_loss_pct = if delta.rx_loss_count > 0 {
@@ -861,14 +783,30 @@ async fn run_connect(
                     0.0
                 };
 
-                eprintln!("{:>8} {:>8.2} {:>8.2} {:>9} {:>9} {:>8.1}%  {}/{}",
-                          elapsed, tx_mbps, rx_mbps, p50, p99, avg_loss_pct,
+                eprintln!("{:>8} {:>8.2} {:>8.2} {:>10.3} {:>10.3} {:>10.3} {:>8.1}%  {}/{}",
+                          elapsed, tx_mbps, rx_mbps, p50, p95, p99, avg_loss_pct,
                           delta.tx_active, delta.rx_active);
             }
         }
     }
 
     Ok(())
+}
+
+async fn handle_local_track(track: LocalTrack) {
+    if track.kind.is_audio() {
+        return;
+    }
+
+    let rid_str = track.rid.as_ref().map(|r| r.as_ref());
+    let data = match rid_str {
+        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
+        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
+        Some("q") => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+    };
+    let looper = H264Looper::new(data, 30);
+    let _ = looper.run(track).await;
 }
 
 #[cfg(test)]
@@ -879,8 +817,8 @@ mod tests {
     fn test_stats_processor_deltas() {
         let mut p = StatsProcessor::default();
 
-        let tx_layers = vec![("tx_1".to_string(), 100, 1, 2)];
-        let rx_layers = vec![("rx_1".to_string(), 200, 3, 4, Some(0.05))];
+        let tx_layers = vec![(Mid::from("track_1"), None, 100, 1, 2)];
+        let rx_layers = vec![(Mid::from("track_2"), None, 200, 3, 4, Some(0.05))];
 
         let delta = p.process(1000, 2000, tx_layers.into_iter(), rx_layers.into_iter());
 
@@ -894,29 +832,5 @@ mod tests {
         assert_eq!(delta.rx_active, 1);
         assert_eq!(delta.rx_loss_sum, 0.05);
         assert_eq!(delta.rx_loss_count, 1);
-
-        // Next tick: no new packets, still active due to grace period
-        let tx_layers2 = vec![("tx_1".to_string(), 100, 1, 2)];
-        let rx_layers2 = vec![("rx_1".to_string(), 200, 3, 4, Some(0.05))];
-
-        let delta2 = p.process(1000, 2000, tx_layers2.into_iter(), rx_layers2.into_iter());
-        assert_eq!(delta2.tx_bytes, 0);
-        assert_eq!(delta2.tx_active, 1);
-    }
-
-    #[test]
-    fn test_silent_ticks() {
-        let mut p = StatsProcessor::default();
-
-        for i in 0..SILENT_TICKS_THRESHOLD {
-            let tx = vec![("tx_1".to_string(), 100, 0, 0)];
-            let delta = p.process(0, 0, tx.into_iter(), std::iter::empty());
-            assert_eq!(delta.tx_active, 1, "tick {}", i);
-        }
-
-        // Silent longer than threshold -> inactive
-        let tx = vec![("tx_1".to_string(), 100, 0, 0)];
-        let delta = p.process(0, 0, tx.into_iter(), std::iter::empty());
-        assert_eq!(delta.tx_active, 0);
     }
 }
