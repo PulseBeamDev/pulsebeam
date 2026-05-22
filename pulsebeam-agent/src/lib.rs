@@ -1,9 +1,9 @@
 pub use bytes::Bytes;
+use std::time::SystemTime;
 pub use str0m;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;
 pub use str0m::media::{MediaData, MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
-use std::time::SystemTime;
 use tokio::time::Instant;
 
 pub mod clock;
