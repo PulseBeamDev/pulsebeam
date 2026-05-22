@@ -14,11 +14,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
-use pulsebeam_proto::rtp_extensions;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{KeyframeRequestKind, Rid, Simulcast, SimulcastLayer};
-use str0m::rtp::Extension;
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid},
@@ -526,7 +524,6 @@ impl AgentBuilder {
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
             .enable_bwe(Some(Bitrate::kbps(300)))
-            .set_extension(rtp_extensions::ABS_CAPTURE_TIME, Extension::AbsoluteCaptureTime)
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
