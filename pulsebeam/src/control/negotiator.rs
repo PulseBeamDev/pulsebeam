@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use pulsebeam_proto::rtp_extensions;
 use str0m::{
     Candidate, IceCreds, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
     format::{Codec, FormatParams},
     media::{Direction, Frequency, MediaKind, Pt},
+    rtp::Extension,
 };
 use tokio::time::Instant;
 
@@ -91,6 +93,7 @@ impl Negotiator {
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
             .set_rtp_mode(true)
+            .set_extension(rtp_extensions::ABS_CAPTURE_TIME, Extension::AbsoluteCaptureTime)
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))

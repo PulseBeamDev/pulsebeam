@@ -2,7 +2,7 @@ pub use bytes::Bytes;
 pub use str0m;
 pub use str0m::Candidate;
 pub use str0m::IceConnectionState;
-pub use str0m::media::{MediaData, MediaKind, MediaTime, Rid, SimulcastLayer};
+pub use str0m::media::{MediaData, MediaKind, MediaTime, Mid, Rid, SimulcastLayer};
 use tokio::time::Instant;
 
 pub mod actor;
