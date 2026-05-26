@@ -18,7 +18,7 @@ use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::media::{KeyframeRequestKind, Rid, Simulcast, SimulcastLayer};
-use str0m::rtp::Extension;
+use str0m::rtp::{AbsCaptureTime, Extension};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     media::{Direction, MediaAdded, MediaKind, Mid},
@@ -946,7 +946,10 @@ impl AgentActor {
                                 writer = writer.rid(rid);
                             }
                             if let Some(abs_capture_time) = frame.abs_capture_time {
-                                writer = writer.abs_capture_time(abs_capture_time);
+                                writer = writer.abs_capture_time(AbsCaptureTime {
+                                    capture_time: abs_capture_time,
+                                    clock_offset: None,
+                                });
                             }
                             let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                         } else {
