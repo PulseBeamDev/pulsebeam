@@ -26,7 +26,6 @@ pub struct RecvPacketBatch {
     pub src: SocketAddr,
     pub dst: SocketAddr,
     pub buf: Vec<u8>,
-    pub offset: usize,
     pub stride: usize,
     pub len: usize,
     pub transport: Transport,
@@ -36,18 +35,7 @@ impl RecvPacketBatch {
     /// Returns the exact byte slice for this packet (accounts for `offset`).
     #[inline]
     pub fn data(&self) -> &[u8] {
-        debug_assert!(
-            self.offset <= self.buf.len(),
-            "RecvPacketBatch.offset is out of bounds"
-        );
-        debug_assert!(
-            self.len <= self.buf.len().saturating_sub(self.offset),
-            "RecvPacketBatch.len is out of bounds"
-        );
-        match self.offset.checked_add(self.len) {
-            Some(end) => self.buf.get(self.offset..end).unwrap_or(&[]),
-            None => &[],
-        }
+        &self.buf
     }
 
     pub fn iter(&self) -> RecvPacketBatchIter<'_> {
@@ -73,34 +61,21 @@ pub struct RecvPacketBatchIter<'a> {
 }
 
 impl<'a> Iterator for RecvPacketBatchIter<'a> {
-    // Zero-copy: yields borrowed slices directly into the shared Bytes buffer.
-    // No atomic operations — the refcount on `batch.buf` is already held by
-    // the RecvPacketBatch owner for the duration of the iteration.
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.batch.len {
-            return None;
-        }
-        let remaining = self.batch.len - self.offset;
-        // stride == 0 means a single non-GRO datagram: treat as one segment.
-        let stride = if self.batch.stride == 0 {
-            self.batch.len
-        } else {
-            self.batch.stride
-        };
-        let seg_len = std::cmp::min(stride, remaining);
-        if seg_len == 0 {
-            return None;
-        }
-        let abs_start = self.batch.offset + self.offset;
-        let abs_end = abs_start.checked_add(seg_len)?;
-        if abs_end > self.batch.buf.len() {
+        assert!(
+            self.batch.stride != 0,
+            "stride must not be zero in iteration"
+        );
+        let tail = self.batch.len.min(self.offset + self.batch.stride);
+        if self.offset >= tail {
             return None;
         }
 
-        self.offset += seg_len;
-        Some(&self.batch.buf[abs_start..abs_end])
+        let buf = &self.batch.buf[self.offset..tail];
+        self.offset = tail;
+        Some(buf)
     }
 }
 
@@ -225,27 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn recv_packet_batch_data_returns_exact_slice() {
-        let batch = RecvPacketBatch {
-            src: test_addr(),
-            dst: test_addr(),
-            buf: vec![1, 2, 3, 4, 5],
-            offset: 1,
-            stride: 0,
-            len: 3,
-            transport: Transport::Udp(UdpMode::Scalar),
-        };
-
-        assert_eq!(batch.data(), &[2, 3, 4]);
-    }
-
-    #[test]
     fn recv_packet_batch_iter_yields_multiple_segments_without_off_by_one() {
         let batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
             buf: (0u8..20).collect(),
-            offset: 0,
             stride: 6,
             len: 20,
             transport: Transport::Udp(UdpMode::Scalar),
@@ -260,19 +219,20 @@ mod tests {
     }
 
     #[test]
-    fn recv_packet_batch_iter_single_segment_stride_zero() {
+    fn recv_packet_batch_iter_yields_multiple_segments_with_exact_len() {
         let batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
-            buf: (0u8..10).collect(),
-            offset: 0,
-            stride: 0,
-            len: 10,
+            buf: (0u8..20).collect(),
+            stride: 6,
+            len: 18,
             transport: Transport::Udp(UdpMode::Scalar),
         };
 
         let chunks: Vec<&[u8]> = batch.iter().collect();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(chunks[1], &[6, 7, 8, 9, 10, 11]);
+        assert_eq!(chunks[2], &[12, 13, 14, 15, 16, 17]);
     }
 }

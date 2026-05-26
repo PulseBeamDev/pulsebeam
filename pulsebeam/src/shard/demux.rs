@@ -809,7 +809,6 @@ mod demux_tests {
             src,
             dst: "0.0.0.0:0".parse().unwrap(),
             buf: data,
-            offset: 0,
             stride: len,
             len,
             transport: Transport::Udp(pulsebeam_runtime::net::UdpMode::Scalar),

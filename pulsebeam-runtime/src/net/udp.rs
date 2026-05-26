@@ -147,45 +147,18 @@ impl UdpTransportReader {
                     for i in 0..count {
                         let m = &self.meta[i];
                         let base = i * CHUNK_SIZE;
+                        assert!(m.stride != 0, "gro stride can't be zero");
+                        let tail = self.batch_buffer.len().min(base + m.len);
+                        let buf = &self.batch_buffer[base..tail];
 
-                        // stride == 0 means a single non-GRO datagram.
-                        let stride = if m.stride == 0 { m.len } else { m.stride };
-                        if stride == 0 {
-                            continue;
-                        }
-
-                        debug_assert!(m.len <= CHUNK_SIZE, "RecvMeta.len exceeds UDP chunk size");
-                        debug_assert!(
-                            m.stride <= CHUNK_SIZE,
-                            "RecvMeta.stride exceeds UDP chunk size"
-                        );
-                        debug_assert!(base + m.len <= self.batch_buffer.len());
-                        if base + m.len > self.batch_buffer.len() {
-                            continue;
-                        }
-
-                        // Iterate GRO segments: each becomes one pool slot + RecvPacketBatch.
-                        // One memcpy per segment is unavoidable when de-bundling GRO;
-                        // the batch_buffer itself is reused across calls (no allocation).
-                        let mut seg_off = 0;
-                        while seg_off < m.len {
-                            let seg_len = stride.min(m.len - seg_off);
-                            debug_assert!(
-                                seg_len > 0,
-                                "computed UDP segment length must be nonzero"
-                            );
-                            let src = &self.batch_buffer[base + seg_off..base + seg_off + seg_len];
-                            out.push(RecvPacketBatch {
-                                src: m.addr,
-                                dst: self.local_addr,
-                                buf: src.to_vec(),
-                                offset: 0,
-                                stride: seg_len,
-                                len: seg_len,
-                                transport: Transport::Udp(UdpMode::Batch),
-                            });
-                            seg_off += stride;
-                        }
+                        out.push(RecvPacketBatch {
+                            src: m.addr,
+                            dst: self.local_addr,
+                            buf: buf.to_vec(), // Contains the entire GRO block
+                            stride: m.stride,  // Downstream will use this to skip through buf
+                            len: m.len,        // Total length of the GRO batch
+                            transport: Transport::Udp(UdpMode::Batch),
+                        });
                     }
                     Ok(out.len() - prev_len)
                 }

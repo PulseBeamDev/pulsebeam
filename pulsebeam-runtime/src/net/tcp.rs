@@ -452,7 +452,6 @@ impl TcpTransport {
                     src,
                     dst: local_addr,
                     buf: payload,
-                    offset: 0,
                     stride: len,
                     len,
                     transport: Transport::Tcp,

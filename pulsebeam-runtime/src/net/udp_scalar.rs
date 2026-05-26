@@ -98,7 +98,6 @@ impl UdpTransportReader {
                     src: source,
                     dst: self.local_addr,
                     buf: slot,
-                    offset: 0,
                     stride: 0,
                     len: n,
                 });
