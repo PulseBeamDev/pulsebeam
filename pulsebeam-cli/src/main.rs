@@ -289,7 +289,7 @@ async fn run_bench(
             "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬─────────┬─────────┤"
         );
         println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50us │ FWD95us │ FWD99us │ Tx Actv │ Rx Actv │"
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50ms │ FWD95ms │ FWD99ms │ Tx Actv │ Rx Actv │"
         );
         println!(
             "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼─────────┼─────────┤"
@@ -323,14 +323,14 @@ async fn run_bench(
         let delay = Duration::from_secs_f64((-u.ln() / arrival_rate).max(0.001));
         tokio::time::sleep(delay).await;
 
-        if state.degraded.load(Ordering::Relaxed) {
-            if matches!(output_format, OutputFormat::Human) {
-                println!("│ {:<140} │", "⚠  DEGRADATION DETECTED — stopping ramp");
-            } else {
-                eprintln!("DEGRADATION DETECTED — stopping ramp");
-            }
-            break;
-        }
+        // if state.degraded.load(Ordering::Relaxed) {
+        //     if matches!(output_format, OutputFormat::Human) {
+        //         println!("│ {:<140} │", "⚠  DEGRADATION DETECTED — stopping ramp");
+        //     } else {
+        //         eprintln!("DEGRADATION DETECTED — stopping ramp");
+        //     }
+        //     break;
+        // }
         if total_rooms >= max_rooms {
             if matches!(output_format, OutputFormat::Human) {
                 println!(
@@ -480,7 +480,7 @@ async fn monitor_task(
 
     if matches!(output_format, OutputFormat::Csv) {
         println!(
-            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_us,fwd_p95_us,fwd_p99_us,tx_active,rx_active"
+            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,tx_active,rx_active"
         );
     }
 
@@ -500,9 +500,9 @@ async fn monitor_task(
 
                 let (p50, p95, p99) = if fwd_has_samples {
                     (
-                        Some(fwd_hist.value_at_quantile(0.50) as f64),
-                        Some(fwd_hist.value_at_quantile(0.95) as f64),
-                        Some(fwd_hist.value_at_quantile(0.99) as f64),
+                        Some(fwd_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                        Some(fwd_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                        Some(fwd_hist.value_at_quantile(0.99) as f64 /1000.0),
                     )
                 } else {
                     (None, None, None)
@@ -529,9 +529,9 @@ async fn monitor_task(
                         );
                     }
                     OutputFormat::Csv => {
-                        let p50_str = p50.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "NA".to_string());
-                        let p95_str = p95.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "NA".to_string());
-                        let p99_str = p99.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "NA".to_string());
+                        let p50_str = p50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                        let p95_str = p95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                        let p99_str = p99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
                         println!(
                             "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{},{},{},{},{}",
                             elapsed, rooms, agents,
