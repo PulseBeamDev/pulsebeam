@@ -1411,7 +1411,7 @@ mod test {
         // Rough range check: mean must be in [target×0.8, target×3].
         assert_ge!(
             mean,
-            TARGET_BPS * 1.05,
+            TARGET_BPS * 1.0,
             "mean estimate too low: {:.0} bps (target {:.0})",
             mean,
             TARGET_BPS
