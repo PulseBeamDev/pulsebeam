@@ -291,6 +291,7 @@ impl ControllerActor {
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300)))
+            .set_extension(9, str0m::rtp::Extension::AbsoluteCaptureTime)
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
             // enable for compatibility, some clients don't support remote ice-lite
