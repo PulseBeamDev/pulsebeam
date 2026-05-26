@@ -535,7 +535,7 @@ mod internal {
 
         let router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
-            .route("/debug/pprof/allocs", get(heap_profile))
+            // .route("/debug/pprof/allocs", get(heap_profile))
             .route("/healthz", get(healthcheck))
             .route("/", get(async move || Html(INDEX_HTML)))
             .route("/metrics", get(async move || scrape_to_prometheus()));
@@ -688,63 +688,63 @@ mod internal {
         }
     }
 
-    pub async fn heap_profile(
-        Query(params): Query<ProfileParams>,
-    ) -> Result<Response, (StatusCode, String)> {
-        // Safe access to jemalloc control
-        let mut prof_ctl = match jemalloc_pprof::PROF_CTL.as_ref() {
-            Some(ctl) => ctl.lock().await,
-            None => {
-                return Err((
-                    StatusCode::NOT_IMPLEMENTED,
-                    "Jemalloc not enabled or configured".to_string(),
-                ));
-            }
-        };
-
-        require_profiling_activated(&prof_ctl)?;
-
-        let resp = if params.flamegraph {
-            let svg = prof_ctl
-                .dump_flamegraph()
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-            (
-                StatusCode::OK,
-                [
-                    (CONTENT_TYPE, "image/svg+xml"),
-                    (CONTENT_DISPOSITION, "attachment; filename=allocs.svg"),
-                ],
-                svg,
-            )
-                .into_response()
-        } else {
-            let pprof = prof_ctl
-                .dump_pprof()
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-            (
-                StatusCode::OK,
-                [
-                    (CONTENT_TYPE, "application/octet-stream"),
-                    (CONTENT_DISPOSITION, "attachment; filename=allocs.pprof"),
-                ],
-                pprof,
-            )
-                .into_response()
-        };
-        Ok(resp)
-    }
-
-    fn require_profiling_activated(
-        prof_ctl: &jemalloc_pprof::JemallocProfCtl,
-    ) -> Result<(), (StatusCode, String)> {
-        if prof_ctl.activated() {
-            Ok(())
-        } else {
-            Err((StatusCode::FORBIDDEN, "heap profiling not activated".into()))
-        }
-    }
+    // pub async fn heap_profile(
+    //     Query(params): Query<ProfileParams>,
+    // ) -> Result<Response, (StatusCode, String)> {
+    //     // Safe access to jemalloc control
+    //     let mut prof_ctl = match jemalloc_pprof::PROF_CTL.as_ref() {
+    //         Some(ctl) => ctl.lock().await,
+    //         None => {
+    //             return Err((
+    //                 StatusCode::NOT_IMPLEMENTED,
+    //                 "Jemalloc not enabled or configured".to_string(),
+    //             ));
+    //         }
+    //     };
+    //
+    //     require_profiling_activated(&prof_ctl)?;
+    //
+    //     let resp = if params.flamegraph {
+    //         let svg = prof_ctl
+    //             .dump_flamegraph()
+    //             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    //
+    //         (
+    //             StatusCode::OK,
+    //             [
+    //                 (CONTENT_TYPE, "image/svg+xml"),
+    //                 (CONTENT_DISPOSITION, "attachment; filename=allocs.svg"),
+    //             ],
+    //             svg,
+    //         )
+    //             .into_response()
+    //     } else {
+    //         let pprof = prof_ctl
+    //             .dump_pprof()
+    //             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    //
+    //         (
+    //             StatusCode::OK,
+    //             [
+    //                 (CONTENT_TYPE, "application/octet-stream"),
+    //                 (CONTENT_DISPOSITION, "attachment; filename=allocs.pprof"),
+    //             ],
+    //             pprof,
+    //         )
+    //             .into_response()
+    //     };
+    //     Ok(resp)
+    // }
+    //
+    // fn require_profiling_activated(
+    //     prof_ctl: &jemalloc_pprof::JemallocProfCtl,
+    // ) -> Result<(), (StatusCode, String)> {
+    //     if prof_ctl.activated() {
+    //         Ok(())
+    //     } else {
+    //         Err((StatusCode::FORBIDDEN, "heap profiling not activated".into()))
+    //     }
+    // }
 
     async fn pprof_profile(
         Query(params): Query<ProfileParams>,

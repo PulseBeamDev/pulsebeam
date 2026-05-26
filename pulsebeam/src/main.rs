@@ -11,10 +11,36 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// sampling every 32MB allocations
+// Reference:
+//   * https://jemalloc.net/jemalloc.3.html#opt.percpu_arena
+//   * https://github.com/jemalloc/jemalloc/blob/dev/TUNING.md
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"background_thread:false,max_background_threads:0,metadata_thp:disabled,dirty_decay_ms:10000,muzzy_decay_ms:30000,lg_tcache_max:13,abort_conf:true,prof:true,prof_active:true,lg_prof_sample:25\0";
+pub static malloc_conf: &[u8] = b"\
+    background_thread:true,\
+    lg_tcache_max:16,\
+    dirty_decay_ms:30000,\
+    muzzy_decay_ms:30000,\
+    metadata_thp:auto,\
+    prof:false,\
+    prof_active:false,\
+    abort_conf:true\
+    \0";
+
+// TODO: disabled heap profiler for now. This keeps causing latency spikes by a few ms.
+// #[allow(non_upper_case_globals)]
+// #[unsafe(export_name = "malloc_conf")]
+// pub static malloc_conf: &[u8] = b"\
+//     percpu_arena:percpu,\
+//     background_thread:true,\
+//     dirty_decay_ms:5000,\
+//     muzzy_decay_ms:5000,\
+//     metadata_thp:disabled,\
+//     prof:true,\
+//     prof_active:true,\
+//     lg_prof_sample:21,\
+//     abort_conf:true\
+//     \0";
 
 // use mimalloc::MiMalloc;
 //
