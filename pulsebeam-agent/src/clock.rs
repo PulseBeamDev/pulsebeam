@@ -7,6 +7,12 @@ pub struct ClockAnchor {
     system_time: SystemTime,
 }
 
+impl Default for ClockAnchor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClockAnchor {
     pub fn new() -> Self {
         let instant = Instant::now();

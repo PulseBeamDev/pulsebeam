@@ -543,7 +543,7 @@ async fn monitor_task(
                     }
                 }
 
-                if p99.map_or(false, |v| v > 300.0) {
+                if p99.is_some_and(|v| v > 300.0) {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
                         state.degraded.store(true, Ordering::Relaxed);
@@ -666,13 +666,13 @@ async fn spawn_agent(
 
                 let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.tx_layers.iter().map(move |(rid, egress)| {
-                        (mid.clone(), rid.clone(), egress.packets, egress.nacks, egress.plis)
+                        (*mid, *rid, egress.packets, egress.nacks, egress.plis)
                     })
                 });
 
                 let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.rx_layers.iter().map(move |(rid, ingress)| {
-                        (mid.clone(), rid.clone(), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                        (*mid, *rid, ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
                     })
                 });
 
@@ -789,13 +789,13 @@ async fn run_connect(
 
                 let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.tx_layers.iter().map(move |(rid, egress)| {
-                        (mid.clone(), rid.clone(), egress.packets, egress.nacks, egress.plis)
+                        (*mid, *rid, egress.packets, egress.nacks, egress.plis)
                     })
                 });
 
                 let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
                     track.rx_layers.iter().map(move |(rid, ingress)| {
-                        (mid.clone(), rid.clone(), ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                        (*mid, *rid, ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
                     })
                 });
 

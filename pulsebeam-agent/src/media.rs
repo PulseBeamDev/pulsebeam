@@ -1,6 +1,5 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use bytes::Bytes;
 use str0m::media::MediaTime;
 use tokio::sync::watch;
 
@@ -34,7 +33,7 @@ impl KeyframeReceiver {
 }
 
 pub struct H264Looper {
-    frames: Vec<Bytes>,
+    frames: Vec<Arc<[u8]>>,
     index: usize,
     fps: u32,
     // Index of the first IDR frame; seek here on keyframe reset.
@@ -44,7 +43,7 @@ pub struct H264Looper {
 impl H264Looper {
     pub fn new(data: &[u8], fps: u32) -> Self {
         let slicer = H264FrameSlicer::new(data);
-        let frames: Vec<Bytes> = slicer.map(Bytes::copy_from_slice).collect();
+        let frames: Vec<Arc<[u8]>> = slicer.map(Arc::from).collect();
         let first_idr = Self::find_first_idr(&frames);
         tracing::info!(frames = frames.len(), first_idr, "H264Looper ready");
         Self {
@@ -55,7 +54,7 @@ impl H264Looper {
         }
     }
 
-    fn find_first_idr(frames: &[Bytes]) -> usize {
+    fn find_first_idr(frames: &[Arc<[u8]>]) -> usize {
         frames
             .iter()
             .position(|f| Self::frame_has_idr(f))
@@ -86,7 +85,7 @@ impl H264Looper {
         false
     }
 
-    fn next(&mut self) -> Bytes {
+    fn next(&mut self) -> Arc<[u8]> {
         let frame = &self.frames[self.index];
         self.index = (self.index + 1) % self.frames.len();
         frame.clone()

@@ -864,7 +864,7 @@ impl AgentActor {
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
         // Periodic BWE reallocation tick (handles upgrade/recovery paths).
-        let mut bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
+        let _bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
         let reconnect_timer = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(reconnect_timer);
 

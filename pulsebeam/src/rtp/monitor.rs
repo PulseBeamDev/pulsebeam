@@ -1359,9 +1359,9 @@ mod test {
             let mut pkt = RtpPacket::default();
             pkt.arrival_ts = now;
             pkt.playout_time = now;
-            // Set payload so header_len + payload.len() == frame_bytes total.
-            pkt.payload
-                .resize(frame_bytes.saturating_sub(pkt.header_len), 0);
+            let payload_len = frame_bytes.saturating_sub(pkt.header_len);
+            pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
+
             bwe.record(&pkt);
 
             // Capture one sample per elapsed 500 ms window.
@@ -1524,7 +1524,8 @@ mod test {
             let mut pkt = RtpPacket::default();
             pkt.arrival_ts = now;
             pkt.playout_time = now;
-            pkt.payload.resize(sz.saturating_sub(pkt.header_len), 0);
+            let payload_len = sz.saturating_sub(pkt.header_len);
+            pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
             bwe.record(&pkt);
         }
         let post_active = bwe.estimate_bps();
@@ -1537,8 +1538,8 @@ mod test {
             let mut pkt = RtpPacket::default();
             pkt.arrival_ts = now;
             pkt.playout_time = now;
-            pkt.payload
-                .resize(IDLE_FRAME_BYTES.saturating_sub(pkt.header_len), 0);
+            let payload_len = IDLE_FRAME_BYTES.saturating_sub(pkt.header_len);
+            pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
             bwe.record(&pkt);
             bwe.poll(now);
             idle_samples.push(bwe.estimate_bps());
