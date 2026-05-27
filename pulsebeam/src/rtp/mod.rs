@@ -4,6 +4,7 @@ pub mod switcher;
 pub mod sync;
 pub mod timeline;
 
+use std::sync::Arc;
 use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::rtcp::SenderInfo;
 use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
@@ -51,7 +52,7 @@ pub struct RtpPacket {
     /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Instant,
     pub is_keyframe: bool,
-    pub payload: Vec<u8>,
+    pub payload: Arc<[u8]>,
 }
 
 impl Default for RtpPacket {
@@ -66,7 +67,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe: false,
-            payload: vec![0u8; 1200], // 1.2KB payload for test realism
+            payload: Arc::new([0u8; 1200]), // 1.2KB payload for test realism
         }
     }
 }
@@ -99,6 +100,21 @@ impl RtpPacket {
             payload: rtp.payload,
         };
         (pkt, sr)
+    }
+
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            ssrc: self.ssrc,
+            marker: self.marker,
+            ext_vals: self.ext_vals.clone(),
+            header_len: self.header_len,
+            seq_no: self.seq_no,
+            rtp_ts: self.rtp_ts,
+            arrival_ts: self.arrival_ts,
+            playout_time: self.playout_time,
+            is_keyframe: self.is_keyframe,
+            payload: Arc::from(&self.payload[..]),
+        }
     }
 
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {

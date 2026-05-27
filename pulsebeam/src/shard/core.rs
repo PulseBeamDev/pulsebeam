@@ -638,7 +638,7 @@ pub(super) fn handle_rtp(
                     shard_id,
                     CrossShardEvent::RtpPublished {
                         stream_id,
-                        pkt: pkt.clone(),
+                        pkt: pkt.deep_clone(),
                     },
                 );
             }

@@ -490,7 +490,7 @@ mod internal {
     use axum::{
         Router,
         extract::Query,
-        response::{Html, IntoResponse, Response},
+        response::{Html, IntoResponse},
         routing::get,
     };
     use hyper::{

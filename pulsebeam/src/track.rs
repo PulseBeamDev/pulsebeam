@@ -1,9 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::time::Duration;
 
-use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
-use tokio::time::Instant;
-
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::id::ShardId;
@@ -12,7 +9,10 @@ use crate::rtp::{
     monitor::{StreamMonitor, StreamState},
     sync::Synchronizer,
 };
+use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
+use str0m::rtp::RtpWrite;
 use str0m::rtp::rtcp::SenderInfo;
+use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);
 
@@ -45,22 +45,17 @@ impl<'a> StreamWriter<'a> {
         tracing::trace!(
             target: crate::log::TARGET_VIDEO,
             %mid, ?rid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
-        let res = stream.write_rtp(
+        let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
             pkt.playout_time.into(),
-            pkt.marker,
-            pkt.ext_vals.clone(),
-            true,
             pkt.payload,
-        );
-        if let Err(err) = res {
-            tracing::warn!(
-                target: crate::log::TARGET_VIDEO,
-                %mid, ?rid, %ssrc, "Dropping RTP for invalid rtp header: {err:?}"
-            );
-        }
+        )
+        .nackable(true)
+        .marker(pkt.marker)
+        .ext_vals(pkt.ext_vals);
+        stream.write_rtp(rtp);
     }
 
     pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, pt: Pt) {
@@ -77,22 +72,18 @@ impl<'a> StreamWriter<'a> {
         tracing::trace!(
             target: crate::log::TARGET_AUDIO,
             %mid, %ssrc, %pt, seq = %pkt.seq_no, ts = pkt.rtp_ts.numer(), len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
-        let res = stream.write_rtp(
+
+        let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
             pkt.playout_time.into(),
-            pkt.marker,
-            pkt.ext_vals.clone(),
-            false, // audio is not nackable
             pkt.payload,
-        );
-        if let Err(err) = res {
-            tracing::warn!(
-                target: crate::log::TARGET_AUDIO,
-                %mid, %ssrc, "Dropping RTP for invalid rtp header: {err:?}"
-            );
-        }
+        )
+        .nackable(false)
+        .marker(pkt.marker)
+        .ext_vals(pkt.ext_vals);
+        stream.write_rtp(rtp);
     }
 }
 

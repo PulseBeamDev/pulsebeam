@@ -889,8 +889,8 @@ mod test {
             let mut pkt = RtpPacket::default();
             pkt.arrival_ts = self.now;
             pkt.playout_time = self.now;
-            pkt.payload
-                .resize(size_bytes.saturating_sub(pkt.header_len), 0);
+            let payload_len = size_bytes.saturating_sub(pkt.header_len);
+            pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
             self.estimator.record(&pkt);
         }
 
