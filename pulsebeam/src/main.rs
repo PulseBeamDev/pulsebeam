@@ -11,10 +11,10 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// sampling every 32MB allocations
-#[allow(non_upper_case_globals)]
-#[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"background_thread:false,max_background_threads:0,metadata_thp:disabled,dirty_decay_ms:10000,muzzy_decay_ms:30000,lg_tcache_max:13,abort_conf:true,prof:true,prof_active:true,lg_prof_sample:25\0";
+// // sampling every 32MB allocations
+// #[allow(non_upper_case_globals)]
+// #[unsafe(export_name = "malloc_conf")]
+// pub static malloc_conf: &[u8] = b"background_thread:false,max_background_threads:0,metadata_thp:disabled,dirty_decay_ms:10000,muzzy_decay_ms:30000,lg_tcache_max:13,abort_conf:true,prof:true,prof_active:true,lg_prof_sample:25\0";
 
 // use mimalloc::MiMalloc;
 //
