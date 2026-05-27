@@ -67,8 +67,6 @@ impl ShardRouter {
         metrics::gauge!("shard_load_peak_to_mean").set(peak_to_mean);
     }
 
-    /// Update the load for a specific shard.
-    /// `load` could be CPU usage (0.0 to 1.0) or active participant count.
     pub fn update_load(&mut self, shard_id: impl Into<ShardId>, load: f64) -> f64 {
         let shard_id = shard_id.into();
         debug_assert!(load >= 0.0);
@@ -78,8 +76,6 @@ impl ShardRouter {
         if let Some(current_load) = self.shard_loads.get_mut(shard_id.index()) {
             let old_load = *current_load;
 
-            // If load is increasing, react fast (higher alpha)
-            // If load is decreasing, react slow (lower alpha)
             let alpha = if new_sample > old_load { 0.8 } else { 0.1 };
             let smoothed_load = (new_sample * alpha) + (old_load * (1.0 - alpha));
 
@@ -92,12 +88,12 @@ impl ShardRouter {
 
     pub fn try_route<K: Hash>(&self, key: &K) -> Option<ShardId> {
         let mut best_index = None;
-        let mut max_score = -1.0;
+        let mut max_hash = -1.0;
 
         for i in 0..self.shard_loads.len() {
             let load = self.shard_loads[i];
 
-            // If the shard is too hot, it's not even a candidate.
+            // Protect core real-time execution deadlines
             if load >= MAX_LOAD {
                 continue;
             }
@@ -106,20 +102,15 @@ impl ShardRouter {
             key.hash(&mut hasher);
             i.hash(&mut hasher);
 
-            // normalize hash value to 0.0 and 1.0
             let h_val = (hasher.finish() as f64) / (u64::MAX as f64);
 
-            let capacity_factor = 1.0 - load;
-            let score = h_val * capacity_factor;
-
-            if score > max_score {
-                max_score = score;
+            // Enforce absolute room locality by preferring the highest raw hash mapping
+            if h_val > max_hash {
+                max_hash = h_val;
                 best_index = Some(ShardId::new(i));
             }
         }
 
-        // If all shards were > MAX_LOAD, this returns None.
-        // The Manager should then send a "Server Busy" to the client.
         best_index
     }
 
@@ -139,5 +130,76 @@ impl ShardRouter {
 
     fn get_mut(&mut self, shard_id: ShardId) -> &mut mailbox::Sender<ShardCommand> {
         &mut self.shard_contexts[shard_id.index()].command_tx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to generate a minimal testing router with artificial capacity
+    fn setup_test_router(shard_count: usize) -> ShardRouter {
+        let rng = pulsebeam_runtime::rand::seeded_rng(42);
+        ShardRouter {
+            hasher_config: ahash::RandomState::with_seeds(1, 2, 3, 4),
+            shard_contexts: vec![], // Omitted to keep tests pure-functional on routing math
+            shard_loads: vec![0.0; shard_count],
+            shard_occupancy_snapshots: vec![],
+        }
+    }
+
+    #[test]
+    fn test_room_locality_preserved_under_moderate_load() {
+        let mut router = setup_test_router(4);
+        let room_key = "room-mega-0";
+
+        // Find the natural primary target shard for this room key when idle
+        let primary_shard = router.try_route(&room_key).expect("should route");
+
+        // Simulate moderate load on the primary shard (e.g., 50% CPU utilization)
+        router.shard_loads[primary_shard.index()] = 0.50;
+
+        // Ensure subsequent joins for the same room key still strictly match the primary shard
+        let next_route = router.try_route(&room_key).expect("should route");
+        assert_eq!(
+            primary_shard, next_route,
+            "Room locality was broken before reaching MAX_LOAD!"
+        );
+    }
+
+    #[test]
+    fn test_room_overflows_only_when_max_load_breached() {
+        let mut router = setup_test_router(4);
+        let room_key = "room-mega-0";
+
+        let primary_shard = router.try_route(&room_key).expect("should route");
+
+        // Push primary shard right up to the line, locality must hold
+        router.shard_loads[primary_shard.index()] = 0.79;
+        assert_eq!(router.try_route(&room_key).unwrap(), primary_shard);
+
+        // Breach the threshold limit
+        router.shard_loads[primary_shard.index()] = 0.80;
+
+        // Ensure routing safely cascades away from the hot shard to a healthy neighbor
+        let backup_shard = router.try_route(&room_key).expect("should route to backup");
+        assert_ne!(
+            primary_shard, backup_shard,
+            "Router failed to shed load away from an overloaded core!"
+        );
+    }
+
+    #[test]
+    fn test_returns_none_when_all_shards_overloaded() {
+        let mut router = setup_test_router(2);
+        let room_key = "room-failed-0";
+
+        router.shard_loads[0] = 0.85;
+        router.shard_loads[1] = 0.90;
+
+        assert!(
+            router.try_route(&room_key).is_none(),
+            "Router should signal busy state when no healthy cores remain"
+        );
     }
 }
