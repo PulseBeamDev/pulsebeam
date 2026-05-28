@@ -2950,6 +2950,7 @@ dependencies = [
  "pulsebeam-testdata",
  "rand 0.10.1",
  "reqwest",
+ "tikv-jemallocator",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -22,3 +22,9 @@ reqwest = "0.13.3"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = [
+  "disable_initial_exec_tls",
+  "unprefixed_malloc_on_supported_platforms"
+] }

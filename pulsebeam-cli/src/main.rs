@@ -18,10 +18,20 @@ use tokio::task::JoinSet;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use mimalloc::MiMalloc;
-
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "malloc_conf")]
+pub static malloc_conf: &[u8] = concat!(
+    "lg_tcache_max:19,", // 512KB limit: buffers GRO/GSO packets & hash expansions lock-free
+    "dirty_decay_ms:30000,", // Soft 1s amortization window prevents huge inline purge spikes
+    "muzzy_decay_ms:0,", // Bypass the unpredictable kernel muzzy gray-zone entirely
+    "abort_conf:true",   // Safely crash on boot if any setting above is invalid
+    "\0"                 // Null-terminator required for C-compatibility
+)
+.as_bytes();
 
 #[derive(Parser)]
 struct Cli {
