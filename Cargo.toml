@@ -52,12 +52,11 @@ panic = "abort"
 
 [profile.release]
 opt-level = 3
-debug = true
+debug = "line-tables-only"
 strip = false  # Retain symbols for profiling
 debug-assertions = false
 lto = "thin"
 panic = "abort"
-force-frame-pointers = true
 
 [profile.test]
 panic = "abort"

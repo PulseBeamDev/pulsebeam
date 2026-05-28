@@ -38,20 +38,47 @@ lint:
 flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
-perf:
+perf-server:
 	@# Capture PIDs, replace newlines with commas, and trim the trailing comma
 	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi; \
 	sudo sysctl -w kernel.kptr_restrict=0
 	sudo sysctl -w kernel.perf_event_paranoid=-1
+	
+	@echo "Recording strictly on Core 4 at a precise 499Hz window..."
 	sudo perf record -p $(PIDS) \
-		--sample-cpu \
-		-e cycles,cache-misses,LLC-load-misses \
+		-F 499 \
+-		-e cycles,cache-misses,LLC-load-misses \
 		-e sched:sched_switch --switch-events \
 		--call-graph fp \
-		-m 16M \
-    -- sleep 30 
+		-m 32M \
+		-o perf.data \
+		-- sleep 15
+	
+	@echo "Launching UI..."
 	sudo hotspot perf.data
+
+perf-system:
+	sudo sysctl -w kernel.kptr_restrict=0
+	sudo sysctl -w kernel.perf_event_paranoid=-1
+	
+	@echo "========================================================"
+	@echo " RECORDING ALL CORES SYSTEM-WIDE"
+	@echo " Press [Ctrl + C] the instant you see the rare spike hit!"
+	@echo "========================================================"
+	
+	# We use a massive 128M buffer so data isn't dropped during a long wait
+	sudo perf record \
+		-a \
+		-F 999 \
+		-e cycles \
+		--call-graph fp \
+		-m 128M \
+		-o perf-system.data
+
+		@echo "Launching UI..."
+		sudo hotspot perf-system.data
+	
 
 stats:
 	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
@@ -74,6 +101,9 @@ deps-brew:
 deps-cargo:
 	$(CARGO_CMD) install cargo-release cargo-dist git-cliff
 	$(CARGO_CMD) install flamegraph cargo-machete
+
+deps-system:
+	paru -S rustc-demangle
 
 deps-profile:
 	# used for perf record speed up
