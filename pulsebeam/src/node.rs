@@ -449,12 +449,25 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
 }
 
 pub fn tune_current_control_thread() {
-    let result = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
+    use thread_priority::{
+        NormalThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy, thread_native_id,
+    };
+
+    // SCHED_BATCH + nice 19: prevents the control plane from preempting media workers,
+    // runs in idle gaps between RTP bursts, and retains enough weight to beat OS daemons.
+    // SCHED_BATCH still guarantees this thread will eventually run.
+    let current_thread_id = thread_native_id();
+    let policy = ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch);
+    let result = thread_priority::set_thread_priority_and_policy(
+        current_thread_id,
+        ThreadPriority::Min,
+        policy,
+    );
 
     if let Err(e) = result {
         tracing::warn!("Failed to lower Control Thread priority: {:?}", e);
     } else {
-        tracing::info!("Control thread tuned: Minimum Priority");
+        tracing::info!("Control thread tuned: Minimum Priority (Batch)");
     }
 }
 
