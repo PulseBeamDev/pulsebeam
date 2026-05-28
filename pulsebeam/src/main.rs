@@ -11,21 +11,19 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Reference:
+// References:
 //   * https://jemalloc.net/jemalloc.3.html#opt.percpu_arena
 //   * https://github.com/jemalloc/jemalloc/blob/dev/TUNING.md
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"\
-    background_thread:true,\
-    lg_tcache_max:16,\
-    dirty_decay_ms:30000,\
-    muzzy_decay_ms:30000,\
-    metadata_thp:auto,\
-    prof:false,\
-    prof_active:false,\
-    abort_conf:true\
-    \0";
+pub static malloc_conf: &[u8] = concat!(
+    "lg_tcache_max:19,", // 512KB limit: buffers GRO/GSO packets & hash expansions lock-free
+    "dirty_decay_ms:30000,", // Soft 1s amortization window prevents huge inline purge spikes
+    "muzzy_decay_ms:0,", // Bypass the unpredictable kernel muzzy gray-zone entirely
+    "abort_conf:true",   // Safely crash on boot if any setting above is invalid
+    "\0"                 // Null-terminator required for C-compatibility
+)
+.as_bytes();
 
 // TODO: disabled heap profiler for now. This keeps causing latency spikes by a few ms.
 // #[allow(non_upper_case_globals)]
