@@ -460,7 +460,7 @@ async fn spawn_room(
 }
 
 async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<SharedState>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = Instant::now();
 
