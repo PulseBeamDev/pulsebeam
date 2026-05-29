@@ -649,7 +649,7 @@ async fn spawn_agent(
     simulcast: bool,
     session_duration: Duration,
     stats_tx: mpsc::Sender<AgentStatReport>,
-    users_per_room: usize,
+    _users_per_room: usize,
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -673,7 +673,7 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::SendOnly, None);
     }
 
-    for _ in 0..users_per_room {
+    for _ in 0..7 {
         builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
     }
 
