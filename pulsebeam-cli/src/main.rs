@@ -230,6 +230,7 @@ fn main() -> Result<()> {
     let core_index = AtomicUsize::new(0);
     let runtime = Builder::new_multi_thread()
         .enable_all()
+        .enable_alt_timer()
         .on_thread_start(move || {
             if !core_ids.is_empty() {
                 if let Some(core) =
