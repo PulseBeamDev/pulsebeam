@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
+core_affinity = "0.8.0"
 hdrhistogram = "7.5.4"
 mimalloc = { version = "0.1.50" }
 pulsebeam-agent = { path = "../pulsebeam-agent" }

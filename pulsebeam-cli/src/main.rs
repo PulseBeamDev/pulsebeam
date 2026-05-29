@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use core_affinity::{get_core_ids, set_for_current};
 use hdrhistogram::Histogram;
 use pulsebeam_agent::{
     MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::error;
@@ -205,8 +207,7 @@ impl StatsProcessor {
 #[allow(dead_code)]
 struct FakeUnused {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -220,21 +221,25 @@ async fn main() -> Result<()> {
     registry.init();
 
     let cli = Cli::parse();
-    match cli.command {
-        Commands::Bench {
-            rooms,
-            users_per_room,
-            arrival_rate,
-            max_rooms,
-            session_duration,
-            join_spread_secs,
-            drain_duration,
-            simulcast,
-            output_format,
-            fixed_session,
-        } => {
-            run_bench(
-                cli.api_url,
+
+    let core_ids = get_core_ids().unwrap_or_default();
+    let core_index = AtomicUsize::new(0);
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || {
+            if !core_ids.is_empty() {
+                if let Some(core) =
+                    core_ids.get(core_index.fetch_add(1, Ordering::Relaxed) % core_ids.len())
+                {
+                    set_for_current(*core);
+                }
+            }
+        })
+        .build()?;
+
+    runtime.block_on(async move {
+        match cli.command {
+            Commands::Bench {
                 rooms,
                 users_per_room,
                 arrival_rate,
@@ -245,28 +250,42 @@ async fn main() -> Result<()> {
                 simulcast,
                 output_format,
                 fixed_session,
-            )
-            .await?
-        }
-        Commands::Connect {
-            room,
-            publish,
-            simulcast,
-            recv_video,
-            recv_audio,
-        } => {
-            run_connect(
-                cli.api_url,
+            } => {
+                run_bench(
+                    cli.api_url,
+                    rooms,
+                    users_per_room,
+                    arrival_rate,
+                    max_rooms,
+                    session_duration,
+                    join_spread_secs,
+                    drain_duration,
+                    simulcast,
+                    output_format,
+                    fixed_session,
+                )
+                .await?
+            }
+            Commands::Connect {
                 room,
                 publish,
                 simulcast,
                 recv_video,
                 recv_audio,
-            )
-            .await?
+            } => {
+                run_connect(
+                    cli.api_url,
+                    room,
+                    publish,
+                    simulcast,
+                    recv_video,
+                    recv_audio,
+                )
+                .await?
+            }
         }
-    }
-    Ok(())
+        anyhow::Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
