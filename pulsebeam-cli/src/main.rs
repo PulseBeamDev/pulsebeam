@@ -919,7 +919,7 @@ async fn handle_remote_track(
 ) {
     while let Some(frame) = recv.recv().await {
         if let Some(abs_capture_time) = frame.abs_capture_time {
-            let receive_time = wallclock_at(frame.capture_time);
+            let receive_time = wallclock_at(tokio::time::Instant::now());
             if let Ok(latency) = receive_time.duration_since(abs_capture_time) {
                 let _ = latency_tx.send(latency);
             }
