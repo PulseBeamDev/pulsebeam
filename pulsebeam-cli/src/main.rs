@@ -183,9 +183,6 @@ impl StatsProcessor {
             let prev = self.prev_rx_layers.entry((mid, rid)).or_default();
             let d_packets = packets.saturating_sub(prev.packets);
             delta.rx_packets += d_packets;
-            let prev = self.prev_rx_layers.entry((mid, rid)).or_default();
-            let d_packets = packets.saturating_sub(prev.packets);
-            delta.rx_packets += d_packets;
             delta.rx_nacks += nacks.saturating_sub(prev.nacks);
             delta.rx_plis += plis.saturating_sub(prev.plis);
 
@@ -518,7 +515,7 @@ async fn monitor_task(
 
     if matches!(output_format, OutputFormat::Csv) {
         println!(
-            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,fwd_p999_ms,fwd_p9999_ms,tx_active,rx_active"
+            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,tx_pps,rx_pps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,fwd_p999_ms,fwd_p9999_ms,tx_active,rx_active"
         );
     }
 
