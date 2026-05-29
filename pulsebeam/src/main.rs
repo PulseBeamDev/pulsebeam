@@ -1,6 +1,7 @@
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -51,13 +52,23 @@ fn main() {
     //     Duration::from_micros(100),
     // );
 
-    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
-    let rt = rt_builder
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let core_index = AtomicUsize::new(0);
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(workers)
         // .disable_lifo_slot()
         // https://github.com/tokio-rs/tokio/issues/7745
         .enable_alt_timer()
+        .on_thread_start(move || {
+            if !core_ids.is_empty() {
+                if let Some(core) =
+                    core_ids.get(core_index.fetch_add(1, Ordering::Relaxed) % core_ids.len())
+                {
+                    core_affinity::set_for_current(*core);
+                }
+            }
+        })
         .build()
         .unwrap();
 
