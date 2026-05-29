@@ -2930,6 +2930,7 @@ dependencies = [
  "metrics",
  "pulsebeam-core",
  "pulsebeam-proto",
+ "pulsebeam-testdata",
  "str0m",
  "thiserror 2.0.18",
  "tokio",

@@ -10,7 +10,7 @@ use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::rtp_extensions;
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{namespace, signaling};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,10 +32,7 @@ use tokio_stream::wrappers::ReceiverStream;
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
 const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
-// Sliding-window bitrate estimator: 20 buckets × 200 ms = 10 s window.
-// A keyframe occupies at most 1 bucket out of 20, so it shifts the estimate by ≤5%.
-const BITRATE_BUCKETS: usize = 20;
-const BITRATE_WINDOW_SECS: f64 = BITRATE_BUCKETS as f64 * 0.5; // 10 s
+const BWE_DEFAULT: Bitrate = Bitrate::kbps(500);
 
 // Debt thresholds (measured in ticks; one tick = BWE_SLOW_INTERVAL = 200 ms).
 // Debt = allocated_bps − available_bps.
@@ -75,13 +72,182 @@ fn rid_quality_rank(rid: Option<Rid>) -> u8 {
 // The only control concept is *debt*: debt = allocated_bps − available_bps.
 // Heavy or lingering debt causes the lowest-priority active layer to be shed.
 // Once debt is gone, the next highest-priority paused layer is resumed if it fits.
-// Smoothing factor used to low-pass filter the raw TWCC estimate before
-// it is consumed by our debt algorithm.  A value of 1.0 bypasses the filter;
-// smaller values make `available_bps` respond more slowly to sudden drops.
-// In normal internet operation the estimator already behaves sanely, so this
-// only matters on zero‑delay links where tiny bursts can trigger over‑use.
-const BW_SMOOTHING_ALPHA: f64 = 0.2;
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
+
+struct BitrateEstimate {
+    tick_start: Option<Instant>,
+    accumulated_bytes: usize,
+    raw_ticks: VecDeque<f64>,
+    sma1_ticks: VecDeque<f64>,
+    max_window_ticks: usize,
+    baseline_bps: f64,
+    fast_trend_bps: f64,
+}
+
+impl BitrateEstimate {
+    const HEADROOM: f64 = 1.05;
+    const TICK_MS: f64 = 500.0;
+
+    pub fn new_with_seed(seed_bps: f64) -> Self {
+        let mut raw_ticks = VecDeque::with_capacity(6);
+        let mut sma1_ticks = VecDeque::with_capacity(6);
+        for _ in 0..6 {
+            raw_ticks.push_back(seed_bps);
+            sma1_ticks.push_back(seed_bps);
+        }
+        Self {
+            tick_start: None,
+            accumulated_bytes: 0,
+            raw_ticks,
+            sma1_ticks,
+            max_window_ticks: 6,
+            baseline_bps: seed_bps,
+            fast_trend_bps: seed_bps,
+        }
+    }
+
+    pub fn record_bytes(&mut self, bytes: usize, now: Instant) {
+        self.advance_time(now);
+        self.accumulated_bytes += bytes;
+    }
+
+    pub fn poll(&mut self, current_time: Instant) {
+        self.advance_time(current_time);
+    }
+
+    fn advance_time(&mut self, time: Instant) {
+        let current_tick = *self.tick_start.get_or_insert(time);
+
+        if time < current_tick + Duration::from_millis(Self::TICK_MS as u64) {
+            return;
+        }
+
+        let elapsed = time.saturating_duration_since(current_tick);
+        let ticks_passed = (elapsed.as_millis() / Self::TICK_MS as u128) as usize;
+
+        let instant_bps = (self.accumulated_bytes as f64 * 8.0 * 1000.0) / Self::TICK_MS;
+        self.push_tick(instant_bps);
+
+        let empty_ticks = ticks_passed.saturating_sub(1).min(1000);
+        for _ in 0..empty_ticks {
+            self.push_tick(0.0);
+        }
+
+        self.accumulated_bytes = 0;
+        self.tick_start = Some(
+            current_tick + Duration::from_millis((ticks_passed as u64) * Self::TICK_MS as u64),
+        );
+    }
+
+    fn push_tick(&mut self, bps: f64) {
+        if self.raw_ticks.len() == self.max_window_ticks {
+            self.raw_ticks.pop_front();
+        }
+        self.raw_ticks.push_back(bps);
+
+        let sma1 = self.raw_ticks.iter().sum::<f64>() / self.raw_ticks.len() as f64;
+
+        if self.sma1_ticks.len() == self.max_window_ticks {
+            self.sma1_ticks.pop_front();
+        }
+        self.sma1_ticks.push_back(sma1);
+
+        self.baseline_bps = self.sma1_ticks.iter().sum::<f64>() / self.sma1_ticks.len() as f64;
+
+        let recent_len = self.raw_ticks.len();
+        if recent_len >= 3 {
+            let a = self.raw_ticks[recent_len - 1];
+            let b = self.raw_ticks[recent_len - 2];
+            let c = self.raw_ticks[recent_len - 3];
+            self.fast_trend_bps = a.max(b.min(c)).min(b.max(c));
+        } else {
+            self.fast_trend_bps = 0.0;
+        }
+    }
+
+    pub fn estimate_bps(&self) -> f64 {
+        self.baseline_bps.max(self.fast_trend_bps) * Self::HEADROOM
+    }
+}
+
+struct BitrateControllerConfig {
+    pub min_bitrate: Bitrate,
+    pub max_bitrate: Bitrate,
+    pub default_bitrate: Bitrate,
+    pub headroom_factor: f64,
+    pub down_smoothing: f64,
+    pub quantization_step: Bitrate,
+    pub hysteresis: Bitrate,
+}
+
+impl Default for BitrateControllerConfig {
+    fn default() -> Self {
+        Self {
+            min_bitrate: BWE_DEFAULT,
+            max_bitrate: Bitrate::mbps(10),
+            default_bitrate: BWE_DEFAULT,
+            headroom_factor: 1.10,
+            down_smoothing: 0.99,
+            quantization_step: Bitrate::kbps(200),
+            hysteresis: Bitrate::kbps(250),
+        }
+    }
+}
+
+impl BitrateControllerConfig {
+    pub fn build(self) -> BitrateController {
+        BitrateController::new(self)
+    }
+}
+
+struct BitrateController {
+    config: BitrateControllerConfig,
+    current_bitrate: f64,
+    down_estimate: f64,
+}
+
+impl BitrateController {
+    pub fn new(config: BitrateControllerConfig) -> Self {
+        let initial_bitrate = config.default_bitrate.as_f64();
+        Self {
+            config,
+            current_bitrate: initial_bitrate,
+            down_estimate: initial_bitrate,
+        }
+    }
+
+    pub fn update(&mut self, desired_bitrate: Bitrate) -> Bitrate {
+        let raw = desired_bitrate.as_f64() * self.config.headroom_factor;
+
+        if raw > self.down_estimate {
+            self.down_estimate = raw;
+        } else {
+            self.down_estimate = self.down_estimate * self.config.down_smoothing
+                + raw * (1.0 - self.config.down_smoothing);
+            if self.down_estimate - raw < 1.0 {
+                self.down_estimate = raw;
+            }
+        }
+
+        let deadband = self.config.hysteresis.as_f64();
+        let step = self.config.quantization_step.as_f64();
+        let target = ((self.down_estimate / step) - 1e-9).max(0.0).ceil() * step;
+
+        if target > self.current_bitrate || self.current_bitrate - target >= deadband {
+            self.current_bitrate = target;
+        }
+
+        self.current()
+    }
+
+    pub fn current(&self) -> Bitrate {
+        let current_bitrate = self.current_bitrate.clamp(
+            self.config.min_bitrate.as_f64(),
+            self.config.max_bitrate.as_f64(),
+        );
+        Bitrate::from(current_bitrate)
+    }
+}
 
 struct LayerController {
     available_bps: f64,
@@ -96,18 +262,11 @@ struct LayerController {
 }
 
 struct LayerState {
-    /// Bitrate estimate derived from a sliding ring-buffer window.
-    /// Each bucket holds the raw bytes received in one BWE_SLOW_INTERVAL period.
-    /// bps = sum(byte_buckets) * 8 / BITRATE_WINDOW_SECS.
-    /// Stable across keyframe bursts: a single IDR occupies ≤1 bucket out of 20.
+    /// Bitrate estimate derived from the server-side `BitrateEstimate`.
+    /// Uses 500 ms tick windows with a triangular SMA and fast trend detector.
     bps: f64,
     paused: bool,
-    /// Bytes accumulated from incoming frames in the current bucket interval.
-    frame_bytes_acc: u64,
-    /// Ring buffer of per-bucket byte counts (one bucket per BWE_SLOW_INTERVAL).
-    byte_buckets: [u64; BITRATE_BUCKETS],
-    /// Index of the next bucket to write.
-    bucket_pos: usize,
+    estimate: BitrateEstimate,
 }
 
 impl LayerController {
@@ -122,10 +281,6 @@ impl LayerController {
         }
     }
 
-    fn has_layers(&self) -> bool {
-        !self.order.is_empty()
-    }
-
     fn register(&mut self, mid: Mid, rid: Option<Rid>, notifier: KeyframeNotifier) {
         let key = (mid, rid);
         // q (rank 0) and non-simulcast tracks start active immediately.
@@ -134,17 +289,14 @@ impl LayerController {
         self.order.push(key);
         // Sort so index 0 = highest priority (q), last = lowest priority (f).
         self.order.sort_by_key(|(_, rid)| rid_quality_rank(*rid));
-        // Pre-fill the ring buffer with the seed bitrate so the upgrade gate sees a
-        // realistic cost before the first full 10 s window of real measurements fills in.
-        let seed_bytes = (layer_seed_bps(rid) * 0.5 / 8.0) as u64;
+        // Seed the bitrate estimator so the upgrade gate sees a realistic cost
+        // before the first 500 ms window of real measurements completes.
         self.states.insert(
             key,
             LayerState {
                 bps: layer_seed_bps(rid),
                 paused,
-                frame_bytes_acc: 0,
-                byte_buckets: [seed_bytes; BITRATE_BUCKETS],
-                bucket_pos: 0,
+                estimate: BitrateEstimate::new_with_seed(layer_seed_bps(rid)),
             },
         );
         self.notifiers.insert(key, notifier);
@@ -156,32 +308,18 @@ impl LayerController {
 
     /// Called for every incoming frame regardless of whether the layer is currently paused.
     /// This gives us a true picture of what the encoder is producing.
-    fn record_frame(&mut self, mid: Mid, rid: Option<Rid>, byte_len: usize, _now: Instant) {
+    fn record_frame(&mut self, mid: Mid, rid: Option<Rid>, byte_len: usize, now: Instant) {
         let key = (mid, rid);
         let Some(s) = self.states.get_mut(&key) else {
             return;
         };
-        s.frame_bytes_acc += byte_len as u64;
-        // tick() drains the accumulator; this just fills it.
+        s.estimate.record_bytes(byte_len, now);
     }
 
-    /// Rotate the bitrate ring buffer and recompute bps.
-    /// Called once per BWE_SLOW_INTERVAL tick, before allocation decisions.
-    ///
-    /// Each call stores this interval's frame bytes into the oldest bucket slot
-    /// and computes bps = total_bytes_in_window * 8 / BITRATE_WINDOW_SECS.
-    /// Because the window spans 20 intervals (10 s), a single IDR frame burst
-    /// occupies at most one bucket and shifts the estimate by ≤5% — keyframes
-    /// are effectively invisible to the allocation logic.
-    fn flush_frame_bitrates(&mut self, _now: Instant) {
+    fn refresh_bitrate_estimates(&mut self, now: Instant) {
         for s in self.states.values_mut() {
-            // Overwrite the oldest bucket with this interval's byte count.
-            s.byte_buckets[s.bucket_pos] = s.frame_bytes_acc;
-            s.bucket_pos = (s.bucket_pos + 1) % BITRATE_BUCKETS;
-            s.frame_bytes_acc = 0;
-
-            let total_bytes: u64 = s.byte_buckets.iter().sum();
-            s.bps = (total_bytes as f64 * 8.0) / BITRATE_WINDOW_SECS;
+            s.estimate.poll(now);
+            s.bps = s.estimate.estimate_bps();
         }
     }
 
@@ -214,7 +352,7 @@ impl LayerController {
         }
 
         // Advance per-layer bps estimates from frames accumulated since last tick.
-        self.flush_frame_bitrates(now);
+        self.refresh_bitrate_estimates(now);
 
         for k in &self.order {
             if let Some(s) = self.states.get(k) {
@@ -525,7 +663,7 @@ impl AgentBuilder {
 
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            .enable_bwe(Some(Bitrate::kbps(300)))
+            .enable_bwe(Some(Bitrate::kbps(500)))
             .set_extension(
                 rtp_extensions::ABS_CAPTURE_TIME,
                 Extension::AbsoluteCaptureTime,
@@ -707,6 +845,7 @@ impl AgentBuilder {
             disconnected_reason: None,
             signaling_cid,
             layer_ctrl: LayerController::new(),
+            desired_ctrl: BitrateControllerConfig::default().build(),
             sub_manager: SubscriptionManager::new(
                 medias
                     .iter()
@@ -844,6 +983,7 @@ struct AgentActor {
     /// Egress-side BWE layer controller: pauses/resumes simulcast layers
     /// based on TWCC bandwidth estimates.
     layer_ctrl: LayerController,
+    desired_ctrl: BitrateController,
 
     sub_manager: SubscriptionManager,
     preset: VideoPreset,
@@ -864,7 +1004,8 @@ impl AgentActor {
         let sleep = tokio::time::sleep(MIN_QUANTA);
         tokio::pin!(sleep);
         // Periodic BWE reallocation tick (handles upgrade/recovery paths).
-        let _bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
+        let bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
+        tokio::pin!(bwe_slow_timer);
         let reconnect_timer = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(reconnect_timer);
 
@@ -956,6 +1097,13 @@ impl AgentActor {
                             tracing::warn!(?mid, "no writer found for mid");
                         }
                     }
+                }
+
+                _ = bwe_slow_timer.tick() => {
+                    let desired_bps = self.layer_ctrl.tick(now);
+                    let desired_bitrate = Bitrate::from(desired_bps.max(0.0) as u64);
+                    let filtered_bitrate = self.desired_ctrl.update(desired_bitrate);
+                    self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
                 }
 
                 _ = &mut sleep => {
@@ -1425,6 +1573,97 @@ mod tests {
         // Fire again quickly; should still be granted.
         ctrl.request_keyframe(mid, rid, KeyframeRequestKind::Fir);
         assert!(receiver.is_requested());
+    }
+
+    fn replay_frames_into_agent_bwe(frame_sizes: &[usize], fps: u64) -> Vec<f64> {
+        let frame_interval = Duration::from_micros(1_000_000 / fps);
+        let tick_dur = Duration::from_millis(500);
+        let t0 = Instant::now();
+        let mut estimator = BitrateEstimate::new_with_seed(0.0);
+        let mut now = t0;
+        let mut next_sample = t0 + tick_dur;
+        let mut samples = Vec::new();
+
+        for &frame_bytes in frame_sizes {
+            now += frame_interval;
+            estimator.record_bytes(frame_bytes, now);
+            while now >= next_sample {
+                estimator.poll(next_sample);
+                samples.push(estimator.estimate_bps());
+                next_sample += tick_dur;
+            }
+        }
+
+        samples
+    }
+
+    #[test]
+    fn bwe_quarter_h264_stable_cbr_estimate() {
+        const RAW_MAX_KBPS: f64 = 225.86;
+        const RAW_MIN_KBPS: f64 = 97.01;
+        const RAW_RATIO: f64 = RAW_MAX_KBPS / RAW_MIN_KBPS;
+        const TARGET_BPS: f64 = 150_000.0;
+
+        let frames = pulsebeam_testdata::h264_frame_sizes(pulsebeam_testdata::RAW_H264_QUARTER_CBR);
+        let samples = replay_frames_into_agent_bwe(&frames, 30);
+
+        assert!(
+            samples.len() >= 20,
+            "expected ≥ 20 samples, got {}",
+            samples.len()
+        );
+        let steady: &[f64] = &samples[10..];
+
+        let mean = steady.iter().sum::<f64>() / steady.len() as f64;
+        let max = steady.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = steady.iter().copied().fold(f64::INFINITY, f64::min);
+        let ratio = max / min.max(1.0);
+
+        assert!(
+            mean >= TARGET_BPS * 1.0,
+            "mean estimate too low: {:.0} bps (target {:.0})",
+            mean,
+            TARGET_BPS
+        );
+        assert!(
+            mean <= TARGET_BPS * 1.15,
+            "mean estimate too high: {:.0} bps (target {:.0})",
+            mean,
+            TARGET_BPS
+        );
+        assert!(
+            ratio < RAW_RATIO,
+            "estimate less stable than raw 1 s window: min={:.0} max={:.0} ratio={:.2}× > raw_ratio={:.2}×",
+            min,
+            max,
+            ratio,
+            RAW_RATIO
+        );
+    }
+
+    #[test]
+    fn pauses_and_resumes_layers_with_keyframe_request() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("mid2");
+        let rid_q = Some(Rid::from("q"));
+        let rid_h = Some(Rid::from("h"));
+        let (notifier_q, mut receiver_q) = KeyframeNotifier::pair();
+        let (notifier_h, mut receiver_h) = KeyframeNotifier::pair();
+
+        ctrl.register(mid, rid_q, notifier_q);
+        ctrl.register(mid, rid_h, notifier_h);
+
+        assert!(!ctrl.is_paused(mid, rid_q));
+        assert!(ctrl.is_paused(mid, rid_h));
+
+        ctrl.update_available(Bitrate::kbps(10));
+        let _ = ctrl.tick(Instant::now());
+        assert!(ctrl.is_paused(mid, rid_q));
+
+        ctrl.update_available(Bitrate::mbps(2));
+        let _ = ctrl.tick(Instant::now());
+        assert!(!ctrl.is_paused(mid, rid_q));
+        assert!(receiver_q.is_requested() || receiver_h.is_requested());
     }
 }
 

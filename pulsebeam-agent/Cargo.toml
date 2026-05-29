@@ -27,3 +27,6 @@ if-addrs = "0.15.0"
 pulsebeam-core = { path = "../pulsebeam-core" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 
+[dev-dependencies]
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+
