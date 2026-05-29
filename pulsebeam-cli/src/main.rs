@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use core_affinity::{get_core_ids, set_for_current};
 use hdrhistogram::Histogram;
-use hdrhistogram::sync::{Recorder, SyncHistogram};
 use pulsebeam_agent::{
     MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack, RemoteTrackRx},
@@ -28,11 +27,11 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] = concat!(
-    "lg_tcache_max:19,", // 512KB limit: buffers GRO/GSO packets & hash expansions lock-free
-    "dirty_decay_ms:30000,", // Soft 1s amortization window prevents huge inline purge spikes
-    "muzzy_decay_ms:0,", // Bypass the unpredictable kernel muzzy gray-zone entirely
-    "abort_conf:true",   // Safely crash on boot if any setting above is invalid
-    "\0"                 // Null-terminator required for C-compatibility
+    "lg_tcache_max:19,",
+    "dirty_decay_ms:30000,",
+    "muzzy_decay_ms:0,",
+    "abort_conf:true",
+    "\0"
 )
 .as_bytes();
 
@@ -100,7 +99,7 @@ const SILENT_TICKS_THRESHOLD: u32 = 3;
 const HISTOGRAM_MAX_US: u64 = 10_000_000;
 const HISTOGRAM_SIGFIG: u8 = 3;
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct AgentDelta {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
@@ -114,6 +113,29 @@ pub struct AgentDelta {
     pub rx_active: usize,
     pub rx_loss_sum: f32,
     pub rx_loss_count: usize,
+    pub forwarding_samples: Vec<u64>,
+    pub rtt_samples: Vec<u64>,
+}
+
+impl Default for AgentDelta {
+    fn default() -> Self {
+        Self {
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
+            tx_nacks: 0,
+            rx_nacks: 0,
+            tx_plis: 0,
+            rx_plis: 0,
+            tx_active: 0,
+            rx_active: 0,
+            rx_loss_sum: 0.0,
+            rx_loss_count: 0,
+            forwarding_samples: Vec::with_capacity(256),
+            rtt_samples: Vec::with_capacity(8),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -298,12 +320,6 @@ async fn run_bench(
     fixed_session: bool,
 ) -> Result<()> {
     let (stats_tx, stats_rx) = mpsc::channel::<AgentStatReport>(64_000);
-    let forwarding_hist =
-        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
-    let rtt_hist =
-        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
-    let forwarding_recorder_template = forwarding_hist.recorder();
-    let rtt_recorder_template = rtt_hist.recorder();
     let state = SharedState::new();
     let mut join_set = JoinSet::new();
     let room_counter = Arc::new(AtomicUsize::new(0));
@@ -313,12 +329,7 @@ async fn run_bench(
     );
 
     let monitor_state = state.clone();
-    let monitor_handle = tokio::spawn(monitor_task(
-        stats_rx,
-        monitor_state,
-        forwarding_hist,
-        rtt_hist,
-    ));
+    let monitor_handle = tokio::spawn(monitor_task(stats_rx, monitor_state));
 
     let mut total_rooms = 0usize;
     let mut ramping = true;
@@ -332,8 +343,6 @@ async fn run_bench(
             session_duration,
             join_spread_secs,
             &stats_tx,
-            forwarding_recorder_template.clone(),
-            rtt_recorder_template.clone(),
             &state,
             simulcast,
             fixed_session,
@@ -365,8 +374,6 @@ async fn run_bench(
             session_duration,
             join_spread_secs,
             &stats_tx,
-            forwarding_recorder_template.clone(),
-            rtt_recorder_template.clone(),
             &state,
             simulcast,
             fixed_session,
@@ -398,8 +405,6 @@ async fn spawn_room(
     session_duration: u64,
     join_spread_secs: u64,
     stats_tx: &mpsc::Sender<AgentStatReport>,
-    forwarding_recorder: Recorder<u64>,
-    rtt_recorder: Recorder<u64>,
     state: &Arc<SharedState>,
     simulcast: bool,
     fixed_session: bool,
@@ -412,8 +417,6 @@ async fn spawn_room(
         let url = api_url.to_string();
         let r = room.clone();
         let tx = stats_tx.clone();
-        let forwarding_recorder = forwarding_recorder.clone();
-        let rtt_recorder = rtt_recorder.clone();
         let st = state.clone();
 
         let join_delay_ms = rand::random_range(0u64..(join_spread_secs * 1_000).max(1));
@@ -438,8 +441,6 @@ async fn spawn_room(
                 Duration::from_secs(duration_secs),
                 tx,
                 users_per_room,
-                forwarding_recorder.clone(),
-                rtt_recorder.clone(),
             )
             .await
             {
@@ -458,15 +459,14 @@ async fn spawn_room(
     });
 }
 
-async fn monitor_task(
-    mut stats_rx: mpsc::Receiver<AgentStatReport>,
-    state: Arc<SharedState>,
-    mut forwarding_hist: SyncHistogram<u64>,
-    mut rtt_hist: SyncHistogram<u64>,
-) {
+async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<SharedState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = Instant::now();
+
+    let mut forwarding_hist =
+        Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
+    let mut rtt_hist = Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
 
     let mut tx_bytes = 0u64;
     let mut rx_bytes = 0u64;
@@ -502,31 +502,24 @@ async fn monitor_task(
                 let tx_pps = tx_packets;
                 let rx_pps = rx_packets;
 
-                let (p50, p95, p99) = {
-                    let hist = &mut forwarding_hist;
-                    hist.refresh_timeout(Duration::from_millis(200));
-                    if hist.len() > 0 {
-                        (
-                            Some(hist.value_at_quantile(0.50) as f64 / 1000.0),
-                            Some(hist.value_at_quantile(0.95) as f64 / 1000.0),
-                            Some(hist.value_at_quantile(0.99) as f64 / 1000.0),
-                        )
-                    } else {
-                        (None, None, None)
-                    }
+                let (p50, p95, p99) = if forwarding_hist.len() > 0 {
+                    (
+                        Some(forwarding_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                        Some(forwarding_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                        Some(forwarding_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                    )
+                } else {
+                    (None, None, None)
                 };
-                let (rtt50, rtt95, rtt99) = {
-                    let hist = &mut rtt_hist;
-                    hist.refresh_timeout(Duration::from_millis(200));
-                    if hist.len() > 0 {
-                        (
-                            Some(hist.value_at_quantile(0.50) as f64 / 1000.0),
-                            Some(hist.value_at_quantile(0.95) as f64 / 1000.0),
-                            Some(hist.value_at_quantile(0.99) as f64 / 1000.0),
-                        )
-                    } else {
-                        (None, None, None)
-                    }
+
+                let (rtt50, rtt95, rtt99) = if rtt_hist.len() > 0 {
+                    (
+                        Some(rtt_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                        Some(rtt_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                        Some(rtt_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                    )
+                } else {
+                    (None, None, None)
                 };
 
                 let avg_loss_pct = if rx_loss_count > 0 {
@@ -544,26 +537,10 @@ async fn monitor_task(
 
                 println!(
                     "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                    elapsed,
-                    rooms,
-                    agents,
-                    tx_mbps,
-                    rx_mbps,
-                    tx_pps,
-                    rx_pps,
-                    avg_loss_pct,
-                    tx_nacks,
-                    rx_nacks,
-                    tx_plis,
-                    rx_plis,
-                    p50_str,
-                    p95_str,
-                    p99_str,
-                    rtt50_str,
-                    rtt95_str,
-                    rtt99_str,
-                    tx_active_streams,
-                    rx_active_streams,
+                    elapsed, rooms, agents, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
+                    tx_nacks, rx_nacks, tx_plis, rx_plis,
+                    p50_str, p95_str, p99_str, rtt50_str, rtt95_str, rtt99_str,
+                    tx_active_streams, rx_active_streams,
                 );
 
                 if p99.is_some_and(|v| v > 100.0) {
@@ -596,6 +573,8 @@ async fn monitor_task(
                 rx_active_streams = 0;
                 rx_loss_sum = 0.0;
                 rx_loss_count = 0;
+                forwarding_hist.reset();
+                rtt_hist.reset();
             }
 
             Some(report) = stats_rx.recv() => {
@@ -611,6 +590,13 @@ async fn monitor_task(
                 rx_active_streams += report.delta.rx_active;
                 rx_loss_sum += report.delta.rx_loss_sum;
                 rx_loss_count += report.delta.rx_loss_count;
+
+                for sample in report.delta.forwarding_samples {
+                    let _ = forwarding_hist.record(sample);
+                }
+                for sample in report.delta.rtt_samples {
+                    let _ = rtt_hist.record(sample);
+                }
             }
         }
     }
@@ -625,8 +611,6 @@ async fn spawn_agent(
     session_duration: Duration,
     stats_tx: mpsc::Sender<AgentStatReport>,
     _users_per_room: usize,
-    forwarding_recorder: Recorder<u64>,
-    rtt_recorder: Recorder<u64>,
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -663,11 +647,10 @@ async fn spawn_agent(
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let (sample_tx, mut sample_rx) = mpsc::channel::<u64>(4096);
+
     let session_end = tokio::time::sleep(session_duration);
     tokio::pin!(session_end);
-
-    let forwarding_recorder = forwarding_recorder;
-    let mut rtt_recorder = rtt_recorder;
 
     loop {
         tokio::select! {
@@ -679,8 +662,8 @@ async fn spawn_agent(
                         tokio::spawn(handle_local_track(track));
                     }
                     AgentEvent::RemoteTrackAdded(recv) => {
-                        let forwarding_recorder = forwarding_recorder.clone();
-                        tokio::spawn(handle_remote_track(recv, forwarding_recorder));
+                        let sample_tx = sample_tx.clone();
+                        tokio::spawn(handle_remote_track(recv, sample_tx));
                     }
                     _ => {}
                 }
@@ -689,28 +672,35 @@ async fn spawn_agent(
             _ = stats_interval.tick() => {
                 let Some(stats) = agent.get_stats().await else { continue };
 
-                let peer = stats.peer.as_ref();
-                if let Some(peer_stats) = peer {
-                    if let Some(rtt) = peer_stats.rtt {
-                        rtt_recorder.saturating_record(rtt.as_micros() as u64);
+                let mut delta = {
+                    let peer = stats.peer.as_ref();
+                    let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
+                    let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
+
+                    let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                        track.tx_layers.iter().map(move |(rid, egress)| {
+                            (*mid, *rid, egress.packets, egress.nacks, egress.plis)
+                        })
+                    });
+
+                    let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                        track.rx_layers.iter().map(move |(rid, ingress)| {
+                            (*mid, *rid, ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                        })
+                    });
+
+                    let mut d = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
+                    if let Some(peer_stats) = peer {
+                        if let Some(rtt) = peer_stats.rtt {
+                            d.rtt_samples.push(rtt.as_micros() as u64);
+                        }
                     }
+                    d
+                };
+
+                while let Ok(sample) = sample_rx.try_recv() {
+                    delta.forwarding_samples.push(sample);
                 }
-                let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
-                let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
-
-                let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
-                    track.tx_layers.iter().map(move |(rid, egress)| {
-                        (*mid, *rid, egress.packets, egress.nacks, egress.plis)
-                    })
-                });
-
-                let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
-                    track.rx_layers.iter().map(move |(rid, ingress)| {
-                        (*mid, *rid, ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
-                    })
-                });
-
-                let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
                 if stats_tx.try_send(AgentStatReport { delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
@@ -766,30 +756,35 @@ async fn run_connect(
     );
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
-        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}  streams (tx/rx)",
+        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "time(s)",
         "tx_mbps",
         "rx_mbps",
         "tx_pps",
         "rx_pps",
-        "FWD50us",
-        "FWD95us",
-        "FWD99us",
+        "loss%",
+        "tx_nack",
+        "rx_nack",
+        "tx_pli",
+        "rx_pli",
+        "FWD50ms",
+        "FWD95ms",
+        "FWD99ms",
         "RTT50ms",
         "RTT95ms",
         "RTT99ms",
-        "loss%"
+        "tx_act",
+        "rx_act"
     );
 
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
+
     let mut forwarding_hist =
-        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
-    let mut rtt_hist =
-        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
-    let forwarding_recorder = forwarding_hist.recorder();
-    let mut rtt_recorder = rtt_hist.recorder();
+        Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
+    let mut rtt_hist = Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
+    let (sample_tx, mut sample_rx) = mpsc::channel::<u64>(4096);
 
     loop {
         tokio::select! {
@@ -805,8 +800,8 @@ async fn run_connect(
                         tokio::spawn(handle_local_track(track));
                     }
                     AgentEvent::RemoteTrackAdded(recv) => {
-                        let forwarding_recorder = forwarding_recorder.clone();
-                        tokio::spawn(handle_remote_track(recv, forwarding_recorder));
+                        let sample_tx = sample_tx.clone();
+                        tokio::spawn(handle_remote_track(recv, sample_tx));
                     }
                     AgentEvent::Disconnected(reason) => {
                         eprintln!("Disconnected: {reason}");
@@ -823,8 +818,12 @@ async fn run_connect(
                 let peer = stats.peer.as_ref();
                 if let Some(peer_stats) = peer {
                     if let Some(rtt) = peer_stats.rtt {
-                        rtt_recorder.saturating_record(rtt.as_micros() as u64);
+                        let _ = rtt_hist.record(rtt.as_micros() as u64);
                     }
+                }
+
+                while let Ok(sample) = sample_rx.try_recv() {
+                    let _ = forwarding_hist.record(sample);
                 }
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
@@ -844,29 +843,24 @@ async fn run_connect(
 
                 let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
-                let (p50, p95, p99) = {
-                    forwarding_hist.refresh_timeout(Duration::from_millis(200));
-                    if forwarding_hist.len() > 0 {
-                        (
-                            Some(forwarding_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                            Some(forwarding_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                            Some(forwarding_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                        )
-                    } else {
-                        (None, None, None)
-                    }
+                let (p50, p95, p99) = if forwarding_hist.len() > 0 {
+                    (
+                        Some(forwarding_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                        Some(forwarding_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                        Some(forwarding_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                    )
+                } else {
+                    (None, None, None)
                 };
-                let (rtt50, rtt95, rtt99) = {
-                    rtt_hist.refresh_timeout(Duration::from_millis(200));
-                    if rtt_hist.len() > 0 {
-                        (
-                            Some(rtt_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                            Some(rtt_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                            Some(rtt_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                        )
-                    } else {
-                        (None, None, None)
-                    }
+
+                let (rtt50, rtt95, rtt99) = if rtt_hist.len() > 0 {
+                    (
+                        Some(rtt_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                        Some(rtt_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                        Some(rtt_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                    )
+                } else {
+                    (None, None, None)
                 };
 
                 let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
@@ -880,18 +874,24 @@ async fn run_connect(
                     0.0
                 };
 
-                let p50_str = p50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let p95_str = p95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let p99_str = p99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let rtt50_str = rtt50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let rtt95_str = rtt95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let rtt99_str = rtt99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                eprintln!("{:>8} {:>8.2} {:>8.2} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-                          elapsed, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
-                          delta.tx_nacks, delta.rx_nacks, delta.tx_plis, delta.rx_plis,
-                          p50_str, p95_str, p99_str,
-                          rtt50_str, rtt95_str, rtt99_str,
-                          delta.tx_active, delta.rx_active);
+                let p50_str = p50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
+                let p95_str = p95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
+                let p99_str = p99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
+                let rtt50_str = rtt50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
+                let rtt95_str = rtt95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
+                let rtt99_str = rtt99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
+
+                eprintln!(
+                    "{:>8} {:>8.2} {:>8.2} {:>10} {:>10} {:>10.2} {:>10} {:>10} {:>10} {:>10} {} {} {} {} {} {} {:>10} {:>10}",
+                    elapsed, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
+                    delta.tx_nacks, delta.rx_nacks, delta.tx_plis, delta.rx_plis,
+                    p50_str, p95_str, p99_str,
+                    rtt50_str, rtt95_str, rtt99_str,
+                    delta.tx_active, delta.rx_active
+                );
+
+                forwarding_hist.reset();
+                rtt_hist.reset();
             }
         }
     }
@@ -915,12 +915,12 @@ async fn handle_local_track(track: LocalTrack) {
     let _ = looper.run(track).await;
 }
 
-async fn handle_remote_track(mut recv: RemoteTrackRx, mut recorder: Recorder<u64>) {
+async fn handle_remote_track(mut recv: RemoteTrackRx, sample_tx: mpsc::Sender<u64>) {
     while let Some(frame) = recv.recv().await {
         if let Some(abs_capture_time) = frame.abs_capture_time {
             let receive_time = wallclock_at(tokio::time::Instant::now());
             if let Ok(latency) = receive_time.duration_since(abs_capture_time) {
-                recorder.saturating_record(latency.as_micros() as u64);
+                let _ = sample_tx.try_send(latency.as_micros() as u64);
             }
         }
     }
