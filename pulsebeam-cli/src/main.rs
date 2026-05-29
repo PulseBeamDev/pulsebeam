@@ -1,7 +1,8 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use core_affinity::{get_core_ids, set_for_current};
 use hdrhistogram::Histogram;
+use hdrhistogram::sync::{Recorder, SyncHistogram};
 use pulsebeam_agent::{
     MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent, LocalTrack, RemoteTrackRx},
@@ -43,13 +44,6 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Clone, Copy, Default, ValueEnum)]
-enum OutputFormat {
-    #[default]
-    Human,
-    Csv,
-}
-
 #[derive(Subcommand)]
 enum Commands {
     Bench {
@@ -69,8 +63,6 @@ enum Commands {
         drain_duration: u64,
         #[arg(long)]
         simulcast: bool,
-        #[arg(long, default_value = "human")]
-        output_format: OutputFormat,
         #[arg(long, default_value_t = false)]
         fixed_session: bool,
     },
@@ -105,6 +97,8 @@ impl SharedState {
 }
 
 const SILENT_TICKS_THRESHOLD: u32 = 3;
+const HISTOGRAM_MAX_US: u64 = 10_000_000;
+const HISTOGRAM_SIGFIG: u8 = 3;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct AgentDelta {
@@ -124,7 +118,6 @@ pub struct AgentDelta {
 
 #[derive(Debug)]
 pub struct AgentStatReport {
-    pub forwarding_latencies: Vec<Duration>,
     pub delta: AgentDelta,
 }
 
@@ -253,7 +246,6 @@ fn main() -> Result<()> {
                 join_spread_secs,
                 drain_duration,
                 simulcast,
-                output_format,
                 fixed_session,
             } => {
                 run_bench(
@@ -266,7 +258,6 @@ fn main() -> Result<()> {
                     join_spread_secs,
                     drain_duration,
                     simulcast,
-                    output_format,
                     fixed_session,
                 )
                 .await?
@@ -304,36 +295,33 @@ async fn run_bench(
     join_spread_secs: u64,
     drain_duration: u64,
     simulcast: bool,
-    output_format: OutputFormat,
     fixed_session: bool,
 ) -> Result<()> {
     let (stats_tx, stats_rx) = mpsc::channel::<AgentStatReport>(64_000);
+    let forwarding_hist =
+        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
+    let rtt_hist =
+        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
+    let forwarding_recorder_template = forwarding_hist.recorder();
+    let rtt_recorder_template = rtt_hist.recorder();
     let state = SharedState::new();
     let mut join_set = JoinSet::new();
     let room_counter = Arc::new(AtomicUsize::new(0));
 
-    if matches!(output_format, OutputFormat::Human) {
-        println!(
-            "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
-        );
-        println!(
-            "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                                  │"
-        );
-        println!(
-            "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬──────────┬─────────┬─────────┤"
-        );
-        println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Tx PPS │ Rx PPS │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50ms │ FWD95ms │ FWD99ms │ FWD99.9ms │ FWD99.99ms │ Tx Actv │ Rx Actv │"
-        );
-        println!(
-            "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼──────────┼─────────┼─────────┤"
-        );
-    }
+    println!(
+        "timestamp_s,rooms,agents,tx_mbps,rx_mbps,tx_pps,rx_pps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,rtt_p50_ms,rtt_p95_ms,rtt_p99_ms,tx_active,rx_active"
+    );
 
     let monitor_state = state.clone();
-    let monitor_handle = tokio::spawn(monitor_task(stats_rx, monitor_state, output_format));
+    let monitor_handle = tokio::spawn(monitor_task(
+        stats_rx,
+        monitor_state,
+        forwarding_hist,
+        rtt_hist,
+    ));
 
     let mut total_rooms = 0usize;
+    let mut ramping = true;
 
     for _ in 0..initial_rooms {
         spawn_room(
@@ -344,6 +332,8 @@ async fn run_bench(
             session_duration,
             join_spread_secs,
             &stats_tx,
+            forwarding_recorder_template.clone(),
+            rtt_recorder_template.clone(),
             &state,
             simulcast,
             fixed_session,
@@ -357,25 +347,16 @@ async fn run_bench(
         let delay = Duration::from_secs_f64((-u.ln() / arrival_rate).max(0.001));
         tokio::time::sleep(delay).await;
 
-        // if state.degraded.load(Ordering::Relaxed) {
-        //     if matches!(output_format, OutputFormat::Human) {
-        //         println!("│ {:<140} │", "⚠  DEGRADATION DETECTED — stopping ramp");
-        //     } else {
-        //         eprintln!("DEGRADATION DETECTED — stopping ramp");
-        //     }
-        //     break;
-        // }
-        if total_rooms >= max_rooms {
-            if matches!(output_format, OutputFormat::Human) {
-                println!(
-                    "│ {:<140} │",
-                    format!("✓  Max rooms reached ({}) — stopping ramp", max_rooms)
-                );
-            } else {
-                eprintln!("Max rooms reached ({}) — stopping ramp", max_rooms);
-            }
+        if ramping && state.degraded.load(Ordering::Relaxed) {
+            ramping = false;
+            eprintln!("DEGRADATION DETECTED — holding current load");
+        }
+
+        if !ramping || total_rooms >= max_rooms {
+            eprintln!("Ramp ended — rooms: {} (max {})", total_rooms, max_rooms);
             break;
         }
+
         spawn_room(
             &mut join_set,
             &api_url,
@@ -384,6 +365,8 @@ async fn run_bench(
             session_duration,
             join_spread_secs,
             &stats_tx,
+            forwarding_recorder_template.clone(),
+            rtt_recorder_template.clone(),
             &state,
             simulcast,
             fixed_session,
@@ -394,28 +377,11 @@ async fn run_bench(
 
     tokio::time::sleep(Duration::from_secs(drain_duration)).await;
 
-    if matches!(output_format, OutputFormat::Human) {
-        println!(
-            "├───────┴───────┴────────┴─────────┴─────────┴────────┴────────┴────────┴────────┴────────┴─────────┴─────────┴─────────┴─────────┴─────────┤"
-        );
-        println!(
-            "│ {:<140} │",
-            format!(
-                "Benchmark complete. Peak rooms: {}  Peak agents: {}",
-                total_rooms,
-                state.active_agents.load(Ordering::Relaxed)
-            )
-        );
-        println!(
-            "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-        );
-    } else {
-        eprintln!(
-            "Benchmark complete. Peak rooms: {}  Peak agents: {}",
-            total_rooms,
-            state.active_agents.load(Ordering::Relaxed),
-        );
-    }
+    eprintln!(
+        "Benchmark complete. Peak rooms: {}  Peak agents: {}",
+        total_rooms,
+        state.active_agents.load(Ordering::Relaxed),
+    );
 
     join_set.shutdown().await;
     drop(stats_tx);
@@ -432,6 +398,8 @@ async fn spawn_room(
     session_duration: u64,
     join_spread_secs: u64,
     stats_tx: &mpsc::Sender<AgentStatReport>,
+    forwarding_recorder: Recorder<u64>,
+    rtt_recorder: Recorder<u64>,
     state: &Arc<SharedState>,
     simulcast: bool,
     fixed_session: bool,
@@ -444,6 +412,8 @@ async fn spawn_room(
         let url = api_url.to_string();
         let r = room.clone();
         let tx = stats_tx.clone();
+        let forwarding_recorder = forwarding_recorder.clone();
+        let rtt_recorder = rtt_recorder.clone();
         let st = state.clone();
 
         let join_delay_ms = rand::random_range(0u64..(join_spread_secs * 1_000).max(1));
@@ -468,6 +438,8 @@ async fn spawn_room(
                 Duration::from_secs(duration_secs),
                 tx,
                 users_per_room,
+                forwarding_recorder.clone(),
+                rtt_recorder.clone(),
             )
             .await
             {
@@ -489,9 +461,11 @@ async fn spawn_room(
 async fn monitor_task(
     mut stats_rx: mpsc::Receiver<AgentStatReport>,
     state: Arc<SharedState>,
-    output_format: OutputFormat,
+    mut forwarding_hist: SyncHistogram<u64>,
+    mut rtt_hist: SyncHistogram<u64>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = Instant::now();
 
     let mut tx_bytes = 0u64;
@@ -509,16 +483,8 @@ async fn monitor_task(
     let mut rx_loss_sum = 0.0f32;
     let mut rx_loss_count = 0usize;
 
-    let mut fwd_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
-    let mut fwd_has_samples = false;
     let mut consecutive_high_p99 = 0u32;
     let mut consecutive_high_loss = 0u32;
-
-    if matches!(output_format, OutputFormat::Csv) {
-        println!(
-            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,tx_pps,rx_pps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,fwd_p999_ms,fwd_p9999_ms,tx_active,rx_active"
-        );
-    }
 
     loop {
         tokio::select! {
@@ -528,7 +494,7 @@ async fn monitor_task(
                 let elapsed = start.elapsed().as_secs();
                 if elapsed == 0 { continue; }
 
-                let rooms  = state.active_rooms.load(Ordering::Relaxed);
+                let rooms = state.active_rooms.load(Ordering::Relaxed);
                 let agents = state.active_agents.load(Ordering::Relaxed);
 
                 let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
@@ -536,16 +502,31 @@ async fn monitor_task(
                 let tx_pps = tx_packets;
                 let rx_pps = rx_packets;
 
-                let (p50, p95, p99, p999, p9999) = if fwd_has_samples {
-                    (
-                        Some(fwd_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.999) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.9999) as f64 / 1000.0),
-                    )
-                } else {
-                    (None, None, None, None, None)
+                let (p50, p95, p99) = {
+                    let hist = &mut forwarding_hist;
+                    hist.refresh_timeout(Duration::from_millis(200));
+                    if hist.len() > 0 {
+                        (
+                            Some(hist.value_at_quantile(0.50) as f64 / 1000.0),
+                            Some(hist.value_at_quantile(0.95) as f64 / 1000.0),
+                            Some(hist.value_at_quantile(0.99) as f64 / 1000.0),
+                        )
+                    } else {
+                        (None, None, None)
+                    }
+                };
+                let (rtt50, rtt95, rtt99) = {
+                    let hist = &mut rtt_hist;
+                    hist.refresh_timeout(Duration::from_millis(200));
+                    if hist.len() > 0 {
+                        (
+                            Some(hist.value_at_quantile(0.50) as f64 / 1000.0),
+                            Some(hist.value_at_quantile(0.95) as f64 / 1000.0),
+                            Some(hist.value_at_quantile(0.99) as f64 / 1000.0),
+                        )
+                    } else {
+                        (None, None, None)
+                    }
                 };
 
                 let avg_loss_pct = if rx_loss_count > 0 {
@@ -554,40 +535,38 @@ async fn monitor_task(
                     0.0
                 };
 
-                match output_format {
-                    OutputFormat::Human => {
-                        let p50_str = p50.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
-                        let p95_str = p95.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
-                        let p99_str = p99.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
-                        let p999_str = p999.map(|v| format!("{:>8.0}", v)).unwrap_or_else(|| "     NA ".to_string());
-                        let p9999_str = p9999.map(|v| format!("{:>9.0}", v)).unwrap_or_else(|| "      NA ".to_string());
-                        println!(
-                            "│ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │ {} │",
-                            elapsed, rooms, agents,
-                            tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
-                            tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50_str, p95_str, p99_str, p999_str, p9999_str,
-                            tx_active_streams, rx_active_streams,
-                        );
-                    }
-                    OutputFormat::Csv => {
-                        let p50_str = p50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                        let p95_str = p95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                        let p99_str = p99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                        let p999_str = p999.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                        let p9999_str = p9999.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                        println!(
-                            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                            elapsed, rooms, agents,
-                            tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
-                            tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50_str, p95_str, p99_str, p999_str, p9999_str,
-                            tx_active_streams, rx_active_streams,
-                        );
-                    }
-                }
+                let p50_str = p50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                let p95_str = p95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                let p99_str = p99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                let rtt50_str = rtt50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                let rtt95_str = rtt95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                let rtt99_str = rtt99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
 
-                if p99.is_some_and(|v| v > 300.0) {
+                println!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    elapsed,
+                    rooms,
+                    agents,
+                    tx_mbps,
+                    rx_mbps,
+                    tx_pps,
+                    rx_pps,
+                    avg_loss_pct,
+                    tx_nacks,
+                    rx_nacks,
+                    tx_plis,
+                    rx_plis,
+                    p50_str,
+                    p95_str,
+                    p99_str,
+                    rtt50_str,
+                    rtt95_str,
+                    rtt99_str,
+                    tx_active_streams,
+                    rx_active_streams,
+                );
+
+                if p99.is_some_and(|v| v > 100.0) {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
                         state.degraded.store(true, Ordering::Relaxed);
@@ -595,8 +574,6 @@ async fn monitor_task(
                 } else {
                     consecutive_high_p99 = 0;
                 }
-
-                fwd_has_samples = false;
 
                 if avg_loss_pct > 5.0 && agents > 0 {
                     consecutive_high_loss += 1;
@@ -607,21 +584,21 @@ async fn monitor_task(
                     consecutive_high_loss = 0;
                 }
 
-                tx_bytes = 0; rx_bytes = 0;
-                tx_packets = 0; rx_packets = 0;
-                tx_nacks = 0; rx_nacks = 0;
-                tx_plis  = 0; rx_plis  = 0;
-                tx_active_streams  = 0; rx_active_streams = 0;
-                rx_loss_sum = 0.0; rx_loss_count = 0;
-                fwd_hist.reset();
+                tx_bytes = 0;
+                rx_bytes = 0;
+                tx_packets = 0;
+                rx_packets = 0;
+                tx_nacks = 0;
+                rx_nacks = 0;
+                tx_plis = 0;
+                rx_plis = 0;
+                tx_active_streams = 0;
+                rx_active_streams = 0;
+                rx_loss_sum = 0.0;
+                rx_loss_count = 0;
             }
 
             Some(report) = stats_rx.recv() => {
-                for latency in report.forwarding_latencies {
-                    if fwd_hist.record(latency.as_micros() as u64).is_ok() {
-                        fwd_has_samples = true;
-                    }
-                }
                 tx_bytes += report.delta.tx_bytes;
                 rx_bytes += report.delta.rx_bytes;
                 tx_packets += report.delta.tx_packets;
@@ -648,6 +625,8 @@ async fn spawn_agent(
     session_duration: Duration,
     stats_tx: mpsc::Sender<AgentStatReport>,
     _users_per_room: usize,
+    forwarding_recorder: Recorder<u64>,
+    rtt_recorder: Recorder<u64>,
 ) -> Result<()> {
     let api = HttpApiClient::new(Box::new(reqwest::Client::new()), &api_url)?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -681,11 +660,14 @@ async fn spawn_agent(
 
     let mut agent = builder.connect(&room).await?;
     let mut stats_processor = StatsProcessor::default();
-    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
-    let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let session_end = tokio::time::sleep(session_duration);
     tokio::pin!(session_end);
+
+    let forwarding_recorder = forwarding_recorder;
+    let mut rtt_recorder = rtt_recorder;
 
     loop {
         tokio::select! {
@@ -697,8 +679,8 @@ async fn spawn_agent(
                         tokio::spawn(handle_local_track(track));
                     }
                     AgentEvent::RemoteTrackAdded(recv) => {
-                        let latency_tx = latency_tx.clone();
-                        tokio::spawn(handle_remote_track(recv, latency_tx));
+                        let forwarding_recorder = forwarding_recorder.clone();
+                        tokio::spawn(handle_remote_track(recv, forwarding_recorder));
                     }
                     _ => {}
                 }
@@ -708,6 +690,11 @@ async fn spawn_agent(
                 let Some(stats) = agent.get_stats().await else { continue };
 
                 let peer = stats.peer.as_ref();
+                if let Some(peer_stats) = peer {
+                    if let Some(rtt) = peer_stats.rtt {
+                        rtt_recorder.saturating_record(rtt.as_micros() as u64);
+                    }
+                }
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
@@ -725,12 +712,7 @@ async fn spawn_agent(
 
                 let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
-                let mut forwarding_latencies = Vec::new();
-                while let Ok(sample) = latency_rx.try_recv() {
-                    forwarding_latencies.push(sample);
-                }
-
-                if stats_tx.try_send(AgentStatReport { forwarding_latencies, delta }).is_err() {
+                if stats_tx.try_send(AgentStatReport { delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
                 }
             }
@@ -784,7 +766,7 @@ async fn run_connect(
     );
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
-        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9}  streams (tx/rx)",
+        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}  streams (tx/rx)",
         "time(s)",
         "tx_mbps",
         "rx_mbps",
@@ -793,17 +775,21 @@ async fn run_connect(
         "FWD50us",
         "FWD95us",
         "FWD99us",
-        "FWD99.9us",
-        "FWD99.99us",
+        "RTT50ms",
+        "RTT95ms",
+        "RTT99ms",
         "loss%"
     );
 
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
-    let mut fwd_hist = Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap();
-    let mut fwd_has_samples = false;
-    let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
+    let mut forwarding_hist =
+        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
+    let mut rtt_hist =
+        SyncHistogram::<u64>::from(Histogram::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG)?);
+    let forwarding_recorder = forwarding_hist.recorder();
+    let mut rtt_recorder = rtt_hist.recorder();
 
     loop {
         tokio::select! {
@@ -819,8 +805,8 @@ async fn run_connect(
                         tokio::spawn(handle_local_track(track));
                     }
                     AgentEvent::RemoteTrackAdded(recv) => {
-                        let latency_tx = latency_tx.clone();
-                        tokio::spawn(handle_remote_track(recv, latency_tx));
+                        let forwarding_recorder = forwarding_recorder.clone();
+                        tokio::spawn(handle_remote_track(recv, forwarding_recorder));
                     }
                     AgentEvent::Disconnected(reason) => {
                         eprintln!("Disconnected: {reason}");
@@ -834,13 +820,13 @@ async fn run_connect(
                 let elapsed = start.elapsed().as_secs();
                 let Some(stats) = agent.get_stats().await else { continue };
 
-                while let Ok(sample) = latency_rx.try_recv() {
-                    if fwd_hist.record(sample.as_micros() as u64).is_ok() {
-                        fwd_has_samples = true;
+                let peer = stats.peer.as_ref();
+                if let Some(peer_stats) = peer {
+                    if let Some(rtt) = peer_stats.rtt {
+                        rtt_recorder.saturating_record(rtt.as_micros() as u64);
                     }
                 }
 
-                let peer = stats.peer.as_ref();
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
 
@@ -858,24 +844,35 @@ async fn run_connect(
 
                 let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
 
+                let (p50, p95, p99) = {
+                    forwarding_hist.refresh_timeout(Duration::from_millis(200));
+                    if forwarding_hist.len() > 0 {
+                        (
+                            Some(forwarding_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                            Some(forwarding_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                            Some(forwarding_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                        )
+                    } else {
+                        (None, None, None)
+                    }
+                };
+                let (rtt50, rtt95, rtt99) = {
+                    rtt_hist.refresh_timeout(Duration::from_millis(200));
+                    if rtt_hist.len() > 0 {
+                        (
+                            Some(rtt_hist.value_at_quantile(0.50) as f64 / 1000.0),
+                            Some(rtt_hist.value_at_quantile(0.95) as f64 / 1000.0),
+                            Some(rtt_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                        )
+                    } else {
+                        (None, None, None)
+                    }
+                };
+
                 let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
                 let tx_pps = delta.tx_packets;
                 let rx_pps = delta.rx_packets;
-
-                let (p50, p95, p99, p999, p9999) = if fwd_has_samples {
-                    (
-                        Some(fwd_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.999) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.9999) as f64 / 1000.0),
-                    )
-                } else {
-                    (None, None, None, None, None)
-                };
-                fwd_hist.reset();
-                fwd_has_samples = false;
 
                 let avg_loss_pct = if delta.rx_loss_count > 0 {
                     delta.rx_loss_sum / delta.rx_loss_count as f32 * 100.0
@@ -886,10 +883,14 @@ async fn run_connect(
                 let p50_str = p50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
                 let p95_str = p95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
                 let p99_str = p99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let p999_str = p999.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                let p9999_str = p9999.map(|v| format!("{:>12.3}", v)).unwrap_or_else(|| "            NA".to_string());
-                eprintln!("{:>8} {:>8.2} {:>8.2} {:>10} {:>10} {} {} {} {} {} {:>8.1}%  {}/{}",
-                          elapsed, tx_mbps, rx_mbps, tx_pps, rx_pps, p50_str, p95_str, p99_str, p999_str, p9999_str, avg_loss_pct,
+                let rtt50_str = rtt50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
+                let rtt95_str = rtt95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
+                let rtt99_str = rtt99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
+                eprintln!("{:>8} {:>8.2} {:>8.2} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                          elapsed, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
+                          delta.tx_nacks, delta.rx_nacks, delta.tx_plis, delta.rx_plis,
+                          p50_str, p95_str, p99_str,
+                          rtt50_str, rtt95_str, rtt99_str,
                           delta.tx_active, delta.rx_active);
             }
         }
@@ -908,21 +909,18 @@ async fn handle_local_track(track: LocalTrack) {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
         Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
         Some("q") => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
-        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+        _ => pulsebeam_testdata::RAW_H264_HALF_CBR,
     };
     let looper = H264Looper::new(data, 30);
     let _ = looper.run(track).await;
 }
 
-async fn handle_remote_track(
-    mut recv: RemoteTrackRx,
-    latency_tx: tokio::sync::mpsc::UnboundedSender<Duration>,
-) {
+async fn handle_remote_track(mut recv: RemoteTrackRx, mut recorder: Recorder<u64>) {
     while let Some(frame) = recv.recv().await {
         if let Some(abs_capture_time) = frame.abs_capture_time {
             let receive_time = wallclock_at(tokio::time::Instant::now());
             if let Ok(latency) = receive_time.duration_since(abs_capture_time) {
-                let _ = latency_tx.send(latency);
+                recorder.saturating_record(latency.as_micros() as u64);
             }
         }
     }
