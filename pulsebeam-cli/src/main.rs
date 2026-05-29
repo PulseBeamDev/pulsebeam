@@ -315,13 +315,13 @@ async fn run_bench(
             "│  PulseBeam SFU Breaking-Point Benchmark  │  Multi-Room Meeting  │  Ramping until degradation                                                  │"
         );
         println!(
-            "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬─────────┬─────────┤"
+            "├───────┬───────┬────────┬─────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┬─────────┬─────────┬──────────┬─────────┬─────────┤"
         );
         println!(
-            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50ms │ FWD95ms │ FWD99ms │ Tx Actv │ Rx Actv │"
+            "│  Time │ Rooms │ Agents │ Tx Mbps │ Rx Mbps │ Loss % │ Tx NACK│ Rx NACK│ Tx PLI │ Rx PLI │ FWD50ms │ FWD95ms │ FWD99ms │ FWD99.9ms │ Tx Actv │ Rx Actv │"
         );
         println!(
-            "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼─────────┼─────────┤"
+            "├───────┼───────┼────────┼─────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┼─────────┼─────────┼──────────┼─────────┼─────────┤"
         );
     }
 
@@ -509,7 +509,7 @@ async fn monitor_task(
 
     if matches!(output_format, OutputFormat::Csv) {
         println!(
-            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,tx_active,rx_active"
+            "timestamp_s,rooms,agents,tx_mbps,rx_mbps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,fwd_p999_ms,tx_active,rx_active"
         );
     }
 
@@ -527,14 +527,15 @@ async fn monitor_task(
                 let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let (p50, p95, p99) = if fwd_has_samples {
+                let (p50, p95, p99, p999) = if fwd_has_samples {
                     (
                         Some(fwd_hist.value_at_quantile(0.50) as f64 / 1000.0),
                         Some(fwd_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(fwd_hist.value_at_quantile(0.99) as f64 /1000.0),
+                        Some(fwd_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                        Some(fwd_hist.value_at_quantile(0.999) as f64 / 1000.0),
                     )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 };
 
                 let avg_loss_pct = if rx_loss_count > 0 {
@@ -548,12 +549,13 @@ async fn monitor_task(
                         let p50_str = p50.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
                         let p95_str = p95.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
                         let p99_str = p99.map(|v| format!("{:>7.0}", v)).unwrap_or_else(|| "    NA ".to_string());
+                        let p999_str = p999.map(|v| format!("{:>8.0}", v)).unwrap_or_else(|| "     NA ".to_string());
                         println!(
-                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │{} │{} │{} │ {:>7} │ {:>7} │",
+                            "│ {:>4}s │ {:>5} │ {:>6} │ {:>7.2} │ {:>7.2} │ {:>6.2} │ {:>6} │ {:>6} │ {:>6} │ {:>6} │{} │{} │{} │{} │ {:>7} │ {:>7} │",
                             elapsed, rooms, agents,
                             tx_mbps, rx_mbps, avg_loss_pct,
                             tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50_str, p95_str, p99_str,
+                            p50_str, p95_str, p99_str, p999_str,
                             tx_active_streams, rx_active_streams,
                         );
                     }
@@ -561,12 +563,13 @@ async fn monitor_task(
                         let p50_str = p50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
                         let p95_str = p95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
                         let p99_str = p99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
+                        let p999_str = p999.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
                         println!(
-                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{},{},{},{},{}",
+                            "{},{},{},{:.3},{:.3},{:.2},{},{},{},{},{},{},{},{},{},{}",
                             elapsed, rooms, agents,
                             tx_mbps, rx_mbps, avg_loss_pct,
                             tx_nacks, rx_nacks, tx_plis, rx_plis,
-                            p50_str, p95_str, p99_str,
+                            p50_str, p95_str, p99_str, p999_str,
                             tx_active_streams, rx_active_streams,
                         );
                     }
@@ -766,8 +769,8 @@ async fn run_connect(
     );
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
-        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>9}  streams (tx/rx)",
-        "time(s)", "tx_mbps", "rx_mbps", "FWD50us", "FWD95us", "FWD99us", "loss%"
+        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9}  streams (tx/rx)",
+        "time(s)", "tx_mbps", "rx_mbps", "FWD50us", "FWD95us", "FWD99us", "FWD99.9us", "loss%"
     );
 
     let mut stats_processor = StatsProcessor::default();
@@ -833,14 +836,15 @@ async fn run_connect(
                 let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
                 let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
 
-                let (p50, p95, p99) = if fwd_has_samples {
+                let (p50, p95, p99, p999) = if fwd_has_samples {
                     (
                         Some(fwd_hist.value_at_quantile(0.50) as f64 / 1000.0),
                         Some(fwd_hist.value_at_quantile(0.95) as f64 / 1000.0),
                         Some(fwd_hist.value_at_quantile(0.99) as f64 / 1000.0),
+                        Some(fwd_hist.value_at_quantile(0.999) as f64 / 1000.0),
                     )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 };
                 fwd_hist.reset();
                 fwd_has_samples = false;
@@ -854,8 +858,9 @@ async fn run_connect(
                 let p50_str = p50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
                 let p95_str = p95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
                 let p99_str = p99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
-                eprintln!("{:>8} {:>8.2} {:>8.2} {} {} {} {:>8.1}%  {}/{}",
-                          elapsed, tx_mbps, rx_mbps, p50_str, p95_str, p99_str, avg_loss_pct,
+                let p999_str = p999.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "         NA".to_string());
+                eprintln!("{:>8} {:>8.2} {:>8.2} {} {} {} {} {:>8.1}%  {}/{}",
+                          elapsed, tx_mbps, rx_mbps, p50_str, p95_str, p99_str, p999_str, avg_loss_pct,
                           delta.tx_active, delta.rx_active);
             }
         }
