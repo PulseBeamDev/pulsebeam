@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use crate::entity::TrackId;
 use crate::track::{SimulcastQuality, SimulcastReceiver, TrackMeta, TrackReceiver};
 
-pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(500);
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
 /// Per-slot construction parameters.  Pass one of these to [`VideoAllocator::add_slot`].

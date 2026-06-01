@@ -290,7 +290,7 @@ impl ControllerActor {
             .set_rtp_mode(true)
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
-            .enable_bwe(Some(str0m::bwe::Bitrate::kbps(300)))
+            .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))
             .set_extension(9, str0m::rtp::Extension::AbsoluteCaptureTime)
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))

@@ -15,7 +15,7 @@ use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use tokio::time::Instant;
 pub use video::Intent;
 
-const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
+const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(500);
 const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
 pub struct DownstreamAllocator {
