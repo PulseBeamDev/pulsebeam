@@ -199,6 +199,18 @@ impl ParticipantCore {
     /// The Main Orchestrator.
     /// Drives the feedback loop between the RTC Engine and the Signaling Logic.
     pub fn poll(&mut self) -> Option<Instant> {
+        while let Some(deadline) = self.poll_inner() {
+            if deadline > Instant::now() {
+                return Some(deadline);
+            }
+            // Deadline already expired — advance str0m's timer so it fires,
+            // then poll_inner() on the next iteration drains the new output.
+            let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
+        }
+        None
+    }
+
+    pub fn poll_inner(&mut self) -> Option<Instant> {
         let now = Instant::now();
 
         if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
