@@ -13,10 +13,11 @@ use pulsebeam_core::net::UdpSocket;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -140,13 +141,12 @@ impl Default for AgentDelta {
 
 #[derive(Debug)]
 pub struct AgentStatReport {
+    pub agent_id: usize,
     pub delta: AgentDelta,
 }
 
 #[derive(Default)]
 pub struct StatsProcessor {
-    prev_tx_bytes: u64,
-    prev_rx_bytes: u64,
     prev_tx_layers: HashMap<(Mid, Option<Rid>), LayerState>,
     prev_rx_layers: HashMap<(Mid, Option<Rid>), LayerState>,
 }
@@ -154,8 +154,6 @@ pub struct StatsProcessor {
 #[derive(Default, Clone)]
 struct LayerState {
     packets: u64,
-    nacks: u64,
-    plis: u64,
     silent_ticks: u32,
 }
 
@@ -169,17 +167,15 @@ impl StatsProcessor {
     ) -> AgentDelta {
         let mut delta = AgentDelta::default();
 
-        delta.tx_bytes = tx_bytes.saturating_sub(self.prev_tx_bytes);
-        delta.rx_bytes = rx_bytes.saturating_sub(self.prev_rx_bytes);
-        self.prev_tx_bytes = tx_bytes;
-        self.prev_rx_bytes = rx_bytes;
+        delta.tx_bytes = tx_bytes;
+        delta.rx_bytes = rx_bytes;
 
         for (mid, rid, packets, nacks, plis) in tx_layers {
             let prev = self.prev_tx_layers.entry((mid, rid)).or_default();
             let d_packets = packets.saturating_sub(prev.packets);
-            delta.tx_packets += d_packets;
-            delta.tx_nacks += nacks.saturating_sub(prev.nacks);
-            delta.tx_plis += plis.saturating_sub(prev.plis);
+            delta.tx_packets += packets;
+            delta.tx_nacks += nacks;
+            delta.tx_plis += plis;
 
             prev.silent_ticks = if d_packets == 0 {
                 prev.silent_ticks.saturating_add(1)
@@ -190,16 +186,14 @@ impl StatsProcessor {
                 delta.tx_active += 1;
             }
             prev.packets = packets;
-            prev.nacks = nacks;
-            prev.plis = plis;
         }
 
         for (mid, rid, packets, nacks, plis, loss) in rx_layers {
             let prev = self.prev_rx_layers.entry((mid, rid)).or_default();
             let d_packets = packets.saturating_sub(prev.packets);
-            delta.rx_packets += d_packets;
-            delta.rx_nacks += nacks.saturating_sub(prev.nacks);
-            delta.rx_plis += plis.saturating_sub(prev.plis);
+            delta.rx_packets += packets;
+            delta.rx_nacks += nacks;
+            delta.rx_plis += plis;
 
             prev.silent_ticks = if d_packets == 0 {
                 prev.silent_ticks.saturating_add(1)
@@ -214,8 +208,6 @@ impl StatsProcessor {
                 }
             }
             prev.packets = packets;
-            prev.nacks = nacks;
-            prev.plis = plis;
         }
 
         delta
@@ -459,29 +451,30 @@ async fn spawn_room(
     });
 }
 
+#[derive(Default)]
+struct AgentHistory {
+    tx_bytes: u64,
+    rx_bytes: u64,
+    tx_packets: u64,
+    rx_packets: u64,
+    tx_nacks: u64,
+    rx_nacks: u64,
+    tx_plis: u64,
+    rx_plis: u64,
+}
+
 async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<SharedState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = Instant::now();
+    let mut last_interval = start;
 
     let mut forwarding_hist =
         Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
     let mut rtt_hist = Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
 
-    let mut tx_bytes = 0u64;
-    let mut rx_bytes = 0u64;
-    let mut tx_nacks = 0u64;
-    let mut rx_nacks = 0u64;
-    let mut tx_plis = 0u64;
-    let mut rx_plis = 0u64;
-
-    let mut tx_active_streams = 0usize;
-    let mut rx_active_streams = 0usize;
-
-    let mut tx_packets = 0u64;
-    let mut rx_packets = 0u64;
-    let mut rx_loss_sum = 0.0f32;
-    let mut rx_loss_count = 0usize;
+    let mut agent_latest: HashMap<usize, AgentDelta> = HashMap::new();
+    let mut agent_prev: HashMap<usize, AgentHistory> = HashMap::new();
 
     let mut consecutive_high_p99 = 0u32;
     let mut consecutive_high_loss = 0u32;
@@ -490,17 +483,65 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
         tokio::select! {
             biased;
 
-            _ = interval.tick() => {
+            now = interval.tick() => {
+                let interval_secs = now.duration_since(last_interval).as_secs_f64();
+                last_interval = now;
+
+                if interval_secs <= 0.0 {
+                    continue;
+                }
+
                 let elapsed = start.elapsed().as_secs();
                 if elapsed == 0 { continue; }
 
                 let rooms = state.active_rooms.load(Ordering::Relaxed);
                 let agents = state.active_agents.load(Ordering::Relaxed);
 
-                let tx_mbps = (tx_bytes * 8) as f64 / 1_000_000.0;
-                let rx_mbps = (rx_bytes * 8) as f64 / 1_000_000.0;
-                let tx_pps = tx_packets;
-                let rx_pps = rx_packets;
+                let mut total_tx_bytes_delta = 0u64;
+                let mut total_rx_bytes_delta = 0u64;
+                let mut total_tx_packets_delta = 0u64;
+                let mut total_rx_packets_delta = 0u64;
+                let mut total_tx_nacks_delta = 0u64;
+                let mut total_rx_nacks_delta = 0u64;
+                let mut total_tx_plis_delta = 0u64;
+                let mut total_rx_plis_delta = 0u64;
+
+                let mut tx_active_streams = 0usize;
+                let mut rx_active_streams = 0usize;
+                let mut rx_loss_sum = 0.0f32;
+                let mut rx_loss_count = 0usize;
+
+                for (&id, latest) in &agent_latest {
+                    let prev = agent_prev.entry(id).or_default();
+
+                    total_tx_bytes_delta += latest.tx_bytes.saturating_sub(prev.tx_bytes);
+                    total_rx_bytes_delta += latest.rx_bytes.saturating_sub(prev.rx_bytes);
+                    total_tx_packets_delta += latest.tx_packets.saturating_sub(prev.tx_packets);
+                    total_rx_packets_delta += latest.rx_packets.saturating_sub(prev.rx_packets);
+                    total_tx_nacks_delta += latest.tx_nacks.saturating_sub(prev.tx_nacks);
+                    total_rx_nacks_delta += latest.rx_nacks.saturating_sub(prev.rx_nacks);
+                    total_tx_plis_delta += latest.tx_plis.saturating_sub(prev.tx_plis);
+                    total_rx_plis_delta += latest.rx_plis.saturating_sub(prev.rx_plis);
+
+                    tx_active_streams += latest.tx_active;
+                    rx_active_streams += latest.rx_active;
+                    rx_loss_sum += latest.rx_loss_sum;
+                    rx_loss_count += latest.rx_loss_count;
+
+                    prev.tx_bytes = latest.tx_bytes;
+                    prev.rx_bytes = latest.rx_bytes;
+                    prev.tx_packets = latest.tx_packets;
+                    prev.rx_packets = latest.rx_packets;
+                    prev.tx_nacks = latest.tx_nacks;
+                    prev.rx_nacks = latest.rx_nacks;
+                    prev.tx_plis = latest.tx_plis;
+                    prev.rx_plis = latest.rx_plis;
+                }
+
+                let tx_mbps = (total_tx_bytes_delta as f64 * 8.0) / 1_000_000.0 / interval_secs;
+                let rx_mbps = (total_rx_bytes_delta as f64 * 8.0) / 1_000_000.0 / interval_secs;
+                let tx_pps = total_tx_packets_delta as f64 / interval_secs;
+                let rx_pps = total_rx_packets_delta as f64 / interval_secs;
 
                 let (p50, p95, p99) = if forwarding_hist.len() > 0 {
                     (
@@ -536,9 +577,9 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                 let rtt99_str = rtt99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
 
                 println!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{:.3},{:.3},{:.1},{:.1},{:.2},{},{},{},{},{},{},{},{},{},{},{},{}",
                     elapsed, rooms, agents, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
-                    tx_nacks, rx_nacks, tx_plis, rx_plis,
+                    total_tx_nacks_delta, total_rx_nacks_delta, total_tx_plis_delta, total_rx_plis_delta,
                     p50_str, p95_str, p99_str, rtt50_str, rtt95_str, rtt99_str,
                     tx_active_streams, rx_active_streams,
                 );
@@ -561,49 +602,25 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                     consecutive_high_loss = 0;
                 }
 
-                tx_bytes = 0;
-                rx_bytes = 0;
-                tx_packets = 0;
-                rx_packets = 0;
-                tx_nacks = 0;
-                rx_nacks = 0;
-                tx_plis = 0;
-                rx_plis = 0;
-                tx_active_streams = 0;
-                rx_active_streams = 0;
-                rx_loss_sum = 0.0;
-                rx_loss_count = 0;
                 forwarding_hist.reset();
                 rtt_hist.reset();
             }
 
             Some(report) = stats_rx.recv() => {
-                tx_bytes += report.delta.tx_bytes;
-                rx_bytes += report.delta.rx_bytes;
-                tx_packets += report.delta.tx_packets;
-                rx_packets += report.delta.rx_packets;
-                tx_nacks += report.delta.tx_nacks;
-                rx_nacks += report.delta.rx_nacks;
-                tx_plis += report.delta.tx_plis;
-                rx_plis += report.delta.rx_plis;
-                tx_active_streams += report.delta.tx_active;
-                rx_active_streams += report.delta.rx_active;
-                rx_loss_sum += report.delta.rx_loss_sum;
-                rx_loss_count += report.delta.rx_loss_count;
-
-                for sample in report.delta.forwarding_samples {
-                    let _ = forwarding_hist.record(sample);
+                for sample in &report.delta.forwarding_samples {
+                    let _ = forwarding_hist.record(*sample);
                 }
-                for sample in report.delta.rtt_samples {
-                    let _ = rtt_hist.record(sample);
+                for sample in &report.delta.rtt_samples {
+                    let _ = rtt_hist.record(*sample);
                 }
+                agent_latest.insert(report.agent_id, report.delta);
             }
         }
     }
 }
 
 async fn spawn_agent(
-    _id: usize,
+    id: usize,
     api_url: String,
     room: String,
     is_pub: bool,
@@ -702,7 +719,7 @@ async fn spawn_agent(
                     delta.forwarding_samples.push(sample);
                 }
 
-                if stats_tx.try_send(AgentStatReport { delta }).is_err() {
+                if stats_tx.try_send(AgentStatReport { agent_id: id, delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
                 }
             }
@@ -780,6 +797,9 @@ async fn run_connect(
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     let start = Instant::now();
+    let mut last_stats = start;
+
+    let mut prev_history = AgentHistory::default();
 
     let mut forwarding_hist =
         Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
@@ -812,6 +832,14 @@ async fn run_connect(
             }
 
             _ = stats_interval.tick() => {
+                let now = Instant::now();
+                let interval_secs = now.duration_since(last_stats).as_secs_f64();
+                last_stats = now;
+
+                if interval_secs <= 0.0 {
+                    continue;
+                }
+
                 let elapsed = start.elapsed().as_secs();
                 let Some(stats) = agent.get_stats().await else { continue };
 
@@ -841,7 +869,25 @@ async fn run_connect(
                     })
                 });
 
-                let delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
+                let latest = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
+
+                let d_tx_bytes = latest.tx_bytes.saturating_sub(prev_history.tx_bytes);
+                let d_rx_bytes = latest.rx_bytes.saturating_sub(prev_history.rx_bytes);
+                let d_tx_packets = latest.tx_packets.saturating_sub(prev_history.tx_packets);
+                let d_rx_packets = latest.rx_packets.saturating_sub(prev_history.rx_packets);
+                let d_tx_nacks = latest.tx_nacks.saturating_sub(prev_history.tx_nacks);
+                let d_rx_nacks = latest.rx_nacks.saturating_sub(prev_history.rx_nacks);
+                let d_tx_plis = latest.tx_plis.saturating_sub(prev_history.tx_plis);
+                let d_rx_plis = latest.rx_plis.saturating_sub(prev_history.rx_plis);
+
+                prev_history.tx_bytes = latest.tx_bytes;
+                prev_history.rx_bytes = latest.rx_bytes;
+                prev_history.tx_packets = latest.tx_packets;
+                prev_history.rx_packets = latest.rx_packets;
+                prev_history.tx_nacks = latest.tx_nacks;
+                prev_history.rx_nacks = latest.rx_nacks;
+                prev_history.tx_plis = latest.tx_plis;
+                prev_history.rx_plis = latest.rx_plis;
 
                 let (p50, p95, p99) = if forwarding_hist.len() > 0 {
                     (
@@ -863,13 +909,13 @@ async fn run_connect(
                     (None, None, None)
                 };
 
-                let tx_mbps = (delta.tx_bytes * 8) as f64 / 1_000_000.0;
-                let rx_mbps = (delta.rx_bytes * 8) as f64 / 1_000_000.0;
-                let tx_pps = delta.tx_packets;
-                let rx_pps = delta.rx_packets;
+                let tx_mbps = (d_tx_bytes as f64 * 8.0) / 1_000_000.0 / interval_secs;
+                let rx_mbps = (d_rx_bytes as f64 * 8.0) / 1_000_000.0 / interval_secs;
+                let tx_pps = d_tx_packets as f64 / interval_secs;
+                let rx_pps = d_rx_packets as f64 / interval_secs;
 
-                let avg_loss_pct = if delta.rx_loss_count > 0 {
-                    delta.rx_loss_sum / delta.rx_loss_count as f32 * 100.0
+                let avg_loss_pct = if latest.rx_loss_count > 0 {
+                    latest.rx_loss_sum / latest.rx_loss_count as f32 * 100.0
                 } else {
                     0.0
                 };
@@ -882,12 +928,12 @@ async fn run_connect(
                 let rtt99_str = rtt99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
 
                 eprintln!(
-                    "{:>8} {:>8.2} {:>8.2} {:>10} {:>10} {:>10.2} {:>10} {:>10} {:>10} {:>10} {} {} {} {} {} {} {:>10} {:>10}",
+                    "{:>8} {:>8.2} {:>8.2} {:>10.0} {:>10.0} {:>10.2} {:>10} {:>10} {:>10} {:>10} {} {} {} {} {} {} {:>10} {:>10}",
                     elapsed, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
-                    delta.tx_nacks, delta.rx_nacks, delta.tx_plis, delta.rx_plis,
+                    d_tx_nacks, d_rx_nacks, d_tx_plis, d_rx_plis,
                     p50_str, p95_str, p99_str,
                     rtt50_str, rtt95_str, rtt99_str,
-                    delta.tx_active, delta.rx_active
+                    latest.tx_active, latest.rx_active
                 );
 
                 forwarding_hist.reset();
@@ -941,8 +987,10 @@ mod tests {
 
         assert_eq!(delta.tx_bytes, 1000);
         assert_eq!(delta.rx_bytes, 2000);
+        assert_eq!(delta.tx_packets, 100);
         assert_eq!(delta.tx_nacks, 1);
         assert_eq!(delta.tx_plis, 2);
+        assert_eq!(delta.rx_packets, 200);
         assert_eq!(delta.rx_nacks, 3);
         assert_eq!(delta.rx_plis, 4);
         assert_eq!(delta.tx_active, 1);
