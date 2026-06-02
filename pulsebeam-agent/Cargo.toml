@@ -20,8 +20,8 @@ str0m = { workspace = true }
 bytes = { workspace = true }
 
 tokio = { workspace = true }
-metrics = "0.24.5"
-http = "1.4.0"
+metrics = "0.24.6"
+http = "1.4.1"
 tokio-stream = "0.1.18"
 if-addrs = "0.15.0"
 pulsebeam-core = { path = "../pulsebeam-core" }
