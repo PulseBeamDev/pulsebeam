@@ -21,6 +21,9 @@ release:
 profile:
 	$(CARGO_CMD) build --profile profiling -p pulsebeam
 
+run-profile: profile
+	$(BINARY)
+
 test: test-unit test-loom test-sim
 
 test-unit:
@@ -39,24 +42,24 @@ flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
 perf-server:
-	@# Capture PIDs, replace newlines with commas, and trim the trailing comma
 	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
-	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi; \
+	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi
 	sudo sysctl -w kernel.kptr_restrict=0
 	sudo sysctl -w kernel.perf_event_paranoid=-1
-	
-	@echo "Recording strictly on Core 4 at a precise 499Hz window..."
-	sudo perf record -p $(PIDS) \
-		-F 499 \
--		-e cycles,cache-misses,LLC-load-misses \
-		-e sched:sched_switch --switch-events \
+	@echo "Recording pulsebeam PIDs=$(PIDS) for 15s at 999Hz..."
+	perf config annotate.objdump=llvm-objdump
+	  # -p $(PIDS) 
+	perf record \
+		-F 99 \
+		-a \
+		-e cycles \
+		-g \
 		--call-graph fp \
-		-m 32M \
+		-m 128M \
 		-o perf.data \
 		-- sleep 15
-	
 	@echo "Launching UI..."
-	sudo hotspot perf.data
+	hotspot perf.data
 
 perf-system:
 	sudo sysctl -w kernel.kptr_restrict=0
@@ -68,17 +71,15 @@ perf-system:
 	@echo "========================================================"
 	
 	# We use a massive 128M buffer so data isn't dropped during a long wait
-	sudo perf record \
+	perf record \
 		-a \
-		-F 999 \
+		-F 99 \
 		-e cycles \
+		-g \
 		--call-graph fp \
 		-m 128M \
 		-o perf-system.data
 
-		@echo "Launching UI..."
-		sudo hotspot perf-system.data
-	
 
 stats:
 	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
