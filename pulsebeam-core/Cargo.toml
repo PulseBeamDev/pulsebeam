@@ -25,4 +25,4 @@ http = { version = "^1" }
 
 axum = { version = "^0.8", optional = true }
 turmoil = { workspace = true, optional = true }
-reqwest = { version = "0.13.3", optional = true }
+reqwest = { version = "0.13.4", optional = true }
