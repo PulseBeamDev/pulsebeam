@@ -60,7 +60,8 @@ impl SimClientBuilder {
     }
 
     pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let agent = self.agent_builder.connect(room).await?;
+        let (agent, driver) = self.agent_builder.connect(room).await?;
+        tokio::spawn(driver.run());
         tracing::info!("connected to {room}");
         Ok(SimClient {
             ip: self.ip,

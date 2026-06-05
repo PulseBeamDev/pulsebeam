@@ -12,6 +12,7 @@ use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{namespace, signaling};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use str0m::IceConnectionState;
@@ -532,50 +533,6 @@ impl LocalTrack {
     }
 }
 
-fn new_remote_track(mid: Mid, track: Arc<Track>) -> (RemoteTrackTx, RemoteTrackRx) {
-    let (ch_tx, ch_rx) = mpsc::channel(8);
-    let tx = RemoteTrackTx {
-        track: track.clone(),
-        tx: ch_tx,
-    };
-    let rx = RemoteTrackRx {
-        mid,
-        track,
-        rx: ch_rx,
-    };
-
-    (tx, rx)
-}
-
-#[derive(Debug, Clone)]
-pub struct RemoteTrackTx {
-    pub track: Arc<Track>,
-    tx: mpsc::Sender<MediaFrame>,
-}
-
-impl RemoteTrackTx {
-    pub fn try_send(&self, frame: MediaFrame) {
-        let _ = self.tx.try_send(frame);
-    }
-
-    pub async fn send(&self, frame: MediaFrame) {
-        let _ = self.tx.send(frame).await;
-    }
-}
-
-#[derive(Debug)]
-pub struct RemoteTrackRx {
-    pub mid: Mid,
-    pub track: Arc<Track>,
-    rx: mpsc::Receiver<MediaFrame>,
-}
-
-impl RemoteTrackRx {
-    pub async fn recv(&mut self) -> Option<MediaFrame> {
-        self.rx.recv().await
-    }
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum AgentError {
     #[error("API call failed: {0}")]
@@ -647,7 +604,7 @@ impl AgentBuilder {
         self
     }
 
-    pub async fn connect(mut self, room_id: &str) -> Result<Agent, AgentError> {
+    pub async fn connect(mut self, room_id: &str) -> Result<(Agent, AgentDriver), AgentError> {
         let port = self.udp_socket.local_addr()?.port();
 
         if self.local_ips.is_empty() {
@@ -822,9 +779,8 @@ impl AgentBuilder {
             .map_err(AgentError::Rtc)?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
-        let (event_tx, event_rx) = mpsc::channel(100);
 
-        let actor = AgentActor {
+        let mut driver = AgentDriver {
             api: self.api,
             addr,
             rtc,
@@ -836,7 +792,7 @@ impl AgentBuilder {
                 None => TcpSession::inactive(),
             },
             cmd_rx,
-            event_tx,
+            pending_events: VecDeque::new(),
             resource_uri: resp.resource_uri,
             participant_id: resp.participant_id.clone(),
             senders: StreamMap::new(),
@@ -857,18 +813,24 @@ impl AgentBuilder {
             retry_count: 0,
             is_reconnecting: false,
             reconnect_deadline: None,
+            sleep: Box::pin(tokio::time::sleep(MIN_QUANTA)),
+            bwe_slow_timer: tokio::time::interval(BWE_SLOW_INTERVAL),
+            debounce_timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            reconnect_timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
         };
 
-        tokio::spawn(async move {
-            actor.run(medias).await;
-        });
+        for media in medias {
+            driver.handle_media_added(media);
+        }
 
-        Ok(Agent {
-            room_id: room_id.to_string(),
-            participant_id: resp.participant_id,
-            cmd_tx,
-            event_rx,
-        })
+        Ok((
+            Agent {
+                room_id: room_id.to_string(),
+                participant_id: resp.participant_id,
+                cmd_tx,
+            },
+            driver,
+        ))
     }
 }
 
@@ -908,7 +870,18 @@ pub enum AgentEvent {
     /// The server announced a remote track (metadata only) even if the client
     /// has not yet subscribed to it.
     RemoteTrackDiscovered(pulsebeam_proto::signaling::Track),
-    RemoteTrackAdded(RemoteTrackRx),
+    /// A remote track has been assigned to a receive slot (MID).
+    RemoteTrackAdded {
+        mid: Mid,
+        track: Arc<Track>,
+    },
+    /// A media frame was received from a remote track.
+    MediaReceived {
+        mid: Mid,
+        track: Arc<Track>,
+        frame: MediaFrame,
+        receive_time: Instant,
+    },
     Connected,
     Disconnected(String),
 }
@@ -917,7 +890,6 @@ pub struct Agent {
     room_id: String,
     participant_id: String,
     cmd_tx: mpsc::Sender<AgentCommand>,
-    event_rx: mpsc::Receiver<AgentEvent>,
 }
 
 impl Agent {
@@ -925,14 +897,8 @@ impl Agent {
         &self.participant_id
     }
 
-    pub async fn next_event(&mut self) -> Option<AgentEvent> {
-        self.event_rx.recv().await
-    }
-
-    pub async fn get_stats(&self) -> Option<AgentStats> {
-        let (stats_tx, stats_rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(AgentCommand::GetStats(stats_tx)).await;
-        stats_rx.await.ok()
+    pub fn room_id(&self) -> &str {
+        &self.room_id
     }
 
     pub async fn send(&self, cmd: AgentCommand) -> Result<(), AgentError> {
@@ -940,9 +906,8 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn disconnect(&mut self) -> Result<(), AgentError> {
+    pub async fn disconnect(&self) -> Result<(), AgentError> {
         let _ = self.cmd_tx.send(AgentCommand::Disconnect).await;
-
         Ok(())
     }
 
@@ -959,7 +924,7 @@ impl Agent {
     }
 }
 
-struct AgentActor {
+pub struct AgentDriver {
     addr: SocketAddr,
     rtc: Rtc,
     socket: UdpSocket,
@@ -968,7 +933,7 @@ struct AgentActor {
     tcp: TcpSession,
     stats: AgentStats,
     cmd_rx: mpsc::Receiver<AgentCommand>,
-    event_tx: mpsc::Sender<AgentEvent>,
+    pending_events: VecDeque<AgentEvent>,
 
     senders: StreamMap<(Mid, Option<Rid>), ReceiverStream<MediaFrame>>,
     pending: PendingState,
@@ -991,48 +956,59 @@ struct AgentActor {
     retry_count: u32,
     is_reconnecting: bool,
     reconnect_deadline: Option<Instant>,
+
+    // Timer state
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    bwe_slow_timer: tokio::time::Interval,
+    debounce_timer: Pin<Box<tokio::time::Sleep>>,
+    reconnect_timer: Pin<Box<tokio::time::Sleep>>,
 }
 
-impl AgentActor {
-    async fn run(mut self, medias: Vec<MediaAdded>) {
-        for media in medias {
-            self.handle_media_added(media);
+impl AgentDriver {
+    /// Drive one iteration of the agent event loop.
+    /// Returns the next available event, or `None` when the agent has shut down.
+    ///
+    /// Designed to be used in a `tokio::select!` alongside other futures, or
+    /// in a plain `while let Some(event) = driver.poll().await` loop.
+    pub async fn poll(&mut self) -> Option<AgentEvent> {
+        // Return events queued by the previous iteration first.
+        if let Some(ev) = self.pending_events.pop_front() {
+            return Some(ev);
         }
 
-        let debounce_timer = tokio::time::sleep(Duration::ZERO);
-        tokio::pin!(debounce_timer);
-        let sleep = tokio::time::sleep(MIN_QUANTA);
-        tokio::pin!(sleep);
-        // Periodic BWE reallocation tick (handles upgrade/recovery paths).
-        let bwe_slow_timer = tokio::time::interval(BWE_SLOW_INTERVAL);
-        tokio::pin!(bwe_slow_timer);
-        let reconnect_timer = tokio::time::sleep(Duration::ZERO);
-        tokio::pin!(reconnect_timer);
+        loop {
+            // Drain all str0m output — this may queue pending_events.
+            let Some(deadline) = self.poll_rtc().await else {
+                return self.pending_events.pop_front();
+            };
 
-        while let Some(deadline) = self.poll_rtc().await {
+            // Return events produced by poll_rtc (MediaData, Connected, etc.).
+            if let Some(ev) = self.pending_events.pop_front() {
+                return Some(ev);
+            }
+
+            // Adjust timers.
             let now = Instant::now();
             let adjusted_deadline = if deadline <= now {
                 now + MIN_QUANTA
             } else {
                 deadline
             };
-
-            if sleep.deadline() != adjusted_deadline {
-                sleep.as_mut().reset(adjusted_deadline);
+            if self.sleep.deadline() != adjusted_deadline {
+                self.sleep.as_mut().reset(adjusted_deadline);
             }
-
             if let Some(reconnect_at) = self.reconnect_deadline
-                && reconnect_timer.deadline() != reconnect_at
+                && self.reconnect_timer.deadline() != reconnect_at
             {
-                reconnect_timer.as_mut().reset(reconnect_at);
+                self.reconnect_timer.as_mut().reset(reconnect_at);
+            }
+            if let Some(debounce_at) = self.pending.deadline
+                && self.debounce_timer.deadline() != debounce_at
+            {
+                self.debounce_timer.as_mut().reset(debounce_at);
             }
 
-            if let Some(deadline) = self.pending.deadline
-                && debounce_timer.deadline() != deadline
-            {
-                debounce_timer.as_mut().reset(deadline);
-            }
-
+            // Wait for the next IO/timer event, then loop back to poll_rtc().
             tokio::select! {
                 biased;
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -1040,7 +1016,7 @@ impl AgentActor {
                 }
                 // If we have a pending state update (for subscription changes),
                 // flush it when the debounce timer fires.
-                _ = &mut debounce_timer, if self.pending.deadline.is_some() => {
+                _ = self.debounce_timer.as_mut(), if self.pending.deadline.is_some() => {
                     self.flush_pending_state(now);
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
@@ -1063,18 +1039,17 @@ impl AgentActor {
                         }
                     }
                 }
-
                 // TCP receive path: decode RFC 4571 frames and feed to str0m.
                 res = self.tcp.wait_recv() => {
                     self.tcp.on_recv(res, &mut self.rtc);
                 }
-
-                // Drain paused layers so the looper task never blocks.
+                // Drain send frames from looper tasks.
+                // Re-stamp abs_capture_time at wire-send time for accurate
+                // end-to-end latency measurement (excludes send-queue depth).
                 Some(((mid, rid), frame)) = self.senders.next() => {
                     let paused = self.layer_ctrl.is_paused(mid, rid);
-                    // Measure the encoder output bitrate BEFORE the pause gate.
-                    // This ensures we always know what the encoder *would* cost
-                    // even when the layer is suppressed.
+                    // Measure encoder output bitrate before the pause gate so
+                    // BWE always sees the true encoder cost even when suppressed.
                     self.layer_ctrl.record_frame(mid, rid, frame.data.len(), Instant::now());
 
                     if !paused {
@@ -1086,38 +1061,55 @@ impl AgentActor {
                             if let Some(rid) = rid {
                                 writer = writer.rid(rid);
                             }
-                            if let Some(abs_capture_time) = frame.abs_capture_time {
-                                writer = writer.abs_capture_time(AbsCaptureTime {
-                                    capture_time: abs_capture_time,
-                                    clock_offset: None,
-                                });
-                            }
+                            // Re-stamp at wire-send time (not encode time) so that
+                            // receive_time - abs_capture_time measures network +
+                            // server forwarding latency only.
+                            writer = writer.abs_capture_time(AbsCaptureTime {
+                                capture_time: crate::clock::capture_wallclock(),
+                                clock_offset: None,
+                            });
                             let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                         } else {
                             tracing::warn!(?mid, "no writer found for mid");
                         }
                     }
                 }
-
-                _ = bwe_slow_timer.tick() => {
+                _ = self.bwe_slow_timer.tick() => {
                     let desired_bps = self.layer_ctrl.tick(now);
                     let desired_bitrate = Bitrate::from(desired_bps.max(0.0) as u64);
                     let filtered_bitrate = self.desired_ctrl.update(desired_bitrate);
                     self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
                 }
-
-                _ = &mut sleep => {
+                _ = self.sleep.as_mut() => {
                     if self.rtc.handle_input(Input::Timeout(Instant::now().into())).is_err() {
                         self.emit(AgentEvent::Disconnected("RTC Timeout".into()));
                     }
                 }
-
-                _ = &mut reconnect_timer, if self.reconnect_deadline.is_some() => {
+                _ = self.reconnect_timer.as_mut(), if self.reconnect_deadline.is_some() => {
                     self.perform_reconnect().await;
                 }
             }
-        }
 
+            // Return any events produced by this select iteration.
+            if let Some(ev) = self.pending_events.pop_front() {
+                return Some(ev);
+            }
+            // No event yet — loop back to drain str0m output.
+        }
+    }
+
+    /// Drive the agent to completion, silently dropping events.
+    /// For fire-and-forget embeddings. Call this via `tokio::spawn(driver.run())`.
+    /// For event-driven use, call `poll()` in your own loop instead.
+    pub async fn run(mut self) {
+        while self.poll().await.is_some() {}
+        self.shutdown().await;
+    }
+
+    /// Perform cleanup after the event loop ends.
+    /// Called automatically by `run()`. If you drive `poll()` manually, call
+    /// this once `poll()` returns `None`.
+    pub async fn shutdown(self) {
         if let Err(e) = self
             .api
             .delete_participant_by_uri(self.resource_uri.clone())
@@ -1125,6 +1117,12 @@ impl AgentActor {
         {
             tracing::warn!(error = ?e, "failed to delete participant on shutdown");
         }
+    }
+
+    /// Direct read of the agent's current accumulated stats.
+    /// Reflects the state as of the most recent `poll()` call.
+    pub fn stats(&self) -> &AgentStats {
+        &self.stats
     }
 
     async fn poll_rtc(&mut self) -> Option<Instant> {
@@ -1163,8 +1161,16 @@ impl AgentActor {
                     Event::MediaAdded(media) => self.handle_media_added(media),
 
                     Event::MediaData(data) => {
-                        if let Some(tx) = self.slot_manager.get_sender(&data.mid) {
-                            tx.try_send(data.into());
+                        let receive_time = Instant::now();
+                        if let Some(track) = self.slot_manager.get_active_track(&data.mid) {
+                            let track = track.clone();
+                            let mid = data.mid;
+                            self.emit(AgentEvent::MediaReceived {
+                                mid,
+                                track,
+                                frame: data.into(),
+                                receive_time,
+                            });
                         }
                     }
 
@@ -1294,13 +1300,13 @@ impl AgentActor {
         match payload {
             signaling::server_message::Payload::Update(update) => {
                 tracing::info!("Received signaling update: {:?}", update);
-                let (new_remote_tracks, new_discovered_tracks) = self.slot_manager.sync(update);
+                let (new_assignments, new_discovered_tracks) = self.slot_manager.sync(update);
                 for track in new_discovered_tracks {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
                 }
-                for rx in new_remote_tracks {
-                    tracing::info!("Emitting RemoteTrackAdded for MID: {:?}", rx.mid);
-                    self.emit(AgentEvent::RemoteTrackAdded(rx));
+                for (mid, track) in new_assignments {
+                    tracing::info!("Emitting RemoteTrackAdded for MID: {:?}", mid);
+                    self.emit(AgentEvent::RemoteTrackAdded { mid, track });
                 }
             }
             signaling::server_message::Payload::Error(err) => {
@@ -1309,10 +1315,8 @@ impl AgentActor {
         }
     }
 
-    fn emit(&self, event: AgentEvent) {
-        if self.event_tx.try_send(event).is_err() {
-            tracing::warn!("agent event channel full or closed; event dropped");
-        }
+    fn emit(&mut self, event: AgentEvent) {
+        self.pending_events.push_back(event);
     }
 
     fn flush_pending_state(&mut self, now: Instant) {
@@ -1675,8 +1679,8 @@ struct ReceiverSlot {
 struct SlotManager {
     // Tracks discovered in the room but not yet assigned to a slot.
     pending_tracks: HashMap<TrackId, Arc<Track>>,
-    // Active track transmitters.
-    remote_tracks: HashMap<TrackId, RemoteTrackTx>,
+    // Active tracks (assigned to a slot and visible to the caller).
+    active_tracks: HashMap<TrackId, Arc<Track>>,
     // The fixed set of Receive Transceivers (MIDs) available to this Agent.
     slots: Vec<ReceiverSlot>,
 }
@@ -1686,7 +1690,7 @@ impl SlotManager {
         Self {
             pending_tracks: HashMap::new(),
             slots: Vec::new(),
-            remote_tracks: HashMap::new(),
+            active_tracks: HashMap::new(),
         }
     }
 
@@ -1709,20 +1713,23 @@ impl SlotManager {
     fn sync(
         &mut self,
         update: pulsebeam_proto::signaling::StateUpdate,
-    ) -> (Vec<RemoteTrackRx>, Vec<pulsebeam_proto::signaling::Track>) {
+    ) -> (
+        Vec<(Mid, Arc<Track>)>,
+        Vec<pulsebeam_proto::signaling::Track>,
+    ) {
         tracing::info!("Syncing SlotManager state with update: {:?}", update);
-        let mut new_remote_tracks = Vec::new();
+        let mut new_assignments: Vec<(Mid, Arc<Track>)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
 
         // 1. Handle track removals
         for t in update.tracks_remove {
             self.pending_tracks.remove(&t);
-            self.remote_tracks.remove(&t);
+            self.active_tracks.remove(&t);
         }
 
         // 2. Handle new tracks (store as pending if not already active or pending)
         for t in update.tracks_upsert {
-            if self.remote_tracks.contains_key(&t.id) {
+            if self.active_tracks.contains_key(&t.id) {
                 // Already active, maybe update track metadata?
                 // For now just keep it.
                 continue;
@@ -1770,9 +1777,9 @@ impl SlotManager {
                     a.track_id,
                     s.mid
                 );
-                let (tx, rx) = new_remote_track(s.mid, track);
-                self.remote_tracks.insert(a.track_id, tx);
-                new_remote_tracks.push(rx);
+                let mid = s.mid;
+                self.active_tracks.insert(a.track_id, track.clone());
+                new_assignments.push((mid, track));
             } else {
                 tracing::debug!(
                     "Track {} already active or not found in pending",
@@ -1783,13 +1790,13 @@ impl SlotManager {
 
         // 5. Handle cases where the assignment arrived before the track metadata.
         // If we already know about the track (in pending_tracks) and it is assigned,
-        // ensure we create a RemoteTrack for it.
+        // promote it now.
         for slot in &self.slots {
             let Some(track_id) = &slot.track_id else {
                 continue;
             };
 
-            if self.remote_tracks.contains_key(track_id) {
+            if self.active_tracks.contains_key(track_id) {
                 continue;
             }
 
@@ -1802,17 +1809,17 @@ impl SlotManager {
                 track_id,
                 slot.mid
             );
-            let (tx, rx) = new_remote_track(slot.mid, track);
-            self.remote_tracks.insert(track_id.clone(), tx);
-            new_remote_tracks.push(rx);
+            let mid = slot.mid;
+            self.active_tracks.insert(track_id.clone(), track.clone());
+            new_assignments.push((mid, track));
         }
 
-        (new_remote_tracks, newly_discovered_tracks)
+        (new_assignments, newly_discovered_tracks)
     }
 
-    fn get_sender(&self, mid: &Mid) -> Option<&RemoteTrackTx> {
+    fn get_active_track(&self, mid: &Mid) -> Option<&Arc<Track>> {
         let slot = self.slots.iter().find(|s| s.mid == *mid)?;
         let track_id = slot.track_id.as_ref()?;
-        self.remote_tracks.get(track_id)
+        self.active_tracks.get(track_id)
     }
 }

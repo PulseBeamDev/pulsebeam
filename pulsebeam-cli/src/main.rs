@@ -4,7 +4,7 @@ use core_affinity::{get_core_ids, set_for_current};
 use hdrhistogram::Histogram;
 use pulsebeam_agent::{
     MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
-    actor::{AgentBuilder, AgentEvent, LocalTrack, RemoteTrackRx},
+    actor::{AgentBuilder, AgentEvent, LocalTrack},
     api::HttpApiClient,
     media::H264Looper,
     wallclock_at,
@@ -659,12 +659,12 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
-    let mut agent = builder.connect(&room).await?;
+    let (_agent, mut driver) = builder.connect(&room).await?;
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let (sample_tx, mut sample_rx) = mpsc::channel::<u64>(4096);
+    let mut forwarding_samples: Vec<u64> = Vec::new();
 
     let session_end = tokio::time::sleep(session_duration);
     tokio::pin!(session_end);
@@ -673,21 +673,25 @@ async fn spawn_agent(
         tokio::select! {
             _ = &mut session_end => break,
 
-            Some(event) = agent.next_event() => {
+            Some(event) = driver.poll() => {
                 match event {
                     AgentEvent::LocalTrackAdded(track) => {
                         tokio::spawn(handle_local_track(track));
                     }
-                    AgentEvent::RemoteTrackAdded(recv) => {
-                        let sample_tx = sample_tx.clone();
-                        tokio::spawn(handle_remote_track(recv, sample_tx));
+                    AgentEvent::MediaReceived { frame, receive_time, .. } => {
+                        if let Some(abs_capture_time) = frame.abs_capture_time {
+                            let receive_wallclock = wallclock_at(receive_time);
+                            if let Ok(latency) = receive_wallclock.duration_since(abs_capture_time) {
+                                forwarding_samples.push(latency.as_micros() as u64);
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
 
             _ = stats_interval.tick() => {
-                let Some(stats) = agent.get_stats().await else { continue };
+                let stats = driver.stats();
 
                 let mut delta = {
                     let peer = stats.peer.as_ref();
@@ -715,9 +719,7 @@ async fn spawn_agent(
                     d
                 };
 
-                while let Ok(sample) = sample_rx.try_recv() {
-                    delta.forwarding_samples.push(sample);
-                }
+                delta.forwarding_samples.append(&mut forwarding_samples);
 
                 if stats_tx.try_send(AgentStatReport { agent_id: id, delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
@@ -765,7 +767,7 @@ async fn run_connect(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
-    let mut agent = builder.connect(&room).await?;
+    let (agent, mut driver) = builder.connect(&room).await?;
     eprintln!(
         "Connected to room '{}' (participant: {})",
         room,
@@ -804,7 +806,6 @@ async fn run_connect(
     let mut forwarding_hist =
         Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
     let mut rtt_hist = Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
-    let (sample_tx, mut sample_rx) = mpsc::channel::<u64>(4096);
 
     loop {
         tokio::select! {
@@ -814,14 +815,18 @@ async fn run_connect(
                 break;
             }
 
-            Some(event) = agent.next_event() => {
+            Some(event) = driver.poll() => {
                 match event {
                     AgentEvent::LocalTrackAdded(track) => {
                         tokio::spawn(handle_local_track(track));
                     }
-                    AgentEvent::RemoteTrackAdded(recv) => {
-                        let sample_tx = sample_tx.clone();
-                        tokio::spawn(handle_remote_track(recv, sample_tx));
+                    AgentEvent::MediaReceived { frame, receive_time, .. } => {
+                        if let Some(abs_capture_time) = frame.abs_capture_time {
+                            let receive_wallclock = wallclock_at(receive_time);
+                            if let Ok(latency) = receive_wallclock.duration_since(abs_capture_time) {
+                                let _ = forwarding_hist.record(latency.as_micros() as u64);
+                            }
+                        }
                     }
                     AgentEvent::Disconnected(reason) => {
                         eprintln!("Disconnected: {reason}");
@@ -841,17 +846,13 @@ async fn run_connect(
                 }
 
                 let elapsed = start.elapsed().as_secs();
-                let Some(stats) = agent.get_stats().await else { continue };
+                let stats = driver.stats();
 
                 let peer = stats.peer.as_ref();
                 if let Some(peer_stats) = peer {
                     if let Some(rtt) = peer_stats.rtt {
                         let _ = rtt_hist.record(rtt.as_micros() as u64);
                     }
-                }
-
-                while let Ok(sample) = sample_rx.try_recv() {
-                    let _ = forwarding_hist.record(sample);
                 }
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
@@ -955,21 +956,10 @@ async fn handle_local_track(track: LocalTrack) {
         Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
         Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
         Some("q") => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
-        _ => pulsebeam_testdata::RAW_H264_HALF_CBR,
+        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
     };
     let looper = H264Looper::new(data, 30);
     let _ = looper.run(track).await;
-}
-
-async fn handle_remote_track(mut recv: RemoteTrackRx, sample_tx: mpsc::Sender<u64>) {
-    while let Some(frame) = recv.recv().await {
-        if let Some(abs_capture_time) = frame.abs_capture_time {
-            let receive_time = wallclock_at(tokio::time::Instant::now());
-            if let Ok(latency) = receive_time.duration_since(abs_capture_time) {
-                let _ = sample_tx.try_send(latency.as_micros() as u64);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
