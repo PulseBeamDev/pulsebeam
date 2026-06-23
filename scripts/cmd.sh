@@ -1,0 +1,1 @@
+RUST_LOG=error taskset -c 6-13 ./target/release/pulsebeam-cli --api-url http://localhost:7070 bench --rooms 80 --max-rooms 100 --users-per-room 4 --session-duration 3600 --join-spread-secs 30 --drain-duration 3600 --output-format csv --arrival-rate 5 --fixed-session | tee c-2.csv
