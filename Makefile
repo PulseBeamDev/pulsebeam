@@ -5,6 +5,7 @@ CARGO_CMD = RUSTC_WRAPPER=$(SCCACHE) cargo
 TARGET_DIR = target/profiling
 BINARY = $(TARGET_DIR)/pulsebeam
 SIM := sim
+TARGET = pulsebeam
 
 .PHONY: all help dev build release profile flamegraph perf deps brew-deps cargo-deps clean
 all: build
@@ -42,7 +43,7 @@ flamegraph: profile
 	taskset -c 2-5 $(CARGO_CMD) flamegraph --profile profiling -p pulsebeam --bin pulsebeam
 
 perf-server:
-	$(eval PIDS := $(shell pgrep -x pulsebeam | paste -sd "," -))
+	$(eval PIDS := $(shell pgrep -x $(TARGET) | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi
 	sudo sysctl -w kernel.kptr_restrict=0
 	sudo sysctl -w kernel.perf_event_paranoid=-1
@@ -58,6 +59,7 @@ perf-server:
 		-m 128M \
 		-o perf.data \
 		-- sleep 15
+	perf script -F +pid > perf-firefox.data
 	@echo "Launching UI..."
 	hotspot perf.data
 
