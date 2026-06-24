@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use core_affinity::{get_core_ids, set_for_current};
 use hdrhistogram::Histogram;
 use pulsebeam_agent::{
     MediaKind, Mid, Rid, SimulcastLayer, TransceiverDirection,
@@ -218,6 +217,30 @@ impl StatsProcessor {
 #[allow(dead_code)]
 struct FakeUnused {}
 
+#[cfg(target_os = "linux")]
+fn configure_runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runtime::Runtime> {
+    use core_affinity::{get_core_ids, set_for_current};
+    let core_ids = get_core_ids().unwrap_or_default();
+    let core_index = std::sync::atomic::AtomicUsize::new(0);
+
+    if !core_ids.is_empty() {
+        builder.on_thread_start(move || {
+            if let Some(core) = core_ids
+                .get(core_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % core_ids.len())
+            {
+                core_affinity::set_for_current(*core);
+            }
+        });
+    }
+    Ok(builder.build()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runtime::Runtime> {
+    // Mac, Windows, and other systems fall back to standard OS scheduling
+    Ok(builder.build()?)
+}
+
 fn main() -> Result<()> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
@@ -233,21 +256,9 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let core_ids = get_core_ids().unwrap_or_default();
-    let core_index = AtomicUsize::new(0);
-    let runtime = Builder::new_multi_thread()
-        .enable_all()
-        .enable_alt_timer()
-        .on_thread_start(move || {
-            if !core_ids.is_empty() {
-                if let Some(core) =
-                    core_ids.get(core_index.fetch_add(1, Ordering::Relaxed) % core_ids.len())
-                {
-                    set_for_current(*core);
-                }
-            }
-        })
-        .build()?;
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all().enable_alt_timer();
+    let runtime = configure_runtime(builder)?;
 
     runtime.block_on(async move {
         match cli.command {
