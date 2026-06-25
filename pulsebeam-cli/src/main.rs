@@ -96,8 +96,51 @@ impl SharedState {
 }
 
 const SILENT_TICKS_THRESHOLD: u32 = 3;
-const HISTOGRAM_MAX_US: u64 = 10_000_000;
+const HISTOGRAM_MAX_US: u64 = 60_000_000;
 const HISTOGRAM_SIGFIG: u8 = 3;
+
+struct RollingHistogram {
+    buckets: Vec<Histogram<u64>>,
+    head: usize,
+    max_value: u64,
+    sigfig: u8,
+}
+
+impl RollingHistogram {
+    fn new(max_value: u64, sigfig: u8, num_buckets: usize) -> Self {
+        assert!(
+            num_buckets >= 2,
+            "need at least 2 buckets for a meaningful window"
+        );
+        let buckets = (0..num_buckets)
+            .map(|_| Histogram::new_with_max(max_value, sigfig).unwrap())
+            .collect();
+        Self {
+            buckets,
+            head: 0,
+            max_value,
+            sigfig,
+        }
+    }
+
+    fn record(&mut self, value: u64) {
+        let _ = self.buckets[self.head].record(value);
+    }
+
+    fn rotate(&mut self) {
+        let next = (self.head + 1) % self.buckets.len();
+        self.buckets[next].reset();
+        self.head = next;
+    }
+
+    fn combined_view(&self) -> Histogram<u64> {
+        let mut combined = Histogram::new_with_max(self.max_value, self.sigfig).unwrap();
+        for bucket in &self.buckets {
+            let _ = combined.add(bucket);
+        }
+        combined
+    }
+}
 
 #[derive(Debug)]
 pub struct AgentDelta {
@@ -113,8 +156,12 @@ pub struct AgentDelta {
     pub rx_active: usize,
     pub rx_loss_sum: f32,
     pub rx_loss_count: usize,
-    pub forwarding_samples: Vec<u64>,
-    pub rtt_samples: Vec<u64>,
+    pub fwd_p50_us: u64,
+    pub fwd_p95_us: u64,
+    pub fwd_p99_us: u64,
+    pub rtt_avg_us: u64,
+    pub has_fwd_samples: bool,
+    pub has_rtt_samples: bool,
 }
 
 impl Default for AgentDelta {
@@ -132,8 +179,12 @@ impl Default for AgentDelta {
             rx_active: 0,
             rx_loss_sum: 0.0,
             rx_loss_count: 0,
-            forwarding_samples: Vec::with_capacity(256),
-            rtt_samples: Vec::with_capacity(8),
+            fwd_p50_us: 0,
+            fwd_p95_us: 0,
+            fwd_p99_us: 0,
+            rtt_avg_us: 0,
+            has_fwd_samples: false,
+            has_rtt_samples: false,
         }
     }
 }
@@ -237,7 +288,6 @@ fn configure_runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runt
 
 #[cfg(not(target_os = "linux"))]
 fn configure_runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runtime::Runtime> {
-    // Mac, Windows, and other systems fall back to standard OS scheduling
     Ok(builder.build()?)
 }
 
@@ -328,7 +378,7 @@ async fn run_bench(
     let room_counter = Arc::new(AtomicUsize::new(0));
 
     println!(
-        "timestamp_s,rooms,agents,tx_mbps,rx_mbps,tx_pps,rx_pps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,fwd_p50_ms,fwd_p95_ms,fwd_p99_ms,rtt_p50_ms,rtt_p95_ms,rtt_p99_ms,tx_active,rx_active"
+        "timestamp_s,rooms,agents,tx_mbps,rx_mbps,tx_pps,rx_pps,loss_pct,tx_nacks,rx_nacks,tx_plis,rx_plis,max_e2e_p50_ms,max_e2e_p95_ms,max_e2e_p99_ms,max_rtt_avg_ms,tx_active,rx_active"
     );
 
     let monitor_state = state.clone();
@@ -480,10 +530,6 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
     let start = Instant::now();
     let mut last_interval = start;
 
-    let mut forwarding_hist =
-        Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
-    let mut rtt_hist = Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
-
     let mut agent_latest: HashMap<usize, AgentDelta> = HashMap::new();
     let mut agent_prev: HashMap<usize, AgentHistory> = HashMap::new();
 
@@ -522,6 +568,14 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                 let mut rx_loss_sum = 0.0f32;
                 let mut rx_loss_count = 0usize;
 
+                let mut max_fwd_p50 = 0u64;
+                let mut max_fwd_p95 = 0u64;
+                let mut max_fwd_p99 = 0u64;
+                let mut max_rtt_avg = 0u64;
+
+                let mut has_any_fwd = false;
+                let mut has_any_rtt = false;
+
                 for (&id, latest) in &agent_latest {
                     let prev = agent_prev.entry(id).or_default();
 
@@ -539,6 +593,18 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                     rx_loss_sum += latest.rx_loss_sum;
                     rx_loss_count += latest.rx_loss_count;
 
+                    if latest.has_fwd_samples {
+                        has_any_fwd = true;
+                        max_fwd_p50 = max_fwd_p50.max(latest.fwd_p50_us);
+                        max_fwd_p95 = max_fwd_p95.max(latest.fwd_p95_us);
+                        max_fwd_p99 = max_fwd_p99.max(latest.fwd_p99_us);
+                    }
+
+                    if latest.has_rtt_samples {
+                        has_any_rtt = true;
+                        max_rtt_avg = max_rtt_avg.max(latest.rtt_avg_us);
+                    }
+
                     prev.tx_bytes = latest.tx_bytes;
                     prev.rx_bytes = latest.rx_bytes;
                     prev.tx_packets = latest.tx_packets;
@@ -554,25 +620,11 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                 let tx_pps = total_tx_packets_delta as f64 / interval_secs;
                 let rx_pps = total_rx_packets_delta as f64 / interval_secs;
 
-                let (p50, p95, p99) = if forwarding_hist.len() > 0 {
-                    (
-                        Some(forwarding_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                        Some(forwarding_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(forwarding_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                    )
-                } else {
-                    (None, None, None)
-                };
+                let p50_str  = if has_any_fwd { format!("{:.3}", max_fwd_p50 as f64 / 1000.0) } else { "NA".to_string() };
+                let p95_str  = if has_any_fwd { format!("{:.3}", max_fwd_p95 as f64 / 1000.0) } else { "NA".to_string() };
+                let p99_str  = if has_any_fwd { format!("{:.3}", max_fwd_p99 as f64 / 1000.0) } else { "NA".to_string() };
 
-                let (rtt50, rtt95, rtt99) = if rtt_hist.len() > 0 {
-                    (
-                        Some(rtt_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                        Some(rtt_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(rtt_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                    )
-                } else {
-                    (None, None, None)
-                };
+                let rtt_avg_str = if has_any_rtt { format!("{:.3}", max_rtt_avg as f64 / 1000.0) } else { "NA".to_string() };
 
                 let avg_loss_pct = if rx_loss_count > 0 {
                     rx_loss_sum / rx_loss_count as f32 * 100.0
@@ -580,22 +632,15 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                     0.0
                 };
 
-                let p50_str = p50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                let p95_str = p95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                let p99_str = p99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                let rtt50_str = rtt50.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                let rtt95_str = rtt95.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-                let rtt99_str = rtt99.map(|v| format!("{:.3}", v)).unwrap_or_else(|| "NA".to_string());
-
                 println!(
-                    "{},{},{},{:.3},{:.3},{:.1},{:.1},{:.2},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{:.3},{:.3},{:.1},{:.1},{:.2},{},{},{},{},{},{},{},{},{},{}",
                     elapsed, rooms, agents, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
                     total_tx_nacks_delta, total_rx_nacks_delta, total_tx_plis_delta, total_rx_plis_delta,
-                    p50_str, p95_str, p99_str, rtt50_str, rtt95_str, rtt99_str,
+                    p50_str, p95_str, p99_str, rtt_avg_str,
                     tx_active_streams, rx_active_streams,
                 );
 
-                if p99.is_some_and(|v| v > 100.0) {
+                if has_any_fwd && (max_fwd_p99 as f64 / 1000.0) > 100.0 {
                     consecutive_high_p99 += 1;
                     if consecutive_high_p99 >= 3 {
                         state.degraded.store(true, Ordering::Relaxed);
@@ -612,18 +657,9 @@ async fn monitor_task(mut stats_rx: mpsc::Receiver<AgentStatReport>, state: Arc<
                 } else {
                     consecutive_high_loss = 0;
                 }
-
-                forwarding_hist.reset();
-                rtt_hist.reset();
             }
 
             Some(report) = stats_rx.recv() => {
-                for sample in &report.delta.forwarding_samples {
-                    let _ = forwarding_hist.record(*sample);
-                }
-                for sample in &report.delta.rtt_samples {
-                    let _ = rtt_hist.record(*sample);
-                }
                 agent_latest.insert(report.agent_id, report.delta);
             }
         }
@@ -675,7 +711,8 @@ async fn spawn_agent(
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut forwarding_samples: Vec<u64> = Vec::new();
+    let mut local_fwd_hist = RollingHistogram::new(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG, 6);
+    let mut local_rtt_ewma: Option<f64> = None;
 
     let session_end = tokio::time::sleep(session_duration);
     tokio::pin!(session_end);
@@ -693,7 +730,7 @@ async fn spawn_agent(
                         if let Some(abs_capture_time) = frame.abs_capture_time {
                             let receive_wallclock = wallclock_at(receive_time);
                             if let Ok(latency) = receive_wallclock.duration_since(abs_capture_time) {
-                                forwarding_samples.push(latency.as_micros() as u64);
+                                local_fwd_hist.record(latency.as_micros() as u64);
                             }
                         }
                     }
@@ -704,33 +741,49 @@ async fn spawn_agent(
             _ = stats_interval.tick() => {
                 let stats = driver.stats();
 
-                let mut delta = {
-                    let peer = stats.peer.as_ref();
-                    let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
-                    let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
-
-                    let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
-                        track.tx_layers.iter().map(move |(rid, egress)| {
-                            (*mid, *rid, egress.packets, egress.nacks, egress.plis)
-                        })
-                    });
-
-                    let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
-                        track.rx_layers.iter().map(move |(rid, ingress)| {
-                            (*mid, *rid, ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
-                        })
-                    });
-
-                    let mut d = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
-                    if let Some(peer_stats) = peer {
-                        if let Some(rtt) = peer_stats.rtt {
-                            d.rtt_samples.push(rtt.as_micros() as u64);
-                        }
+                let peer = stats.peer.as_ref();
+                if let Some(peer_stats) = peer {
+                    if let Some(rtt) = peer_stats.rtt {
+                        let current_sample = rtt.as_micros() as f64;
+                        local_rtt_ewma = Some(match local_rtt_ewma {
+                            Some(prev) => 0.5 * current_sample + 0.5 * prev,
+                            None => current_sample,
+                        });
                     }
-                    d
-                };
+                }
 
-                delta.forwarding_samples.append(&mut forwarding_samples);
+                let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
+                let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
+
+                let tx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                    track.tx_layers.iter().map(move |(rid, egress)| {
+                        (*mid, *rid, egress.packets, egress.nacks, egress.plis)
+                    })
+                });
+
+                let rx_iter = stats.tracks.iter().flat_map(|(mid, track)| {
+                    track.rx_layers.iter().map(move |(rid, ingress)| {
+                        (*mid, *rid, ingress.packets, ingress.nacks, ingress.plis, ingress.loss)
+                    })
+                });
+
+                let mut delta = stats_processor.process(tx_bytes, rx_bytes, tx_iter, rx_iter);
+
+                let fwd_view = local_fwd_hist.combined_view();
+                // Send only if there are enough datapoints to safely parse P99
+                if fwd_view.len() >= 500 {
+                    delta.has_fwd_samples = true;
+                    delta.fwd_p50_us = fwd_view.value_at_quantile(0.50);
+                    delta.fwd_p95_us = fwd_view.value_at_quantile(0.95);
+                    delta.fwd_p99_us = fwd_view.value_at_quantile(0.99);
+                }
+
+                if let Some(ewma_val) = local_rtt_ewma {
+                    delta.has_rtt_samples = true;
+                    delta.rtt_avg_us = ewma_val as u64;
+                }
+
+                local_fwd_hist.rotate();
 
                 if stats_tx.try_send(AgentStatReport { agent_id: id, delta }).is_err() {
                     tracing::warn!("stats channel full, dropping report");
@@ -786,7 +839,7 @@ async fn run_connect(
     );
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
-        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "{:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "time(s)",
         "tx_mbps",
         "rx_mbps",
@@ -800,9 +853,7 @@ async fn run_connect(
         "FWD50ms",
         "FWD95ms",
         "FWD99ms",
-        "RTT50ms",
-        "RTT95ms",
-        "RTT99ms",
+        "RTTAveMs",
         "tx_act",
         "rx_act"
     );
@@ -814,9 +865,8 @@ async fn run_connect(
 
     let mut prev_history = AgentHistory::default();
 
-    let mut forwarding_hist =
-        Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
-    let mut rtt_hist = Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG).unwrap();
+    let mut forwarding_hist = RollingHistogram::new(HISTOGRAM_MAX_US, HISTOGRAM_SIGFIG, 30);
+    let mut local_rtt_ewma: Option<f64> = None;
 
     loop {
         tokio::select! {
@@ -835,7 +885,7 @@ async fn run_connect(
                         if let Some(abs_capture_time) = frame.abs_capture_time {
                             let receive_wallclock = wallclock_at(receive_time);
                             if let Ok(latency) = receive_wallclock.duration_since(abs_capture_time) {
-                                let _ = forwarding_hist.record(latency.as_micros() as u64);
+                                forwarding_hist.record(latency.as_micros() as u64);
                             }
                         }
                     }
@@ -862,7 +912,11 @@ async fn run_connect(
                 let peer = stats.peer.as_ref();
                 if let Some(peer_stats) = peer {
                     if let Some(rtt) = peer_stats.rtt {
-                        let _ = rtt_hist.record(rtt.as_micros() as u64);
+                        let current_sample = rtt.as_micros() as f64;
+                        local_rtt_ewma = Some(match local_rtt_ewma {
+                            Some(prev) => 0.5 * current_sample + 0.5 * prev,
+                            None => current_sample,
+                        });
                     }
                 }
 
@@ -901,25 +955,12 @@ async fn run_connect(
                 prev_history.tx_plis = latest.tx_plis;
                 prev_history.rx_plis = latest.rx_plis;
 
-                let (p50, p95, p99) = if forwarding_hist.len() > 0 {
-                    (
-                        Some(forwarding_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                        Some(forwarding_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(forwarding_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                    )
-                } else {
-                    (None, None, None)
-                };
+                let fwd_view = forwarding_hist.combined_view();
+                let p50_str = if fwd_view.len() >= 10 { format!("{:>10.3}", fwd_view.value_at_quantile(0.50) as f64 / 1000.0) } else { format!("{:>10}", "NA") };
+                let p95_str = if fwd_view.len() >= 100 { format!("{:>10.3}", fwd_view.value_at_quantile(0.95) as f64 / 1000.0) } else { format!("{:>10}", "NA") };
+                let p99_str = if fwd_view.len() >= 500 { format!("{:>10.3}", fwd_view.value_at_quantile(0.99) as f64 / 1000.0) } else { format!("{:>10}", "NA") };
 
-                let (rtt50, rtt95, rtt99) = if rtt_hist.len() > 0 {
-                    (
-                        Some(rtt_hist.value_at_quantile(0.50) as f64 / 1000.0),
-                        Some(rtt_hist.value_at_quantile(0.95) as f64 / 1000.0),
-                        Some(rtt_hist.value_at_quantile(0.99) as f64 / 1000.0),
-                    )
-                } else {
-                    (None, None, None)
-                };
+                let rtt_avg_str = if let Some(v) = local_rtt_ewma { format!("{:>10.3}", v / 1000.0) } else { format!("{:>10}", "NA") };
 
                 let tx_mbps = (d_tx_bytes as f64 * 8.0) / 1_000_000.0 / interval_secs;
                 let rx_mbps = (d_rx_bytes as f64 * 8.0) / 1_000_000.0 / interval_secs;
@@ -932,24 +973,16 @@ async fn run_connect(
                     0.0
                 };
 
-                let p50_str = p50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
-                let p95_str = p95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
-                let p99_str = p99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
-                let rtt50_str = rtt50.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
-                let rtt95_str = rtt95.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
-                let rtt99_str = rtt99.map(|v| format!("{:>10.3}", v)).unwrap_or_else(|| "        NA".to_string());
-
                 eprintln!(
-                    "{:>8} {:>8.2} {:>8.2} {:>10.0} {:>10.0} {:>10.2} {:>10} {:>10} {:>10} {:>10} {} {} {} {} {} {} {:>10} {:>10}",
+                    "{:>8} {:>8.2} {:>8.2} {:>10.0} {:>10.0} {:>10.2} {:>10} {:>10} {:>10} {:>10} {} {} {} {} {:>10} {:>10}",
                     elapsed, tx_mbps, rx_mbps, tx_pps, rx_pps, avg_loss_pct,
                     d_tx_nacks, d_rx_nacks, d_tx_plis, d_rx_plis,
                     p50_str, p95_str, p99_str,
-                    rtt50_str, rtt95_str, rtt99_str,
+                    rtt_avg_str,
                     latest.tx_active, latest.rx_active
                 );
 
-                forwarding_hist.reset();
-                rtt_hist.reset();
+                forwarding_hist.rotate();
             }
         }
     }
