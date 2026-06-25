@@ -472,19 +472,37 @@ pub fn tune_current_control_thread() {
 }
 
 pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
-    use rustix::thread::{current_timer_slack, set_current_timer_slack};
-
-    if let Some(core) = core_id {
-        if core_affinity::set_for_current(core) {
-            tracing::info!(?core, "Data thread pinned to CPU core");
-        } else {
-            tracing::warn!(?core, "Failed to pin Data thread to CPU core");
-        }
-    }
-
     #[cfg(target_os = "linux")]
     {
+        use rustix::thread::{current_timer_slack, set_current_timer_slack};
         use std::num::NonZero;
+        use thread_priority::{
+            RealtimeThreadSchedulePolicy, ScheduleParams, ThreadPriority, ThreadSchedulePolicy,
+            thread_native_id,
+        };
+
+        if let Some(core) = core_id {
+            if core_affinity::set_for_current(core) {
+                tracing::info!(?core, "Data thread pinned to CPU core");
+            } else {
+                tracing::warn!(?core, "Failed to pin Data thread to CPU core");
+            }
+        }
+
+        let current_thread_id = thread_native_id();
+        let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
+
+        let priority = ThreadPriority::from_posix(ScheduleParams { sched_priority: 50 });
+        if let Err(e) =
+            thread_priority::set_thread_priority_and_policy(current_thread_id, priority, policy)
+        {
+            tracing::warn!(
+                "Failed to set Data Thread to SCHED_FIFO at priority 50 (requires CAP_SYS_NICE): {:?}",
+                e
+            );
+        } else {
+            tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 50)");
+        }
 
         // attempt to get closer to SCHED_FIFO without CAP_SYS_ADMIN
         let slack_value = NonZero::new(1);
