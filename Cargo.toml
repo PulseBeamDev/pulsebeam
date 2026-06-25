@@ -71,6 +71,5 @@ inherits = "release"
 
 # We want to crash during simulation
 [profile.sim]
-inherits = "release"
-debug-assertions = true
-panic = "abort"
+inherits = "dev"
+opt-level = 1

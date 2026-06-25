@@ -492,7 +492,7 @@ impl Stage for AssertAllDisconnectedStage {
                     let client = client_guard
                         .as_ref()
                         .expect("client should have been initialized");
-                    let stats = client.agent.get_stats().await.unwrap_or_default();
+                    let stats = client.get_stats();
                     if stats.peer.is_some() {
                         return Err(format!(
                             "Expected client {} to have no peer, got {:?}",

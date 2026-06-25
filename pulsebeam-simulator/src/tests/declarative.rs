@@ -176,12 +176,7 @@ fn reconnection_recovery_test() -> turmoil::Result {
 
         // Wait for agent to reconnect and resume flow
         tracing::info!("Waiting for reconnection and flow recovery...");
-        let start_bytes = client
-            .agent
-            .get_stats()
-            .await
-            .map(|s| s.total_tx_bytes())
-            .unwrap_or(0);
+        let start_bytes = client.get_stats().total_tx_bytes();
         client
             .drive_until(Duration::from_secs(20), |stats| {
                 stats.total_tx_bytes() > start_bytes + 20_000

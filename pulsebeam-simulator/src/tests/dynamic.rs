@@ -120,12 +120,7 @@ fn abrupt_exit_chaos_test() {
             .await?;
 
         for _ in 0..6 {
-            let before = subscriber
-                .agent
-                .get_stats()
-                .await
-                .unwrap_or_default()
-                .total_rx_bytes();
+            let before = subscriber.get_stats().total_rx_bytes();
 
             subscriber
                 .drive_until(Duration::from_secs(8), |stats| {

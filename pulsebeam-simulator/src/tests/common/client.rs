@@ -4,7 +4,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent::actor::{Agent, AgentBuilder, AgentEvent, AgentStats};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
-use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
+use pulsebeam_agent::{AgentDriver, MediaKind, SimulcastLayer, TransceiverDirection};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::net::IpAddr;
@@ -61,12 +61,12 @@ impl SimClientBuilder {
 
     pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
         let (agent, driver) = self.agent_builder.connect(room).await?;
-        tokio::spawn(driver.run());
         tracing::info!("connected to {room}");
         Ok(SimClient {
             ip: self.ip,
             participant_id: agent.participant_id().to_string(),
             agent,
+            driver,
             local_mids: Vec::new(),
             discovered_tracks: Vec::new(),
             remote_tracks: Vec::new(),
@@ -78,6 +78,7 @@ impl SimClientBuilder {
 pub struct SimClient {
     pub ip: IpAddr,
     pub agent: Agent,
+    pub driver: AgentDriver,
     /// The participant ID assigned by the server for this client.
     pub participant_id: String,
     /// Local track mids (as reported by LocalTrackAdded events).
@@ -90,6 +91,10 @@ pub struct SimClient {
 }
 
 impl SimClient {
+    pub fn get_stats(&self) -> &AgentStats {
+        self.driver.stats()
+    }
+
     pub async fn drive(&mut self, token: CancellationToken) -> anyhow::Result<AgentStats> {
         self.drive_until_cancelled(token, |_| false).await
     }
@@ -122,7 +127,7 @@ impl SimClient {
         let _guard = token.clone().drop_guard();
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
-                let stats = self.agent.get_stats().await.unwrap_or_default();
+                let stats = self.driver.stats();
                 anyhow::bail!(
                     "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
                     self.ip,
@@ -147,10 +152,10 @@ impl SimClient {
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
-                    let stats = self.agent.get_stats().await.unwrap_or_default();
-                    return Ok(stats);
+                    let stats = self.driver.stats();
+                    return Ok(stats.clone());
                 }
-                Some(event) = self.agent.next_event() => {
+                Some(event) = self.driver.poll() => {
                     match event {
                         AgentEvent::LocalTrackAdded(sender) => {
                             tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
@@ -164,24 +169,24 @@ impl SimClient {
                                 self.discovered_tracks.push(track.id.clone());
                             }
                         }
-                        AgentEvent::RemoteTrackAdded(recv) => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
-                            self.remote_tracks.push((recv.mid, recv.track.id.clone()));
+                        AgentEvent::RemoteTrackAdded {mid, track} => {
+                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, track.id);
+                            self.remote_tracks.push((mid, track.id.clone()));
                         }
                         _ => {}
                     }
 
                     // Re-check the predicate after processing an event, since a new
                     // event may indicate the desired state has been reached.
-                    let stats = self.agent.get_stats().await.unwrap_or_default();
-                    if predicate(&stats) {
-                        return Ok(stats);
+                    let stats = self.driver.stats();
+                    if predicate(stats) {
+                        return Ok(stats.clone());
                     }
                 }
                 _ = check_interval.tick() => {
-                    let stats = self.agent.get_stats().await.unwrap_or_default();
-                    if predicate(&stats) {
-                        return Ok(stats);
+                    let stats = self.driver.stats();
+                    if predicate(stats) {
+                        return Ok(stats.clone());
                     }
                 }
             }
@@ -204,24 +209,23 @@ impl SimClient {
 
             // As a fallback, consider a track "received" if we see actual rx bytes in stats.
             // This makes the test more robust to transient event delivery or ordering issues.
-            if let Some(stats) = self.agent.get_stats().await {
-                let rx_tracks = stats
-                    .tracks
-                    .values()
-                    .filter(|t| t.rx_layers.values().any(|l| l.bytes > 0))
-                    .count();
-                if rx_tracks >= count {
-                    tracing::info!(
-                        "{} observed {} tracks with inbound bytes (fallback)",
-                        self.ip,
-                        rx_tracks
-                    );
-                    return Ok(());
-                }
+            let stats = self.driver.stats();
+            let rx_tracks = stats
+                .tracks
+                .values()
+                .filter(|t| t.rx_layers.values().any(|l| l.bytes > 0))
+                .count();
+            if rx_tracks >= count {
+                tracing::info!(
+                    "{} observed {} tracks with inbound bytes (fallback)",
+                    self.ip,
+                    rx_tracks
+                );
+                return Ok(());
             }
 
             if start.elapsed() > timeout {
-                let stats = self.agent.get_stats().await.unwrap_or_default();
+                let stats = self.driver.stats();
                 anyhow::bail!(
                     "Client {} timed out waiting for {} remote tracks. Got {:?} / {:?}. Final Stats:\n{:?}",
                     self.ip,
@@ -233,7 +237,7 @@ impl SimClient {
             }
 
             tokio::select! {
-                Some(event) = self.agent.next_event() => {
+                Some(event) = self.driver.poll() => {
                     match event {
                         AgentEvent::LocalTrackAdded(sender) => {
                             tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
@@ -246,10 +250,10 @@ impl SimClient {
                                 self.discovered_tracks.push(track.id.clone());
                             }
                         }
-                        AgentEvent::RemoteTrackAdded(recv) => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
+                        AgentEvent::RemoteTrackAdded { mid, track } => {
+                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, track.id);
                             self.remote_tracks
-                                .push((recv.mid, recv.track.id.clone()));
+                                .push((mid, track.id.clone()));
                         }
                         _ => {}
                     }
@@ -273,7 +277,7 @@ impl SimClient {
             }
 
             if start.elapsed() > timeout {
-                let stats = self.agent.get_stats().await.unwrap_or_default();
+                let stats = self.driver.stats();
                 anyhow::bail!(
                     "Client {} timed out waiting for {} discovered tracks. Got {:?}. Final Stats:\n{:?}",
                     self.ip,
@@ -284,7 +288,7 @@ impl SimClient {
             }
 
             tokio::select! {
-                Some(event) = self.agent.next_event() => {
+                Some(event) = self.driver.poll() => {
                     match event {
                         AgentEvent::LocalTrackAdded(sender) => {
                             tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
@@ -298,10 +302,10 @@ impl SimClient {
                                 self.discovered_tracks.push(track.id.clone());
                             }
                         }
-                        AgentEvent::RemoteTrackAdded(recv) => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, recv.track.id);
+                        AgentEvent::RemoteTrackAdded { mid, track } => {
+                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, track.id);
                             self.remote_tracks
-                                .push((recv.mid, recv.track.id.clone()));
+                                .push((mid, track.id.clone()));
                         }
                         _ => {}
                     }

@@ -24,74 +24,40 @@ fn slots_layout_update_test() -> turmoil::Result {
     let pub2_ip = common::subnet_ip(subnet, 3);
     let sub1_ip = common::subnet_ip(subnet, 4);
 
+    // 1. Start SFU Node
     sim.host(server_ip, move || async move {
         common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF))
             .await
             .map_err(|e| e.into())
     });
 
-    // Share publisher track identity (participant_id + mid) with the subscriber.
-    let pub1_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
-    let pub2_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    // 2. Publisher 1: Immediately publishes and streams
+    sim.client(pub1_ip, async move {
+        let mut client = common::client::SimClientBuilder::bind(pub1_ip, server_ip)
+            .await?
+            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+            .connect("room1")
+            .await?;
 
-    // Publisher 1: Sends "track1"
-    {
-        let pub1_info = pub1_info.clone();
-        sim.client(pub1_ip, async move {
-            let mut client = common::client::SimClientBuilder::bind(pub1_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-                .connect("room1")
-                .await?;
+        // Keep pumping media for the duration of the test
+        client.drive_for(Duration::from_secs(50)).await.ok();
+        Ok(())
+    });
 
-            // Wait for the local track MID to be advertised by the agent.
-            // This can take a few ticks in the async runtime.
-            let start = tokio::time::Instant::now();
-            while start.elapsed() < Duration::from_secs(10) {
-                if !client.local_mids.is_empty() {
-                    break;
-                }
-                // Advance the simulation a bit.
-                client.drive_for(Duration::from_millis(50)).await.ok();
-            }
+    // 3. Publisher 2: Immediately publishes and streams
+    sim.client(pub2_ip, async move {
+        let mut client = common::client::SimClientBuilder::bind(pub2_ip, server_ip)
+            .await?
+            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
+            .connect("room1")
+            .await?;
 
-            // Store participant_id + mid for subscriber to use when subscribing.
-            if let Some(mid) = client.local_mids.get(0) {
-                let pid = client.participant_id.clone();
-                *pub1_info.lock().await = Some((pid, mid.to_string()));
-            }
+        // Keep pumping media for the duration of the test
+        client.drive_for(Duration::from_secs(50)).await.ok();
+        Ok(())
+    });
 
-            client.drive_for(Duration::from_secs(40)).await.ok();
-
-            Ok(())
-        });
-    }
-
-    // Publisher 2: Sends "track2"
-    {
-        let pub2_info = pub2_info.clone();
-        sim.client(pub2_ip, async move {
-            let mut client = common::client::SimClientBuilder::bind(pub2_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-                .connect("room1")
-                .await?;
-
-            client
-                .drive_until(Duration::from_secs(30), |_| false)
-                .await
-                .ok();
-
-            if let Some(mid) = client.local_mids.get(0) {
-                let pid = client.participant_id.clone();
-                *pub2_info.lock().await = Some((pid, mid.to_string()));
-            }
-
-            Ok(())
-        });
-    }
-
-    // Subscriber: Swaps between pub1 and pub2
+    // 4. Subscriber: Discovers tracks over signaling and interacts with slots
     sim.client(sub1_ip, async move {
         let mut client = common::client::SimClientBuilder::bind(sub1_ip, server_ip)
             .await?
@@ -100,60 +66,40 @@ fn slots_layout_update_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // 1. Wait for both publishers to expose their participant_id + mid.
-        let mut info1 = None;
-        let mut info2 = None;
-        let start = tokio::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(60) {
-            if info1.is_none() {
-                info1 = pub1_info.lock().await.clone();
-            }
-            if info2.is_none() {
-                info2 = pub2_info.lock().await.clone();
-            }
-            if info1.is_some() && info2.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the SFU signaling to tell us about both remote tracks
+        client
+            .wait_for_remote_tracks(2, Duration::from_secs(10))
+            .await?;
+
+        // Extract the discovered track IDs dynamically from the client's internal state
+        let track_ids = client.discovered_tracks.clone();
+        if track_ids.len() < 2 {
+            return Err("Expected at least 2 discovered tracks".into());
         }
+        let track1 = &track_ids[0];
+        let track2 = &track_ids[1];
 
-        let (pid1, mid1) = info1.expect("publisher 1 info never populated");
-        let (pid2, mid2) = info2.expect("publisher 2 info never populated");
+        tracing::info!("Discovered remote track IDs: {} and {}", track1, track2);
 
-        let track1 = ParticipantId::from_str(&pid1)
-            .unwrap()
-            .derive_track_id(MediaKind::Video, &mid1)
-            .as_str();
-        let track2 = ParticipantId::from_str(&pid2)
-            .unwrap()
-            .derive_track_id(MediaKind::Video, &mid2)
-            .as_str();
-
-        tracing::info!("Computed track IDs: {} and {}", track1, track2);
-
-        // 2. Subscribe: Slot 1 -> track1, Slot 2 -> track2
+        // Initial Layout Subscription: Slot 1 -> Track 1, Slot 2 -> Track 2
         client
             .agent
             .set_subscriptions(vec![
                 Subscription {
-                    track_id: track1.to_string(),
+                    track_id: track1.clone(),
                     height: 720,
                 },
                 Subscription {
-                    track_id: track2.to_string(),
+                    track_id: track2.clone(),
                     height: 720,
                 },
             ])
             .await?;
 
-        // 3. Wait for assignment to settle and for media to start flowing.
+        // Drive until media bytes start hitting rx_layers on both tracks
+        tracing::info!("Waiting for initial media on both slots...");
         client
-            .wait_for_remote_tracks(2, Duration::from_secs(20))
-            .await?;
-
-        tracing::info!("Waiting for media on both slots...");
-        client
-            .drive_until(Duration::from_secs(40), |stats| {
+            .drive_until(Duration::from_secs(10), |stats| {
                 stats
                     .tracks
                     .values()
@@ -161,7 +107,7 @@ fn slots_layout_update_test() -> turmoil::Result {
             })
             .await?;
 
-        // 3. Swap: Slot 1 -> T2, Slot 2 -> T1
+        // Swap Layout: Slot 1 -> Track 2, Slot 2 -> Track 1
         tracing::info!("Swapping slots...");
         client
             .agent
@@ -177,9 +123,9 @@ fn slots_layout_update_test() -> turmoil::Result {
             ])
             .await?;
 
-        // 4. Verify swap
+        // Verify media continues flowing after the swap step
         client
-            .drive_until(Duration::from_secs(40), |stats| {
+            .drive_until(Duration::from_secs(10), |stats| {
                 stats
                     .tracks
                     .values()
@@ -190,7 +136,7 @@ fn slots_layout_update_test() -> turmoil::Result {
         Ok(())
     });
 
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(40))?;
+    common::run_sim_or_timeout(&mut sim, Duration::from_secs(30))?;
     Ok(())
 }
 
@@ -376,8 +322,8 @@ fn slots_prioritization_test() -> turmoil::Result {
             })
             .await?;
 
-        let stats = client.agent.get_stats().await.unwrap();
-        for (mid, track_stats) in stats.tracks {
+        let stats = client.get_stats();
+        for (mid, track_stats) in &stats.tracks {
             assert!(
                 track_stats.rx_layers.values().any(|l| l.bytes > 0),
                 "Slot {:?} should have received media",
