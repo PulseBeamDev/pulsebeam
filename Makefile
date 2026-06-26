@@ -32,7 +32,7 @@ test-unit:
 	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator -- --skip loom_
 
 test-sim:
-	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture $(TEST)
+	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture --test-threads=1 $(TEST)
 
 test-loom:
 	LOOM_MAX_PREEMPTIONS=2 $(CARGO_CMD) test --workspace --features loom loom_

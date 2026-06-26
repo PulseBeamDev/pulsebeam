@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
@@ -143,46 +144,49 @@ impl SimClient {
     where
         F: FnMut(&ClientContext) -> bool,
     {
-        let mut check_interval = tokio::time::interval(Duration::from_millis(200));
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Ok(());
-                }
-                Some(event) = self.ctx.driver.poll() => {
-                    match event {
-                        AgentEvent::LocalTrackAdded(sender) => {
-                            tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ctx.ip, sender.mid, sender.rid);
-                            self.ctx.local_mids.push(sender.mid);
-                            let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
-                            self.join_set.spawn(looper.run(sender));
-                        }
-                        AgentEvent::RemoteTrackDiscovered(track) => {
-                            tracing::info!("{} discovered remote track: {:?}", self.ctx.ip, track.id);
-                            if !self.ctx.discovered_tracks.contains(&track.id) {
-                                self.ctx.discovered_tracks.push(track.id.clone());
+        let span = tracing::info_span!("drive_until_cancelled", ip = %self.ctx.ip, participant_id = %self.ctx.driver.participant_id());
+        async move {
+            let mut check_interval = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        return Ok(());
+                    }
+                    Some(event) = self.ctx.driver.poll() => {
+                        match event {
+                            AgentEvent::LocalTrackAdded(sender) => {
+                                tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ctx.ip, sender.mid, sender.rid);
+                                self.ctx.local_mids.push(sender.mid);
+                                let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
+                                self.join_set.spawn(looper.run(sender));
                             }
+                            AgentEvent::RemoteTrackDiscovered(track) => {
+                                tracing::info!("{} discovered remote track: {:?}", self.ctx.ip, track.id);
+                                if !self.ctx.discovered_tracks.contains(&track.id) {
+                                    self.ctx.discovered_tracks.push(track.id.clone());
+                                }
+                            }
+                            AgentEvent::RemoteTrackAdded {mid, track} => {
+                                tracing::info!("{} subscribed to remote track: {:?}", self.ctx.ip, track.id);
+                                self.ctx.remote_tracks.push((mid, track.id.clone()));
+                            }
+                            _ => {}
                         }
-                        AgentEvent::RemoteTrackAdded {mid, track} => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ctx.ip, track.id);
-                            self.ctx.remote_tracks.push((mid, track.id.clone()));
-                        }
-                        _ => {}
-                    }
 
-                    // Re-check the predicate after processing an event, since a new
-                    // event may indicate the desired state has been reached.
-                    if predicate(&self.ctx) {
-                        return Ok(());
+                        // Re-check the predicate after processing an event, since a new
+                        // event may indicate the desired state has been reached.
+                        if predicate(&self.ctx) {
+                            return Ok(());
+                        }
                     }
-                }
-                _ = check_interval.tick() => {
-                    if predicate(&self.ctx) {
-                        return Ok(());
+                    _ = check_interval.tick() => {
+                        if predicate(&self.ctx) {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
+        }.instrument(span).await
     }
 }
 
