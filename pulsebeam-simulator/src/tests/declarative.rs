@@ -57,38 +57,31 @@ fn declarative_subscription_test() -> turmoil::Result {
             .await?;
 
         // 1. Wait for the publisher to advertise its track via signaling discovery.
-        let start = tokio::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(30) {
-            if !client.discovered_tracks.is_empty() {
-                break;
-            }
-            client
-                .drive_until(Duration::from_millis(100), |_| false)
-                .await
-                .ok();
-        }
+        client
+            .drive_until(Duration::from_secs(5), |ctx| {
+                !ctx.discovered_tracks.is_empty()
+            })
+            .await?;
 
         let track_id = client
+            .ctx
             .discovered_tracks
             .first()
             .cloned()
             .expect("No remote tracks discovered");
 
         // 2. Set declarative subscriptions
-        client
-            .agent
-            .set_subscriptions(vec![Subscription {
-                track_id: track_id.clone(),
-                height: 720,
-            }])
-            .await?;
+        client.ctx.driver.set_subscriptions(vec![Subscription {
+            track_id: track_id.clone(),
+            height: 720,
+        }]);
 
         // 2. Wait for media flow
         tracing::info!("Waiting for media flow via declarative subscription...");
         client
-            .drive_until(Duration::from_secs(20), |stats| {
+            .drive_until(Duration::from_secs(20), |ctx| {
                 // We only need a small amount of flow to consider the subscription active.
-                stats.total_rx_bytes() > 1_000
+                ctx.driver.stats().total_rx_bytes() > 1_000
             })
             .await?;
 
@@ -96,19 +89,16 @@ fn declarative_subscription_test() -> turmoil::Result {
 
         // 3. Update subscriptions (Sticky test)
         // Add a non-existent track, Alice should stay on the same MID (internal check via logs)
-        client
-            .agent
-            .set_subscriptions(vec![
-                Subscription {
-                    track_id: track_id.clone(),
-                    height: 360,
-                },
-                Subscription {
-                    track_id: "non_existent".to_string(),
-                    height: 360,
-                },
-            ])
-            .await?;
+        client.ctx.driver.set_subscriptions(vec![
+            Subscription {
+                track_id: track_id.clone(),
+                height: 360,
+            },
+            Subscription {
+                track_id: "non_existent".to_string(),
+                height: 360,
+            },
+        ]);
 
         client
             .drive_until(Duration::from_secs(5), |_| false)
@@ -154,8 +144,8 @@ fn reconnection_recovery_test() -> turmoil::Result {
 
         // 1. Establish initial flow
         client
-            .drive_until(Duration::from_secs(10), |stats| {
-                stats.total_tx_bytes() > 20_000
+            .drive_until(Duration::from_secs(10), |ctx| {
+                ctx.driver.stats().total_tx_bytes() > 20_000
             })
             .await?;
         tracing::info!("Initial flow established");
@@ -176,10 +166,10 @@ fn reconnection_recovery_test() -> turmoil::Result {
 
         // Wait for agent to reconnect and resume flow
         tracing::info!("Waiting for reconnection and flow recovery...");
-        let start_bytes = client.get_stats().total_tx_bytes();
+        let start_bytes = client.ctx.driver.stats().total_tx_bytes();
         client
-            .drive_until(Duration::from_secs(20), |stats| {
-                stats.total_tx_bytes() > start_bytes + 20_000
+            .drive_until(Duration::from_secs(20), |ctx| {
+                ctx.driver.stats().total_tx_bytes() > start_bytes + 20_000
             })
             .await?;
 

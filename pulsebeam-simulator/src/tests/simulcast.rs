@@ -64,7 +64,7 @@ fn simulcast_stream_stability_test() {
         // Phase 1: wait for initial flow to establish
         tracing::info!("waiting for initial flow...");
         client.drive_for(WARMUP).await.unwrap();
-        let stats = client.get_stats();
+        let stats = client.ctx.driver.stats();
         assert!(stats.peer.is_some(), "stream did not establish within warmup window");
 
         tracing::info!("stream established, entering soak...");
@@ -75,7 +75,7 @@ fn simulcast_stream_stability_test() {
 
         for i in 0..num_intervals {
             client.drive_for(HEALTH_INTERVAL).await.unwrap();
-            let stats = client.get_stats();
+            let stats = client.ctx.driver.stats();
             let bits_rx = stats.peer.as_ref().map_or(0, |p| p.peer_bytes_rx) * 8;
             let delta = bits_rx.saturating_sub(last_bits_rx);
 

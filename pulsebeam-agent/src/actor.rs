@@ -541,8 +541,6 @@ pub enum AgentError {
     Rtc(#[from] str0m::RtcError),
     #[error("IO Error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Comand Error: {0}")]
-    Command(#[from] mpsc::error::SendError<AgentCommand>),
     #[error("Protocol Error: {0}")]
     Protocol(String),
     #[error("No valid network candidates found")]
@@ -604,7 +602,7 @@ impl AgentBuilder {
         self
     }
 
-    pub async fn connect(mut self, room_id: &str) -> Result<(Agent, AgentDriver), AgentError> {
+    pub async fn connect(mut self, room_id: &str) -> Result<AgentDriver, AgentError> {
         let port = self.udp_socket.local_addr()?.port();
 
         if self.local_ips.is_empty() {
@@ -722,19 +720,8 @@ impl AgentBuilder {
             protocol: "v1".to_string(),
         });
 
-        // matching SFU's reserved channel
-        rtc.direct_api().create_data_channel(ChannelConfig {
-            label: "".to_string(),
-            ordered: true,
-            reliability: Reliability::Reliable,
-            negotiated: Some(1),
-            protocol: "v1".to_string(),
-        });
-
         let mut sdp = rtc.sdp_api();
-        // Add a dummy channel to ensure the SDP offer contains an m=application section.
-        // This is necessary for SCTP to be enabled.
-        sdp.add_channel("sctp-enable".to_string());
+        // sdp.add_channel("sctp-enable".to_string());
         let mut medias = Vec::new();
         for track in self.tracks.clone() {
             let (dir, simulcast) = match track.direction {
@@ -778,12 +765,11 @@ impl AgentBuilder {
             .accept_answer(pending, resp.answer)
             .map_err(AgentError::Rtc)?;
 
-        let (cmd_tx, cmd_rx) = mpsc::channel(100);
-
         let mut driver = AgentDriver {
             api: self.api,
             addr,
             rtc,
+            now: Instant::now(),
             stats: AgentStats::default(),
             socket: self.udp_socket,
             buf: vec![0u8; 2048],
@@ -791,7 +777,6 @@ impl AgentBuilder {
                 Some(s) => TcpSession::new(s, tcp_local_addr, tcp_server_addr.unwrap()),
                 None => TcpSession::inactive(),
             },
-            cmd_rx,
             pending_events: VecDeque::new(),
             resource_uri: resp.resource_uri,
             participant_id: resp.participant_id.clone(),
@@ -813,6 +798,7 @@ impl AgentBuilder {
             retry_count: 0,
             is_reconnecting: false,
             reconnect_deadline: None,
+            notifier: tokio::sync::Notify::new(),
             sleep: Box::pin(tokio::time::sleep(MIN_QUANTA)),
             bwe_slow_timer: tokio::time::interval(BWE_SLOW_INTERVAL),
             debounce_timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
@@ -823,45 +809,8 @@ impl AgentBuilder {
             driver.handle_media_added(media);
         }
 
-        Ok((
-            Agent {
-                room_id: room_id.to_string(),
-                participant_id: resp.participant_id,
-                cmd_tx,
-            },
-            driver,
-        ))
+        Ok(driver)
     }
-}
-
-#[derive(Debug)]
-pub enum AgentCommand {
-    Disconnect,
-    GetStats(oneshot::Sender<AgentStats>),
-
-    /// Assigns a specific Track to a specific Receiver Slot (MID) at a target resolution.
-    ///
-    /// - `track_id`: The remote track to subscribe to.
-    /// - `height`: Desired resolution (e.g. 720, 1080).
-    ///   Use `0` to pause the stream while keeping the assignment.
-    Subscribe {
-        track_id: String,
-        height: u32,
-    },
-
-    /// Stops receiving media on the specified slot and clears the assignment.
-    ///
-    /// The Actor will look up the `track_id` currently assigned to this `mid`
-    /// and send a `VideoRequest` with `height: 0`.
-    Unsubscribe {
-        track_id: String,
-    },
-
-    /// Declarative subscription state update.
-    SetSubscriptions(Vec<Subscription>),
-
-    /// Set video encoding preset for outgoing media.
-    SetPreset(VideoPreset),
 }
 
 #[derive(Debug)]
@@ -886,44 +835,6 @@ pub enum AgentEvent {
     Disconnected(String),
 }
 
-pub struct Agent {
-    room_id: String,
-    participant_id: String,
-    cmd_tx: mpsc::Sender<AgentCommand>,
-}
-
-impl Agent {
-    pub fn participant_id(&self) -> &str {
-        &self.participant_id
-    }
-
-    pub fn room_id(&self) -> &str {
-        &self.room_id
-    }
-
-    pub async fn send(&self, cmd: AgentCommand) -> Result<(), AgentError> {
-        self.cmd_tx.send(cmd).await?;
-        Ok(())
-    }
-
-    pub async fn disconnect(&self) -> Result<(), AgentError> {
-        let _ = self.cmd_tx.send(AgentCommand::Disconnect).await;
-        Ok(())
-    }
-
-    pub async fn set_subscriptions(&self, subs: Vec<Subscription>) -> Result<(), AgentError> {
-        self.cmd_tx
-            .send(AgentCommand::SetSubscriptions(subs))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_preset(&self, preset: VideoPreset) -> Result<(), AgentError> {
-        self.cmd_tx.send(AgentCommand::SetPreset(preset)).await?;
-        Ok(())
-    }
-}
-
 pub struct AgentDriver {
     addr: SocketAddr,
     rtc: Rtc,
@@ -932,7 +843,6 @@ pub struct AgentDriver {
     /// Active TCP connection to the server (RFC 6544 client role).
     tcp: TcpSession,
     stats: AgentStats,
-    cmd_rx: mpsc::Receiver<AgentCommand>,
     pending_events: VecDeque<AgentEvent>,
 
     senders: StreamMap<(Mid, Option<Rid>), ReceiverStream<MediaFrame>>,
@@ -958,6 +868,8 @@ pub struct AgentDriver {
     reconnect_deadline: Option<Instant>,
 
     // Timer state
+    now: Instant,
+    notifier: tokio::sync::Notify,
     sleep: Pin<Box<tokio::time::Sleep>>,
     bwe_slow_timer: tokio::time::Interval,
     debounce_timer: Pin<Box<tokio::time::Sleep>>,
@@ -965,6 +877,45 @@ pub struct AgentDriver {
 }
 
 impl AgentDriver {
+    pub fn stats(&self) -> &AgentStats {
+        &self.stats
+    }
+
+    pub fn participant_id(&self) -> &ParticipantId {
+        &self.participant_id
+    }
+
+    /// Perform cleanup after the event loop ends.
+    /// Called automatically by `run()`. If you drive `poll()` manually, call
+    /// this once `poll()` returns `None`.
+    pub async fn shutdown(&mut self) {
+        if let Err(e) = self
+            .api
+            .delete_participant_by_uri(self.resource_uri.clone())
+            .await
+        {
+            tracing::warn!(error = ?e, "failed to delete participant on shutdown");
+        }
+        self.rtc.disconnect();
+        self.notifier.notify_one();
+    }
+
+    pub fn set_subscriptions(&mut self, subs: Vec<Subscription>) {
+        tracing::debug!("processing SetSubscriptions: {:?}", subs);
+        self.sub_manager.set_desired(subs);
+        self.pending.deadline.replace(self.now + STATE_DEBOUNCE);
+        // Make sure we attempt to send the new desired state immediately.
+        self.flush_pending_state();
+        self.notifier.notify_one();
+    }
+
+    pub fn set_preset(&mut self, preset: VideoPreset) {
+        self.preset = preset;
+        // In a more complete implementation, we would update RTCPeerConnection parameters here
+        // if the underlying WebRTC implementation supports it.
+        self.notifier.notify_one();
+    }
+
     /// Drive one iteration of the agent event loop.
     /// Returns the next available event, or `None` when the agent has shut down.
     ///
@@ -988,9 +939,9 @@ impl AgentDriver {
             }
 
             // Adjust timers.
-            let now = Instant::now();
-            let adjusted_deadline = if deadline <= now {
-                now + MIN_QUANTA
+            self.now = Instant::now();
+            let adjusted_deadline = if deadline <= self.now {
+                self.now + MIN_QUANTA
             } else {
                 deadline
             };
@@ -1011,13 +962,11 @@ impl AgentDriver {
             // Wait for the next IO/timer event, then loop back to poll_rtc().
             tokio::select! {
                 biased;
-                Some(cmd) = self.cmd_rx.recv() => {
-                    self.handle_command(cmd, now);
-                }
+                _ = self.notifier.notified() => {}
                 // If we have a pending state update (for subscription changes),
                 // flush it when the debounce timer fires.
                 _ = self.debounce_timer.as_mut(), if self.pending.deadline.is_some() => {
-                    self.flush_pending_state(now);
+                    self.flush_pending_state();
                 }
                 res = self.socket.recv_from(&mut self.buf) => {
                     if let Ok((n, source)) = res {
@@ -1075,7 +1024,7 @@ impl AgentDriver {
                     }
                 }
                 _ = self.bwe_slow_timer.tick() => {
-                    let desired_bps = self.layer_ctrl.tick(now);
+                    let desired_bps = self.layer_ctrl.tick(self.now);
                     let desired_bitrate = Bitrate::from(desired_bps.max(0.0) as u64);
                     let filtered_bitrate = self.desired_ctrl.update(desired_bitrate);
                     self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
@@ -1104,25 +1053,6 @@ impl AgentDriver {
     pub async fn run(mut self) {
         while self.poll().await.is_some() {}
         self.shutdown().await;
-    }
-
-    /// Perform cleanup after the event loop ends.
-    /// Called automatically by `run()`. If you drive `poll()` manually, call
-    /// this once `poll()` returns `None`.
-    pub async fn shutdown(self) {
-        if let Err(e) = self
-            .api
-            .delete_participant_by_uri(self.resource_uri.clone())
-            .await
-        {
-            tracing::warn!(error = ?e, "failed to delete participant on shutdown");
-        }
-    }
-
-    /// Direct read of the agent's current accumulated stats.
-    /// Reflects the state as of the most recent `poll()` call.
-    pub fn stats(&self) -> &AgentStats {
-        &self.stats
     }
 
     async fn poll_rtc(&mut self) -> Option<Instant> {
@@ -1262,30 +1192,6 @@ impl AgentDriver {
         }
     }
 
-    fn handle_command(&mut self, cmd: AgentCommand, now: Instant) {
-        match cmd {
-            AgentCommand::Disconnect => self.rtc.disconnect(),
-            AgentCommand::GetStats(stats_tx) => {
-                let _ = stats_tx.send(self.stats.clone());
-            }
-            AgentCommand::Subscribe { .. } | AgentCommand::Unsubscribe { .. } => {
-                tracing::warn!("Manual subscribe/unsubscribe is deprecated, use SetSubscriptions");
-            }
-            AgentCommand::SetSubscriptions(subs) => {
-                tracing::debug!("processing SetSubscriptions: {:?}", subs);
-                self.sub_manager.set_desired(subs);
-                self.pending.deadline.replace(now + STATE_DEBOUNCE);
-                // Make sure we attempt to send the new desired state immediately.
-                self.flush_pending_state(now);
-            }
-            AgentCommand::SetPreset(preset) => {
-                self.preset = preset;
-                // In a more complete implementation, we would update RTCPeerConnection parameters here
-                // if the underlying WebRTC implementation supports it.
-            }
-        }
-    }
-
     fn handle_signaling_data(&mut self, cd: ChannelData) {
         let Ok(msg) = signaling::ServerMessage::decode(cd.data.as_slice()) else {
             tracing::warn!("Invalid Protobuf");
@@ -1319,7 +1225,7 @@ impl AgentDriver {
         self.pending_events.push_back(event);
     }
 
-    fn flush_pending_state(&mut self, now: Instant) {
+    fn flush_pending_state(&mut self) {
         let channel_exists = self.rtc.channel(self.signaling_cid).is_some();
         tracing::debug!(
             "flush_pending_state: signaling_cid={:?}, exists={}",
@@ -1330,7 +1236,7 @@ impl AgentDriver {
         let Some(mut ch) = self.rtc.channel(self.signaling_cid) else {
             tracing::debug!("signaling channel not ready yet, will retry later");
             // Keep retrying in the future
-            self.pending.deadline.replace(now + STATE_DEBOUNCE);
+            self.pending.deadline.replace(self.now + STATE_DEBOUNCE);
             return;
         };
 
@@ -1358,7 +1264,7 @@ impl AgentDriver {
         if let Err(err) = ch.write(true, encoded.as_slice()) {
             tracing::warn!("failed to send signaling: {:?}", err);
             // Retry later
-            self.pending.deadline.replace(now + STATE_DEBOUNCE);
+            self.pending.deadline.replace(self.now + STATE_DEBOUNCE);
         } else {
             self.pending.deadline = None;
         }

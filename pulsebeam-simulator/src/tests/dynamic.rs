@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[test]
-fn churn_test() {
+fn churn_test() -> turmoil::Result {
     common::setup_tracing();
 
     let mut sim = turmoil::Builder::new()
@@ -51,8 +51,8 @@ fn churn_test() {
                 .await?;
 
             client
-                .drive_until(Duration::from_secs(10), |stats| {
-                    let Some(peer) = &stats.peer else {
+                .drive_until(Duration::from_secs(10), |ctx| {
+                    let Some(peer) = &ctx.driver.stats().peer else {
                         return false;
                     };
                     peer.peer_bytes_rx > 10_000
@@ -60,17 +60,21 @@ fn churn_test() {
                 .await?;
 
             tracing::info!("Participant 2 leaving, attempt {}", i);
-            client.agent.disconnect().await?;
+            client.ctx.driver.shutdown().await;
+
+            // Drop explicitly before sleeping so simulation engine cleans up its tracking
+            drop(client);
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         Ok(())
     });
 
     common::run_sim_or_timeout(&mut sim, Duration::from_secs(130)).expect("Simulation failed");
+    Ok(())
 }
 
 #[test]
-fn abrupt_exit_chaos_test() {
+fn abrupt_exit_chaos_test() -> turmoil::Result {
     common::setup_tracing();
 
     let mut sim = turmoil::Builder::new()
@@ -115,16 +119,19 @@ fn abrupt_exit_chaos_test() {
                 .connect("room1")
                 .await?;
 
+        // Replaced wait_for_discovered_tracks: Drive until at least 1 track is discovered
         subscriber
-            .wait_for_discovered_tracks(1, Duration::from_secs(20))
+            .drive_until(Duration::from_secs(20), |ctx| {
+                ctx.discovered_tracks.len() >= 1
+            })
             .await?;
 
         for _ in 0..6 {
-            let before = subscriber.get_stats().total_rx_bytes();
+            let before = subscriber.ctx.driver.stats().total_rx_bytes();
 
             subscriber
-                .drive_until(Duration::from_secs(8), |stats| {
-                    stats.total_rx_bytes() > before + 1_500
+                .drive_until(Duration::from_secs(8), |ctx| {
+                    ctx.driver.stats().total_rx_bytes() > before + 1_500
                 })
                 .await?;
         }
@@ -147,8 +154,11 @@ fn abrupt_exit_chaos_test() {
                 .await?;
 
             churn_client.drive_for(Duration::from_secs(2)).await.ok();
+
+            // Introduce network isolation modeling
             turmoil::partition(ip, server_ip_for_client);
             tokio::time::sleep(Duration::from_millis(500)).await;
+
             // Intentionally drop without signaling disconnect to model abrupt process exits.
             drop(churn_client);
             turmoil::repair(ip, server_ip_for_client);
@@ -158,4 +168,5 @@ fn abrupt_exit_chaos_test() {
     }
 
     common::run_sim_or_timeout(&mut sim, Duration::from_secs(125)).expect("Simulation failed");
+    Ok(())
 }

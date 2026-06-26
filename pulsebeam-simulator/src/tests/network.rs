@@ -32,7 +32,7 @@ fn network_impairment_test() {
 
         // Phase 1: verify baseline flow
         client.drive_for(Duration::from_secs(30)).await?;
-        let stats = client.get_stats();
+        let stats = client.ctx.driver.stats();
         assert!(
             stats.peer.as_ref().map_or(false, |p| p.peer_bytes_tx > 0),
             "no outbound bytes after baseline drive"
@@ -45,7 +45,7 @@ fn network_impairment_test() {
         // Phase 3: repair and ensure we can still send/receive.
         turmoil::repair(client_ip, server_ip);
         client.drive_for(Duration::from_secs(30)).await?;
-        let stats = client.get_stats();
+        let stats = client.ctx.driver.stats();
         assert!(
             stats.peer.as_ref().map_or(false, |p| p.peer_bytes_tx > 0),
             "no outbound bytes after repair"

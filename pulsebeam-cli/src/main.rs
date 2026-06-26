@@ -706,7 +706,7 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
-    let (_agent, mut driver) = builder.connect(&room).await?;
+    let mut driver = builder.connect(&room).await?;
     let mut stats_processor = StatsProcessor::default();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -831,11 +831,11 @@ async fn run_connect(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
-    let (agent, mut driver) = builder.connect(&room).await?;
+    let mut driver = builder.connect(&room).await?;
     eprintln!(
         "Connected to room '{}' (participant: {})",
         room,
-        agent.participant_id()
+        driver.participant_id()
     );
     eprintln!("Press Ctrl-C to disconnect.");
     eprintln!(
@@ -872,8 +872,7 @@ async fn run_connect(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\nDisconnecting…");
-                agent.disconnect().await?;
-                break;
+                driver.shutdown().await;
             }
 
             Some(event) = driver.poll() => {
@@ -984,6 +983,7 @@ async fn run_connect(
 
                 forwarding_hist.rotate();
             }
+            else => break,
         }
     }
 

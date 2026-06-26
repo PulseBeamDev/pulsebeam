@@ -39,7 +39,6 @@ fn slots_layout_update_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // Keep pumping media for the duration of the test
         client.drive_for(Duration::from_secs(50)).await.ok();
         Ok(())
     });
@@ -52,7 +51,6 @@ fn slots_layout_update_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // Keep pumping media for the duration of the test
         client.drive_for(Duration::from_secs(50)).await.ok();
         Ok(())
     });
@@ -66,13 +64,14 @@ fn slots_layout_update_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // Wait for the SFU signaling to tell us about both remote tracks
+        // Replaced wait_for_remote_tracks: Drive until SFU signaling discovers both remote tracks
         client
-            .wait_for_remote_tracks(2, Duration::from_secs(10))
+            .drive_until(Duration::from_secs(10), |ctx| {
+                ctx.discovered_tracks.len() >= 2
+            })
             .await?;
 
-        // Extract the discovered track IDs dynamically from the client's internal state
-        let track_ids = client.discovered_tracks.clone();
+        let track_ids = client.ctx.discovered_tracks.clone();
         if track_ids.len() < 2 {
             return Err("Expected at least 2 discovered tracks".into());
         }
@@ -82,25 +81,23 @@ fn slots_layout_update_test() -> turmoil::Result {
         tracing::info!("Discovered remote track IDs: {} and {}", track1, track2);
 
         // Initial Layout Subscription: Slot 1 -> Track 1, Slot 2 -> Track 2
-        client
-            .agent
-            .set_subscriptions(vec![
-                Subscription {
-                    track_id: track1.clone(),
-                    height: 720,
-                },
-                Subscription {
-                    track_id: track2.clone(),
-                    height: 720,
-                },
-            ])
-            .await?;
+        client.ctx.driver.set_subscriptions(vec![
+            Subscription {
+                track_id: track1.clone(),
+                height: 720,
+            },
+            Subscription {
+                track_id: track2.clone(),
+                height: 720,
+            },
+        ]);
 
         // Drive until media bytes start hitting rx_layers on both tracks
         tracing::info!("Waiting for initial media on both slots...");
         client
-            .drive_until(Duration::from_secs(10), |stats| {
-                stats
+            .drive_until(Duration::from_secs(10), |ctx| {
+                ctx.driver
+                    .stats()
                     .tracks
                     .values()
                     .all(|t| t.rx_layers.values().any(|l| l.bytes > 0))
@@ -109,24 +106,22 @@ fn slots_layout_update_test() -> turmoil::Result {
 
         // Swap Layout: Slot 1 -> Track 2, Slot 2 -> Track 1
         tracing::info!("Swapping slots...");
-        client
-            .agent
-            .set_subscriptions(vec![
-                Subscription {
-                    track_id: track2.clone(),
-                    height: 720,
-                },
-                Subscription {
-                    track_id: track1.clone(),
-                    height: 720,
-                },
-            ])
-            .await?;
+        client.ctx.driver.set_subscriptions(vec![
+            Subscription {
+                track_id: track2.clone(),
+                height: 720,
+            },
+            Subscription {
+                track_id: track1.clone(),
+                height: 720,
+            },
+        ]);
 
         // Verify media continues flowing after the swap step
         client
-            .drive_until(Duration::from_secs(10), |stats| {
-                stats
+            .drive_until(Duration::from_secs(10), |ctx| {
+                ctx.driver
+                    .stats()
                     .tracks
                     .values()
                     .all(|t| t.rx_layers.values().any(|l| l.bytes > 1000))
@@ -174,36 +169,25 @@ fn slots_prioritization_test() -> turmoil::Result {
                     MediaKind::Video,
                     TransceiverDirection::SendOnly,
                     Some(vec![
-                        SimulcastLayer::new("f"), // High
-                        SimulcastLayer::new("h"), // Med
-                        SimulcastLayer::new("q"), // Low
+                        SimulcastLayer::new("f"),
+                        SimulcastLayer::new("h"),
+                        SimulcastLayer::new("q"),
                     ]),
                 )
                 .connect("room1")
                 .await?;
-            // Wait for the local track MID to be advertised by the agent.
-            let start = tokio::time::Instant::now();
-            while start.elapsed() < Duration::from_secs(10) {
-                if !client.local_mids.is_empty() {
-                    break;
-                }
-                client
-                    .drive_until(Duration::from_millis(50), |_| false)
-                    .await
-                    .ok();
-            }
 
-            // Store participant_id + mid for subscriber to use when subscribing.
-            if let Some(mid) = client.local_mids.get(0) {
-                let pid = client.participant_id.clone();
+            // Drive until the local track MID has been populated cleanly
+            client
+                .drive_until(Duration::from_secs(10), |ctx| !ctx.local_mids.is_empty())
+                .await?;
+
+            if let Some(mid) = client.ctx.local_mids.get(0) {
+                let pid = client.ctx.driver.participant_id().clone();
                 *pub1_info.lock().await = Some((pid, mid.to_string()));
             }
 
-            client
-                .drive_until(Duration::from_secs(40), |_| false)
-                .await
-                .ok();
-
+            client.drive_for(Duration::from_secs(40)).await.ok();
             Ok(())
         });
     }
@@ -225,29 +209,18 @@ fn slots_prioritization_test() -> turmoil::Result {
                 )
                 .connect("room1")
                 .await?;
-            // Wait for the local track MID to be advertised by the agent.
-            let start = tokio::time::Instant::now();
-            while start.elapsed() < Duration::from_secs(10) {
-                if !client.local_mids.is_empty() {
-                    break;
-                }
-                client
-                    .drive_until(Duration::from_millis(50), |_| false)
-                    .await
-                    .ok();
-            }
 
-            // Store participant_id + mid for subscriber to use when subscribing.
-            if let Some(mid) = client.local_mids.get(0) {
-                let pid = client.participant_id.clone();
+            // Drive until the local track MID has been populated cleanly
+            client
+                .drive_until(Duration::from_secs(10), |ctx| !ctx.local_mids.is_empty())
+                .await?;
+
+            if let Some(mid) = client.ctx.local_mids.get(0) {
+                let pid = client.ctx.driver.participant_id().clone();
                 *pub2_info.lock().await = Some((pid, mid.to_string()));
             }
 
-            client
-                .drive_until(Duration::from_secs(40), |_| false)
-                .await
-                .ok();
-
+            client.drive_for(Duration::from_secs(40)).await.ok();
             Ok(())
         });
     }
@@ -261,25 +234,24 @@ fn slots_prioritization_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // 1. Wait for both publishers to expose their participant_id + mid.
+        // Clean way to wait for cross-client async info without halting the engine loop
         let mut info1 = None;
         let mut info2 = None;
-        let start = tokio::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(60) {
-            if info1.is_none() {
-                info1 = pub1_info.lock().await.clone();
-            }
-            if info2.is_none() {
-                info2 = pub2_info.lock().await.clone();
-            }
-            if info1.is_some() && info2.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
 
-        let (pid1, mid1) = info1.expect("publisher 1 info never populated");
-        let (pid2, mid2) = info2.expect("publisher 2 info never populated");
+        client
+            .drive_until(Duration::from_secs(60), |_| {
+                if info1.is_none() {
+                    info1 = pub1_info.try_lock().ok().and_then(|l| l.clone());
+                }
+                if info2.is_none() {
+                    info2 = pub2_info.try_lock().ok().and_then(|l| l.clone());
+                }
+                info1.is_some() && info2.is_some()
+            })
+            .await?;
+
+        let (pid1, mid1) = info1.unwrap();
+        let (pid2, mid2) = info2.unwrap();
 
         let track1 = ParticipantId::from_str(&pid1)
             .unwrap()
@@ -293,36 +265,36 @@ fn slots_prioritization_test() -> turmoil::Result {
             .to_string();
 
         // One slot high (track1), one slot low (track2)
+        client.ctx.driver.set_subscriptions(vec![
+            Subscription {
+                track_id: track1.clone(),
+                height: 720,
+            },
+            Subscription {
+                track_id: track2.clone(),
+                height: 180,
+            },
+        ]);
+
+        // Replaced wait_for_remote_tracks: Drive until at least 1 track is discovered
         client
-            .agent
-            .set_subscriptions(vec![
-                Subscription {
-                    track_id: track1.clone(),
-                    height: 720,
-                },
-                Subscription {
-                    track_id: track2.clone(),
-                    height: 180,
-                },
-            ])
+            .drive_until(Duration::from_secs(40), |ctx| {
+                ctx.discovered_tracks.len() >= 1
+            })
             .await?;
 
-        // Wait for assignments to take effect and at least one slot to start receiving media.
+        // Wait for flow on at least one received track
         client
-            .wait_for_remote_tracks(1, Duration::from_secs(40))
-            .await?;
-
-        // Wait for flow on at least one received track.
-        client
-            .drive_until(Duration::from_secs(60), |stats| {
-                stats
+            .drive_until(Duration::from_secs(60), |ctx| {
+                ctx.driver
+                    .stats()
                     .tracks
                     .values()
                     .all(|t| t.rx_layers.values().any(|l| l.bytes > 0))
             })
             .await?;
 
-        let stats = client.get_stats();
+        let stats = client.ctx.driver.stats();
         for (mid, track_stats) in &stats.tracks {
             assert!(
                 track_stats.rx_layers.values().any(|l| l.bytes > 0),

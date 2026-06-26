@@ -180,8 +180,8 @@ impl Stage for ConnectPeersTcpOnlyStage {
                     let mut guard = client_handle.lock().await;
                     let client = guard.as_mut().expect("client must be initialized");
                     client
-                        .drive_until(max_wait, |stats| {
-                            let Some(peer) = &stats.peer else {
+                        .drive_until(max_wait, |ctx| {
+                            let Some(peer) = &ctx.driver.stats().peer else {
                                 return false;
                             };
                             peer.peer_bytes_tx > min_tx_bytes && peer.peer_bytes_rx > min_rx_bytes
@@ -278,8 +278,8 @@ impl Stage for ConnectPeersStage {
                     let mut guard = client_handle.lock().await;
                     let client = guard.as_mut().expect("client must be initialized");
                     client
-                        .drive_until(max_wait, |stats| {
-                            let Some(peer) = &stats.peer else {
+                        .drive_until(max_wait, |ctx| {
+                            let Some(peer) = &ctx.driver.stats().peer else {
                                 return false;
                             };
 
@@ -410,7 +410,7 @@ impl Stage for ChurnStage {
                         .connect("room1")
                         .await?;
                     tokio::time::sleep(join_duration).await;
-                    client.agent.disconnect().await?;
+                    client.ctx.driver.shutdown().await;
                     Ok(())
                 });
             }
@@ -453,8 +453,8 @@ impl Stage for DisconnectStage {
                         Option<crate::tests::common::client::SimClient>,
                     > = client.handle.lock().await;
                     let client = guard.as_mut().expect("client should have been initialized");
-                    tracing::info!(ip = ?client.ip, "disconnecting client");
-                    client.agent.disconnect().await?;
+                    tracing::info!(ip = ?client.ctx.ip, "disconnecting client");
+                    client.ctx.driver.shutdown().await;
                 }
                 Ok(())
             }
@@ -492,11 +492,11 @@ impl Stage for AssertAllDisconnectedStage {
                     let client = client_guard
                         .as_ref()
                         .expect("client should have been initialized");
-                    let stats = client.get_stats();
+                    let stats = client.ctx.driver.stats();
                     if stats.peer.is_some() {
                         return Err(format!(
                             "Expected client {} to have no peer, got {:?}",
-                            client.ip, stats.peer
+                            client.ctx.ip, stats.peer
                         )
                         .into());
                     }

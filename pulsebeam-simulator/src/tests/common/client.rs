@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use pulsebeam_agent::actor::{Agent, AgentBuilder, AgentEvent, AgentStats};
+use pulsebeam_agent::actor::{AgentBuilder, AgentEvent};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
 use pulsebeam_agent::{AgentDriver, MediaKind, SimulcastLayer, TransceiverDirection};
@@ -60,46 +60,45 @@ impl SimClientBuilder {
     }
 
     pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let (agent, driver) = self.agent_builder.connect(room).await?;
+        let driver = self.agent_builder.connect(room).await?;
         tracing::info!("connected to {room}");
-        Ok(SimClient {
+        let ctx = ClientContext {
             ip: self.ip,
-            participant_id: agent.participant_id().to_string(),
-            agent,
             driver,
             local_mids: Vec::new(),
             discovered_tracks: Vec::new(),
             remote_tracks: Vec::new(),
+        };
+        Ok(SimClient {
+            ctx,
             join_set: JoinSet::new(),
         })
     }
 }
 
-pub struct SimClient {
+pub struct ClientContext {
     pub ip: IpAddr,
-    pub agent: Agent,
     pub driver: AgentDriver,
-    /// The participant ID assigned by the server for this client.
-    pub participant_id: String,
+
     /// Local track mids (as reported by LocalTrackAdded events).
     pub local_mids: Vec<pulsebeam_agent::str0m::media::Mid>,
     /// Remote track IDs that have been discovered from signaling updates.
     pub discovered_tracks: Vec<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: Vec<(pulsebeam_agent::str0m::media::Mid, String)>,
+}
+
+pub struct SimClient {
+    pub ctx: ClientContext,
     join_set: JoinSet<()>,
 }
 
 impl SimClient {
-    pub fn get_stats(&self) -> &AgentStats {
-        self.driver.stats()
-    }
-
-    pub async fn drive(&mut self, token: CancellationToken) -> anyhow::Result<AgentStats> {
+    pub async fn drive(&mut self, token: CancellationToken) -> anyhow::Result<()> {
         self.drive_until_cancelled(token, |_| false).await
     }
 
-    pub async fn drive_for(&mut self, timeout: Duration) -> anyhow::Result<AgentStats> {
+    pub async fn drive_for(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let token = CancellationToken::new();
         let mut driver = Box::pin(self.drive_until_cancelled(token.clone(), |_| false));
 
@@ -115,25 +114,21 @@ impl SimClient {
         driver.await
     }
 
-    pub async fn drive_until<F>(
-        &mut self,
-        timeout: Duration,
-        predicate: F,
-    ) -> anyhow::Result<AgentStats>
+    pub async fn drive_until<F>(&mut self, timeout: Duration, predicate: F) -> anyhow::Result<()>
     where
-        F: FnMut(&AgentStats) -> bool,
+        F: FnMut(&ClientContext) -> bool,
     {
         let token = CancellationToken::new();
         let _guard = token.clone().drop_guard();
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
-                let stats = self.driver.stats();
+                let stats = self.ctx.driver.stats();
                 anyhow::bail!(
                     "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
-                    self.ip,
+                    self.ctx.ip,
                     stats,
-                    self.discovered_tracks,
-                    self.remote_tracks
+                    self.ctx.discovered_tracks,
+                    self.ctx.remote_tracks
                 );
             }
             result = self.drive_until_cancelled(token, predicate) => result
@@ -144,173 +139,48 @@ impl SimClient {
         &mut self,
         token: CancellationToken,
         mut predicate: F,
-    ) -> anyhow::Result<AgentStats>
+    ) -> anyhow::Result<()>
     where
-        F: FnMut(&AgentStats) -> bool,
+        F: FnMut(&ClientContext) -> bool,
     {
         let mut check_interval = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
-                    let stats = self.driver.stats();
-                    return Ok(stats.clone());
+                    return Ok(());
                 }
-                Some(event) = self.driver.poll() => {
+                Some(event) = self.ctx.driver.poll() => {
                     match event {
                         AgentEvent::LocalTrackAdded(sender) => {
-                            tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
-                            self.local_mids.push(sender.mid);
+                            tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ctx.ip, sender.mid, sender.rid);
+                            self.ctx.local_mids.push(sender.mid);
                             let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
                             self.join_set.spawn(looper.run(sender));
                         }
                         AgentEvent::RemoteTrackDiscovered(track) => {
-                            tracing::info!("{} discovered remote track: {:?}", self.ip, track.id);
-                            if !self.discovered_tracks.contains(&track.id) {
-                                self.discovered_tracks.push(track.id.clone());
+                            tracing::info!("{} discovered remote track: {:?}", self.ctx.ip, track.id);
+                            if !self.ctx.discovered_tracks.contains(&track.id) {
+                                self.ctx.discovered_tracks.push(track.id.clone());
                             }
                         }
                         AgentEvent::RemoteTrackAdded {mid, track} => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, track.id);
-                            self.remote_tracks.push((mid, track.id.clone()));
+                            tracing::info!("{} subscribed to remote track: {:?}", self.ctx.ip, track.id);
+                            self.ctx.remote_tracks.push((mid, track.id.clone()));
                         }
                         _ => {}
                     }
 
                     // Re-check the predicate after processing an event, since a new
                     // event may indicate the desired state has been reached.
-                    let stats = self.driver.stats();
-                    if predicate(stats) {
-                        return Ok(stats.clone());
+                    if predicate(&self.ctx) {
+                        return Ok(());
                     }
                 }
                 _ = check_interval.tick() => {
-                    let stats = self.driver.stats();
-                    if predicate(stats) {
-                        return Ok(stats.clone());
+                    if predicate(&self.ctx) {
+                        return Ok(());
                     }
                 }
-            }
-        }
-    }
-
-    pub async fn wait_for_remote_tracks(
-        &mut self,
-        count: usize,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        // Use wall-clock time so this timeout isn't affected by simulated tokio time.
-        let start = std::time::Instant::now();
-        let mut check_interval = tokio::time::interval(Duration::from_millis(200));
-
-        loop {
-            if self.remote_tracks.len() >= count {
-                return Ok(());
-            }
-
-            // As a fallback, consider a track "received" if we see actual rx bytes in stats.
-            // This makes the test more robust to transient event delivery or ordering issues.
-            let stats = self.driver.stats();
-            let rx_tracks = stats
-                .tracks
-                .values()
-                .filter(|t| t.rx_layers.values().any(|l| l.bytes > 0))
-                .count();
-            if rx_tracks >= count {
-                tracing::info!(
-                    "{} observed {} tracks with inbound bytes (fallback)",
-                    self.ip,
-                    rx_tracks
-                );
-                return Ok(());
-            }
-
-            if start.elapsed() > timeout {
-                let stats = self.driver.stats();
-                anyhow::bail!(
-                    "Client {} timed out waiting for {} remote tracks. Got {:?} / {:?}. Final Stats:\n{:?}",
-                    self.ip,
-                    count,
-                    self.discovered_tracks,
-                    self.remote_tracks,
-                    stats
-                );
-            }
-
-            tokio::select! {
-                Some(event) = self.driver.poll() => {
-                    match event {
-                        AgentEvent::LocalTrackAdded(sender) => {
-                            tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
-                            let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
-                            self.join_set.spawn(looper.run(sender));
-                        }
-                        AgentEvent::RemoteTrackDiscovered(track) => {
-                            tracing::info!("{} discovered remote track: {:?}", self.ip, track.id);
-                            if !self.discovered_tracks.contains(&track.id) {
-                                self.discovered_tracks.push(track.id.clone());
-                            }
-                        }
-                        AgentEvent::RemoteTrackAdded { mid, track } => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, track.id);
-                            self.remote_tracks
-                                .push((mid, track.id.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-                _ = check_interval.tick() => {}
-            }
-        }
-    }
-
-    pub async fn wait_for_discovered_tracks(
-        &mut self,
-        count: usize,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        let start = std::time::Instant::now();
-        let mut check_interval = tokio::time::interval(Duration::from_millis(200));
-
-        loop {
-            if self.discovered_tracks.len() >= count {
-                return Ok(());
-            }
-
-            if start.elapsed() > timeout {
-                let stats = self.driver.stats();
-                anyhow::bail!(
-                    "Client {} timed out waiting for {} discovered tracks. Got {:?}. Final Stats:\n{:?}",
-                    self.ip,
-                    count,
-                    self.discovered_tracks,
-                    stats
-                );
-            }
-
-            tokio::select! {
-                Some(event) = self.driver.poll() => {
-                    match event {
-                        AgentEvent::LocalTrackAdded(sender) => {
-                            tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ip, sender.mid, sender.rid);
-                            self.local_mids.push(sender.mid);
-                            let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
-                            self.join_set.spawn(looper.run(sender));
-                        }
-                        AgentEvent::RemoteTrackDiscovered(track) => {
-                            tracing::info!("{} discovered remote track: {:?}", self.ip, track.id);
-                            if !self.discovered_tracks.contains(&track.id) {
-                                self.discovered_tracks.push(track.id.clone());
-                            }
-                        }
-                        AgentEvent::RemoteTrackAdded { mid, track } => {
-                            tracing::info!("{} subscribed to remote track: {:?}", self.ip, track.id);
-                            self.remote_tracks
-                                .push((mid, track.id.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-                _ = check_interval.tick() => {}
             }
         }
     }
