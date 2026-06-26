@@ -4,7 +4,7 @@
 VERSION_1="e61896405556543cac4a209c97936476c0e27c8d"
 VERSION_2="d656eaf8a2c3d555c12de0d2ba489d7a6ff9ca17"
 VERSION_3="0d7d34749857397a907d530a31b2df4aac014fae"
-VERSION_4="efcc58bec628f46f3c63072bdca90753e4aae0c8"
+VERSION_4="1f033641f5b1959aeb037030bec0dbfc8ec5907f"
 
 echo "------------------------------------------------"
 echo " Select a Pulsebeam SFU version to run:"
@@ -47,7 +47,8 @@ echo "--> Launching Podman with commit: $HASH"
 
 # Your exact command with the chosen hash dynamically inserted
 podman run --rm \
-  --cpuset-cpus=2-5 \
+  --cpuset-cpus=10-13 \
+  --memory=8g \
   --env=RUST_LOG=error \
   --net=host \
   --log-driver=passthrough-tty \

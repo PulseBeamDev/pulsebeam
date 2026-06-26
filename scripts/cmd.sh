@@ -4,6 +4,4 @@ RUST_LOG=error ./target/release/pulsebeam-cli --api-url http://192.168.4.1:7070 
   --users-per-room 4 \
   --arrival-rate 0.1 \
   --max-rooms 50 \
-  --session-duration 3600 \
-  --fixed-session \
-  --drain-duration 3600
+  --session-duration 3600

@@ -20,6 +20,7 @@ pulsebeam-core = { path = "../pulsebeam-core", features = ["reqwest"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 rand.workspace = true
 reqwest = "0.13.4"
+tachyonix = "0.3.1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

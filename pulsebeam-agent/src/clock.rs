@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 pub struct ClockAnchor {
@@ -25,6 +25,10 @@ impl ClockAnchor {
 
     pub fn wallclock(&self, now: Instant) -> SystemTime {
         self.system_time + now.duration_since(self.instant)
+    }
+
+    pub fn since(&self, at: Instant) -> Duration {
+        at.duration_since(self.instant)
     }
 }
 
