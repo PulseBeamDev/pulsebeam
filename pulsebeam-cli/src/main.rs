@@ -270,7 +270,7 @@ struct FakeUnused {}
 
 #[cfg(target_os = "linux")]
 fn configure_runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runtime::Runtime> {
-    use core_affinity::{get_core_ids, set_for_current};
+    use core_affinity::get_core_ids;
     let core_ids = get_core_ids().unwrap_or_default();
     let core_index = std::sync::atomic::AtomicUsize::new(0);
 
@@ -742,15 +742,14 @@ async fn spawn_agent(
                 let stats = driver.stats();
 
                 let peer = stats.peer.as_ref();
-                if let Some(peer_stats) = peer {
-                    if let Some(rtt) = peer_stats.rtt {
+                if let Some(peer_stats) = peer
+                    && let Some(rtt) = peer_stats.rtt {
                         let current_sample = rtt.as_micros() as f64;
                         local_rtt_ewma = Some(match local_rtt_ewma {
                             Some(prev) => 0.5 * current_sample + 0.5 * prev,
                             None => current_sample,
                         });
                     }
-                }
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
@@ -909,15 +908,14 @@ async fn run_connect(
                 let stats = driver.stats();
 
                 let peer = stats.peer.as_ref();
-                if let Some(peer_stats) = peer {
-                    if let Some(rtt) = peer_stats.rtt {
+                if let Some(peer_stats) = peer
+                    && let Some(rtt) = peer_stats.rtt {
                         let current_sample = rtt.as_micros() as f64;
                         local_rtt_ewma = Some(match local_rtt_ewma {
                             Some(prev) => 0.5 * current_sample + 0.5 * prev,
                             None => current_sample,
                         });
                     }
-                }
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);

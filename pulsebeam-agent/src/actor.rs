@@ -25,7 +25,7 @@ use str0m::{
     media::{Direction, MediaAdded, MediaKind, Mid},
     net::{Protocol, Receive, TcpType},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
