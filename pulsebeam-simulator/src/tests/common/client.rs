@@ -7,6 +7,8 @@ use pulsebeam_agent::media::H264Looper;
 use pulsebeam_agent::{AgentDriver, MediaKind, SimulcastLayer, TransceiverDirection};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -66,9 +68,9 @@ impl SimClientBuilder {
         let ctx = ClientContext {
             ip: self.ip,
             driver,
-            local_mids: Vec::new(),
-            discovered_tracks: Vec::new(),
-            remote_tracks: Vec::new(),
+            local_mids: HashSet::new(),
+            discovered_tracks: HashSet::new(),
+            remote_tracks: HashMap::new(),
         };
         Ok(SimClient {
             ctx,
@@ -82,11 +84,11 @@ pub struct ClientContext {
     pub driver: AgentDriver,
 
     /// Local track mids (as reported by LocalTrackAdded events).
-    pub local_mids: Vec<pulsebeam_agent::str0m::media::Mid>,
+    pub local_mids: HashSet<pulsebeam_agent::str0m::media::Mid>,
     /// Remote track IDs that have been discovered from signaling updates.
-    pub discovered_tracks: Vec<String>,
+    pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
-    pub remote_tracks: Vec<(pulsebeam_agent::str0m::media::Mid, String)>,
+    pub remote_tracks: HashMap<pulsebeam_agent::str0m::media::Mid, String>,
 }
 
 pub struct SimClient {
@@ -156,19 +158,19 @@ impl SimClient {
                         match event {
                             AgentEvent::LocalTrackAdded(sender) => {
                                 tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ctx.ip, sender.mid, sender.rid);
-                                self.ctx.local_mids.push(sender.mid);
+                                self.ctx.local_mids.insert(sender.mid);
                                 let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
                                 self.join_set.spawn(looper.run(sender));
                             }
                             AgentEvent::RemoteTrackDiscovered(track) => {
                                 tracing::info!("{} discovered remote track: {:?}", self.ctx.ip, track.id);
                                 if !self.ctx.discovered_tracks.contains(&track.id) {
-                                    self.ctx.discovered_tracks.push(track.id.clone());
+                                    self.ctx.discovered_tracks.insert(track.id.clone());
                                 }
                             }
                             AgentEvent::RemoteTrackAdded {mid, track} => {
                                 tracing::info!("{} subscribed to remote track: {:?}", self.ctx.ip, track.id);
-                                self.ctx.remote_tracks.push((mid, track.id.clone()));
+                                self.ctx.remote_tracks.insert(mid, track.id.clone());
                             }
                             _ => {}
                         }

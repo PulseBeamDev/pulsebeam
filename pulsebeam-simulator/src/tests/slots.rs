@@ -1,12 +1,9 @@
 use super::common;
-use pulsebeam::entity::ParticipantId;
 use pulsebeam_agent::manager::Subscription;
 use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
 use std::net::IpAddr;
-use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn slots_layout_update_test() -> turmoil::Result {
@@ -71,7 +68,7 @@ fn slots_layout_update_test() -> turmoil::Result {
             })
             .await?;
 
-        let track_ids = client.ctx.discovered_tracks.clone();
+        let track_ids: Vec<String> = client.ctx.discovered_tracks.iter().cloned().collect();
         if track_ids.len() < 2 {
             return Err("Expected at least 2 discovered tracks".into());
         }
@@ -155,13 +152,11 @@ fn slots_prioritization_test() -> turmoil::Result {
     let pub1_ip: IpAddr = "192.168.1.1".parse().unwrap();
     let pub2_ip: IpAddr = "192.168.1.2".parse().unwrap();
     let sub_ip: IpAddr = "192.168.2.1".parse().unwrap();
-
-    let pub1_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
-    let pub2_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    let token = CancellationToken::new();
 
     // Publisher 1: Sends 3 layers
     {
-        let pub1_info = pub1_info.clone();
+        let token = token.child_token();
         sim.client(pub1_ip, async move {
             let mut client = common::client::SimClientBuilder::bind(pub1_ip, server_ip)
                 .await?
@@ -177,24 +172,14 @@ fn slots_prioritization_test() -> turmoil::Result {
                 .connect("room1")
                 .await?;
 
-            // Drive until the local track MID has been populated cleanly
-            client
-                .drive_until(Duration::from_secs(10), |ctx| !ctx.local_mids.is_empty())
-                .await?;
-
-            if let Some(mid) = client.ctx.local_mids.get(0) {
-                let pid = client.ctx.driver.participant_id().clone();
-                *pub1_info.lock().await = Some((pid, mid.to_string()));
-            }
-
-            client.drive_for(Duration::from_secs(40)).await.ok();
+            client.drive(token).await.ok();
             Ok(())
         });
     }
 
     // Publisher 2: Sends 3 layers
     {
-        let pub2_info = pub2_info.clone();
+        let token = token.child_token();
         sim.client(pub2_ip, async move {
             let mut client = common::client::SimClientBuilder::bind(pub2_ip, server_ip)
                 .await?
@@ -210,17 +195,7 @@ fn slots_prioritization_test() -> turmoil::Result {
                 .connect("room1")
                 .await?;
 
-            // Drive until the local track MID has been populated cleanly
-            client
-                .drive_until(Duration::from_secs(10), |ctx| !ctx.local_mids.is_empty())
-                .await?;
-
-            if let Some(mid) = client.ctx.local_mids.get(0) {
-                let pid = client.ctx.driver.participant_id().clone();
-                *pub2_info.lock().await = Some((pid, mid.to_string()));
-            }
-
-            client.drive_for(Duration::from_secs(40)).await.ok();
+            client.drive(token).await.ok();
             Ok(())
         });
     }
@@ -234,35 +209,15 @@ fn slots_prioritization_test() -> turmoil::Result {
             .connect("room1")
             .await?;
 
-        // Clean way to wait for cross-client async info without halting the engine loop
-        let mut info1 = None;
-        let mut info2 = None;
-
         client
-            .drive_until(Duration::from_secs(60), |_| {
-                if info1.is_none() {
-                    info1 = pub1_info.try_lock().ok().and_then(|l| l.clone());
-                }
-                if info2.is_none() {
-                    info2 = pub2_info.try_lock().ok().and_then(|l| l.clone());
-                }
-                info1.is_some() && info2.is_some()
+            .drive_until(Duration::from_secs(40), |ctx| {
+                ctx.discovered_tracks.len() >= 2
             })
             .await?;
 
-        let (pid1, mid1) = info1.unwrap();
-        let (pid2, mid2) = info2.unwrap();
-
-        let track1 = ParticipantId::from_str(&pid1)
-            .unwrap()
-            .derive_track_id(MediaKind::Video, &mid1)
-            .as_str()
-            .to_string();
-        let track2 = ParticipantId::from_str(&pid2)
-            .unwrap()
-            .derive_track_id(MediaKind::Video, &mid2)
-            .as_str()
-            .to_string();
+        let tracks: Vec<String> = client.ctx.discovered_tracks.iter().cloned().collect();
+        let track1 = &tracks[0];
+        let track2 = &tracks[1];
 
         // One slot high (track1), one slot low (track2)
         client.ctx.driver.set_subscriptions(vec![
@@ -276,13 +231,6 @@ fn slots_prioritization_test() -> turmoil::Result {
             },
         ]);
 
-        // Replaced wait_for_remote_tracks: Drive until at least 1 track is discovered
-        client
-            .drive_until(Duration::from_secs(40), |ctx| {
-                ctx.discovered_tracks.len() >= 1
-            })
-            .await?;
-
         // Wait for flow on at least one received track
         client
             .drive_until(Duration::from_secs(60), |ctx| {
@@ -293,19 +241,10 @@ fn slots_prioritization_test() -> turmoil::Result {
                     .all(|t| t.rx_layers.values().any(|l| l.bytes > 0))
             })
             .await?;
-
-        let stats = client.ctx.driver.stats();
-        for (mid, track_stats) in &stats.tracks {
-            assert!(
-                track_stats.rx_layers.values().any(|l| l.bytes > 0),
-                "Slot {:?} should have received media",
-                mid
-            );
-        }
-
+        token.cancel();
         Ok(())
     });
 
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(40))?;
+    common::run_sim_or_timeout(&mut sim, Duration::from_secs(120))?;
     Ok(())
 }

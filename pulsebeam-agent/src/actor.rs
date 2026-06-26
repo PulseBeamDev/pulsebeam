@@ -712,16 +712,17 @@ impl AgentBuilder {
             return Err(AgentError::NoCandidates);
         };
 
-        let signaling_cid = rtc.direct_api().create_data_channel(ChannelConfig {
+        let mut sdp = rtc.sdp_api();
+
+        let signaling_cfg = ChannelConfig {
             label: namespace::Signaling::Reliable.as_str().to_string(),
             ordered: true,
             reliability: Reliability::Reliable,
             negotiated: Some(0),
             protocol: "v1".to_string(),
-        });
+        };
+        let signaling_cid = sdp.add_channel_with_config(signaling_cfg);
 
-        let mut sdp = rtc.sdp_api();
-        // sdp.add_channel("sctp-enable".to_string());
         let mut medias = Vec::new();
         for track in self.tracks.clone() {
             let (dir, simulcast) = match track.direction {

@@ -66,9 +66,10 @@ fn declarative_subscription_test() -> turmoil::Result {
         let track_id = client
             .ctx
             .discovered_tracks
-            .first()
-            .cloned()
-            .expect("No remote tracks discovered");
+            .iter()
+            .next()
+            .expect("No remote tracks discovered")
+            .clone();
 
         // 2. Set declarative subscriptions
         client.ctx.driver.set_subscriptions(vec![Subscription {
