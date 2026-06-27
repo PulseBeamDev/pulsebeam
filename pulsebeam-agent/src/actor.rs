@@ -618,7 +618,7 @@ impl AgentBuilder {
 
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            .enable_bwe(None)
+            .enable_bwe(Some(Bitrate::kbps(500)))
             .set_extension(
                 rtp_extensions::ABS_CAPTURE_TIME,
                 Extension::AbsoluteCaptureTime,
