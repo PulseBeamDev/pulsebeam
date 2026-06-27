@@ -9,11 +9,10 @@ use pulsebeam_agent::{
     wallclock_at,
 };
 use pulsebeam_core::net::UdpSocket;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::time::Duration;
 use tachyonix as mpsc;
-use tokio::task::JoinSet;
+use tokio::{fs::File, io::BufWriter};
+use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio::{runtime::Builder, time::Instant};
 
 #[cfg(not(target_env = "msvc"))]
@@ -103,8 +102,8 @@ fn main() -> Result<()> {
 }
 
 async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
-    let latency_csv = File::create(&config.latency_file)?;
-    let snapshots_csv = File::create(&config.snapshots_file)?;
+    let latency_csv = File::create(&config.latency_file).await?;
+    let snapshots_csv = File::create(&config.snapshots_file).await?;
 
     let (latency_tx, latency_rx) = mpsc::channel::<EventLatency>(128_000);
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<EventSnapshot>(128_000);
@@ -279,51 +278,60 @@ async fn spawn_agent(
 
 async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -> Result<()> {
     let mut writer = BufWriter::with_capacity(16 * 1024, file);
-    let _ = writeln!(writer, "elapsed_ms,room_id,agent_id,delay_us");
+    let _ = writer
+        .write_all("elapsed_ms,room_id,agent_id,delay_us\n".as_bytes())
+        .await;
     let mut count = 0;
 
     while let Ok(e) = rx.recv().await {
-        let _ = writeln!(
-            writer,
-            "{},{},{},{}",
-            clock_anchor().since(e.captured_at).as_millis(),
-            e.room_id,
-            e.agent_id,
-            e.delay_us
-        );
+        let _ = writer
+            .write_all(
+                format!(
+                    "{},{},{},{}\n",
+                    clock_anchor().since(e.captured_at).as_millis(),
+                    e.room_id,
+                    e.agent_id,
+                    e.delay_us,
+                )
+                .as_bytes(),
+            )
+            .await;
         count += 1;
 
         if count >= 1000 {
-            let _ = writer.flush();
+            let _ = writer.flush().await;
             count = 0;
         }
     }
-    let _ = writer.flush();
+    let _ = writer.flush().await;
     Ok(())
 }
 
 async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File) -> Result<()> {
     let mut writer = BufWriter::with_capacity(4 * 1024, file);
-    let _ = writeln!(
-        writer,
-        "elapsed_ms,room_id,agent_id,tx_bytes,rx_bytes,rtt_us,loss_pct"
-    );
+    let _ = writer
+        .write_all("elapsed_ms,room_id,agent_id,tx_bytes,rx_bytes,rtt_us,loss_pct\n".as_bytes())
+        .await;
 
     while let Ok(e) = rx.recv().await {
-        let _ = writeln!(
-            writer,
-            "{},{},{},{},{},{},{:.4}",
-            clock_anchor().since(e.captured_at).as_millis(),
-            e.room_id,
-            e.agent_id,
-            e.tx_bytes,
-            e.rx_bytes,
-            e.rtt_us,
-            e.loss_pct
-        );
-        let _ = writer.flush();
+        let _ = writer
+            .write_all(
+                format!(
+                    "{},{},{},{},{},{},{:.4}\n",
+                    clock_anchor().since(e.captured_at).as_millis(),
+                    e.room_id,
+                    e.agent_id,
+                    e.tx_bytes,
+                    e.rx_bytes,
+                    e.rtt_us,
+                    e.loss_pct
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = writer.flush().await;
     }
-    let _ = writer.flush();
+    let _ = writer.flush().await;
     Ok(())
 }
 
