@@ -124,6 +124,46 @@ impl TcpSession {
         }
     }
 
+    pub(crate) fn try_send(&mut self, payload: &[u8]) {
+        let Some(stream) = &mut self.stream else {
+            return;
+        };
+
+        let length = payload.len();
+        if length > u16::MAX as usize {
+            tracing::error!("TCP payload exceeds 64KB RFC limit");
+            return;
+        }
+
+        let header = (length as u16).to_be_bytes();
+
+        let mut packet = Vec::with_capacity(header.len() + payload.len());
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(payload);
+
+        match stream.try_write(&packet) {
+            Ok(n) if n == packet.len() => {}
+            Ok(n) => {
+                // Partial write. Because TCP is a stream, a partial write corrupts
+                // the protocol alignment for all subsequent packets. Terminate connection.
+                tracing::warn!(
+                    "TCP partial write (wrote {}/{} bytes), killing stream",
+                    n,
+                    packet.len()
+                );
+                self.stream = None;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Localhost engine congestion—drop the frame cleanly exactly like UDP
+                tracing::debug!("TCP write would block, frame dropped lossily");
+            }
+            Err(e) => {
+                tracing::warn!("TCP write failed, closing stream: {:?}", e);
+                self.stream = None;
+            }
+        }
+    }
+
     pub(crate) fn close(&mut self) {
         self.stream = None;
         self.recv_accum.clear();

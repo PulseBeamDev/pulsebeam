@@ -618,7 +618,7 @@ impl AgentBuilder {
 
         let mut rtc_builder = Rtc::builder()
             .clear_codecs()
-            .enable_bwe(Some(Bitrate::kbps(500)))
+            .enable_bwe(None)
             .set_extension(
                 rtp_extensions::ABS_CAPTURE_TIME,
                 Extension::AbsoluteCaptureTime,
@@ -912,8 +912,6 @@ impl AgentDriver {
 
     pub fn set_preset(&mut self, preset: VideoPreset) {
         self.preset = preset;
-        // In a more complete implementation, we would update RTCPeerConnection parameters here
-        // if the underlying WebRTC implementation supports it.
         self.notifier.notify_one();
     }
 
@@ -930,7 +928,7 @@ impl AgentDriver {
 
         loop {
             // Drain all str0m output — this may queue pending_events.
-            let Some(deadline) = self.poll_rtc().await else {
+            let Some(deadline) = self.poll_rtc() else {
                 return self.pending_events.pop_front();
             };
 
@@ -941,13 +939,8 @@ impl AgentDriver {
 
             // Adjust timers.
             self.now = Instant::now();
-            let adjusted_deadline = if deadline <= self.now {
-                self.now + MIN_QUANTA
-            } else {
-                deadline
-            };
-            if self.sleep.deadline() != adjusted_deadline {
-                self.sleep.as_mut().reset(adjusted_deadline);
+            if self.sleep.deadline() != deadline {
+                self.sleep.as_mut().reset(deadline);
             }
             if let Some(reconnect_at) = self.reconnect_deadline
                 && self.reconnect_timer.deadline() != reconnect_at
@@ -1056,15 +1049,15 @@ impl AgentDriver {
         self.shutdown().await;
     }
 
-    async fn poll_rtc(&mut self) -> Option<Instant> {
+    fn poll_rtc(&mut self) -> Option<Instant> {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(tx)) => match tx.proto {
                     Protocol::Udp => {
-                        let _ = self.socket.send_to(&tx.contents, tx.destination).await;
+                        let _ = self.socket.try_send_to(&tx.contents, tx.destination);
                     }
                     Protocol::Tcp => {
-                        self.tcp.send(&tx.contents).await;
+                        self.tcp.try_send(&tx.contents);
                     }
                     _ => {}
                 },
