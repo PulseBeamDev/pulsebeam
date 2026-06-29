@@ -1,15 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
-    MediaKind, SimulcastLayer, TransceiverDirection,
-    actor::{AgentBuilder, AgentEvent, LocalTrack},
+    MediaKind, Rid, SimulcastLayer, TransceiverDirection,
+    actor::{AgentBuilder, AgentEvent},
     api::HttpApiClient,
     clock::clock_anchor,
-    media::H264Looper,
+    media::{H264Looper, SharedH264Asset},
     wallclock_at,
 };
 use pulsebeam_core::net::UdpSocket;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tachyonix as mpsc;
 use tokio::{fs::File, io::BufWriter};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
@@ -18,6 +18,25 @@ use tokio::{runtime::Builder, time::Instant};
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[derive(Clone)]
+struct VideoAssets {
+    full: Arc<SharedH264Asset>,
+    half: Arc<SharedH264Asset>,
+    quarter: Arc<SharedH264Asset>,
+}
+
+impl VideoAssets {
+    fn new() -> Self {
+        Self {
+            full: Arc::new(SharedH264Asset::new(pulsebeam_testdata::RAW_H264_FULL_CBR)),
+            half: Arc::new(SharedH264Asset::new(pulsebeam_testdata::RAW_H264_HALF_CBR)),
+            quarter: Arc::new(SharedH264Asset::new(
+                pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+            )),
+        }
+    }
+}
 
 #[derive(Parser)]
 struct Cli {
@@ -60,6 +79,7 @@ struct AgentContext {
     room_id: usize,
     agent_id: usize,
     logger: Logger,
+    assets: VideoAssets,
 }
 
 pub struct EventLatency {
@@ -111,6 +131,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
         latency: latency_tx,
         snapshot: snapshot_tx,
     };
+    let assets = VideoAssets::new();
     let mut join_set = JoinSet::new();
 
     let latency_writer_handle = tokio::spawn(latency_writer_task(latency_rx, latency_csv));
@@ -118,7 +139,15 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
 
     let mut total_rooms = 0;
     for room_id in 0..config.rooms {
-        spawn_room(&mut join_set, &api_url, room_id, &config, logger.clone()).await;
+        spawn_room(
+            &mut join_set,
+            &api_url,
+            room_id,
+            &config,
+            logger.clone(),
+            assets.clone(),
+        )
+        .await;
         total_rooms += 1;
     }
 
@@ -136,7 +165,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
                 let delay = Duration::from_secs_f64((-u.ln() / config.arrival_rate).max(0.001));
                 tokio::time::sleep(delay).await;
 
-                spawn_room(&mut join_set, &api_url, total_rooms, &config, logger.clone()).await;
+                spawn_room(&mut join_set, &api_url, total_rooms, &config, logger.clone(), assets.clone()).await;
                 total_rooms += 1;
             }
             // Keep running inside this block until all active agents complete their session schedules
@@ -162,6 +191,7 @@ async fn spawn_room(
     room_id: usize,
     config: &BenchConfig,
     logger: Logger,
+    assets: VideoAssets,
 ) {
     let room_name = format!("bench-room-{}", room_id);
 
@@ -175,6 +205,7 @@ async fn spawn_room(
             room_id,
             agent_id: room_id * 1000 + user_id,
             logger: logger.clone(),
+            assets: assets.clone(),
         };
         let r_name = room_name.clone();
 
@@ -254,7 +285,12 @@ async fn spawn_agent(
             }
             Some(event) = driver.poll() => {
                 match event {
-                    AgentEvent::LocalTrackAdded(track) => { tokio::spawn(handle_local_track(track)); }
+                    AgentEvent::LocalTrackAdded(track) => {
+                        if track.kind.is_video() {
+                            let looper = get_looper(&track.rid, &ctx.assets);
+                            tokio::spawn(looper.run(track));
+                        }
+                    }
                     AgentEvent::MediaReceived { frame, receive_time, .. } => {
                         if let Some(abs_capture_time) = frame.abs_capture_time {
                             let wallclock = wallclock_at(receive_time);
@@ -335,14 +371,12 @@ async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File)
     Ok(())
 }
 
-async fn handle_local_track(track: LocalTrack) {
-    if track.kind.is_audio() {
-        return;
-    }
-    let data = match track.rid.as_ref().map(|r| r.as_ref()) {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+fn get_looper(rid: &Option<Rid>, assets: &VideoAssets) -> H264Looper {
+    let data = match rid.as_ref().map(|r| r.as_ref()) {
+        Some("f") => &assets.full,
+        Some("h") => &assets.half,
+        Some("q") => &assets.quarter,
+        _ => &assets.half,
     };
-    let _ = H264Looper::new(data, 30).run(track).await;
+    H264Looper::new_shared(data.clone(), 30)
 }

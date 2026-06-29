@@ -32,26 +32,20 @@ impl KeyframeReceiver {
     }
 }
 
-pub struct H264Looper {
-    frames: Vec<Arc<[u8]>>,
-    index: usize,
-    fps: u32,
-    // Index of the first IDR frame; seek here on keyframe reset.
-    first_idr: usize,
+pub struct SharedH264Asset {
+    // The master list of frame slices
+    pub(crate) frames: Vec<Arc<[u8]>>,
+    // Pre-calculated position of the first IDR frame for quick seeking
+    pub(crate) first_idr: usize,
 }
 
-impl H264Looper {
-    pub fn new(data: &[u8], fps: u32) -> Self {
+impl SharedH264Asset {
+    pub fn new(data: &[u8]) -> Self {
         let slicer = H264FrameSlicer::new(data);
         let frames: Vec<Arc<[u8]>> = slicer.map(Arc::from).collect();
         let first_idr = Self::find_first_idr(&frames);
-        tracing::info!(frames = frames.len(), first_idr, "H264Looper ready");
-        Self {
-            frames,
-            index: 0,
-            fps,
-            first_idr,
-        }
+
+        Self { frames, first_idr }
     }
 
     fn find_first_idr(frames: &[Arc<[u8]>]) -> usize {
@@ -84,10 +78,35 @@ impl H264Looper {
         }
         false
     }
+}
+
+pub struct H264Looper {
+    asset: Arc<SharedH264Asset>,
+    index: usize,
+    fps: u32,
+}
+
+impl H264Looper {
+    pub fn new(data: &[u8], fps: u32) -> Self {
+        let asset = Arc::new(SharedH264Asset::new(data));
+        Self {
+            asset,
+            index: 0,
+            fps,
+        }
+    }
+
+    pub fn new_shared(asset: Arc<SharedH264Asset>, fps: u32) -> Self {
+        Self {
+            asset,
+            index: 0,
+            fps,
+        }
+    }
 
     fn next(&mut self) -> Arc<[u8]> {
-        let frame = &self.frames[self.index];
-        self.index = (self.index + 1) % self.frames.len();
+        let frame = &self.asset.frames[self.index];
+        self.index = (self.index + 1) % self.asset.frames.len();
         frame.clone()
     }
 
@@ -109,8 +128,14 @@ impl H264Looper {
             let tick_time = interval.tick().await;
 
             if keyframe_rx.is_requested() {
-                tracing::debug!(?mid, ?rid, first_idr = self.first_idr, "keyframe reset");
-                self.index = self.first_idr;
+                tracing::debug!(
+                    ?mid,
+                    ?rid,
+                    first_idr = self.asset.first_idr,
+                    "keyframe reset"
+                );
+                // Seek back to the asset's pre-calculated IDR frame index
+                self.index = self.asset.first_idr;
             }
 
             let frame_data = self.next();
@@ -123,12 +148,7 @@ impl H264Looper {
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
             };
 
-            // backpressure: await the channel rather than drop frames
-            // if the actor can't keep up. this prevents the source from
-            // endlessly flooding the RTC send queue and allows pacing to
-            // naturally throttle the encoder.
             if tx.send(frame).await.is_err() {
-                // actor dropped the receiver, we're shutting down
                 break;
             }
             frame_count += 1;
