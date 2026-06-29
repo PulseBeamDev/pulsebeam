@@ -280,12 +280,23 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut EventQueue) {
-        let next_deadline = self.poll_until_deadline(now, events);
-
-        if let Some(next_deadline) = next_deadline {
-            events.update_deadline(next_deadline);
-        } else {
-            events.exit();
+        loop {
+            let next_deadline = self.poll_until_deadline(now, events);
+            match next_deadline {
+                None => {
+                    events.exit();
+                    return;
+                }
+                Some(deadline) if deadline > now => {
+                    events.update_deadline(deadline);
+                    return;
+                }
+                Some(_) => {
+                    // Deadline is immediate, feed another Timeout and keep draining
+                    // https://discordapp.com/channels/1436725650302959829/1436796781462687817
+                    let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                }
+            }
         }
     }
 
