@@ -1004,13 +1004,12 @@ impl AgentDriver {
                             if let Some(rid) = rid {
                                 writer = writer.rid(rid);
                             }
-                            // Re-stamp at wire-send time (not encode time) so that
-                            // receive_time - abs_capture_time measures network +
-                            // server forwarding latency only.
-                            writer = writer.abs_capture_time(AbsCaptureTime {
-                                capture_time: crate::clock::capture_wallclock(),
-                                clock_offset: None,
-                            });
+                            if let Some(abs_capture_time) = frame.abs_capture_time {
+                                writer = writer.abs_capture_time(AbsCaptureTime {
+                                    capture_time: abs_capture_time,
+                                    clock_offset: None,
+                                });
+                            }
                             let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                         } else {
                             tracing::warn!(?mid, "no writer found for mid");
