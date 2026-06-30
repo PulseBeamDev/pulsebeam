@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use metrics::Unit;
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
@@ -151,6 +152,7 @@ pub struct ShardWorker {
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
     router: ShardRouter,
     metrics: Arc<ShardMetrics>,
+    latency: metrics::Histogram,
 }
 
 impl ShardWorker {
@@ -170,6 +172,13 @@ impl ShardWorker {
             shard_id,
             cross_shard_event_txs,
         };
+
+        metrics::describe_histogram!(
+            "shard_tick_delay_us",
+            Unit::Microseconds,
+            "shard tick delay distribution"
+        );
+        let latency = metrics::histogram!("shard_tick_delay_us",);
         Self {
             core,
             recv_batch: Vec::with_capacity(net::BATCH_SIZE),
@@ -180,6 +189,7 @@ impl ShardWorker {
             cross_shard_event_rx,
             router,
             metrics,
+            latency,
         }
     }
 
@@ -205,6 +215,7 @@ impl ShardWorker {
             loop_start = busy_end;
             let busy_duration = busy_end.duration_since(busy_start);
             self.metrics.record_busy(busy_duration);
+            self.latency.record(busy_duration.as_micros() as f64);
         }
     }
 

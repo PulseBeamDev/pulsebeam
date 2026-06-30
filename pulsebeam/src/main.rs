@@ -89,7 +89,6 @@ impl Runtime for PulsebeamRuntime {
 }
 
 fn main() {
-    pulsebeam_runtime::init();
     let args = Args::parse();
     let use_tokio_console = cfg!(feature = "tokio-console");
 

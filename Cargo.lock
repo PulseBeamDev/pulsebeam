@@ -2999,6 +2999,7 @@ dependencies = [
  "local-event",
  "loom 0.7.2",
  "metrics",
+ "metrics-exporter-prometheus",
  "once_cell",
  "parking_lot",
  "pulsebeam-core",
