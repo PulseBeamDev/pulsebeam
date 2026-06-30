@@ -94,7 +94,7 @@ impl Batcher {
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }
-                Err(err) if err.kind() != io::ErrorKind::WouldBlock => {
+                Err(err) => {
                     tracing::trace!("error on writing to egress socket: {:?}", err);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
@@ -125,7 +125,7 @@ impl Batcher {
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }
-                Err(err) if err.kind() != io::ErrorKind::WouldBlock => {
+                Err(err) => {
                     tracing::trace!("error on writing to TCP socket: {:?}", err);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
