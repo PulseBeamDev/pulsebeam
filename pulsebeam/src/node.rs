@@ -566,7 +566,7 @@ mod internal {
         pub fn init(listener: TcpListener) -> anyhow::Result<Self> {
             let prometheus = PrometheusBuilder::new()
                 .set_buckets_for_metric(
-                    Matcher::Full("shard_tick_delay_us".to_string()),
+                    Matcher::Suffix("_delay_us".to_string()),
                     &create_exponential_buckets(1.0, 4.0, 6), // 1us -> 4ms,
                 )
                 .expect("invalid bucket config")

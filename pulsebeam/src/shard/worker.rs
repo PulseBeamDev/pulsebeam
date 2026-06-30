@@ -152,7 +152,11 @@ pub struct ShardWorker {
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
     router: ShardRouter,
     metrics: Arc<ShardMetrics>,
-    latency: metrics::Histogram,
+
+    delay_ingress: metrics::Histogram,
+    delay_compute: metrics::Histogram,
+    delay_egress: metrics::Histogram,
+    delay_tick: metrics::Histogram,
 }
 
 impl ShardWorker {
@@ -178,7 +182,10 @@ impl ShardWorker {
             Unit::Microseconds,
             "shard tick delay distribution"
         );
-        let latency = metrics::histogram!("shard_tick_delay_us",);
+        let delay_tick = metrics::histogram!("shard_tick_delay_us",);
+        let delay_ingress = metrics::histogram!("shard_ingress_delay_us",);
+        let delay_compute = metrics::histogram!("shard_compute_delay_us",);
+        let delay_egress = metrics::histogram!("shard_egress_delay_us",);
         Self {
             core,
             recv_batch: Vec::with_capacity(net::BATCH_SIZE),
@@ -189,7 +196,10 @@ impl ShardWorker {
             cross_shard_event_rx,
             router,
             metrics,
-            latency,
+            delay_tick,
+            delay_ingress,
+            delay_compute,
+            delay_egress,
         }
     }
 
@@ -215,7 +225,7 @@ impl ShardWorker {
             loop_start = busy_end;
             let busy_duration = busy_end.duration_since(busy_start);
             self.metrics.record_busy(busy_duration);
-            self.latency.record(busy_duration.as_micros() as f64);
+            self.delay_tick.record(busy_duration.as_micros() as f64);
         }
     }
 
@@ -262,7 +272,6 @@ impl ShardWorker {
         while let Ok(ev) = self.cross_shard_event_rx.try_recv() {
             self.core.on_cross_shard_event(ev, now, &self.router);
         }
-
         self.core.fire_timers(now);
 
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
@@ -270,18 +279,26 @@ impl ShardWorker {
         for batch in self.recv_batch.drain(..) {
             self.core.on_udp_batch(batch, &self.router);
         }
+        let ingress_delay = now.elapsed();
+        self.delay_ingress.record(ingress_delay.as_micros() as f64);
 
         // phase 2: compute
+        let now = Instant::now();
         self.core.poll_input(now);
         self.core.flush_rtp_events(&self.router);
         self.core.poll_fanout(now);
         self.core.flush_participant_events(&self.router);
+        let compute_delay = now.elapsed();
+        self.delay_compute.record(compute_delay.as_micros() as f64);
 
         // phase 3: output
+        let now = Instant::now();
         self.core
             .flush_egress(&self.udp_socket, &mut self.tcp_socket);
+        let egress_delay = now.elapsed();
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
+        self.delay_egress.record(egress_delay.as_micros() as f64);
     }
 
     async fn flush_shard_events(&mut self) -> Result<(), ShardError> {
