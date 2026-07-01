@@ -158,6 +158,7 @@ impl UdpTransportReader {
                             stride: m.stride,  // Downstream will use this to skip through buf
                             len: m.len,        // Total length of the GRO batch
                             transport: Transport::Udp(UdpMode::Batch),
+                            offset: 0,
                         });
                     }
                     Ok(out.len() - prev_len)

@@ -100,6 +100,7 @@ impl UdpTransportReader {
                     buf: slot,
                     stride: n,
                     len: n,
+                    offset: 0,
                 });
             }
             Err(err) => {

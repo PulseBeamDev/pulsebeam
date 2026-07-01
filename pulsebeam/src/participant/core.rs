@@ -280,72 +280,54 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut EventQueue) {
-        loop {
-            let next_deadline = self.poll_until_deadline(now, events);
-            match next_deadline {
-                None => {
-                    events.exit();
-                    return;
-                }
-                Some(deadline) if deadline > now => {
-                    events.update_deadline(deadline);
-                    return;
-                }
-                Some(_) => {
-                    // Deadline is immediate, feed another Timeout and keep draining
-                    // https://discordapp.com/channels/1436725650302959829/1436796781462687817
-                    let _ = self.rtc.handle_input(Input::Timeout(now.into()));
-                }
-            }
-        }
-    }
-
-    fn poll_until_deadline(&mut self, now: Instant, events: &mut EventQueue) -> Option<Instant> {
-        if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
-            self.poll_slow(now, events);
-            self.last_slow_poll = now;
-        }
-
-        while let Some(batch) = self.pending_ingress.pop_front() {
-            let transport = match batch.transport {
-                Transport::Udp(_) => str0m::net::Protocol::Udp,
-                Transport::Tcp => str0m::net::Protocol::Tcp,
+        'drain: loop {
+            let Some(rtc_deadline) = self.poll_rtc(events) else {
+                events.exit();
+                return;
             };
 
-            for pkt in batch.into_iter() {
-                if let Ok(contents) = (*pkt).try_into() {
-                    let recv = str0m::net::Receive {
-                        proto: transport,
-                        source: batch.src,
-                        destination: batch.dst,
-                        contents,
-                    };
-                    if self
-                        .rtc
-                        .handle_input(Input::Receive(now.into(), recv))
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    self.poll_rtc(events)?;
-                } else {
-                    tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
-                }
+            if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
+                self.poll_slow(now, events);
+                self.last_slow_poll = now;
+                continue;
             }
-        }
 
-        loop {
-            let rtc_deadline = self.poll_rtc(events)?;
+            while let Some(batch) = self.pending_ingress.front_mut() {
+                let transport = match batch.transport {
+                    Transport::Udp(_) => str0m::net::Protocol::Udp,
+                    Transport::Tcp => str0m::net::Protocol::Tcp,
+                };
+
+                let src = batch.src;
+                let dst = batch.dst;
+                let Some(pkt) = batch.next_packet() else {
+                    self.pending_ingress.pop_front();
+                    continue;
+                };
+
+                let Ok(contents) = (*pkt).try_into() else {
+                    tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
+                    // no point iterating the batch, this is already malicous
+                    self.pending_ingress.pop_front();
+                    continue;
+                };
+
+                let recv = str0m::net::Receive {
+                    proto: transport,
+                    source: src,
+                    destination: dst,
+                    contents,
+                };
+                let _ = self.rtc.handle_input(Input::Receive(now.into(), recv));
+                continue 'drain;
+            }
+
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
-                // Signaling wrote data. The RTC engine is now "dirty" (has output to send).
-                // We loop back to `poll_rtc` immediately to flush `Output::Transmit`.
                 continue;
             }
 
             if self.downstream.dirty_allocation {
-                // Make sure rtc is updated with new allocations
                 let assignments_changed = self.downstream.update_allocations(&mut self.rtc.bwe());
                 if assignments_changed {
                     self.signaling.mark_assignments_dirty();
@@ -355,9 +337,14 @@ impl ParticipantCore {
             }
 
             let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
+            let deadline = rtc_deadline.min(next_slow_poll);
 
-            // No new work generated. We are synced. Return the RTC deadline.
-            return Some(rtc_deadline.min(next_slow_poll));
+            if deadline > now {
+                events.update_deadline(deadline);
+                return;
+            }
+
+            let _ = self.rtc.handle_input(Input::Timeout(now.into()));
         }
     }
 

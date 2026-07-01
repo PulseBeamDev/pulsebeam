@@ -455,6 +455,7 @@ impl TcpTransport {
                     stride: len,
                     len,
                     transport: Transport::Tcp,
+                    offset: 0,
                 });
             }
             TcpEvent::Closed(src) => {

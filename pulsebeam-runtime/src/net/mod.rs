@@ -29,6 +29,8 @@ pub struct RecvPacketBatch {
     pub stride: usize,
     pub len: usize,
     pub transport: Transport,
+
+    offset: usize,
 }
 
 impl RecvPacketBatch {
@@ -38,42 +40,16 @@ impl RecvPacketBatch {
         &self.buf
     }
 
-    pub fn iter(&self) -> RecvPacketBatchIter<'_> {
-        RecvPacketBatchIter {
-            batch: self,
-            offset: 0,
-        }
-    }
-}
-
-impl<'a> IntoIterator for &'a RecvPacketBatch {
-    type Item = &'a [u8];
-    type IntoIter = RecvPacketBatchIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-pub struct RecvPacketBatchIter<'a> {
-    batch: &'a RecvPacketBatch,
-    offset: usize,
-}
-
-impl<'a> Iterator for RecvPacketBatchIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        assert!(
-            self.batch.stride != 0,
-            "stride must not be zero in iteration"
-        );
-        let tail = self.batch.len.min(self.offset + self.batch.stride);
+    // https://stackoverflow.com/questions/68606470/how-to-return-a-reference-when-implementing-an-iterator
+    // GAT is not stabilized, so it's not possible to return a reference in an iterator yet.
+    pub fn next_packet(&mut self) -> Option<&[u8]> {
+        assert!(self.stride != 0, "stride must not be zero in iteration");
+        let tail = self.len.min(self.offset + self.stride);
         if self.offset >= tail {
             return None;
         }
 
-        let buf = &self.batch.buf[self.offset..tail];
+        let buf = &self.buf[self.offset..tail];
         self.offset = tail;
         Some(buf)
     }
@@ -201,38 +177,38 @@ mod tests {
 
     #[test]
     fn recv_packet_batch_iter_yields_multiple_segments_without_off_by_one() {
-        let batch = RecvPacketBatch {
+        let mut batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
             buf: (0u8..20).collect(),
             stride: 6,
             len: 20,
             transport: Transport::Udp(UdpMode::Scalar),
+            offset: 0,
         };
 
-        let chunks: Vec<&[u8]> = batch.iter().collect();
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0], &[0, 1, 2, 3, 4, 5]);
-        assert_eq!(chunks[1], &[6, 7, 8, 9, 10, 11]);
-        assert_eq!(chunks[2], &[12, 13, 14, 15, 16, 17]);
-        assert_eq!(chunks[3], &[18, 19]);
+        assert_eq!(batch.next_packet(), Some(&[0, 1, 2, 3, 4, 5][..]));
+        assert_eq!(batch.next_packet(), Some(&[6, 7, 8, 9, 10, 11][..]));
+        assert_eq!(batch.next_packet(), Some(&[12, 13, 14, 15, 16, 17][..]));
+        assert_eq!(batch.next_packet(), Some(&[18, 19][..]));
+        assert_eq!(batch.next_packet(), None);
     }
 
     #[test]
     fn recv_packet_batch_iter_yields_multiple_segments_with_exact_len() {
-        let batch = RecvPacketBatch {
+        let mut batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
             buf: (0u8..20).collect(),
             stride: 6,
             len: 18,
             transport: Transport::Udp(UdpMode::Scalar),
+            offset: 0,
         };
 
-        let chunks: Vec<&[u8]> = batch.iter().collect();
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0], &[0, 1, 2, 3, 4, 5]);
-        assert_eq!(chunks[1], &[6, 7, 8, 9, 10, 11]);
-        assert_eq!(chunks[2], &[12, 13, 14, 15, 16, 17]);
+        assert_eq!(batch.next_packet(), Some(&[0, 1, 2, 3, 4, 5][..]));
+        assert_eq!(batch.next_packet(), Some(&[6, 7, 8, 9, 10, 11][..]));
+        assert_eq!(batch.next_packet(), Some(&[12, 13, 14, 15, 16, 17][..]));
+        assert_eq!(batch.next_packet(), None);
     }
 }
