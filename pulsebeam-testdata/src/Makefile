@@ -1,6 +1,7 @@
 # Source Configuration
 SOURCE_URL   = https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_720p_h264.mov
-INPUT_VIDEO  = BigBuckBunny_720p.mov
+# INPUT_VIDEO  = driving.webm
+INPUT_VIDEO = BigBuckBunny_720p.mov
 
 INPUT_H264   = full_f_cbr.h264
 OUT_DIR      = .
@@ -22,11 +23,17 @@ BASE_COMMON = tune=zerolatency \
               aud=false \
               rc-lookahead=0 \
               sliced-threads=false \
-              threads=1 \
-              option-string="repeat-headers=1:open-gop=0:scenecut=0:intra-refresh=0"
+							threads=1 \
+							# intra-refresh allows ammortizing complex scenes to a series of slightly larger P-frames instead of 
+							# generating a big IDR frame. This means much more stable bitrate and lower latency.
+							#
+							# https://news.ycombinator.com/item?id=25970843
+							# http://www.chaneru.com/Roku/HLS/X264_Settings.htm#intra-refresh
+							intra-refresh=true \
+              option-string="repeat-headers=1:open-gop=0:scenecut=0"
 
 # Specific rate-control modifiers
-CBR_FLAGS = pass=cbr nal-hrd=cbr vbv-buf-capacity=1000
+CBR_FLAGS = pass=cbr nal-hrd=cbr vbv-buf-capacity=200
 VBR_FLAGS   = # Intentionally blank. x264enc defaults to VBR/ABR when pass=cbr is omitted.
 
 .PHONY: all clean prepare estimate download distclean
@@ -144,41 +151,6 @@ estimate:
 		fakesink silent=false 2>&1 | \
 		grep -oP '\(\K[0-9]+(?=\s*bytes)' || \
 		{ echo "Error: no frame sizes captured — check gst-launch output format." >&2; exit 1; }
-
-# Same as estimate, but also prints stdev/CV, and separates the largest frame
-# (likely a keyframe) from the steady-state P-frames for a cleaner
-# apples-to-apples "tightness" comparison against Chrome's trace.
-estimate-summary:
-	@if [ ! -f "$(INPUT_H264)" ]; then \
-		echo "Error: Input file '$(INPUT_H264)' not found." >&2; \
-		exit 1; \
-	fi
-	@gst-launch-1.0 -v \
-		filesrc location=$(INPUT_H264) ! \
-		h264parse ! \
-		fakesink silent=false 2>&1 | \
-		grep -oP '\(\K[0-9]+(?=\s*bytes)' | \
-		awk '{ \
-			print; \
-			sizes[n]=$$1; sum+=$$1; n++; \
-			if ($$1 > max) { max=$$1; maxidx=n-1 } \
-		} \
-		END { \
-			if (!n) { print "no frames captured" > "/dev/stderr"; exit 1 } \
-			mean = sum/n; \
-			for (i=0;i<n;i++) { d=sizes[i]-mean; ss+=d*d } \
-			stdev = sqrt(ss/n); \
-			sum2=0; n2=0; \
-			for (i=0;i<n;i++) { if (i!=maxidx) { sum2+=sizes[i]; n2++ } } \
-			mean2 = n2 ? sum2/n2 : 0; \
-			ss2=0; \
-			for (i=0;i<n;i++) { if (i!=maxidx) { d=sizes[i]-mean2; ss2+=d*d } } \
-			stdev2 = n2 ? sqrt(ss2/n2) : 0; \
-			printf "---\n"; \
-			printf "frames=%d  mean=%.1f  stdev=%.1f  cv=%.1f%%\n", n, mean, stdev, (stdev/mean)*100; \
-			printf "largest frame: idx=%d size=%d (likely keyframe)\n", maxidx, max; \
-			printf "excl. largest: frames=%d  mean=%.1f  stdev=%.1f  cv=%.1f%%\n", n2, mean2, stdev2, n2?(stdev2/mean2)*100:0; \
-		}'
 
 clean:
 	rm -f $(OUT_DIR)/trimmed.mp4 \
