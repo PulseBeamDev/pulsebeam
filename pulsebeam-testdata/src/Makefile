@@ -1,7 +1,8 @@
 # Source Configuration
 SOURCE_URL   = https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_720p_h264.mov
-# INPUT_VIDEO  = driving.webm
-INPUT_VIDEO = BigBuckBunny_720p.mov
+# https://www.pexels.com/video/scenic-city-drive-at-sunset-from-car-dashboard-31901316/
+INPUT_VIDEO  = driving.mp4
+# INPUT_VIDEO = BigBuckBunny_720p.mov
 
 INPUT_H264   = full_f_cbr.h264
 OUT_DIR      = .
