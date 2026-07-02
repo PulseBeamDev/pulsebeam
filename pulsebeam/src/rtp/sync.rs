@@ -35,12 +35,10 @@ pub struct Synchronizer {
     /// The server Instant that corresponds to a specific NTP time, representing
     /// the minimum observed propagation delay.
     ntp_anchor: Option<ClockReference>,
-    ppm_hist: metrics::Histogram,
 }
 
 impl Synchronizer {
     pub fn new(clock_rate: Frequency) -> Self {
-        let ppm_hist = metrics::histogram!("rtp_sync_clock_drift_ppm");
         Self {
             clock_rate,
             first_sr: None,
@@ -50,7 +48,6 @@ impl Synchronizer {
             base_server_time: None,
             estimated_clock_drift_ppm: 0.0,
             ntp_anchor: None,
-            ppm_hist,
         }
     }
 
@@ -175,7 +172,6 @@ impl Synchronizer {
 
         if let (Some(first), Some(latest)) = (self.first_sr, self.latest_sr) {
             self.estimated_clock_drift_ppm = Self::compute_clock_drift(&first, &latest);
-            self.ppm_hist.record(self.estimated_clock_drift_ppm);
         }
 
         // Update the NTP anchor with a minimum envelope filter
