@@ -365,20 +365,20 @@ mod internal {
         // Try to install the Prometheus recorder.
         // In simulation or test environments running multiple nodes in one process,
         // this might fail if already installed. We proceed gracefully.
-        static GLOBAL_PROMETHEUS_HANDLE: once_cell::sync::OnceCell<PrometheusHandle> =
-            once_cell::sync::OnceCell::new();
+        // static GLOBAL_PROMETHEUS_HANDLE: once_cell::sync::OnceCell<PrometheusHandle> =
+        //     once_cell::sync::OnceCell::new();
 
-        let prometheus_handle = match PrometheusBuilder::new().install_recorder() {
-            Ok(handle) => {
-                let _ = GLOBAL_PROMETHEUS_HANDLE.set(handle.clone());
-                handle
-            }
-            Err(_) => GLOBAL_PROMETHEUS_HANDLE
-                .get()
-                .cloned()
-                .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
-        };
-
+        // let prometheus_handle = match PrometheusBuilder::new().install_recorder() {
+        //     Ok(handle) => {
+        //         let _ = GLOBAL_PROMETHEUS_HANDLE.set(handle.clone());
+        //         handle
+        //     }
+        //     Err(_) => GLOBAL_PROMETHEUS_HANDLE
+        //         .get()
+        //         .cloned()
+        //         .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
+        // };
+        //
         const INDEX_HTML: &str = r#"
 <ul>
   <li><a href="/healthz">Healthcheck</a></li>
@@ -390,14 +390,14 @@ mod internal {
 </ul>
 "#;
 
-        let router_prometheus = prometheus_handle.clone();
+        // let router_prometheus = prometheus_handle.clone();
         let router = Router::new()
             .route("/debug/pprof/profile", get(pprof_profile))
             .route("/debug/pprof/allocs", get(heap_profile))
             .route("/healthz", get(healthcheck))
-            .route("/", get(async move || Html(INDEX_HTML)))
-            .route("/metrics", get(async move || router_prometheus.render()));
-        let rt_monitor_join = tokio::spawn(rt_background_monitor(prometheus_handle));
+            .route("/", get(async move || Html(INDEX_HTML)));
+        // .route("/metrics", get(async move || router_prometheus.render()));
+        // let rt_monitor_join = tokio::spawn(rt_background_monitor(prometheus_handle));
 
         tracing::info!("internal metrics listening on {:?}", addr);
 
@@ -420,7 +420,7 @@ mod internal {
                     tracing::error!("internal http server error: {e}");
                 }
             }
-            _ = rt_monitor_join => {}
+            // _ = rt_monitor_join => {}
             // _ = runtime_metrics_join => {}
             // _ = actor_monitor_join => {}
             _ = shutdown.cancelled() => {
