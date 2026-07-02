@@ -46,21 +46,22 @@ flamegraph: profile
 perf-server:
 	$(eval PIDS := $(shell pgrep -x $(TARGET) | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi
+	sudo sysctl -w kernel.perf_event_max_stack=64
 	sudo sysctl -w kernel.kptr_restrict=0
 	sudo sysctl -w kernel.perf_event_paranoid=-1
 	@echo "Recording pulsebeam PIDs=$(PIDS) for 15s at 999Hz..."
 	perf config annotate.objdump=llvm-objdump
 	  # -p $(PIDS) 
 	perf record \
-		-F 99 \
 		-a \
-		-e cycles \
 		-g \
+		-e cycles \
 		--call-graph fp \
-		-m 128M \
+		-F 15000 \
+		-m 256M \
 		-o perf.data \
 		-- sleep 15
-	perf script -F +pid > perf-firefox.data
+	#perf script -F +pid > perf-firefox.data
 	@echo "Launching UI..."
 	hotspot perf.data
 

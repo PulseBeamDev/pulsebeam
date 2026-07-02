@@ -246,7 +246,7 @@ impl BitrateController {
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
-        Bitrate::from(current_bitrate)
+        Bitrate::from(current_bitrate) * 1.50
     }
 }
 
@@ -926,6 +926,8 @@ impl AgentDriver {
             return Some(ev);
         }
 
+        let mut last_desired = Bitrate::bps(0);
+
         loop {
             // Drain all str0m output — this may queue pending_events.
             let Some(deadline) = self.poll_rtc() else {
@@ -1020,7 +1022,11 @@ impl AgentDriver {
                     let desired_bps = self.layer_ctrl.tick(self.now);
                     let desired_bitrate = Bitrate::from(desired_bps.max(0.0) as u64);
                     let filtered_bitrate = self.desired_ctrl.update(desired_bitrate);
-                    self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
+                    if filtered_bitrate != last_desired {
+                        last_desired = filtered_bitrate;
+                        self.rtc.bwe().set_desired_bitrate(filtered_bitrate);
+                    }
+                    tracing::debug!("desired={}", filtered_bitrate);
                 }
                 _ = self.sleep.as_mut() => {
                     if self.rtc.handle_input(Input::Timeout(Instant::now().into())).is_err() {
@@ -1031,12 +1037,6 @@ impl AgentDriver {
                     self.perform_reconnect().await;
                 }
             }
-
-            // Return any events produced by this select iteration.
-            if let Some(ev) = self.pending_events.pop_front() {
-                return Some(ev);
-            }
-            // No event yet — loop back to drain str0m output.
         }
     }
 

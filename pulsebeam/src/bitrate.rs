@@ -81,7 +81,7 @@ impl BitrateController {
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
-        Bitrate::from(current_bitrate)
+        Bitrate::from(current_bitrate) * 1.50
     }
 }
 
