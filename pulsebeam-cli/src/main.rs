@@ -266,7 +266,10 @@ async fn spawn_agent(
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
                 let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
-                let rtt_us = peer.and_then(|p| p.rtt).map(|r| r.as_micros() as u64).unwrap_or(0);
+                let rtt_us = peer
+                    .and_then(|p| p.selected_candidate_pair.as_ref())
+                    .and_then(|r| r.current_round_trip_time)
+                    .map(|r| r.as_micros() as u64).unwrap_or(0);
 
                 let loss_pct = stats.tracks.values()
                     .flat_map(|t| t.rx_layers.values())
