@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 pub use bytes::Bytes;
 pub use str0m;
 pub use str0m::Candidate;
@@ -12,7 +14,7 @@ pub mod media;
 
 pub struct MediaFrame {
     pub ts: MediaTime,
-    pub data: Bytes,
+    pub data: Arc<[u8]>,
     pub capture_time: Instant,
 }
 
@@ -20,7 +22,7 @@ impl From<MediaData> for MediaFrame {
     fn from(value: MediaData) -> Self {
         Self {
             ts: value.time,
-            data: value.data.into(),
+            data: value.data,
             capture_time: value.network_time.into(),
         }
     }

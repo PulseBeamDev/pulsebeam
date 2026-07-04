@@ -4,7 +4,7 @@ pub mod switcher;
 pub mod sync;
 pub mod timeline;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use pulsebeam_runtime::sync::{BufPool, PoolBuf};
 use str0m::media::{Frequency, MediaTime};
@@ -70,7 +70,7 @@ pub struct RtpPacket {
     /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Instant,
     pub is_keyframe_start: bool,
-    pub payload: Vec<u8>,
+    pub payload: Arc<[u8]>,
 }
 
 impl Default for RtpPacket {
@@ -85,7 +85,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe_start: false,
-            payload: vec![0u8; 1200],
+            payload: Arc::new([0u8; 1200]),
         }
     }
 }

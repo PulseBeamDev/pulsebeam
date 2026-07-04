@@ -10,7 +10,7 @@ use str0m::bwe::BweKind;
 use str0m::channel::ChannelConfig;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
 use str0m::net::Protocol;
-use str0m::rtp::Ssrc;
+use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded},
@@ -330,18 +330,17 @@ impl ParticipantCore {
             pkt.rtp_ts,
             pkt.playout_time
         );
-        if let Err(err) = writer.write_rtp(
+        let pkt = RtpWrite::new(
             pt,
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
             pkt.playout_time.into(),
-            pkt.marker,
-            pkt.ext_vals,
-            true,
-            pkt.payload.to_vec(),
-        ) {
-            tracing::warn!(%mid, %ssrc, "Dropping RTP for invalid rtp header: {err:?}");
-        }
+            pkt.payload,
+        )
+        .marker(pkt.marker)
+        .ext_vals(pkt.ext_vals)
+        .nackable(true);
+        writer.write_rtp(pkt);
     }
 
     fn handle_event(&mut self, event: Event) {

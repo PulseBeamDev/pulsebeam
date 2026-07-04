@@ -845,6 +845,7 @@ impl AgentActor {
                             if let Some(rid) = rid {
                                 writer = writer.rid(rid);
                             }
+
                             let _ = writer.write(pt, frame.capture_time.into(), frame.ts, frame.data);
                         } else {
                             tracing::warn!(?mid, "no writer found for mid");
