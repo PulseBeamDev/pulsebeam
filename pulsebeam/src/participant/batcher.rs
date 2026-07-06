@@ -1,5 +1,5 @@
 use pulsebeam_runtime::net;
-use std::{collections::VecDeque, io, net::SocketAddr};
+use std::{collections::VecDeque, net::SocketAddr};
 
 const MAX_GSO_SEGMENTS: usize = 8;
 const MAX_FREE_STATES: usize = 3;

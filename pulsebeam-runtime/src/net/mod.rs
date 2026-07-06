@@ -30,7 +30,7 @@ pub struct RecvPacketBatch {
     pub len: usize,
     pub transport: Transport,
 
-    offset: usize,
+    pub offset: usize,
 }
 
 impl RecvPacketBatch {

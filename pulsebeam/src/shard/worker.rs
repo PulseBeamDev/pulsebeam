@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use metrics::Unit;
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
