@@ -132,3 +132,11 @@ chore-release:
 
 unused:
 	cargo machete
+
+tune: net-tune cpu-tune system-tune
+
+cpu-tune:
+	cpupower frequency-set --max 1.8GHz
+
+system-tune:
+	sudo grubby --update-kernel=ALL --args="isolcpus=1-4 nohz_full=1-4 rcu_nocbs=1-4"
