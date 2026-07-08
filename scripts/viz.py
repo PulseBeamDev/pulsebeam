@@ -3,25 +3,25 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import re
 
-# --- Target Aesthetic Colors ---
-BG_COLOR    = "#0b0f19"  
-GRID_COLOR  = "#1e293b"  
-TEXT_MUTED  = "#94a3b8"  
-TEXT_MAIN   = "#f8fafc"  
+# --- Target Aesthetic Colors (Colorblind-Friendly Light Theme) ---
+BG_COLOR    = "#ffffff"  # Crisp White Background
+GRID_COLOR  = "#e2e8f0"  # Soft Light Gray Gridlines
+TEXT_MUTED  = "#475569"  # Cool Gray Muted Text
+TEXT_MAIN   = "#0f172a"  # Dark Slate Main Text
 
-COLOR_P9999 = "#ef4444"  # Vibrant Red for P99.99 Tail Latency
-COLOR_P50   = "#64748b"  # Slate Blue for P50
-COLOR_TX    = "#3b82f6"  # Vibrant Blue for TX Throughput
-COLOR_RX    = "#10b981"  # Emerald Green for RX Throughput
+# High-contrast, non-overlapping color choices for color blindness
+COLOR_P9999 = "#dc2626"  # Crimson Red for P99.99 Tail Latency
+COLOR_P50   = "#1e293b"  # Dark Charcoal for P50 Median
+COLOR_TX    = "#2563eb"  # Vivid Blue for TX Throughput
+COLOR_RX    = "#d97706"  # Amber/Orange for RX Throughput
 
 
 def process_data(lat_csv: str, snap_csv: str, window_secs: float, offset_ms: float, duration_ms: float, metric_col: str):
     end_ms = offset_ms + duration_ms if duration_ms else float('inf')
 
-    # ---------------------------------------------------------
-    # 1. PROCESS LATENCY (Extract timeline and delay if selected)
-    # ---------------------------------------------------------
+    # 1. PROCESS LATENCY
     lat_df = pd.read_csv(lat_csv)
     lat_df.columns = lat_df.columns.str.strip()
     
@@ -35,9 +35,7 @@ def process_data(lat_csv: str, snap_csv: str, window_secs: float, offset_ms: flo
     active_agents = lat_df.groupby("window_rel")["agent_id"].nunique().reset_index()
     active_agents.rename(columns={"agent_id": "agents"}, inplace=True)
 
-    # ---------------------------------------------------------
-    # 2. PROCESS SNAPSHOTS (Throughput and RTT tracking)
-    # ---------------------------------------------------------
+    # 2. PROCESS SNAPSHOTS
     snap_df = pd.read_csv(snap_csv)
     snap_df.columns = snap_df.columns.str.strip()
     snap_df = snap_df.sort_values(['agent_id', 'elapsed_ms'])
@@ -70,15 +68,19 @@ def process_data(lat_csv: str, snap_csv: str, window_secs: float, offset_ms: flo
     times = np.arange(0, num_bins * window_secs, window_secs)
     tput = pd.DataFrame({'window_rel': times, 'tx_mbps_raw': tx_mbps_totals, 'rx_mbps_raw': rx_mbps_totals})
     
+    if 'loss_pct' in valid_snaps.columns:
+        loss_grouped = valid_snaps.groupby('window_rel')['loss_pct'].mean().reset_index()
+        tput = pd.merge(tput, loss_grouped, on="window_rel", how="left").fillna({'loss_pct': 0.0})
+    else:
+        tput['loss_pct'] = 0.0
+
     tput = pd.merge(tput, active_agents, on="window_rel", how="left").fillna({'agents': 0})
     tput['tx_mbps'] = tput['tx_mbps_raw'].rolling(window=3, center=True, min_periods=1).median()
     tput['rx_mbps'] = tput['rx_mbps_raw'].rolling(window=3, center=True, min_periods=1).median()
     tput['mbps'] = tput['tx_mbps'] + tput['rx_mbps']
     tput = tput[tput['window_rel'] <= max_t].copy()
 
-    # ---------------------------------------------------------
-    # 3. DYNAMIC PERCENTILE COMPUTATION BASED ON SOURCE FILE
-    # ---------------------------------------------------------
+    # 3. DYNAMIC PERCENTILE COMPUTATION
     if metric_col == "delay_us":
         lat_df["metric_ms"] = lat_df["delay_us"] / 1000.0
         percentiles = lat_df.groupby("window_rel")["metric_ms"].agg(
@@ -86,7 +88,7 @@ def process_data(lat_csv: str, snap_csv: str, window_secs: float, offset_ms: flo
             p9999=lambda x: np.percentile(x, 99.99),
             pmax=lambda x: np.max(x)
         ).reset_index()
-    else:  # rtt_us from snapshots
+    else:
         valid_snaps["metric_ms"] = valid_snaps["rtt_us"] / 1000.0
         percentiles = valid_snaps.groupby("window_rel")["metric_ms"].agg(
             p50=lambda x: np.percentile(x, 50),
@@ -94,7 +96,6 @@ def process_data(lat_csv: str, snap_csv: str, window_secs: float, offset_ms: flo
             pmax=lambda x: np.max(x)
         ).reset_index()
         
-        # Ensure a continuous timeline for snapshot metrics by alignment with tput timeline
         percentiles = pd.merge(tput[['window_rel']], percentiles, on="window_rel", how="left")
         percentiles['p50'] = percentiles['p50'].ffill().bfill().fillna(0)
         percentiles['p9999'] = percentiles['p9999'].ffill().bfill().fillna(0)
@@ -103,74 +104,61 @@ def process_data(lat_csv: str, snap_csv: str, window_secs: float, offset_ms: flo
     return percentiles, tput
 
 
-def plot_benchmark(lat_csv: str, snap_csv: str, label: str, window_secs: float, offset_ms: float, duration_ms: float, metric_col: str, max_y: float = None):
+def plot_benchmark(lat_csv: str, snap_csv: str, label: str, window_secs: float, offset_ms: float, duration_ms: float, metric_col: str, output_html: str = None):
     percentiles, tput = process_data(lat_csv, snap_csv, window_secs, offset_ms, duration_ms, metric_col)
 
-    # Summary Stats calculation
     max_agents = int(tput["agents"].max())
     p50_med = percentiles["p50"].median()
     p9999_med = percentiles["p9999"].median()
     max_lat = percentiles["pmax"].max()
     tput_avg = tput["mbps"].mean()
-    tx_avg = tput["tx_mbps"].mean()
-    rx_avg = tput["rx_mbps"].mean()
     tput_max = tput["mbps"].max()
-    duration_s = int(tput["window_rel"].max())
+    loss_avg = tput["loss_pct"].mean()
 
-    metric_label = "End-to-end Latency (delay_us)" if metric_col == "delay_us" else "Round Trip Time (rtt_us)"
-
-    title_html = f"""
-    <span style="font-size: 22px; font-weight: bold; color: {TEXT_MAIN};">{label}</span><br>
-    <span style="font-size: 13px; color: {TEXT_MUTED};">
-    Peak Concurrency: {max_agents} Agents • Window: {window_secs}s • Sliced Duration: {duration_s}s (Offset: {offset_ms}ms)<br>
-    {metric_label} • Med: {p50_med:.2f} ms • P99.99: {p9999_med:.2f} ms • Max: {max_lat:.2f} ms<br>
-    Total Throughput • Avg: {tput_avg:.2f} Mbps (TX Avg: {tx_avg:.2f} Mbps • RX Avg: {rx_avg:.2f} Mbps)
-    </span>
-    """
+    metric_label = "Latency" if metric_col == "delay_us" else "RTT"
 
     fig = make_subplots(
         rows=2, cols=1, 
         shared_xaxes=True, 
-        row_heights=[0.75, 0.25],
-        vertical_spacing=0.08
+        row_heights=[0.70, 0.30],
+        vertical_spacing=0.10     
     )
 
     # 1. Target Metric: P99.99 Line
     fig.add_trace(go.Scatter(
         x=percentiles["window_rel"], y=percentiles["p9999"],
-        name=f"P99.99 {metric_col}",
-        line=dict(color=COLOR_P9999, width=1.5),
-        opacity=0.9
+        name=f"P99.99 Tail",
+        line=dict(color=COLOR_P9999, width=3.0),
+        opacity=0.95
     ), row=1, col=1)
 
     # 2. Target Metric: P50 Line
     fig.add_trace(go.Scatter(
         x=percentiles["window_rel"], y=percentiles["p50"],
-        name=f"P50 {metric_col} (Median)",
-        line=dict(color=COLOR_P50, width=1.5, dash='dot')
+        name=f"P50 Median",
+        line=dict(color=COLOR_P50, width=2.5, dash='dash')
     ), row=1, col=1)
 
-    # 3. RX Throughput Fill (Stacked Area Part 1)
+    # 3. RX Throughput Fill
     fig.add_trace(go.Scatter(
         x=tput["window_rel"], y=tput["rx_mbps"],
         name="RX Throughput",
         mode='lines',
         stackgroup='throughput',
-        line=dict(color=COLOR_RX, width=1.5),
-        fillcolor="rgba(16, 185, 129, 0.15)"
+        line=dict(color=COLOR_RX, width=2.0),
+        fillcolor="rgba(217, 119, 6, 0.15)"
     ), row=2, col=1)
 
-    # 4. TX Throughput Fill (Stacked Area Part 2)
+    # 4. TX Throughput Fill
     fig.add_trace(go.Scatter(
         x=tput["window_rel"], y=tput["tx_mbps"],
         name="TX Throughput",
         mode='lines',
         stackgroup='throughput',
-        line=dict(color=COLOR_TX, width=1.5),
-        fillcolor="rgba(59, 130, 246, 0.15)"
+        line=dict(color=COLOR_TX, width=2.0),
+        fillcolor="rgba(37, 99, 235, 0.15)"
     ), row=2, col=1)
 
-    # 5. Total Throughput Hidden Trace (Forces total value into unified hover context)
     fig.add_trace(go.Scatter(
         x=tput["window_rel"], y=tput["mbps"],
         name="Total Throughput",
@@ -179,34 +167,54 @@ def plot_benchmark(lat_csv: str, snap_csv: str, label: str, window_secs: float, 
         showlegend=False
     ), row=2, col=1)
 
+    # --- REALLOCATED LAYOUT HEIGHTS ---
+    inline_title_html = f"""
+    <span style="font-family: Inter, sans-serif; font-size: 12px; font-weight: 700; color: {TEXT_MAIN};">{label}</span>
+    <br>
+    <span style="font-family: Inter, sans-serif; font-size: 12px; color: {TEXT_MUTED}; margin-left: 4px;">
+        ({max_agents}Agents • Loss: {loss_avg:.2f}%) | <b>{metric_label}:</b> Med {p50_med:.1f}ms / P99.99 <span style="color: {COLOR_P9999}; font-weight: 600;">{p9999_med:.1f}ms</span> / Max {max_lat:.1f}ms | <b>Throughput:</b> {tput_avg:.1f}Mbps
+    </span>
+    """
+
     fig.update_layout(
-        title=dict(text=title_html, x=0.5, xanchor='center', y=0.96),
-        margin=dict(t=140, b=40, l=60, r=40),
+        title=dict(
+            text=inline_title_html,
+            x=0.01,             # Flush to the left edge
+            xanchor='left',
+            y=0.98,             # Tucked right into the upper ceiling
+            yanchor='top'
+        ),
+        margin=dict(t=55, b=50, l=70, r=30), # Reclaimed maximum space: top margin dropped down to 55px
         paper_bgcolor=BG_COLOR,
         plot_bgcolor=BG_COLOR,
-        font=dict(family="Inter, -apple-system, sans-serif", color=TEXT_MAIN),
+        font=dict(family="Inter, -apple-system, sans-serif", color=TEXT_MAIN, size=13),
         hovermode="x unified",
-        hoverlabel=dict(bgcolor="#1e293b", font_size=13, font_family="monospace"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, bgcolor="rgba(0,0,0,0)"),
+        hoverlabel=dict(bgcolor="#f8fafc", font_size=13, font_family="monospace", font_color=TEXT_MAIN, bordercolor="#e2e8f0"),
+        legend=dict(
+            orientation="h", 
+            yanchor="bottom", 
+            y=1.02, 
+            xanchor="right", 
+            x=1.0,         
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=12)
+        ),
     )
 
-    # Scale viewport limit based on explicit argument OR fallback to visible metric
-    if max_y is not None:
-        lat_max = max_y
-    else:
-        max_y_val = percentiles["p9999"].max()
-        lat_max = min(max_y_val * 1.2, 500.0) if max_y_val > 0 else 100.0
-
+    # --- AXIS LABELS AND TICK UPGRADES ---
     fig.update_yaxes(
-        title_text=f"{metric_col} [ms]", title_font=dict(color=TEXT_MUTED, size=12),
-        range=[0, lat_max],
+        title_text=f"{metric_col} [ms]", 
+        title_font=dict(color=TEXT_MUTED, size=14, family="Inter, sans-serif"),
+        tickfont=dict(size=13), 
         showgrid=True, gridwidth=1, gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR,
         showspikes=True, spikemode="across", spikethickness=1, spikedash="dash", spikecolor=TEXT_MUTED,
         row=1, col=1
     )
     
     fig.update_yaxes(
-        title_text="Traffic [Mbps]", title_font=dict(color=TEXT_MUTED, size=12),
+        title_text="Traffic [Mbps]", 
+        title_font=dict(color=TEXT_MUTED, size=14, family="Inter, sans-serif"),
+        tickfont=dict(size=13), 
         range=[0, tput_max * 1.2],
         showgrid=True, gridwidth=1, gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR,
         showspikes=True, spikemode="across", spikethickness=1, spikedash="dash", spikecolor=TEXT_MUTED,
@@ -214,18 +222,24 @@ def plot_benchmark(lat_csv: str, snap_csv: str, label: str, window_secs: float, 
     )
 
     fig.update_xaxes(
+        tickfont=dict(size=13),
         showgrid=True, gridwidth=1, gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR,
         showspikes=True, spikemode="across", spikethickness=1, spikedash="dash", spikecolor=TEXT_MUTED,
     )
     
     fig.update_xaxes(
-        title_text="Time since offset [s]", title_font=dict(color=TEXT_MUTED, size=12),
-        rangeslider=dict(visible=False),  # Fully removes the range slider window container
+        title_text="Time since offset [s]", 
+        title_font=dict(color=TEXT_MUTED, size=14, family="Inter, sans-serif"),
+        rangeslider=dict(visible=False),
         row=2, col=1
     )
 
-    print(f"✅ Loaded window instantly. Plotting {max_agents} peak concurrent agents looking at {metric_col} (P50 & P99.99)...")
-    fig.show()
+    if not output_html:
+        clean_label = re.sub(r'[^a-zA-Z0-9_\-]', '_', label.lower().strip())
+        output_html = f"benchmark_{clean_label}.html"
+
+    print(f"✅ Data processed. Saving interactive HTML report to: {output_html}")
+    fig.write_html(output_html, include_plotlyjs="cdn")
 
 
 if __name__ == "__main__":
@@ -236,10 +250,8 @@ if __name__ == "__main__":
     parser.add_argument("--window", type=float, default=1.0)
     parser.add_argument("--offset-ms", type=float, required=True)
     parser.add_argument("--duration-ms", type=float, default=None)
-    parser.add_argument("--metric", choices=["delay_us", "rtt_us"], default="delay_us", 
-                        help="Choose target metric column (delay_us from latency, rtt_us from snapshots)")
-    parser.add_argument("--max-y", type=float, default=None,
-                        help="Manually cap the maximum Y-axis limit for the latency/RTT plot (in ms)")
+    parser.add_argument("--metric", choices=["delay_us", "rtt_us"], default="delay_us")
+    parser.add_argument("--output", type=str, default=None)
     
     args = parser.parse_args()
     plot_benchmark(
@@ -250,5 +262,5 @@ if __name__ == "__main__":
         args.offset_ms, 
         args.duration_ms, 
         args.metric,
-        max_y=args.max_y
+        output_html=args.output
     )
