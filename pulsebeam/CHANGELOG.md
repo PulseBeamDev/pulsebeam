@@ -1,3 +1,12 @@
+## [unreleased]
+
+* Increase pacer headroom to 1.5
+* Bump str0m to 0.21.0
+* Centralized str0m polling to always happen after mutation
+* Revert to metrics-exporter-prometheus
+* Remove metrics-rs from data plane (for now), <https://github.com/PulseBeamDev/pulsebeam/issues/154>
+* Added core pinning and RT_FIFO 50 when allowed
+
 ## [pulsebeam-v0.4.4] - 2026-05-19
 
 * More stable and tighter stream bitrate estimate
