@@ -127,8 +127,9 @@ impl SimClient {
             _ = tokio::time::sleep(timeout) => {
                 let stats = self.ctx.driver.stats();
                 anyhow::bail!(
-                    "Client {} timed out. Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
+                    "Client {} timed out ({:?}). Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
                     self.ctx.ip,
+                    timeout,
                     stats,
                     self.ctx.discovered_tracks,
                     self.ctx.remote_tracks
@@ -136,6 +137,14 @@ impl SimClient {
             }
             result = self.drive_until_cancelled(token, predicate) => result
         }
+    }
+
+    pub async fn drive_with<F>(&mut self, predicate: F) -> anyhow::Result<()>
+    where
+        F: FnMut(&ClientContext) -> bool,
+    {
+        self.drive_until_cancelled(CancellationToken::new(), predicate)
+            .await
     }
 
     pub async fn drive_until_cancelled<F>(
@@ -200,9 +209,9 @@ pub fn create_http_client() -> Box<dyn AsyncHttpClient> {
 
 pub fn create_h264_looper_for_rid(rid: Option<&str>) -> H264Looper {
     let data = match rid {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL_VBR,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF_VBR,
-        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_VBR,
+        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
+        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
+        Some("q") | _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
     };
     H264Looper::new(data, 30)
 }

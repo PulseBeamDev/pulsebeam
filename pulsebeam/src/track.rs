@@ -295,6 +295,31 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 }
 
 /// Construct a new video track sender and its per-layer descriptors.
+///
+/// # Arguments
+///
+/// * `mid` - The Media Identifier associated with this video stream.
+/// * `meta` - Metadata describing the track. `meta.kind` **must** be `MediaKind::Video`.
+/// * `layers` - A vector of configurations defining the simulcast layers.
+///
+/// # Layer Index Mapping Behavior
+///
+/// This constructor assigns bitrates and `LayerQuality` profiles positionally based on
+/// the insertion order of the `layers` parameter:
+///
+/// | Vector Index | Layer Quality | Target Bitrate | Typical Target RID |
+/// | :--- | :--- | :--- | :--- |
+/// | `0` | `LayerQuality::High` | 1,250,000 bits/s | `"f"` (Full) |
+/// | `1` | `LayerQuality::Medium` | 400,000 bits/s | `"h"` (Half) |
+/// | `2+` or Empty | `LayerQuality::Low` | 150,000 bits/s | `"q"` (Quarter) |
+///
+/// ### Sorting Post-Processing
+/// After initialization, both the internal `UpstreamTrack` and `Track` layers are
+/// **sorted in descending order** by their `LayerQuality` enum fields (`High -> Medium -> Low`).
+///
+/// # Panics
+///
+/// In debug builds, this function will panic if `meta.kind` is not `MediaKind::Video`.
 pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (UpstreamTrack, Track) {
     debug_assert_eq!(meta.kind, MediaKind::Video);
     let simulcast_rids: Vec<Option<Rid>> = if layers.is_empty() {

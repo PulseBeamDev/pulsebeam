@@ -137,7 +137,6 @@ fn slots_prioritization_test() -> turmoil::Result {
     common::setup_tracing();
 
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))
         .rng_seed(0)
         .build();
@@ -210,12 +209,11 @@ fn slots_prioritization_test() -> turmoil::Result {
             .await?;
 
         client
-            .drive_until(Duration::from_secs(40), |ctx| {
-                ctx.discovered_tracks.len() >= 2
-            })
+            .drive_with(|ctx| ctx.discovered_tracks.len() >= 2)
             .await?;
 
-        let tracks: Vec<String> = client.ctx.discovered_tracks.iter().cloned().collect();
+        let mut tracks: Vec<String> = client.ctx.discovered_tracks.iter().cloned().collect();
+        tracks.sort();
         let track1 = &tracks[0];
         let track2 = &tracks[1];
 
@@ -233,7 +231,7 @@ fn slots_prioritization_test() -> turmoil::Result {
 
         // Wait for flow on at least one received track
         client
-            .drive_until(Duration::from_secs(60), |ctx| {
+            .drive_until(Duration::from_secs(10), |ctx| {
                 ctx.driver
                     .stats()
                     .tracks
@@ -245,6 +243,6 @@ fn slots_prioritization_test() -> turmoil::Result {
         Ok(())
     });
 
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(120))?;
+    sim.run()?;
     Ok(())
 }

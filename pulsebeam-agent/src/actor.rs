@@ -284,19 +284,14 @@ impl LayerController {
 
     fn register(&mut self, mid: Mid, rid: Option<Rid>, notifier: KeyframeNotifier) {
         let key = (mid, rid);
-        // q (rank 0) and non-simulcast tracks start active immediately.
-        // h and f start paused; debt-free ticks resume them once BWE confirms budget.
-        let paused = rid.is_some() && rid_quality_rank(rid) > 0;
         self.order.push(key);
-        // Sort so index 0 = highest priority (q), last = lowest priority (f).
-        self.order.sort_by_key(|(_, rid)| rid_quality_rank(*rid));
         // Seed the bitrate estimator so the upgrade gate sees a realistic cost
         // before the first 500 ms window of real measurements completes.
         self.states.insert(
             key,
             LayerState {
                 bps: layer_seed_bps(rid),
-                paused,
+                paused: true,
                 estimate: BitrateEstimate::new_with_seed(layer_seed_bps(rid)),
             },
         );
@@ -425,10 +420,11 @@ impl LayerController {
             }
         } else if debt <= 0.0 {
             // No debt — try to resume the highest-priority paused layer if it fits.
-            // order is q→h→f so the first paused entry is the most important to restore.
+            // order is f->h->q so the first paused entry is the most important to restore.
             if let Some(key) = self
                 .order
                 .iter()
+                .rev()
                 .find(|k| self.states.get(*k).is_some_and(|s| s.paused))
                 .cloned()
             {
@@ -576,6 +572,24 @@ impl AgentBuilder {
         }
     }
 
+    /// Adds a media track to the client configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - The type of media (`MediaKind::Video` or `MediaKind::Audio`).
+    /// * `direction` - The directionality of the transceiver (e.g., `SendOnly`).
+    /// * `simulcast_layers` - An optional vector defining the active simulcast configurations.
+    ///
+    /// ### Simulcast Layer Ordering Requirement
+    ///
+    /// When passing a `Vec<SimulcastLayer>`, the layers **must be ordered by descending quality/resolution**
+    ///
+    /// * **Index 0:** Maps to `LayerQuality::High` (1.25 Mbps) -> Usually RID `"f"`
+    /// * **Index 1:** Maps to `LayerQuality::Medium` (400 kbps) -> Usually RID `"h"`
+    /// * **Index 2+:** Maps to `LayerQuality::Low` (150 kbps) -> Usually RID `"q"`
+    ///
+    /// If the layers are inserted in the wrong sequence (e.g. low-to-high), the bitrate targets
+    /// will be inversely bound to your RIDs, breaking downstream bandwidth estimation (BWE) profiles.
     pub fn with_track(
         mut self,
         kind: MediaKind,
