@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.5] - 2026-07-09
 
 * Increase pacer headroom to 1.5
 * Bump str0m to 0.21.0
