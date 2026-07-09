@@ -456,7 +456,12 @@ pub fn tune_current_control_thread() {
     // runs in idle gaps between RTP bursts, and retains enough weight to beat OS daemons.
     // SCHED_BATCH still guarantees this thread will eventually run.
     let current_thread_id = thread_native_id();
-    let policy = ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch);
+    let policy = if cfg!(target_os = "linux") {
+        ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch)
+    } else {
+        ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Other)
+    };
+
     let result = thread_priority::set_thread_priority_and_policy(
         current_thread_id,
         ThreadPriority::Min,
