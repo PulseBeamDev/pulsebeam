@@ -1567,10 +1567,10 @@ mod tests {
         let (notifier_q, mut receiver_q) = KeyframeNotifier::pair();
         let (notifier_h, mut receiver_h) = KeyframeNotifier::pair();
 
-        ctrl.register(mid, rid_q, notifier_q);
         ctrl.register(mid, rid_h, notifier_h);
+        ctrl.register(mid, rid_q, notifier_q);
 
-        assert!(!ctrl.is_paused(mid, rid_q));
+        assert!(ctrl.is_paused(mid, rid_q));
         assert!(ctrl.is_paused(mid, rid_h));
 
         ctrl.update_available(Bitrate::kbps(10));
