@@ -884,7 +884,7 @@ impl AllocationEngine {
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
-    use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId};
+    use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId, TrackKind};
     use crate::participant::event::{EventQueue, ParticipantControlEvent, ParticipantEvent};
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
@@ -1004,7 +1004,7 @@ mod assignment_tests {
         allocator.rebalance();
 
         let missing_track_id = ParticipantId::new(&mut test_rng())
-            .derive_track_id(MediaKind::Video, &Mid::from("missing"));
+            .derive_track_id(TrackKind::Video, &Mid::from("missing"));
         let mut intents = HashMap::new();
         intents.insert(
             Mid::from("s0"),

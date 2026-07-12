@@ -8,7 +8,7 @@ use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
 use tokio::time::Instant;
 
-use crate::entity::TrackId;
+use crate::entity::{TrackId, TrackKind};
 use crate::{
     entity::{ParticipantId, RoomId},
     id::ShardId,
@@ -23,14 +23,13 @@ use crate::{
     shard::{demux::Demuxer, timer::TimerWheel},
     track::StreamId,
 };
-use str0m::media::MediaKind;
 
 use super::worker::{ClusterCommand, CrossShardEvent, ShardCommand, ShardEvent};
 
 const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 
 pub(super) struct Routing {
-    pub(super) kind: MediaKind,
+    pub(super) kind: TrackKind,
     pub(super) subscribers: IndexSet<ParticipantId>,
     pub(super) remote_shards: IndexSet<ShardId>,
 }
@@ -200,7 +199,7 @@ impl ShardCore {
 
     pub(crate) fn flush_rtp_events(&mut self, router: &impl CrossShardSend) {
         while let Some(ev) = self.rtp_events.pop_front() {
-            if ev.stream_id.0.kind().is_audio() {
+            if ev.stream_id.0.kind() == TrackKind::Audio {
                 handle_audio_rtp(
                     ev,
                     &mut self.rooms,
@@ -386,7 +385,7 @@ impl ShardCore {
                 track,
             } => {
                 let routing = self.routing.entry(track.id).or_insert_with(|| Routing {
-                    kind: track.kind,
+                    kind: track.id.kind(),
                     subscribers: IndexSet::new(),
                     remote_shards: IndexSet::new(),
                 });
@@ -625,7 +624,7 @@ pub(super) fn handle_rtp(
 ) -> Option<()> {
     let route = routing.get(&stream_id.0)?;
     match route.kind {
-        MediaKind::Video => {
+        TrackKind::Video => {
             for participant_id in &route.subscribers {
                 let Some(sub) = participants.get_mut(participant_id) else {
                     continue;
@@ -643,7 +642,8 @@ pub(super) fn handle_rtp(
                 );
             }
         }
-        MediaKind::Audio => {}
+        TrackKind::Audio => {}
+        TrackKind::Data => {}
     }
     Some(())
 }
@@ -726,7 +726,7 @@ pub(super) fn handle_participant_topology(
     match ev {
         ParticipantTopologyEvent::TrackSubscribed { track, subscriber } => {
             let entry = routing.entry(track.id).or_insert_with(|| Routing {
-                kind: track.kind,
+                kind: track.id.kind(),
                 subscribers: IndexSet::with_capacity(256),
                 remote_shards: IndexSet::new(),
             });
@@ -780,7 +780,7 @@ mod tests {
         participant::event::ParticipantTopologyEvent,
         track::{GlobalKeyframeRequest, TrackMeta},
     };
-    use str0m::media::{KeyframeRequestKind, MediaKind};
+    use str0m::media::KeyframeRequestKind;
 
     use super::*;
 
@@ -836,23 +836,22 @@ mod tests {
     }
 
     fn video_stream(p: ParticipantId) -> StreamId {
-        (p.derive_track_id(MediaKind::Video, "v"), None)
+        (p.derive_track_id(TrackKind::Video, "v"), None)
     }
 
     fn audio_stream(p: ParticipantId) -> StreamId {
-        (p.derive_track_id(MediaKind::Audio, "a"), None)
+        (p.derive_track_id(TrackKind::Audio, "a"), None)
     }
 
     fn video_track(origin: ParticipantId, shard_id: usize) -> TrackMeta {
         TrackMeta {
             shard_id: ShardId::new(shard_id),
-            id: origin.derive_track_id(MediaKind::Video, "v"),
+            id: origin.derive_track_id(TrackKind::Video, "v"),
             origin,
-            kind: MediaKind::Video,
         }
     }
 
-    fn empty_routing(kind: MediaKind) -> Routing {
+    fn empty_routing(kind: TrackKind) -> Routing {
         Routing {
             kind,
             subscribers: IndexSet::new(),
@@ -1046,7 +1045,7 @@ mod tests {
         let router = TestRouter::new(0, 3);
         let stream = video_stream(pid());
         let mut routing: HashMap<TrackId, Routing> = HashMap::default();
-        let mut route = empty_routing(MediaKind::Video);
+        let mut route = empty_routing(TrackKind::Video);
         route.remote_shards.insert(ShardId::new(1));
         route.remote_shards.insert(ShardId::new(2));
         routing.insert(stream.0, route);
@@ -1083,7 +1082,7 @@ mod tests {
         let router = TestRouter::new(0, 3);
         let stream = video_stream(pid());
         let mut routing: HashMap<TrackId, Routing> = HashMap::default();
-        routing.insert(stream.0, empty_routing(MediaKind::Video)); // no remote_shards
+        routing.insert(stream.0, empty_routing(TrackKind::Video)); // no remote_shards
 
         handle_rtp(
             stream,
@@ -1207,7 +1206,7 @@ mod tests {
         core.routing.insert(
             track.id,
             Routing {
-                kind: MediaKind::Video,
+                kind: TrackKind::Video,
                 subscribers: {
                     let mut s = IndexSet::new();
                     s.insert(local_sub);
@@ -1607,9 +1606,8 @@ mod tests {
         use crate::track::{LayerQuality, Track, TrackLayer, TrackMeta};
         let meta = TrackMeta {
             shard_id,
-            id: origin.derive_track_id(MediaKind::Video, "v"),
+            id: origin.derive_track_id(TrackKind::Video, "v"),
             origin,
-            kind: MediaKind::Video,
         };
         let layer = TrackLayer {
             meta: meta.clone(),
@@ -1997,7 +1995,7 @@ mod tests {
         core.input_dirty.clear();
 
         // B never received A's track — command should be a no-op.
-        let unknown_track_id = a.derive_track_id(MediaKind::Video, "v");
+        let unknown_track_id = a.derive_track_id(TrackKind::Video, "v");
         core.on_command(
             ShardCommand::Cluster(ClusterCommand::UnpublishTracks {
                 room_id: r,

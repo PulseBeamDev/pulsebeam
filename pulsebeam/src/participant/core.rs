@@ -514,12 +514,13 @@ impl ParticipantCore {
     fn handle_media_added(&mut self, media: MediaAdded, _events: &mut EventQueue) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id = self.participant_id.derive_track_id(media.kind, &media.mid);
+                let track_id = self
+                    .participant_id
+                    .derive_track_id(media.kind.into(), &media.mid);
                 let track_meta = track::TrackMeta {
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
-                    kind: media.kind,
                 };
                 match media.kind {
                     MediaKind::Audio => {

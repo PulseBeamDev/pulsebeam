@@ -209,11 +209,10 @@ impl ControllerCore {
 mod tests {
     use super::*;
     use crate::{
-        entity::{ExternalRoomId, ParticipantId, RoomId},
+        entity::{ExternalRoomId, ParticipantId, RoomId, TrackKind},
         shard::worker::ClusterCommand,
         track::TrackMeta,
     };
-    use str0m::media::MediaKind;
 
     fn pid(seed: u8) -> ParticipantId {
         ParticipantId::from_bytes([seed; 16])
@@ -227,9 +226,8 @@ mod tests {
     fn track_meta(origin: ParticipantId, shard_id: ShardId) -> TrackMeta {
         TrackMeta {
             shard_id,
-            id: origin.derive_track_id(MediaKind::Video, "v"),
+            id: origin.derive_track_id(TrackKind::Video, "v"),
             origin,
-            kind: MediaKind::Video,
         }
     }
 
@@ -308,9 +306,8 @@ mod tests {
         let track = crate::track::Track {
             meta: TrackMeta {
                 shard_id: ShardId::new(0),
-                id: publisher.derive_track_id(MediaKind::Audio, "a"),
+                id: publisher.derive_track_id(TrackKind::Audio, "a"),
                 origin: publisher,
-                kind: MediaKind::Audio,
             },
             layers: Vec::new(),
         };
@@ -352,13 +349,12 @@ mod tests {
         core.registry
             .add_participant(subscriber_b, room, ShardId::new(2));
 
-        let track_id = publisher.derive_track_id(MediaKind::Audio, "a");
+        let track_id = publisher.derive_track_id(TrackKind::Audio, "a");
         let track = crate::track::Track {
             meta: TrackMeta {
                 shard_id: ShardId::new(0),
                 id: track_id,
                 origin: publisher,
-                kind: MediaKind::Audio,
             },
             layers: Vec::new(),
         };
@@ -450,9 +446,8 @@ mod tests {
         let track = crate::track::Track {
             meta: TrackMeta {
                 shard_id: ShardId::new(0),
-                id: publisher.derive_track_id(MediaKind::Audio, "a"),
+                id: publisher.derive_track_id(TrackKind::Audio, "a"),
                 origin: publisher,
-                kind: MediaKind::Audio,
             },
             layers: Vec::new(),
         };

@@ -226,10 +226,9 @@ mod tests {
     use str0m::rtp::ExtensionValues;
     use tokio::time::Instant;
 
-    use crate::entity::ParticipantId;
+    use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp::RtpPacket;
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
-    use str0m::media::MediaKind;
 
     const TICK_MS: u64 = 20;
 
@@ -246,7 +245,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         (
             ParticipantId::new(&mut seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed)))
-                .derive_track_id(MediaKind::Audio, "test"),
+                .derive_track_id(TrackKind::Audio, "test"),
             None,
         )
     }

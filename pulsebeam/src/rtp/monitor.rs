@@ -3,9 +3,10 @@ use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::time::Duration;
-use str0m::{bwe::Bitrate, media::MediaKind};
+use str0m::bwe::Bitrate;
 use tokio::time::Instant;
 
+use crate::entity::TrackKind;
 use crate::rtp::RtpPacket;
 
 const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -131,7 +132,7 @@ pub struct StreamMonitor {
     shared_state: StreamState,
 
     stream_id: String,
-    kind: MediaKind, // distinguish Audio/Video for scoring
+    kind: TrackKind, // distinguish Audio/Video for scoring
 
     window_start_ts: Instant,
     window_start_seq: u64,
@@ -146,11 +147,11 @@ pub struct StreamMonitor {
 }
 
 impl StreamMonitor {
-    pub fn new(kind: MediaKind, stream_id: String, shared_state: StreamState) -> Self {
+    pub fn new(kind: TrackKind, stream_id: String, shared_state: StreamState) -> Self {
         let now = Instant::now();
         let audio_monitor = match kind {
-            MediaKind::Audio => Some(AudioMonitor::new()),
-            MediaKind::Video => None,
+            TrackKind::Audio => Some(AudioMonitor::new()),
+            TrackKind::Video | TrackKind::Data => None,
         };
         Self {
             stream_id,
@@ -298,14 +299,14 @@ impl StreamMonitor {
     fn evaluate_quality_hysteresis(&mut self, interval_loss: f64, expected: u64, actual: u64) {
         // Step C: Evaluate Quality Hysteresis
         let evaluated_quality = match (self.kind, self.current_quality) {
-            (MediaKind::Video, StreamQuality::Bad) => {
+            (TrackKind::Video, StreamQuality::Bad) => {
                 if self.smoothed_loss_ratio <= 0.025 {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Bad
                 }
             }
-            (MediaKind::Video, StreamQuality::Good) => {
+            (TrackKind::Video, StreamQuality::Good) => {
                 if self.smoothed_loss_ratio >= 0.05 {
                     StreamQuality::Bad
                 } else if self.smoothed_loss_ratio <= 0.005 {
@@ -314,7 +315,7 @@ impl StreamMonitor {
                     StreamQuality::Good
                 }
             }
-            (MediaKind::Video, StreamQuality::Excellent) => {
+            (TrackKind::Video, StreamQuality::Excellent) => {
                 if self.smoothed_loss_ratio >= 0.05 {
                     StreamQuality::Bad
                 } else if self.smoothed_loss_ratio >= 0.015 {
@@ -323,14 +324,14 @@ impl StreamMonitor {
                     StreamQuality::Excellent
                 }
             }
-            (MediaKind::Audio, StreamQuality::Bad) => {
+            (TrackKind::Audio, StreamQuality::Bad) => {
                 if self.smoothed_loss_ratio <= 0.06 {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Bad
                 }
             }
-            (MediaKind::Audio, StreamQuality::Good) => {
+            (TrackKind::Audio, StreamQuality::Good) => {
                 if self.smoothed_loss_ratio >= 0.10 {
                     StreamQuality::Bad
                 } else if self.smoothed_loss_ratio <= 0.02 {
@@ -339,7 +340,7 @@ impl StreamMonitor {
                     StreamQuality::Good
                 }
             }
-            (MediaKind::Audio, StreamQuality::Excellent) => {
+            (TrackKind::Audio, StreamQuality::Excellent) => {
                 if self.smoothed_loss_ratio >= 0.10 {
                     StreamQuality::Bad
                 } else if self.smoothed_loss_ratio >= 0.06 {
@@ -348,6 +349,7 @@ impl StreamMonitor {
                     StreamQuality::Excellent
                 }
             }
+            (_, _) => todo!("data track stream quality"),
         };
 
         let new_quality = evaluated_quality;
@@ -609,7 +611,7 @@ impl AudioMonitor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use more_asserts::{assert_ge, assert_gt, assert_le};
+    use more_asserts::{assert_ge, assert_le};
     use pulsebeam_testdata;
     use std::time::Duration;
     use str0m::media::{Frequency, MediaTime};
@@ -628,7 +630,7 @@ mod test {
     #[test]
     fn stream_monitor_fast_pause_marks_inactive_and_bad() {
         let shared = StreamState::new(false, 123_000);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "v0".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v0".into(), shared.clone());
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
@@ -646,7 +648,7 @@ mod test {
     #[test]
     fn stream_monitor_dead_timeout_resets_metrics() {
         let shared = StreamState::new(false, 123_000);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "v1".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v1".into(), shared.clone());
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
@@ -670,7 +672,7 @@ mod test {
     #[test]
     fn stream_monitor_ewma_is_fast_drop_slow_recover() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "v2".into(), shared);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v2".into(), shared);
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
@@ -692,7 +694,7 @@ mod test {
     #[test]
     fn stream_monitor_hysteresis_prevents_flop() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "v4".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v4".into(), shared.clone());
         let now = Instant::now();
 
         // Drive quality Bad: 9 gaps out of 10 expected (loss=0.8, smoothed=0.4 >= 0.05)
@@ -748,7 +750,7 @@ mod test {
         // bring smoothed_loss_ratio below the Bad→Good threshold (2.5% for video).
         // The EWMA's natural time-to-decay is the "consecutive windows" guard.
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "v5".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v5".into(), shared.clone());
         let now = Instant::now();
 
         // Drive Bad: seq 1 and 11 in one window → expected=10, actual=2, loss=80%
@@ -793,7 +795,7 @@ mod test {
     #[test]
     fn stream_monitor_downgrade_stays_immediate() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "v6".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "v6".into(), shared.clone());
         let now = Instant::now();
 
         monitor.current_quality = StreamQuality::Excellent;
@@ -814,7 +816,7 @@ mod test {
         let now = Instant::now();
 
         let audio_shared = StreamState::new(false, 0);
-        let mut audio = StreamMonitor::new(MediaKind::Audio, "a0".into(), audio_shared.clone());
+        let mut audio = StreamMonitor::new(TrackKind::Audio, "a0".into(), audio_shared.clone());
         audio.process_packet(&packet(1, now));
         audio.process_packet(&packet(2, now + Duration::from_millis(1)));
         audio.poll(now + Duration::from_millis(600), false);
@@ -832,7 +834,7 @@ mod test {
         assert_eq!(audio_shared.quality(), StreamQuality::Bad);
 
         let video_shared = StreamState::new(false, 0);
-        let mut video = StreamMonitor::new(MediaKind::Video, "v3".into(), video_shared.clone());
+        let mut video = StreamMonitor::new(TrackKind::Video, "v3".into(), video_shared.clone());
         video.process_packet(&packet(1, now));
         video.process_packet(&packet(2, now + Duration::from_millis(1)));
         video.poll(now + Duration::from_millis(600), false);
@@ -937,7 +939,7 @@ mod test {
     #[test]
     fn fiber_clean_network_reaches_and_stays_excellent() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "fiber".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "fiber".into(), shared.clone());
         let now = Instant::now();
 
         // 10 packets per 500-ms window; seq advances by 10 each window.
@@ -979,7 +981,7 @@ mod test {
     #[test]
     fn wan_low_loss_stays_good() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "wan".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "wan".into(), shared.clone());
         let now = Instant::now();
 
         // 50 packets per window; skip 1 seq in the middle → ~2% loss.
@@ -1014,7 +1016,7 @@ mod test {
     #[test]
     fn cross_region_high_loss_detects_bad_then_recovers() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "xr".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "xr".into(), shared.clone());
         let now = Instant::now();
 
         // 10 packets per window; always drop packet at position 5 → ~10% loss.
@@ -1064,7 +1066,7 @@ mod test {
     #[test]
     fn vbr_idle_window_does_not_change_quality() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "vbr".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "vbr".into(), shared.clone());
         let now = Instant::now();
 
         // Reach Excellent with 6 clean windows.
@@ -1111,7 +1113,7 @@ mod test {
     #[test]
     fn no_phantom_loss_on_simulcast_resume() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "sr".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "sr".into(), shared.clone());
         let now = Instant::now();
 
         // Establish stream at seq 1–10.
@@ -1148,7 +1150,7 @@ mod test {
     #[test]
     fn no_oscillation_under_alternating_loss() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "osc".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared.clone());
         let now = Instant::now();
 
         // First drive quality to Bad with a high-loss window.
@@ -1206,7 +1208,7 @@ mod test {
     #[test]
     fn publisher_bw_limit_fast_detection() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "high".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
         let now = Instant::now();
         // is_any_sibling_active=true because mid and low layers are healthy.
         let siblings = true;
@@ -1261,7 +1263,7 @@ mod test {
     #[test]
     fn publisher_oscillating_layer_stays_bad() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(MediaKind::Video, "osc".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared.clone());
         let now = Instant::now();
 
         let mut seq = 1u64;

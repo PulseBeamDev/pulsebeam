@@ -1,15 +1,15 @@
 use std::fmt::{Debug, Display};
 use std::time::Duration;
 
-use crate::entity::ParticipantId;
 use crate::entity::TrackId;
+use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamState},
     sync::Synchronizer,
 };
-use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SimulcastLayer};
+use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::RtpWrite;
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
@@ -112,7 +112,6 @@ pub struct TrackMeta {
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
-    pub kind: MediaKind,
 }
 
 #[derive(Debug)]
@@ -269,11 +268,11 @@ impl Display for TrackLayer {
 
 /// Construct a new audio track sender and its corresponding layer descriptor.
 pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
-    debug_assert_eq!(meta.kind, MediaKind::Audio);
+    debug_assert_eq!(meta.id.kind(), TrackKind::Audio);
     let bitrate = 64_000;
     let stream_state = StreamState::new(true, bitrate);
     let stream_id = format!("{}:_", meta.id);
-    let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
+    let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
 
     let sender = UpstreamTrack {
         meta: meta.clone(),
@@ -299,7 +298,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 /// # Arguments
 ///
 /// * `mid` - The Media Identifier associated with this video stream.
-/// * `meta` - Metadata describing the track. `meta.kind` **must** be `MediaKind::Video`.
+/// * `meta` - Metadata describing the track. `meta.kind` **must** be `Video`.
 /// * `layers` - A vector of configurations defining the simulcast layers.
 ///
 /// # Layer Index Mapping Behavior
@@ -316,12 +315,8 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 /// ### Sorting Post-Processing
 /// After initialization, both the internal `UpstreamTrack` and `Track` layers are
 /// **sorted in descending order** by their `LayerQuality` enum fields (`High -> Medium -> Low`).
-///
-/// # Panics
-///
-/// In debug builds, this function will panic if `meta.kind` is not `MediaKind::Video`.
 pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (UpstreamTrack, Track) {
-    debug_assert_eq!(meta.kind, MediaKind::Video);
+    debug_assert_eq!(meta.id.kind(), TrackKind::Video);
     let simulcast_rids: Vec<Option<Rid>> = if layers.is_empty() {
         vec![None]
     } else {
@@ -341,7 +336,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
 
         let stream_state = StreamState::new(true, bitrate);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
-        let monitor = StreamMonitor::new(meta.kind, stream_id, stream_state.clone());
+        let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
 
         senders.push(UpstreamTrackLayer {
             mid,
@@ -384,23 +379,21 @@ pub mod test_utils {
         mid: Mid,
         layers: Vec<SimulcastLayer>,
     ) -> (UpstreamTrack, Track) {
-        let track_id = participant_id.derive_track_id(MediaKind::Video, &mid);
+        let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
-            kind: MediaKind::Video,
         };
         crate::track::new_video(mid, meta, layers)
     }
 
     pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
-        let track_id = participant_id.derive_track_id(MediaKind::Audio, &mid);
+        let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
-            kind: MediaKind::Audio,
         };
         crate::track::new_audio(mid, meta)
     }

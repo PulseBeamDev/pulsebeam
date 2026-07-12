@@ -1,8 +1,12 @@
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
-use crate::{entity::TrackId, rtp::RtpPacket, track::UpstreamTrack};
-use str0m::media::{MediaKind, Mid};
+use crate::{
+    entity::{TrackId, TrackKind},
+    rtp::RtpPacket,
+    track::UpstreamTrack,
+};
+use str0m::media::Mid;
 
 const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 2;
 
@@ -37,29 +41,30 @@ impl UpstreamAllocator {
             return false;
         }
 
-        match track.meta.kind {
-            MediaKind::Video => {
+        match track.meta.id.kind() {
+            TrackKind::Video => {
                 let video_count = self
                     .published_tracks
                     .iter()
-                    .filter(|s| s.track.meta.kind == MediaKind::Video)
+                    .filter(|s| s.track.meta.id.kind() == TrackKind::Video)
                     .count();
 
                 if video_count >= MAX_UPSTREAM_SLOT_PER_TYPE {
                     return false;
                 }
             }
-            MediaKind::Audio => {
+            TrackKind::Audio => {
                 let audio_count = self
                     .published_tracks
                     .iter()
-                    .filter(|s| s.track.meta.kind == MediaKind::Audio)
+                    .filter(|s| s.track.meta.id.kind() == TrackKind::Audio)
                     .count();
 
                 if audio_count >= MAX_UPSTREAM_SLOT_PER_TYPE {
                     return false;
                 }
             }
+            TrackKind::Data => todo!("add upstream data track"),
         }
 
         let slot = UpstreamSlot { mid, track };
@@ -100,7 +105,7 @@ impl UpstreamAllocator {
     pub fn audio_track_ids(&self) -> impl Iterator<Item = TrackId> + '_ {
         self.published_tracks
             .iter()
-            .filter(|s| s.track.meta.kind == MediaKind::Audio)
+            .filter(|s| s.track.meta.id.kind() == TrackKind::Audio)
             .map(|s| s.track.meta.id)
     }
 

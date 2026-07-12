@@ -3,6 +3,7 @@ mod video;
 
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
+use crate::entity::TrackKind;
 use crate::id::AudioSelectorSlotId;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
@@ -59,7 +60,7 @@ impl DownstreamAllocator {
     }
 
     pub fn add_track(&mut self, track: Track) {
-        if track.meta.kind.is_video() {
+        if track.meta.id.kind() == TrackKind::Video {
             self.video.add_track(track);
             self.dirty_allocation = true;
         }
