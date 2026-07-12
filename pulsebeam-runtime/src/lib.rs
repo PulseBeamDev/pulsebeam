@@ -1,6 +1,3 @@
-#[macro_use]
-pub mod macros;
-pub mod actor;
 pub mod collections;
 pub mod mailbox;
 pub mod net;
@@ -10,7 +7,3 @@ pub mod rt;
 pub mod sync;
 pub mod system;
 pub mod testing;
-pub mod unsync;
-
-#[cfg(test)]
-mod tests;

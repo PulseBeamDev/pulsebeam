@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn try_send_fails_when_full() {
         // Create a mailbox with a buffer of 1
-        let (mut sender, _mailbox) = mailbox::new::<i32>(1);
+        let (sender, _mailbox) = mailbox::new::<i32>(1);
 
         // The first send succeeds and fills the buffer
         sender.try_send(1).unwrap();

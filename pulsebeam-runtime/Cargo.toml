@@ -11,10 +11,6 @@ publish = false
 
 [lib]
 
-[[bench]]
-harness = false
-name = "sync"
-
 [dependencies]
 async-channel = "2.5.0"
 backtrace = "0.3.76"
@@ -28,7 +24,6 @@ futures = "0.3.32"
 futures-lite = { workspace = true }
 libc = "0.2.186"
 local-event = "0.1.2"
-loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true }
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 once_cell = "1.21.4"
@@ -52,11 +47,9 @@ async-stream = "0.3.6"
 criterion = { version = "0.8.2", features = ["async", "async_tokio"] }
 futures-concurrency = "7.7.1"
 futures-test = "0.3.32"
-loom = { version = "0.7", features = ["checkpoint", "futures"] }
 
 [features]
 default = ["parking_lot"]
 deep-metrics = []
-loom = ["dep:loom", "event-listener/loom"]
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
 sim = ["pulsebeam-core/sim", "dep:turmoil"]

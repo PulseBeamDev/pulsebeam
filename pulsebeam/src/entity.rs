@@ -245,7 +245,7 @@ impl ParticipantId {
 
     pub fn derive_track_id(&self, kind: TrackKind, label: &str) -> TrackId {
         let uuid = new_v8_sha3(&self.uuid, label.as_bytes());
-        TrackId { kind: kind, uuid }
+        TrackId { kind, uuid }
     }
 }
 

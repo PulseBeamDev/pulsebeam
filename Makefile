@@ -26,16 +26,13 @@ profile:
 run-profile: profile
 	$(BINARY)
 
-test: test-unit test-loom test-sim
+test: test-unit test-sim
 
 test-unit:
-	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator -- --skip loom_
+	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --
 
 test-sim:
 	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture $(TEST)
-
-test-loom:
-	LOOM_MAX_PREEMPTIONS=2 $(CARGO_CMD) test --workspace --features loom loom_
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all

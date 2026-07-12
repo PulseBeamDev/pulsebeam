@@ -1,14 +1,3 @@
-pub mod mpsc;
-pub mod slot_group;
-pub mod spmc;
-pub mod spsc;
-
-pub use mpsc::{
-    UnsyncReceiver as UnsyncMpscReceiver, UnsyncSender as UnsyncMpscSender,
-    unsync_channel as unsync_mpsc_channel,
-};
-pub use slot_group::UnsyncSlotGroup;
-
 #[cfg(not(feature = "loom"))]
 mod primitives {
     #[cfg(feature = "parking_lot")]
