@@ -25,7 +25,7 @@ pub enum SignalingInputEvent {
 }
 
 pub struct Signaling {
-    pub cid: ChannelId,
+    pub cid: Option<ChannelId>,
     seq: u64,
     slot_count: usize,
 
@@ -45,9 +45,9 @@ pub struct Signaling {
 }
 
 impl Signaling {
-    pub fn new(cid: ChannelId) -> Self {
+    pub fn new() -> Self {
         Self {
-            cid,
+            cid: None,
             seq: 0,
             dirty_tracks: false,
             dirty_assignments: false,
@@ -59,6 +59,10 @@ impl Signaling {
 
             slot_count: 0,
         }
+    }
+
+    pub fn set_cid(&mut self, cid: ChannelId) {
+        self.cid = Some(cid);
     }
 
     pub fn set_slot_count(&mut self, slot_count: usize) {
@@ -168,7 +172,11 @@ impl Signaling {
             return false;
         }
 
-        let Some(mut channel) = rtc.channel(self.cid) else {
+        let Some(cid) = self.cid else {
+            return false;
+        };
+
+        let Some(mut channel) = rtc.channel(cid) else {
             return false;
         };
 

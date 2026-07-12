@@ -18,7 +18,7 @@ pub mod namespace {
     impl Signaling {
         pub fn as_str(&self) -> &str {
             match self {
-                Self::Reliable => "__internal/v1/signaling",
+                Self::Reliable => "v1/sys/signaling",
             }
         }
     }

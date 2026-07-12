@@ -732,8 +732,8 @@ impl AgentBuilder {
             label: namespace::Signaling::Reliable.as_str().to_string(),
             ordered: true,
             reliability: Reliability::Reliable,
-            negotiated: Some(0),
-            protocol: "v1".to_string(),
+            negotiated: None,
+            protocol: "".to_string(),
         };
         let signaling_cid = sdp.add_channel_with_config(signaling_cfg);
 

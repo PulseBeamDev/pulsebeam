@@ -2,13 +2,11 @@ use super::signaling::Signaling;
 use ahash::{HashMap, HashMapExt};
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
-use pulsebeam_proto::namespace;
 use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
-use str0m::channel::ChannelConfig;
 use str0m::format::Codec;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::Protocol;
@@ -123,26 +121,8 @@ impl ParticipantCore {
         tcp_gso_size: usize,
         rng: &mut impl RngCore,
     ) -> Self {
-        let mut rtc = cfg.rtc;
-        let mut api = rtc.direct_api();
-        let cid = api.create_data_channel(ChannelConfig {
-            label: namespace::Signaling::Reliable.as_str().to_string(),
-            ordered: true,
-            reliability: str0m::channel::Reliability::Reliable,
-            negotiated: Some(0),
-            protocol: "v1".to_string(),
-        });
-        // reserving sctp IDs for future expansion
-        for i in 1..RESERVED_DATA_CHANNEL_COUNT {
-            api.create_data_channel(ChannelConfig {
-                label: "".to_string(),
-                ordered: true,
-                reliability: str0m::channel::Reliability::Reliable,
-                negotiated: Some(i),
-                protocol: "v1".to_string(),
-            });
-        }
-
+        let rtc = cfg.rtc;
+        let signaling = Signaling::new();
         let udp_batcher = Batcher::with_capacity(udp_gso_size);
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
@@ -155,7 +135,7 @@ impl ParticipantCore {
             upstream: UpstreamAllocator::new(),
             downstream: DownstreamAllocator::new(cfg.participant_id, cfg.manual_sub, rng),
             disconnect_reason: None,
-            signaling: Signaling::new(cid),
+            signaling,
             last_slow_poll: Instant::now(),
             last_keyframe_request: HashMap::new(),
             published_tracks: HashMap::new(),
@@ -441,6 +421,7 @@ impl ParticipantCore {
                 self.downstream.update_bitrate(available)
             }
             Event::ChannelOpen(cid, label) => {
+                tracing::info!("{} is opened", label);
                 let intent = match DataTrackIntent::try_from(label) {
                     Ok(intent) => intent,
                     Err(err) => {
@@ -449,20 +430,27 @@ impl ParticipantCore {
                     }
                 };
 
-                let topic = self
-                    .participant_id
-                    .derive_track_id(TrackKind::Data, &intent.topic);
-                match intent.direction {
-                    DataTrackDirection::Publish => {
-                        // self.upstream.add_data_track(cid, topic);
+                match intent {
+                    DataTrackIntent::InternalSignaling => {
+                        tracing::info!("internal media signaling is opened");
+                        self.signaling.set_cid(cid);
                     }
-                    DataTrackDirection::Subscribe => {
-                        // self.downstream.add_data_track(cid, topic);
+
+                    DataTrackIntent::UserTopic { direction, topic } => {
+                        let _topic = self.participant_id.derive_track_id(TrackKind::Data, &topic);
+                        match direction {
+                            DataTrackDirection::Publish => {
+                                // self.upstream.add_data_track(cid, topic);
+                            }
+                            DataTrackDirection::Subscribe => {
+                                // self.downstream.add_data_track(cid, topic);
+                            }
+                        }
                     }
                 }
             }
             Event::ChannelData(data) => {
-                if data.id == self.signaling.cid
+                if Some(data.id) == self.signaling.cid
                     && let Err(err) = self
                         .signaling
                         .handle_input(&data.data, &mut self.downstream)
