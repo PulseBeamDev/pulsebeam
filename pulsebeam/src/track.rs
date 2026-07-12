@@ -9,6 +9,7 @@ use crate::rtp::{
     monitor::{StreamMonitor, StreamState},
     sync::Synchronizer,
 };
+pub use data_track::*;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::RtpWrite;
 use str0m::rtp::rtcp::SenderInfo;
@@ -396,5 +397,174 @@ pub mod test_utils {
             origin: participant_id,
         };
         crate::track::new_audio(mid, meta)
+    }
+}
+
+mod data_track {
+    const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum DataTrackDirection {
+        Publish,
+        Subscribe,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct DataTrackIntent {
+        pub direction: DataTrackDirection,
+        pub topic: String,
+    }
+
+    #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DataTrackIntentError {
+        #[error("The input string exceeds the maximum permitted security boundary size")]
+        LabelTooLong,
+
+        #[error("Invalid or missing API version protocol prefix (expected 'v1')")]
+        InvalidVersion,
+
+        #[error("Invalid transport execution mode (expected real-time, 'rt')")]
+        InvalidMode,
+
+        #[error("Invalid routing direction parameter (expected 'pub' or 'sub')")]
+        InvalidDirection,
+
+        #[error("The target user asset label component is missing or empty")]
+        MissingLabel,
+
+        #[error(
+            "The label contains illegal characters (only alphanumeric, dashes, and underscores allowed)"
+        )]
+        IllegalCharacters,
+    }
+
+    impl TryFrom<String> for DataTrackIntent {
+        type Error = DataTrackIntentError;
+
+        fn try_from(mut s: String) -> Result<Self, Self::Error> {
+            if s.len() > MAX_DATA_TRACK_NAMESPACE_LEN {
+                return Err(DataTrackIntentError::LabelTooLong);
+            }
+
+            let mut parts = s.splitn(4, '/');
+
+            if parts.next() != Some("v1") {
+                return Err(DataTrackIntentError::InvalidVersion);
+            }
+            if parts.next() != Some("rt") {
+                return Err(DataTrackIntentError::InvalidMode);
+            }
+
+            let direction = match parts.next() {
+                Some("pub") => DataTrackDirection::Publish,
+                Some("sub") => DataTrackDirection::Subscribe,
+                _ => return Err(DataTrackIntentError::InvalidDirection),
+            };
+
+            let topic_slice = parts.next().ok_or(DataTrackIntentError::MissingLabel)?;
+            if topic_slice.is_empty() {
+                return Err(DataTrackIntentError::MissingLabel);
+            }
+
+            let is_valid = topic_slice
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+
+            if !is_valid {
+                return Err(DataTrackIntentError::IllegalCharacters);
+            }
+            let prefix_len = s.len() - topic_slice.len();
+            s.drain(0..prefix_len);
+
+            Ok(Self {
+                direction,
+                topic: s,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::*;
+
+        #[test]
+        fn test_valid_publish_channels() {
+            let intent = DataTrackIntent::try_from("v1/rt/pub/game-state".to_string()).unwrap();
+            assert_eq!(intent.direction, DataTrackDirection::Publish);
+            assert_eq!(intent.topic, "game-state");
+
+            let intent =
+                DataTrackIntent::try_from("v1/rt/pub/audio_metadata_123".to_string()).unwrap();
+            assert_eq!(intent.direction, DataTrackDirection::Publish);
+            assert_eq!(intent.topic, "audio_metadata_123");
+        }
+
+        #[test]
+        fn test_valid_subscribe_channels() {
+            let intent = DataTrackIntent::try_from("v1/rt/sub/chat-room".to_string()).unwrap();
+            assert_eq!(intent.direction, DataTrackDirection::Subscribe);
+            assert_eq!(intent.topic, "chat-room");
+        }
+
+        #[test]
+        fn test_invalid_version() {
+            let err = DataTrackIntent::try_from("v2/rt/pub/label".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::InvalidVersion);
+
+            let err = DataTrackIntent::try_from("v/rt/pub/label".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::InvalidVersion);
+        }
+
+        #[test]
+        fn test_invalid_mode() {
+            let err = DataTrackIntent::try_from("v1/rel/pub/label".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::InvalidMode);
+        }
+
+        #[test]
+        fn test_invalid_direction() {
+            let err = DataTrackIntent::try_from("v1/rt/broadcast/label".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::InvalidDirection);
+        }
+
+        #[test]
+        fn test_missing_or_empty_label() {
+            let err = DataTrackIntent::try_from("v1/rt/pub/".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::MissingLabel);
+
+            let err = DataTrackIntent::try_from("v1/rt/pub".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::MissingLabel);
+        }
+
+        #[test]
+        fn test_illegal_characters() {
+            // Nested slashes are explicitly banned by character validation
+            let err = DataTrackIntent::try_from("v1/rt/pub/game/engine".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::IllegalCharacters);
+
+            // Spaces and symbols are banned
+            let err = DataTrackIntent::try_from("v1/rt/pub/my label".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::IllegalCharacters);
+
+            let err = DataTrackIntent::try_from("v1/rt/pub/label$".to_string()).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::IllegalCharacters);
+        }
+
+        #[test]
+        fn test_max_length_boundary() {
+            // Exact boundary (10 bytes prefix + 54 bytes label = 64 total)
+            let exact_valid = format!("v1/rt/pub/{}", "a".repeat(54));
+            assert!(DataTrackIntent::try_from(exact_valid).is_ok());
+
+            // Violates 64-byte limit by 1 byte
+            let one_byte_over = format!("v1/rt/pub/{}", "a".repeat(55));
+            let err = DataTrackIntent::try_from(one_byte_over).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::LabelTooLong);
+
+            // Massive payload check to verify defense against allocation amplification
+            let massive = "a".repeat(1000);
+            let err = DataTrackIntent::try_from(massive).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::LabelTooLong);
+        }
     }
 }

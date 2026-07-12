@@ -18,7 +18,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity::{self, TrackId};
+use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::EventQueue;
@@ -27,7 +27,10 @@ use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
-use crate::track::{self, KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Track};
+use crate::track::{
+    self, DataTrackDirection, DataTrackIntent, DataTrackIntentError, KEYFRAME_DEBOUNCE, StreamId,
+    StreamWriter, Track,
+};
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -62,6 +65,8 @@ pub enum DisconnectReason {
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
     InvalidMediaDirection,
+    #[error("Invalid data channel protocol: {0}")]
+    InvalidDataTrackIntent(#[from] DataTrackIntentError),
     #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
     #[error("Room closed")]
@@ -435,7 +440,27 @@ impl ParticipantCore {
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 self.downstream.update_bitrate(available)
             }
-            Event::ChannelOpen(_cid, _label) => {}
+            Event::ChannelOpen(cid, label) => {
+                let intent = match DataTrackIntent::try_from(label) {
+                    Ok(intent) => intent,
+                    Err(err) => {
+                        self.disconnect(err.into());
+                        return;
+                    }
+                };
+
+                let topic = self
+                    .participant_id
+                    .derive_track_id(TrackKind::Data, &intent.topic);
+                match intent.direction {
+                    DataTrackDirection::Publish => {
+                        // self.upstream.add_data_track(cid, topic);
+                    }
+                    DataTrackDirection::Subscribe => {
+                        // self.downstream.add_data_track(cid, topic);
+                    }
+                }
+            }
             Event::ChannelData(data) => {
                 if data.id == self.signaling.cid
                     && let Err(err) = self
