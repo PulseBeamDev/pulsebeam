@@ -70,7 +70,7 @@ pub enum ClusterCommand {
 
 pub enum CrossShardEvent {
     /// Publisher shard → Subscriber shards: carry a video RTP packet across the shard boundary.
-    RtpPublished { stream_id: StreamId, pkt: RtpPacket },
+    VideoRtpPublished { stream_id: StreamId, pkt: RtpPacket },
     /// Publisher shard → all other shards in the same room: carry an audio RTP packet.
     AudioRtpPublished {
         room_id: RoomId,
@@ -125,15 +125,6 @@ impl CrossShardSend for ShardRouter {
             return;
         }
         let _ = self.cross_shard_event_txs[shard_id.index()].try_send(ev);
-    }
-
-    fn broadcast<F: Fn() -> CrossShardEvent>(&self, make_ev: F) {
-        for (shard_id, tx) in self.cross_shard_event_txs.iter().enumerate() {
-            if ShardId::new(shard_id) == self.shard_id {
-                continue;
-            }
-            let _ = tx.try_send(make_ev());
-        }
     }
 
     fn shard_id(&self) -> ShardId {
@@ -275,7 +266,7 @@ impl ShardWorker {
     }
 
     async fn flush_shard_events(&mut self) -> Result<(), ShardError> {
-        while let Some(event) = self.core.shard_events.pop_front() {
+        while let Some(event) = self.core.pop_shard_event() {
             let wrapped = ShardEventWrapper {
                 from_shard_id: self.router.shard_id,
                 ev: event,

@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(transparent)]
 pub struct ShardId(usize);
 
