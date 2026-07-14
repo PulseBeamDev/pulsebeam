@@ -30,6 +30,7 @@ rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }
 # str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/abs-capture-time" }
 # str0m = { git = "https://github.com/algesten/str0m.git", rev = "92fac41" }
+# str0m = { git = "https://github.com/algesten/str0m.git", branch = "poll-output-readiness" }
 str0m = { version = "0.21.0" }
 # str0m = { path = "../str0m" }
 thiserror = "2.0"
@@ -66,6 +67,10 @@ lto = "thin"
 
 [profile.profiling]
 inherits = "release"
+debug = true           
+split-debuginfo = "off" 
+strip = "none"          #
+lto = "thin"
 
 # We want to crash during simulation
 [profile.sim]
