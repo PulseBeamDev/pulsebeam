@@ -254,7 +254,7 @@ impl ShardWorker {
         // phase 2: compute
         let now = Instant::now();
         self.core.poll_input(now);
-        self.core.flush_rtp_events(&self.router);
+        self.core.flush_stream_buffers(&self.router);
         self.core.poll_fanout(now);
         self.core.flush_participant_events(&self.router);
 

@@ -1,147 +1,78 @@
-use std::collections::VecDeque;
-
-use str0m::media::KeyframeRequestKind;
+use crate::entity::TrackId;
+use crate::rtp::RtpPacket;
+use crate::track::{StreamId, Track, TrackLayer, TrackMeta};
 use tokio::time::Instant;
 
-use crate::entity::{ParticipantId, RoomId, TrackId};
-use crate::rtp::RtpPacket;
-use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer, TrackMeta};
+pub trait ParticipantSink {
+    fn subscribe(&mut self, track: TrackMeta);
+    fn unsubscribe(&mut self, track: TrackMeta);
+    fn publish_track(&mut self, track: Track);
+    fn unpublish_track(&mut self, track_id: TrackId);
+    fn request_keyframe(&mut self, layer: &TrackLayer);
+    fn update_deadline(&mut self, deadline: Instant);
+    fn exit(&mut self);
 
-pub struct RtpEvent {
-    pub stream_id: StreamId,
-    pub pkt: RtpPacket,
-    pub room_id: RoomId,
-    /// The participant that published this packet (used to skip self-forwarding on audio fanout).
-    pub origin: ParticipantId,
+    fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket);
 }
 
-pub enum ParticipantEvent {
-    Topology(ParticipantTopologyEvent),
-    Timer(ParticipantTimerEvent),
-    Lifecycle(ParticipantLifecycleEvent),
-    Control(ParticipantControlEvent),
-}
+#[cfg(test)]
+pub mod test_utils {
+    use super::*;
 
-pub enum ParticipantTopologyEvent {
-    TrackSubscribed {
-        subscriber: ParticipantId,
-        track: TrackMeta,
-    },
-    TrackUnsubscribed {
-        subscriber: ParticipantId,
-        track: TrackMeta,
-    },
-}
+    #[derive(Debug, Default)]
+    pub struct MockParticipantSink {
+        pub subscribe_calls: Vec<TrackMeta>,
+        pub unsubscribe_calls: Vec<TrackMeta>,
+        pub publish_track_calls: Vec<TrackId>,
+        pub unpublish_track_calls: Vec<TrackId>,
+        pub request_keyframe_calls: Vec<(StreamId, crate::entity::ParticipantId)>,
+        pub update_deadline_calls: Vec<Instant>,
+        pub exit_count: usize,
+        pub publish_rtp_calls: Vec<StreamId>,
+    }
 
-pub enum ParticipantTimerEvent {
-    DeadlineUpdated {
-        at: Instant,
-        participant_id: ParticipantId,
-    },
-}
+    impl MockParticipantSink {
+        pub fn new() -> Self {
+            Self::default()
+        }
 
-pub enum ParticipantLifecycleEvent {
-    Exited { participant_id: ParticipantId },
-}
-
-pub enum ParticipantControlEvent {
-    TrackPublished(Track),
-    TrackUnpublished {
-        origin: ParticipantId,
-        track_id: TrackId,
-    },
-    KeyframeRequested(GlobalKeyframeRequest),
-}
-
-pub struct EventQueue<'a> {
-    id: &'a ParticipantId,
-    room_id: RoomId,
-    queue: &'a mut VecDeque<ParticipantEvent>,
-    rtp_queue: &'a mut VecDeque<RtpEvent>,
-}
-
-impl<'a> EventQueue<'a> {
-    pub fn new(
-        id: &'a ParticipantId,
-        room_id: RoomId,
-        queue: &'a mut VecDeque<ParticipantEvent>,
-        rtp_queue: &'a mut VecDeque<RtpEvent>,
-    ) -> Self {
-        Self {
-            id,
-            room_id,
-            queue,
-            rtp_queue,
+        pub fn reset(&mut self) {
+            *self = Self::default();
         }
     }
 
-    pub fn subscribe(&mut self, track: TrackMeta) {
-        self.queue.push_back(ParticipantEvent::Topology(
-            ParticipantTopologyEvent::TrackSubscribed {
-                subscriber: *self.id,
-                track,
-            },
-        ));
-    }
+    impl ParticipantSink for MockParticipantSink {
+        fn subscribe(&mut self, track: TrackMeta) {
+            self.subscribe_calls.push(track);
+        }
 
-    pub fn unsubscribe(&mut self, track: TrackMeta) {
-        self.queue.push_back(ParticipantEvent::Topology(
-            ParticipantTopologyEvent::TrackUnsubscribed {
-                subscriber: *self.id,
-                track,
-            },
-        ));
-    }
+        fn unsubscribe(&mut self, track: TrackMeta) {
+            self.unsubscribe_calls.push(track);
+        }
 
-    pub fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket) {
-        self.rtp_queue.push_back(RtpEvent {
-            stream_id,
-            pkt,
-            room_id: self.room_id,
-            origin: *self.id,
-        });
-    }
+        fn publish_track(&mut self, track: Track) {
+            self.publish_track_calls.push(track.meta.id);
+        }
 
-    pub fn publish_track(&mut self, track: Track) {
-        self.queue.push_back(ParticipantEvent::Control(
-            ParticipantControlEvent::TrackPublished(track),
-        ));
-    }
+        fn unpublish_track(&mut self, track_id: TrackId) {
+            self.unpublish_track_calls.push(track_id);
+        }
 
-    pub fn unpublish_track(&mut self, track_id: TrackId) {
-        self.queue.push_back(ParticipantEvent::Control(
-            ParticipantControlEvent::TrackUnpublished {
-                origin: *self.id,
-                track_id,
-            },
-        ));
-    }
+        fn request_keyframe(&mut self, layer: &TrackLayer) {
+            self.request_keyframe_calls
+                .push((layer.stream_id(), layer.meta.origin));
+        }
 
-    pub fn request_keyframe(&mut self, layer: &TrackLayer) {
-        self.queue.push_back(ParticipantEvent::Control(
-            ParticipantControlEvent::KeyframeRequested(GlobalKeyframeRequest {
-                shard_id: layer.meta.shard_id,
-                origin: layer.meta.origin,
-                stream_id: layer.stream_id(),
-                kind: KeyframeRequestKind::Pli,
-            }),
-        ));
-    }
+        fn update_deadline(&mut self, deadline: Instant) {
+            self.update_deadline_calls.push(deadline);
+        }
 
-    pub fn update_deadline(&mut self, deadline: Instant) {
-        self.queue.push_back(ParticipantEvent::Timer(
-            ParticipantTimerEvent::DeadlineUpdated {
-                at: deadline,
-                participant_id: *self.id,
-            },
-        ));
-    }
+        fn exit(&mut self) {
+            self.exit_count += 1;
+        }
 
-    pub fn exit(&mut self) {
-        self.queue.push_back(ParticipantEvent::Lifecycle(
-            ParticipantLifecycleEvent::Exited {
-                participant_id: *self.id,
-            },
-        ));
+        fn publish_rtp(&mut self, stream_id: StreamId, _pkt: RtpPacket) {
+            self.publish_rtp_calls.push(stream_id);
+        }
     }
 }

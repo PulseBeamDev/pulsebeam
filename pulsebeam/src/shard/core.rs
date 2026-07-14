@@ -2,14 +2,12 @@ use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
+use super::events::{ParticipantEvent, ParticipantLifecycleEvent, ParticipantTimerEvent, RtpEvent};
 use crate::id::AudioSelectorSlotId;
 use crate::{
     entity::{ParticipantId, TrackKind},
     id::ShardId,
-    participant::{
-        ParticipantConfig,
-        event::{ParticipantEvent, ParticipantLifecycleEvent, ParticipantTimerEvent, RtpEvent},
-    },
+    participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::{
         dirty::{DirtyKind, DirtyTracker},
@@ -201,30 +199,32 @@ impl ShardCore {
                 continue;
             };
             let room_id = participant.room_id;
-            let (events, rtp_events) = pipeline.poll_sinks();
-            let mut queue = crate::participant::event::EventQueue::new(
-                &participant_id,
-                room_id,
-                events,
-                rtp_events,
-            );
-            participant.with_span(|core| core.poll(now, &mut queue));
+            let mut sink = pipeline.participant_sink(room_id, participant_id);
+            participant.with_span(|core| core.poll(now, &mut sink));
         }
     }
 
-    pub(crate) fn flush_rtp_events(&mut self, router: &impl CrossShardSend) {
-        while let Some(ev) = self.pipeline.pop_rtp_event() {
+    pub(crate) fn flush_stream_buffers(&mut self, router: &impl CrossShardSend) {
+        while let Some(ev) = self.pipeline.pop_audio_rtp() {
+            debug_assert!(ev.stream_id.0.kind() == TrackKind::Audio);
             let mut ctx = DispatchCtx {
                 registry: &mut self.registry,
                 dirty: &mut self.dirty,
                 kind: DirtyKind::Fanout,
                 router,
             };
-            if ev.stream_id.0.kind() == TrackKind::Audio {
-                self.routing.route_audio(ev, &mut ctx);
-            } else {
-                self.routing.route_video(ev.stream_id, &ev.pkt, &mut ctx);
-            }
+            self.routing.route_audio(ev, &mut ctx);
+        }
+
+        while let Some(ev) = self.pipeline.pop_video_rtp() {
+            debug_assert!(ev.stream_id.0.kind() == TrackKind::Video);
+            let mut ctx = DispatchCtx {
+                registry: &mut self.registry,
+                dirty: &mut self.dirty,
+                kind: DirtyKind::Fanout,
+                router,
+            };
+            self.routing.route_video(ev.stream_id, &ev.pkt, &mut ctx);
         }
     }
 

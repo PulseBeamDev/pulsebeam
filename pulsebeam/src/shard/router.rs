@@ -5,10 +5,10 @@ use indexmap::IndexSet;
 use pulsebeam_runtime::rand;
 use str0m::media::KeyframeRequestKind;
 
+use super::events::{ParticipantControlEvent, ParticipantTopologyEvent, RtpEvent};
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
-use crate::participant::event::{ParticipantControlEvent, ParticipantTopologyEvent, RtpEvent};
 use crate::rtp::RtpPacket;
 use crate::track::{StreamId, Track, TrackMeta};
 

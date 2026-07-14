@@ -7,7 +7,7 @@ use crate::entity::TrackKind;
 use crate::id::AudioSelectorSlotId;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::VideoAllocator;
-use crate::participant::event::EventQueue;
+use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
 use pulsebeam_runtime::rand::RngCore;
@@ -110,11 +110,16 @@ impl DownstreamAllocator {
         assignments_changed
     }
 
-    pub fn reconcile_routes(&mut self, _now: Instant, events: &mut EventQueue) {
+    pub fn reconcile_routes(&mut self, _now: Instant, events: &mut impl ParticipantSink) {
         self.video.reconcile_routes(events);
     }
 
-    pub fn poll_slow(&mut self, now: Instant, bwe: &mut Bwe, events: &mut EventQueue) -> bool {
+    pub fn poll_slow(
+        &mut self,
+        now: Instant,
+        bwe: &mut Bwe,
+        events: &mut impl ParticipantSink,
+    ) -> bool {
         let assignments_changed = self.update_allocations(bwe);
         self.video.poll_slow(now, self.available_bandwidth, events);
         assignments_changed

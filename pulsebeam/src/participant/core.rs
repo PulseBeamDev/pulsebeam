@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::participant::downstream::SlotConfig;
-use crate::participant::event::EventQueue;
+use crate::participant::event::ParticipantSink;
 use crate::participant::signaling;
 use crate::participant::{
     batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
@@ -256,7 +256,7 @@ impl ParticipantCore {
         let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
     }
 
-    fn poll_slow(&mut self, now: Instant, events: &mut EventQueue) {
+    fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
@@ -264,7 +264,7 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
-    pub fn poll(&mut self, now: Instant, events: &mut EventQueue) {
+    pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         'drain: loop {
             let Some(rtc_deadline) = self.poll_rtc(events) else {
                 events.exit();
@@ -335,7 +335,7 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self, events: &mut EventQueue) -> Option<Instant> {
+    fn poll_rtc(&mut self, events: &mut impl ParticipantSink) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -405,7 +405,7 @@ impl ParticipantCore {
         result
     }
 
-    fn handle_event(&mut self, e: Event, events: &mut EventQueue) {
+    fn handle_event(&mut self, e: Event, events: &mut impl ParticipantSink) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
@@ -475,7 +475,7 @@ impl ParticipantCore {
     fn handle_signaling_input(
         &mut self,
         event: signaling::SignalingInputEvent,
-        events: &mut EventQueue,
+        events: &mut impl ParticipantSink,
     ) {
         match event {
             signaling::SignalingInputEvent::UpstreamTrackState { mid, active } => {
@@ -484,7 +484,12 @@ impl ParticipantCore {
         }
     }
 
-    fn handle_upstream_track_state(&mut self, mid: Mid, active: bool, events: &mut EventQueue) {
+    fn handle_upstream_track_state(
+        &mut self,
+        mid: Mid,
+        active: bool,
+        events: &mut impl ParticipantSink,
+    ) {
         let Some(track_id) = self.upstream.track_id_for_mid(mid) else {
             return;
         };
@@ -514,7 +519,7 @@ impl ParticipantCore {
         state.in_topology = false;
     }
 
-    fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut EventQueue) {
+    fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut impl ParticipantSink) {
         // Treat unpaused as an implicit publish signal from str0m.
         // We intentionally do not unpublish on paused=true here; explicit
         // client intent is authoritative for stop/unpublish transitions.
@@ -524,7 +529,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id, mid = %media.mid))]
-    fn handle_media_added(&mut self, media: MediaAdded, _events: &mut EventQueue) {
+    fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
         match media.direction {
             Direction::RecvOnly => {
                 let track_id = self
@@ -637,7 +642,11 @@ impl ParticipantCore {
         });
     }
 
-    fn handle_incoming_rtp(&mut self, rtp: str0m::rtp::RtpPacket, events: &mut EventQueue) {
+    fn handle_incoming_rtp(
+        &mut self,
+        rtp: str0m::rtp::RtpPacket,
+        events: &mut impl ParticipantSink,
+    ) {
         tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {

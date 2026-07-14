@@ -1,6 +1,6 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
-use crate::participant::event::EventQueue;
+use crate::participant::event::ParticipantSink;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -303,13 +303,10 @@ impl VideoAllocator {
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
-        let Some(slot) = self
+        let slot = self
             .slots
             .values()
-            .find(|s| s.mid == req.mid && s.rid == req.rid)
-        else {
-            return None;
-        };
+            .find(|s| s.mid == req.mid && s.rid == req.rid)?;
 
         slot.target()
     }
@@ -346,18 +343,23 @@ impl VideoAllocator {
         state_changed
     }
 
-    pub fn poll_slow(&mut self, now: Instant, _bandwidth: Bitrate, events: &mut EventQueue) {
+    pub fn poll_slow(
+        &mut self,
+        now: Instant,
+        _bandwidth: Bitrate,
+        events: &mut impl ParticipantSink,
+    ) {
         self.reconcile_routes(events);
         self.retry_keyframe_requests(now, events);
     }
 
-    fn retry_keyframe_requests(&mut self, now: Instant, events: &mut EventQueue) {
+    fn retry_keyframe_requests(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         for (_, slot) in self.slots.iter_mut() {
             slot.pli_retry(now, events);
         }
     }
 
-    pub fn reconcile_routes(&mut self, events: &mut EventQueue) {
+    pub fn reconcile_routes(&mut self, events: &mut impl ParticipantSink) {
         let mut current = HashSet::new();
         for (slot_key, slot) in &self.slots {
             if let Some(staging) = slot.staging.as_ref() {
@@ -505,7 +507,7 @@ impl Slot {
         self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
     }
 
-    fn pli_retry(&mut self, now: Instant, events: &mut EventQueue) {
+    fn pli_retry(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         if self.paused {
             return;
         }
@@ -885,13 +887,14 @@ impl AllocationEngine {
 mod assignment_tests {
     use super::*;
     use crate::entity::{ExternalRoomId, ParticipantId, RoomId, TrackId, TrackKind};
-    use crate::participant::event::{EventQueue, ParticipantControlEvent, ParticipantEvent};
+    use crate::participant::event::ParticipantSink;
+    use crate::participant::event::test_utils::MockParticipantSink;
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack, test_utils::make_video_track};
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
     use std::collections::VecDeque;
     use str0m::bwe::Bitrate;
-    use str0m::media::{MediaKind, Mid, SimulcastLayer};
+    use str0m::media::{Mid, SimulcastLayer};
 
     fn test_rng() -> impl RngCore {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1041,7 +1044,6 @@ mod assignment_tests {
 
     #[test]
     fn route_subscription_initializes_keyframe_retry_state() {
-        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
@@ -1053,41 +1055,19 @@ mod assignment_tests {
         slot.staging = Some(low);
         slot.paused = false;
 
-        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
-        let mut events = VecDeque::new();
-        let mut rtp_events = VecDeque::new();
         let now = Instant::now();
-
-        {
-            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(&mut queue);
-        }
-
+        let mut queue = MockParticipantSink::new();
+        allocator.reconcile_routes(&mut queue);
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ParticipantEvent::Control(ParticipantControlEvent::KeyframeRequested(_))
-                ))
-                .count(),
+            queue.request_keyframe_calls.len(),
             0,
             "reconcile_routes no longer emits an immediate keyframe request"
         );
 
-        {
-            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.retry_keyframe_requests(now, &mut queue);
-        }
-
+        let mut queue = MockParticipantSink::new();
+        allocator.retry_keyframe_requests(now, &mut queue);
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ParticipantEvent::Control(ParticipantControlEvent::KeyframeRequested(_))
-                ))
-                .count(),
+            queue.request_keyframe_calls.len(),
             1,
             "retry_keyframe_requests should not send an immediate duplicate PLI after reconcile_routes"
         );
@@ -1124,33 +1104,23 @@ mod assignment_tests {
         slot.staging = Some(high.clone());
         slot.paused = false;
 
-        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
-        let mut events = VecDeque::new();
-        let mut rtp_events = VecDeque::new();
-
-        {
-            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(&mut queue);
-        }
+        let mut queue = MockParticipantSink::new();
+        allocator.reconcile_routes(&mut queue);
 
         assert!(allocator.routes.contains_key(&low.meta.id));
         assert!(allocator.routes.contains_key(&high.meta.id));
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ParticipantEvent::Topology(_)))
-                .count(),
+            queue.subscribe_calls.len(),
             1,
             "routes are tracked per track, so staging and active layers share one subscription"
         );
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ParticipantEvent::Control(ParticipantControlEvent::KeyframeRequested(_))
-                ))
-                .count(),
+            queue.unsubscribe_calls.len(),
+            0,
+            "routes are tracked per track, so staging and active layers share one subscription"
+        );
+        assert_eq!(
+            queue.request_keyframe_calls.len(),
             0,
             "reconcile_routes does not request keyframes directly"
         );
@@ -1158,14 +1128,13 @@ mod assignment_tests {
 
     #[test]
     fn route_removed_only_when_slot_has_no_active_or_staging_target() {
-        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
         let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let old_stream_id = track.lowest_quality().stream_id();
-        let slot_key = allocator.slots.keys().next().unwrap().clone();
+        let slot_key = allocator.slots.keys().next().unwrap();
         allocator.routes.insert(old_stream_id.0, slot_key);
         allocator
             .last_reconciled
@@ -1176,26 +1145,15 @@ mod assignment_tests {
         slot.staging = None;
         slot.paused = false;
 
-        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
-        let mut events = VecDeque::new();
-        let mut rtp_events = VecDeque::new();
-
-        {
-            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(&mut queue);
-        }
+        let mut queue = MockParticipantSink::new();
+        allocator.reconcile_routes(&mut queue);
 
         assert!(allocator.routes.is_empty());
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ParticipantEvent::Topology(_)))
-        );
+        assert_eq!(queue.unsubscribe_calls.len(), 1);
     }
 
     #[test]
     fn reconcile_routes_corrects_invalid_route_slot_mapping() {
-        let pid = ParticipantId::new(&mut test_rng());
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 2);
@@ -1212,21 +1170,11 @@ mod assignment_tests {
 
         allocator.routes.insert(low.meta.id, stale_slot_key);
 
-        let room_id = RoomId::from_external(&ExternalRoomId::new("room").unwrap());
-        let mut events = VecDeque::new();
-        let mut rtp_events = VecDeque::new();
-
-        {
-            let mut queue = EventQueue::new(&pid, room_id, &mut events, &mut rtp_events);
-            allocator.reconcile_routes(&mut queue);
-        }
+        let mut queue = MockParticipantSink::new();
+        allocator.reconcile_routes(&mut queue);
 
         assert_eq!(allocator.routes.get(&low.meta.id), Some(&correct_slot_key));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ParticipantEvent::Topology(_)))
-        );
+        assert_eq!(queue.subscribe_calls.len(), 1);
     }
 
     #[test]
