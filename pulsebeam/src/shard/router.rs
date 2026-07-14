@@ -163,9 +163,8 @@ impl ShardRoutingTable {
         for route in room.data_topics.values_mut() {
             route.subscribers.swap_remove(participant_id);
         }
-        room.data_topics.retain(|_, route| {
-            !(route.subscribers.is_empty() && route.remote_shards.is_empty())
-        });
+        room.data_topics
+            .retain(|_, route| !(route.subscribers.is_empty() && route.remote_shards.is_empty()));
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -507,7 +506,7 @@ impl ShardRoutingTable {
                         room_id: ev.room_id,
                         origin: ev.origin,
                         stream_id: ev.stream_id,
-                        pkt: ev.pkt.clone(),
+                        pkt: ev.pkt.deep_clone(),
                     },
                 );
             }

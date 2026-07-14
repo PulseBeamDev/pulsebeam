@@ -215,35 +215,23 @@ impl ShardCore {
     }
 
     pub(crate) fn flush_stream_buffers(&mut self, router: &impl CrossShardSend) {
+        let mut ctx = DispatchCtx {
+            registry: &mut self.registry,
+            dirty: &mut self.dirty,
+            kind: DirtyKind::Fanout,
+            router,
+        };
         while let Some(ev) = self.pipeline.pop_audio_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Audio);
-            let mut ctx = DispatchCtx {
-                registry: &mut self.registry,
-                dirty: &mut self.dirty,
-                kind: DirtyKind::Fanout,
-                router,
-            };
             self.routing.route_audio(ev, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_video_rtp() {
             debug_assert!(ev.stream_id.0.kind() == TrackKind::Video);
-            let mut ctx = DispatchCtx {
-                registry: &mut self.registry,
-                dirty: &mut self.dirty,
-                kind: DirtyKind::Fanout,
-                router,
-            };
             self.routing.route_video(ev.stream_id, &ev.pkt, &mut ctx);
         }
 
         while let Some(ev) = self.pipeline.pop_data_sctp() {
-            let mut ctx = DispatchCtx {
-                registry: &mut self.registry,
-                dirty: &mut self.dirty,
-                kind: DirtyKind::Fanout,
-                router,
-            };
             self.routing
                 .route_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
         }
@@ -272,70 +260,80 @@ impl ShardCore {
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
-                ParticipantEvent::Control(ev) => {
-                    match ev {
-                        ParticipantControlEvent::DataPacketPublished(data) => {
-                            let mut ctx = DispatchCtx {
-                                registry: &mut self.registry,
-                                dirty: &mut self.dirty,
-                                kind: DirtyKind::Fanout,
-                                router,
-                            };
-                            self.routing.route_data(
-                                data.room_id,
-                                data.origin,
-                                &data.topic,
-                                &data.pkt,
-                                &mut ctx,
-                            );
-                        }
-                        ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
-                            if self.routing.register_data_publisher(room_id, topic.clone()) {
-                                self.pipeline
-                                    .push_shard_event(ShardEvent::DataTopicPublished { room_id, topic });
-                            }
-                        }
-                        ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
-                            if self.routing.unregister_data_publisher(room_id, &topic) {
-                                self.pipeline
-                                    .push_shard_event(ShardEvent::DataTopicUnpublished { room_id, topic });
-                            }
-                        }
-                        ParticipantControlEvent::DataTopicSubscribed {
-                            room_id,
-                            subscriber,
-                            topic,
-                        } => {
-                            if self
-                                .routing
-                                .register_data_subscriber(room_id, subscriber, topic.clone())
-                            {
-                                self.pipeline
-                                    .push_shard_event(ShardEvent::DataTopicSubscribed { room_id, topic });
-                            }
-                        }
-                        ParticipantControlEvent::DataTopicUnsubscribed {
-                            room_id,
-                            subscriber,
-                            topic,
-                        } => {
-                            if self
-                                .routing
-                                .unregister_data_subscriber(room_id, subscriber, &topic)
-                            {
-                                self.pipeline
-                                    .push_shard_event(ShardEvent::DataTopicUnsubscribed { room_id, topic });
-                            }
-                        }
-                        ev => {
-                            router::route_participant_control_event(
-                                ev,
-                                self.pipeline.shard_events_mut(),
-                                router,
-                            );
+                ParticipantEvent::Control(ev) => match ev {
+                    ParticipantControlEvent::DataPacketPublished(data) => {
+                        let mut ctx = DispatchCtx {
+                            registry: &mut self.registry,
+                            dirty: &mut self.dirty,
+                            kind: DirtyKind::Fanout,
+                            router,
+                        };
+                        self.routing.route_data(
+                            data.room_id,
+                            data.origin,
+                            &data.topic,
+                            &data.pkt,
+                            &mut ctx,
+                        );
+                    }
+                    ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
+                        if self.routing.register_data_publisher(room_id, topic.clone()) {
+                            self.pipeline
+                                .push_shard_event(ShardEvent::DataTopicPublished {
+                                    room_id,
+                                    topic,
+                                });
                         }
                     }
-                }
+                    ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
+                        if self.routing.unregister_data_publisher(room_id, &topic) {
+                            self.pipeline
+                                .push_shard_event(ShardEvent::DataTopicUnpublished {
+                                    room_id,
+                                    topic,
+                                });
+                        }
+                    }
+                    ParticipantControlEvent::DataTopicSubscribed {
+                        room_id,
+                        subscriber,
+                        topic,
+                    } => {
+                        if self
+                            .routing
+                            .register_data_subscriber(room_id, subscriber, topic.clone())
+                        {
+                            self.pipeline
+                                .push_shard_event(ShardEvent::DataTopicSubscribed {
+                                    room_id,
+                                    topic,
+                                });
+                        }
+                    }
+                    ParticipantControlEvent::DataTopicUnsubscribed {
+                        room_id,
+                        subscriber,
+                        topic,
+                    } => {
+                        if self
+                            .routing
+                            .unregister_data_subscriber(room_id, subscriber, &topic)
+                        {
+                            self.pipeline
+                                .push_shard_event(ShardEvent::DataTopicUnsubscribed {
+                                    room_id,
+                                    topic,
+                                });
+                        }
+                    }
+                    ev => {
+                        router::route_participant_control_event(
+                            ev,
+                            self.pipeline.shard_events_mut(),
+                            router,
+                        );
+                    }
+                },
             }
         }
     }
