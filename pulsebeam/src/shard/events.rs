@@ -16,6 +16,13 @@ pub struct RtpEvent {
     pub origin: ParticipantId,
 }
 
+pub struct SctpEvent {
+    pub topic: Topic,
+    pub pkt: Vec<u8>,
+    pub room_id: RoomId,
+    pub origin: ParticipantId,
+}
+
 pub enum ParticipantEvent {
     Topology(ParticipantTopologyEvent),
     Timer(ParticipantTimerEvent),
@@ -51,6 +58,25 @@ pub enum ParticipantControlEvent {
         origin: ParticipantId,
         track_id: TrackId,
     },
+    DataTopicPublished {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicUnpublished {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicSubscribed {
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: Topic,
+    },
+    DataTopicUnsubscribed {
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: Topic,
+    },
+    DataPacketPublished(SctpEvent),
     KeyframeRequested(GlobalKeyframeRequest),
 }
 
@@ -58,7 +84,7 @@ pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
     audio_queue: VecDeque<RtpEvent>,
     video_queue: VecDeque<RtpEvent>,
-    data_queue: VecDeque<RtpEvent>, // Added to handle the full match breakdown
+    data_queue: VecDeque<SctpEvent>,
     shard_events: VecDeque<ShardEvent>,
 }
 
@@ -95,6 +121,10 @@ impl EventPipeline {
 
     pub fn push_shard_event(&mut self, ev: ShardEvent) {
         self.shard_events.push_back(ev);
+    }
+
+    pub fn pop_data_sctp(&mut self) -> Option<SctpEvent> {
+        self.data_queue.pop_front()
     }
 
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
@@ -159,6 +189,56 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
+    fn subscribe_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::DataTopicSubscribed {
+                    room_id: self.room_id,
+                    subscriber: self.id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn unsubscribe_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::DataTopicUnsubscribed {
+                    room_id: self.room_id,
+                    subscriber: self.id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn publish_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::DataTopicPublished {
+                    room_id: self.room_id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn unpublish_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::DataTopicUnpublished {
+                    room_id: self.room_id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
     fn request_keyframe(&mut self, layer: &TrackLayer) {
         self.pipeline
             .participant_events
@@ -207,10 +287,21 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         match stream_id.0.kind() {
             TrackKind::Audio => self.pipeline.audio_queue.push_back(event),
             TrackKind::Video => self.pipeline.video_queue.push_back(event),
-            TrackKind::Data => todo!("remove data"),
+            TrackKind::Data => {}
         }
     }
 
     #[inline]
-    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>) {}
+    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::DataPacketPublished(SctpEvent {
+                    topic,
+                    pkt,
+                    room_id: self.room_id,
+                    origin: self.id,
+                }),
+            ));
+    }
 }

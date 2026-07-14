@@ -128,6 +128,60 @@ impl ControllerCore {
                     },
                 );
             }
+            ShardEvent::DataTopicPublished { room_id, topic } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::PublishDataTopic {
+                                room_id,
+                                topic: topic.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::DataTopicUnpublished { room_id, topic } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::UnpublishDataTopic {
+                                room_id,
+                                topic: topic.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::DataTopicSubscribed { room_id, topic } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::SubscribeDataTopic {
+                                room_id,
+                                from_shard_id: e.from_shard_id,
+                                topic: topic.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::DataTopicUnsubscribed { room_id, topic } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::UnsubscribeDataTopic {
+                                room_id,
+                                from_shard_id: e.from_shard_id,
+                                topic: topic.clone(),
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 

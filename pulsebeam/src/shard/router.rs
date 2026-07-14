@@ -10,7 +10,7 @@ use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
 use crate::rtp::RtpPacket;
-use crate::track::{StreamId, Track, TrackMeta};
+use crate::track::{StreamId, Topic, Track, TrackMeta};
 
 use super::worker::{CrossShardEvent, ShardEvent};
 
@@ -44,6 +44,7 @@ pub(crate) trait RoutingContext: CrossShardSend {
         slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
     );
+    fn forward_sctp(&mut self, subscriber: ParticipantId, topic: &Topic, pkt: &[u8]);
     fn notify_tracks_published(&mut self, participant_id: ParticipantId, tracks: &[Track]);
     fn notify_tracks_unpublished(&mut self, participant_id: ParticipantId, track_ids: &[TrackId]);
     fn notify_keyframe_request(
@@ -65,6 +66,8 @@ pub(crate) struct ShardRoomContext {
     pub members: FastIndexSet<ParticipantId>,
     pub remote_shards: FastIndexSet<ShardId>,
     pub audio_selector: TopNAudioSelector,
+    pub data_topics: HashMap<Topic, DataTopicRoute>,
+    pub data_publisher_refcounts: HashMap<Topic, usize>,
 }
 
 impl ShardRoomContext {
@@ -73,6 +76,22 @@ impl ShardRoomContext {
             members: fast_set(),
             remote_shards: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
+            data_topics: HashMap::default(),
+            data_publisher_refcounts: HashMap::default(),
+        }
+    }
+}
+
+pub(crate) struct DataTopicRoute {
+    pub subscribers: FastIndexSet<ParticipantId>,
+    pub remote_shards: FastIndexSet<ShardId>,
+}
+
+impl DataTopicRoute {
+    fn new() -> Self {
+        Self {
+            subscribers: fast_set_with_capacity(256),
+            remote_shards: fast_set(),
         }
     }
 }
@@ -141,6 +160,12 @@ impl ShardRoutingTable {
             return;
         };
         room.members.swap_remove(participant_id);
+        for route in room.data_topics.values_mut() {
+            route.subscribers.swap_remove(participant_id);
+        }
+        room.data_topics.retain(|_, route| {
+            !(route.subscribers.is_empty() && route.remote_shards.is_empty())
+        });
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -286,6 +311,104 @@ impl ShardRoutingTable {
         }
     }
 
+    pub fn register_data_publisher(&mut self, room_id: RoomId, topic: Topic) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        let count = room.data_publisher_refcounts.entry(topic).or_insert(0);
+        let was_zero = *count == 0;
+        *count += 1;
+        was_zero
+    }
+
+    pub fn unregister_data_publisher(&mut self, room_id: RoomId, topic: &Topic) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        if let Some(count) = room.data_publisher_refcounts.get_mut(topic) {
+            let was_one = *count == 1;
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                room.data_publisher_refcounts.remove(topic);
+            }
+            return was_one;
+        }
+        false
+    }
+
+    pub fn register_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: Topic,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        let route = room
+            .data_topics
+            .entry(topic)
+            .or_insert_with(DataTopicRoute::new);
+        let was_empty = route.subscribers.is_empty();
+        route.subscribers.insert(subscriber);
+        was_empty
+    }
+
+    pub fn unregister_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: &Topic,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        let Some(route) = room.data_topics.get_mut(topic) else {
+            return false;
+        };
+        let was_one = route.subscribers.len() == 1 && route.subscribers.contains(&subscriber);
+        route.subscribers.swap_remove(&subscriber);
+        let no_locals = route.subscribers.is_empty();
+        if no_locals && route.remote_shards.is_empty() {
+            room.data_topics.remove(topic);
+        }
+        was_one
+    }
+
+    pub fn register_remote_data_subscriber_shard(
+        &mut self,
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        topic: Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        room.data_topics
+            .entry(topic)
+            .or_insert_with(DataTopicRoute::new)
+            .remote_shards
+            .insert(from_shard_id);
+    }
+
+    pub fn unregister_remote_data_subscriber_shard(
+        &mut self,
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        topic: &Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let Some(route) = room.data_topics.get_mut(topic) else {
+            return;
+        };
+        route.remote_shards.swap_remove(&from_shard_id);
+        if route.subscribers.is_empty() && route.remote_shards.is_empty() {
+            room.data_topics.remove(topic);
+        }
+    }
+
     // -- track subscription topology (remote shards) ---------------------
 
     pub fn register_remote_subscriber_shard(&mut self, from_shard_id: ShardId, track: TrackMeta) {
@@ -400,6 +523,44 @@ impl ShardRoutingTable {
             ctx.forward_audio_rtp(participant_id, slot_idx, &ev.pkt);
         }
     }
+
+    #[inline]
+    pub fn route_data(
+        &mut self,
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: &Topic,
+        pkt: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let Some(route) = room.data_topics.get(topic) else {
+            return;
+        };
+
+        for &subscriber_id in &route.subscribers {
+            // if subscriber_id == origin {
+            //     continue;
+            // }
+            ctx.forward_sctp(subscriber_id, topic, pkt);
+        }
+
+        if ctx.is_local(&origin) {
+            for &shard_id in &route.remote_shards {
+                ctx.send(
+                    shard_id,
+                    CrossShardEvent::DataSctpPublished {
+                        room_id,
+                        origin,
+                        topic: topic.clone(),
+                        pkt: pkt.to_vec(),
+                    },
+                );
+            }
+        }
+    }
 }
 
 // -- participant-originated control-event routing -------------------------
@@ -426,6 +587,45 @@ pub(crate) fn route_participant_control_event(
                 router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
             }
         }
+        ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
+            shard_events.push_back(ShardEvent::DataTopicPublished { room_id, topic });
+        }
+        ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
+            shard_events.push_back(ShardEvent::DataTopicUnpublished { room_id, topic });
+        }
+        ParticipantControlEvent::DataTopicSubscribed {
+            room_id,
+            subscriber,
+            topic,
+        } => {
+            tracing::trace!(
+                room_id = %room_id,
+                subscriber = %subscriber,
+                topic = %topic.as_ref(),
+                "data topic subscribe is handled directly in shard core"
+            );
+        }
+        ParticipantControlEvent::DataTopicUnsubscribed {
+            room_id,
+            subscriber,
+            topic,
+        } => {
+            tracing::trace!(
+                room_id = %room_id,
+                subscriber = %subscriber,
+                topic = %topic.as_ref(),
+                "data topic unsubscribe is handled directly in shard core"
+            );
+        }
+        ParticipantControlEvent::DataPacketPublished(ev) => {
+            tracing::trace!(
+                room_id = %ev.room_id,
+                origin = %ev.origin,
+                topic = %ev.topic.as_ref(),
+                len = ev.pkt.len(),
+                "data packet is routed directly by shard core"
+            );
+        }
     }
 }
 
@@ -447,6 +647,7 @@ mod tests {
         sent: RefCell<Vec<(ShardId, CrossShardEvent)>>,
         forwarded_video: RefCell<Vec<ParticipantId>>,
         forwarded_audio: RefCell<Vec<(ParticipantId, AudioSelectorSlotId)>>,
+        forwarded_sctp: RefCell<Vec<ParticipantId>>,
         published: RefCell<Vec<ParticipantId>>,
         unpublished: RefCell<Vec<ParticipantId>>,
         keyframed: RefCell<Vec<ParticipantId>>,
@@ -479,6 +680,9 @@ mod tests {
             self.forwarded_audio
                 .borrow_mut()
                 .push((subscriber, slot_idx));
+        }
+        fn forward_sctp(&mut self, subscriber: ParticipantId, _topic: &Topic, _pkt: &[u8]) {
+            self.forwarded_sctp.borrow_mut().push(subscriber);
         }
         fn notify_tracks_published(&mut self, participant_id: ParticipantId, _tracks: &[Track]) {
             self.published.borrow_mut().push(participant_id);

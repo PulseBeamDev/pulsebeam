@@ -401,12 +401,23 @@ pub mod test_utils {
 }
 
 mod data_track {
+    use std::fmt::Display;
+
     const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 64;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum DataTrackDirection {
         Publish,
         Subscribe,
+    }
+
+    impl Display for DataTrackDirection {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                DataTrackDirection::Publish => f.write_str("pub"),
+                DataTrackDirection::Subscribe => f.write_str("sub"),
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -416,6 +427,12 @@ mod data_track {
         #[inline]
         fn as_ref(&self) -> &str {
             &self.0
+        }
+    }
+
+    impl Display for Topic {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
         }
     }
 
@@ -436,12 +453,21 @@ mod data_track {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct DataTopicChannel {
+        pub direction: DataTrackDirection,
+        pub topic: crate::track::Topic,
+    }
+
+    impl Display for DataTopicChannel {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "v1/rt/{}/{}", self.direction, self.topic)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub enum DataTrackIntent {
         InternalSignaling,
-        UserTopic {
-            direction: DataTrackDirection,
-            topic: Topic,
-        },
+        UserTopic(DataTopicChannel),
     }
 
     #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,10 +539,11 @@ mod data_track {
                     let prefix_len = s.len() - topic_slice.len();
                     s.drain(0..prefix_len);
 
-                    Ok(Self::UserTopic {
+                    let topic = DataTopicChannel {
                         direction,
                         topic: Topic(s),
-                    })
+                    };
+                    Ok(Self::UserTopic(topic))
                 }
                 _ => Err(DataTrackIntentError::InvalidLane),
             }
@@ -550,18 +577,18 @@ mod data_track {
         fn test_valid_user_topics() {
             // Publish path
             let res = DataTrackIntent::try_from("v1/rt/pub/game-sync".to_string()).unwrap();
-            if let DataTrackIntent::UserTopic { direction, topic } = res {
-                assert_eq!(direction, DataTrackDirection::Publish);
-                assert_eq!(topic.deref(), "game-sync");
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.direction, DataTrackDirection::Publish);
+                assert_eq!(e.topic.deref(), "game-sync");
             } else {
                 panic!("Expected UserTopic variant");
             }
 
             // Subscribe path
             let res = DataTrackIntent::try_from("v1/rt/sub/audio_stream_12".to_string()).unwrap();
-            if let DataTrackIntent::UserTopic { direction, topic } = res {
-                assert_eq!(direction, DataTrackDirection::Subscribe);
-                assert_eq!(topic.deref(), "audio_stream_12");
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.direction, DataTrackDirection::Subscribe);
+                assert_eq!(e.topic.deref(), "audio_stream_12");
             } else {
                 panic!("Expected UserTopic variant");
             }

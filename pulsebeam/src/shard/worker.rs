@@ -13,7 +13,7 @@ use crate::{
     participant::ParticipantConfig,
     rtp::RtpPacket,
     shard::metrics::ShardMetrics,
-    track::{GlobalKeyframeRequest, StreamId, Track, TrackMeta},
+    track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackMeta},
 };
 
 use super::core::{CrossShardSend, ShardCore};
@@ -66,6 +66,24 @@ pub enum ClusterCommand {
         from_shard_id: ShardId,
         track: TrackMeta,
     },
+    PublishDataTopic {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    UnpublishDataTopic {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    SubscribeDataTopic {
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        topic: Topic,
+    },
+    UnsubscribeDataTopic {
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        topic: Topic,
+    },
 }
 
 pub enum CrossShardEvent {
@@ -84,6 +102,12 @@ pub enum CrossShardEvent {
     UdpPacket {
         participant_id: ParticipantId,
         batch: RecvPacketBatch,
+    },
+    DataSctpPublished {
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: Topic,
+        pkt: Vec<u8>,
     },
 }
 
@@ -106,6 +130,10 @@ pub enum ShardEvent {
     TrackSubscribed(TrackMeta),
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     TrackUnsubscribed(TrackMeta),
+    DataTopicPublished { room_id: RoomId, topic: Topic },
+    DataTopicUnpublished { room_id: RoomId, topic: Topic },
+    DataTopicSubscribed { room_id: RoomId, topic: Topic },
+    DataTopicUnsubscribed { room_id: RoomId, topic: Topic },
 }
 
 #[derive(Clone)]

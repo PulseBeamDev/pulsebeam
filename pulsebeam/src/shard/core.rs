@@ -2,7 +2,10 @@ use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
-use super::events::{ParticipantEvent, ParticipantLifecycleEvent, ParticipantTimerEvent, RtpEvent};
+use super::events::{
+    ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent, ParticipantTimerEvent,
+    RtpEvent,
+};
 use crate::id::AudioSelectorSlotId;
 use crate::{
     entity::{ParticipantId, TrackKind},
@@ -63,6 +66,13 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.with_span(|core| core.on_forward_audio_rtp(slot_idx, pkt));
+            self.dirty.mark(self.kind, subscriber);
+        }
+    }
+
+    fn forward_sctp(&mut self, subscriber: ParticipantId, topic: &crate::track::Topic, pkt: &[u8]) {
+        if let Some(p) = self.registry.get_mut(&subscriber) {
+            p.with_span(|core| core.on_forward_sctp(topic, pkt));
             self.dirty.mark(self.kind, subscriber);
         }
     }
@@ -226,6 +236,17 @@ impl ShardCore {
             };
             self.routing.route_video(ev.stream_id, &ev.pkt, &mut ctx);
         }
+
+        while let Some(ev) = self.pipeline.pop_data_sctp() {
+            let mut ctx = DispatchCtx {
+                registry: &mut self.registry,
+                dirty: &mut self.dirty,
+                kind: DirtyKind::Fanout,
+                router,
+            };
+            self.routing
+                .route_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
+        }
     }
 
     pub(crate) fn flush_participant_events(&mut self, router: &impl CrossShardSend) {
@@ -252,11 +273,68 @@ impl ShardCore {
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
                 ParticipantEvent::Control(ev) => {
-                    router::route_participant_control_event(
-                        ev,
-                        self.pipeline.shard_events_mut(),
-                        router,
-                    );
+                    match ev {
+                        ParticipantControlEvent::DataPacketPublished(data) => {
+                            let mut ctx = DispatchCtx {
+                                registry: &mut self.registry,
+                                dirty: &mut self.dirty,
+                                kind: DirtyKind::Fanout,
+                                router,
+                            };
+                            self.routing.route_data(
+                                data.room_id,
+                                data.origin,
+                                &data.topic,
+                                &data.pkt,
+                                &mut ctx,
+                            );
+                        }
+                        ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
+                            if self.routing.register_data_publisher(room_id, topic.clone()) {
+                                self.pipeline
+                                    .push_shard_event(ShardEvent::DataTopicPublished { room_id, topic });
+                            }
+                        }
+                        ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
+                            if self.routing.unregister_data_publisher(room_id, &topic) {
+                                self.pipeline
+                                    .push_shard_event(ShardEvent::DataTopicUnpublished { room_id, topic });
+                            }
+                        }
+                        ParticipantControlEvent::DataTopicSubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                        } => {
+                            if self
+                                .routing
+                                .register_data_subscriber(room_id, subscriber, topic.clone())
+                            {
+                                self.pipeline
+                                    .push_shard_event(ShardEvent::DataTopicSubscribed { room_id, topic });
+                            }
+                        }
+                        ParticipantControlEvent::DataTopicUnsubscribed {
+                            room_id,
+                            subscriber,
+                            topic,
+                        } => {
+                            if self
+                                .routing
+                                .unregister_data_subscriber(room_id, subscriber, &topic)
+                            {
+                                self.pipeline
+                                    .push_shard_event(ShardEvent::DataTopicUnsubscribed { room_id, topic });
+                            }
+                        }
+                        ev => {
+                            router::route_participant_control_event(
+                                ev,
+                                self.pipeline.shard_events_mut(),
+                                router,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -385,6 +463,31 @@ impl ShardCore {
                 self.routing
                     .unregister_remote_subscriber_shard(from_shard_id, track);
             }
+            ClusterCommand::PublishDataTopic { room_id, topic } => {
+                let _ = (room_id, topic);
+            }
+            ClusterCommand::UnpublishDataTopic { room_id, topic } => {
+                let _ = (room_id, topic);
+            }
+            ClusterCommand::SubscribeDataTopic {
+                room_id,
+                from_shard_id,
+                topic,
+            } => {
+                self.routing
+                    .register_remote_data_subscriber_shard(room_id, from_shard_id, topic);
+            }
+            ClusterCommand::UnsubscribeDataTopic {
+                room_id,
+                from_shard_id,
+                topic,
+            } => {
+                self.routing.unregister_remote_data_subscriber_shard(
+                    room_id,
+                    from_shard_id,
+                    &topic,
+                );
+            }
         }
         Some(())
     }
@@ -442,6 +545,21 @@ impl ShardCore {
                     router,
                 };
                 ctx.notify_keyframe_request(req.origin, req.stream_id, req.kind);
+            }
+            CrossShardEvent::DataSctpPublished {
+                room_id,
+                origin,
+                topic,
+                pkt,
+            } => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    kind: DirtyKind::Fanout,
+                    router,
+                };
+                self.routing
+                    .route_data(room_id, origin, &topic, &pkt, &mut ctx);
             }
         }
     }

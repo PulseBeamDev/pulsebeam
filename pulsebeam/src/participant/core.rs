@@ -7,6 +7,7 @@ use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
 use std::time::Duration;
 use str0m::bwe::BweKind;
+use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::Protocol;
@@ -16,7 +17,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::entity::{self, TrackId, TrackKind};
+use crate::entity::{self, TrackId};
 use crate::id::ShardId;
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
@@ -26,8 +27,8 @@ use crate::participant::{
 };
 use crate::rtp::RtpPacket;
 use crate::track::{
-    self, DataTrackDirection, DataTrackIntent, DataTrackIntentError, KEYFRAME_DEBOUNCE, StreamId,
-    StreamWriter, Track,
+    self, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
+    KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Topic, Track,
 };
 
 const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
@@ -65,6 +66,8 @@ pub enum DisconnectReason {
     InvalidMediaDirection,
     #[error("Invalid data channel protocol: {0}")]
     InvalidDataTrackIntent(#[from] DataTrackIntentError),
+    #[error("Duplicate data channel label for same direction: {0}")]
+    DuplicateDataChannelLabel(DataTopicChannel),
     #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
     #[error("Room closed")]
@@ -104,6 +107,9 @@ pub struct ParticipantCore {
 
     published_tracks: HashMap<TrackId, Track>,
     track_availability: HashMap<TrackId, TrackAvailability>,
+    data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
+    data_pub_channels: HashMap<Topic, ChannelId>,
+    data_sub_channels: HashMap<Topic, ChannelId>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -140,6 +146,9 @@ impl ParticipantCore {
             last_keyframe_request: HashMap::new(),
             published_tracks: HashMap::new(),
             track_availability: HashMap::new(),
+            data_topic_channels: HashMap::new(),
+            data_pub_channels: HashMap::new(),
+            data_sub_channels: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -174,6 +183,20 @@ impl ParticipantCore {
         let mut writer = StreamWriter(&mut self.rtc);
         self.downstream
             .on_forward_audio_rtp(slot_idx, pkt, &mut writer);
+    }
+
+    #[inline]
+    pub fn on_forward_sctp(&mut self, topic: &Topic, pkt: &[u8]) {
+        let Some(cid) = self.data_sub_channels.get(topic).copied() else {
+            return;
+        };
+
+        let Some(mut ch) = self.rtc.channel(cid) else {
+            return;
+        };
+        if let Err(err) = ch.write(false, pkt) {
+            tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+        }
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
@@ -267,6 +290,7 @@ impl ParticipantCore {
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         'drain: loop {
             let Some(rtc_deadline) = self.poll_rtc(events) else {
+                self.cleanup_data_topics(events);
                 events.exit();
                 return;
             };
@@ -436,18 +460,48 @@ impl ParticipantCore {
                         self.signaling.set_cid(cid);
                     }
 
-                    DataTrackIntent::UserTopic { direction, topic } => {
-                        let _topic = self.participant_id.derive_track_id(TrackKind::Data, &topic);
-                        match direction {
+                    DataTrackIntent::UserTopic(e) => {
+                        if let Some(previous) = self.data_topic_channels.remove(&cid) {
+                            self.release_data_topic_channel(previous, events);
+                        }
+
+                        let duplicate = match e.direction {
+                            DataTrackDirection::Publish => self
+                                .data_pub_channels
+                                .get(&e.topic)
+                                .copied()
+                                .filter(|existing| *existing != cid),
+                            DataTrackDirection::Subscribe => self
+                                .data_sub_channels
+                                .get(&e.topic)
+                                .copied()
+                                .filter(|existing| *existing != cid),
+                        };
+                        if duplicate.is_some() {
+                            self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
+                            return;
+                        }
+
+                        self.data_topic_channels.insert(cid, e.clone());
+                        match e.direction {
                             DataTrackDirection::Publish => {
-                                // self.upstream.add_data_track(cid, topic);
+                                self.data_pub_channels.insert(e.topic.clone(), cid);
+                                events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
-                                // self.downstream.add_data_track(cid, topic);
+                                self.data_sub_channels.insert(e.topic.clone(), cid);
+                                events.subscribe_data_topic(e.topic);
                             }
                         }
                     }
                 }
+            }
+            Event::ChannelClose(cid) => {
+                let Some(ch) = self.data_topic_channels.remove(&cid) else {
+                    return;
+                };
+                tracing::info!("{} is closed", ch.topic);
+                self.release_data_topic_channel(ch, events);
             }
             Event::ChannelData(data) => {
                 if Some(data.id) == self.signaling.cid
@@ -461,6 +515,13 @@ impl ParticipantCore {
                         })
                 {
                     self.disconnect(err.into());
+                    return;
+                }
+
+                if let Some(ch) = self.data_topic_channels.get(&data.id)
+                    && ch.direction == DataTrackDirection::Publish
+                {
+                    events.publish_sctp(ch.topic.clone(), data.data.to_vec());
                 }
             }
             Event::StreamPaused(stream) => {
@@ -672,6 +733,35 @@ impl ParticipantCore {
                 .expect("handle_incoming_rtp returned true so mid must have a slot");
             let stream_id: StreamId = (track_id, rid);
             events.publish_rtp(stream_id, rtp);
+        }
+    }
+
+    fn cleanup_data_topics(&mut self, events: &mut impl ParticipantSink) {
+        let channels: Vec<_> = self.data_topic_channels.drain().collect();
+
+        for (cid, ch) in channels {
+            let _ = cid;
+            self.release_data_topic_channel(ch, events);
+        }
+
+        self.data_pub_channels.clear();
+        self.data_sub_channels.clear();
+    }
+
+    fn release_data_topic_channel(
+        &mut self,
+        ch: DataTopicChannel,
+        events: &mut impl ParticipantSink,
+    ) {
+        match ch.direction {
+            DataTrackDirection::Publish => {
+                self.data_pub_channels.remove(&ch.topic);
+                events.unpublish_data_topic(ch.topic);
+            }
+            DataTrackDirection::Subscribe => {
+                self.data_sub_channels.remove(&ch.topic);
+                events.unsubscribe_data_topic(ch.topic);
+            }
         }
     }
 

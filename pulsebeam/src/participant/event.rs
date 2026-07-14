@@ -8,6 +8,10 @@ pub trait ParticipantSink {
     fn unsubscribe(&mut self, track: TrackMeta);
     fn publish_track(&mut self, track: Track);
     fn unpublish_track(&mut self, track_id: TrackId);
+    fn subscribe_data_topic(&mut self, topic: Topic);
+    fn unsubscribe_data_topic(&mut self, topic: Topic);
+    fn publish_data_topic(&mut self, topic: Topic);
+    fn unpublish_data_topic(&mut self, topic: Topic);
     fn request_keyframe(&mut self, layer: &TrackLayer);
     fn update_deadline(&mut self, deadline: Instant);
     fn exit(&mut self);
@@ -26,6 +30,10 @@ pub mod test_utils {
         pub unsubscribe_calls: Vec<TrackMeta>,
         pub publish_track_calls: Vec<TrackId>,
         pub unpublish_track_calls: Vec<TrackId>,
+        pub subscribe_data_topic_calls: Vec<Topic>,
+        pub unsubscribe_data_topic_calls: Vec<Topic>,
+        pub publish_data_topic_calls: Vec<Topic>,
+        pub unpublish_data_topic_calls: Vec<Topic>,
         pub request_keyframe_calls: Vec<(StreamId, crate::entity::ParticipantId)>,
         pub update_deadline_calls: Vec<Instant>,
         pub exit_count: usize,
@@ -58,6 +66,22 @@ pub mod test_utils {
 
         fn unpublish_track(&mut self, track_id: TrackId) {
             self.unpublish_track_calls.push(track_id);
+        }
+
+        fn subscribe_data_topic(&mut self, topic: Topic) {
+            self.subscribe_data_topic_calls.push(topic);
+        }
+
+        fn unsubscribe_data_topic(&mut self, topic: Topic) {
+            self.unsubscribe_data_topic_calls.push(topic);
+        }
+
+        fn publish_data_topic(&mut self, topic: Topic) {
+            self.publish_data_topic_calls.push(topic);
+        }
+
+        fn unpublish_data_topic(&mut self, topic: Topic) {
+            self.unpublish_data_topic_calls.push(topic);
         }
 
         fn request_keyframe(&mut self, layer: &TrackLayer) {
