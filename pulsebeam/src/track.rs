@@ -504,10 +504,11 @@ mod data_track {
         IllegalCharacters,
     }
 
-    impl TryFrom<(String, &ChannelConfig)> for DataTrackIntent {
+    impl TryFrom<&ChannelConfig> for DataTrackIntent {
         type Error = DataTrackIntentError;
 
-        fn try_from((mut s, cfg): (String, &ChannelConfig)) -> Result<Self, Self::Error> {
+        fn try_from(cfg: &ChannelConfig) -> Result<Self, Self::Error> {
+            let s = &cfg.label;
             if s.len() > MAX_DATA_TRACK_NAMESPACE_LEN {
                 return Err(DataTrackIntentError::LabelTooLong);
             }
@@ -534,7 +535,7 @@ mod data_track {
                     ) && !cfg.ordered;
                     if !supported_delivery_guarantee {
                         return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
-                            label: s,
+                            label: s.clone(),
                             ordered: cfg.ordered,
                             reliability: cfg.reliability,
                         });
@@ -559,12 +560,9 @@ mod data_track {
                         return Err(DataTrackIntentError::IllegalCharacters);
                     }
 
-                    let prefix_len = s.len() - topic_slice.len();
-                    s.drain(0..prefix_len);
-
                     let topic = DataTopicChannel {
                         direction,
-                        topic: Topic(s),
+                        topic: Topic(topic_slice.to_string()),
                     };
                     Ok(Self::UserTopic(topic))
                 }
@@ -578,28 +576,37 @@ mod data_track {
         use std::ops::Deref;
 
         use super::*;
+        fn cfg(label: &str) -> ChannelConfig {
+            ChannelConfig {
+                label: label.to_string(),
+                ordered: false,
+                reliability: Reliability::MaxRetransmits { retransmits: 0 },
+                negotiated: None,
+                protocol: "".to_string(),
+            }
+        }
 
         #[test]
         fn test_modern_system_routing() {
-            let res = DataTrackIntent::try_from("v1/sys/signaling".to_string()).unwrap();
+            let res = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap();
             assert!(matches!(res, DataTrackIntent::InternalSignaling));
         }
 
         #[test]
         fn test_invalid_system_channels() {
             // Unknown system channel
-            let err = DataTrackIntent::try_from("v1/sys/metrics".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/sys/metrics")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::InvalidDirection);
 
             // Malformed layout trailing after signaling
-            let err = DataTrackIntent::try_from("v1/sys/signaling/extra".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/sys/signaling/extra")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::InvalidDirection);
         }
 
         #[test]
         fn test_valid_user_topics() {
             // Publish path
-            let res = DataTrackIntent::try_from("v1/rt/pub/game-sync".to_string()).unwrap();
+            let res = DataTrackIntent::try_from(&cfg("v1/rt/pub/game-sync")).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
                 assert_eq!(e.direction, DataTrackDirection::Publish);
                 assert_eq!(e.topic.deref(), "game-sync");
@@ -608,7 +615,7 @@ mod data_track {
             }
 
             // Subscribe path
-            let res = DataTrackIntent::try_from("v1/rt/sub/audio_stream_12".to_string()).unwrap();
+            let res = DataTrackIntent::try_from(&cfg("v1/rt/sub/audio_stream_12")).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
                 assert_eq!(e.direction, DataTrackDirection::Subscribe);
                 assert_eq!(e.topic.deref(), "audio_stream_12");
@@ -620,40 +627,40 @@ mod data_track {
         #[test]
         fn test_invalid_version_and_lane() {
             // Bad version prefix
-            let err = DataTrackIntent::try_from("v2/rt/pub/topic".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v2/rt/pub/topic")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::InvalidVersion);
 
             // Unknown lane (neither sys nor rt)
-            let err = DataTrackIntent::try_from("v1/data/pub/topic".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/data/pub/topic")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::InvalidLane);
         }
 
         #[test]
         fn test_invalid_direction() {
-            let err = DataTrackIntent::try_from("v1/rt/broadcast/topic".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/broadcast/topic")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::InvalidDirection);
         }
 
         #[test]
         fn test_missing_or_empty_label() {
-            let err = DataTrackIntent::try_from("v1/rt/pub/".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::MissingLabel);
 
-            let err = DataTrackIntent::try_from("v1/rt/pub".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/pub")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::MissingLabel);
         }
 
         #[test]
         fn test_illegal_characters() {
             // Forward slashes are caught by char check since splitn stops at 4
-            let err = DataTrackIntent::try_from("v1/rt/pub/game/engine".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/game/engine")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::IllegalCharacters);
 
             // Spaces and symbols
-            let err = DataTrackIntent::try_from("v1/rt/pub/my topic".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/my topic")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::IllegalCharacters);
 
-            let err = DataTrackIntent::try_from("v1/rt/pub/topic$".to_string()).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/topic$")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::IllegalCharacters);
         }
 
@@ -661,11 +668,11 @@ mod data_track {
         fn test_max_length_boundary() {
             // Exact boundary (10 bytes prefix + 54 bytes topic = 64 total)
             let exact_valid = format!("v1/rt/pub/{}", "a".repeat(54));
-            assert!(DataTrackIntent::try_from(exact_valid).is_ok());
+            assert!(DataTrackIntent::try_from(&cfg(&exact_valid)).is_ok());
 
             // 1 byte over limit
             let one_byte_over = format!("v1/rt/pub/{}", "a".repeat(55));
-            let err = DataTrackIntent::try_from(one_byte_over).unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg(&one_byte_over)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::LabelTooLong);
         }
     }

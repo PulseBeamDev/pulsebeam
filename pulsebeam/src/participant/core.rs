@@ -443,7 +443,7 @@ impl ParticipantCore {
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 self.downstream.update_bitrate(available)
             }
-            Event::ChannelOpen(cid, label) => {
+            Event::ChannelOpen(cid, _label) => {
                 let Some(ch) = self.rtc.channel(cid) else {
                     return;
                 };
@@ -451,7 +451,7 @@ impl ParticipantCore {
                     return;
                 };
 
-                let intent = match DataTrackIntent::try_from((label, cfg)) {
+                let intent = match DataTrackIntent::try_from(cfg) {
                     Ok(intent) => intent,
                     Err(err) => {
                         self.disconnect(err.into());
