@@ -403,6 +403,8 @@ pub mod test_utils {
 mod data_track {
     use std::fmt::Display;
 
+    use str0m::channel::{ChannelConfig, Reliability};
+
     const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 64;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -470,7 +472,7 @@ mod data_track {
         UserTopic(DataTopicChannel),
     }
 
-    #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
     pub enum DataTrackIntentError {
         #[error("The input string exceeds the maximum permitted security boundary size")]
         LabelTooLong,
@@ -488,15 +490,24 @@ mod data_track {
         MissingLabel,
 
         #[error(
+            "Unsupported data channel configuration for label '{label}': expected unordered with MaxRetransmits(0), but got ordered={ordered}, reliability={reliability:?}"
+        )]
+        UnsupportedDataChannelConfig {
+            label: String,
+            ordered: bool,
+            reliability: Reliability,
+        },
+
+        #[error(
             "The label contains illegal characters (only alphanumeric, dashes, and underscores allowed)"
         )]
         IllegalCharacters,
     }
 
-    impl TryFrom<String> for DataTrackIntent {
+    impl TryFrom<(String, &ChannelConfig)> for DataTrackIntent {
         type Error = DataTrackIntentError;
 
-        fn try_from(mut s: String) -> Result<Self, Self::Error> {
+        fn try_from((mut s, cfg): (String, &ChannelConfig)) -> Result<Self, Self::Error> {
             if s.len() > MAX_DATA_TRACK_NAMESPACE_LEN {
                 return Err(DataTrackIntentError::LabelTooLong);
             }
@@ -517,6 +528,18 @@ mod data_track {
                     }
                 }
                 Some("rt") => {
+                    let supported_delivery_guarantee = matches!(
+                        cfg.reliability,
+                        Reliability::MaxRetransmits { retransmits: 0 }
+                    ) && !cfg.ordered;
+                    if !supported_delivery_guarantee {
+                        return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
+                            label: s,
+                            ordered: cfg.ordered,
+                            reliability: cfg.reliability,
+                        });
+                    }
+
                     let direction = match parts.next() {
                         Some("pub") => DataTrackDirection::Publish,
                         Some("sub") => DataTrackDirection::Subscribe,

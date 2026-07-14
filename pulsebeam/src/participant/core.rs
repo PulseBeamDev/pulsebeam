@@ -31,7 +31,6 @@ use crate::track::{
     KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Topic, Track,
 };
 
-const RESERVED_DATA_CHANNEL_COUNT: u16 = 2;
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct TrackAvailability {
@@ -445,8 +444,14 @@ impl ParticipantCore {
                 self.downstream.update_bitrate(available)
             }
             Event::ChannelOpen(cid, label) => {
-                tracing::info!("{} is opened", label);
-                let intent = match DataTrackIntent::try_from(label) {
+                let Some(ch) = self.rtc.channel(cid) else {
+                    return;
+                };
+                let Some(cfg) = ch.config() else {
+                    return;
+                };
+
+                let intent = match DataTrackIntent::try_from((label, cfg)) {
                     Ok(intent) => intent,
                     Err(err) => {
                         self.disconnect(err.into());
@@ -461,6 +466,7 @@ impl ParticipantCore {
                     }
 
                     DataTrackIntent::UserTopic(e) => {
+                        tracing::info!("{} is opened", e.topic);
                         if let Some(previous) = self.data_topic_channels.remove(&cid) {
                             self.release_data_topic_channel(previous, events);
                         }
