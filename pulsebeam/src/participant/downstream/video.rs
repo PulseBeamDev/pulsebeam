@@ -72,7 +72,7 @@ impl VideoAllocator {
         if self.tracks.contains_key(&track.meta.id) {
             return;
         }
-        crate::log::info!(track = %track.meta.id, "video track added");
+        tracing::info!(track = %track.meta.id, "video track added");
         self.tracks.insert(track.meta.id, track);
         self.rebalance();
     }
@@ -81,7 +81,7 @@ impl VideoAllocator {
         if self.tracks.remove(track_id).is_none() {
             return false;
         }
-        crate::log::info!(track = %track_id, "video track removed");
+        tracing::info!(track = %track_id, "video track removed");
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
         for slot in self.slots.values_mut() {
@@ -125,7 +125,7 @@ impl VideoAllocator {
             && max_height > 0
         {
             let Some(track_state) = tracks.get_mut(track_id) else {
-                crate::log::warn!(track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
+                tracing::warn!(track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
                 slot.max_height = 0;
                 slot.stop();
                 return None;
@@ -175,7 +175,7 @@ impl VideoAllocator {
 
     pub fn add_slot(&mut self, config: SlotConfig) {
         if self.has_slot(config.mid) {
-            crate::log::debug!(mid = %config.mid, "video slot already provisioned; skipping duplicate");
+            tracing::debug!(mid = %config.mid, "video slot already provisioned; skipping duplicate");
             return;
         }
         let slot = Slot::new(config, &mut self.rng);
@@ -213,7 +213,7 @@ impl VideoAllocator {
             .count();
         let pending_count = self.tracks.len().saturating_sub(already_assigned.len());
         if pending_count > 0 && idle_slot_count == 0 {
-            crate::log::debug!(
+            tracing::debug!(
                 pending_tracks = pending_count,
                 total_slots = self.slots.len(),
                 "rebalance: pending tracks but no idle slots, tracks will wait"
@@ -235,7 +235,7 @@ impl VideoAllocator {
             }
         }
         if staged > 0 {
-            crate::log::debug!(
+            tracing::debug!(
                 staged,
                 "rebalance: staged tracks into idle slots, awaiting BWE to activate"
             );
@@ -280,7 +280,7 @@ impl VideoAllocator {
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
         for (key, decision) in &decisions {
             let Some(slot) = self.slots.get_mut(*key) else {
-                crate::log::warn!("no slot found from decision");
+                tracing::warn!("no slot found from decision");
                 continue;
             };
 
@@ -323,7 +323,7 @@ impl VideoAllocator {
         };
 
         let Some(slot) = self.slots.get_mut(*slot_key) else {
-            crate::log::warn!("no slot found for {:?}", stream_id);
+            tracing::warn!("no slot found for {:?}", stream_id);
             return false;
         };
 
@@ -419,7 +419,7 @@ impl VideoAllocator {
             {
                 if let Some(existing_slot) = seen.get(&layer.meta.id) {
                     if existing_slot != &slot_key {
-                        crate::log::error!(
+                        tracing::error!(
                             track = %layer.meta.id,
                             first_slot = ?existing_slot,
                             second_slot = ?slot_key,
@@ -536,7 +536,7 @@ impl Slot {
 
         if reached_keepalive {
             self.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
-            crate::log::debug!(
+            tracing::debug!(
                 mid = %self.mid,
                 retries = KEYFRAME_MAX_RETRIES,
                 interval = ?self.staging_keyframe_interval,
@@ -566,7 +566,7 @@ impl Slot {
                 self.switcher.clear_staging();
                 self.pli_reset();
                 changed = true;
-                crate::log::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
+                tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
             }
         } else if self.target().as_ref() != Some(&new_layer) {
             self.staging = Some(new_layer.clone());
@@ -576,20 +576,20 @@ impl Slot {
             // Reset retry state so the new staging layer gets fresh PLI attempts.
             self.pli_reset();
             changed = true;
-            crate::log::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
+            tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
         }
 
         if self.paused {
             self.paused = false;
             changed = true;
-            crate::log::debug!(mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
+            tracing::debug!(mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
         }
 
         changed
     }
 
     fn stop(&mut self) {
-        crate::log::debug!(mid=%self.mid, "slot stopped");
+        tracing::debug!(mid=%self.mid, "slot stopped");
         self.active = None;
         self.staging = None;
         self.pli_reset();
@@ -608,13 +608,13 @@ impl Slot {
         if self.staging.as_ref() != Some(layer) {
             self.staging = Some(layer.clone());
             changed = true;
-            crate::log::debug!(mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
+            tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
         }
 
         if !self.paused {
             self.paused = true;
             changed = true;
-            crate::log::debug!(mid=%self.mid, target=?layer.stream_id(), "slot paused");
+            tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot paused");
         }
 
         changed
@@ -622,7 +622,7 @@ impl Slot {
 
     fn process(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
         if self.paused {
-            crate::log::trace!(mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
+            tracing::trace!(mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
             return;
         }
 
@@ -635,7 +635,7 @@ impl Slot {
         {
             self.switcher.stage(pkt.clone());
         } else {
-            crate::log::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
+            tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
         }
     }
 
@@ -682,7 +682,7 @@ pub fn log_allocation(
         reports.push(entry);
     }
 
-    crate::log::info!(
+    tracing::info!(
         %bwe,
         used = %Bitrate::from(total_used_bps as u64),
         want = %desired,

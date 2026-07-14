@@ -89,7 +89,7 @@ impl Negotiator {
     ) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
         const PT_OPUS: Pt = Pt::new_with_value(111);
 
-        crate::log::debug!("{offer}");
+        tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
             .set_rtp_mode(true)
@@ -180,7 +180,7 @@ impl Negotiator {
             .map_err(NegotiatorError::Rtc)?;
         Self::enforce_media_lines(&answer)?;
 
-        crate::log::debug!("{answer}");
+        tracing::debug!("{answer}");
         Ok((rtc, answer))
     }
 

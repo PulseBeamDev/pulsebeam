@@ -35,7 +35,7 @@ impl<'a> StreamWriter<'a> {
     pub fn write_video_owned(&mut self, pkt: RtpPacket, mid: Mid, rid: Option<Rid>, pt: Pt) {
         let mut api = self.0.direct_api();
         let Some(stream) = api.stream_tx_by_mid(mid, rid) else {
-            crate::log::warn!(
+            tracing::warn!(
                 target: crate::log::TARGET_VIDEO,
                 %mid, ?rid,
                 "no stream_tx_by_mid found"
@@ -43,7 +43,7 @@ impl<'a> StreamWriter<'a> {
             return;
         };
         let ssrc = stream.ssrc();
-        crate::log::trace!(
+        tracing::trace!(
             target: crate::log::TARGET_VIDEO,
             %mid, ?rid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
         let rtp = RtpWrite::new(
@@ -62,7 +62,7 @@ impl<'a> StreamWriter<'a> {
     pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, pt: Pt) {
         let mut api = self.0.direct_api();
         let Some(stream) = api.stream_tx_by_mid(mid, None) else {
-            crate::log::warn!(
+            tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
                 %mid,
                 "no stream_tx_by_mid found"
@@ -70,7 +70,7 @@ impl<'a> StreamWriter<'a> {
             return;
         };
         let ssrc = stream.ssrc();
-        crate::log::trace!(
+        tracing::trace!(
             target: crate::log::TARGET_AUDIO,
             %mid, %ssrc, %pt, seq = %pkt.seq_no, ts = pkt.rtp_ts.numer(), len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
 
@@ -356,7 +356,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
     layers.sort_by_key(|e| std::cmp::Reverse(e.quality));
 
-    crate::log::info!(track_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
+    tracing::info!(track_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
     let track = Track {
         meta: meta.clone(),
         layers,

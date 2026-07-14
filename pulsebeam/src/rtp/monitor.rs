@@ -200,7 +200,7 @@ impl StreamMonitor {
     pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
         let bitrate_estimate = self.bwe.estimate_bps() as u64;
-        crate::log::debug!(
+        tracing::debug!(
             stream_id = self.stream_id,
             "upstream bwe={}",
             Bitrate::from(bitrate_estimate)
@@ -233,7 +233,7 @@ impl StreamMonitor {
             if !was_inactive {
                 self.shared_state.inactive.store(true, Ordering::Relaxed);
                 self.smoothed_loss_ratio = WARMUP_LOSS_PENALTY;
-                crate::log::warn!(
+                tracing::warn!(
                     stream_id = %self.stream_id,
                     "Simulcast layer paused while siblings active; applying warmup loss penalty and forcing Bad quality"
                 );
@@ -355,7 +355,7 @@ impl StreamMonitor {
         let new_quality = evaluated_quality;
 
         if new_quality != self.current_quality {
-            crate::log::info!(
+            tracing::info!(
                 stream_id = %self.stream_id,
                 "Stream quality transition: {:?} -> {:?} (smoothed_loss_ratio: {:.2}%, interval_loss: {:.2}%, expected: {}, actual: {}, bitrate: {})",
                 self.current_quality,
@@ -374,7 +374,7 @@ impl StreamMonitor {
     }
 
     fn reset(&mut self, now: Instant) {
-        crate::log::info!(
+        tracing::info!(
             stream_id = %self.stream_id,
             "Stream inactive, resetting all metrics. Quality was: {:?}", self.current_quality);
         self.window_highest_seq = None;

@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
-use fastrace::prelude::*;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
@@ -155,7 +154,6 @@ impl NodeBuilder {
     }
 
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
-    #[fastrace::trace]
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let workers_count = self.workers;
         // Default to binding 0.0.0.0:0 if no address is provided but binding is required
@@ -180,11 +178,11 @@ impl NodeBuilder {
 
         let cpu_cores = get_core_ids().unwrap_or_default();
         if cpu_cores.is_empty() {
-            crate::log::warn!(
+            tracing::warn!(
                 "no CPU cores detected for thread affinity; worker threads will not be pinned"
             );
         } else {
-            crate::log::info!(
+            tracing::info!(
                 count = cpu_cores.len(),
                 "detected CPU cores for thread affinity"
             );
@@ -254,25 +252,24 @@ impl NodeBuilder {
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
             let occupancy = Arc::new(ShardMetrics::new());
-            let occupancy_worker = occupancy.clone();
+            let shard = ShardWorker::new(
+                shard_id,
+                udp_sock,
+                tcp_sock,
+                shard_command_rx,
+                shard_event_tx,
+                cross_shard_event_rx,
+                cross_shard_event_txs,
+                occupancy.clone(),
+                shard_rng,
+            );
 
             if use_shared_runtime {
-                let shard = ShardWorker::new(
-                    shard_id,
-                    udp_sock,
-                    tcp_sock,
-                    shard_command_rx,
-                    shard_event_tx,
-                    cross_shard_event_rx,
-                    cross_shard_event_txs,
-                    occupancy_worker,
-                    shard_rng,
-                );
                 // spawn_local keeps the shard (and any nested spawn_local calls, e.g.
                 // tcp_read_task) within the caller's LocalSet context (e.g. turmoil's
                 // per-host LocalSet).  Regular spawn() would detach from that context
                 // causing spawn_local panics inside add_connection.
-                join_set.spawn_local(ignore(shard.run()));
+                join_set.spawn(ignore(shard.run()));
             } else {
                 let core_id = if cpu_cores.is_empty() {
                     None
@@ -282,20 +279,6 @@ impl NodeBuilder {
                 let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
                 let handle = builder
                     .spawn(move || {
-                        let root = fastrace::Span::root("pulsebeam.data_thread", SpanContext::random())
-                            .with_property(|| ("shard_id", shard_id.to_string()));
-                        let _guard = root.set_local_parent();
-                        let shard = ShardWorker::new(
-                            shard_id,
-                            udp_sock,
-                            tcp_sock,
-                            shard_command_rx,
-                            shard_event_tx,
-                            cross_shard_event_rx,
-                            cross_shard_event_txs,
-                            occupancy_worker,
-                            shard_rng,
-                        );
                         tune_current_data_thread(core_id);
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -341,7 +324,7 @@ impl NodeBuilder {
             };
 
             let local_addr = listener.local_addr().ok();
-            crate::log::debug!("signaling api listening on {:?}", local_addr);
+            tracing::debug!("signaling api listening on {:?}", local_addr);
 
             let api_cfg = api::ApiConfig {
                 base_path: "/api/v1".to_string(),
@@ -382,7 +365,7 @@ impl NodeBuilder {
 
             join_set.spawn(async move {
                 if let Err(e) = api_server.await {
-                    crate::log::error!("http server error: {e}");
+                    tracing::error!("http server error: {e}");
                 }
             });
         }
@@ -391,7 +374,7 @@ impl NodeBuilder {
         tokio::select! {
             _ = join_set.join_all() => {}
             _ = shutdown.cancelled() => {
-                crate::log::info!("node received shutdown");
+                tracing::info!("node received shutdown");
             }
         }
 
@@ -425,7 +408,7 @@ async fn bind_udp_sockets(
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
             }
             Err(e) => {
-                crate::log::warn!(
+                tracing::warn!(
                     "SO_REUSEPORT not supported or failed after first bind, proceeding with {} workers: {}",
                     sockets.len(),
                     e
@@ -486,16 +469,16 @@ pub fn tune_current_control_thread() {
         );
 
         if let Err(e) = result {
-            crate::log::warn!("Failed to lower Control Thread priority: {:?}", e);
+            tracing::warn!("Failed to lower Control Thread priority: {:?}", e);
         } else {
-            crate::log::info!("Control thread tuned: Minimum Priority");
+            tracing::info!("Control thread tuned: Minimum Priority");
         }
     }
 
     #[cfg(not(unix))]
     {
         // Fallback for Windows or other non-Unix targets if necessary
-        crate::log::debug!("Thread tuning is a no-op on non-Unix platforms.");
+        tracing::debug!("Thread tuning is a no-op on non-Unix platforms.");
     }
 }
 
@@ -515,30 +498,30 @@ pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) {
         if let Err(e) =
             thread_priority::set_thread_priority_and_policy(current_thread_id, priority, policy)
         {
-            crate::log::warn!(
+            tracing::warn!(
                 "Failed to set Data Thread to SCHED_FIFO at priority 50 (requires CAP_SYS_NICE): {:?}",
                 e
             );
         } else {
-            crate::log::info!("Data thread successfully elevated to SCHED_FIFO (Priority 50)");
+            tracing::info!("Data thread successfully elevated to SCHED_FIFO (Priority 50)");
         }
 
         // attempt to get closer to SCHED_FIFO without CAP_SYS_ADMIN
         let slack_value = NonZero::new(1);
         if let Err(err) = set_current_timer_slack(slack_value) {
-            crate::log::warn!(?err, "Failed to set timer slack on data thread");
+            tracing::warn!(?err, "Failed to set timer slack on data thread");
         } else {
             let current_slack = current_timer_slack().unwrap_or(0);
-            crate::log::info!(current_slack, "Data thread timer slack successfully tuned");
+            tracing::info!(current_slack, "Data thread timer slack successfully tuned");
         }
 
         // https://developers.redhat.com/articles/2025/03/26/rhel-real-time-cpu-throttling-and-risks#is_that_a_bug_
         // set higher priority first before pinning to avoid a potential lockup
         if let Some(core) = core_id {
             if core_affinity::set_for_current(core) {
-                crate::log::info!(?core, "Data thread pinned to CPU core");
+                tracing::info!(?core, "Data thread pinned to CPU core");
             } else {
-                crate::log::warn!(?core, "Failed to pin Data thread to CPU core");
+                tracing::warn!(?core, "Failed to pin Data thread to CPU core");
             }
         }
     }
@@ -607,7 +590,6 @@ mod internal {
             })
         }
 
-        #[fastrace::trace]
         pub async fn serve_internal_http(self, shutdown: CancellationToken) -> Result<()> {
             let addr = self.listener.local_addr().ok();
 
@@ -633,17 +615,17 @@ mod internal {
             };
             let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
 
-            crate::log::info!("internal metrics listening on {:?}", addr);
+            tracing::info!("internal metrics listening on {:?}", addr);
 
             tokio::select! {
                 res = axum::serve(self.listener, router) => {
                     if let Err(e) = res {
-                        crate::log::error!("internal http server error: {e}");
+                        tracing::error!("internal http server error: {e}");
                     }
                 }
                 _ = rt_monitor_join => {}
                 _ = shutdown.cancelled() => {
-                    crate::log::info!("internal http server shutting down");
+                    tracing::info!("internal http server shutting down");
                 }
             }
 

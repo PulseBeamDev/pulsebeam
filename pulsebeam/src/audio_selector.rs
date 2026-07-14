@@ -87,7 +87,7 @@ impl TopNAudioSelector {
     ) -> Option<AudioSelectorSlotId> {
         // Step 1: Parse relative power and wall-clock arrival time.
         let Some(audio_level) = pkt.ext_vals.audio_level else {
-            crate::log::warn!(
+            tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
                 stream_id = %stream_id.0,
                 "audio selector dropped packet due to missing audio level"
@@ -137,7 +137,7 @@ impl TopNAudioSelector {
             if power > quietest_slot.last_power {
                 Some(quietest_idx)
             } else {
-                crate::log::debug!(
+                tracing::debug!(
                     target: crate::log::TARGET_AUDIO,
                     stream_id = %stream_id.0,
                     incoming_power = power,

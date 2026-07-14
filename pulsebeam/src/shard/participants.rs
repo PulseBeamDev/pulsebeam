@@ -1,4 +1,3 @@
-use fastrace::prelude::*;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
@@ -15,7 +14,7 @@ use crate::{
 };
 
 pub(crate) struct ParticipantMeta {
-    span: Span,
+    span: tracing::Span,
     core: ParticipantCore,
 }
 
@@ -34,7 +33,7 @@ impl DerefMut for ParticipantMeta {
 
 impl ParticipantMeta {
     pub(super) fn with_span<R>(&mut self, f: impl FnOnce(&mut ParticipantCore) -> R) -> R {
-        let _guard = self.span.set_local_parent();
+        let _guard = self.span.enter();
         f(&mut self.core)
     }
 }
@@ -63,13 +62,7 @@ impl ParticipantRegistry {
     pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantId {
         let participant_id = cfg.participant_id;
         let room_id = cfg.room_id;
-        let span = Span::enter_with_local_parent("participant").with_properties(|| {
-            [
-                ("room_id", room_id.as_str()),
-                ("participant_id", participant_id.as_str()),
-            ]
-        });
-        let _guard = span.set_local_parent();
+        let span = tracing::info_span!("participant", %room_id, %participant_id);
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -80,7 +73,7 @@ impl ParticipantRegistry {
         );
         self.participants
             .insert(participant_id, ParticipantMeta { core, span });
-        crate::log::info!(%participant_id, "participant added to shard");
+        tracing::info!(%participant_id, "participant added to shard");
         participant_id
     }
 

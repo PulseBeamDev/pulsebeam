@@ -95,7 +95,7 @@ impl Batcher {
                     self.reclaim(state);
                 }
                 Err(err) => {
-                    crate::log::trace!("error on writing to egress socket: {:?}", err);
+                    tracing::trace!("error on writing to egress socket: {:?}", err);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }
@@ -126,7 +126,7 @@ impl Batcher {
                     self.reclaim(state);
                 }
                 Err(err) => {
-                    crate::log::trace!("error on writing to TCP socket: {:?}", err);
+                    tracing::trace!("error on writing to TCP socket: {:?}", err);
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }

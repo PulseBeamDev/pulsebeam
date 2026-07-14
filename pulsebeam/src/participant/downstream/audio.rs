@@ -37,7 +37,7 @@ impl AudioAllocator {
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
         if self.has_slot(slot.mid) {
-            crate::log::debug!(
+            tracing::debug!(
                 target: crate::log::TARGET_AUDIO,
                 mid = %slot.mid,
                 "audio slot already provisioned; skipping duplicate"
@@ -52,7 +52,7 @@ impl AudioAllocator {
                 pending_marker: true,
             });
         } else {
-            crate::log::warn!(
+            tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
                 mid = %slot.mid,
                 pt = %slot.pt,
@@ -74,7 +74,7 @@ impl AudioAllocator {
         writer: &mut StreamWriter,
     ) -> Option<()> {
         let Some(slot_entry) = self.slots.get_mut(slot_idx.index()) else {
-            crate::log::warn!(
+            tracing::warn!(
                 target: crate::log::TARGET_AUDIO,
                 slot_idx = %slot_idx,
                 slots = self.slots.len(),
@@ -83,7 +83,7 @@ impl AudioAllocator {
             return None;
         };
         let Some(slot) = slot_entry.as_mut() else {
-            crate::log::debug!(
+            tracing::debug!(
                 target: crate::log::TARGET_AUDIO,
                 slot_idx = %slot_idx,
                 slots = self.slots.len(),
