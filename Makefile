@@ -43,6 +43,9 @@ flamegraph: profile
 perf-server:
 	$(eval PIDS := $(shell pgrep -x $(TARGET) | paste -sd "," -))
 	@if [ -z "$(PIDS)" ]; then echo "Error: pulsebeam not running"; exit 1; fi
+	sudo sysctl -w kernel.perf_event_max_stack=64
+	sudo sysctl -w kernel.kptr_restrict=0
+	sudo sysctl -w kernel.perf_event_paranoid=-1
 	perf record \
 		-p $(PIDS) \
 		-g \
