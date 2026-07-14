@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use fastrace::prelude::SpanContext;
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
@@ -130,10 +131,22 @@ pub enum ShardEvent {
     TrackSubscribed(TrackMeta),
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     TrackUnsubscribed(TrackMeta),
-    DataTopicPublished { room_id: RoomId, topic: Topic },
-    DataTopicUnpublished { room_id: RoomId, topic: Topic },
-    DataTopicSubscribed { room_id: RoomId, topic: Topic },
-    DataTopicUnsubscribed { room_id: RoomId, topic: Topic },
+    DataTopicPublished {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicUnpublished {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicSubscribed {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicUnsubscribed {
+        room_id: RoomId,
+        topic: Topic,
+    },
 }
 
 #[derive(Clone)]
@@ -203,13 +216,15 @@ impl ShardWorker {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(shard_id = %self.router.shard_id))]
+    #[fastrace::trace]
     pub async fn run(self) {
         let res = self.run_inner().await;
-        tracing::info!("shard exited: {:?}", res);
+        crate::log::info!("shard exited: {:?}", res);
     }
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
+        let shard_span = fastrace::Span::root("shard_worker", SpanContext::random())
+            .with_property(|| ("shard_id", self.router.shard_id.to_string()));
         let mut loop_start = Instant::now();
         loop {
             self.wait_for_inputs().await?;
@@ -217,7 +232,10 @@ impl ShardWorker {
             let busy_start = Instant::now();
             self.metrics.record_idle(busy_start - loop_start);
 
-            self.tick(busy_start);
+            {
+                let _guard = shard_span.set_local_parent();
+                self.tick(busy_start);
+            }
             self.flush_shard_events().await?;
 
             // TODO: record forwarding latency
@@ -260,7 +278,7 @@ impl ShardWorker {
             match cmd {
                 ShardCommand::AddTcpConnection { stream, peer_addr } => {
                     if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
-                        tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
+                        crate::log::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
                     }
                 }
                 cmd => {
@@ -300,7 +318,7 @@ impl ShardWorker {
                 ev: event,
             };
             if let Err(err) = self.event_tx.send(wrapped).await {
-                tracing::warn!("shard event channel is closed, exiting: {}", err);
+                crate::log::warn!("shard event channel is closed, exiting: {}", err);
                 return Err(ShardError::ManagerDisconnected);
             }
         }

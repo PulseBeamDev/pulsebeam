@@ -37,7 +37,7 @@ impl UpstreamAllocator {
     /// Adds a new locally published track that will receive RTP packets.
     pub fn add_published_track(&mut self, mid: Mid, track: UpstreamTrack) -> bool {
         if self.published_tracks.iter().any(|s| s.mid == mid) {
-            tracing::warn!("duplicated slot mid={}.", mid);
+            crate::log::warn!("duplicated slot mid={}.", mid);
             return false;
         }
 
@@ -83,7 +83,7 @@ impl UpstreamAllocator {
             rtp.ext_vals.rid = rid.cloned();
             slot.track.process(rid, rtp, sr)
         } else {
-            tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
+            crate::log::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
             false
         }
     }

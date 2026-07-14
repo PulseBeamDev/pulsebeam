@@ -123,6 +123,7 @@ impl ControllerActor {
         }
     }
 
+    #[fastrace::trace]
     pub async fn run(
         mut self,
         mut command_rx: mailbox::Receiver<ControllerCommand>,
@@ -234,12 +235,12 @@ impl ControllerActor {
     /// 4. If no ufrag at all, fall back to hash(peer_addr) routing.
     fn route_tcp_connection(&mut self, conn: PendingTcpConn) {
         let Some(ufrag) = conn.server_ufrag.and_then(|ufrag| IceUfrag::decode(&ufrag)) else {
-            tracing::warn!("invalid ufrag, disconnecting due to likely a malicous actor");
+            crate::log::warn!("invalid ufrag, disconnecting due to likely a malicous actor");
             return;
         };
 
         if ufrag.cluster_id != self.cluster_id || ufrag.node_id != self.node_id {
-            tracing::warn!(
+            crate::log::warn!(
                 peer_addr = %conn.peer_addr,
                 ufrag_cluster = ufrag.cluster_id,
                 ufrag_node    = ufrag.node_id,

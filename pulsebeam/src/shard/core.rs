@@ -83,7 +83,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         tracks: &[crate::track::Track],
     ) {
         if let Some(p) = self.registry.get_mut(&participant_id) {
-            p.on_tracks_published(tracks);
+            p.with_span(|core| core.on_tracks_published(tracks));
             self.dirty.mark(self.kind, participant_id);
         }
     }
@@ -97,7 +97,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
             return;
         };
 
-        if p.on_tracks_unpublished(track_ids) {
+        if p.with_span(|core| core.on_tracks_unpublished(track_ids)) {
             self.dirty.mark(self.kind, participant_id);
         }
     }

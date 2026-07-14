@@ -224,7 +224,7 @@ impl ShardRoutingTable {
             return;
         };
         if current != expected {
-            tracing::warn!(
+            crate::log::warn!(
                 %participant_id,
                 current_shard = %current.shard_id,
                 current_room = %current.room_id,
@@ -429,7 +429,7 @@ impl ShardRoutingTable {
     pub fn publish_track(&self, track: Track, room_id: RoomId, ctx: &mut impl RoutingContext) {
         let publisher = track.meta.origin;
         let Some(room) = self.rooms.get(&room_id) else {
-            tracing::debug!(%room_id, "publish_track: room missing on this shard");
+            crate::log::debug!(%room_id, "publish_track: room missing on this shard");
             return;
         };
         let tracks = std::slice::from_ref(&track);
@@ -453,7 +453,7 @@ impl ShardRoutingTable {
             }
         }
         let Some(room) = self.rooms.get(&room_id) else {
-            tracing::debug!(%room_id, "unpublish_tracks: room missing on this shard");
+            crate::log::debug!(%room_id, "unpublish_tracks: room missing on this shard");
             return;
         };
         for &participant_id in &room.members {
@@ -484,7 +484,7 @@ impl ShardRoutingTable {
 
     #[inline]
     pub fn route_audio(&mut self, mut ev: RtpEvent, ctx: &mut impl RoutingContext) {
-        tracing::trace!(
+        crate::log::trace!(
             target: crate::log::TARGET_AUDIO,
             room_id = %ev.room_id,
             origin = %ev.origin,
@@ -494,7 +494,7 @@ impl ShardRoutingTable {
         );
 
         let Some(room) = self.rooms.get_mut(&ev.room_id) else {
-            tracing::warn!(target: crate::log::TARGET_AUDIO, room_id = %ev.room_id, "audio packet dropped: room missing");
+            crate::log::warn!(target: crate::log::TARGET_AUDIO, room_id = %ev.room_id, "audio packet dropped: room missing");
             return;
         };
 
@@ -597,7 +597,7 @@ pub(crate) fn route_participant_control_event(
             subscriber,
             topic,
         } => {
-            tracing::trace!(
+            crate::log::trace!(
                 room_id = %room_id,
                 subscriber = %subscriber,
                 topic = %topic.as_ref(),
@@ -609,7 +609,7 @@ pub(crate) fn route_participant_control_event(
             subscriber,
             topic,
         } => {
-            tracing::trace!(
+            crate::log::trace!(
                 room_id = %room_id,
                 subscriber = %subscriber,
                 topic = %topic.as_ref(),
@@ -617,7 +617,7 @@ pub(crate) fn route_participant_control_event(
             );
         }
         ParticipantControlEvent::DataPacketPublished(ev) => {
-            tracing::trace!(
+            crate::log::trace!(
                 room_id = %ev.room_id,
                 origin = %ev.origin,
                 topic = %ev.topic.as_ref(),

@@ -43,11 +43,11 @@ impl RoomRegistry {
 
     pub fn room_mut_for(&mut self, participant_id: &ParticipantId) -> Option<&mut Room> {
         let meta = self.participants.get(participant_id).or_else(|| {
-            tracing::warn!(%participant_id, "participant not found in reigstry, dropping");
+            crate::log::warn!(%participant_id, "participant not found in reigstry, dropping");
             None
         })?;
         self.rooms.get_mut(&meta.room_id).or_else(|| {
-            tracing::warn!(%participant_id, room = %meta.room_id, "room not found in registry, dropping");
+            crate::log::warn!(%participant_id, room = %meta.room_id, "room not found in registry, dropping");
             None
         })
     }

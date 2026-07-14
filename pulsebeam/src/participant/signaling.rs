@@ -83,19 +83,19 @@ impl Signaling {
     ) -> Result<Vec<SignalingInputEvent>, SignalingError> {
         let mut events = Vec::new();
         if data.len() > MAX_SIGNALING_MSG_SIZE {
-            tracing::warn!(len = data.len(), "Fatal: Oversized signaling message");
+            crate::log::warn!(len = data.len(), "Fatal: Oversized signaling message");
             return Err(SignalingError::OversizedPacket);
         }
 
         let Ok(msg) = signaling::ClientMessage::decode(data) else {
-            tracing::warn!("Fatal: Invalid Protobuf");
+            crate::log::warn!("Fatal: Invalid Protobuf");
             return Err(SignalingError::DecodeFailed);
         };
 
         match msg.payload {
             Some(signaling::client_message::Payload::Intent(intent)) => {
                 if intent.downstream_requests.len() > self.slot_count {
-                    tracing::warn!("Fatal: Complexity limit exceeded");
+                    crate::log::warn!("Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
                 }
                 for state in &intent.upstream_intents {
@@ -104,7 +104,7 @@ impl Signaling {
                         active: state.active,
                     });
                 }
-                tracing::info!("received client intent: {:?}", intent);
+                crate::log::info!("received client intent: {:?}", intent);
                 self.apply_client_intent(intent, downstream);
                 self.dirty_assignments = true;
             }
@@ -128,7 +128,7 @@ impl Signaling {
             let track_id = match TrackId::try_from(track_id_str.clone()) {
                 Ok(id) => id,
                 Err(_) => {
-                    tracing::warn!(track_id = %track_id_str, "invalid track_id in client intent");
+                    crate::log::warn!(track_id = %track_id_str, "invalid track_id in client intent");
                     continue;
                 }
             };
@@ -276,7 +276,7 @@ impl Signaling {
 
         // 5. Send and Commit State
         if let Err(e) = channel.write(true, &buf) {
-            tracing::warn!("Failed to write signaling: {:?}", e);
+            crate::log::warn!("Failed to write signaling: {:?}", e);
             // DO NOT reset flags or state; retry next poll
             return false;
         }

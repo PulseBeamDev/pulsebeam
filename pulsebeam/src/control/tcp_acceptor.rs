@@ -102,7 +102,7 @@ async fn acceptor_loop(
             }
 
             _ = shutdown.cancelled() => {
-                tracing::debug!("tcp acceptor shutting down");
+                crate::log::debug!("tcp acceptor shutting down");
                 break;
             }
 
@@ -112,11 +112,11 @@ async fn acceptor_loop(
                         if shutdown.is_cancelled() {
                             break;
                         }
-                        tracing::warn!(error = ?err, "TCP accept failed");
+                        crate::log::warn!(error = ?err, "TCP accept failed");
                     }
                     Ok((stream, peer_addr)) => {
                         if pending >= MAX_PENDING_TCP {
-                            tracing::warn!(
+                            crate::log::warn!(
                                 %peer_addr,
                                 limit = MAX_PENDING_TCP,
                                 "Pending TCP limit reached, dropping connection"
@@ -126,7 +126,7 @@ async fn acceptor_loop(
                         let ip = peer_addr.ip();
                         let ip_count = ip_counts.entry(ip).or_insert(0);
                         if *ip_count >= MAX_PENDING_TCP_PER_IP {
-                            tracing::warn!(
+                            crate::log::warn!(
                                 %peer_addr,
                                 limit = MAX_PENDING_TCP_PER_IP,
                                 "Per-IP pending TCP limit reached, dropping connection"
@@ -164,7 +164,7 @@ async fn first_frame_task(
             })
         }
         Err(e) => {
-            tracing::warn!(%peer_addr, error = ?e, "TCP first-frame read failed");
+            crate::log::warn!(%peer_addr, error = ?e, "TCP first-frame read failed");
             None
         }
     };

@@ -104,7 +104,7 @@ impl ControllerCore {
             }
             ShardEvent::KeyframeRequest(req) => {
                 let Some(meta) = self.registry.get_participant(&req.origin) else {
-                    tracing::warn!(origin = %req.origin, track = ?req.stream_id.0, "KeyframeRequest: origin participant not found in controller");
+                    crate::log::warn!(origin = %req.origin, track = ?req.stream_id.0, "KeyframeRequest: origin participant not found in controller");
                     return;
                 };
                 eq.send_cluster(meta.shard_id, ClusterCommand::RequestKeyframe(req))

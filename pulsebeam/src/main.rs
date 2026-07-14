@@ -1,11 +1,12 @@
+use fastrace::collector::{Config, ConsoleReporter};
+use fastrace::prelude::*;
 use clap::Parser;
+use pulsebeam::log;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_runtime::rand;
 use std::{net::SocketAddr, num::NonZeroUsize};
 use tokio::runtime::LocalOptions;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -89,29 +90,33 @@ impl Runtime for PulsebeamRuntime {
 }
 
 fn main() {
+    fastrace::set_reporter(ConsoleReporter, Config::default());
+    let root = Span::root("pulsebeam.main", SpanContext::random());
+    let _guard = root.set_local_parent();
+
     let args = Args::parse();
-    let use_tokio_console = cfg!(feature = "tokio-console");
-
-    if use_tokio_console {
-        #[cfg(feature = "tokio-console")]
-        console_subscriber::init();
-    } else {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_ansi(true);
-
-        let registry = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer);
-        registry.init();
-    }
-
+    // let use_tokio_console = cfg!(feature = "tokio-console");
+    //
+    // if use_tokio_console {
+    //     #[cfg(feature = "tokio-console")]
+    //     console_subscriber::init();
+    // } else {
+    //     let env_filter =
+    //         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+    //     let fmt_layer = tracing_subscriber::fmt::layer()
+    //         .with_target(true)
+    //         .with_ansi(true);
+    //
+    //     let registry = tracing_subscriber::registry()
+    //         .with(env_filter)
+    //         .with(fmt_layer);
+    //     registry.init();
+    // }
+    //
     // Control thread is floating between threads
     let total_cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let workers = total_cores;
-    tracing::info!(
+    log::info!(
         "using {} data plane worker threads ({} total cores)",
         workers,
         total_cores
@@ -149,8 +154,10 @@ fn main() {
     let shared_runtime = matches!(args.rt, RtMode::Stealing);
     rt.block_on(run(shutdown.clone(), workers, rtc_port, shared_runtime));
     shutdown.cancel();
+    fastrace::flush();
 }
 
+#[fastrace::trace]
 pub async fn run(
     shutdown: CancellationToken,
     workers: usize,
@@ -163,7 +170,7 @@ pub async fn run(
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse().unwrap();
     let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
 
-    tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
+    log::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
     let rng = rand::os_rng();
     let mut node_builder = NodeBuilder::new()
         .workers(workers)
@@ -179,14 +186,14 @@ pub async fn run(
     let node = node_builder.run(shutdown.child_token());
     let node_handle = tokio::task::spawn(node);
 
-    tracing::info!("server started...");
+    log::info!("server started...");
 
     tokio::select! {
         Err(err) = node_handle => {
-            tracing::warn!("node exited with error: {err}");
+            log::warn!("node exited with error: {err}");
         }
         _ = pulsebeam_runtime::system::wait_for_signal() => {
-            tracing::info!("shutting down gracefully...");
+            log::info!("shutting down gracefully...");
             shutdown.cancel();
         }
     }
