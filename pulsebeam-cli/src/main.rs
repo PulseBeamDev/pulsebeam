@@ -296,7 +296,6 @@ async fn spawn_agent(
                         }
                     }
                     AgentEvent::MediaReceived { frame, receive_time, .. } => {
-                        tracing::info!("received: {}", frame.data.len());
                         if let Some(abs_capture_time) = frame.abs_capture_time {
                             let wallclock = wallclock_at(receive_time);
                             if let Ok(latency) = wallclock.duration_since(abs_capture_time) {

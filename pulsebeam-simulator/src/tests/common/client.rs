@@ -71,6 +71,7 @@ impl SimClientBuilder {
             local_mids: HashSet::new(),
             discovered_tracks: HashSet::new(),
             remote_tracks: HashMap::new(),
+            received_data: Vec::new(),
         };
         Ok(SimClient {
             ctx,
@@ -89,6 +90,8 @@ pub struct ClientContext {
     pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: HashMap<pulsebeam_agent::str0m::media::Mid, String>,
+    /// Data channel payloads received by topic.
+    pub received_data: Vec<(String, Vec<u8>)>,
 }
 
 pub struct SimClient {
@@ -180,6 +183,10 @@ impl SimClient {
                             AgentEvent::RemoteTrackAdded {mid, track} => {
                                 tracing::info!("{} subscribed to remote track: {:?}", self.ctx.ip, track.id);
                                 self.ctx.remote_tracks.insert(mid, track.id.clone());
+                            }
+                            AgentEvent::DataReceived { topic, payload } => {
+                                tracing::info!("{} received data topic={}", self.ctx.ip, topic);
+                                self.ctx.received_data.push((topic, payload));
                             }
                             _ => {}
                         }

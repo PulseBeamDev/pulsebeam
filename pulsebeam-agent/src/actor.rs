@@ -10,7 +10,7 @@ use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::rtp_extensions;
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{namespace, signaling};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -550,6 +550,26 @@ struct TrackRequest {
     simulcast_layers: Option<Vec<SimulcastLayer>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataTrackDirection {
+    Publish,
+    Subscribe,
+}
+
+#[derive(Debug, Clone)]
+struct DataTrackBinding {
+    direction: DataTrackDirection,
+    topic: String,
+}
+
+fn data_track_label(direction: DataTrackDirection, topic: &str) -> String {
+    let lane = match direction {
+        DataTrackDirection::Publish => "pub",
+        DataTrackDirection::Subscribe => "sub",
+    };
+    format!("v1/rt/{lane}/{topic}")
+}
+
 pub struct AgentBuilder {
     api: HttpApiClient,
     udp_socket: UdpSocket,
@@ -800,6 +820,10 @@ impl AgentBuilder {
             slot_manager: SlotManager::new(),
             disconnected_reason: None,
             signaling_cid,
+            data_channels: HashMap::new(),
+            data_pub_topics: HashMap::new(),
+            data_sub_topics: HashMap::new(),
+            open_data_channels: HashSet::new(),
             layer_ctrl: LayerController::new(),
             desired_ctrl: BitrateControllerConfig::default().build(),
             sub_manager: SubscriptionManager::new(
@@ -846,6 +870,10 @@ pub enum AgentEvent {
         frame: MediaFrame,
         receive_time: Instant,
     },
+    DataReceived {
+        topic: String,
+        payload: Vec<u8>,
+    },
     Connected,
     Disconnected(String),
 }
@@ -866,6 +894,10 @@ pub struct AgentDriver {
 
     api: HttpApiClient,
     signaling_cid: ChannelId,
+    data_channels: HashMap<ChannelId, DataTrackBinding>,
+    data_pub_topics: HashMap<String, ChannelId>,
+    data_sub_topics: HashMap<String, ChannelId>,
+    open_data_channels: HashSet<ChannelId>,
     resource_uri: Uri,
     participant_id: String,
     disconnected_reason: Option<String>,
@@ -898,6 +930,36 @@ impl AgentDriver {
 
     pub fn participant_id(&self) -> &ParticipantId {
         &self.participant_id
+    }
+
+    pub async fn ensure_publish_topic(&mut self, topic: &str) -> Result<(), AgentError> {
+        let _ = self
+            .ensure_data_topic(DataTrackDirection::Publish, topic)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn ensure_subscribe_topic(&mut self, topic: &str) -> Result<(), AgentError> {
+        let _ = self
+            .ensure_data_topic(DataTrackDirection::Subscribe, topic)
+            .await?;
+        Ok(())
+    }
+
+    pub fn publish_data(&mut self, topic: &str, payload: &[u8]) -> bool {
+        let Some(cid) = self.data_pub_topics.get(topic).copied() else {
+            return false;
+        };
+        let Some(mut channel) = self.rtc.channel(cid) else {
+            return false;
+        };
+        match channel.write(true, payload) {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!(topic, ?cid, ?err, "failed to publish data channel payload");
+                false
+            }
+        }
     }
 
     /// Perform cleanup after the event loop ends.
@@ -1090,10 +1152,26 @@ impl AgentDriver {
                             // the freshly-created server-side participant.
                             self.sub_manager.reset_active_assignments();
                             self.pending.deadline.replace(Instant::now());
+                        } else if self.data_channels.contains_key(&cid) {
+                            tracing::info!(?cid, ?label, "data channel is now open");
+                            self.open_data_channels.insert(cid);
                         }
                     }
+                    Event::ChannelClose(cid) => {
+                        self.open_data_channels.remove(&cid);
+                    }
                     Event::ChannelData(data) => {
-                        self.handle_signaling_data(data);
+                        if data.id == self.signaling_cid {
+                            self.handle_signaling_data(data);
+                        } else if let Some(binding) = self.data_channels.get(&data.id)
+                            && binding.direction == DataTrackDirection::Subscribe
+                            && self.data_sub_topics.contains_key(binding.topic.as_str())
+                        {
+                            self.emit(AgentEvent::DataReceived {
+                                topic: binding.topic.clone(),
+                                payload: data.data,
+                            });
+                        }
                     }
                     Event::MediaAdded(media) => self.handle_media_added(media),
 
@@ -1321,6 +1399,10 @@ impl AgentDriver {
     }
 
     async fn try_reconnect(&mut self) -> Result<(), AgentError> {
+        self.renegotiate().await
+    }
+
+    async fn renegotiate(&mut self) -> Result<(), AgentError> {
         let (offer, pending) = {
             let sdp_api = self.rtc.sdp_api();
             match sdp_api.apply() {
@@ -1348,6 +1430,48 @@ impl AgentDriver {
             .map_err(AgentError::Rtc)?;
 
         Ok(())
+    }
+
+    async fn ensure_data_topic(
+        &mut self,
+        direction: DataTrackDirection,
+        topic: &str,
+    ) -> Result<ChannelId, AgentError> {
+        let existing = match direction {
+            DataTrackDirection::Publish => self.data_pub_topics.get(topic).copied(),
+            DataTrackDirection::Subscribe => self.data_sub_topics.get(topic).copied(),
+        };
+        if let Some(cid) = existing {
+            return Ok(cid);
+        }
+
+        let topic_owned = topic.to_string();
+        let cfg = ChannelConfig {
+            label: data_track_label(direction, &topic_owned),
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            negotiated: None,
+            protocol: "".to_string(),
+        };
+        let cid = self.rtc.direct_api().create_data_channel(cfg);
+
+        self.data_channels.insert(
+            cid,
+            DataTrackBinding {
+                direction,
+                topic: topic_owned.clone(),
+            },
+        );
+        match direction {
+            DataTrackDirection::Publish => {
+                self.data_pub_topics.insert(topic_owned, cid);
+            }
+            DataTrackDirection::Subscribe => {
+                self.data_sub_topics.insert(topic_owned, cid);
+            }
+        }
+
+        Ok(cid)
     }
 }
 
