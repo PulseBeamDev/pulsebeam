@@ -79,7 +79,7 @@ transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
 
-const res = await fetch("http://localhost:7070/api/v1/rooms/demo", {
+const res = await fetch("http://localhost:7070/api/v1/rooms/demo/participants", {
   method: "POST",
   headers: { "Content-Type": "application/sdp" },
   body: offer.sdp,
