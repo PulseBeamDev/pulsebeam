@@ -193,7 +193,7 @@ impl ParticipantCore {
         let Some(mut ch) = self.rtc.channel(cid) else {
             return;
         };
-        if let Err(err) = ch.write(false, pkt) {
+        if let Err(err) = ch.write(true, pkt) {
             tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
         }
     }
@@ -526,6 +526,7 @@ impl ParticipantCore {
 
                 if let Some(ch) = self.data_topic_channels.get(&data.id)
                     && ch.direction == DataTrackDirection::Publish
+                    && data.binary
                 {
                     events.publish_sctp(ch.topic.clone(), data.data.to_vec());
                 }
