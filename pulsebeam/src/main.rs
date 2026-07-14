@@ -45,47 +45,12 @@ pub static malloc_conf: &[u8] = concat!(
 // #[global_allocator]
 // static GLOBAL: MiMalloc = MiMalloc;
 
-#[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq)]
-pub enum RtMode {
-    /// Thread-per-core (default)
-    Tpc,
-    /// Work-stealing
-    Stealing,
-}
-
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Enable development mode preset
     #[arg(short, long)]
     dev: bool,
-
-    /// Runtime mode
-    #[arg(
-        long = "runtime",
-        visible_alias = "rt",
-        value_enum,
-        default_value_t = RtMode::Tpc
-    )]
-    pub rt: RtMode,
-}
-
-trait Runtime {
-    fn block_on<F: Future>(&self, future: F) -> F::Output;
-}
-
-enum PulsebeamRuntime {
-    LocalRuntime(tokio::runtime::LocalRuntime),
-    MultiThreadedRuntime(tokio::runtime::Runtime),
-}
-
-impl Runtime for PulsebeamRuntime {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        match self {
-            Self::LocalRuntime(rt) => rt.block_on(future),
-            Self::MultiThreadedRuntime(rt) => rt.block_on(future),
-        }
-    }
 }
 
 fn main() {
@@ -117,37 +82,18 @@ fn main() {
         total_cores
     );
 
-    let rt = match args.rt {
-        RtMode::Tpc => {
-            let mut rt_builder = tokio::runtime::Builder::new_current_thread();
-            let rt = rt_builder
-                .enable_all()
-                // .worker_threads(workers)
-                // .disable_lifo_slot()
-                // https://github.com/tokio-rs/tokio/issues/7745
-                .enable_alt_timer()
-                .build_local(LocalOptions::default())
-                .unwrap();
-            PulsebeamRuntime::LocalRuntime(rt)
-        }
-        RtMode::Stealing => {
-            let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
-            let rt = rt_builder
-                .enable_all()
-                // .worker_threads(workers)
-                // .disable_lifo_slot()
-                // https://github.com/tokio-rs/tokio/issues/7745
-                .enable_alt_timer()
-                .build()
-                .unwrap();
-            PulsebeamRuntime::MultiThreadedRuntime(rt)
-        }
-    };
-
+    let mut rt_builder = tokio::runtime::Builder::new_current_thread();
+    let rt = rt_builder
+        .enable_all()
+        // .worker_threads(workers)
+        // .disable_lifo_slot()
+        // https://github.com/tokio-rs/tokio/issues/7745
+        .enable_alt_timer()
+        .build_local(LocalOptions::default())
+        .unwrap();
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    let shared_runtime = matches!(args.rt, RtMode::Stealing);
-    rt.block_on(run(shutdown.clone(), workers, rtc_port, shared_runtime));
+    rt.block_on(run(shutdown.clone(), workers, rtc_port, false));
     shutdown.cancel();
 }
 
