@@ -410,11 +410,37 @@ mod data_track {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct Topic(String);
+
+    impl AsRef<str> for Topic {
+        #[inline]
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::ops::Deref for Topic {
+        type Target = str;
+
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::borrow::Borrow<str> for Topic {
+        #[inline]
+        fn borrow(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub enum DataTrackIntent {
         InternalSignaling,
         UserTopic {
             direction: DataTrackDirection,
-            topic: String,
+            topic: Topic,
         },
     }
 
@@ -489,7 +515,7 @@ mod data_track {
 
                     Ok(Self::UserTopic {
                         direction,
-                        topic: s,
+                        topic: Topic(s),
                     })
                 }
                 _ => Err(DataTrackIntentError::InvalidLane),
@@ -499,6 +525,8 @@ mod data_track {
 
     #[cfg(test)]
     mod test {
+        use std::ops::Deref;
+
         use super::*;
 
         #[test]
@@ -524,7 +552,7 @@ mod data_track {
             let res = DataTrackIntent::try_from("v1/rt/pub/game-sync".to_string()).unwrap();
             if let DataTrackIntent::UserTopic { direction, topic } = res {
                 assert_eq!(direction, DataTrackDirection::Publish);
-                assert_eq!(topic, "game-sync");
+                assert_eq!(topic.deref(), "game-sync");
             } else {
                 panic!("Expected UserTopic variant");
             }
@@ -533,7 +561,7 @@ mod data_track {
             let res = DataTrackIntent::try_from("v1/rt/sub/audio_stream_12".to_string()).unwrap();
             if let DataTrackIntent::UserTopic { direction, topic } = res {
                 assert_eq!(direction, DataTrackDirection::Subscribe);
-                assert_eq!(topic, "audio_stream_12");
+                assert_eq!(topic.deref(), "audio_stream_12");
             } else {
                 panic!("Expected UserTopic variant");
             }

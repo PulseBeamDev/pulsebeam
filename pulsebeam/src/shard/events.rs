@@ -6,7 +6,7 @@ use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
-use crate::track::{GlobalKeyframeRequest, StreamId, Track, TrackLayer, TrackMeta};
+use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, TrackMeta};
 
 pub struct RtpEvent {
     pub stream_id: StreamId,
@@ -210,4 +210,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             TrackKind::Data => todo!("remove data"),
         }
     }
+
+    #[inline]
+    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>) {}
 }

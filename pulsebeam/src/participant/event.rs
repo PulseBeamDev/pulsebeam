@@ -1,6 +1,6 @@
 use crate::entity::TrackId;
 use crate::rtp::RtpPacket;
-use crate::track::{StreamId, Track, TrackLayer, TrackMeta};
+use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 use tokio::time::Instant;
 
 pub trait ParticipantSink {
@@ -13,6 +13,7 @@ pub trait ParticipantSink {
     fn exit(&mut self);
 
     fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket);
+    fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>);
 }
 
 #[cfg(test)]
@@ -29,6 +30,7 @@ pub mod test_utils {
         pub update_deadline_calls: Vec<Instant>,
         pub exit_count: usize,
         pub publish_rtp_calls: Vec<StreamId>,
+        pub publish_sctp_calls: Vec<Topic>,
     }
 
     impl MockParticipantSink {
@@ -73,6 +75,10 @@ pub mod test_utils {
 
         fn publish_rtp(&mut self, stream_id: StreamId, _pkt: RtpPacket) {
             self.publish_rtp_calls.push(stream_id);
+        }
+
+        fn publish_sctp(&mut self, topic: Topic, _pkt: Vec<u8>) {
+            self.publish_sctp_calls.push(topic);
         }
     }
 }
