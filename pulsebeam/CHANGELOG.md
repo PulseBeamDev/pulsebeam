@@ -1,4 +1,4 @@
-## [unreleased]
+## [pulsebeam-v0.4.6] - 2026-07-15
 
 * feat: defensive rtc poll loop
 * remove rt cli flag
