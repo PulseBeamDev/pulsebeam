@@ -55,7 +55,7 @@ thread-priority = "3.0.0"
 tokio = { workspace = true }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tokio-util = { workspace = true, features = ["time"] }
-tower-http = { version = "0.6.11", features = [
+tower-http = { version = "0.7.0", features = [
   "compression-zstd",
   "cors",
   "decompression-gzip",
