@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use pulsebeam_runtime::{
     mailbox::{self},
     net::{self, RecvPacketBatch, UnifiedSocket},
     rand::Rng,
 };
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 
 use crate::{
     entity::{self, ParticipantId, RoomId, TrackId},
@@ -130,10 +130,22 @@ pub enum ShardEvent {
     TrackSubscribed(TrackMeta),
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     TrackUnsubscribed(TrackMeta),
-    DataTopicPublished { room_id: RoomId, topic: Topic },
-    DataTopicUnpublished { room_id: RoomId, topic: Topic },
-    DataTopicSubscribed { room_id: RoomId, topic: Topic },
-    DataTopicUnsubscribed { room_id: RoomId, topic: Topic },
+    DataTopicPublished {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicUnpublished {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicSubscribed {
+        room_id: RoomId,
+        topic: Topic,
+    },
+    DataTopicUnsubscribed {
+        room_id: RoomId,
+        topic: Topic,
+    },
 }
 
 #[derive(Clone)]
@@ -210,9 +222,12 @@ impl ShardWorker {
     }
 
     async fn run_inner(mut self) -> Result<(), ShardError> {
+        let sleep = tokio::time::sleep(tokio::time::Duration::MAX);
+        tokio::pin!(sleep);
+
         let mut loop_start = Instant::now();
         loop {
-            self.wait_for_inputs().await?;
+            self.wait_for_inputs(sleep.as_mut()).await?;
 
             let busy_start = Instant::now();
             self.metrics.record_idle(busy_start - loop_start);
@@ -228,16 +243,12 @@ impl ShardWorker {
         }
     }
 
-    async fn wait_for_inputs(&mut self) -> Result<(), ShardError> {
-        // Compute the deadline before the select so no borrow of self.core
-        // outlives this block.
-        let deadline = self.core.next_timer_deadline();
-        let wait = async move {
-            match deadline {
-                Some(d) => tokio::time::sleep_until(d).await,
-                // No pending timers: park forever until socket wakes us.
-                None => std::future::pending::<()>().await,
-            }
+    async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
+        let has_timer = if let Some(d) = self.core.next_timer_deadline() {
+            sleep.as_mut().reset(d);
+            true
+        } else {
+            false
         };
 
         // Block until at least one source is ready.
@@ -247,7 +258,7 @@ impl ShardWorker {
             Some(_) = self.cross_shard_event_rx.readable() => {}
             Ok(_) = self.tcp_socket.readable() => {}
             Some(_) = self.command_rx.readable() => {}
-            _ = wait => {}
+            _ = sleep.as_mut(), if has_timer => {}
             else => return Err(ShardError::ManagerDisconnected),
         }
 

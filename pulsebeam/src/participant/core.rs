@@ -347,12 +347,8 @@ impl ParticipantCore {
             let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
             let deadline = rtc_deadline.min(next_slow_poll);
 
-            if deadline > now {
-                events.update_deadline(deadline);
-                return;
-            }
-
-            let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+            events.update_deadline(deadline);
+            break;
         }
     }
 
@@ -466,7 +462,7 @@ impl ParticipantCore {
                     }
 
                     DataTrackIntent::UserTopic(e) => {
-                        tracing::info!("{} is opened", e.topic);
+                        tracing::info!("{} is opened", e);
                         if let Some(previous) = self.data_topic_channels.remove(&cid) {
                             self.release_data_topic_channel(previous, events);
                         }

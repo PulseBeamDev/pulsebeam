@@ -1,4 +1,7 @@
-use std::{cmp::Reverse, collections::BinaryHeap};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, hash_map::Entry},
+};
 
 use ahash::{HashMap, HashMapExt};
 use tokio::time::Instant;
@@ -72,12 +75,13 @@ impl TimerWheel {
                 break;
             }
             let Reverse((deadline, id)) = self.heap.pop().unwrap();
-            if self.deadlines.get(&id) != Some(&deadline) {
-                // lazy cancelation
-                continue;
+
+            if let Entry::Occupied(entry) = self.deadlines.entry(id)
+                && *entry.get() == deadline
+            {
+                entry.remove();
+                f(id);
             }
-            self.deadlines.remove(&id);
-            f(id);
         }
     }
 }
