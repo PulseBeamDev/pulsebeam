@@ -55,23 +55,20 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let use_tokio_console = cfg!(feature = "tokio-console");
+    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
 
-    if use_tokio_console {
-        #[cfg(feature = "tokio-console")]
-        console_subscriber::init();
-    } else {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_ansi(true);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_writer)
+        .with_ansi(true)
+        .compact();
 
-        let registry = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer);
-        registry.init();
-    }
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .init();
 
     // Control thread is floating between threads
     let total_cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
