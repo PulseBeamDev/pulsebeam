@@ -1,3 +1,13 @@
+## [unreleased]
+
+* feat: defensive rtc poll loop
+* remove rt cli flag
+* feat: use non-blocking tracing-appender
+* feat: many-to-many realtime pubsub api
+* refactor: decouple shard core logic
+* feat!: renamed internal signaling
+* feat!: use in-band internal signaling
+
 ## [pulsebeam-v0.4.5] - 2026-07-09
 
 * Increase pacer headroom to 1.5
