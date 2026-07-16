@@ -67,12 +67,17 @@ lto = "thin"
 
 [profile.profiling]
 inherits = "release"
-debug = true           
-split-debuginfo = "off" 
-strip = "none"          #
-lto = "thin"
+debug = true
+split-debuginfo = "unpacked"
+strip = "none"
+lto = "off"
+codegen-units = 256
+incremental = true
 
 # We want to crash during simulation
 [profile.sim]
 inherits = "dev"
 opt-level = 1
+
+[profile.profiling.package."*"]
+opt-level = 3
