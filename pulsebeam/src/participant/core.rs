@@ -160,10 +160,6 @@ impl ParticipantCore {
         self.pending_ingress.push_back(batch);
     }
 
-    pub fn on_timeout(&mut self, now: Instant) {
-        let _ = self.rtc.handle_input(Input::Timeout(now.into()));
-    }
-
     #[inline]
     pub fn on_forward_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
         let mut writer = StreamWriter(&mut self.rtc);
@@ -274,10 +270,6 @@ impl ParticipantCore {
         });
     }
 
-    pub fn handle_tick(&mut self) {
-        let _ = self.rtc.handle_input(Input::Timeout(Instant::now().into()));
-    }
-
     fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         if assignments_changed {
@@ -287,6 +279,7 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        let _ = self.rtc.handle_input(Input::Timeout(now.into()));
         'drain: loop {
             let Some(rtc_deadline) = self.poll_rtc(events) else {
                 self.cleanup_data_topics(events);

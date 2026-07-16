@@ -123,7 +123,7 @@ pub(crate) struct ShardCore {
     pub(crate) shard_id: ShardId,
     registry: ParticipantRegistry,
     pub(super) routing: ShardRoutingTable,
-    timers: TimerWheel,
+    timers: TimerWheel<ParticipantId>,
     dirty: DirtyTracker,
     pipeline: EventPipeline,
     rng: Rng,
@@ -148,13 +148,9 @@ impl ShardCore {
     }
 
     pub(crate) fn fire_timers(&mut self, now: Instant) {
-        let registry = &mut self.registry;
         let dirty = &mut self.dirty;
         self.timers.drain_expired(now, |participant_id| {
-            if let Some(participant) = registry.get_mut(&participant_id) {
-                participant.with_span(|core| core.on_timeout(now));
-                dirty.mark_input(participant_id);
-            }
+            dirty.mark_input(participant_id);
         });
     }
 
