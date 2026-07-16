@@ -148,9 +148,13 @@ impl ShardCore {
     }
 
     pub(crate) fn fire_timers(&mut self, now: Instant) {
+        let registry = &mut self.registry;
         let dirty = &mut self.dirty;
         self.timers.drain_expired(now, |participant_id| {
-            dirty.mark_input(participant_id);
+            if let Some(participant) = registry.get_mut(&participant_id) {
+                participant.with_span(|core| core.on_timeout(now));
+                dirty.mark_input(participant_id);
+            }
         });
     }
 
@@ -257,21 +261,6 @@ impl ShardCore {
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
                 ParticipantEvent::Control(ev) => match ev {
-                    ParticipantControlEvent::DataPacketPublished(data) => {
-                        let mut ctx = DispatchCtx {
-                            registry: &mut self.registry,
-                            dirty: &mut self.dirty,
-                            kind: DirtyKind::Fanout,
-                            router,
-                        };
-                        self.routing.route_data(
-                            data.room_id,
-                            data.origin,
-                            &data.topic,
-                            &data.pkt,
-                            &mut ctx,
-                        );
-                    }
                     ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
                         if self.routing.register_data_publisher(room_id, topic.clone()) {
                             self.pipeline

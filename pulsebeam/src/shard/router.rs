@@ -616,15 +616,6 @@ pub(crate) fn route_participant_control_event(
                 "data topic unsubscribe is handled directly in shard core"
             );
         }
-        ParticipantControlEvent::DataPacketPublished(ev) => {
-            tracing::trace!(
-                room_id = %ev.room_id,
-                origin = %ev.origin,
-                topic = %ev.topic.as_ref(),
-                len = ev.pkt.len(),
-                "data packet is routed directly by shard core"
-            );
-        }
     }
 }
 

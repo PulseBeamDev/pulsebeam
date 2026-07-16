@@ -76,7 +76,6 @@ pub enum ParticipantControlEvent {
         subscriber: ParticipantId,
         topic: Topic,
     },
-    DataPacketPublished(SctpEvent),
     KeyframeRequested(GlobalKeyframeRequest),
 }
 
@@ -293,15 +292,11 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
 
     #[inline]
     fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ParticipantControlEvent::DataPacketPublished(SctpEvent {
-                    topic,
-                    pkt,
-                    room_id: self.room_id,
-                    origin: self.id,
-                }),
-            ));
+        self.pipeline.data_queue.push_back(SctpEvent {
+            topic,
+            pkt,
+            room_id: self.room_id,
+            origin: self.id,
+        });
     }
 }

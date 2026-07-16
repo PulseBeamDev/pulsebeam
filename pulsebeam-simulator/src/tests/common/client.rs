@@ -150,13 +150,42 @@ impl SimClient {
     where
         F: FnMut(&mut ClientContext) -> bool,
     {
-        self.drive_until_cancelled(CancellationToken::new(), predicate)
+        self.drive_until_cancelled_with_interval(
+            CancellationToken::new(),
+            Duration::from_millis(200),
+            predicate,
+        )
+        .await
+    }
+
+    pub async fn drive_with_interval<F>(
+        &mut self,
+        check_interval: Duration,
+        predicate: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&mut ClientContext) -> bool,
+    {
+        self.drive_until_cancelled_with_interval(CancellationToken::new(), check_interval, predicate)
             .await
     }
 
     pub async fn drive_until_cancelled<F>(
         &mut self,
         token: CancellationToken,
+        predicate: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&mut ClientContext) -> bool,
+    {
+        self.drive_until_cancelled_with_interval(token, Duration::from_millis(200), predicate)
+            .await
+    }
+
+    async fn drive_until_cancelled_with_interval<F>(
+        &mut self,
+        token: CancellationToken,
+        check_every: Duration,
         mut predicate: F,
     ) -> anyhow::Result<()>
     where
@@ -164,7 +193,7 @@ impl SimClient {
     {
         let span = tracing::info_span!("drive_until_cancelled", ip = %self.ctx.ip, participant_id = %self.ctx.driver.participant_id());
         async move {
-            let mut check_interval = tokio::time::interval(Duration::from_millis(200));
+            let mut check_interval = tokio::time::interval(check_every);
             loop {
                 tokio::select! {
                     _ = token.cancelled() => {

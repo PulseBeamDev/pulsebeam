@@ -5,7 +5,7 @@ VERSION_1="70018b0"
 # VERSION_1="cd4777d4adf7db83e7a043cf7c462c03c4d90552"
 VERSION_2="d656eaf8a2c3d555c12de0d2ba489d7a6ff9ca17"
 VERSION_3="0d7d34749857397a907d530a31b2df4aac014fae"
-VERSION_4="83aa3169f9ef7ca71c06675110c1df28e603c038"
+VERSION_4="pulsebeam-v0.4.6"
 
 echo "------------------------------------------------"
 echo " Select a Pulsebeam SFU version to run:"
@@ -50,8 +50,8 @@ echo "--> Launching Podman with commit: $HASH"
 podman run --rm \
   --cpuset-cpus=1-4 \
   --memory=8g \
-  --env=RUST_LOG=error \
+  --env=RUST_LOG=info \
   --net=host \
   --log-driver=passthrough-tty \
   "ghcr.io/pulsebeamdev/pulsebeam:$HASH" \
-  --dev >/dev/null
+  --dev

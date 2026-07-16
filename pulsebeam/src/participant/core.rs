@@ -98,6 +98,7 @@ pub struct ParticipantCore {
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
     pending_ingress: VecDeque<RecvPacketBatch>,
+    pending_timeout: Option<Instant>,
 
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
@@ -133,6 +134,7 @@ impl ParticipantCore {
 
         let mut p = Self {
             pending_ingress: VecDeque::new(),
+            pending_timeout: None,
             participant_id: cfg.participant_id,
             rtc,
             udp_batcher,
@@ -158,6 +160,10 @@ impl ParticipantCore {
 
     pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
         self.pending_ingress.push_back(batch);
+    }
+
+    pub fn on_timeout(&mut self, now: Instant) {
+        self.pending_timeout = Some(now);
     }
 
     #[inline]
@@ -279,13 +285,18 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
-        let _ = self.rtc.handle_input(Input::Timeout(now.into()));
         'drain: loop {
             let Some(rtc_deadline) = self.poll_rtc(events) else {
                 self.cleanup_data_topics(events);
                 events.exit();
                 return;
             };
+
+            if let Some(deadline) = self.pending_timeout.take() {
+                let now = deadline.max(now);
+                let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                continue;
+            }
 
             if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
                 self.poll_slow(now, events);
