@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use str0m::media::MediaTime;
 use tokio::sync::watch;
 
-use crate::{MediaFrame, actor::LocalTrack};
+use crate::{MediaFrame, agent::LocalTrack};
 
 pub struct KeyframeNotifier(watch::Sender<u64>);
 
@@ -33,9 +33,7 @@ impl KeyframeReceiver {
 }
 
 pub struct SharedH264Asset {
-    // The master list of frame slices
     pub(crate) frames: Vec<Arc<[u8]>>,
-    // Pre-calculated position of the first IDR frame for quick seeking
     pub(crate) first_idr: usize,
 }
 
@@ -55,7 +53,6 @@ impl SharedH264Asset {
             .unwrap_or(0)
     }
 
-    /// Returns `true` when the Annex-B buffer contains at least one IDR NALU (type 5).
     fn frame_has_idr(frame: &[u8]) -> bool {
         let mut i = 0usize;
         while i + 3 < frame.len() {
@@ -110,16 +107,11 @@ impl H264Looper {
         frame.clone()
     }
 
-    pub async fn run(mut self, sender: LocalTrack) {
+    pub async fn run(mut self, mut sender: LocalTrack) {
         let clock_rate = 90_000u64;
         let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
-        let LocalTrack {
-            mid,
-            rid,
-            tx,
-            mut keyframe_rx,
-            ..
-        } = sender;
+        let mid = sender.mid;
+        let rid = sender.rid;
 
         let mut interval = tokio::time::interval(frame_interval);
         let mut frame_count: u64 = 0;
@@ -127,14 +119,13 @@ impl H264Looper {
         loop {
             let tick_time = interval.tick().await;
 
-            if keyframe_rx.is_requested() {
+            if sender.keyframe_rx.is_requested() {
                 tracing::debug!(
                     ?mid,
                     ?rid,
                     first_idr = self.asset.first_idr,
                     "keyframe reset"
                 );
-                // Seek back to the asset's pre-calculated IDR frame index
                 self.index = self.asset.first_idr;
             }
 
@@ -148,9 +139,7 @@ impl H264Looper {
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
             };
 
-            if tx.send(frame).await.is_err() {
-                break;
-            }
+            sender.send(frame).await;
             frame_count += 1;
         }
     }
@@ -166,11 +155,9 @@ impl<'a> H264FrameSlicer<'a> {
         Self { data, pos: 0 }
     }
 
-    /// Finds the boundaries of the next NALU in the Annex B stream.
     fn next_nalu_bounds(&self, start: usize) -> Option<(usize, usize, u8)> {
         let mut i = start;
         while i + 3 < self.data.len() {
-            // Check for start code 00 00 01 or 00 00 00 01
             if self.data[i] == 0
                 && self.data[i + 1] == 0
                 && (self.data[i + 2] == 1 || (self.data[i + 2] == 0 && self.data[i + 3] == 1))
@@ -179,7 +166,6 @@ impl<'a> H264FrameSlicer<'a> {
                 let header_pos = if self.data[i + 2] == 1 { i + 3 } else { i + 4 };
                 let nalu_type = self.data[header_pos] & 0x1F;
 
-                // Find the start of the NEXT NALU to determine the end of this one
                 let mut next = header_pos;
                 while next + 3 < self.data.len() {
                     if self.data[next] == 0
@@ -198,17 +184,10 @@ impl<'a> H264FrameSlicer<'a> {
         None
     }
 
-    /// Determines if a NALU is the start of a brand new Access Unit (Frame).
     fn is_new_access_unit(&self, nalu_type: u8, nalu_start: usize, _nalu_end: usize) -> bool {
         match nalu_type {
-            // AUD (9), SPS (7), PPS (8), SEI (6)
-            // These always precede the VCL slices of a new frame.
             6..=9 => true,
-            // IDR (5) or Non-IDR (1) slices
             1 | 5 => {
-                // To be precise, we check if first_mb_in_slice == 0.
-                // It is an Exp-Golomb encoded value. If the first bit of the
-                // slice header payload is 1, the value is 0.
                 let header_pos = if self.data[nalu_start + 2] == 1 {
                     nalu_start + 3
                 } else {
@@ -217,7 +196,6 @@ impl<'a> H264FrameSlicer<'a> {
 
                 if self.data.len() > header_pos + 1 {
                     let first_byte_of_slice_header = self.data[header_pos + 1];
-                    // If high bit is 1, first_mb_in_slice is 0 -> New Frame
                     return (first_byte_of_slice_header & 0x80) != 0;
                 }
                 false
@@ -239,11 +217,8 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
         let mut end_pos = self.pos;
         let mut has_vcl = false;
 
-        // We iterate through NALUs until we find one that belongs to the NEXT frame
         let mut search_pos = self.pos;
         while let Some((n_start, n_end, n_type)) = self.next_nalu_bounds(search_pos) {
-            // If we already have some VCL (slice) data and we hit a NALU that
-            // signals a new frame, we stop and return everything up to this point.
             if has_vcl && self.is_new_access_unit(n_type, n_start, n_end) {
                 self.pos = n_start;
                 return Some(&self.data[start_pos..n_start]);
@@ -257,7 +232,6 @@ impl<'a> Iterator for H264FrameSlicer<'a> {
             search_pos = n_end;
         }
 
-        // Handle the last frame in the buffer
         self.pos = self.data.len();
         if end_pos > start_pos {
             Some(&self.data[start_pos..end_pos])

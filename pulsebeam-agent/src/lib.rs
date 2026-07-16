@@ -9,16 +9,17 @@ use tokio::time::Instant;
 
 pub mod clock;
 
-pub use actor::AgentDriver;
+pub use agent::AgentDriver;
 pub use clock::wallclock_at;
 
 pub mod actor;
+pub mod agent;
 pub mod api;
 pub mod manager;
 pub mod media;
 pub(crate) mod tcp;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MediaFrame {
     pub ts: MediaTime,
     pub data: Arc<[u8]>,

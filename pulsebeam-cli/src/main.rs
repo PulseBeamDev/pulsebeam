@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
     MediaKind, Rid, SimulcastLayer, TransceiverDirection,
     actor::{AgentBuilder, AgentEvent},
+    agent::RemoteTrack,
     api::HttpApiClient,
     clock::clock_anchor,
     media::{H264Looper, SharedH264Asset},
@@ -250,12 +251,14 @@ async fn spawn_agent(
     }
 
     let mut driver = builder.connect(&room_name).await?;
+
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let session_end = tokio::time::sleep(duration);
     tokio::pin!(session_end);
 
+    let mut join_set = JoinSet::new();
     loop {
         tokio::select! {
             biased;
@@ -295,25 +298,33 @@ async fn spawn_agent(
                             tokio::spawn(looper.run(track));
                         }
                     }
-                    AgentEvent::MediaReceived { frame, receive_time, .. } => {
-                        if let Some(abs_capture_time) = frame.abs_capture_time {
-                            let wallclock = wallclock_at(receive_time);
-                            if let Ok(latency) = wallclock.duration_since(abs_capture_time) {
-                                let _ = ctx.logger.latency.try_send(EventLatency {
-                                    captured_at: Instant::now(),
-                                    room_id: ctx.room_id,
-                                    agent_id: ctx.agent_id,
-                                    delay_us: latency.as_micros() as u64,
-                                });
-                            }
-                        }
+                    AgentEvent::RemoteTrackAdded(t) => {
+                        join_set.spawn(handle_receiving(t, ctx.clone()));
                     }
-                    _ => {}
+                    AgentEvent::Connected | AgentEvent::Disconnected(_) | AgentEvent::RemoteTrackDiscovered(_) | AgentEvent::DataPublisherDeclared(_) | AgentEvent::DataSubscriberDeclared(_)  => {}
                 }
             }
         }
     }
+
+    join_set.join_all().await;
     Ok(())
+}
+
+async fn handle_receiving(mut track: RemoteTrack, ctx: AgentContext) {
+    while let Ok(frame) = track.recv().await {
+        if let Some(abs_capture_time) = frame.abs_capture_time {
+            let wallclock = wallclock_at(Instant::now());
+            if let Ok(latency) = wallclock.duration_since(abs_capture_time) {
+                let _ = ctx.logger.latency.try_send(EventLatency {
+                    captured_at: Instant::now(),
+                    room_id: ctx.room_id,
+                    agent_id: ctx.agent_id,
+                    delay_us: latency.as_micros() as u64,
+                });
+            }
+        }
+    }
 }
 
 async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -> Result<()> {

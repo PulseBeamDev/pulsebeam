@@ -2,13 +2,13 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent::actor::{AgentBuilder, AgentEvent};
+use pulsebeam_agent::agent::{DataPublisher, DataSubscriber};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
 use pulsebeam_agent::{AgentDriver, MediaKind, SimulcastLayer, TransceiverDirection};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -70,6 +70,8 @@ impl SimClientBuilder {
             driver,
             local_mids: HashSet::new(),
             discovered_tracks: HashSet::new(),
+            published_topics: HashMap::new(),
+            subscribed_topics: HashMap::new(),
             remote_tracks: HashMap::new(),
             received_data: Vec::new(),
         };
@@ -90,6 +92,8 @@ pub struct ClientContext {
     pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: HashMap<pulsebeam_agent::str0m::media::Mid, String>,
+    pub published_topics: HashMap<String, DataPublisher>,
+    pub subscribed_topics: HashMap<String, DataSubscriber>,
     /// Data channel payloads received by topic.
     pub received_data: Vec<(String, Vec<u8>)>,
 }
@@ -122,7 +126,7 @@ impl SimClient {
 
     pub async fn drive_until<F>(&mut self, timeout: Duration, predicate: F) -> anyhow::Result<()>
     where
-        F: FnMut(&ClientContext) -> bool,
+        F: FnMut(&mut ClientContext) -> bool,
     {
         let token = CancellationToken::new();
         let _guard = token.clone().drop_guard();
@@ -144,7 +148,7 @@ impl SimClient {
 
     pub async fn drive_with<F>(&mut self, predicate: F) -> anyhow::Result<()>
     where
-        F: FnMut(&ClientContext) -> bool,
+        F: FnMut(&mut ClientContext) -> bool,
     {
         self.drive_until_cancelled(CancellationToken::new(), predicate)
             .await
@@ -156,7 +160,7 @@ impl SimClient {
         mut predicate: F,
     ) -> anyhow::Result<()>
     where
-        F: FnMut(&ClientContext) -> bool,
+        F: FnMut(&mut ClientContext) -> bool,
     {
         let span = tracing::info_span!("drive_until_cancelled", ip = %self.ctx.ip, participant_id = %self.ctx.driver.participant_id());
         async move {
@@ -171,7 +175,8 @@ impl SimClient {
                             AgentEvent::LocalTrackAdded(sender) => {
                                 tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ctx.ip, sender.mid, sender.rid);
                                 self.ctx.local_mids.insert(sender.mid);
-                                let looper = create_h264_looper_for_rid(sender.rid.as_ref().map(|r| r.as_ref()));
+                                let rid = sender.rid.as_ref().map(|r| r.as_ref());
+                                let looper = create_h264_looper_for_rid(rid);
                                 self.join_set.spawn(looper.run(sender));
                             }
                             AgentEvent::RemoteTrackDiscovered(track) => {
@@ -180,25 +185,26 @@ impl SimClient {
                                     self.ctx.discovered_tracks.insert(track.id.clone());
                                 }
                             }
-                            AgentEvent::RemoteTrackAdded {mid, track} => {
-                                tracing::info!("{} subscribed to remote track: {:?}", self.ctx.ip, track.id);
-                                self.ctx.remote_tracks.insert(mid, track.id.clone());
+                            AgentEvent::RemoteTrackAdded(t) => {
+                                self.ctx.remote_tracks.insert(t.mid, t.track.id.clone());
                             }
-                            AgentEvent::DataReceived { topic, payload } => {
-                                tracing::info!("{} received data topic={}", self.ctx.ip, topic);
-                                self.ctx.received_data.push((topic, payload));
+                            AgentEvent::DataPublisherDeclared(publisher) => {
+                                self.ctx.published_topics.insert(publisher.topic.clone(), publisher);
                             }
-                            _ => {}
+                            AgentEvent::DataSubscriberDeclared(subscriber) => {
+                                self.ctx.subscribed_topics.insert(subscriber.topic.clone(), subscriber);
+                            }
+                            AgentEvent::Connected | AgentEvent::Disconnected(_) => {}
                         }
 
                         // Re-check the predicate after processing an event, since a new
                         // event may indicate the desired state has been reached.
-                        if predicate(&self.ctx) {
+                        if predicate(&mut self.ctx) {
                             return Ok(());
                         }
                     }
                     _ = check_interval.tick() => {
-                        if predicate(&self.ctx) {
+                        if predicate(&mut self.ctx) {
                             return Ok(());
                         }
                     }

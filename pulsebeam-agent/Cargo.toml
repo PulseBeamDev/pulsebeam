@@ -10,7 +10,7 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = []
+default = ["pulsebeam-core/reqwest"]
 
 [dependencies]
 futures-lite = { workspace = true }
@@ -26,6 +26,7 @@ tokio-stream = "0.1.18"
 if-addrs = "0.15.0"
 pulsebeam-core = { path = "../pulsebeam-core" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
+flume = "0.12.0"
 
 [dev-dependencies]
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
