@@ -78,16 +78,19 @@ impl BitrateController {
     }
 
     pub fn current(&self) -> Bitrate {
-        let current_bitrate = self.current_bitrate.clamp(
+        let current_bitrate = self.current_bitrate * HEADROOM;
+        let current_bitrate = current_bitrate.clamp(
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
-        Bitrate::from(current_bitrate) * HEADROOM
+        Bitrate::from(current_bitrate)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use more_asserts::assert_le;
+
     use super::*;
 
     #[test]
@@ -190,24 +193,24 @@ mod tests {
 
         // Reach the cap via a request that exceeds the configured maximum after headroom.
         ctrl.update(Bitrate::kbps(4600));
-        assert_eq!(ctrl.current().as_f64(), 5_000_000.0 * HEADROOM);
+        assert_eq!(ctrl.current().as_f64(), 5_000_000.0);
 
         // While the raw request still exceeds the max, hold the cap and do not decay.
         for _ in 0..20 {
             let res = ctrl.update(Bitrate::kbps(4700));
-            assert_eq!(res.as_f64(), 5_000_000.0 * HEADROOM);
+            assert_eq!(res.as_f64(), 5_000_000.0);
         }
 
         // Once demand falls below the capped threshold, the controller may step down.
         let mut res = ctrl.current();
         for _ in 0..40 {
             res = ctrl.update(Bitrate::kbps(4100));
-            if res.as_f64() < 5_000_000.0 * HEADROOM {
+            if res.as_f64() < 5_000_000.0 {
                 break;
             }
         }
 
-        assert!(res.as_f64() < 5_000_000.0 * HEADROOM);
+        assert_le!(res.as_f64(), 5_000_000.0);
     }
 
     #[test]

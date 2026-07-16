@@ -196,11 +196,12 @@ impl BitrateController {
     }
 
     pub fn current(&self) -> Bitrate {
-        let current_bitrate = self.current_bitrate.clamp(
+        let current_bitrate = self.current_bitrate * 1.50;
+        let current_bitrate = current_bitrate.clamp(
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
-        Bitrate::from(current_bitrate) * 1.50
+        Bitrate::from(current_bitrate)
     }
 }
 
