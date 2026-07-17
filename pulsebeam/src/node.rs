@@ -3,13 +3,13 @@ use core_affinity::get_core_ids;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
-use pulsebeam_runtime::net::Transport;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::{RngCore, SeedableRng};
+use std::collections::HashSet;
 use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use str0m::Candidate;
@@ -40,11 +40,37 @@ enum WorkerExecution {
     SharedRuntime,
 }
 
+#[cfg(not(feature = "sim"))]
+async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket2_sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    if addr.is_ipv6() {
+        // Prefer dual-stack listeners so a single IPv6 socket can accept IPv4-mapped peers.
+        socket2_sock.set_only_v6(false)?;
+    }
+
+    socket2_sock.set_nonblocking(true)?;
+    socket2_sock.set_reuse_address(true)?;
+    socket2_sock.bind(&addr.into())?;
+    socket2_sock.listen(1024)?;
+
+    tokio::net::TcpListener::from_std(socket2_sock.into())
+}
+
+#[cfg(feature = "sim")]
+async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    TcpListener::bind(addr).await
+}
+
 pub struct NodeBuilder {
     // Configuration
     workers: usize,
     local_addr: Option<SocketAddr>,
-    external_addr: Option<SocketAddr>,
+    external_addrs: Vec<SocketAddr>,
 
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
@@ -73,7 +99,7 @@ impl NodeBuilder {
         Self {
             workers: 1,
             local_addr: None,
-            external_addr: None,
+            external_addrs: Vec::new(),
             rng: None,
             udp_mode: UdpMode::Batch,
             http_api: None,
@@ -96,9 +122,9 @@ impl NodeBuilder {
         self
     }
 
-    /// Set the external address advertised to peers.
-    pub fn external_addr(mut self, addr: SocketAddr) -> Self {
-        self.external_addr = Some(addr);
+    /// Set multiple external addresses (e.g. dual-stack IPv4/IPv6) advertised to peers.
+    pub fn external_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.external_addrs = addrs;
         self
     }
 
@@ -156,16 +182,61 @@ impl NodeBuilder {
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let workers_count = self.workers;
-        // Default to binding 0.0.0.0:0 if no address is provided but binding is required
+        // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
+        // both IPv6 and IPv4 peers.
         let local_addr = self
             .local_addr
-            .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
-        let external_addr = self.external_addr;
+            .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
+        if self.external_addrs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "NodeBuilder requires at least one external IPv4 address; call `.external_addrs(...)`"
+            ));
+        }
+
+        let advertised_addrs = self.external_addrs;
+
+        let mut deduped = Vec::with_capacity(advertised_addrs.len());
+        let mut seen = HashSet::with_capacity(advertised_addrs.len());
+        for addr in advertised_addrs {
+            if seen.insert(addr) {
+                deduped.push(addr);
+            }
+        }
+        let mut v4_addrs = Vec::new();
+        let mut v6_addrs = Vec::new();
+        for addr in deduped {
+            if addr.is_ipv4() {
+                v4_addrs.push(addr);
+            } else {
+                v6_addrs.push(addr);
+            }
+        }
+
+        if v4_addrs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "NodeBuilder requires at least one IPv4 external address in `.external_addrs(...)`"
+            ));
+        }
+        if v4_addrs.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "NodeBuilder currently supports exactly one external IPv4 address"
+            ));
+        }
+        if v6_addrs.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "NodeBuilder currently supports at most one external IPv6 address"
+            ));
+        }
+
+        let mut advertised_addrs = Vec::with_capacity(2);
+        advertised_addrs.extend(v4_addrs);
+        advertised_addrs.extend(v6_addrs);
+        let primary_external_addr = advertised_addrs.first().copied();
 
         let mut join_set = JoinSet::new();
         if let Some(source) = self.internal_metrics {
             let listener = match source {
-                ListenerSource::Bind(addr) => TcpListener::bind(addr)
+                ListenerSource::Bind(addr) => bind_tcp_listener(addr)
                     .await
                     .context("binding internal metrics")?,
                 ListenerSource::PreBound(l) => l,
@@ -188,31 +259,44 @@ impl NodeBuilder {
             );
         }
 
-        let udp_sockets =
-            bind_udp_sockets(local_addr, external_addr, workers_count, self.udp_mode).await?;
+        let udp_sockets = bind_udp_sockets(
+            local_addr,
+            primary_external_addr,
+            workers_count,
+            self.udp_mode,
+        )
+        .await?;
 
-        let tcp_listener = TcpListener::bind(local_addr)
+        let tcp_listener = bind_tcp_listener(local_addr)
             .await
             .context("binding tcp listener")?;
-        let tcp_local_addr = external_addr.unwrap_or(tcp_listener.local_addr()?);
+        let tcp_local_addr = primary_external_addr.unwrap_or(tcp_listener.local_addr()?);
 
         let tcp_sockets: Vec<net::tcp::TcpTransport> = (0..workers_count)
             .map(|_| net::tcp::TcpTransport::new(tcp_local_addr))
             .collect();
 
-        let mut candidates = sockets_to_candidates(&udp_sockets);
+        let mut candidates = sockets_to_candidates(&udp_sockets, &advertised_addrs);
         if self.tcp_only {
             candidates.clear();
         }
         if !tcp_sockets.is_empty() {
-            candidates.push(
-                Candidate::builder()
-                    .tcp()
-                    .host(tcp_local_addr)
-                    .tcptype(str0m::net::TcpType::Passive)
-                    .build()
-                    .expect("a TCP passive host candidate"),
-            );
+            let tcp_candidate_addrs = if advertised_addrs.is_empty() {
+                vec![tcp_local_addr]
+            } else {
+                advertised_addrs.clone()
+            };
+
+            for addr in tcp_candidate_addrs {
+                candidates.push(
+                    Candidate::builder()
+                        .tcp()
+                        .host(addr)
+                        .tcptype(str0m::net::TcpType::Passive)
+                        .build()
+                        .expect("a TCP passive host candidate"),
+                );
+            }
         }
 
         let (shard_event_tx, shard_event_rx) = mailbox::new(4096);
@@ -318,7 +402,7 @@ impl NodeBuilder {
             // Resolve listener
             let listener = match source {
                 ListenerSource::Bind(addr) => {
-                    TcpListener::bind(addr).await.context("binding http api")?
+                    bind_tcp_listener(addr).await.context("binding http api")?
                 }
                 ListenerSource::PreBound(l) => l,
             };
@@ -331,7 +415,7 @@ impl NodeBuilder {
                 // Best effort to guess host if bound randomly
                 default_host: local_addr
                     .map(|a| a.to_string())
-                    .unwrap_or_else(|| "0.0.0.0:0".to_string()),
+                    .unwrap_or_else(|| "[::]:0".to_string()),
             };
 
             let cors = CorsLayer::new()
@@ -395,14 +479,14 @@ pub struct NodeContext {
 
 async fn bind_udp_sockets(
     local_addr: SocketAddr,
-    external_addr: Option<SocketAddr>,
+    advertised_addr: Option<SocketAddr>,
     workers: usize,
     mode: UdpMode,
 ) -> Result<Vec<net::UnifiedSocket>> {
     let mut sockets = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let socket = match net::bind(local_addr, net::Transport::Udp(mode), external_addr).await {
+        let socket = match net::bind(local_addr, net::Transport::Udp(mode), advertised_addr).await {
             Ok(s) => s,
             Err(e) if sockets.is_empty() => {
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
@@ -421,22 +505,31 @@ async fn bind_udp_sockets(
     Ok(sockets)
 }
 
-fn sockets_to_candidates(sockets: &[UnifiedSocket]) -> Vec<Candidate> {
-    let mut candidates = Vec::with_capacity(sockets.len());
-    for s in sockets {
-        let candidate = match s.transport() {
-            Transport::Udp(_) => Candidate::builder()
-                .udp()
-                .host(s.local_addr())
-                .build()
-                .expect("a UDP host candidate"),
-            Transport::Tcp => Candidate::builder()
-                .tcp()
-                .host(s.local_addr())
-                .tcptype(str0m::net::TcpType::Passive)
-                .build()
-                .expect("a TCP passive host candidate"),
-        };
+fn sockets_to_candidates(
+    sockets: &[UnifiedSocket],
+    advertised_addrs: &[SocketAddr],
+) -> Vec<Candidate> {
+    let candidate_addrs = if advertised_addrs.is_empty() {
+        let mut unique = Vec::with_capacity(sockets.len());
+        let mut seen = HashSet::with_capacity(sockets.len());
+        for socket in sockets {
+            let addr = socket.local_addr();
+            if seen.insert(addr) {
+                unique.push(addr);
+            }
+        }
+        unique
+    } else {
+        advertised_addrs.to_vec()
+    };
+
+    let mut candidates = Vec::with_capacity(candidate_addrs.len());
+    for addr in candidate_addrs {
+        let candidate = Candidate::builder()
+            .udp()
+            .host(addr)
+            .build()
+            .expect("a UDP host candidate");
         candidates.push(candidate);
     }
 

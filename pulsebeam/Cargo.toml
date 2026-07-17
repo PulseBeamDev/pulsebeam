@@ -48,6 +48,7 @@ serde = { workspace = true }
 serde_json = "1.0.150"
 sha3 = "0.12.0"
 slotmap = "1.1.1"
+socket2 = "0.6.4"
 str0m = { workspace = true }
 tachyonix = "0.3.1"
 thiserror = { workspace = true }

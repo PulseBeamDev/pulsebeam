@@ -5,8 +5,21 @@ use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes}
 use quinn_udp::RecvMeta;
 use std::{
     io::{self, ErrorKind, IoSliceMut},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
 };
+
+fn normalize_v4_mapped(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                SocketAddr::new(IpAddr::V4(v4), addr.port())
+            } else {
+                addr
+            }
+        }
+        IpAddr::V4(_) => addr,
+    }
+}
 
 pub const SOCKET_SEND_SIZE: usize = 2 * 1024 * 1024;
 pub const SOCKET_RECV_SIZE: usize = 4 * 1024 * 1024;
@@ -56,6 +69,12 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?;
+
+    if addr.is_ipv6() {
+        // Prefer dual-stack listeners so a single IPv6 socket can accept IPv4-mapped peers.
+        socket2_sock.set_only_v6(false)?;
+    }
+
     socket2_sock.set_nonblocking(true)?;
     socket2_sock.set_reuse_address(true)?;
 
@@ -152,7 +171,7 @@ impl UdpTransportReader {
                         let buf = &self.batch_buffer[base..tail];
 
                         out.push(RecvPacketBatch {
-                            src: m.addr,
+                            src: normalize_v4_mapped(m.addr),
                             dst: self.local_addr,
                             buf: buf.to_vec(), // Contains the entire GRO block
                             stride: m.stride,  // Downstream will use this to skip through buf

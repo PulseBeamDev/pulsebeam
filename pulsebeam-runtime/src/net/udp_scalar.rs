@@ -48,7 +48,27 @@ impl UdpTransport {
 }
 
 pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
+    #[cfg(not(feature = "sim"))]
+    let socket = {
+        let socket2_sock = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+
+        if addr.is_ipv6() {
+            // Prefer dual-stack listeners so a single IPv6 socket can accept IPv4-mapped peers.
+            socket2_sock.set_only_v6(false)?;
+        }
+
+        socket2_sock.set_nonblocking(true)?;
+        socket2_sock.bind(&addr.into())?;
+        UdpSocket::from_std(socket2_sock.into())?
+    };
+
+    #[cfg(feature = "sim")]
     let socket = UdpSocket::bind(addr).await?;
+
     let socket = Arc::new(socket);
     let local_addr = external_addr.unwrap_or(socket.local_addr()?);
 

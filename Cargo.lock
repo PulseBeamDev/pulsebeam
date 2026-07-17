@@ -2828,6 +2828,7 @@ dependencies = [
  "serde_json",
  "sha3",
  "slotmap",
+ "socket2",
  "str0m",
  "tachyonix",
  "thiserror 2.0.18",

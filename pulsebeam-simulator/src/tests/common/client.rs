@@ -20,10 +20,17 @@ pub struct SimClientBuilder {
     agent_builder: AgentBuilder,
 }
 
+fn http_base_uri(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("http://{}:{}", v4, port),
+        IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
+    }
+}
+
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
-        let server_base_uri = format!("http://{}:7070", server_ip);
+        let server_base_uri = http_base_uri(server_ip, 7070);
         let api = HttpApiClient::new(client, &server_base_uri)?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -38,11 +45,11 @@ impl SimClientBuilder {
     /// port (3478).  Use with `start_sfu_node_tcp_only` to test TCP connectivity.
     pub async fn bind_tcp(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let client = create_http_client();
-        let server_base_uri = format!("http://{}:7070", server_ip);
+        let server_base_uri = http_base_uri(server_ip, 7070);
         let api = HttpApiClient::new(client, &server_base_uri)?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let server_tcp_addr: std::net::SocketAddr = format!("{}:3478", server_ip).parse()?;
+        let server_tcp_addr = std::net::SocketAddr::new(server_ip, 3478);
 
         Ok(Self {
             ip,
