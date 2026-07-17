@@ -329,7 +329,7 @@ impl ShardCore {
 
     pub(crate) fn flush_egress(
         &mut self,
-        udp_socket: &UnifiedSocket,
+        udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
         for participant_id in self.dirty.drain_all() {

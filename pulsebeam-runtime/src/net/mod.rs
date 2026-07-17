@@ -132,7 +132,7 @@ impl UnifiedSocket {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         match self {
             Self::Udp(inner) => inner.try_send_batch(batch),
             Self::UdpScalar(inner) => inner.try_send_batch(batch),

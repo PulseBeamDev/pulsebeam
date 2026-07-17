@@ -38,7 +38,7 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         self.writer.try_send_batch(batch)
     }
 
@@ -79,6 +79,7 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
     let writer = UdpTransportWriter {
         sock: socket.clone(),
         local_addr,
+        drop_count: 0,
     };
     Ok(UdpTransport { reader, writer })
 }
@@ -136,6 +137,7 @@ impl UdpTransportReader {
 pub struct UdpTransportWriter {
     sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
+    drop_count: usize,
 }
 
 impl UdpTransportWriter {
@@ -154,14 +156,18 @@ impl UdpTransportWriter {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         let res = self.sock.try_send_to(batch.buf, batch.dst);
 
         match res {
             Ok(_) => Ok(true),
             // Lossy: kernel buffer full — drop this batch rather than queue it.
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                metrics::counter!("udp_egress_packets_dropped_total").increment(1);
+                // metrics::counter!("udp_egress_packets_dropped_total").increment(1);
+                if self.drop_count % 100 == 0 {
+                    tracing::warn!("udp_scalar dropped a packet due to full socket");
+                }
+                self.drop_count += 1;
                 Ok(true)
             }
             Err(err) => {

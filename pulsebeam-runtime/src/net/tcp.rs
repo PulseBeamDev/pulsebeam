@@ -257,6 +257,7 @@ pub struct TcpTransport {
     event_rx: mailbox::Receiver<TcpEvent>,
     /// One event stashed by `readable()` so `try_recv_batch` can always find it.
     peeked: Option<TcpEvent>,
+    drop_count: usize,
 }
 
 impl TcpTransport {
@@ -269,6 +270,7 @@ impl TcpTransport {
             event_tx,
             event_rx,
             peeked: None,
+            drop_count: 0,
         }
     }
 
@@ -499,7 +501,11 @@ impl TcpTransport {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     let dropped = count_rfc4571_frames(&buf);
                     if dropped > 0 {
-                        metrics::counter!("tcp_egress_packets_dropped_total").increment(dropped);
+                        // metrics::counter!("tcp_egress_packets_dropped_total").increment(dropped);
+                        if self.drop_count % 100 == 0 {
+                            tracing::warn!("udp dropped a packet due to full socket");
+                        }
+                        self.drop_count += dropped as usize;
                     }
                     break;
                 }

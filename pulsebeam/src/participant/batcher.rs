@@ -73,7 +73,7 @@ impl Batcher {
         }
     }
 
-    pub fn flush(&mut self, socket: &net::UnifiedSocket) {
+    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) {
         while let Some(state) = self.front() {
             debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
             debug_assert!(

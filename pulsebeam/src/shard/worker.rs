@@ -298,7 +298,7 @@ impl ShardWorker {
 
         // phase 3: output
         self.core
-            .flush_egress(&self.udp_socket, &mut self.tcp_socket);
+            .flush_egress(&mut self.udp_socket, &mut self.tcp_socket);
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
     }

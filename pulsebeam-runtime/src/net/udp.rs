@@ -54,7 +54,7 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         self.writer.try_send_batch(batch)
     }
 
@@ -108,6 +108,7 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
         sock: writer_sock,
         state,
         local_addr,
+        drop_count: 0,
     };
 
     tracing::info!(
@@ -193,6 +194,7 @@ pub struct UdpTransportWriter {
     sock: Arc<tokio::net::UdpSocket>,
     state: Arc<quinn_udp::UdpSocketState>,
     local_addr: SocketAddr,
+    drop_count: usize,
 }
 
 impl UdpTransportWriter {
@@ -211,7 +213,7 @@ impl UdpTransportWriter {
     }
 
     #[inline]
-    pub fn try_send_batch(&self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
         debug_assert!(
             !batch.buf.is_empty(),
@@ -237,7 +239,12 @@ impl UdpTransportWriter {
             // Lossy: kernel buffer full — drop this batch rather than queue it.
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 let dropped = batch.buf.len().div_ceil(batch.segment_size);
-                metrics::counter!("udp_egress_packets_dropped_total").increment(dropped as u64);
+                // metrics::counter!("udp_egress_packets_dropped_total").increment(dropped as u64);
+
+                if self.drop_count % 100 == 0 {
+                    tracing::warn!("udp dropped a packet due to full socket");
+                }
+                self.drop_count += dropped;
                 Ok(true)
             }
             Err(err) => {
@@ -280,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn udp_transport_writer_sends_payload_without_corruption() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let transport = bind(addr, None).await.unwrap();
+        let mut transport = bind(addr, None).await.unwrap();
         let send_addr = transport.local_addr();
 
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
