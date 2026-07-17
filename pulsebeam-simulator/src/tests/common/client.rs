@@ -166,8 +166,12 @@ impl SimClient {
     where
         F: FnMut(&mut ClientContext) -> bool,
     {
-        self.drive_until_cancelled_with_interval(CancellationToken::new(), check_interval, predicate)
-            .await
+        self.drive_until_cancelled_with_interval(
+            CancellationToken::new(),
+            check_interval,
+            predicate,
+        )
+        .await
     }
 
     pub async fn drive_until_cancelled<F>(

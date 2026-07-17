@@ -103,7 +103,9 @@ impl DownstreamAllocator {
         self.dirty_allocation = false;
         let (desired, assignments_changed) =
             self.video.update_allocations(self.available_bandwidth);
+        // let desired = Bitrate::kbps(300);
         if self.last_desired != desired {
+            tracing::info!("set desired to {}", desired);
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;
         }

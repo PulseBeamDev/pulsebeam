@@ -338,23 +338,22 @@ impl LayerController {
                 self.debt_ticks = 0;
                 tracing::info!(mid = ?key.0, rid = ?key.1, "bwe: pause layer");
             }
-        } else if debt <= 0.0 {
-            if let Some(key) = self
+        } else if debt <= 0.0
+            && let Some(key) = self
                 .order
                 .iter()
                 .rev()
                 .find(|k| self.states.get(*k).is_some_and(|s| s.paused))
                 .cloned()
-            {
-                let candidate_bps = self.states.get(&key).map_or(0.0, |s| s.bps);
-                let surplus = -debt;
-                if candidate_bps > 0.0 && candidate_bps <= surplus {
-                    if let Some(s) = self.states.get_mut(&key) {
-                        s.paused = false;
-                    }
-                    if let Some(n) = self.notifiers.get(&key) {
-                        n.notify();
-                    }
+        {
+            let candidate_bps = self.states.get(&key).map_or(0.0, |s| s.bps);
+            let surplus = -debt;
+            if candidate_bps > 0.0 && candidate_bps <= surplus {
+                if let Some(s) = self.states.get_mut(&key) {
+                    s.paused = false;
+                }
+                if let Some(n) = self.notifiers.get(&key) {
+                    n.notify();
                 }
             }
         }

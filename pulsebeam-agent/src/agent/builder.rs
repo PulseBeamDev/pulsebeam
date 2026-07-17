@@ -1,7 +1,7 @@
+use crate::TransceiverDirection;
 use crate::agent::driver::{AgentDriver, AgentError, DriverInit};
 use crate::api::{CreateParticipantRequest, HttpApiClient};
 use crate::tcp::TcpSession;
-use crate::TransceiverDirection;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::namespace;
 use pulsebeam_proto::rtp_extensions;
@@ -10,10 +10,7 @@ use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::channel::{ChannelConfig, Reliability};
 use str0m::media::{Direction, MediaAdded, MediaKind, Simulcast, SimulcastLayer};
-use str0m::{
-    Candidate, Rtc,
-    net::TcpType,
-};
+use str0m::{Candidate, Rtc, net::TcpType};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -88,14 +85,15 @@ impl AgentBuilder {
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);
-
-        let baseline_levels = [0x34];
-        let mut pt = 96;
-
-        for level in &baseline_levels {
-            codec_config.add_h264(pt.into(), Some((pt + 1).into()), true, 0x42e000 | level);
-            pt += 2;
-        }
+        codec_config.enable_h264(true);
+        //
+        // let baseline_levels = [0x34];
+        // let mut pt = 96;
+        //
+        // for level in &baseline_levels {
+        //     codec_config.add_h264(pt.into(), Some((pt + 1).into()), true, 0x42e000 | level);
+        //     pt += 2;
+        // }
 
         let mut rtc = rtc_builder.build(Instant::now().into());
         let mut candidate_count = 0;
@@ -127,20 +125,17 @@ impl AgentBuilder {
 
                     for ip in &self.local_ips {
                         let tcp_candidate_addr = SocketAddr::new(*ip, 9);
-                        match Candidate::builder()
+                        if let Ok(c) = Candidate::builder()
                             .tcp()
                             .host(tcp_candidate_addr)
                             .tcptype(TcpType::Active)
                             .build()
                         {
-                            Ok(c) => {
-                                rtc.add_local_candidate(c);
-                                candidate_count += 1;
-                                if maybe_addr.is_none() {
-                                    maybe_addr = Some(tcp_candidate_addr);
-                                }
+                            rtc.add_local_candidate(c);
+                            candidate_count += 1;
+                            if maybe_addr.is_none() {
+                                maybe_addr = Some(tcp_candidate_addr);
                             }
-                            Err(_) => {}
                         }
                     }
                 }
