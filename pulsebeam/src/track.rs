@@ -454,10 +454,30 @@ mod data_track {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum DeliveryClass {
+        Lossy,
+        SemiReliable,
+        Reliable,
+    }
+
+    impl From<&ChannelConfig> for DeliveryClass {
+        fn from(cfg: &ChannelConfig) -> Self {
+            match cfg.reliability {
+                Reliability::Reliable => Self::Reliable,
+                Reliability::MaxRetransmits { retransmits: 0 } => Self::Lossy,
+                Reliability::MaxRetransmits { .. } | Reliability::MaxPacketLifetime { .. } => {
+                    Self::SemiReliable
+                }
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct DataTopicChannel {
         pub direction: DataTrackDirection,
         pub topic: crate::track::Topic,
+        pub delivery: DeliveryClass,
     }
 
     impl Display for DataTopicChannel {
@@ -490,15 +510,6 @@ mod data_track {
         MissingLabel,
 
         #[error(
-            "Unsupported data channel configuration for label '{label}': expected unordered with MaxRetransmits(0), but got ordered={ordered}, reliability={reliability:?}"
-        )]
-        UnsupportedDataChannelConfig {
-            label: String,
-            ordered: bool,
-            reliability: Reliability,
-        },
-
-        #[error(
             "The label contains illegal characters (only alphanumeric, dashes, and underscores allowed)"
         )]
         IllegalCharacters,
@@ -529,18 +540,6 @@ mod data_track {
                     }
                 }
                 Some("rt") => {
-                    let supported_delivery_guarantee = matches!(
-                        cfg.reliability,
-                        Reliability::MaxRetransmits { retransmits: 0 }
-                    ) && !cfg.ordered;
-                    if !supported_delivery_guarantee {
-                        return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
-                            label: s.clone(),
-                            ordered: cfg.ordered,
-                            reliability: cfg.reliability,
-                        });
-                    }
-
                     let direction = match parts.next() {
                         Some("pub") => DataTrackDirection::Publish,
                         Some("sub") => DataTrackDirection::Subscribe,
@@ -563,6 +562,7 @@ mod data_track {
                     let topic = DataTopicChannel {
                         direction,
                         topic: Topic(topic_slice.to_string()),
+                        delivery: DeliveryClass::from(cfg),
                     };
                     Ok(Self::UserTopic(topic))
                 }
@@ -662,6 +662,44 @@ mod data_track {
 
             let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/topic$")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::IllegalCharacters);
+        }
+
+        #[test]
+        fn test_delivery_class_from_config() {
+            let mut reliable = cfg("v1/rt/pub/operation");
+            reliable.ordered = true;
+            reliable.reliability = Reliability::Reliable;
+            let res = DataTrackIntent::try_from(&reliable).unwrap();
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.delivery, DeliveryClass::Reliable);
+            } else {
+                panic!("Expected UserTopic variant");
+            }
+
+            let mut semi = cfg("v1/rt/sub/telemetry");
+            semi.reliability = Reliability::MaxRetransmits { retransmits: 5 };
+            let res = DataTrackIntent::try_from(&semi).unwrap();
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.delivery, DeliveryClass::SemiReliable);
+            } else {
+                panic!("Expected UserTopic variant");
+            }
+
+            let mut lifetime = cfg("v1/rt/sub/telemetry");
+            lifetime.reliability = Reliability::MaxPacketLifetime { lifetime: 200 };
+            let res = DataTrackIntent::try_from(&lifetime).unwrap();
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.delivery, DeliveryClass::SemiReliable);
+            } else {
+                panic!("Expected UserTopic variant");
+            }
+
+            let res = DataTrackIntent::try_from(&cfg("v1/rt/pub/control_input")).unwrap();
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.delivery, DeliveryClass::Lossy);
+            } else {
+                panic!("Expected UserTopic variant");
+            }
         }
 
         #[test]

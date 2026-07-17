@@ -28,10 +28,19 @@ use crate::participant::{
 use crate::rtp::RtpPacket;
 use crate::track::{
     self, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
-    KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Topic, Track,
+    DeliveryClass, KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Topic, Track,
 };
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+const MAX_RELIABLE_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+const RELIABLE_FLUSH_THRESHOLD: usize = 64 * 1024;
+
+#[derive(Default)]
+struct ReliableBacklog {
+    queue: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
 
 struct TrackAvailability {
     in_topology: bool,
@@ -110,6 +119,7 @@ pub struct ParticipantCore {
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
     data_sub_channels: HashMap<Topic, ChannelId>,
+    data_reliable_backlogs: HashMap<ChannelId, ReliableBacklog>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -150,6 +160,7 @@ impl ParticipantCore {
             data_topic_channels: HashMap::new(),
             data_pub_channels: HashMap::new(),
             data_sub_channels: HashMap::new(),
+            data_reliable_backlogs: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -192,12 +203,110 @@ impl ParticipantCore {
             return;
         };
 
+        let reliable = self
+            .data_topic_channels
+            .get(&cid)
+            .is_some_and(|ch| ch.delivery == DeliveryClass::Reliable);
+
+        if !reliable {
+            let Some(mut ch) = self.rtc.channel(cid) else {
+                return;
+            };
+            if let Err(err) = ch.write(true, pkt) {
+                tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+            }
+            return;
+        }
+
+        if !self.flush_reliable_backlog(cid) {
+            self.enqueue_reliable(cid, pkt.to_vec());
+            return;
+        }
+
         let Some(mut ch) = self.rtc.channel(cid) else {
             return;
         };
-        if let Err(err) = ch.write(true, pkt) {
-            tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+        match ch.write(true, pkt) {
+            Ok(true) => {}
+            Ok(false) => self.enqueue_reliable(cid, pkt.to_vec()),
+            Err(err) => {
+                tracing::warn!(
+                    ?topic,
+                    ?cid,
+                    ?err,
+                    "failed to forward reliable data topic packet, closing channel"
+                );
+                self.close_reliable_channel(cid);
+            }
         }
+    }
+
+    fn flush_reliable_backlog(&mut self, cid: ChannelId) -> bool {
+        let Some(backlog) = self.data_reliable_backlogs.get_mut(&cid) else {
+            return true;
+        };
+
+        let Some(mut ch) = self.rtc.channel(cid) else {
+            self.data_reliable_backlogs.remove(&cid);
+            return false;
+        };
+
+        let mut write_error = None;
+        while let Some(pkt) = backlog.queue.front() {
+            match ch.write(true, pkt) {
+                Ok(true) => {
+                    backlog.bytes -= pkt.len();
+                    backlog.queue.pop_front();
+                }
+                Ok(false) => return false,
+                Err(err) => {
+                    write_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = write_error {
+            tracing::warn!(
+                ?cid,
+                ?err,
+                "failed to flush reliable data topic backlog, closing channel"
+            );
+            self.close_reliable_channel(cid);
+            return false;
+        }
+
+        self.data_reliable_backlogs.remove(&cid);
+        true
+    }
+
+    fn flush_reliable_backlogs(&mut self) {
+        if self.data_reliable_backlogs.is_empty() {
+            return;
+        }
+        let cids: Vec<ChannelId> = self.data_reliable_backlogs.keys().copied().collect();
+        for cid in cids {
+            self.flush_reliable_backlog(cid);
+        }
+    }
+
+    fn enqueue_reliable(&mut self, cid: ChannelId, pkt: Vec<u8>) {
+        let backlog = self.data_reliable_backlogs.entry(cid).or_default();
+        backlog.bytes += pkt.len();
+        backlog.queue.push_back(pkt);
+        if backlog.bytes > MAX_RELIABLE_BACKLOG_BYTES {
+            tracing::warn!(
+                ?cid,
+                bytes = backlog.bytes,
+                "reliable data topic backlog exceeded budget, closing channel"
+            );
+            self.close_reliable_channel(cid);
+        }
+    }
+
+    fn close_reliable_channel(&mut self, cid: ChannelId) {
+        self.data_reliable_backlogs.remove(&cid);
+        self.rtc.direct_api().close_data_channel(cid);
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
@@ -277,6 +386,8 @@ impl ParticipantCore {
     }
 
     fn poll_slow(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        // Buffered-amount-low only fires per stream, backlogs may wait behind other streams.
+        self.flush_reliable_backlogs();
         let assignments_changed = self.downstream.poll_slow(now, &mut self.rtc.bwe(), events);
         if assignments_changed {
             self.signaling.mark_assignments_dirty();
@@ -496,13 +607,23 @@ impl ParticipantCore {
                             }
                             DataTrackDirection::Subscribe => {
                                 self.data_sub_channels.insert(e.topic.clone(), cid);
+                                if e.delivery == DeliveryClass::Reliable
+                                    && let Some(mut ch) = self.rtc.channel(cid)
+                                {
+                                    ch.set_buffered_amount_low_threshold(RELIABLE_FLUSH_THRESHOLD);
+                                }
                                 events.subscribe_data_topic(e.topic);
                             }
                         }
                     }
                 }
             }
+            Event::ChannelBufferedAmountLow(_) => {
+                // The freed budget is association-wide, retry every backlog.
+                self.flush_reliable_backlogs();
+            }
             Event::ChannelClose(cid) => {
+                self.data_reliable_backlogs.remove(&cid);
                 let Some(ch) = self.data_topic_channels.remove(&cid) else {
                     return;
                 };
@@ -753,6 +874,7 @@ impl ParticipantCore {
 
         self.data_pub_channels.clear();
         self.data_sub_channels.clear();
+        self.data_reliable_backlogs.clear();
     }
 
     fn release_data_topic_channel(
