@@ -141,6 +141,8 @@ impl ControllerActor {
 
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut next_cmd_at = tokio::time::Instant::now();
+        let cooldown_duration = SHARD_LOAD_POLL_INTERVAL / 4;
 
         loop {
             tokio::select! {
@@ -163,8 +165,14 @@ impl ControllerActor {
                     }
                 }
 
-                Some(cmd) = command_rx.recv() => {
+                Some(cmd) = recv_command_paced(&mut command_rx, next_cmd_at) => {
+                    let is_join = matches!(cmd, ControllerCommand::CreateParticipant(_, _));
+
                     self.process_command(cmd);
+
+                    if is_join {
+                        next_cmd_at = tokio::time::Instant::now() + cooldown_duration;
+                    }
                 }
 
                 _ = shutdown.cancelled() => {
@@ -296,6 +304,14 @@ impl ControllerActor {
 }
 
 pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
+
+async fn recv_command_paced(
+    rx: &mut mailbox::Receiver<ControllerCommand>,
+    allowed_at: tokio::time::Instant,
+) -> Option<ControllerCommand> {
+    tokio::time::sleep_until(allowed_at).await;
+    rx.recv().await
+}
 
 #[cfg(test)]
 mod tests {

@@ -390,7 +390,8 @@ impl NodeBuilder {
         let controller =
             ControllerActor::new(controller_rng, shard_contexts, candidates, tcp_listener);
         // intentionally small so backpressure is applied early
-        let (controller_command_tx, controller_command_rx) = mailbox::new(64);
+        // with 62.5 ms pacing rate, at most we get 1s latency here.
+        let (controller_command_tx, controller_command_rx) = mailbox::new(16);
 
         join_set.spawn(ignore(controller.run(
             controller_command_rx,
