@@ -45,14 +45,14 @@ pub fn setup_tracing() {
 
 pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {
     let rtc_port = 3478;
-    let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
+    let external_addr = SocketAddr::new(ip, rtc_port);
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
         .workers(1)
         .local_addr(local_addr)
-        .external_addr(external_addr)
+        .external_addrs(vec![external_addr])
         .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)
@@ -69,14 +69,14 @@ pub async fn start_sfu_node_tcp_only(
     rng: pulsebeam_runtime::rand::Rng,
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
-    let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
+    let external_addr = SocketAddr::new(ip, rtc_port);
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
         .workers(1)
         .local_addr(local_addr)
-        .external_addr(external_addr)
+        .external_addrs(vec![external_addr])
         .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)
@@ -98,14 +98,14 @@ pub async fn start_sfu_node_tcp_only_multi_shard(
     rng: pulsebeam_runtime::rand::Rng,
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
-    let external_addr: SocketAddr = format!("{}:3478", ip).parse()?;
+    let external_addr = SocketAddr::new(ip, rtc_port);
     let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse()?;
     let http_api_addr: SocketAddr = "0.0.0.0:7070".parse()?;
 
     pulsebeam::node::NodeBuilder::new()
         .workers(2)
         .local_addr(local_addr)
-        .external_addr(external_addr)
+        .external_addrs(vec![external_addr])
         .rng(rng)
         .with_udp_mode(UdpMode::Scalar)
         .with_http_api(http_api_addr)

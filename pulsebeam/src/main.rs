@@ -100,18 +100,26 @@ pub async fn run(
     rtc_port: u16,
     use_shared_runtime: bool,
 ) {
-    let external_ip = pulsebeam_runtime::system::select_host_address();
-    let external_addr: SocketAddr = format!("{}:{}", external_ip, rtc_port).parse().unwrap();
-    let local_addr: SocketAddr = format!("0.0.0.0:{}", rtc_port).parse().unwrap();
-    let http_api_addr: SocketAddr = "0.0.0.0:7070".parse().unwrap();
-    let metrics_addr: SocketAddr = "0.0.0.0:6060".parse().unwrap();
+    let external_ips = pulsebeam_runtime::system::select_host_addresses();
+    let external_addrs: Vec<SocketAddr> = external_ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, rtc_port))
+        .collect();
+    let local_addr: SocketAddr = format!("[::]:{}", rtc_port).parse().unwrap();
+    let http_api_addr: SocketAddr = "[::]:7070".parse().unwrap();
+    let metrics_addr: SocketAddr = "[::]:6060".parse().unwrap();
 
-    tracing::info!("Starting node on {external_addr} (RTC), {http_api_addr} (API)");
+    tracing::info!(
+        ?external_addrs,
+        "Starting node with advertised RTC addresses"
+    );
+    tracing::info!("API listening on {http_api_addr}");
     let rng = rand::os_rng();
     let mut node_builder = NodeBuilder::new()
         .workers(workers)
         .local_addr(local_addr)
-        .external_addr(external_addr)
+        .external_addrs(external_addrs)
         .rng(rng)
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr);
