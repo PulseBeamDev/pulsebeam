@@ -142,7 +142,10 @@ impl ControllerActor {
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut next_cmd_at = tokio::time::Instant::now();
+        #[cfg(not(feature = "unpace"))]
         let cooldown_duration = SHARD_LOAD_POLL_INTERVAL / 4;
+        #[cfg(feature = "unpace")]
+        let cooldown_duration = std::time::Duration::from_secs(0);
 
         loop {
             tokio::select! {
@@ -170,6 +173,7 @@ impl ControllerActor {
 
                     self.process_command(cmd);
 
+                    #[cfg(not(feature = "unpace"))]
                     if is_join {
                         next_cmd_at = tokio::time::Instant::now() + cooldown_duration;
                     }
