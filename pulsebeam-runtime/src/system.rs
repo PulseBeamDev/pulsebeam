@@ -44,7 +44,7 @@ pub async fn wait_for_signal() {
     wait_for_signal_impl().await
 }
 
-pub fn select_host_addresses() -> Vec<IpAddr> {
+pub fn select_host_addresses(forced_interface: Option<&str>) -> Vec<IpAddr> {
     #[derive(Default, Clone)]
     struct InterfaceCandidates {
         external_v4: Option<Ipv4Addr>,
@@ -103,8 +103,12 @@ pub fn select_host_addresses() -> Vec<IpAddr> {
     let mut best_iface: Option<InterfaceCandidates> = None;
 
     for (name, net) in &networks {
-        // Skip virtual/container management abstractions
-        if name.starts_with("docker")
+        // Match explicit parameter if provided, otherwise apply general filters
+        if let Some(target) = forced_interface {
+            if name != target {
+                continue;
+            }
+        } else if name.starts_with("docker")
             || name.starts_with("veth")
             || name.starts_with("br-")
             || name.starts_with("virbr")
@@ -180,23 +184,30 @@ pub fn select_host_addresses() -> Vec<IpAddr> {
             }
         }
 
-        // An interface is valid if it possesses AT LEAST one usable address (v4 or v6)
         if candidates.best_v4().is_none() && candidates.best_v6().is_none() {
             continue;
         }
 
-        // Compare using tuple comparison rules: V4 rank takes priority, V6 rank breaks ties.
-        let replace_best = match &best_iface {
-            None => true,
-            Some(current) => {
-                (candidates.v4_rank(), candidates.v6_rank())
-                    > (current.v4_rank(), current.v6_rank())
+        // If explicitly requested, the match rules instantly without rank checking
+        let replace_best = if forced_interface.is_some() {
+            true
+        } else {
+            match &best_iface {
+                None => true,
+                Some(current) => {
+                    (candidates.v4_rank(), candidates.v6_rank())
+                        > (current.v4_rank(), current.v6_rank())
+                }
             }
         };
 
         if replace_best {
             best_iface_name = Some(name.clone());
             best_iface = Some(candidates);
+
+            if forced_interface.is_some() {
+                break;
+            }
         }
     }
 
@@ -212,9 +223,13 @@ pub fn select_host_addresses() -> Vec<IpAddr> {
         tracing::info!(
             iface = best_iface_name.unwrap_or_else(|| "<unknown>".to_string()),
             ?out,
-            "selected interface host addresses dynamically"
+            "selected interface host addresses"
         );
         return out;
+    }
+
+    if let Some(target) = forced_interface {
+        tracing::warn!("explicitly pinned interface '{target}' was not found or has no valid IPs");
     }
 
     tracing::warn!("no active network interfaces detected; returning local fallback anchors");

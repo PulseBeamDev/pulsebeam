@@ -51,6 +51,9 @@ struct Args {
     /// Enable development mode preset
     #[arg(short, long)]
     dev: bool,
+    /// Pin to a specific network interface name (e.g., enp0s13f0u1u2)
+    #[arg(short = 'i', long = "iface")]
+    iface: Option<String>,
 }
 
 fn main() {
@@ -90,7 +93,7 @@ fn main() {
         .unwrap();
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    rt.block_on(run(shutdown.clone(), workers, rtc_port, false));
+    rt.block_on(run(shutdown.clone(), workers, rtc_port, args.iface));
     shutdown.cancel();
 }
 
@@ -98,9 +101,10 @@ pub async fn run(
     shutdown: CancellationToken,
     workers: usize,
     rtc_port: u16,
-    use_shared_runtime: bool,
+    network_interface: Option<String>,
 ) {
-    let external_ips = pulsebeam_runtime::system::select_host_addresses();
+    let external_ips =
+        pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
     let external_addrs: Vec<SocketAddr> = external_ips
         .iter()
         .copied()
@@ -116,7 +120,7 @@ pub async fn run(
     );
     tracing::info!("API listening on {http_api_addr}");
     let rng = rand::os_rng();
-    let mut node_builder = NodeBuilder::new()
+    let node_builder = NodeBuilder::new()
         .workers(workers)
         .local_addr(local_addr)
         .external_addrs(external_addrs)
@@ -124,9 +128,6 @@ pub async fn run(
         .with_http_api(http_api_addr)
         .with_internal_metrics(metrics_addr);
 
-    if use_shared_runtime {
-        node_builder = node_builder.with_current_runtime();
-    }
     let node = node_builder.run(shutdown.child_token());
     let node_handle = tokio::task::spawn(node);
 
