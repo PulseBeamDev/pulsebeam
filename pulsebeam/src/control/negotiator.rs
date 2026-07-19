@@ -102,8 +102,7 @@ impl Negotiator {
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            // enable for compatibility, some clients don't support remote ice-lite
-            .set_ice_lite(false);
+            .set_ice_lite(true);
         rtc_config.set_initial_stun_rto(Duration::from_millis(200));
         rtc_config.set_max_stun_rto(Duration::from_millis(1500));
         rtc_config.set_max_stun_retransmits(5);
