@@ -102,7 +102,9 @@ impl Negotiator {
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
-            .set_ice_lite(true);
+            .set_ice_lite(true)
+            .set_snap_enabled(true)
+            .set_dtls_version(str0m::config::DtlsVersion::Auto);
         rtc_config.set_initial_stun_rto(Duration::from_millis(200));
         rtc_config.set_max_stun_rto(Duration::from_millis(1500));
         rtc_config.set_max_stun_retransmits(5);
