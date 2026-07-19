@@ -1062,11 +1062,11 @@ mod test {
         );
     }
 
-    /// VBR / screen-share idle: windows with expected==0 must NOT change quality.
+    /// screen-share idle: windows with expected==0 must NOT change quality.
     #[test]
-    fn vbr_idle_window_does_not_change_quality() {
+    fn cbr_idle_window_does_not_change_quality() {
         let shared = StreamState::new(false, 0);
-        let mut monitor = StreamMonitor::new(TrackKind::Video, "vbr".into(), shared.clone());
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "cbr".into(), shared.clone());
         let now = Instant::now();
 
         // Reach Excellent with 6 clean windows.
@@ -1395,7 +1395,7 @@ mod test {
 
         const TARGET_BPS: f64 = 150_000.0;
 
-        let frames = pulsebeam_testdata::h264_frame_sizes(pulsebeam_testdata::RAW_H264_QUARTER_VBR);
+        let frames = pulsebeam_testdata::h264_frame_sizes(pulsebeam_testdata::RAW_H264_QUARTER_CBR);
         let samples = replay_frames_into_bwe(&frames, 30);
 
         // 45 s @ 30 fps → ~90 ticks; skip first 10 (5 s warmup).

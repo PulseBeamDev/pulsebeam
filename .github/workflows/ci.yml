@@ -15,24 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
-    - name: Create Git LFS file list
-      run: git lfs ls-files -l |cut -d' ' -f1 |sort >.git/lfs-hashes.txt
-
-    - name: Restore Git LFS object cache
-      uses: actions/cache@v4
-      with:
-        path: .git/lfs
-        key: ${{ runner.os }}-lfsdata-v1-${{ hashFiles('.git/lfs-hashes.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-lfsdata-v1-
-          ${{ runner.os }}-lfsdata
-
-    - name: Fetch any needed Git LFS objects and prune extraneous ones
-      run: git lfs fetch --prune
-
-    - name: Check out Git LFS content
-      run: git lfs checkout
-
     - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.10
