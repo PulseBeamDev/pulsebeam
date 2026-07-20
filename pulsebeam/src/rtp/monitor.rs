@@ -12,7 +12,32 @@ use crate::rtp::RtpPacket;
 const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
 const STREAM_DEAD_TIMEOUT: Duration = Duration::from_millis(3000);
 const LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_millis(500);
-const WARMUP_LOSS_PENALTY: f64 = 0.15;
+// An eligibility signal, not a per-packet alarm: small 500ms windows on a
+// lossy WAN regularly contain one late/missing packet, and treating those
+// as health transitions causes false layer churn and PLI storms.
+const VIDEO_BAD_LOSS_THRESHOLD: f64 = 0.12;
+const VIDEO_SEVERE_LOSS_THRESHOLD: f64 = 0.30;
+const VIDEO_EXCELLENT_TO_GOOD_THRESHOLD: f64 = 0.05;
+const VIDEO_BAD_TO_GOOD_THRESHOLD: f64 = 0.02;
+// Durations, not packet-count thresholds, so a 5fps screen share and a
+// 60fps camera both need persistent evidence, not one unlucky interval.
+const VIDEO_DEGRADE_CONFIRMATION: Duration = Duration::from_secs(2);
+const VIDEO_BAD_CONFIRMATION: Duration = Duration::from_secs(3);
+const VIDEO_SEVERE_CONFIRMATION: Duration = Duration::from_secs(1);
+const VIDEO_RECOVERY_CONFIRMATION: Duration = Duration::from_secs(3);
+// Time-based so a single lost low-fps frame can't combine with another
+// loss many seconds later, without imposing a packet-rate cutoff.
+const VIDEO_EVIDENCE_MAX_GAP: Duration = Duration::from_secs(2);
+// There's no jitter buffer: a packet that lands one window late is
+// indistinguishable from a genuinely lost one, so `interval_loss` is exact
+// only in how many packets it counts, not in what happened to them. With
+// few expected packets that exactness doesn't help — a screen share at
+// 2-5 fps can see just 1-2 packets per 500 ms window, so a single
+// late/lost one swings interval_loss by 50-100%. Keep extending the
+// window until it has gathered enough samples to be meaningful, capped so
+// a persistently very-low-rate stream still gets evaluated eventually.
+const MIN_LOSS_EVIDENCE_PACKETS: u64 = 5;
+const MAX_LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -53,7 +78,15 @@ impl AsRef<StreamStateInner> for StreamState {
 #[derive(Debug)]
 pub struct StreamStateInner {
     inactive: AtomicBool,
+    // Kept separate from the rolling ingress measurement: an inactive
+    // encoding has no current rate, but reactivating it still costs its
+    // nominal rate plus a keyframe.
+    nominal_bitrate_bps: u64,
     bitrate_bps: AtomicU64,
+    // Fast-reacting counterpart to `bitrate_bps` — see
+    // `BitrateEstimate::demand_bps`. Used only to signal bandwidth demand
+    // (BWE probing), never for admission/cost accounting.
+    demand_bitrate_bps: AtomicU64,
     quality: AtomicU8,
 
     audio_envelope_bits: AtomicU32,
@@ -65,7 +98,9 @@ impl StreamStateInner {
     pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
         Self {
             inactive: AtomicBool::new(inactive),
+            nominal_bitrate_bps: bitrate_bps,
             bitrate_bps: AtomicU64::new(bitrate_bps),
+            demand_bitrate_bps: AtomicU64::new(bitrate_bps),
             quality: AtomicU8::new(StreamQuality::Good as u8),
             audio_envelope_bits: AtomicU32::new(0.0f32.to_bits()),
             silence_duration_ms: AtomicU64::new(0),
@@ -77,12 +112,36 @@ impl StreamStateInner {
         !self.is_inactive() && self.quality() != StreamQuality::Bad
     }
 
+    /// Whether an encoding may be targeted by a keyframe-gated switch.
+    ///
+    /// Inactive isn't evidence of loss — publishers commonly pause an
+    /// encoding until requested, so a known-good paused encoding stays
+    /// eligible for one-PLI reactivation. Only sustained real loss (`Bad`)
+    /// makes it ineligible.
+    pub fn is_activation_candidate(&self) -> bool {
+        self.quality() != StreamQuality::Bad
+    }
+
     pub fn is_inactive(&self) -> bool {
         self.inactive.load(Ordering::Relaxed)
     }
 
     pub fn bitrate_bps(&self) -> f64 {
         self.bitrate_bps.load(Ordering::Relaxed) as f64
+    }
+
+    /// Fast-reacting bandwidth *demand* signal — for asking str0m to probe
+    /// for more headroom, never for admission/cost accounting (that's
+    /// `bitrate_bps`, deliberately more conservative). See
+    /// `BitrateEstimate::demand_bps`.
+    pub fn demand_bitrate_bps(&self) -> f64 {
+        self.demand_bitrate_bps.load(Ordering::Relaxed) as f64
+    }
+
+    /// Configured bitrate envelope for this encoding, independent of whether
+    /// it is currently producing packets.
+    pub fn nominal_bitrate_bps(&self) -> f64 {
+        self.nominal_bitrate_bps as f64
     }
 
     pub fn audio_envelope(&self) -> f32 {
@@ -117,6 +176,10 @@ impl<'a> StreamStateUpdater<'a> {
         self.state.bitrate_bps.store(bps, Ordering::Relaxed);
         self
     }
+    pub fn demand_bitrate(self, bps: u64) -> Self {
+        self.state.demand_bitrate_bps.store(bps, Ordering::Relaxed);
+        self
+    }
     pub fn quality(self, q: StreamQuality) -> Self {
         self.state.quality.store(q as u8, Ordering::Relaxed);
         self
@@ -130,6 +193,7 @@ impl<'a> StreamStateUpdater<'a> {
 #[derive(Debug)]
 pub struct StreamMonitor {
     shared_state: StreamState,
+    nominal_bitrate_bps: u64,
 
     stream_id: String,
     kind: TrackKind, // distinguish Audio/Video for scoring
@@ -144,19 +208,35 @@ pub struct StreamMonitor {
     audio_monitor: Option<AudioMonitor>,
 
     current_quality: StreamQuality,
+    quality_transition_since: Option<Instant>,
+    quality_transition_target: Option<StreamQuality>,
+    quality_transition_last_evidence: Option<Instant>,
 }
 
 impl StreamMonitor {
     pub fn new(kind: TrackKind, stream_id: String, shared_state: StreamState) -> Self {
         let now = Instant::now();
+        let nominal_bitrate_bps = shared_state.bitrate_bps() as u64;
         let audio_monitor = match kind {
             TrackKind::Audio => Some(AudioMonitor::new()),
             TrackKind::Video | TrackKind::Data => None,
         };
+        // Audio has no simulcast layer to select between, so there's nothing
+        // for a loss-driven quality signal to act on yet; stubbed Excellent
+        // rather than run the (currently video-only) hysteresis machinery
+        // against it. See `poll`.
+        let current_quality = match kind {
+            TrackKind::Audio => StreamQuality::Excellent,
+            TrackKind::Video | TrackKind::Data => StreamQuality::Good,
+        };
+        shared_state
+            .quality
+            .store(current_quality as u8, Ordering::Relaxed);
         Self {
             stream_id,
             kind,
             shared_state,
+            nominal_bitrate_bps,
             last_packet_at: now,
             window_start_ts: now,
             window_start_seq: 0,
@@ -165,7 +245,10 @@ impl StreamMonitor {
             smoothed_loss_ratio: 0.0,
             audio_monitor,
             bwe: BitrateEstimate::new(now),
-            current_quality: StreamQuality::Good,
+            current_quality,
+            quality_transition_since: None,
+            quality_transition_target: None,
+            quality_transition_last_evidence: None,
         }
     }
 
@@ -200,14 +283,32 @@ impl StreamMonitor {
     pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
         let bitrate_estimate = self.bwe.estimate_bps() as u64;
+        // The ingress estimator can dip well below a video layer's nominal
+        // rate between keyframes, but the next keyframe still costs the
+        // full rate — never let a dip underprice it for allocation.
+        let allocation_bitrate = if self.kind == TrackKind::Video {
+            bitrate_estimate.max(self.nominal_bitrate_bps)
+        } else if self.bwe.is_warm() {
+            bitrate_estimate
+        } else {
+            bitrate_estimate.max(self.nominal_bitrate_bps)
+        };
+        // Same floor as `allocation_bitrate`, but from the fast/reactive
+        // trend — this is what lets a live burst raise demand signaling
+        // even while the conservative admission value hasn't confirmed it.
+        let demand_estimate = self.bwe.demand_bps() as u64;
+        let demand_bitrate = demand_estimate.max(self.nominal_bitrate_bps);
         tracing::debug!(
             stream_id = self.stream_id,
             "upstream bwe={}",
-            Bitrate::from(bitrate_estimate)
+            Bitrate::from(allocation_bitrate)
         );
         self.shared_state
             .bitrate_bps
-            .store(bitrate_estimate, Ordering::Relaxed);
+            .store(allocation_bitrate, Ordering::Relaxed);
+        self.shared_state
+            .demand_bitrate_bps
+            .store(demand_bitrate, Ordering::Relaxed);
 
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
@@ -232,16 +333,17 @@ impl StreamMonitor {
         if time_since_last_packet > SIMULCAST_LAYER_PAUSE_TIMEOUT && is_any_sibling_active {
             if !was_inactive {
                 self.shared_state.inactive.store(true, Ordering::Relaxed);
-                self.smoothed_loss_ratio = WARMUP_LOSS_PENALTY;
-                tracing::warn!(
+                tracing::debug!(
                     stream_id = %self.stream_id,
-                    "Simulcast layer paused while siblings active; applying warmup loss penalty and forcing Bad quality"
+                    "Simulcast layer paused while siblings active; retaining its last loss classification for keyframe-gated reactivation"
                 );
-                self.current_quality = StreamQuality::Bad;
-                self.shared_state
-                    .quality
-                    .store(StreamQuality::Bad as u8, Ordering::Relaxed);
+                self.quality_transition_since = None;
+                self.quality_transition_target = None;
+                self.quality_transition_last_evidence = None;
                 self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
+                self.shared_state
+                    .demand_bitrate_bps
+                    .store(0, Ordering::Relaxed);
             }
             return;
         }
@@ -258,8 +360,6 @@ impl StreamMonitor {
 
         // Resuming from any form of inactivity: reset the measurement window so that
         // stale seq numbers don't produce a phantom loss spike on the first window.
-        // smoothed_loss_ratio is intentionally NOT reset — the 0.15 simulcast-resume
-        // warmup penalty must survive the transition.
         if was_inactive {
             self.window_highest_seq = None;
             self.window_start_seq = 0;
@@ -267,12 +367,27 @@ impl StreamMonitor {
             self.window_start_ts = now;
         }
 
-        // Step B: Windowed Packet Loss Calculation
-        if now.saturating_duration_since(self.window_start_ts) >= LOSS_MEASUREMENT_WINDOW {
-            let expected = self
-                .window_highest_seq
-                .unwrap_or(0)
-                .saturating_sub(self.window_start_seq);
+        // Step B: Windowed Packet Loss Calculation. Audio has no simulcast
+        // layer for a loss signal to act on yet, so it's stubbed Excellent
+        // at construction and never evaluated here — see `new`.
+        if self.kind != TrackKind::Video {
+            return;
+        }
+
+        let window_elapsed = now.saturating_duration_since(self.window_start_ts);
+        let expected = self
+            .window_highest_seq
+            .unwrap_or(0)
+            .saturating_sub(self.window_start_seq);
+        // Keep extending the window past LOSS_MEASUREMENT_WINDOW until
+        // enough packets have been seen to make interval_loss meaningful,
+        // capped by MAX_LOSS_MEASUREMENT_WINDOW. See that constant's doc
+        // comment.
+        let window_ready = window_elapsed >= LOSS_MEASUREMENT_WINDOW
+            && (expected >= MIN_LOSS_EVIDENCE_PACKETS
+                || window_elapsed >= MAX_LOSS_MEASUREMENT_WINDOW);
+
+        if window_ready {
             let actual = self.window_actual_packets;
 
             if expected > 0 {
@@ -285,7 +400,7 @@ impl StreamMonitor {
                 self.smoothed_loss_ratio =
                     (self.smoothed_loss_ratio * (1.0 - alpha)) + (interval_loss * alpha);
 
-                self.evaluate_quality_hysteresis(interval_loss, expected, actual);
+                self.evaluate_quality_hysteresis(now, interval_loss, expected, actual);
             }
 
             self.window_start_ts = now;
@@ -296,18 +411,30 @@ impl StreamMonitor {
         }
     }
 
-    fn evaluate_quality_hysteresis(&mut self, interval_loss: f64, expected: u64, actual: u64) {
-        // Step C: Evaluate Quality Hysteresis
-        let evaluated_quality = match (self.kind, self.current_quality) {
-            (TrackKind::Video, StreamQuality::Bad) => {
-                if self.smoothed_loss_ratio <= 0.025 {
+    fn evaluate_quality_hysteresis(
+        &mut self,
+        now: Instant,
+        interval_loss: f64,
+        expected: u64,
+        actual: u64,
+    ) {
+        // Only Bad makes a layer ineligible; don't let one 500ms loss
+        // window withdraw it. Severe loss still acts immediately. Video
+        // only — audio is stubbed Excellent in `new` and never reaches
+        // here (see `poll`'s Step B kind gate).
+        debug_assert_eq!(self.kind, TrackKind::Video);
+        let new_quality = match self.current_quality {
+            StreamQuality::Bad => {
+                if self.smoothed_loss_ratio <= VIDEO_BAD_TO_GOOD_THRESHOLD {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Bad
                 }
             }
-            (TrackKind::Video, StreamQuality::Good) => {
-                if self.smoothed_loss_ratio >= 0.05 {
+            StreamQuality::Good => {
+                if self.smoothed_loss_ratio >= VIDEO_BAD_LOSS_THRESHOLD
+                    || interval_loss >= VIDEO_SEVERE_LOSS_THRESHOLD
+                {
                     StreamQuality::Bad
                 } else if self.smoothed_loss_ratio <= 0.005 {
                     StreamQuality::Excellent
@@ -315,44 +442,52 @@ impl StreamMonitor {
                     StreamQuality::Good
                 }
             }
-            (TrackKind::Video, StreamQuality::Excellent) => {
-                if self.smoothed_loss_ratio >= 0.05 {
+            StreamQuality::Excellent => {
+                if self.smoothed_loss_ratio >= VIDEO_BAD_LOSS_THRESHOLD
+                    || interval_loss >= VIDEO_SEVERE_LOSS_THRESHOLD
+                {
                     StreamQuality::Bad
-                } else if self.smoothed_loss_ratio >= 0.015 {
+                } else if self.smoothed_loss_ratio >= VIDEO_EXCELLENT_TO_GOOD_THRESHOLD {
                     StreamQuality::Good
                 } else {
                     StreamQuality::Excellent
                 }
             }
-            (TrackKind::Audio, StreamQuality::Bad) => {
-                if self.smoothed_loss_ratio <= 0.06 {
-                    StreamQuality::Good
-                } else {
-                    StreamQuality::Bad
-                }
-            }
-            (TrackKind::Audio, StreamQuality::Good) => {
-                if self.smoothed_loss_ratio >= 0.10 {
-                    StreamQuality::Bad
-                } else if self.smoothed_loss_ratio <= 0.02 {
-                    StreamQuality::Excellent
-                } else {
-                    StreamQuality::Good
-                }
-            }
-            (TrackKind::Audio, StreamQuality::Excellent) => {
-                if self.smoothed_loss_ratio >= 0.10 {
-                    StreamQuality::Bad
-                } else if self.smoothed_loss_ratio >= 0.06 {
-                    StreamQuality::Good
-                } else {
-                    StreamQuality::Excellent
-                }
-            }
-            (_, _) => todo!("data track stream quality"),
         };
 
-        let new_quality = evaluated_quality;
+        if new_quality != self.current_quality {
+            let confirmation = if new_quality > self.current_quality {
+                VIDEO_RECOVERY_CONFIRMATION
+            } else if interval_loss >= VIDEO_SEVERE_LOSS_THRESHOLD {
+                VIDEO_SEVERE_CONFIRMATION
+            } else if new_quality == StreamQuality::Bad {
+                VIDEO_BAD_CONFIRMATION
+            } else {
+                VIDEO_DEGRADE_CONFIRMATION
+            };
+            // Evidence only accumulates while it supports the *same* target.
+            // Otherwise alternating loss windows could accidentally combine
+            // into a transition even though neither condition persisted.
+            if self.quality_transition_target != Some(new_quality)
+                || self
+                    .quality_transition_last_evidence
+                    .is_none_or(|last| now.saturating_duration_since(last) > VIDEO_EVIDENCE_MAX_GAP)
+            {
+                self.quality_transition_target = Some(new_quality);
+                self.quality_transition_since = Some(now);
+            }
+            self.quality_transition_last_evidence = Some(now);
+            let since = self
+                .quality_transition_since
+                .expect("transition start set above");
+            if now.saturating_duration_since(since) < confirmation {
+                return;
+            }
+        } else {
+            self.quality_transition_since = None;
+            self.quality_transition_target = None;
+            self.quality_transition_last_evidence = None;
+        }
 
         if new_quality != self.current_quality {
             tracing::info!(
@@ -367,6 +502,9 @@ impl StreamMonitor {
                 Bitrate::from(self.bwe.estimate_bps()),
             );
             self.current_quality = new_quality;
+            self.quality_transition_since = None;
+            self.quality_transition_target = None;
+            self.quality_transition_last_evidence = None;
             self.shared_state
                 .quality
                 .store(new_quality as u8, Ordering::Relaxed);
@@ -382,13 +520,24 @@ impl StreamMonitor {
         self.window_actual_packets = 0;
         self.window_start_ts = now;
         self.smoothed_loss_ratio = 0.0;
+        self.quality_transition_since = None;
+        self.quality_transition_target = None;
+        self.quality_transition_last_evidence = None;
         self.bwe = BitrateEstimate::new(now);
-        self.current_quality = StreamQuality::Good;
+        // Audio stays stubbed Excellent even across a dead-stream reset —
+        // see `new`.
+        self.current_quality = match self.kind {
+            TrackKind::Audio => StreamQuality::Excellent,
+            TrackKind::Video | TrackKind::Data => StreamQuality::Good,
+        };
         self.shared_state
             .quality
-            .store(StreamQuality::Good as u8, Ordering::Relaxed);
+            .store(self.current_quality as u8, Ordering::Relaxed);
 
         self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
+        self.shared_state
+            .demand_bitrate_bps
+            .store(0, Ordering::Relaxed);
     }
 }
 
@@ -400,12 +549,29 @@ pub struct BitrateEstimate {
     sma1_ticks: VecDeque<f64>,
     max_window_ticks: usize,
     baseline_bps: f64,
+    // Fast, reactive trend (median of last 3 raw ticks). Deliberately
+    // trigger-happy — this is the *demand* signal (see `demand_bps`), used
+    // to ask for more bandwidth, where a false-positive is cheap. It must
+    // never feed admission math directly; see `admission_trend_bps`.
     fast_trend_bps: f64,
+    // Slower, majority-confirmed trend over its own window (see
+    // `admission_ticks`), decoupled from `raw_ticks`/`sma1_ticks` so it
+    // doesn't disturb `baseline_bps`. This is the *admission* signal (see
+    // `estimate_bps`) — a multi-second VBR/screen-share burst must not look
+    // like a sustained cost increase until a real majority of the window
+    // agrees.
+    admission_ticks: VecDeque<f64>,
+    admission_trend_bps: f64,
 }
 
 impl BitrateEstimate {
     const HEADROOM: f64 = 1.05;
     const TICK_MS: f64 = 500.0;
+    // 3.5s: long enough that a multi-second burst (a few seconds of
+    // screen-share/VBR activity) can't masquerade as a sustained cost
+    // change, short enough to still confirm a genuine step-up well before
+    // the 6s `baseline_bps` catches up.
+    const ADMISSION_TREND_WINDOW_TICKS: usize = 7;
 
     pub fn new(_now: Instant) -> Self {
         Self {
@@ -416,6 +582,8 @@ impl BitrateEstimate {
             max_window_ticks: 6, // 3s per stage (6s total triangular spread)
             baseline_bps: 0.0,
             fast_trend_bps: 0.0,
+            admission_ticks: VecDeque::with_capacity(Self::ADMISSION_TREND_WINDOW_TICKS),
+            admission_trend_bps: 0.0,
         }
     }
 
@@ -482,10 +650,36 @@ impl BitrateEstimate {
         } else {
             self.fast_trend_bps = 0.0;
         }
+
+        // Admission trend: median over a wider window, requiring a real
+        // majority of the last 3.5s to agree before a rise counts.
+        if self.admission_ticks.len() == Self::ADMISSION_TREND_WINDOW_TICKS {
+            self.admission_ticks.pop_front();
+        }
+        self.admission_ticks.push_back(bps);
+        let mut sorted: Vec<f64> = self.admission_ticks.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        self.admission_trend_bps = sorted[sorted.len() / 2];
     }
 
+    /// Conservative, admission-facing estimate (backs `bitrate_bps()`): a
+    /// burst must persist long enough to win a majority of
+    /// `admission_trend_bps`'s window before it's trusted as real cost.
     pub fn estimate_bps(&self) -> f64 {
+        self.baseline_bps.max(self.admission_trend_bps) * Self::HEADROOM
+    }
+
+    /// Fast, reactive estimate for signaling bandwidth *demand* (e.g.
+    /// probing str0m for more headroom) — never for admission math. Safe to
+    /// react quickly here: asking for more bandwidth is cheap, unlike
+    /// charging another slot's shared pool on a false positive.
+    pub fn demand_bps(&self) -> f64 {
         self.baseline_bps.max(self.fast_trend_bps) * Self::HEADROOM
+    }
+
+    fn is_warm(&self) -> bool {
+        self.raw_ticks.len() == self.max_window_ticks
+            && self.sma1_ticks.len() == self.max_window_ticks
     }
 }
 
@@ -628,7 +822,35 @@ mod test {
     }
 
     #[test]
-    fn stream_monitor_fast_pause_marks_inactive_and_bad() {
+    fn video_upstream_bitrate_never_falls_below_nominal_layer_rate() {
+        let shared = StreamState::new(false, 1_250_000);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "high".into(), shared.clone());
+        let now = Instant::now();
+
+        // A partial initial window has too little traffic to characterize a
+        // high simulcast layer. Its nominal rate remains the allocation cost.
+        monitor.process_packet(&packet(1, now));
+        monitor.poll(now + Duration::from_millis(600), false);
+        assert_eq!(shared.bitrate_bps(), 1_250_000.0);
+        assert!(!monitor.bwe.is_warm());
+
+        // The same must remain true after the rolling estimator is warm but
+        // happens to observe a low-VBR interval.
+        monitor.bwe.raw_ticks.clear();
+        monitor.bwe.sma1_ticks.clear();
+        for _ in 0..monitor.bwe.max_window_ticks {
+            monitor.bwe.raw_ticks.push_back(100_000.0);
+            monitor.bwe.sma1_ticks.push_back(100_000.0);
+        }
+        monitor.bwe.baseline_bps = 100_000.0;
+        monitor.bwe.fast_trend_bps = 100_000.0;
+        monitor.poll(now + Duration::from_millis(700), false);
+        assert!(monitor.bwe.is_warm());
+        assert_eq!(shared.bitrate_bps(), 1_250_000.0);
+    }
+
+    #[test]
+    fn stream_monitor_fast_pause_preserves_keyframe_reactivation_eligibility() {
         let shared = StreamState::new(false, 123_000);
         let mut monitor = StreamMonitor::new(TrackKind::Video, "v0".into(), shared.clone());
         let now = Instant::now();
@@ -640,9 +862,11 @@ mod test {
         monitor.poll(paused_now, true);
 
         assert!(shared.is_inactive());
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        assert_eq!(shared.quality(), StreamQuality::Good);
+        assert!(!shared.is_healthy());
+        assert!(shared.is_activation_candidate());
         assert_eq!(shared.bitrate_bps(), 0.0);
-        assert_eq!(monitor.smoothed_loss_ratio, WARMUP_LOSS_PENALTY);
+        assert_eq!(monitor.smoothed_loss_ratio, 0.0);
     }
 
     #[test]
@@ -651,13 +875,16 @@ mod test {
         let mut monitor = StreamMonitor::new(TrackKind::Video, "v1".into(), shared.clone());
         let now = Instant::now();
 
-        monitor.process_packet(&packet(1, now));
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
-        monitor.poll(now + Duration::from_millis(600), false);
+        for window in 0..3u64 {
+            let t = now + Duration::from_millis(window * 600);
+            monitor.process_packet(&packet(1 + window * 10, t));
+            monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
+            monitor.poll(t + Duration::from_millis(600), false);
+        }
         assert_eq!(shared.quality(), StreamQuality::Bad);
         assert!(monitor.smoothed_loss_ratio > 0.0);
 
-        monitor.poll(now + Duration::from_millis(3200), false);
+        monitor.poll(now + Duration::from_millis(5000), false);
 
         assert!(shared.is_inactive());
         assert_eq!(shared.quality(), StreamQuality::Good);
@@ -697,10 +924,13 @@ mod test {
         let mut monitor = StreamMonitor::new(TrackKind::Video, "v4".into(), shared.clone());
         let now = Instant::now();
 
-        // Drive quality Bad: 9 gaps out of 10 expected (loss=0.8, smoothed=0.4 >= 0.05)
-        monitor.process_packet(&packet(1, now));
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
-        monitor.poll(now + Duration::from_millis(600), false);
+        // Drive quality Bad with persistent severe loss, not one report.
+        for window in 0..3u64 {
+            let t = now + Duration::from_millis(window * 600);
+            monitor.process_packet(&packet(1 + window * 10, t));
+            monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
+            monitor.poll(t + Duration::from_millis(600), false);
+        }
         assert_eq!(shared.quality(), StreamQuality::Bad);
         assert!(
             monitor.smoothed_loss_ratio > 0.025,
@@ -709,10 +939,10 @@ mod test {
         );
 
         // One fully clean window: smoothed decays from 0.4 * 0.8 = 0.32 — still above 0.025
-        for seq in 12u64..=22 {
-            monitor.process_packet(&packet(seq, now + Duration::from_millis(700 + seq - 12)));
+        for seq in 32u64..=42 {
+            monitor.process_packet(&packet(seq, now + Duration::from_millis(1900 + seq - 32)));
         }
-        monitor.poll(now + Duration::from_millis(1200), false);
+        monitor.poll(now + Duration::from_millis(2400), false);
         assert_eq!(
             shared.quality(),
             StreamQuality::Bad,
@@ -720,8 +950,8 @@ mod test {
         );
 
         // Sustain clean traffic until smoothed_loss_ratio falls below 0.025
-        let mut tick_now = now + Duration::from_millis(1700);
-        let mut base_seq = 23u64;
+        let mut tick_now = now + Duration::from_millis(2900);
+        let mut base_seq = 43u64;
         for _ in 0..100 {
             for seq in base_seq..(base_seq + 10) {
                 monitor.process_packet(&packet(
@@ -753,19 +983,25 @@ mod test {
         let mut monitor = StreamMonitor::new(TrackKind::Video, "v5".into(), shared.clone());
         let now = Instant::now();
 
-        // Drive Bad: seq 1 and 11 in one window → expected=10, actual=2, loss=80%
-        // EWMA = 0.0 * 0.5 + 0.8 * 0.5 = 0.40  (well above the 5% Good→Bad threshold)
-        monitor.process_packet(&packet(1, now));
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
-        monitor.poll(now + Duration::from_millis(600), false);
+        // Drive Bad with three severe windows. The time confirmation prevents
+        // a lone report from changing upstream eligibility.
+        for window in 0..3u64 {
+            let t = now + Duration::from_millis(window * 600);
+            monitor.process_packet(&packet(1 + window * 10, t));
+            monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
+            monitor.poll(t + Duration::from_millis(600), false);
+        }
         assert_eq!(shared.quality(), StreamQuality::Bad);
-        assert!((monitor.smoothed_loss_ratio - 0.40).abs() < 1e-9);
+        assert!(
+            monitor.smoothed_loss_ratio >= VIDEO_BAD_LOSS_THRESHOLD,
+            "persistent severe loss must leave a substantial EWMA penalty"
+        );
 
         // One clean window: EWMA = 0.40 * 0.80 = 0.32 — still above 2.5%.
-        for seq in 12u64..=22 {
-            monitor.process_packet(&packet(seq, now + Duration::from_millis(700)));
+        for seq in 32u64..=42 {
+            monitor.process_packet(&packet(seq, now + Duration::from_millis(1900)));
         }
-        monitor.poll(now + Duration::from_millis(1200), false);
+        monitor.poll(now + Duration::from_millis(2400), false);
         assert_eq!(
             shared.quality(),
             StreamQuality::Bad,
@@ -774,8 +1010,8 @@ mod test {
         );
 
         // Sustain clean traffic until EWMA decays below 2.5% and quality upgrades.
-        let mut t = now + Duration::from_millis(1700);
-        let mut seq = 23u64;
+        let mut t = now + Duration::from_millis(2900);
+        let mut seq = 43u64;
         let mut recovered = false;
         for _ in 0..60 {
             for i in 0..10u64 {
@@ -793,7 +1029,7 @@ mod test {
     }
 
     #[test]
-    fn stream_monitor_downgrade_stays_immediate() {
+    fn stream_monitor_severe_downgrade_is_time_confirmed() {
         let shared = StreamState::new(false, 0);
         let mut monitor = StreamMonitor::new(TrackKind::Video, "v6".into(), shared.clone());
         let now = Instant::now();
@@ -804,11 +1040,95 @@ mod test {
             .quality
             .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
 
+        for window in 0..3u64 {
+            let t = now + Duration::from_millis(window * 600);
+            monitor.process_packet(&packet(1 + window * 10, t));
+            monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
+            monitor.poll(t + Duration::from_millis(600), false);
+        }
+
+        assert_eq!(shared.quality(), StreamQuality::Bad);
+    }
+
+    /// A 2 fps screen share sees only one expected packet per 500 ms
+    /// window. Without a minimum-sample gate, a single lost frame is a
+    /// 1-packet window reading 100% interval_loss — noise, not evidence.
+    /// The window must instead keep extending past `LOSS_MEASUREMENT_WINDOW`
+    /// until it has gathered `MIN_LOSS_EVIDENCE_PACKETS`, so the ratio
+    /// reflects real history instead of a single coin flip.
+    #[test]
+    fn low_fps_window_defers_evaluation_until_minimum_sample_size() {
+        let shared = StreamState::new(false, 0);
+        let mut monitor =
+            StreamMonitor::new(TrackKind::Video, "screenshare".into(), shared.clone());
+        let now = Instant::now();
+
+        // Seed steady-state window bookkeeping directly: window_start_seq
+        // is a carried-over boundary from a prior window (as in
+        // production, every window after the very first), not a
+        // freshly-received packet — avoids the unrelated first-window
+        // accounting edge case this test isn't about.
+        monitor.window_highest_seq = Some(100);
+        monitor.window_start_seq = 100;
+        monitor.window_start_ts = now;
+        monitor.window_actual_packets = 0;
+
+        // Frame 101 is lost; frame 102 arrives. 600ms later (past
+        // LOSS_MEASUREMENT_WINDOW) only 2 packets are expected — below
+        // MIN_LOSS_EVIDENCE_PACKETS, so the window must not evaluate yet.
+        monitor.process_packet(&packet(102, now + Duration::from_millis(500)));
+        monitor.poll(now + Duration::from_millis(600), false);
+        assert_eq!(
+            monitor.smoothed_loss_ratio, 0.0,
+            "a 2-packet window was trusted as loss evidence"
+        );
+
+        // Frames 103-107 arrive cleanly. expected is now 7 (>= 5): enough
+        // samples to finally evaluate — one real loss among 7 is real
+        // evidence (~14%), but must not be misread as severe (30%+).
+        let mut t = now + Duration::from_millis(600);
+        for seq in 103..=107u64 {
+            monitor.process_packet(&packet(seq, t));
+            t += Duration::from_millis(500);
+        }
+        monitor.poll(t + Duration::from_millis(100), false);
+
+        assert!(
+            monitor.smoothed_loss_ratio > 0.0,
+            "loss was never evaluated even once enough samples accumulated"
+        );
+        assert!(
+            monitor.smoothed_loss_ratio < VIDEO_SEVERE_LOSS_THRESHOLD,
+            "one real loss among 7 samples misread as severe: {}",
+            monitor.smoothed_loss_ratio
+        );
+    }
+
+    #[test]
+    fn sparse_video_does_not_combine_separated_loss_observations() {
+        let shared = StreamState::new(false, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "sparse".into(), shared.clone());
+        let now = Instant::now();
+        monitor.current_quality = StreamQuality::Excellent;
+        monitor
+            .shared_state
+            .quality
+            .store(StreamQuality::Excellent as u8, Ordering::Relaxed);
+
+        // The first severe observation starts, but cannot complete, a
+        // degradation candidate.
         monitor.process_packet(&packet(1, now));
         monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
         monitor.poll(now + Duration::from_millis(600), false);
 
-        assert_eq!(shared.quality(), StreamQuality::Bad);
+        // At this sparse cadence the next observation arrives after the
+        // allowed evidence gap. It must start a new candidate instead of
+        // completing the old one.
+        let later = now + Duration::from_secs(4);
+        monitor.process_packet(&packet(21, later));
+        monitor.process_packet(&packet(31, later + Duration::from_millis(1)));
+        monitor.poll(later + Duration::from_millis(600), false);
+        assert_eq!(shared.quality(), StreamQuality::Excellent);
     }
 
     #[test]
@@ -831,7 +1151,10 @@ mod test {
         audio.process_packet(&packet(7, now + Duration::from_millis(1900)));
         audio.process_packet(&packet(11, now + Duration::from_millis(1901)));
         audio.poll(now + Duration::from_millis(2400), false);
-        assert_eq!(audio_shared.quality(), StreamQuality::Bad);
+        // Audio has no simulcast layer for a loss-driven quality signal to
+        // act on yet, so it's stubbed Excellent and never evaluated here —
+        // this lossy window must not move it.
+        assert_eq!(audio_shared.quality(), StreamQuality::Excellent);
 
         let video_shared = StreamState::new(false, 0);
         let mut video = StreamMonitor::new(TrackKind::Video, "v3".into(), video_shared.clone());
@@ -847,12 +1170,15 @@ mod test {
         video.process_packet(&packet(7, now + Duration::from_millis(1900)));
         video.process_packet(&packet(8, now + Duration::from_millis(1901)));
         video.poll(now + Duration::from_millis(2400), false);
-        assert_eq!(video_shared.quality(), StreamQuality::Excellent);
+        // Four two-packet windows are insufficient to establish video
+        // quality; retain the conservative initial state.
+        assert_eq!(video_shared.quality(), StreamQuality::Good);
 
         video.process_packet(&packet(9, now + Duration::from_millis(2500)));
         video.process_packet(&packet(11, now + Duration::from_millis(2501)));
         video.poll(now + Duration::from_millis(3000), false);
-        assert_eq!(video_shared.quality(), StreamQuality::Bad);
+        // A tiny two-packet sample is not evidence of upstream congestion.
+        assert_eq!(video_shared.quality(), StreamQuality::Good);
     }
 
     struct StreamSimulator {
@@ -1006,12 +1332,78 @@ mod test {
             );
         }
 
-        // After 20 windows at 2% loss the quality should have settled at Good
-        // (smoothed ≈ 0.02, above 0.005 Excellent threshold).
+        // It may be classified Good rather than Excellent, but it must remain
+        // eligible and never create allocator churn.
         assert_eq!(shared.quality(), StreamQuality::Good);
     }
 
-    /// Cross-region WAN: 10% sustained loss → Bad within 2 windows, then
+    #[test]
+    fn isolated_loss_windows_do_not_flap_video_quality() {
+        let shared = StreamState::new(false, 0);
+        let mut monitor =
+            StreamMonitor::new(TrackKind::Video, "isolated-loss".into(), shared.clone());
+        let now = Instant::now();
+        let mut base_seq = 1u64;
+        let mut t = now;
+
+        // Every window contains one missing packet out of 30: this is the
+        // shape seen on a jittery path. It may be conservatively Good, but it
+        // must remain eligible and never flap into Bad.
+        for _ in 0..8 {
+            for i in 0..30u64 {
+                if i != 15 {
+                    monitor.process_packet(&packet(base_seq + i, t + Duration::from_millis(i * 2)));
+                }
+            }
+            base_seq += 30;
+            t += Duration::from_millis(600);
+            monitor.poll(t, false);
+        }
+
+        assert_eq!(shared.quality(), StreamQuality::Good);
+        assert!(monitor.shared_state.is_healthy());
+    }
+
+    #[test]
+    fn video_ordinary_loss_does_not_make_a_layer_ineligible() {
+        let shared = StreamState::new(false, 0);
+        let mut monitor =
+            StreamMonitor::new(TrackKind::Video, "confirm-bad".into(), shared.clone());
+        let now = Instant::now();
+
+        // Repeated ~11% intervals are degraded, but below the high-confidence
+        // Bad threshold and must not remove a layer from allocation.
+        for i in 0..10u64 {
+            if i != 5 {
+                monitor.process_packet(&packet(1 + i, now + Duration::from_millis(i * 10)));
+            }
+        }
+        monitor.poll(now + Duration::from_millis(600), false);
+        // The initial window establishes the sequence baseline, so there is
+        // not yet a loss measurement to act on.
+        assert_eq!(shared.quality(), StreamQuality::Good);
+
+        // More ordinary-loss windows still keep the layer eligible.
+        let next = now + Duration::from_millis(600);
+        for i in 0..10u64 {
+            if i != 5 {
+                monitor.process_packet(&packet(11 + i, next + Duration::from_millis(i * 10)));
+            }
+        }
+        monitor.poll(next + Duration::from_millis(600), false);
+        assert_eq!(shared.quality(), StreamQuality::Good);
+
+        let third = next + Duration::from_millis(600);
+        for i in 0..10u64 {
+            if i != 5 {
+                monitor.process_packet(&packet(21 + i, third + Duration::from_millis(i * 10)));
+            }
+        }
+        monitor.poll(third + Duration::from_millis(600), false);
+        assert_eq!(shared.quality(), StreamQuality::Good);
+    }
+
+    /// Cross-region WAN: 20% sustained loss → Bad after confirmation, then
     /// recovers to Good after sustained clean traffic.
     #[test]
     fn cross_region_high_loss_detects_bad_then_recovers() {
@@ -1019,15 +1411,15 @@ mod test {
         let mut monitor = StreamMonitor::new(TrackKind::Video, "xr".into(), shared.clone());
         let now = Instant::now();
 
-        // 10 packets per window; always drop packet at position 5 → ~10% loss.
-        // expected = 9, actual = 9 (9 packets sent, 1 gap) → 1/9 ≈ 11%.
+        // 10 packets per window; drop two interior packets → ~20% loss.
         let mut base_seq = 1u64;
         let mut t = now;
 
-        // Drive bad: 2 windows of ~11% loss should push smoothed above 5%.
-        for _ in 0..2 {
+        // The first window establishes the sequence baseline. Three measured
+        // windows confirm the high-confidence ordinary-loss Bad transition.
+        for _ in 0..8 {
             for i in 0..10u64 {
-                if i == 5 {
+                if i == 3 || i == 5 {
                     continue;
                 }
                 monitor.process_packet(&packet(base_seq + i, t + Duration::from_millis(i * 10)));
@@ -1109,7 +1501,8 @@ mod test {
     }
 
     /// Simulcast resume: a large seq gap during a pause must NOT produce phantom
-    /// loss that spikes smoothed_loss_ratio above the warmup penalty.
+    /// loss. A pause is not loss evidence and must preserve reactivation
+    /// eligibility for the layer.
     #[test]
     fn no_phantom_loss_on_simulcast_resume() {
         let shared = StreamState::new(false, 0);
@@ -1127,7 +1520,8 @@ mod test {
         monitor.poll(paused_at, true);
         assert!(shared.is_inactive());
         let smoothed_after_pause = monitor.smoothed_loss_ratio;
-        assert_eq!(smoothed_after_pause, 0.15, "warmup penalty must be 0.15");
+        assert_eq!(smoothed_after_pause, 0.0, "pause must not manufacture loss");
+        assert!(shared.is_activation_candidate());
 
         // Resume with a large seq gap (encoder advanced by 990 during the pause).
         let resumed_at = paused_at + Duration::from_millis(50);
@@ -1153,16 +1547,19 @@ mod test {
         let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared.clone());
         let now = Instant::now();
 
-        // First drive quality to Bad with a high-loss window.
-        monitor.process_packet(&packet(1, now));
-        monitor.process_packet(&packet(11, now + Duration::from_millis(1)));
-        monitor.poll(now + Duration::from_millis(600), false);
+        // First drive quality to Bad with persistent high loss.
+        for window in 0..3u64 {
+            let t = now + Duration::from_millis(window * 600);
+            monitor.process_packet(&packet(1 + window * 10, t));
+            monitor.process_packet(&packet(11 + window * 10, t + Duration::from_millis(1)));
+            monitor.poll(t + Duration::from_millis(600), false);
+        }
         assert_eq!(shared.quality(), StreamQuality::Bad);
 
         // Alternate: one clean window, one lossy window, 20 pairs.
         // Quality must stay Bad (smoothed stays well above 0.025).
-        let mut base_seq = 12u64;
-        let mut t = now + Duration::from_millis(600);
+        let mut base_seq = 31u64;
+        let mut t = now + Duration::from_millis(1800);
         let mut quality_changes = 0u32;
         let mut prev_quality = shared.quality();
 
@@ -1203,8 +1600,8 @@ mod test {
 
     /// Three simulcast layers; the high layer abruptly takes on 40% packet loss
     /// (publisher limited by bandwidth). The SFU needs to switch to the mid
-    /// layer fast — so the high layer must be detected as Bad within the first
-    /// 500-ms measurement window.
+    /// layer fast — but after time-confirmed severe loss rather than from one
+    /// 500-ms receiver report.
     #[test]
     fn publisher_bw_limit_fast_detection() {
         let shared = StreamState::new(false, 0);
@@ -1234,19 +1631,21 @@ mod test {
         // Send seq+0,1,2, drop seq+3,4,5,6, send seq+7,8,9.
         // expected = (seq+9) − window_start(seq−1) = 10
         // actual   = 6  →  interval_loss = 4/10 = 40%
-        for i in 0..10u64 {
-            if i < 3 || i >= 7 {
-                monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
+        for _ in 0..3 {
+            for i in 0..10u64 {
+                if i < 3 || i >= 7 {
+                    monitor.process_packet(&packet(seq + i, t + Duration::from_millis(i * 5)));
+                }
             }
+            seq += 10;
+            t += Duration::from_millis(600);
+            monitor.poll(t, siblings);
         }
-        seq += 10;
-        t += Duration::from_millis(600);
-        monitor.poll(t, siblings);
 
         assert_eq!(
             shared.quality(),
             StreamQuality::Bad,
-            "must detect Bad within 1 window (500 ms) of 40% loss; \
+            "must detect Bad after time-confirmed 40% loss; \
              smoothed={:.3}",
             monitor.smoothed_loss_ratio
         );
@@ -1256,12 +1655,11 @@ mod test {
     /// Publisher oscillating layer: the encoder keeps turning a simulcast layer
     /// on for a brief burst (~700 ms) then pausing it while siblings are active.
     ///
-    /// Each pause sets `smoothed_loss_ratio = 0.15` (warmup penalty). One clean
-    /// 500-ms window only decays that to `0.15 × 0.8 = 0.12`, which is above the
-    /// Bad→Good threshold (2.5%). The layer must therefore remain Bad throughout
-    /// all oscillation cycles — the SFU must never promote it.
+    /// A pause alone is not a loss signal. The layer may be selected only by the
+    /// downstream controller's separately guarded probe and keyframe transition;
+    /// the upstream monitor must retain its last real-loss classification.
     #[test]
-    fn publisher_oscillating_layer_stays_bad() {
+    fn publisher_oscillating_layer_remains_a_keyframe_reactivation_candidate() {
         let shared = StreamState::new(false, 0);
         let mut monitor = StreamMonitor::new(TrackKind::Video, "osc".into(), shared.clone());
         let now = Instant::now();
@@ -1290,15 +1688,13 @@ mod test {
             t += Duration::from_millis(1100);
             monitor.poll(t, true);
 
-            assert_eq!(
-                shared.quality(),
-                StreamQuality::Bad,
-                "cycle {cycle}: must be Bad on pause"
+            assert!(
+                shared.is_inactive(),
+                "cycle {cycle}: must be dormant on pause"
             );
             assert!(
-                (monitor.smoothed_loss_ratio - 0.15).abs() < 1e-9,
-                "cycle {cycle}: warmup penalty must be 0.15; got {:.3}",
-                monitor.smoothed_loss_ratio
+                shared.is_activation_candidate(),
+                "cycle {cycle}: a pause alone must not make the layer Bad"
             );
 
             // Resume — step 1: one "wake" packet updates last_packet_at so the
@@ -1316,27 +1712,13 @@ mod test {
             t += Duration::from_millis(700); // ≥ 500 ms from first burst packet
             monitor.poll(t, true);
 
-            // After one clean window: EWMA = 0.15 × 0.8 = 0.12 → still > 2.5% → Bad.
-            assert_eq!(
-                shared.quality(),
-                StreamQuality::Bad,
-                "cycle {cycle}: must remain Bad after one clean burst (EWMA: 0.12 > 2.5%); \
-                 smoothed={:.3}",
-                monitor.smoothed_loss_ratio
-            );
             assert!(
-                monitor.smoothed_loss_ratio > 0.025 && monitor.smoothed_loss_ratio < 0.15,
-                "cycle {cycle}: EWMA must be decaying but above Bad→Good threshold; got {:.3}",
-                monitor.smoothed_loss_ratio
+                shared.is_activation_candidate(),
+                "cycle {cycle}: clean packets must retain reactivation eligibility"
             );
         }
 
-        // Final: quality still Bad — the oscillating layer was never promoted.
-        assert_eq!(
-            shared.quality(),
-            StreamQuality::Bad,
-            "must remain Bad after all oscillation cycles"
-        );
+        assert!(shared.is_activation_candidate());
     }
 
     // ── BitrateEstimate stability: real H.264 testdata ──────────────────────
@@ -1569,6 +1951,77 @@ mod test {
             post_active > 200_000.0,
             "post-active estimate unexpectedly low: {:.0} bps",
             post_active
+        );
+    }
+
+    // ── BitrateEstimate: admission/demand split ─────────────────────────────
+
+    fn send_tick(bwe: &mut BitrateEstimate, now: &mut Instant, tick_dur: Duration, bps: f64) {
+        *now += tick_dur;
+        let bytes = (bps * tick_dur.as_secs_f64() / 8.0) as usize;
+        let mut pkt = RtpPacket::default();
+        pkt.arrival_ts = *now;
+        pkt.playout_time = *now;
+        let payload_len = bytes.saturating_sub(pkt.header_len);
+        pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
+        bwe.record(&pkt);
+        bwe.poll(*now);
+    }
+
+    /// A brief burst (3 ticks, 1.5s — shorter than the 7-tick/3.5s admission
+    /// majority window) must raise the fast `demand_bps()` signal strongly,
+    /// so a screen-share flurry can still ask str0m for headroom — but must
+    /// only weakly move the conservative `estimate_bps()` (admission/cost)
+    /// value, which is what used to swing wildly on VBR content and steal
+    /// shared bandwidth from sibling slots. A longer, genuinely sustained
+    /// burst must still, in time, raise the admission value too — it isn't
+    /// ignored forever, just not trusted on one unlucky window.
+    #[test]
+    fn brief_burst_raises_demand_far_more_than_admission_estimate() {
+        const LOW_BPS: f64 = 50_000.0;
+        const BURST_BPS: f64 = 500_000.0;
+        let tick_dur = Duration::from_millis(500);
+        let t0 = Instant::now();
+        let mut bwe = BitrateEstimate::new(t0);
+        let mut now = t0;
+
+        // Warm up fully at LOW so both signals settle.
+        for _ in 0..14 {
+            send_tick(&mut bwe, &mut now, tick_dur, LOW_BPS);
+        }
+
+        let mut peak_admission = 0.0_f64;
+        let mut peak_demand = 0.0_f64;
+        for _ in 0..3 {
+            send_tick(&mut bwe, &mut now, tick_dur, BURST_BPS);
+            peak_admission = peak_admission.max(bwe.estimate_bps());
+            peak_demand = peak_demand.max(bwe.demand_bps());
+        }
+
+        assert!(
+            peak_demand > BURST_BPS * 0.8,
+            "demand signal failed to react to the burst: peak={:.0}",
+            peak_demand
+        );
+        assert!(
+            peak_admission < peak_demand * 0.5,
+            "admission estimate tracked the brief burst almost as closely as \
+             demand did — it should dampen a burst this short far more: \
+             admission_peak={:.0} demand_peak={:.0}",
+            peak_admission,
+            peak_demand
+        );
+
+        // A genuinely sustained burst (5 ticks — a majority of the 7-tick
+        // admission window) must still, in time, raise the admission value.
+        for _ in 0..5 {
+            send_tick(&mut bwe, &mut now, tick_dur, BURST_BPS);
+        }
+        assert!(
+            bwe.estimate_bps() > LOW_BPS * 3.0,
+            "admission estimate failed to confirm a genuinely sustained \
+             burst: {:.0}",
+            bwe.estimate_bps()
         );
     }
 }

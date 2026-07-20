@@ -32,7 +32,14 @@ use crate::track::{
 };
 use str0m::rtp::RtpWrite;
 
-const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Gates `StreamMonitor::poll`'s loss-window bookkeeping (dominated by
+// multi-second confirmation timers — 1-8s to a quality transition, see
+// `rtp::monitor`) and `VideoAllocator`'s periodic floor (real congestion
+// reaction is event-driven off TWCC estimates via `dirty_allocation`,
+// independent of this interval). 200ms halves the per-participant fan-out
+// cost over every published layer at an active-call cadence, at the cost of
+// at most ~100-200ms of added slop against those much longer timers.
+const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 struct TrackAvailability {
     in_topology: bool,

@@ -325,12 +325,23 @@ impl LayerController {
             || self.debt_ticks >= DEBT_LINGER_MAX_TICKS;
 
         if must_shed {
-            if let Some(key) = self
+            let unpaused_simulcast_layers = self
                 .order
                 .iter()
-                .rev()
-                .find(|k| self.states.get(*k).is_some_and(|s| !s.paused) && k.1.is_some())
-                .cloned()
+                .filter(|k| k.1.is_some() && self.states.get(*k).is_some_and(|s| !s.paused))
+                .count();
+            // Never pause the last remaining layer — uplink BWE can read
+            // low from transient jitter, not just a real capacity limit, so
+            // degrade to the cheapest layer rather than going silent.
+            if unpaused_simulcast_layers > 1
+                // Shed the most expensive layer first; rank by quality, not
+                // registration order (insertion order isn't guaranteed high-to-low).
+                && let Some(key) = self
+                    .order
+                    .iter()
+                    .filter(|k| k.1.is_some() && self.states.get(*k).is_some_and(|s| !s.paused))
+                    .max_by_key(|k| rid_quality_rank(k.1))
+                    .cloned()
             {
                 if let Some(s) = self.states.get_mut(&key) {
                     s.paused = true;
@@ -342,8 +353,10 @@ impl LayerController {
             && let Some(key) = self
                 .order
                 .iter()
-                .rev()
-                .find(|k| self.states.get(*k).is_some_and(|s| s.paused))
+                // Restore the cheapest paused layer first, climbing the
+                // quality ladder from the bottom as capacity returns.
+                .filter(|k| self.states.get(*k).is_some_and(|s| s.paused))
+                .min_by_key(|k| rid_quality_rank(k.1))
                 .cloned()
         {
             let candidate_bps = self.states.get(&key).map_or(0.0, |s| s.bps);
@@ -359,5 +372,171 @@ impl LayerController {
         }
 
         desired
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use str0m::media::{Mid, Rid};
+
+    /// Registers Low/Medium/High out of quality order, to also prove
+    /// shed/resume priority is ranked by quality and not registration order.
+    fn register_three_layers(ctrl: &mut LayerController, mid: Mid) {
+        let (n_h, _rx_h) = KeyframeNotifier::pair();
+        ctrl.register(mid, Some(Rid::from("h")), n_h);
+        let (n_f, _rx_f) = KeyframeNotifier::pair();
+        ctrl.register(mid, Some(Rid::from("f")), n_f);
+        let (n_q, _rx_q) = KeyframeNotifier::pair();
+        ctrl.register(mid, Some(Rid::from("q")), n_q);
+    }
+
+    #[test]
+    fn no_layers_resume_until_available_bandwidth_is_known() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("v0");
+        register_three_layers(&mut ctrl, mid);
+
+        // available_bps starts at the f64::MAX sentinel: tick() must not
+        // treat that as "unlimited bandwidth, resume everything."
+        ctrl.tick(Instant::now());
+
+        assert!(ctrl.is_paused(mid, Some(Rid::from("q"))));
+        assert!(ctrl.is_paused(mid, Some(Rid::from("h"))));
+        assert!(ctrl.is_paused(mid, Some(Rid::from("f"))));
+    }
+
+    #[test]
+    fn resumes_cheapest_layer_first_as_soon_as_it_fits() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("v0");
+        register_three_layers(&mut ctrl, mid);
+
+        let now = Instant::now();
+        // Enough for Low only.
+        ctrl.update_available(Bitrate::from(40_000u64));
+        ctrl.tick(now);
+
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("q"))),
+            "Low should resume immediately once it fits"
+        );
+        assert!(ctrl.is_paused(mid, Some(Rid::from("h"))));
+        assert!(ctrl.is_paused(mid, Some(Rid::from("f"))));
+    }
+
+    #[test]
+    fn resumes_progressively_one_layer_per_tick_as_bandwidth_grows() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("v0");
+        register_three_layers(&mut ctrl, mid);
+
+        let now = Instant::now();
+        // Enough for all three layers, offered all at once: resume must
+        // still climb the quality ladder one layer per tick, cheapest
+        // first, rather than jumping straight to the top.
+        ctrl.update_available(Bitrate::from(2_500_000u64));
+
+        ctrl.tick(now);
+        assert!(!ctrl.is_paused(mid, Some(Rid::from("q"))), "tick 1: Low resumes");
+        assert!(
+            ctrl.is_paused(mid, Some(Rid::from("h"))),
+            "tick 1: Medium still waits its turn"
+        );
+        assert!(
+            ctrl.is_paused(mid, Some(Rid::from("f"))),
+            "tick 1: High still waits its turn"
+        );
+
+        ctrl.tick(now + Duration::from_millis(10));
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("h"))),
+            "tick 2: Medium resumes next"
+        );
+        assert!(
+            ctrl.is_paused(mid, Some(Rid::from("f"))),
+            "tick 2: High still waits"
+        );
+
+        ctrl.tick(now + Duration::from_millis(20));
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("f"))),
+            "tick 3: High resumes last"
+        );
+    }
+
+    #[test]
+    fn resume_applies_the_instant_surplus_covers_it_no_extra_delay() {
+        // Unlike shedding (DEBT_LINGER_MAX_TICKS), resuming has no
+        // confirmation delay — the first tick where surplus covers a
+        // paused layer's cost resumes it.
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("v0");
+        register_three_layers(&mut ctrl, mid);
+
+        let now = Instant::now();
+        ctrl.update_available(Bitrate::from(40_000u64));
+        ctrl.tick(now);
+        assert!(!ctrl.is_paused(mid, Some(Rid::from("q"))));
+
+        // Bandwidth jumps to cover Medium too, in a single step.
+        ctrl.update_available(Bitrate::from(1_000_000u64));
+        ctrl.tick(now + Duration::from_millis(5));
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("h"))),
+            "Medium should resume on the very next tick, not after a delay"
+        );
+    }
+
+    #[test]
+    fn never_pauses_the_last_remaining_layer() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("v0");
+        register_three_layers(&mut ctrl, mid);
+
+        let now = Instant::now();
+        ctrl.update_available(Bitrate::from(2_500_000u64));
+        for i in 0..3 {
+            ctrl.tick(now + Duration::from_millis(i));
+        }
+        assert!(!ctrl.is_paused(mid, Some(Rid::from("f"))));
+
+        // Available bandwidth collapses to ~nothing: severe, sustained debt
+        // should shed down toward the cheapest layer, but never past it.
+        ctrl.update_available(Bitrate::from(0u64));
+        for i in 0..10 {
+            ctrl.tick(now + Duration::from_millis(3 + i));
+        }
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("q"))),
+            "must always keep at least one live layer"
+        );
+    }
+
+    #[test]
+    fn sheds_the_most_expensive_layer_first() {
+        let mut ctrl = LayerController::new();
+        let mid = Mid::from("v0");
+        register_three_layers(&mut ctrl, mid);
+
+        let now = Instant::now();
+        ctrl.update_available(Bitrate::from(2_500_000u64));
+        for i in 0..3 {
+            ctrl.tick(now + Duration::from_millis(i));
+        }
+        assert!(!ctrl.is_paused(mid, Some(Rid::from("f"))));
+
+        // A severe, immediate overage should shed High before Medium.
+        ctrl.update_available(Bitrate::from(500_000u64));
+        ctrl.tick(now + Duration::from_millis(10));
+
+        assert!(
+            ctrl.is_paused(mid, Some(Rid::from("f"))),
+            "High should be shed first"
+        );
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("h"))),
+            "Medium should still be alive"
+        );
     }
 }

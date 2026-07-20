@@ -47,6 +47,17 @@ pub struct DownstreamAllocator {
     last_desired: Bitrate,
 }
 
+/// `set_desired_bitrate` wakes str0m's probe controller. Encoder-rate samples
+/// naturally drift a little, but they are not a new application demand. Only
+/// communicate a material policy change to BWE.
+fn desired_bitrate_changed(previous: Bitrate, next: Bitrate) -> bool {
+    if previous.is_zero() || next.is_zero() {
+        return previous != next;
+    }
+
+    (next.as_f64() - previous.as_f64()).abs() / previous.as_f64() >= 0.10
+}
+
 impl DownstreamAllocator {
     pub fn new(_participant_id: ParticipantId, manual_sub: bool, rng: &mut impl RngCore) -> Self {
         Self {
@@ -103,9 +114,12 @@ impl DownstreamAllocator {
         self.dirty_allocation = false;
         let (desired, assignments_changed) =
             self.video.update_allocations(self.available_bandwidth);
-        // let desired = Bitrate::kbps(300);
-        if self.last_desired != desired {
-            tracing::info!("set desired to {}", desired);
+        if desired_bitrate_changed(self.last_desired, desired) {
+            tracing::info!(
+                desired = %desired,
+                previous = %self.last_desired,
+                "set BWE application demand"
+            );
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;
         }
@@ -150,5 +164,23 @@ impl DownstreamAllocator {
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) -> Option<&TrackLayer> {
         self.video.handle_keyframe_request(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desired_bitrate_changes_only_for_material_demand_updates() {
+        assert!(!desired_bitrate_changed(
+            Bitrate::kbps(1250),
+            Bitrate::kbps(1320)
+        ));
+        assert!(desired_bitrate_changed(
+            Bitrate::kbps(1250),
+            Bitrate::kbps(1400)
+        ));
+        assert!(desired_bitrate_changed(Bitrate::kbps(1250), Bitrate::ZERO));
     }
 }

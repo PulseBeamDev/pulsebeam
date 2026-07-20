@@ -83,6 +83,10 @@ impl Timeline {
         if let Some(last_playout) = self.last_playout_time {
             let time_delta = packet.playout_time.saturating_duration_since(last_playout);
             let ts_delta = (time_delta.as_secs_f64() * (self.clock_rate.get() as f64)) as u64;
+            // A new keyframe can share the old layer's exact capture time; a
+            // zero delta would make receivers treat it as part of that old
+            // frame. A rebase always starts a new frame, so reserve one tick.
+            let ts_delta = ts_delta.max(1);
             let expected_ts = self.max_output_ts.wrapping_add(ts_delta);
             self.ts_base = expected_ts.wrapping_sub(input_ts);
         } else {
@@ -215,6 +219,36 @@ mod test {
         // So B1 should be A2 + 6030 ticks.
         let ts_diff = p_b1.rtp_ts.numer().wrapping_sub(p_a2.rtp_ts.numer());
         assert_eq!(ts_diff, 6030, "Timestamp should be linear across switch");
+    }
+
+    #[test]
+    fn rebase_with_equal_playout_starts_a_new_rtp_frame() {
+        let now = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut old = RtpPacket {
+            seq_no: 100.into(),
+            rtp_ts: MediaTime::new(10_000, Frequency::NINETY_KHZ),
+            playout_time: now,
+            ..Default::default()
+        };
+        timeline.rebase(&old);
+        timeline.rewrite(&mut old);
+
+        // A new simulcast layer can have the same capture timestamp as the
+        // old layer's last packet.
+        let mut new = RtpPacket {
+            seq_no: 5_000.into(),
+            rtp_ts: MediaTime::new(80_000, Frequency::NINETY_KHZ),
+            playout_time: now,
+            is_keyframe: true,
+            ..Default::default()
+        };
+        timeline.rebase(&new);
+        timeline.rewrite(&mut new);
+
+        assert_eq!(*new.seq_no, (*old.seq_no).wrapping_add(1));
+        assert!(new.rtp_ts.numer() > old.rtp_ts.numer());
     }
 
     #[test]

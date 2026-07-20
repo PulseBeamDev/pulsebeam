@@ -17,8 +17,10 @@ use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);
 
-/// Leading-edge debounce interval for keyframe requests forwarded upstream.
-pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Leading-edge, per-publisher-stream debounce interval for keyframe requests.
+/// A spatial transition's I-frame is itself a congestion burst, so subscribers
+/// must share one PLI budget instead of amplifying that burst into a storm.
+pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(1500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
 #[derive(Debug, Clone)]
@@ -218,6 +220,20 @@ impl Track {
             .filter(|l| l.quality < current)
             .max_by_key(|l| l.quality)
     }
+
+    /// The cheapest layer currently delivering content, unlike
+    /// `lowest_quality` which returns the literal lowest tier even if it's
+    /// gone silent (e.g. paused by the publisher's own uplink congestion)
+    /// while a higher tier stays live. Only checks liveness, not quality —
+    /// a lossy-but-live layer is still the right fallback. Falls back to
+    /// `lowest_quality` if nothing is live.
+    pub fn cheapest_active_layer(&self) -> &TrackLayer {
+        self.layers
+            .iter()
+            .filter(|l| !l.state.is_inactive())
+            .min_by_key(|l| l.quality)
+            .unwrap_or_else(|| self.lowest_quality())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -301,7 +317,15 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 /// | :--- | :--- | :--- | :--- |
 /// | `0` | `LayerQuality::High` | 1,250,000 bits/s | `"f"` (Full) |
 /// | `1` | `LayerQuality::Medium` | 400,000 bits/s | `"h"` (Half) |
-/// | `2+` or Empty | `LayerQuality::Low` | 150,000 bits/s | `"q"` (Quarter) |
+/// | `2+` | `LayerQuality::Low` | 150,000 bits/s | `"q"` (Quarter) |
+/// | Empty (no simulcast) | `LayerQuality::Low` | 800,000 bits/s | n/a |
+///
+/// The no-simulcast case is priced well above the lowest simulcast rung:
+/// browsers commonly publish screen share this way, and unlike a device too
+/// weak to run simulcast at all, its single stream is often a high-resolution
+/// capture that needs far more than a mobile camera's bottom tier — pricing
+/// it at 150 kbps would let the allocator badly under-cost it against every
+/// other participant's budget.
 ///
 /// ### Sorting Post-Processing
 /// After initialization, both the internal `UpstreamTrack` and `Track` layers are
@@ -319,7 +343,9 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
 
     for (index, &rid) in simulcast_rids.iter().enumerate() {
         let (bitrate, quality) = match (rid, index) {
-            (None, _) => (150_000, LayerQuality::Low),
+            // No simulcast at all — commonly a screen share, not a
+            // low-power device. See this function's doc comment.
+            (None, _) => (800_000, LayerQuality::Low),
             (Some(_), 0) => (1_250_000, LayerQuality::High),
             (Some(_), 1) => (400_000, LayerQuality::Medium),
             (Some(_), _) => (150_000, LayerQuality::Low),
@@ -387,6 +413,52 @@ pub mod test_utils {
             origin: participant_id,
         };
         crate::track::new_audio(mid, meta)
+    }
+}
+
+#[cfg(test)]
+mod new_video_tests {
+    use super::test_utils::make_video_track;
+    use super::*;
+    use pulsebeam_runtime::rand::{RngCore, seeded_rng};
+
+    fn test_rng() -> impl RngCore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// A track published without simulcast (the common way browsers send
+    /// screen share) must not be priced at the bottom simulcast rung's
+    /// bitrate — that rung assumes a low-power device, not a
+    /// possibly-high-resolution single stream.
+    #[test]
+    fn non_simulcast_track_is_not_priced_at_the_lowest_simulcast_rung() {
+        let pid = ParticipantId::new(&mut test_rng());
+        let (_, track) = make_video_track(pid, Mid::from("screenshare"), vec![]);
+
+        assert_eq!(track.layers.len(), 1);
+        let layer = &track.layers[0];
+        assert!(
+            layer.state.nominal_bitrate_bps() > 150_000.0,
+            "non-simulcast track priced at the lowest simulcast rung's bitrate"
+        );
+    }
+
+    /// Real simulcast tiers are unaffected: the lowest rung of an actual
+    /// multi-layer publish is still a low-power device's bottom tier.
+    #[test]
+    fn lowest_simulcast_rung_still_prices_at_its_original_guess() {
+        let pid = ParticipantId::new(&mut test_rng());
+        let layers = vec![
+            SimulcastLayer::new("f"),
+            SimulcastLayer::new("h"),
+            SimulcastLayer::new("q"),
+        ];
+        let (_, track) = make_video_track(pid, Mid::from("cam"), layers);
+
+        let low = track.by_quality(LayerQuality::Low).unwrap();
+        assert_eq!(low.state.nominal_bitrate_bps(), 150_000.0);
     }
 }
 

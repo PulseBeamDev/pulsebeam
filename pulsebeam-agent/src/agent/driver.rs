@@ -531,10 +531,28 @@ impl AgentDriver {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(tx)) => match tx.proto {
                     Protocol::Udp => {
-                        let _ = self
-                            .network
-                            .socket
-                            .try_send_to(&tx.contents, tx.destination);
+                        // Keyed by our own source IP, not destination:
+                        // unlike the SFU (the only sender to a given
+                        // receiver), this agent's egress may share a
+                        // destination with unrelated participants.
+                        #[cfg(feature = "sim")]
+                        let admitted = pulsebeam_core::net::shaper::admit_uplink(
+                            tx.source.ip(),
+                            tx.contents.len(),
+                        );
+                        #[cfg(not(feature = "sim"))]
+                        let admitted = true;
+
+                        // Policed: the simulated link's configured bandwidth is
+                        // exceeded. Drop as if the packet never reached the wire
+                        // so BWE sees the same missing-sequence-number signal a
+                        // real capacity-limited uplink would produce.
+                        if admitted {
+                            let _ = self
+                                .network
+                                .socket
+                                .try_send_to(&tx.contents, tx.destination);
+                        }
                     }
                     Protocol::Tcp => {
                         self.network.tcp.try_send(&tx.contents);

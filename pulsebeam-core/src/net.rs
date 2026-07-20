@@ -251,6 +251,154 @@ mod sim {
     }
 }
 
+/// Test-only bandwidth shaper for the turmoil-backed simulator.
+///
+/// Turmoil's own knobs (latency, jitter, `fail_rate`) never constrain
+/// throughput, so this polices egress bytes against a settable rate:
+/// packets within budget are sent, over-budget packets are dropped. Lives
+/// in `pulsebeam-core` (shared by `pulsebeam-runtime` and the agent) so
+/// both the SFU's egress path and the agent's UDP send path can use it.
+/// Only exists under the `sim` feature.
+///
+/// Two registries, keyed differently on purpose:
+/// - [`set_downlink_bandwidth`]/[`admit`] key by *destination* IP (only the
+///   SFU sends to a given receiver, so destination alone is unambiguous).
+/// - [`set_uplink_bandwidth`]/[`admit_uplink`] key by *source* IP instead —
+///   a sender and receiver in the same test both address the SFU, so a
+///   destination-keyed bucket would let a sender's media burst starve an
+///   unrelated receiver's ICE/RTCP traffic to that same SFU.
+#[cfg(feature = "sim")]
+pub mod shaper {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::{Mutex, OnceLock};
+    // Not `std::time::Instant`: under turmoil this must track the
+    // simulated clock (which turmoil fast-forwards independent of real
+    // wall-clock time), or the bucket's elapsed-time math desyncs
+    // completely from the simulation.
+    use tokio::time::Instant;
+
+    struct Bucket {
+        bytes_per_sec: f64,
+        burst_bytes: f64,
+        available_bytes: f64,
+        last_refill: Instant,
+    }
+
+    impl Bucket {
+        fn new(bytes_per_sec: f64, now: Instant) -> Self {
+            let burst_bytes = Self::burst_for_rate(bytes_per_sec);
+            Self {
+                bytes_per_sec,
+                burst_bytes,
+                available_bytes: burst_bytes,
+                last_refill: now,
+            }
+        }
+
+        /// A small, rate-relative burst allowance (50ms worth of the configured
+        /// rate) so a single oversized packet isn't perpetually starved, while
+        /// staying far too small to mask a real capacity change from BWE.
+        fn burst_for_rate(bytes_per_sec: f64) -> f64 {
+            (bytes_per_sec * 0.05).max(8_000.0)
+        }
+
+        fn set_rate(&mut self, bytes_per_sec: f64, now: Instant) {
+            self.refill(now);
+            self.bytes_per_sec = bytes_per_sec;
+            self.burst_bytes = Self::burst_for_rate(bytes_per_sec);
+            self.available_bytes = self.available_bytes.min(self.burst_bytes);
+        }
+
+        fn refill(&mut self, now: Instant) {
+            let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+            self.last_refill = now;
+            self.available_bytes = (self.available_bytes + elapsed * self.bytes_per_sec)
+                .min(self.burst_bytes);
+        }
+
+        fn admit(&mut self, len: usize, now: Instant) -> bool {
+            self.refill(now);
+            if self.available_bytes >= len as f64 {
+                self.available_bytes -= len as f64;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    fn buckets() -> &'static Mutex<HashMap<IpAddr, Bucket>> {
+        static BUCKETS: OnceLock<Mutex<HashMap<IpAddr, Bucket>>> = OnceLock::new();
+        BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn uplink_buckets() -> &'static Mutex<HashMap<IpAddr, Bucket>> {
+        static BUCKETS: OnceLock<Mutex<HashMap<IpAddr, Bucket>>> = OnceLock::new();
+        BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn set_bandwidth(registry: &Mutex<HashMap<IpAddr, Bucket>>, ip: IpAddr, bytes_per_sec: Option<u64>) {
+        let now = Instant::now();
+        let mut map = registry.lock().unwrap();
+        match bytes_per_sec {
+            None => {
+                map.remove(&ip);
+            }
+            Some(rate) => {
+                map.entry(ip)
+                    .and_modify(|b| b.set_rate(rate as f64, now))
+                    .or_insert_with(|| Bucket::new(rate as f64, now));
+            }
+        }
+    }
+
+    /// Set (or clear, with `None`) the enforced byte rate for egress packets
+    /// destined to `ip`. Takes effect immediately: on a step down, packets
+    /// sent above the new rate are dropped from the very next call; on a
+    /// step up, the bucket simply refills faster.
+    pub fn set_downlink_bandwidth(ip: IpAddr, bytes_per_sec: Option<u64>) {
+        set_bandwidth(buckets(), ip, bytes_per_sec);
+    }
+
+    /// Set (or clear, with `None`) the enforced byte rate for egress packets
+    /// *sent from* `ip`, regardless of destination. See the module doc for
+    /// why this is a separate, source-keyed registry rather than reusing
+    /// [`set_downlink_bandwidth`].
+    pub fn set_uplink_bandwidth(ip: IpAddr, bytes_per_sec: Option<u64>) {
+        set_bandwidth(uplink_buckets(), ip, bytes_per_sec);
+    }
+
+    /// Remove every configured limit, in both registries. Simulator tests
+    /// reuse a per-process registry across independently-subnetted test
+    /// cases; call this at the start of a scenario that shapes bandwidth to
+    /// avoid depending on leftover state from an earlier test.
+    pub fn clear_all() {
+        buckets().lock().unwrap().clear();
+        uplink_buckets().lock().unwrap().clear();
+    }
+
+    /// Returns `true` if a packet of `len` bytes to `dst` may be sent now.
+    /// Destinations with no configured limit are always admitted.
+    pub fn admit(dst: std::net::SocketAddr, len: usize) -> bool {
+        let mut map = buckets().lock().unwrap();
+        let Some(bucket) = map.get_mut(&dst.ip()) else {
+            return true;
+        };
+        bucket.admit(len, Instant::now())
+    }
+
+    /// Returns `true` if a packet of `len` bytes sent from `src` may be sent
+    /// now. Sources with no configured limit are always admitted.
+    pub fn admit_uplink(src: IpAddr, len: usize) -> bool {
+        let mut map = uplink_buckets().lock().unwrap();
+        let Some(bucket) = map.get_mut(&src) else {
+            return true;
+        };
+        bucket.admit(len, Instant::now())
+    }
+}
+
 pub type HttpRequest = http::Request<Vec<u8>>;
 pub type HttpResponse = Result<http::Response<Vec<u8>>, HttpError>;
 pub type HttpError = Box<dyn std::error::Error + Send + Sync>;

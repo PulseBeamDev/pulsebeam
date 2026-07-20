@@ -154,7 +154,7 @@ mod test {
     }
 
     #[test]
-    fn switches_to_staged_stream_with_contiguous_output_sequence() {
+    fn optimistic_switch_starts_before_new_keyframe_marker_arrives() {
         let now = Instant::now();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(7));
 
@@ -162,7 +162,8 @@ mod test {
         switcher.push(pkt(10, 10, 1_000, now, false, true));
         let active_out = switcher.pop().expect("active packet should be emitted");
 
-        // Stage new stream with boundary marker from previous frame then keyframe.
+        // The old-frame marker permits an optimistic cutover on the first IDR
+        // packet. The IDR marker has not arrived yet.
         switcher.stage(pkt(20, 99, 2_000, now, false, true));
         switcher.stage(pkt(
             20,
@@ -176,6 +177,10 @@ mod test {
         let switched = drain_all(&mut switcher);
         assert_eq!(switched.len(), 1);
         assert_eq!(switched[0].ssrc, Ssrc::from(20));
+        assert!(
+            !switched[0].marker,
+            "the switch must forward the first IDR packet before its final marker arrives"
+        );
         assert_eq!(*switched[0].seq_no, (*active_out.seq_no).wrapping_add(1));
         assert!(switcher.ready_to_switch());
     }
@@ -189,7 +194,7 @@ mod test {
         switcher.push(pkt(10, 1, 1_000, now, false, true));
         let _ = switcher.pop();
 
-        let old = now - Duration::from_millis(100);
+        let old = now - Duration::from_millis(400);
         switcher.stage(pkt(
             20,
             199,

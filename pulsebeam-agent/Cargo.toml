@@ -11,6 +11,7 @@ authors.workspace = true
 
 [features]
 default = ["pulsebeam-core/reqwest"]
+sim = ["pulsebeam-core/sim"]
 
 [dependencies]
 futures-lite = { workspace = true }

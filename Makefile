@@ -32,7 +32,7 @@ test-unit:
 	$(CARGO_CMD) test --workspace --exclude pulsebeam-simulator --
 
 test-sim:
-	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture $(TEST)
+	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture --test-threads=1 $(TEST)
 
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all

@@ -10,6 +10,8 @@ use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +83,7 @@ impl SimClientBuilder {
             subscribed_topics: HashMap::new(),
             remote_tracks: HashMap::new(),
             received_data: Vec::new(),
+            received_media_bytes: Arc::new(AtomicU64::new(0)),
         };
         Ok(SimClient {
             ctx,
@@ -103,6 +106,16 @@ pub struct ClientContext {
     pub subscribed_topics: HashMap<String, DataSubscriber>,
     /// Data channel payloads received by topic.
     pub received_data: Vec<(String, Vec<u8>)>,
+    /// Running total of decoded media bytes received across all remote
+    /// tracks — ground truth for "how much media got through", read
+    /// directly off frames rather than inferred from RTCP/peer-stats.
+    pub received_media_bytes: Arc<AtomicU64>,
+}
+
+impl ClientContext {
+    pub fn total_received_media_bytes(&self) -> u64 {
+        self.received_media_bytes.load(Ordering::Relaxed)
+    }
 }
 
 pub struct SimClient {
@@ -227,6 +240,8 @@ impl SimClient {
                             }
                             AgentEvent::RemoteTrackAdded(t) => {
                                 self.ctx.remote_tracks.insert(t.mid, t.track.id.clone());
+                                let sink = self.ctx.received_media_bytes.clone();
+                                self.join_set.spawn(drain_remote_track(t, sink));
                             }
                             AgentEvent::DataPublisherDeclared(publisher) => {
                                 self.ctx.published_topics.insert(publisher.topic.clone(), publisher);
@@ -251,6 +266,14 @@ impl SimClient {
                 }
             }
         }.instrument(span).await
+    }
+}
+
+/// Drains a subscribed remote track's decoded frames for the connection's
+/// lifetime, accumulating their sizes into `sink`.
+async fn drain_remote_track(mut track: pulsebeam_agent::agent::RemoteTrack, sink: Arc<AtomicU64>) {
+    while let Ok(frame) = track.recv().await {
+        sink.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
     }
 }
 

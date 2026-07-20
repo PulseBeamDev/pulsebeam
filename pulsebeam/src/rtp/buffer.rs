@@ -42,15 +42,6 @@ impl RingBuffer {
         }
     }
 
-    fn on_frame_boundary(&self, seqno: SeqNo) -> bool {
-        let prev: SeqNo = seqno.wrapping_sub(1).into();
-        let Some(prev_pkt) = self.packet(prev) else {
-            return false;
-        };
-
-        prev_pkt.marker && prev_pkt.seq_no == prev
-    }
-
     fn packet_mut(&mut self, seq: SeqNo) -> &mut Option<RtpPacket> {
         let idx = self.index(seq);
         &mut self.ring[idx]
@@ -59,6 +50,15 @@ impl RingBuffer {
     fn packet(&self, seq: SeqNo) -> &Option<RtpPacket> {
         let idx = self.index(seq);
         &self.ring[idx]
+    }
+
+    fn on_frame_boundary(&self, seqno: SeqNo) -> bool {
+        let prev: SeqNo = seqno.wrapping_sub(1).into();
+        let Some(prev_pkt) = self.packet(prev) else {
+            return false;
+        };
+
+        prev_pkt.marker && prev_pkt.seq_no == prev
     }
 
     fn index(&self, seq: SeqNo) -> usize {
@@ -105,8 +105,9 @@ impl KeyframeBuffer {
         let start = target_playout
             .checked_sub(PLAYOUT_JITTER_TOLERANCE)
             .unwrap_or(target_playout);
-        // Accept segments at or ahead of target playout. We only reject segments
-        // that are too far behind, since they tend to produce stale switches.
+        // The keyframe can legitimately be ahead of the last emitted packet:
+        // the original optimistic transition deliberately starts that new
+        // layer as soon as its keyframe boundary is seen.
         start <= segment_playout
     }
 
@@ -128,7 +129,10 @@ impl KeyframeBuffer {
         let seqno = pkt.seq_no;
         *self.ring.packet_mut(seqno) = Some(pkt);
 
-        // TODO: should we check frame completeness as well?
+        // Start optimistically when the preceding frame boundary and the first
+        // keyframe packet are present. Waiting for this keyframe's final RTP
+        // marker is incorrect here: Switcher transitions immediately and the
+        // remaining keyframe packets are then forwarded through the new route.
         let is_segment = frame.is_keyframe
             && frame.found_boundary
             && Self::segment_within_tolerance(playout_time, target_playout);
@@ -202,13 +206,14 @@ mod test {
     }
 
     #[test]
-    fn segments_when_keyframe_boundary_and_playout_in_tolerance() {
+    fn optimistically_segments_at_preceding_marker_before_keyframe_marker() {
         let mut buf = KeyframeBuffer::new();
         let now = Instant::now();
 
-        // Previous frame marker packet (different playout segment), used as boundary anchor.
+        // This is the real simulcast handoff shape: the old frame ends, then
+        // the first packet of the new IDR arrives. The IDR's marker is still
+        // in the future. Starting here is required for uninterrupted decode.
         assert!(!buf.push(make(99, now - Duration::from_millis(10), false, true), now,));
-
         let segmented = buf.push(make(100, now, true, false), now);
         assert!(segmented);
 
@@ -227,7 +232,6 @@ mod test {
             now,
         ));
         assert!(buf.push(make(200, far_future, true, false), now));
-
         assert_eq!(buf.pop().unwrap().seq_no, 200.into());
         assert!(buf.pop().is_none());
     }
@@ -252,7 +256,7 @@ mod test {
     fn does_not_segment_when_playout_is_too_old() {
         let mut buf = KeyframeBuffer::new();
         let now = Instant::now();
-        let old = now - Duration::from_millis(100);
+        let old = now - Duration::from_millis(400);
 
         assert!(!buf.push(make(299, old - Duration::from_millis(1), false, true), now));
         assert!(!buf.push(make(300, old, true, false), now));

@@ -8,16 +8,11 @@ use std::{
 };
 
 static NEXT_SUBNET: AtomicU8 = AtomicU8::new(1);
-static NEXT_TEST_ID: AtomicU8 = AtomicU8::new(1);
 
 pub fn reserve_subnet() -> u8 {
     // Avoid 0 and 255.
     let next = NEXT_SUBNET.fetch_add(1, Ordering::Relaxed);
     1 + (next % 200)
-}
-
-pub fn next_test_id() -> u8 {
-    NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
