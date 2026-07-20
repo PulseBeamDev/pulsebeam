@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt::{Debug, Display};
 use std::time::Duration;
 
@@ -11,7 +12,6 @@ use crate::rtp::{
 };
 pub use data_track::*;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
-use str0m::rtp::RtpWrite;
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
@@ -29,62 +29,52 @@ pub struct GlobalKeyframeRequest {
     pub kind: KeyframeRequestKind,
 }
 
-pub struct StreamWriter<'a>(pub &'a mut str0m::Rtc);
+/// Deferred outbound RTP write.  Applying it to `Rtc` is deliberately the
+/// participant core's responsibility so it can drain str0m between writes.
+pub enum StreamWrite {
+    Video {
+        pkt: RtpPacket,
+        mid: Mid,
+        rid: Option<Rid>,
+        pt: Pt,
+    },
+    Audio {
+        pkt: RtpPacket,
+        mid: Mid,
+        pt: Pt,
+    },
+}
 
-impl<'a> StreamWriter<'a> {
+/// Reusable packet queue shared by all downstream allocators for one
+/// participant. It never touches `Rtc`; callers only enqueue writes.
+pub struct StreamWriter {
+    pending: VecDeque<StreamWrite>,
+}
+
+impl Default for StreamWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamWriter {
+    pub fn new() -> Self {
+        Self {
+            pending: VecDeque::with_capacity(64),
+        }
+    }
+
     pub fn write_video_owned(&mut self, pkt: RtpPacket, mid: Mid, rid: Option<Rid>, pt: Pt) {
-        let mut api = self.0.direct_api();
-        let Some(stream) = api.stream_tx_by_mid(mid, rid) else {
-            tracing::warn!(
-                target: crate::log::TARGET_VIDEO,
-                %mid, ?rid,
-                "no stream_tx_by_mid found"
-            );
-            return;
-        };
-        let ssrc = stream.ssrc();
-        tracing::trace!(
-            target: crate::log::TARGET_VIDEO,
-            %mid, ?rid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
-        let rtp = RtpWrite::new(
-            pt,
-            pkt.seq_no,
-            pkt.rtp_ts.numer() as u32,
-            pkt.playout_time.into(),
-            pkt.payload,
-        )
-        .nackable(true)
-        .marker(pkt.marker)
-        .ext_vals(pkt.ext_vals);
-        stream.write_rtp(rtp);
+        self.pending
+            .push_back(StreamWrite::Video { pkt, mid, rid, pt });
     }
 
     pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, pt: Pt) {
-        let mut api = self.0.direct_api();
-        let Some(stream) = api.stream_tx_by_mid(mid, None) else {
-            tracing::warn!(
-                target: crate::log::TARGET_AUDIO,
-                %mid,
-                "no stream_tx_by_mid found"
-            );
-            return;
-        };
-        let ssrc = stream.ssrc();
-        tracing::trace!(
-            target: crate::log::TARGET_AUDIO,
-            %mid, %ssrc, %pt, seq = %pkt.seq_no, ts = pkt.rtp_ts.numer(), len = pkt.payload.len(), marker = pkt.marker, "Writing RTP packet");
+        self.pending.push_back(StreamWrite::Audio { pkt, mid, pt });
+    }
 
-        let rtp = RtpWrite::new(
-            pt,
-            pkt.seq_no,
-            pkt.rtp_ts.numer() as u32,
-            pkt.playout_time.into(),
-            pkt.payload,
-        )
-        .nackable(false)
-        .marker(pkt.marker)
-        .ext_vals(pkt.ext_vals);
-        stream.write_rtp(rtp);
+    pub fn pop(&mut self) -> Option<StreamWrite> {
+        self.pending.pop_front()
     }
 }
 

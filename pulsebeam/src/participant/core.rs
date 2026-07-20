@@ -28,8 +28,9 @@ use crate::participant::{
 use crate::rtp::RtpPacket;
 use crate::track::{
     self, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
-    KEYFRAME_DEBOUNCE, StreamId, StreamWriter, Topic, Track,
+    KEYFRAME_DEBOUNCE, StreamId, StreamWrite, StreamWriter, Topic, Track,
 };
+use str0m::rtp::RtpWrite;
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -51,6 +52,32 @@ pub struct TrackMapping {
     pub mid: Mid,
     pub track_id: TrackId,
     pub kind: MediaKind,
+}
+
+/// Routing is not allowed to mutate an `Rtc`; it only queues work for the
+/// participant's mutate-then-drain loop.
+enum PendingFanout {
+    Sctp {
+        topic: Topic,
+        pkt: Vec<u8>,
+    },
+    Keyframe {
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    },
+}
+
+/// One str0m mutation. The poll loop applies one item and immediately returns
+/// to `poll_rtc()` before applying another mutation.
+enum PendingRtcMutation {
+    Sctp {
+        topic: Topic,
+        pkt: Vec<u8>,
+    },
+    Keyframe {
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -97,8 +124,11 @@ pub struct ParticipantCore {
     pub udp_batcher: Batcher,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
+    stream_writer: StreamWriter,
     pending_ingress: VecDeque<RecvPacketBatch>,
     pending_timeout: Option<Instant>,
+    pending_fanout: VecDeque<PendingFanout>,
+    pending_rtc_mutations: VecDeque<PendingRtcMutation>,
 
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
@@ -135,6 +165,9 @@ impl ParticipantCore {
         let mut p = Self {
             pending_ingress: VecDeque::new(),
             pending_timeout: None,
+            pending_fanout: VecDeque::new(),
+            pending_rtc_mutations: VecDeque::new(),
+            stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             rtc,
             udp_batcher,
@@ -168,8 +201,9 @@ impl ParticipantCore {
 
     #[inline]
     pub fn on_forward_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
-        let mut writer = StreamWriter(&mut self.rtc);
-        let promoted = self.downstream.on_forward_rtp(stream_id, pkt, &mut writer);
+        let promoted = self
+            .downstream
+            .on_forward_rtp(stream_id, pkt, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }
@@ -181,23 +215,16 @@ impl ParticipantCore {
         slot_idx: crate::id::AudioSelectorSlotId,
         pkt: &RtpPacket,
     ) {
-        let mut writer = StreamWriter(&mut self.rtc);
         self.downstream
-            .on_forward_audio_rtp(slot_idx, pkt, &mut writer);
+            .on_forward_audio_rtp(slot_idx, pkt, &mut self.stream_writer);
     }
 
     #[inline]
     pub fn on_forward_sctp(&mut self, topic: &Topic, pkt: &[u8]) {
-        let Some(cid) = self.data_sub_channels.get(topic).copied() else {
-            return;
-        };
-
-        let Some(mut ch) = self.rtc.channel(cid) else {
-            return;
-        };
-        if let Err(err) = ch.write(true, pkt) {
-            tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
-        }
+        self.pending_fanout.push_back(PendingFanout::Sctp {
+            topic: topic.clone(),
+            pkt: pkt.to_vec(),
+        });
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
@@ -240,7 +267,7 @@ impl ParticipantCore {
         self.disconnect_reason.as_ref()
     }
 
-    pub fn handle_keyframe_request(&mut self, key: KeyframeRequest) {
+    fn handle_keyframe_request_now(&mut self, key: KeyframeRequest) {
         let mut api = self.rtc.direct_api();
         if let Some(stream) = api.stream_rx_by_mid(key.mid, key.rid) {
             stream.request_keyframe(key.kind);
@@ -251,6 +278,15 @@ impl ParticipantCore {
     }
 
     pub fn handle_remote_keyframe_request(
+        &mut self,
+        stream_id: StreamId,
+        kind: KeyframeRequestKind,
+    ) {
+        self.pending_fanout
+            .push_back(PendingFanout::Keyframe { stream_id, kind });
+    }
+
+    fn handle_remote_keyframe_request_now(
         &mut self,
         stream_id: StreamId,
         kind: KeyframeRequestKind,
@@ -269,7 +305,7 @@ impl ParticipantCore {
         };
 
         self.last_keyframe_request.insert(stream_id, now);
-        self.handle_keyframe_request(KeyframeRequest {
+        self.handle_keyframe_request_now(KeyframeRequest {
             mid,
             rid: stream_id.1,
             kind,
@@ -284,6 +320,102 @@ impl ParticipantCore {
         self.upstream.poll_slow(now);
     }
 
+    /// Converts one routed item into zero or more deferred `Rtc` mutations.
+    /// This only changes allocator state; actual str0m writes are performed by
+    /// `apply_one_rtc_mutation` below.
+    fn process_one_fanout(&mut self) -> bool {
+        let Some(work) = self.pending_fanout.pop_front() else {
+            return false;
+        };
+
+        match work {
+            PendingFanout::Sctp { topic, pkt } => {
+                self.pending_rtc_mutations
+                    .push_back(PendingRtcMutation::Sctp { topic, pkt });
+            }
+            PendingFanout::Keyframe { stream_id, kind } => {
+                self.pending_rtc_mutations
+                    .push_back(PendingRtcMutation::Keyframe { stream_id, kind });
+            }
+        }
+
+        true
+    }
+
+    /// Performs exactly one `Rtc` mutation. The caller must immediately resume
+    /// the drain loop before this method can be called again.
+    fn apply_one_rtc_mutation(&mut self) -> bool {
+        if let Some(write) = self.stream_writer.pop() {
+            self.apply_stream_write(write);
+            return true;
+        }
+
+        let Some(mutation) = self.pending_rtc_mutations.pop_front() else {
+            return false;
+        };
+
+        match mutation {
+            PendingRtcMutation::Sctp { topic, pkt } => {
+                let Some(cid) = self.data_sub_channels.get(&topic).copied() else {
+                    return true;
+                };
+                let Some(mut ch) = self.rtc.channel(cid) else {
+                    return true;
+                };
+                if let Err(err) = ch.write(true, &pkt) {
+                    tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+                }
+            }
+            PendingRtcMutation::Keyframe { stream_id, kind } => {
+                self.handle_remote_keyframe_request_now(stream_id, kind);
+            }
+        }
+
+        true
+    }
+
+    fn apply_stream_write(&mut self, write: StreamWrite) {
+        let (pkt, mid, rid, pt, nackable) = match write {
+            StreamWrite::Video { pkt, mid, rid, pt } => (pkt, mid, rid, pt, true),
+            StreamWrite::Audio { pkt, mid, pt } => (pkt, mid, None, pt, false),
+        };
+
+        let mut api = self.rtc.direct_api();
+        let Some(stream) = api.stream_tx_by_mid(mid, rid) else {
+            if nackable {
+                tracing::warn!(target: crate::log::TARGET_VIDEO, %mid, ?rid, "no stream_tx_by_mid found");
+            } else {
+                tracing::warn!(target: crate::log::TARGET_AUDIO, %mid, "no stream_tx_by_mid found");
+            }
+            return;
+        };
+        let ssrc = stream.ssrc();
+        if nackable {
+            tracing::trace!(
+                target: crate::log::TARGET_VIDEO,
+                %mid, ?rid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker,
+                "Writing RTP packet"
+            );
+        } else {
+            tracing::trace!(
+                target: crate::log::TARGET_AUDIO,
+                %mid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker,
+                "Writing RTP packet"
+            );
+        }
+        let rtp = RtpWrite::new(
+            pt,
+            pkt.seq_no,
+            pkt.rtp_ts.numer() as u32,
+            pkt.playout_time.into(),
+            pkt.payload,
+        )
+        .nackable(nackable)
+        .marker(pkt.marker)
+        .ext_vals(pkt.ext_vals);
+        stream.write_rtp(rtp);
+    }
+
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         'drain: loop {
             let Some(rtc_deadline) = self.poll_rtc(events) else {
@@ -295,6 +427,10 @@ impl ParticipantCore {
             if let Some(deadline) = self.pending_timeout.take() {
                 let now = deadline.max(now);
                 let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                continue;
+            }
+
+            if self.apply_one_rtc_mutation() {
                 continue;
             }
 
@@ -332,6 +468,10 @@ impl ParticipantCore {
                 };
                 let _ = self.rtc.handle_input(Input::Receive(now.into(), recv));
                 continue 'drain;
+            }
+
+            if self.process_one_fanout() {
+                continue;
             }
 
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);

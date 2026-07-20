@@ -106,8 +106,6 @@ mod tests {
     use super::*;
     use crate::participant::downstream::SlotConfig;
     use crate::rtp::RtpPacket;
-    use crate::track::StreamWriter;
-    use str0m::RtcConfig;
     use str0m::media::{MediaKind, Mid, Pt};
     use str0m::rtp::Ssrc;
 
@@ -130,18 +128,23 @@ mod tests {
             "new audio slot must start with pending marker"
         );
 
-        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
-        let mut writer = StreamWriter(&mut rtc);
-
         let first = RtpPacket::default();
-        let _ = alloc.on_rtp(AudioSelectorSlotId::new(0), &first, &mut writer);
+        let _ = alloc.on_rtp(
+            AudioSelectorSlotId::new(0),
+            &first,
+            &mut StreamWriter::new(),
+        );
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| !s.pending_marker),
             "first forwarded packet must consume pending marker"
         );
 
         let second = RtpPacket::default();
-        let _ = alloc.on_rtp(AudioSelectorSlotId::new(0), &second, &mut writer);
+        let _ = alloc.on_rtp(
+            AudioSelectorSlotId::new(0),
+            &second,
+            &mut StreamWriter::new(),
+        );
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| !s.pending_marker),
             "pending marker must stay cleared for subsequent packets"
@@ -153,11 +156,8 @@ mod tests {
         let mut alloc = AudioAllocator::new();
         alloc.add_slot(make_audio_slot());
 
-        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
-        let mut writer = StreamWriter(&mut rtc);
-
         let pkt = RtpPacket::default();
-        let res = alloc.on_rtp(AudioSelectorSlotId::new(1), &pkt, &mut writer);
+        let res = alloc.on_rtp(AudioSelectorSlotId::new(1), &pkt, &mut StreamWriter::new());
         assert!(res.is_none(), "unprovisioned slot must be dropped");
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| s.pending_marker),
