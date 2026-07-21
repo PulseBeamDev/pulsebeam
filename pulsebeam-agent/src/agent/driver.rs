@@ -109,6 +109,28 @@ pub(crate) enum DataTrackDirection {
     Subscribe,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeliveryClass {
+    #[default]
+    Lossy,
+    SemiReliable {
+        retransmits: u16,
+    },
+    ReliableOrdered,
+}
+
+impl DeliveryClass {
+    fn channel_settings(self) -> (bool, Reliability) {
+        match self {
+            Self::Lossy => (false, Reliability::MaxRetransmits { retransmits: 0 }),
+            Self::SemiReliable { retransmits } => {
+                (false, Reliability::MaxRetransmits { retransmits })
+            }
+            Self::ReliableOrdered => (true, Reliability::Reliable),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DataTrackBinding {
     direction: DataTrackDirection,
@@ -296,7 +318,15 @@ impl AgentDriver {
     }
 
     pub fn declare_publish_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_data_topic(DataTrackDirection::Publish, topic)?;
+        self.declare_publish_topic_with(topic, DeliveryClass::default())
+    }
+
+    pub fn declare_publish_topic_with(
+        &mut self,
+        topic: &str,
+        delivery: DeliveryClass,
+    ) -> Result<ChannelId, AgentError> {
+        let cid = self.ensure_data_topic(DataTrackDirection::Publish, topic, delivery)?;
         self.data.data_pub_topics.insert(
             topic.to_string(),
             DataPublisher::new(cid, topic.to_string(), self.outgoing_tx.clone()),
@@ -305,7 +335,15 @@ impl AgentDriver {
     }
 
     pub fn declare_subscribe_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_data_topic(DataTrackDirection::Subscribe, topic)?;
+        self.declare_subscribe_topic_with(topic, DeliveryClass::default())
+    }
+
+    pub fn declare_subscribe_topic_with(
+        &mut self,
+        topic: &str,
+        delivery: DeliveryClass,
+    ) -> Result<ChannelId, AgentError> {
+        let cid = self.ensure_data_topic(DataTrackDirection::Subscribe, topic, delivery)?;
         let (tx, rx) = mailbox::bounded(8);
         self.data.data_sub_topics.insert(
             topic.to_string(),
@@ -800,6 +838,7 @@ impl AgentDriver {
         &mut self,
         direction: DataTrackDirection,
         topic: &str,
+        delivery: DeliveryClass,
     ) -> Result<ChannelId, AgentError> {
         let existing = match direction {
             DataTrackDirection::Publish => {
@@ -814,10 +853,11 @@ impl AgentDriver {
         }
 
         let topic_owned = topic.to_string();
+        let (ordered, reliability) = delivery.channel_settings();
         let cfg = ChannelConfig {
             label: data_track_label(direction, &topic_owned),
-            ordered: false,
-            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            ordered,
+            reliability,
             negotiated: None,
             protocol: "".to_string(),
         };
