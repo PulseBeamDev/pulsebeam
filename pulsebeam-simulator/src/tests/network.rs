@@ -4,8 +4,6 @@ use std::time::Duration;
 
 #[test]
 fn network_impairment_test() {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))

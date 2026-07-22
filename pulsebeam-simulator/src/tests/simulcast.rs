@@ -5,8 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 #[test]
 fn simulcast_stream_stability_test() {
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(5);
     const SOAK: Duration = Duration::from_secs(55);

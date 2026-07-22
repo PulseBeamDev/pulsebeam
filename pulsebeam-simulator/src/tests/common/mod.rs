@@ -3,15 +3,9 @@ pub mod client;
 use pulsebeam_runtime::net::UdpMode;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{
-        Once,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::atomic::{AtomicU8, Ordering},
     time::{Duration, Instant},
 };
-use tracing_subscriber::EnvFilter;
-
-static INIT: Once = Once::new();
 
 static NEXT_SUBNET: AtomicU8 = AtomicU8::new(1);
 static NEXT_TEST_ID: AtomicU8 = AtomicU8::new(1);
@@ -28,19 +22,6 @@ pub fn next_test_id() -> u8 {
 
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
     format!("192.168.{}.{}", subnet, host).parse().unwrap()
-}
-
-pub fn setup_tracing() {
-    INIT.call_once(|| {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));
-        tracing_subscriber::fmt()
-            .pretty()
-            .with_env_filter(env_filter)
-            .with_target(true)
-            .with_ansi(true)
-            .init();
-    });
 }
 
 pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {

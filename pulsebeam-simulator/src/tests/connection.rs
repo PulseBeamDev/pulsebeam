@@ -13,8 +13,6 @@ fn run_connection_scenario(
     enable_partition: bool,
     enable_churn: bool,
 ) {
-    common::setup_tracing();
-
     let subnet = common::reserve_subnet();
     let server_ip = common::subnet_ip(subnet, 1);
     let sim = turmoil::Builder::new()
@@ -76,8 +74,6 @@ fn simulation_test() {
 
 #[test]
 fn tcp_simulation_test() {
-    common::setup_tracing();
-
     let subnet = common::reserve_subnet();
     let server_ip = common::subnet_ip(subnet, 1);
     let sim = turmoil::Builder::new()
@@ -113,8 +109,6 @@ fn tcp_simulation_test() {
 /// The fix routes egress cross-shard via `CrossShardEvent::TcpEgressForward`.
 #[test]
 fn tcp_multi_shard_simulation_test() {
-    common::setup_tracing();
-
     let subnet = common::reserve_subnet();
     let server_ip = common::subnet_ip(subnet, 1);
     let sim = turmoil::Builder::new()

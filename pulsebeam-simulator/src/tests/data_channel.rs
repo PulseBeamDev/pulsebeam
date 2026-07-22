@@ -7,8 +7,6 @@ use tokio::time::Instant;
 
 #[test]
 fn data_channel_pubsub_forwarding_test() -> turmoil::Result {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .tick_duration(Duration::from_micros(100))
         .rng_seed(0x0BADC0DE)
@@ -92,8 +90,6 @@ fn data_channel_pubsub_forwarding_test() -> turmoil::Result {
 
 #[test]
 fn data_channel_latency_regression_test() -> turmoil::Result {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .tick_duration(Duration::from_micros(100))
         .rng_seed(0xFEEDBEEF)

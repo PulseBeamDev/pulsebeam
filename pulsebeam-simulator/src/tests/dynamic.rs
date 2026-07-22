@@ -5,8 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 #[test]
 fn churn_test() -> turmoil::Result {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(120))
         .rng_seed(0xDEADBEEF)
@@ -75,8 +73,6 @@ fn churn_test() -> turmoil::Result {
 
 #[test]
 fn abrupt_exit_chaos_test() -> turmoil::Result {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(120))
         .rng_seed(0xC0FFEE)

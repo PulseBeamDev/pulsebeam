@@ -1,4 +1,4 @@
-use crate::tests::common::{self, client::SimClientBuilder, run_sim_or_timeout, setup_tracing};
+use crate::tests::common::{self, client::SimClientBuilder, run_sim_or_timeout};
 use pulsebeam_agent::MediaKind;
 use pulsebeam_agent::TransceiverDirection;
 use pulsebeam_agent::manager::Subscription;
@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 #[test]
 fn declarative_subscription_test() -> turmoil::Result {
-    setup_tracing();
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(30))
         .rng_seed(0xDEADBEEF)
@@ -115,7 +114,6 @@ fn declarative_subscription_test() -> turmoil::Result {
 
 #[test]
 fn reconnection_recovery_test() -> turmoil::Result {
-    setup_tracing();
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .rng_seed(0xDEADBEEF)

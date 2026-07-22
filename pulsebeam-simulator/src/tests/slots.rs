@@ -7,8 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 #[test]
 fn slots_layout_update_test() -> turmoil::Result {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .tick_duration(Duration::from_micros(100))
@@ -134,8 +132,6 @@ fn slots_layout_update_test() -> turmoil::Result {
 
 #[test]
 fn slots_prioritization_test() -> turmoil::Result {
-    common::setup_tracing();
-
     let mut sim = turmoil::Builder::new()
         .tick_duration(Duration::from_micros(100))
         .rng_seed(0)
