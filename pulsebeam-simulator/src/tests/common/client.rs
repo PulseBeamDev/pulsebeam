@@ -100,7 +100,7 @@ pub struct ClientContext {
     /// Remote tracks that have been assigned to a slot and are actively streaming.
     pub remote_tracks: HashMap<pulsebeam_agent::str0m::media::Mid, String>,
     pub published_topics: HashMap<String, DataPublisher>,
-    pub subscribed_topics: HashMap<String, DataSubscriber>,
+    pub subscribed_topics: HashMap<(String, Option<String>), DataSubscriber>,
     /// Data channel payloads received by topic.
     pub received_data: Vec<(String, Vec<u8>)>,
 }
@@ -232,7 +232,8 @@ impl SimClient {
                                 self.ctx.published_topics.insert(publisher.topic.clone(), publisher);
                             }
                             AgentEvent::DataSubscriberDeclared(subscriber) => {
-                                self.ctx.subscribed_topics.insert(subscriber.topic.clone(), subscriber);
+                                let key = (subscriber.topic.clone(), subscriber.scope.clone());
+                                self.ctx.subscribed_topics.insert(key, subscriber);
                             }
                             AgentEvent::Connected | AgentEvent::Disconnected(_) => {}
                         }

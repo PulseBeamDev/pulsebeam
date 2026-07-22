@@ -71,9 +71,15 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         }
     }
 
-    fn forward_sctp(&mut self, subscriber: ParticipantId, topic: &crate::track::Topic, pkt: &[u8]) {
+    fn forward_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &crate::track::Topic,
+        pkt: &[u8],
+    ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
-            p.with_span(|core| core.on_forward_sctp(topic, pkt));
+            p.with_span(|core| core.on_forward_sctp(topic, origin, pkt));
             self.dirty.mark(self.kind, subscriber);
         }
     }

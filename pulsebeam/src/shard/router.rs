@@ -44,7 +44,13 @@ pub(crate) trait RoutingContext: CrossShardSend {
         slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
     );
-    fn forward_sctp(&mut self, subscriber: ParticipantId, topic: &Topic, pkt: &[u8]);
+    fn forward_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &Topic,
+        pkt: &[u8],
+    );
     fn notify_tracks_published(&mut self, participant_id: ParticipantId, tracks: &[Track]);
     fn notify_tracks_unpublished(&mut self, participant_id: ParticipantId, track_ids: &[TrackId]);
     fn notify_keyframe_request(
@@ -543,7 +549,7 @@ impl ShardRoutingTable {
             // if subscriber_id == origin {
             //     continue;
             // }
-            ctx.forward_sctp(subscriber_id, topic, pkt);
+            ctx.forward_sctp(subscriber_id, origin, topic, pkt);
         }
 
         if ctx.is_local(&origin) {
@@ -671,7 +677,13 @@ mod tests {
                 .borrow_mut()
                 .push((subscriber, slot_idx));
         }
-        fn forward_sctp(&mut self, subscriber: ParticipantId, _topic: &Topic, _pkt: &[u8]) {
+        fn forward_sctp(
+            &mut self,
+            subscriber: ParticipantId,
+            _origin: ParticipantId,
+            _topic: &Topic,
+            _pkt: &[u8],
+        ) {
             self.forwarded_sctp.borrow_mut().push(subscriber);
         }
         fn notify_tracks_published(&mut self, participant_id: ParticipantId, _tracks: &[Track]) {

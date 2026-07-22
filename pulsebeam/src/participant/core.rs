@@ -28,7 +28,7 @@ use crate::participant::{
 use crate::rtp::RtpPacket;
 use crate::track::{
     self, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
-    KEYFRAME_DEBOUNCE, StreamId, StreamWrite, StreamWriter, Topic, Track,
+    KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
 };
 use str0m::rtp::RtpWrite;
 
@@ -59,6 +59,7 @@ pub struct TrackMapping {
 enum PendingFanout {
     Sctp {
         topic: Topic,
+        origin: entity::ParticipantId,
         pkt: Vec<u8>,
     },
     Keyframe {
@@ -72,6 +73,7 @@ enum PendingFanout {
 enum PendingRtcMutation {
     Sctp {
         topic: Topic,
+        origin: entity::ParticipantId,
         pkt: Vec<u8>,
     },
     Keyframe {
@@ -96,6 +98,8 @@ pub enum DisconnectReason {
     DuplicateDataChannelLabel(DataTopicChannel),
     #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
+    #[error("Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed")]
+    TooManyDataTopicChannels,
     #[error("Room closed")]
     RoomClosed,
     #[error("System terminated")]
@@ -139,7 +143,11 @@ pub struct ParticipantCore {
     track_availability: HashMap<TrackId, TrackAvailability>,
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
-    data_sub_channels: HashMap<Topic, ChannelId>,
+    // Keyed by (topic, scope): scope is `None` for the wildcard (all-publishers)
+    // subscribe form and `Some(publisher_id)` for a scoped one, so a participant
+    // can hold a wildcard sub and multiple differently-scoped subs to the same
+    // topic simultaneously.
+    data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -220,9 +228,10 @@ impl ParticipantCore {
     }
 
     #[inline]
-    pub fn on_forward_sctp(&mut self, topic: &Topic, pkt: &[u8]) {
+    pub fn on_forward_sctp(&mut self, topic: &Topic, origin: entity::ParticipantId, pkt: &[u8]) {
         self.pending_fanout.push_back(PendingFanout::Sctp {
             topic: topic.clone(),
+            origin,
             pkt: pkt.to_vec(),
         });
     }
@@ -329,9 +338,9 @@ impl ParticipantCore {
         };
 
         match work {
-            PendingFanout::Sctp { topic, pkt } => {
+            PendingFanout::Sctp { topic, origin, pkt } => {
                 self.pending_rtc_mutations
-                    .push_back(PendingRtcMutation::Sctp { topic, pkt });
+                    .push_back(PendingRtcMutation::Sctp { topic, origin, pkt });
             }
             PendingFanout::Keyframe { stream_id, kind } => {
                 self.pending_rtc_mutations
@@ -355,15 +364,18 @@ impl ParticipantCore {
         };
 
         match mutation {
-            PendingRtcMutation::Sctp { topic, pkt } => {
-                let Some(cid) = self.data_sub_channels.get(&topic).copied() else {
-                    return true;
-                };
-                let Some(mut ch) = self.rtc.channel(cid) else {
-                    return true;
-                };
-                if let Err(err) = ch.write(true, &pkt) {
-                    tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+            PendingRtcMutation::Sctp { topic, origin, pkt } => {
+                // Wildcard subscriber for this topic (existing all-publishers fan-in).
+                if let Some(cid) = self.data_sub_channels.get(&(topic.clone(), None)).copied() {
+                    self.write_to_data_channel(cid, &topic, &pkt);
+                }
+                // Subscriber scoped to exactly this publisher, if any.
+                if let Some(cid) = self
+                    .data_sub_channels
+                    .get(&(topic.clone(), Some(origin)))
+                    .copied()
+                {
+                    self.write_to_data_channel(cid, &topic, &pkt);
                 }
             }
             PendingRtcMutation::Keyframe { stream_id, kind } => {
@@ -372,6 +384,15 @@ impl ParticipantCore {
         }
 
         true
+    }
+
+    fn write_to_data_channel(&mut self, cid: ChannelId, topic: &Topic, pkt: &[u8]) {
+        let Some(mut ch) = self.rtc.channel(cid) else {
+            return;
+        };
+        if let Err(err) = ch.write(true, pkt) {
+            tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+        }
     }
 
     fn apply_stream_write(&mut self, write: StreamWrite) {
@@ -619,12 +640,17 @@ impl ParticipantCore {
                                 .filter(|existing| *existing != cid),
                             DataTrackDirection::Subscribe => self
                                 .data_sub_channels
-                                .get(&e.topic)
+                                .get(&(e.topic.clone(), e.scope))
                                 .copied()
                                 .filter(|existing| *existing != cid),
                         };
                         if duplicate.is_some() {
                             self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
+                            return;
+                        }
+
+                        if self.data_topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
+                            self.disconnect(DisconnectReason::TooManyDataTopicChannels);
                             return;
                         }
 
@@ -635,7 +661,7 @@ impl ParticipantCore {
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
-                                self.data_sub_channels.insert(e.topic.clone(), cid);
+                                self.data_sub_channels.insert((e.topic.clone(), e.scope), cid);
                                 events.subscribe_data_topic(e.topic);
                             }
                         }
@@ -906,8 +932,18 @@ impl ParticipantCore {
                 events.unpublish_data_topic(ch.topic);
             }
             DataTrackDirection::Subscribe => {
-                self.data_sub_channels.remove(&ch.topic);
-                events.unsubscribe_data_topic(ch.topic);
+                self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
+                // Only signal room-level unsubscribe once no sibling scope
+                // (wildcard or another publisher-scoped channel) for this
+                // same topic remains open, so closing one scoped channel
+                // never wrongly evicts the participant from the topic's
+                // room-level subscriber set while another channel for it
+                // is still live.
+                let any_remaining_scope_for_topic =
+                    self.data_sub_channels.keys().any(|(topic, _)| *topic == ch.topic);
+                if !any_remaining_scope_for_topic {
+                    events.unsubscribe_data_topic(ch.topic);
+                }
             }
         }
     }

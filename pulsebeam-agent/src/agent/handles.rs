@@ -30,6 +30,10 @@ pub(crate) struct SendMedia {
 pub struct DataPublisher {
     pub channel_id: ChannelId,
     pub topic: String,
+    /// Always `None` — publish channels never carry a publisher scope.
+    /// Present for symmetry with `DataSubscriber` (e.g. so reliable-mode
+    /// wrappers can introspect it uniformly).
+    pub scope: Option<String>,
     pub(crate) tx: mailbox::Sender<OutgoingCommand>,
 }
 
@@ -42,6 +46,7 @@ impl DataPublisher {
         Self {
             channel_id,
             topic,
+            scope: None,
             tx,
         }
     }
@@ -80,6 +85,9 @@ impl DataPublisher {
 pub struct DataSubscriber {
     pub channel_id: ChannelId,
     pub topic: String,
+    /// `Some(publisher_id)` if this subscription is scoped to exactly one
+    /// publisher; `None` for the wildcard (all-publishers) form.
+    pub scope: Option<String>,
     pub(crate) rx: mailbox::Receiver<Vec<u8>>,
 }
 
@@ -87,11 +95,13 @@ impl DataSubscriber {
     pub(crate) fn new(
         channel_id: ChannelId,
         topic: String,
+        scope: Option<String>,
         rx: mailbox::Receiver<Vec<u8>>,
     ) -> Self {
         Self {
             channel_id,
             topic,
+            scope,
             rx,
         }
     }
