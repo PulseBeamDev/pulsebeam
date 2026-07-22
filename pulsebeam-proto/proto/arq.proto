@@ -1,0 +1,44 @@
+syntax = "proto3";
+package arq;
+
+// =========================================================================
+// Reliable ARQ (Automatic Repeat reQuest) protocol, SDK-side only.
+//
+// The server treats every data-channel payload as opaque bytes; these
+// messages are never parsed by the SFU.  Both messages are serialised with
+// prost (proto3 binary) and carried as raw DCEP data-channel payloads.
+// =========================================================================
+
+// One sequenced data frame sent from publisher to subscriber(s).
+// Carried on the raw data topic (e.g. "game-sync").
+message ArqFrame {
+  // Monotonically increasing per (publisher, topic) instance.
+  // u64 avoids wraparound for any realistic session length.
+  uint64 seq = 1;
+
+  // Informational only: set when this is a retransmit of a previously sent
+  // frame.  Receivers dedup by seq regardless of this flag.
+  bool is_retransmit = 2;
+
+  // Opaque application payload.
+  bytes payload = 3;
+}
+
+// Cumulative + selective acknowledgement sent from subscriber to publisher.
+// Carried on the sibling ack topic (e.g. "game-sync_ack").
+message ArqAck {
+  // Acking subscriber's participant id (fixed 29-char ASCII "pa_…" string),
+  // used by the publisher to demux acks from multiple subscribers sharing one
+  // ack topic and to maintain per-subscriber retransmit watermarks.
+  string subscriber_id = 1;
+
+  // next_expected: exclusive upper bound of contiguous delivery.
+  // "I have delivered every seq < next_expected and am waiting for this one."
+  // A value of 0 means nothing has been delivered yet — no eviction triggered.
+  uint64 next_expected = 2;
+
+  // Sparse list of sequence numbers in [next_expected, max_buffered) that
+  // have been received out-of-order but are not yet deliverable (waiting for
+  // earlier gaps to close).  Capped at 32 entries to bound ack size.
+  repeated uint64 missing = 3;
+}

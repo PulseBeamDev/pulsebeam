@@ -4,6 +4,12 @@
 //! payload as far as `pulsebeam` is concerned; sequencing, acking, and
 //! retransmission are purely a client-side concern layered on top.
 //!
+//! # Wire format
+//!
+//! Frames and acks are serialised as proto3 binary using the types defined in
+//! `pulsebeam-proto/proto/arq.proto` (`ArqFrame` and `ArqAck`).  The server
+//! treats every data-channel payload as opaque bytes and never parses them.
+//!
 //! # Scoped subscribe is required
 //!
 //! [`ReliableSubscriber`] must wrap a *scoped* subscribe channel
@@ -46,6 +52,8 @@
 
 use crate::agent::handles::{DataPublisher, DataSubscriber};
 use crate::agent::mailbox;
+use pulsebeam_proto::arq::{ArqAck, ArqFrame};
+use pulsebeam_proto::prelude::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,111 +64,31 @@ pub fn ack_topic_name(topic: &str) -> String {
     format!("{topic}_ack")
 }
 
-// -- wire framing -----------------------------------------------------------
-//
-// Fixed 9-byte header, not varint: DCEP payloads sit well under typical MTU,
-// and fixed offsets keep retransmit/reorder indexing branch-free.
-//   byte 0:      flags (bit1 = is-retransmit; informational only, receivers
-//                dedup by seq regardless of this bit)
-//   bytes 1..9:  seq: u64, big-endian
-//   bytes 9..:   opaque payload
-//
-// u64 (not u32) specifically so sequence wraparound is a non-issue for any
-// realistic session lifetime, avoiding wraparound-aware comparison logic.
+// -- wire helpers -----------------------------------------------------------
 
-const FRAME_HEADER_LEN: usize = 9;
-const RETRANSMIT_FLAG: u8 = 0b10;
-
-fn encode_frame(seq: u64, is_retransmit: bool, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    buf.push(if is_retransmit { RETRANSMIT_FLAG } else { 0 });
-    buf.extend_from_slice(&seq.to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf
+fn encode_frame(seq: u64, is_retransmit: bool, payload: Vec<u8>) -> Vec<u8> {
+    ArqFrame { seq, is_retransmit, payload }.encode_to_vec()
 }
 
-fn decode_frame(raw: &[u8]) -> Option<(u64, bool, &[u8])> {
-    if raw.len() < FRAME_HEADER_LEN {
-        return None;
-    }
-    let is_retransmit = raw[0] & RETRANSMIT_FLAG != 0;
-    let seq = u64::from_be_bytes(raw[1..FRAME_HEADER_LEN].try_into().ok()?);
-    Some((seq, is_retransmit, &raw[FRAME_HEADER_LEN..]))
+fn decode_frame(raw: &[u8]) -> Option<ArqFrame> {
+    ArqFrame::decode(raw).ok()
 }
 
-// -- ack payload --------------------------------------------------------
-//
-// bytes 0..29:  acking subscriber's ParticipantId::as_str() (fixed-width
-//               ASCII, "pa_" + 26-char Crockford base32 = 29 bytes), so the
-//               publisher can tell which subscriber's flow-control state
-//               this ack updates.
-// bytes 29..37: highest_contiguous_seq: u64 BE (cumulative ack)
-// byte 37:      missing_count: u8 (capped)
-// bytes 38..:   missing_count * 8 bytes, each a u64 seq (sparse list)
-//
-// Ack loss is self-healing via the cumulative watermark — no retry needed.
-
-const ACK_ID_LEN: usize = 29;
-const ACK_HEADER_LEN: usize = ACK_ID_LEN + 8 + 1;
-const MAX_ACK_MISSING: usize = 32;
-
-struct Ack {
-    subscriber_id: String,
-    highest_contiguous_seq: u64,
-    missing: Vec<u64>,
+fn encode_ack(ack: &ArqAck) -> Vec<u8> {
+    ack.encode_to_vec()
 }
 
-fn encode_ack(ack: &Ack) -> Vec<u8> {
-    let mut id_bytes = [0u8; ACK_ID_LEN];
-    let src = ack.subscriber_id.as_bytes();
-    let n = src.len().min(ACK_ID_LEN);
-    id_bytes[..n].copy_from_slice(&src[..n]);
-
-    let missing_count = ack.missing.len().min(MAX_ACK_MISSING);
-    let mut buf = Vec::with_capacity(ACK_HEADER_LEN + missing_count * 8);
-    buf.extend_from_slice(&id_bytes);
-    buf.extend_from_slice(&ack.highest_contiguous_seq.to_be_bytes());
-    buf.push(missing_count as u8);
-    for &seq in ack.missing.iter().take(missing_count) {
-        buf.extend_from_slice(&seq.to_be_bytes());
-    }
-    buf
+fn decode_ack(raw: &[u8]) -> Option<ArqAck> {
+    ArqAck::decode(raw).ok()
 }
 
-fn decode_ack(raw: &[u8]) -> Option<Ack> {
-    if raw.len() < ACK_HEADER_LEN {
-        return None;
-    }
-    let subscriber_id = String::from_utf8_lossy(&raw[..ACK_ID_LEN])
-        .trim_end_matches('\0')
-        .to_string();
-    let highest_contiguous_seq =
-        u64::from_be_bytes(raw[ACK_ID_LEN..ACK_ID_LEN + 8].try_into().ok()?);
-    let missing_count = raw[ACK_ID_LEN + 8] as usize;
-
-    let mut missing = Vec::with_capacity(missing_count);
-    let mut offset = ACK_HEADER_LEN;
-    for _ in 0..missing_count {
-        if offset + 8 > raw.len() {
-            break;
-        }
-        missing.push(u64::from_be_bytes(raw[offset..offset + 8].try_into().ok()?));
-        offset += 8;
-    }
-
-    Some(Ack {
-        subscriber_id,
-        highest_contiguous_seq,
-        missing,
-    })
-}
-
-// -- reorder buffer (subscriber side) ----------------------------------
+// -- reorder buffer (subscriber side) --------------------------------------
 
 const DEFAULT_REORDER_CAP: usize = 256;
 const DEFAULT_RETRANSMIT_CAP: usize = 512;
 const ACK_EVERY_N_FRAMES: u32 = 16;
 const ACK_TIMER_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_ACK_MISSING: usize = 32;
 
 struct ReorderBuffer {
     next_expected: u64,
@@ -170,11 +98,7 @@ struct ReorderBuffer {
 
 impl ReorderBuffer {
     fn new(cap: usize) -> Self {
-        Self {
-            next_expected: 0,
-            buf: BTreeMap::new(),
-            cap,
-        }
+        Self { next_expected: 0, buf: BTreeMap::new(), cap }
     }
 
     /// Feeds one decoded frame; returns any now-contiguous payloads to
@@ -198,8 +122,7 @@ impl ReorderBuffer {
         if self.buf.len() > self.cap {
             // The gap never closed and the buffer is over budget: skip ahead
             // to the oldest buffered seq, permanently losing the
-            // unrecoverable range, rather than growing without bound. A
-            // sufficiently-behind sender simply can't be waited for forever.
+            // unrecoverable range, rather than growing without bound.
             if let Some(&oldest) = self.buf.keys().next() {
                 self.next_expected = oldest;
                 while let Some(next) = self.buf.remove(&self.next_expected) {
@@ -230,56 +153,46 @@ impl ReorderBuffer {
     }
 }
 
-// -- retransmit buffer (publisher side) --------------------------------
+// -- retransmit buffer (publisher side) ------------------------------------
 
 struct RetransmitBuffer {
     buf: BTreeMap<u64, Vec<u8>>,
     cap: usize,
-    /// Highest contiguous seq acked by each subscriber_id we've heard from.
+    /// Per-subscriber next_expected watermarks (exclusive upper bound).
     watermarks: HashMap<String, u64>,
 }
 
 impl RetransmitBuffer {
     fn new(cap: usize) -> Self {
-        Self {
-            buf: BTreeMap::new(),
-            cap,
-            watermarks: HashMap::new(),
-        }
+        Self { buf: BTreeMap::new(), cap, watermarks: HashMap::new() }
     }
 
     fn insert(&mut self, seq: u64, payload: Vec<u8>) {
         self.buf.insert(seq, payload);
         // Hard cap so one silent/disconnected subscriber can't pin the
-        // buffer forever — a sufficiently-lagging subscriber simply loses
-        // recovery for evicted seqs, a documented ARQ limitation.
+        // buffer forever.
         while self.buf.len() > self.cap {
-            let Some(&oldest) = self.buf.keys().next() else {
-                break;
-            };
+            let Some(&oldest) = self.buf.keys().next() else { break };
             self.buf.remove(&oldest);
         }
     }
 
-    /// Evicts everything strictly below the lowest `next_expected` seen
-    /// across subscribers *heard from so far*. The ack field
-    /// `highest_contiguous_seq` carries `next_expected` (exclusive upper
-    /// bound: "I expect seq N next"), so a watermark of N means seqs 0..N-1
-    /// have been delivered and can be dropped. A watermark of 0 means
-    /// nothing has been delivered yet — evict nothing.
+    /// Records a subscriber's `next_expected` watermark and evicts all seqs
+    /// strictly below the minimum watermark seen so far.
     ///
-    /// Eviction is intentionally progressive, not a lookahead over some
-    /// expected roster (we don't have one): a subscriber that acks early
-    /// with a high watermark can evict seqs a not-yet-heard-from subscriber
-    /// will later need. That subscriber then simply can't recover those
-    /// seqs — the same documented "sufficiently-lagging subscriber loses
-    /// recovery" limitation as the hard size cap, just triggered by ordering
-    /// instead of volume.
-    fn on_ack(&mut self, subscriber_id: String, highest_contiguous_seq: u64) {
-        self.watermarks.insert(subscriber_id, highest_contiguous_seq);
+    /// `next_expected` is an *exclusive* upper bound ("I expect seq N next"),
+    /// so seqs < N have been delivered and can be dropped from the buffer.
+    /// A value of 0 means nothing has been delivered yet — nothing is evicted.
+    ///
+    /// Eviction is progressive per-ack: a subscriber that acks early with a
+    /// high watermark can evict seqs a not-yet-heard-from subscriber will
+    /// later need.  That subscriber simply can't recover those seqs — the
+    /// same documented limitation as the hard size cap above.
+    fn on_ack(&mut self, subscriber_id: String, next_expected: u64) {
+        self.watermarks.insert(subscriber_id, next_expected);
         if let Some(&min_watermark) = self.watermarks.values().min() {
-            // Evict seqs < min_watermark (i.e., keep seqs >= min_watermark).
-            // min_watermark == 0 means "nothing delivered yet" → retain all.
+            // Retain everything at or above min_watermark.
+            // min_watermark == 0 → retain all (nothing delivered yet).
             self.buf.retain(|&seq, _| seq >= min_watermark);
         }
     }
@@ -289,7 +202,7 @@ impl RetransmitBuffer {
     }
 }
 
-// -- public API -----------------------------------------------------------
+// -- public API ------------------------------------------------------------
 
 struct PublisherState {
     next_seq: u64,
@@ -319,36 +232,27 @@ impl ReliablePublisher {
         let mut ack_subscriber = ack_subscriber;
         let ack_task = tokio::spawn(async move {
             loop {
-                let Ok(raw) = ack_subscriber.recv().await else {
-                    return;
-                };
-                let Some(ack) = decode_ack(&raw) else {
-                    continue;
-                };
+                let Ok(raw) = ack_subscriber.recv().await else { return };
+                let Some(ack) = decode_ack(&raw) else { continue };
 
                 let to_resend = {
                     let mut state = task_state.lock().unwrap();
-                    state
-                        .retransmit
-                        .on_ack(ack.subscriber_id, ack.highest_contiguous_seq);
+                    state.retransmit.on_ack(ack.subscriber_id, ack.next_expected);
                     let mut resend: Vec<(u64, Vec<u8>)> = ack
                         .missing
                         .into_iter()
                         .filter_map(|seq| {
-                            state
-                                .retransmit
-                                .get(seq)
-                                .map(|payload| (seq, payload.to_vec()))
+                            state.retransmit.get(seq).map(|p| (seq, p.to_vec()))
                         })
                         .collect();
                     // Tail-packet recovery: if the missing list is empty but the
                     // subscriber hasn't caught up to our next_seq, the last
                     // unacked frame was lost and can't appear in missing() (the
                     // reorder buffer has nothing buffered above it to expose the
-                    // gap). Retransmit highest_contiguous_seq directly so the
-                    // subscriber isn't stuck waiting forever.
+                    // gap). Retransmit next_expected directly so the subscriber
+                    // isn't stuck waiting forever.
                     if resend.is_empty() {
-                        let sub_next = ack.highest_contiguous_seq;
+                        let sub_next = ack.next_expected;
                         if sub_next < state.next_seq {
                             if let Some(p) = state.retransmit.get(sub_next) {
                                 resend.push((sub_next, p.to_vec()));
@@ -358,16 +262,13 @@ impl ReliablePublisher {
                     resend
                 };
                 for (seq, payload) in to_resend {
-                    let _ = resend_publisher.try_send(encode_frame(seq, true, &payload));
+                    let _ =
+                        resend_publisher.try_send(encode_frame(seq, true, payload));
                 }
             }
         });
 
-        Self {
-            publisher,
-            state,
-            _ack_task: ack_task,
-        }
+        Self { publisher, state, _ack_task: ack_task }
     }
 
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), mailbox::SendError<Vec<u8>>> {
@@ -375,14 +276,10 @@ impl ReliablePublisher {
             let mut state = self.state.lock().unwrap();
             let seq = state.next_seq;
             state.next_seq += 1;
-            let frame = encode_frame(seq, false, &payload);
             state.retransmit.insert(seq, payload.clone());
-            frame
+            encode_frame(seq, false, payload.clone())
         };
-        self.publisher
-            .send(frame)
-            .await
-            .map_err(|_| mailbox::SendError(payload))
+        self.publisher.send(frame).await.map_err(|_| mailbox::SendError(payload))
     }
 }
 
@@ -399,7 +296,11 @@ impl ReliableSubscriber {
     /// `_ack` sibling; `local_id` is this agent's own participant id, used
     /// to stamp outgoing acks so the publisher can demux multiple acking
     /// subscribers sharing one ack topic.
-    pub fn new(subscriber: DataSubscriber, ack_publisher: DataPublisher, local_id: String) -> Self {
+    pub fn new(
+        subscriber: DataSubscriber,
+        ack_publisher: DataPublisher,
+        local_id: String,
+    ) -> Self {
         debug_assert!(
             subscriber.scope.is_some(),
             "ReliableSubscriber requires a scoped subscribe channel: the ARQ \
@@ -414,18 +315,14 @@ impl ReliableSubscriber {
             let mut reorder = ReorderBuffer::new(DEFAULT_REORDER_CAP);
             let mut since_last_ack: u32 = 0;
             let mut ack_timer = tokio::time::interval(ACK_TIMER_INTERVAL);
-            ack_timer.tick().await; // first tick fires immediately
+            ack_timer.tick().await; // consume immediate first tick
 
             loop {
                 tokio::select! {
                     frame = subscriber.recv() => {
-                        let Ok(raw) = frame else {
-                            return;
-                        };
-                        let Some((seq, _is_retransmit, payload)) = decode_frame(&raw) else {
-                            continue;
-                        };
-                        for delivered in reorder.ingest(seq, payload.to_vec()) {
+                        let Ok(raw) = frame else { return };
+                        let Some(f) = decode_frame(&raw) else { continue };
+                        for delivered in reorder.ingest(f.seq, f.payload) {
                             if tx.send(delivered).await.is_err() {
                                 return;
                             }
@@ -458,14 +355,13 @@ impl ReliableSubscriber {
 }
 
 fn send_ack(ack_publisher: &DataPublisher, subscriber_id: &str, reorder: &ReorderBuffer) {
-    let ack = Ack {
+    let ack = ArqAck {
         subscriber_id: subscriber_id.to_string(),
-        // Use next_expected (exclusive upper bound): "I expect seq N next",
-        // meaning seqs 0..next_expected-1 have been delivered. This avoids
-        // the ambiguity of saturating_sub(1) where 0 could mean either
-        // "seq 0 delivered" or "nothing delivered yet", which causes the
-        // publisher to wrongly evict seq 0 from the retransmit buffer.
-        highest_contiguous_seq: reorder.next_expected,
+        // next_expected (exclusive upper bound): "I expect seq N next", meaning
+        // seqs 0..N-1 have been delivered.  Using next_expected directly avoids
+        // the saturating_sub(1) ambiguity where 0 would wrongly signal seq 0 as
+        // already delivered when nothing has been received yet.
+        next_expected: reorder.next_expected,
         missing: reorder.missing(MAX_ACK_MISSING),
     };
     let _ = ack_publisher.try_send(encode_ack(&ack));
@@ -477,49 +373,52 @@ mod tests {
 
     #[test]
     fn frame_round_trip() {
-        let frame = encode_frame(42, false, b"hello");
-        let (seq, is_retransmit, payload) = decode_frame(&frame).unwrap();
-        assert_eq!(seq, 42);
-        assert!(!is_retransmit);
-        assert_eq!(payload, b"hello");
+        let frame = encode_frame(42, false, b"hello".to_vec());
+        let f = decode_frame(&frame).unwrap();
+        assert_eq!(f.seq, 42);
+        assert!(!f.is_retransmit);
+        assert_eq!(f.payload, b"hello");
 
-        let frame = encode_frame(7, true, b"world");
-        let (seq, is_retransmit, payload) = decode_frame(&frame).unwrap();
-        assert_eq!(seq, 7);
-        assert!(is_retransmit);
-        assert_eq!(payload, b"world");
+        let frame = encode_frame(7, true, b"world".to_vec());
+        let f = decode_frame(&frame).unwrap();
+        assert_eq!(f.seq, 7);
+        assert!(f.is_retransmit);
+        assert_eq!(f.payload, b"world");
     }
 
     #[test]
-    fn decode_frame_rejects_short_input() {
-        assert!(decode_frame(&[0u8; 3]).is_none());
+    fn decode_frame_rejects_garbage() {
+        assert!(decode_frame(&[0xFF, 0x00, 0xAB]).is_none());
     }
 
     #[test]
     fn ack_round_trip() {
-        let ack = Ack {
+        let ack = ArqAck {
             subscriber_id: "pa_TESTSUBSCRIBERID0000000000".to_string(),
-            highest_contiguous_seq: 100,
+            next_expected: 101,
             missing: vec![101, 103, 105],
         };
         let raw = encode_ack(&ack);
         let decoded = decode_ack(&raw).unwrap();
-        assert_eq!(decoded.subscriber_id.trim_end_matches('\0'), ack.subscriber_id);
-        assert_eq!(decoded.highest_contiguous_seq, 100);
+        assert_eq!(decoded.subscriber_id, ack.subscriber_id);
+        assert_eq!(decoded.next_expected, 101);
         assert_eq!(decoded.missing, vec![101, 103, 105]);
     }
 
     #[test]
-    fn ack_missing_list_is_capped() {
+    fn ack_missing_list_is_capped_by_caller() {
+        // The cap is enforced by the caller (send_ack passes MAX_ACK_MISSING to
+        // missing()); proto itself has no field-level size limit, so test that
+        // a large list round-trips correctly.
         let missing: Vec<u64> = (0..64).collect();
-        let ack = Ack {
+        let ack = ArqAck {
             subscriber_id: "pa_X".to_string(),
-            highest_contiguous_seq: 0,
-            missing,
+            next_expected: 0,
+            missing: missing.clone(),
         };
         let raw = encode_ack(&ack);
         let decoded = decode_ack(&raw).unwrap();
-        assert_eq!(decoded.missing.len(), MAX_ACK_MISSING);
+        assert_eq!(decoded.missing.len(), 64);
     }
 
     #[test]
@@ -545,12 +444,9 @@ mod tests {
     #[test]
     fn reorder_buffer_skips_ahead_when_gap_never_closes() {
         let mut buf = ReorderBuffer::new(4);
-        // seq 0 never arrives; feed enough later seqs to exceed the cap.
         for seq in 1..=6u64 {
             buf.ingest(seq, vec![seq as u8]);
         }
-        // Buffer capped at 4; once exceeded it should skip ahead to the
-        // oldest buffered seq rather than growing unbounded.
         assert!(buf.next_expected > 0);
         assert!(buf.buf.len() <= 4);
     }
@@ -561,12 +457,8 @@ mod tests {
         for seq in 0..10u64 {
             buf.insert(seq, vec![seq as u8]);
         }
-        // Watermarks are next_expected (exclusive upper bound): 6 means
-        // "seqs 0-5 delivered, evict them." Eviction is progressive per-ack:
-        // sub-a's early ack at next_expected=6 evicts seqs 0-5 immediately,
-        // before sub-b's lower watermark is even known. A slower subscriber's
-        // retransmit requests for those already-evicted seqs simply won't be
-        // served — documented, intentional behavior (see `on_ack`'s doc comment).
+        // Watermarks are next_expected (exclusive upper bound): 6 means seqs
+        // 0-5 delivered, evict them.
         buf.on_ack("sub-a".to_string(), 6);
         assert!(buf.get(5).is_none()); // seq 5 evicted (< 6)
         assert!(buf.get(6).is_some()); // seq 6 kept (>= 6)
