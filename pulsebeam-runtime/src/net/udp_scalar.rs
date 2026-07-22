@@ -1,4 +1,4 @@
-use crate::sync::Arc;
+use crate::{net::SendPacket, sync::Arc};
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
@@ -38,7 +38,7 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<usize> {
         self.writer.try_send_batch(batch)
     }
 
@@ -47,28 +47,10 @@ impl UdpTransport {
     }
 }
 
-pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
-    #[cfg(not(feature = "sim"))]
-    let socket = {
-        let socket2_sock = socket2::Socket::new(
-            socket2::Domain::for_address(addr),
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-
-        if addr.is_ipv6() {
-            // Prefer dual-stack listeners so a single IPv6 socket can accept IPv4-mapped peers.
-            socket2_sock.set_only_v6(false)?;
-        }
-
-        socket2_sock.set_nonblocking(true)?;
-        socket2_sock.bind(&addr.into())?;
-        UdpSocket::from_std(socket2_sock.into())?
-    };
-
-    #[cfg(feature = "sim")]
-    let socket = UdpSocket::bind(addr).await?;
-
+pub fn from_socket(
+    socket: UdpSocket,
+    external_addr: Option<SocketAddr>,
+) -> io::Result<UdpTransport> {
     let socket = Arc::new(socket);
     let local_addr = external_addr.unwrap_or(socket.local_addr()?);
 
@@ -82,6 +64,10 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
         drop_count: 0,
     };
     Ok(UdpTransport { reader, writer })
+}
+
+pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
+    from_socket(UdpSocket::bind(addr).await?, external_addr)
 }
 
 pub struct UdpTransportReader {
@@ -156,7 +142,14 @@ impl UdpTransportWriter {
     }
 
     #[inline]
-    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<usize> {
+        for group in batch.packets {
+            self.try_send_group(group)?;
+        }
+        Ok(batch.packets.len())
+    }
+
+    pub fn try_send_group(&mut self, batch: &SendPacket) -> std::io::Result<bool> {
         let res = self.sock.try_send_to(batch.buf, batch.dst);
 
         match res {
@@ -164,7 +157,7 @@ impl UdpTransportWriter {
             // Lossy: kernel buffer full — drop this batch rather than queue it.
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 // metrics::counter!("udp_egress_packets_dropped_total").increment(1);
-                if self.drop_count % 100 == 0 {
+                if self.drop_count.is_multiple_of(100) {
                     tracing::warn!("udp_scalar dropped a packet due to full socket");
                 }
                 self.drop_count += 1;

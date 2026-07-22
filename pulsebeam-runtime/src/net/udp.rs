@@ -1,28 +1,75 @@
+//! Batched UDP transport built directly on Linux's `recvmmsg(2)`/`sendmmsg(2)`
+//! plus UDP GRO (receive-side coalescing) and UDP GSO (send-side segmentation
+//! offload) — no `quinn-udp` dependency.
+//!
+//! All actual `unsafe` needed to make these syscalls lives inside `nix`
+//! (which wraps libc/the kernel ABI in a reviewed, tested safe API). This
+//! module contains none itself; that's enforced below.
+//!
+//! Linux only: `recvmmsg`/`sendmmsg`, `UDP_GRO`, and `UDP_SEGMENT` are all
+//! Linux-specific, so this file simply doesn't compile anywhere else.
+
+#![cfg(target_os = "linux")]
+#![forbid(unsafe_code)]
+
 use crate::net::{Transport, UdpMode};
 use crate::sync::Arc;
 
-use super::{BATCH_SIZE, CHUNK_SIZE, RecvPacketBatch, SendPacketBatch, fmt_bytes};
-use quinn_udp::RecvMeta;
-use std::{
-    io::{self, ErrorKind, IoSliceMut},
-    net::{IpAddr, SocketAddr},
+use super::{
+    BATCH_SIZE, MAX_UDP_GSO_PAYLOAD_SIZE, MAX_UDP_PAYLOAD_SIZE, RecvPacketBatch, SendPacket,
+    SendPacketBatch, fmt_bytes,
 };
+
+use nix::{
+    cmsg_space,
+    errno::Errno,
+    sys::socket::{
+        ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg,
+        sendmmsg, setsockopt, sockopt,
+    },
+};
+use std::{
+    io::{self, ErrorKind, IoSlice, IoSliceMut},
+    net::{IpAddr, SocketAddr},
+    os::fd::AsRawFd,
+};
+use zerocopy::FromZeros;
+
+const MEBIBYTE: usize = 1024 * 1024;
+const GSO_PROBE_SEGMENT_SIZE: i32 = 1200;
+const DISABLE_GSO_SEGMENT_SIZE: i32 = 0;
+const INVALID_GRO_SEGMENT_SIZE: i32 = 0;
+const SINGLE_SEGMENT: usize = 1;
+const DROP_LOG_INTERVAL: usize = 100;
+
+pub const SOCKET_SEND_SIZE: usize = 2 * MEBIBYTE;
+pub const SOCKET_RECV_SIZE: usize = 4 * MEBIBYTE;
+
+const UDP_MAX_GSO_SEGMENTS: usize = 64;
+const GRO_SLOT_SIZE: usize = UDP_MAX_GSO_SEGMENTS * MAX_UDP_PAYLOAD_SIZE;
 
 fn normalize_v4_mapped(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                SocketAddr::new(IpAddr::V4(v4), addr.port())
-            } else {
-                addr
-            }
-        }
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| SocketAddr::new(IpAddr::V4(v4), addr.port()))
+            .unwrap_or(addr),
         IpAddr::V4(_) => addr,
     }
 }
 
-pub const SOCKET_SEND_SIZE: usize = 2 * 1024 * 1024;
-pub const SOCKET_RECV_SIZE: usize = 4 * 1024 * 1024;
+fn sockaddr_to_std(addr: &SockaddrStorage) -> io::Result<SocketAddr> {
+    if let Some(v4) = addr.as_sockaddr_in() {
+        Ok(SocketAddr::new(IpAddr::V4(v4.ip()), v4.port()))
+    } else if let Some(v6) = addr.as_sockaddr_in6() {
+        Ok(SocketAddr::new(IpAddr::V6(v6.ip()), v6.port()))
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "recvmmsg returned an address family we don't support (expected IPv4/IPv6)",
+        ))
+    }
+}
 
 pub struct UdpTransport {
     reader: UdpTransportReader,
@@ -49,12 +96,12 @@ impl UdpTransport {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
         self.reader.try_recv_batch(out)
     }
 
     #[inline]
-    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<usize> {
         self.writer.try_send_batch(batch)
     }
 
@@ -63,7 +110,7 @@ impl UdpTransport {
     }
 }
 
-pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
+pub fn bind_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
     let socket2_sock = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::DGRAM,
@@ -77,60 +124,89 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
 
     socket2_sock.set_nonblocking(true)?;
     socket2_sock.set_reuse_address(true)?;
-
-    #[cfg(unix)]
     socket2_sock.set_reuse_port(true)?;
 
     socket2_sock.set_recv_buffer_size(SOCKET_RECV_SIZE)?;
     socket2_sock.set_send_buffer_size(SOCKET_SEND_SIZE)?;
     socket2_sock.bind(&addr.into())?;
 
+    Ok(socket2_sock)
+}
+
+pub fn from_socket(
+    socket2_sock: socket2::Socket,
+    external_addr: Option<SocketAddr>,
+) -> io::Result<UdpTransport> {
     let send_buf_size = socket2_sock.send_buffer_size()?;
     let recv_buf_size = socket2_sock.recv_buffer_size()?;
 
-    let state = quinn_udp::UdpSocketState::new((&socket2_sock).into())?;
-    let state = Arc::new(state);
+    let gro_enabled = setsockopt(&socket2_sock, sockopt::UdpGroSegment, &true).is_ok();
+
+    let gso_capable = if setsockopt(
+        &socket2_sock,
+        sockopt::UdpGsoSegment,
+        &GSO_PROBE_SEGMENT_SIZE,
+    )
+    .is_ok()
+    {
+        let _ = setsockopt(
+            &socket2_sock,
+            sockopt::UdpGsoSegment,
+            &DISABLE_GSO_SEGMENT_SIZE,
+        );
+        true
+    } else {
+        false
+    };
+
+    let state_fd = socket2_sock.try_clone()?;
     let sock = tokio::net::UdpSocket::from_std(socket2_sock.into())?;
     let writer_sock = Arc::new(sock);
 
     let local_addr = external_addr.unwrap_or(writer_sock.local_addr()?);
     let reader_sock = writer_sock.clone();
+    drop(state_fd);
+
+    let buffer = <[[u8; GRO_SLOT_SIZE]; BATCH_SIZE]>::new_box_zeroed()
+        .expect("failed to allocate zeroed UDP receive buffer");
 
     let reader = UdpTransportReader {
         sock: reader_sock,
-        state: state.clone(),
         local_addr,
-        meta: [RecvMeta::default(); BATCH_SIZE],
-        batch_buffer: vec![0u8; BATCH_SIZE * CHUNK_SIZE],
+        gro_enabled,
+        buffer,
     };
 
     let writer = UdpTransportWriter {
         sock: writer_sock,
-        state,
         local_addr,
+        gso_capable,
         drop_count: 0,
+        send_batch_limit: send_buf_size / 2,
     };
 
     tracing::info!(
-        %addr,
         %local_addr,
         recv_buf = fmt_bytes(recv_buf_size),
         send_buf = fmt_bytes(send_buf_size),
-        gro_segments = ?reader.gro_segments(),
-        gso_segments = ?writer.max_gso_segments(),
+        gro = gro_enabled,
+        gso = gso_capable,
         "UDP socket bound"
     );
 
     Ok(UdpTransport { reader, writer })
 }
 
+pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Result<UdpTransport> {
+    from_socket(bind_socket(addr)?, external_addr)
+}
+
 pub struct UdpTransportReader {
     sock: Arc<tokio::net::UdpSocket>,
-    state: Arc<quinn_udp::UdpSocketState>,
     local_addr: SocketAddr,
+    gro_enabled: bool,
 
-    meta: [RecvMeta; BATCH_SIZE],
-    batch_buffer: Vec<u8>,
+    buffer: Box<[[u8; GRO_SLOT_SIZE]; BATCH_SIZE]>,
 }
 
 impl UdpTransportReader {
@@ -138,8 +214,8 @@ impl UdpTransportReader {
         self.local_addr
     }
 
-    pub fn gro_segments(&self) -> usize {
-        self.state.gro_segments()
+    pub fn gro_enabled(&self) -> bool {
+        self.gro_enabled
     }
 
     #[inline]
@@ -149,61 +225,127 @@ impl UdpTransportReader {
     }
 
     #[inline]
-    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
-        self.sock.try_io(tokio::io::Interest::READABLE, || {
-            let mut chunks = self.batch_buffer.chunks_exact_mut(CHUNK_SIZE);
-            let mut slices: [IoSliceMut; BATCH_SIZE] = std::array::from_fn(|_| {
-                let chunk = chunks.next().expect("batch_buffer is sized correctly");
-                IoSliceMut::new(chunk)
+    pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
+        let Self {
+            sock,
+            local_addr,
+            gro_enabled,
+            buffer,
+        } = self;
+        let local_addr = *local_addr;
+        let gro_enabled = *gro_enabled;
+
+        sock.try_io(tokio::io::Interest::READABLE, || {
+            let mut slot_iter = buffer.iter_mut();
+            let mut iovs: [[IoSliceMut; 1]; BATCH_SIZE] = std::array::from_fn(|_| {
+                let slot = slot_iter
+                    .next()
+                    .expect("buffer has exactly BATCH_SIZE slots");
+                [IoSliceMut::new(slot.as_mut_slice())]
             });
+            drop(slot_iter);
 
-            let res = self
-                .state
-                .recv((&*self.sock).into(), &mut slices, &mut self.meta);
+            let fd = sock.as_raw_fd();
+            let mut headers = MultiHeaders::preallocate(BATCH_SIZE, Some(cmsg_space!(i32)));
 
-            match res {
-                Ok(count) => {
-                    let prev_len = out.len();
-                    for i in 0..count {
-                        let m = &self.meta[i];
-                        let base = i * CHUNK_SIZE;
-                        assert!(m.stride != 0, "gro stride can't be zero");
-                        let tail = self.batch_buffer.len().min(base + m.len);
-                        let buf = &self.batch_buffer[base..tail];
+            let mut received = [None; BATCH_SIZE];
+            match recvmmsg(fd, &mut headers, iovs.iter_mut(), MsgFlags::empty(), None) {
+                Ok(results) => {
+                    for (slot_idx, item) in results.enumerate() {
+                        debug_assert!(slot_idx < BATCH_SIZE);
+                        if item
+                            .flags
+                            .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+                        {
+                            continue;
+                        }
+                        let total_len = item.bytes;
+                        debug_assert!(total_len <= GRO_SLOT_SIZE);
+                        if total_len == 0 {
+                            continue;
+                        }
 
-                        out.push(RecvPacketBatch {
-                            src: normalize_v4_mapped(m.addr),
-                            dst: self.local_addr,
-                            buf: buf.to_vec(), // Contains the entire GRO block
-                            stride: m.stride,  // Downstream will use this to skip through buf
-                            len: m.len,        // Total length of the GRO batch
-                            transport: Transport::Udp(UdpMode::Batch),
-                            offset: 0,
-                        });
+                        let src = match item.address.as_ref().map(sockaddr_to_std).transpose()? {
+                            Some(addr) => normalize_v4_mapped(addr),
+                            None => continue, // no source address, can't attribute this datagram
+                        };
+
+                        // Default: this slot holds exactly one datagram. If GRO
+                        // coalesced several same-size datagrams into it, the
+                        // kernel tells us via the UdpGroSegments cmsg.
+                        let mut stride = total_len;
+                        if gro_enabled && let Ok(cmsgs) = item.cmsgs() {
+                            for cmsg in cmsgs {
+                                if let ControlMessageOwned::UdpGroSegments(seg) = cmsg {
+                                    if seg > INVALID_GRO_SEGMENT_SIZE {
+                                        stride = (seg as usize).min(total_len);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        received[slot_idx] = Some((src, stride, total_len));
+                        debug_assert_ne!(stride, 0);
+                        debug_assert!(stride <= total_len);
                     }
-                    Ok(out.len() - prev_len)
                 }
-                Err(e) => Err(e),
+                Err(Errno::EWOULDBLOCK) => return Err(io::Error::from(ErrorKind::WouldBlock)),
+                Err(e) => return Err(io::Error::from(e)),
             }
+            let prev_len = out.len();
+            for (slot_idx, entry) in received.into_iter().enumerate() {
+                let Some((src, stride, total_len)) = entry else {
+                    continue;
+                };
+                let buf = buffer[slot_idx][..total_len].to_vec();
+                out.push(RecvPacketBatch {
+                    src,
+                    dst: local_addr,
+                    buf,
+                    stride,
+                    len: total_len,
+                    transport: Transport::Udp(UdpMode::Batch),
+                    offset: 0,
+                });
+            }
+            Ok(out.len() - prev_len)
         })
     }
 }
 
-#[derive(Clone)]
 pub struct UdpTransportWriter {
     sock: Arc<tokio::net::UdpSocket>,
-    state: Arc<quinn_udp::UdpSocketState>,
     local_addr: SocketAddr,
+    gso_capable: bool,
     drop_count: usize,
+    send_batch_limit: usize,
 }
 
 impl UdpTransportWriter {
+    /// Builds another independent writer handle over the same underlying
+    /// socket. Each write creates its syscall scratch locally, so this can be
+    /// used by another task without sharing mutable header state.
+    pub fn fork(&self) -> Self {
+        Self {
+            sock: self.sock.clone(),
+            local_addr: self.local_addr,
+            gso_capable: self.gso_capable,
+            drop_count: 0,
+            send_batch_limit: self.send_batch_limit,
+        }
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     pub fn max_gso_segments(&self) -> usize {
-        self.state.max_gso_segments()
+        if self.gso_capable {
+            UDP_MAX_GSO_SEGMENTS
+        } else {
+            SINGLE_SEGMENT
+        }
     }
 
     #[inline]
@@ -212,40 +354,134 @@ impl UdpTransportWriter {
         Ok(())
     }
 
+    /// Sends every packet in `batch`. GSO's segment-size cmsg applies to an
+    /// entire `sendmmsg()` call, not per-message, so packets are grouped into
+    /// contiguous runs sharing a `segment_size` and one `sendmmsg()` is
+    /// issued per run (and per BATCH_SIZE chunk within a run).
+    ///
+    /// Lossy by design: if the kernel send buffer is full, the offending
+    /// group is dropped (counted, rate-limited-logged) rather than queued or
+    /// retried, matching UDP's unreliable-delivery contract.
     #[inline]
-    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<bool> {
-        debug_assert!(batch.segment_size != 0);
-        debug_assert!(
-            !batch.buf.is_empty(),
-            "SendPacketBatch buffer must not be empty"
-        );
-        debug_assert!(
-            batch.segment_size <= batch.buf.len(),
-            "SendPacketBatch segment_size must not exceed total buffer length"
-        );
-        let transmit = quinn_udp::Transmit {
-            destination: batch.dst,
-            ecn: None,
-            contents: batch.buf,
-            segment_size: Some(batch.segment_size),
-            src_ip: None,
-        };
-        let res = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
-            self.state.try_send((&*self.sock).into(), &transmit)
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<usize> {
+        let mut sent = 0usize;
+        let packets = &batch.packets;
+        let mut i = 0;
+
+        while i < packets.len() {
+            // UDP_SEGMENT is encoded in every mmsghdr in a `sendmmsg` call.
+            // Keep ordinary datagrams out of a GSO run: attaching a segment
+            // cmsg to a one-segment message is rejected by some kernels.
+            let gso_seg = self
+                .gso_capable
+                .then_some(packets[i].segment_size)
+                .filter(|&seg| seg < packets[i].buf.len());
+            let mut j = i + 1;
+            let mut bytes = packets[i].buf.len();
+            while j < packets.len()
+                && self
+                    .gso_capable
+                    .then_some(packets[j].segment_size)
+                    .filter(|&seg| seg < packets[j].buf.len())
+                    == gso_seg
+                && (j - i) < BATCH_SIZE
+                && bytes + packets[j].buf.len() <= self.send_batch_limit
+            {
+                bytes += packets[j].buf.len();
+                j += 1;
+            }
+            sent += self.send_group(&packets[i..j], gso_seg)?;
+            i = j;
+        }
+
+        Ok(sent)
+    }
+
+    fn send_group(&mut self, group: &[SendPacket], gso_seg: Option<usize>) -> io::Result<usize> {
+        debug_assert!(!group.is_empty());
+        debug_assert!(group.len() <= BATCH_SIZE);
+        if group.is_empty() {
+            return Ok(0);
+        }
+
+        for p in group {
+            debug_assert!(!p.buf.is_empty(), "SendPacket buffer must not be empty");
+            debug_assert_ne!(p.segment_size, 0);
+            debug_assert!(p.segment_size <= p.buf.len());
+            debug_assert!(p.buf.len() <= MAX_UDP_GSO_PAYLOAD_SIZE);
+            debug_assert!(
+                p.segment_size >= p.buf.len()
+                    || p.buf.len().div_ceil(p.segment_size) <= UDP_MAX_GSO_SEGMENTS
+            );
+            debug_assert_eq!(
+                gso_seg,
+                self.gso_capable
+                    .then_some(p.segment_size)
+                    .filter(|&seg| seg < p.buf.len())
+            );
+            if p.buf.is_empty()
+                || p.segment_size == 0
+                || p.segment_size > p.buf.len()
+                || p.segment_size > u16::MAX as usize
+                || p.buf.len() > MAX_UDP_GSO_PAYLOAD_SIZE
+                || (p.segment_size < p.buf.len()
+                    && p.buf.len().div_ceil(p.segment_size) > UDP_MAX_GSO_SEGMENTS)
+            {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid UDP packet segment size",
+                ));
+            }
+        }
+
+        // sendmmsg is capped at BATCH_SIZE, so keep its transient pointer
+        // lists on the stack. Allocating these Vecs on every submission was
+        // a significant part of CPU time for small RTP packets.
+        let mut iovs: [[IoSlice<'_>; 1]; BATCH_SIZE] = std::array::from_fn(|_| [IoSlice::new(&[])]);
+        let mut addrs: [Option<SockaddrStorage>; BATCH_SIZE] = std::array::from_fn(|_| None);
+        for (index, packet) in group.iter().enumerate() {
+            iovs[index] = [IoSlice::new(packet.buf)];
+            addrs[index] = Some(SockaddrStorage::from(packet.dst));
+        }
+
+        // GSO only makes sense (and is only legal) when segment_size is
+        // strictly smaller than at least one packet in the group, and only
+        // when we've confirmed the kernel supports UDP_SEGMENT.
+        let gso_seg = gso_seg.map(|size| size as u16);
+        let cmsg = gso_seg.as_ref().map(ControlMessage::UdpGsoSegments);
+
+        let sock = &self.sock;
+        let result = sock.try_io(tokio::io::Interest::WRITABLE, || {
+            let fd = sock.as_raw_fd();
+            let cmsgs = cmsg.as_slice();
+            let mut headers = if cmsg.is_some() {
+                MultiHeaders::preallocate(BATCH_SIZE, Some(cmsg_space!(u16)))
+            } else {
+                MultiHeaders::preallocate(BATCH_SIZE, None)
+            };
+            match sendmmsg(
+                fd,
+                &mut headers,
+                &iovs[..group.len()],
+                &addrs[..group.len()],
+                cmsgs,
+                MsgFlags::empty(),
+            ) {
+                Ok(results) => Ok(results.count()),
+                Err(Errno::EWOULDBLOCK) => Err(io::Error::from(ErrorKind::WouldBlock)),
+                Err(e) => Err(io::Error::from(e)),
+            }
         });
 
-        match res {
-            Ok(_) => Ok(true),
-            // Lossy: kernel buffer full — drop this batch rather than queue it.
+        match result {
+            Ok(count) => {
+                self.record_drop(group.len() - count);
+                Ok(count)
+            }
+            // Lossy: kernel buffer full — drop this group rather than queue it.
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                let dropped = batch.buf.len().div_ceil(batch.segment_size);
-                // metrics::counter!("udp_egress_packets_dropped_total").increment(dropped as u64);
-
-                if self.drop_count % 100 == 0 {
-                    tracing::warn!("udp dropped a packet due to full socket");
-                }
-                self.drop_count += dropped;
-                Ok(true)
+                self.record_drop(group.len());
+                Ok(group.len())
             }
             Err(err) => {
                 tracing::trace!("try_send_batch failed with {err}");
@@ -253,11 +489,22 @@ impl UdpTransportWriter {
             }
         }
     }
+
+    fn record_drop(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if self.drop_count.is_multiple_of(DROP_LOG_INTERVAL) {
+            tracing::warn!(dropped = count, "udp dropped packets during sendmmsg");
+        }
+        self.drop_count += count;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::{SendPacket, SendPacketBatch};
     use std::{net::SocketAddr, time::Duration};
     use tokio::net::UdpSocket;
 
@@ -294,15 +541,16 @@ mod tests {
         let recv_addr = receiver.local_addr().unwrap();
 
         let payload = (0..1500).map(|i| (i % 256) as u8).collect::<Vec<_>>();
-        let batch = SendPacketBatch {
+        let packets = [SendPacket {
             dst: recv_addr,
             buf: &payload,
             segment_size: 500,
-        };
+        }];
+        let batch = SendPacketBatch { packets: &packets };
 
         transport.writable().await.unwrap();
         let sent = transport.try_send_batch(&batch).unwrap();
-        assert!(sent, "UDP transport should accept the batch for egress");
+        assert_eq!(sent, 1, "UDP transport should accept the batch for egress");
 
         let mut buf = vec![0u8; 2048];
         let mut received = Vec::with_capacity(payload.len());
@@ -318,5 +566,169 @@ mod tests {
         }
 
         assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn udp_transport_writer_fans_out_to_multiple_destinations() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut transport = bind(addr, None).await.unwrap();
+
+        let r1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p1 = b"hello-r1".to_vec();
+        let p2 = b"hello-r2-longer".to_vec();
+
+        let packets = [
+            SendPacket {
+                dst: r1.local_addr().unwrap(),
+                buf: &p1,
+                segment_size: p1.len(),
+            },
+            SendPacket {
+                dst: r2.local_addr().unwrap(),
+                buf: &p2,
+                segment_size: p2.len(),
+            },
+        ];
+        let batch = SendPacketBatch { packets: &packets };
+
+        transport.writable().await.unwrap();
+        let sent = transport.try_send_batch(&batch).unwrap();
+        assert_eq!(sent, 2);
+
+        let mut buf = vec![0u8; 64];
+        let (n1, _) = tokio::time::timeout(Duration::from_millis(250), r1.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n1], &p1[..]);
+
+        let (n2, _) = tokio::time::timeout(Duration::from_millis(250), r2.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n2], &p2[..]);
+    }
+
+    #[tokio::test]
+    async fn gso_gro_preserves_a_full_segment_batch() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut sender = bind(addr, None).await.unwrap();
+        let mut receiver = bind(addr, None).await.unwrap();
+        if sender.max_gso_segments() == SINGLE_SEGMENT || !receiver.reader.gro_enabled() {
+            return;
+        }
+
+        let segment_size = MAX_UDP_PAYLOAD_SIZE;
+        let segment_count = sender
+            .max_gso_segments()
+            .min(MAX_UDP_GSO_PAYLOAD_SIZE / segment_size);
+        let mut payload = vec![0; segment_size * segment_count];
+        for (index, segment) in payload.chunks_exact_mut(segment_size).enumerate() {
+            segment.fill(index as u8);
+        }
+        let packets = [SendPacket {
+            dst: receiver.local_addr(),
+            buf: &payload,
+            segment_size,
+        }];
+
+        sender.writable().await.unwrap();
+        assert_eq!(
+            sender
+                .try_send_batch(&SendPacketBatch { packets: &packets })
+                .unwrap(),
+            1
+        );
+
+        receiver.readable().await.unwrap();
+        let mut batches = Vec::new();
+        receiver.try_recv_batch(&mut batches).unwrap();
+        let mut received = Vec::new();
+        for batch in &mut batches {
+            while let Some(packet) = batch.next_packet() {
+                received.push(packet.to_vec());
+            }
+        }
+
+        assert_eq!(received.len(), segment_count);
+        for (index, packet) in received.iter().enumerate() {
+            assert_eq!(packet, &vec![index as u8; segment_size]);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_drains_a_burst_across_multiple_recvmmsg_calls() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut receiver = bind(addr, None).await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let packet_count = BATCH_SIZE * 2;
+
+        for index in 0..packet_count {
+            let payload = vec![index as u8; MAX_UDP_PAYLOAD_SIZE - index % 2];
+            sender
+                .send_to(&payload, receiver.local_addr())
+                .await
+                .unwrap();
+        }
+
+        let mut received = Vec::with_capacity(packet_count);
+        while received.len() < packet_count {
+            tokio::time::timeout(Duration::from_millis(250), receiver.readable())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut batches = Vec::new();
+            receiver.try_recv_batch(&mut batches).unwrap();
+            for batch in &mut batches {
+                while let Some(packet) = batch.next_packet() {
+                    received.push(packet.to_vec());
+                }
+            }
+        }
+
+        assert_eq!(received.len(), packet_count);
+        for (index, packet) in received.iter().enumerate() {
+            assert_eq!(packet.len(), MAX_UDP_PAYLOAD_SIZE - index % 2);
+            assert!(packet.iter().all(|&byte| byte == index as u8));
+        }
+    }
+
+    #[tokio::test]
+    async fn gro_preserves_a_full_receive_aggregate() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut receiver = bind(addr, None).await.unwrap();
+        if !receiver.reader.gro_enabled() {
+            return;
+        }
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        for index in 0..UDP_MAX_GSO_SEGMENTS {
+            let payload = vec![index as u8; MAX_UDP_PAYLOAD_SIZE];
+            sender
+                .send_to(&payload, receiver.local_addr())
+                .await
+                .unwrap();
+        }
+
+        let mut received = Vec::with_capacity(UDP_MAX_GSO_SEGMENTS);
+        while received.len() < UDP_MAX_GSO_SEGMENTS {
+            tokio::time::timeout(Duration::from_millis(250), receiver.readable())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut batches = Vec::new();
+            receiver.try_recv_batch(&mut batches).unwrap();
+            for batch in &mut batches {
+                while let Some(packet) = batch.next_packet() {
+                    received.push(packet.to_vec());
+                }
+            }
+        }
+
+        assert_eq!(received.len(), UDP_MAX_GSO_SEGMENTS);
+        for (index, packet) in received.iter().enumerate() {
+            assert_eq!(packet, &vec![index as u8; MAX_UDP_PAYLOAD_SIZE]);
+        }
     }
 }

@@ -4,7 +4,6 @@ use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UdpMode;
-use pulsebeam_runtime::net::UnifiedSocket;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::{RngCore, SeedableRng};
 use std::collections::HashSet;
@@ -336,24 +335,21 @@ impl NodeBuilder {
             let shard_event_tx = shard_event_tx.clone();
             let cross_shard_event_txs = cross_shard_event_txs.clone();
             let occupancy = Arc::new(ShardMetrics::new());
-            let shard = ShardWorker::new(
-                shard_id,
-                udp_sock,
-                tcp_sock,
-                shard_command_rx,
-                shard_event_tx,
-                cross_shard_event_rx,
-                cross_shard_event_txs,
-                occupancy.clone(),
-                shard_rng,
-            );
+            let shard_occupancy = Arc::new(ShardMetrics::new());
 
             if use_shared_runtime {
-                // spawn_local keeps the shard (and any nested spawn_local calls, e.g.
-                // tcp_read_task) within the caller's LocalSet context (e.g. turmoil's
-                // per-host LocalSet).  Regular spawn() would detach from that context
-                // causing spawn_local panics inside add_connection.
-                join_set.spawn(ignore(shard.run()));
+                let shard = ShardWorker::new(
+                    shard_id,
+                    udp_sock.into_unified_socket()?,
+                    tcp_sock,
+                    shard_command_rx,
+                    shard_event_tx,
+                    cross_shard_event_rx,
+                    cross_shard_event_txs,
+                    shard_occupancy,
+                    shard_rng,
+                );
+                join_set.spawn_local(ignore(shard.run()));
             } else {
                 let core_id = if cpu_cores.is_empty() {
                     None
@@ -363,13 +359,28 @@ impl NodeBuilder {
                 let builder = std::thread::Builder::new().name(format!("pb-w-{}", shard_id));
                 let handle = builder
                     .spawn(move || {
-                        tune_current_data_thread(core_id);
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .enable_alt_timer()
                             .build_local(LocalOptions::default())
                             .unwrap();
-                        rt.block_on(tokio::task::unconstrained(shard.run()));
+                        tune_current_data_thread(core_id);
+                        rt.block_on(async move {
+                            let udp_sock =
+                                udp_sock.into_unified_socket().expect("bound UDP socket");
+                            let shard = ShardWorker::new(
+                                shard_id,
+                                udp_sock,
+                                tcp_sock,
+                                shard_command_rx,
+                                shard_event_tx,
+                                cross_shard_event_rx,
+                                cross_shard_event_txs,
+                                shard_occupancy,
+                                shard_rng,
+                            );
+                            tokio::task::unconstrained(shard.run()).await;
+                        });
                     })
                     .unwrap();
                 shard_handles.push(handle);
@@ -483,11 +494,11 @@ async fn bind_udp_sockets(
     advertised_addr: Option<SocketAddr>,
     workers: usize,
     mode: UdpMode,
-) -> Result<Vec<net::UnifiedSocket>> {
+) -> Result<Vec<net::BoundUdpSocket>> {
     let mut sockets = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let socket = match net::bind(local_addr, net::Transport::Udp(mode), advertised_addr).await {
+        let socket = match net::bind_udp_socket(local_addr, mode, advertised_addr).await {
             Ok(s) => s,
             Err(e) if sockets.is_empty() => {
                 return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
@@ -507,7 +518,7 @@ async fn bind_udp_sockets(
 }
 
 fn sockets_to_candidates(
-    sockets: &[UnifiedSocket],
+    sockets: &[net::BoundUdpSocket],
     advertised_addrs: &[SocketAddr],
 ) -> Vec<Candidate> {
     let candidate_addrs = if advertised_addrs.is_empty() {

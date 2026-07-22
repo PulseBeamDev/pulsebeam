@@ -1,7 +1,6 @@
 use pulsebeam_runtime::net;
 use std::{collections::VecDeque, net::SocketAddr};
 
-const MAX_GSO_SEGMENTS: usize = 8;
 const MAX_FREE_STATES: usize = 3;
 
 /// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
@@ -15,7 +14,10 @@ impl Batcher {
     /// Creates a new `Batcher` where each internal buffer has the specified capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            cap: cap.min(MAX_GSO_SEGMENTS),
+            // The socket reports the kernel's actual UDP_SEGMENT fan-out
+            // limit. Do not silently reduce it here: doing so turns a 64
+            // segment GSO-capable socket into eight-datagram submissions.
+            cap,
             active_states: VecDeque::with_capacity(3),
             free_states: Vec::with_capacity(MAX_FREE_STATES),
         }
@@ -73,34 +75,24 @@ impl Batcher {
         }
     }
 
-    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) {
-        while let Some(state) = self.front() {
-            debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
-            debug_assert!(
-                state.segment_size != 0,
-                "BatcherState must have a nonzero segment_size before flush"
-            );
-            debug_assert!(
-                state.buf.len() <= state.max_segments * BatcherState::MAX_MTU,
-                "Batch exceeds configured UDP batch capacity"
-            );
-            let res = socket.try_send_batch(&net::SendPacketBatch {
-                dst: state.dst,
-                buf: &state.buf,
-                segment_size: state.segment_size,
-            });
-            match res {
-                Ok(true) => {
-                    let state = self.pop_front().unwrap();
-                    self.reclaim(state);
-                }
-                Err(err) => {
-                    tracing::trace!("error on writing to egress socket: {:?}", err);
-                    let state = self.pop_front().unwrap();
-                    self.reclaim(state);
-                }
-                _ => break,
-            }
+    /// Exposes every completed GSO datagram without copying its payload.
+    /// The shard gathers these from all dirty participants into one
+    /// `sendmmsg()` submission, then calls `discard_all()` after the
+    /// lossy egress decision has been made.
+    pub fn packets(&self) -> impl Iterator<Item = net::SendPacket<'_>> + '_ {
+        self.active_states.iter().map(|state| net::SendPacket {
+            dst: state.dst,
+            buf: &state.buf,
+            segment_size: state.segment_size,
+        })
+    }
+
+    /// Releases every queued packet after the output phase.  UDP/TCP egress
+    /// is deliberately lossy, so a short send or `WouldBlock` also drains the
+    /// queue instead of retaining latency-inducing backlog.
+    pub fn discard_all(&mut self) {
+        while let Some(state) = self.pop_front() {
+            self.reclaim(state);
         }
     }
 
@@ -112,16 +104,17 @@ impl Batcher {
                 "BatcherState must have a nonzero segment_size before flush"
             );
             debug_assert!(
-                state.buf.len() <= state.max_segments * BatcherState::MAX_MTU,
+                state.buf.len() <= state.max_segments * net::MAX_UDP_PAYLOAD_SIZE,
                 "Batch exceeds configured TCP batch capacity"
             );
-            let res = socket.try_send_batch(&net::SendPacketBatch {
+            let packet = [net::SendPacket {
                 dst: state.dst,
                 buf: &state.buf,
                 segment_size: state.segment_size,
-            });
+            }];
+            let res = socket.try_send_batch(&net::SendPacketBatch { packets: &packet });
             match res {
-                Ok(true) => {
+                Ok(_) => {
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }
@@ -130,7 +123,6 @@ impl Batcher {
                     let state = self.pop_front().unwrap();
                     self.reclaim(state);
                 }
-                _ => break,
             }
         }
     }
@@ -147,15 +139,18 @@ pub struct BatcherState {
 }
 
 impl BatcherState {
-    const MAX_MTU: usize = 1500;
     fn with_capacity(cap: usize) -> Self {
+        debug_assert_ne!(cap, 0);
         Self {
             dst: "0.0.0.0:0".parse().unwrap(),
             segment_size: 0,
             segment_count: 0,
             max_segments: cap,
             sealed: false,
-            buf: Vec::with_capacity(cap * Self::MAX_MTU),
+            // Reserving the full GSO maximum for every participant is costly
+            // at SFU scale. Grow only for the batches that are actually used;
+            // recycled states retain that capacity for the next tick.
+            buf: Vec::with_capacity(cap * net::MAX_UDP_PAYLOAD_SIZE),
         }
     }
 
@@ -163,9 +158,13 @@ impl BatcherState {
     fn try_push(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
         debug_assert!(!content.is_empty(), "Segment content must not be empty");
         debug_assert!(
-            content.len() <= Self::MAX_MTU,
+            content.len() <= net::MAX_UDP_PAYLOAD_SIZE,
             "Segment content exceeds maximum supported MTU"
         );
+        debug_assert_eq!(self.buf.is_empty(), self.segment_count == 0);
+        debug_assert_eq!(self.segment_size == 0, self.segment_count == 0);
+        debug_assert!(self.segment_count <= self.max_segments);
+        debug_assert!(self.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
 
         if self.sealed {
             return false;
@@ -179,20 +178,32 @@ impl BatcherState {
             return false;
         }
 
+        if self.buf.len() + content.len() > net::MAX_UDP_GSO_PAYLOAD_SIZE {
+            return false;
+        }
+
         if self.segment_size == 0 {
             self.segment_size = content.len();
         }
 
         if content.len() == self.segment_size {
-            debug_assert!(self.buf.len() + content.len() <= self.max_segments * Self::MAX_MTU);
+            debug_assert!(
+                self.buf.len() + content.len() <= self.max_segments * net::MAX_UDP_PAYLOAD_SIZE
+            );
             self.buf.extend_from_slice(content);
             self.segment_count += 1;
+            debug_assert!(self.segment_count <= self.max_segments);
+            debug_assert!(self.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
             true
         } else if content.len() < self.segment_size {
-            debug_assert!(self.buf.len() + content.len() <= self.max_segments * Self::MAX_MTU);
+            debug_assert!(
+                self.buf.len() + content.len() <= self.max_segments * net::MAX_UDP_PAYLOAD_SIZE
+            );
             self.buf.extend_from_slice(content);
             self.segment_count += 1;
             self.sealed = true;
+            debug_assert!(self.segment_count <= self.max_segments);
+            debug_assert!(self.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
             true
         } else {
             false
@@ -206,6 +217,9 @@ impl BatcherState {
         self.segment_count = 0;
         self.sealed = false;
         self.buf.clear();
+        debug_assert_eq!(self.segment_size, 0);
+        debug_assert_eq!(self.segment_count, 0);
+        debug_assert!(self.buf.is_empty());
     }
 }
 
@@ -231,6 +245,51 @@ mod tests {
         assert!(!batch.sealed);
         assert_eq!(batch.segment_size, 1000);
         assert_eq!(batch.buf.len(), 2000);
+    }
+
+    #[test]
+    fn test_uses_the_socket_reported_gso_capacity() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(16);
+
+        for _ in 0..16 {
+            batcher.push_back(addr, &[1; 1000]);
+        }
+
+        assert_eq!(batcher.active_states.len(), 1);
+        assert_eq!(batcher.active_states[0].segment_count, 16);
+        assert_eq!(batcher.active_states[0].max_segments, 16);
+    }
+
+    #[test]
+    fn test_gso_payload_limit_seals_before_segment_limit() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(64);
+        let segment = [0; net::MAX_UDP_PAYLOAD_SIZE];
+        let count = net::MAX_UDP_GSO_PAYLOAD_SIZE / segment.len();
+
+        for _ in 0..=count {
+            batcher.push_back(addr, &segment);
+        }
+
+        assert_eq!(batcher.active_states.len(), 2);
+        assert_eq!(batcher.active_states[0].segment_count, count);
+        assert_eq!(batcher.active_states[1].segment_count, 1);
+    }
+
+    #[test]
+    fn test_gso_payload_limit_scales_with_segment_size() {
+        let addr = create_test_addr();
+        let mut batcher = Batcher::with_capacity(64);
+        let segment = [0; 1200];
+        let count = net::MAX_UDP_GSO_PAYLOAD_SIZE / segment.len();
+
+        for _ in 0..=count {
+            batcher.push_back(addr, &segment);
+        }
+
+        assert_eq!(batcher.active_states[0].segment_count, count);
+        assert_eq!(batcher.active_states[1].segment_count, 1);
     }
 
     #[test]

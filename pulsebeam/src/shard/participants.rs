@@ -99,6 +99,10 @@ impl ParticipantRegistry {
         self.participants.get_mut(id)
     }
 
+    pub fn get(&self, id: &ParticipantId) -> Option<&ParticipantMeta> {
+        self.participants.get(id)
+    }
+
     pub fn contains(&self, id: &ParticipantId) -> bool {
         self.participants.contains_key(id)
     }

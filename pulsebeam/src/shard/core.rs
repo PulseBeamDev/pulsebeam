@@ -1,3 +1,4 @@
+use arrayvec::ArrayVec;
 use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
@@ -125,6 +126,9 @@ pub(crate) struct ShardCore {
     pub(super) routing: ShardRoutingTable,
     timers: TimerWheel<ParticipantId>,
     dirty: DirtyTracker,
+    /// Reused participant-id storage for the output phase. This avoids an
+    /// allocation on every media tick and makes the final recycle pass linear.
+    egress_dirty: Vec<ParticipantId>,
     pipeline: EventPipeline,
     rng: Rng,
 }
@@ -138,6 +142,7 @@ impl ShardCore {
             routing: ShardRoutingTable::new(),
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
             dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD, &mut rng),
+            egress_dirty: Vec::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rng,
         }
@@ -332,12 +337,44 @@ impl ShardCore {
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
-        for participant_id in self.dirty.drain_all() {
-            let Some(participant) = self.registry.get_mut(&participant_id) else {
-                continue;
-            };
-            participant.udp_batcher.flush(udp_socket);
-            participant.tcp_batcher.flush_tcp(tcp_socket);
+        self.egress_dirty.clear();
+        self.dirty.drain_all_into(&mut self.egress_dirty);
+
+        // Only stage one syscall-sized borrowed packet list at a time. The
+        // previous whole-tick Vec allocated and traversed every queued state
+        // before the first packet could reach the socket.
+        let mut udp_packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
+        for participant_id in &self.egress_dirty {
+            if let Some(participant) = self.registry.get(participant_id) {
+                for packet in participant.udp_batcher.packets() {
+                    if udp_packets.is_full() {
+                        Self::flush_udp_packet_batch(udp_socket, &udp_packets);
+                        udp_packets.clear();
+                    }
+                    udp_packets.push(packet);
+                }
+            }
+        }
+        if !udp_packets.is_empty() {
+            Self::flush_udp_packet_batch(udp_socket, &udp_packets);
+        }
+        drop(udp_packets);
+
+        // References are gone, so recycle UDP state and flush TCP while each
+        // participant is looked up only once in the mutable registry.
+        for participant_id in self.egress_dirty.drain(..) {
+            if let Some(participant) = self.registry.get_mut(&participant_id) {
+                participant.udp_batcher.discard_all();
+                participant.tcp_batcher.flush_tcp(tcp_socket);
+            }
+        }
+    }
+
+    #[inline]
+    fn flush_udp_packet_batch(udp_socket: &mut UnifiedSocket, packets: &[net::SendPacket<'_>]) {
+        let batch = net::SendPacketBatch { packets };
+        if let Err(err) = udp_socket.try_send_batch(&batch) {
+            tracing::trace!(error = ?err, "error writing UDP egress batch");
         }
     }
 

@@ -1,6 +1,6 @@
 use super::{RecvPacketBatch, SendPacketBatch};
-use crate::mailbox;
 use crate::net::Transport;
+use crate::{mailbox, net::SendPacket};
 use bytes::{Buf, BufMut, BytesMut};
 use pulsebeam_core::net::{TcpReadHalf, TcpStream, TcpWriteHalf, split_tcp};
 use std::{
@@ -473,7 +473,14 @@ impl TcpTransport {
     /// **Lossy**: if the kernel send buffer is full (`WouldBlock`) the batch is
     /// dropped rather than queued.  This keeps memory bounded and ensures the
     /// caller's batch queue is always drained to empty on every tick.
-    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<bool> {
+    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> io::Result<usize> {
+        for group in batch.packets {
+            self.try_send_group(group)?;
+        }
+        Ok(batch.packets.len())
+    }
+
+    pub fn try_send_group(&mut self, batch: &SendPacket) -> io::Result<bool> {
         debug_assert!(batch.segment_size != 0);
         let Some(conn) = self.conns.get_mut(&batch.dst) else {
             return Ok(true); // peer gone — treat as sent
@@ -502,7 +509,7 @@ impl TcpTransport {
                     let dropped = count_rfc4571_frames(&buf);
                     if dropped > 0 {
                         // metrics::counter!("tcp_egress_packets_dropped_total").increment(dropped);
-                        if self.drop_count % 100 == 0 {
+                        if self.drop_count.is_multiple_of(100) {
                             tracing::warn!("udp dropped a packet due to full socket");
                         }
                         self.drop_count += dropped as usize;
@@ -615,11 +622,12 @@ mod tests {
 
             // Egress: server → client, two segments
             let payload = b"segment1segment2";
-            let batch = SendPacketBatch {
+            let packets = [SendPacket {
                 dst: peer_addr,
                 buf: payload,
                 segment_size: 8,
-            };
+            }];
+            let batch = SendPacketBatch { packets: &packets };
             sock.try_send_batch(&batch).unwrap();
 
             for expected in [b"segment1".as_slice(), b"segment2".as_slice()] {
@@ -730,14 +738,15 @@ mod tests {
             // Flood: every call must return Ok(true) (lossy drop), never buffering.
             let payload = vec![0u8; MAX_FRAME_SIZE];
             for _ in 0..200 {
-                let batch = SendPacketBatch {
+                let packets = [SendPacket {
                     dst: peer_addr,
                     buf: &payload,
                     segment_size: MAX_FRAME_SIZE,
-                };
+                }];
+                let batch = SendPacketBatch { packets: &packets };
                 assert_eq!(
                     sock.try_send_batch(&batch).unwrap(),
-                    true,
+                    1,
                     "try_send_batch must always return Ok(true) under back-pressure"
                 );
             }

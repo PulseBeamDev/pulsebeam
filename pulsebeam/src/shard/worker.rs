@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::Arc};
+use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
 use pulsebeam_runtime::{
     mailbox::{self},
@@ -182,6 +182,9 @@ pub struct ShardWorker {
     cross_shard_event_rx: mailbox::Receiver<CrossShardEvent>,
     router: ShardRouter,
     metrics: Arc<ShardMetrics>,
+
+    // Mark !Send
+    _marker: PhantomData<*mut ()>,
 }
 
 impl ShardWorker {
@@ -212,6 +215,7 @@ impl ShardWorker {
             cross_shard_event_rx,
             router,
             metrics,
+            _marker: PhantomData,
         }
     }
 

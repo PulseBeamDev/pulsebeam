@@ -60,10 +60,16 @@ impl DirtyTracker {
         &self.fanout
     }
 
-    /// Drains both sets for the egress flush. A participant present in both
-    /// is fine to flush once either way — flush is idempotent per participant.
-    pub fn drain_all(&mut self) -> impl Iterator<Item = ParticipantId> + '_ {
-        self.input.drain(..).chain(self.fanout.drain(..))
+    /// Drains both sets into reusable shard-owned storage, omitting ids that
+    /// are present in both sets. Egress must flush a participant only once.
+    pub fn drain_all_into(&mut self, out: &mut Vec<ParticipantId>) {
+        debug_assert!(
+            out.is_empty(),
+            "egress scratch must be cleared before draining"
+        );
+        self.fanout.retain(|id| !self.input.contains(id));
+        out.extend(self.input.drain(..));
+        out.extend(self.fanout.drain(..));
     }
 }
 
@@ -96,8 +102,10 @@ mod tests {
         let a = pid();
         let b = pid();
         dirty.mark(DirtyKind::Input, a);
+        dirty.mark(DirtyKind::Fanout, a);
         dirty.mark(DirtyKind::Fanout, b);
-        let drained: Vec<_> = dirty.drain_all().collect();
+        let mut drained = Vec::new();
+        dirty.drain_all_into(&mut drained);
         assert_eq!(drained.len(), 2);
         assert!(drained.contains(&a) && drained.contains(&b));
         assert!(dirty.input().is_empty() && dirty.fanout().is_empty());
