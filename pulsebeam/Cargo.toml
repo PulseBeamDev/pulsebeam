@@ -71,6 +71,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 
 [dev-dependencies]
+ctor = "1.0.10"
 hex = "0.4.3"
 more-asserts = { workspace = true }
 proptest = "1.11.0"

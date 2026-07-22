@@ -12,6 +12,7 @@ publish = false
 [dev-dependencies]
 anyhow.workspace = true
 bytes = "1"
+ctor = "1.0.10"
 futures = "0.3.32"
 http = "1.4.1"
 http-body-util = "0.1"  # Crucial for .collect().await
