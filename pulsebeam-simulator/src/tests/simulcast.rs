@@ -73,8 +73,6 @@ fn simulcast_downlink_resilience_case(
     disruption: DownlinkDisruption,
     min_bits_per_interval: u64,
 ) {
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
@@ -326,8 +324,6 @@ fn simulcast_maintains_delivery_under_packet_loss() {
 #[test]
 fn simulcast_downstream_bwe_tracks_a_bandwidth_step_down_and_recovers() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     // Stability against real-world jitter/RTT noise (see DOWNGRADE_CONFIRMATION
@@ -467,8 +463,6 @@ fn simulcast_downstream_bwe_tracks_a_bandwidth_step_down_and_recovers() {
 #[test]
 fn simulcast_reaches_and_holds_full_layer_under_ample_bandwidth() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     // Real time for BWE to climb every tier from a cold start.
@@ -554,9 +548,7 @@ fn simulcast_reaches_and_holds_full_layer_under_ample_bandwidth() {
             .iter()
             .position(|&bps| bps > FULL_LAYER_FLOOR_BPS);
         let Some(reached_full) = reached_full else {
-            panic!(
-                "never reached the full layer on an ample link; window rates: {window_bps:?}"
-            );
+            panic!("never reached the full layer on an ample link; window rates: {window_bps:?}");
         };
         // One transient miss (e.g. a rare residual jitter blip) is tolerated
         // as long as it recovers immediately; two in a row would be a real
@@ -598,8 +590,6 @@ fn simulcast_reaches_and_holds_full_layer_under_ample_bandwidth() {
 #[test]
 fn simulcast_multiple_downstreams_all_reach_full_layer() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     const RAMP: Duration = Duration::from_secs(40);
@@ -671,7 +661,6 @@ fn simulcast_multiple_downstreams_all_reach_full_layer() {
             })
             .await?;
 
-
         client.drive_for(WARMUP + RAMP).await?;
         let ramped = per_track_bytes(&client);
         assert_eq!(
@@ -691,7 +680,10 @@ fn simulcast_multiple_downstreams_all_reach_full_layer() {
                 .iter()
                 .map(|(mid, b)| {
                     let prev = last.get(mid).copied().unwrap_or(0);
-                    (*mid, (b.saturating_sub(prev)) * 8 / SUSTAIN_WINDOW.as_secs())
+                    (
+                        *mid,
+                        (b.saturating_sub(prev)) * 8 / SUSTAIN_WINDOW.as_secs(),
+                    )
                 })
                 .collect();
             for (mid, rate) in &bps {
@@ -854,8 +846,6 @@ fn simulcast_stream_stability_test() {
 #[test]
 fn simulcast_survives_combined_jitter_and_loss_like_real_wifi() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     // Connection setup itself (TCP-based HTTP signaling, ICE, DTLS) rides
     // out the same jitter+loss, so give it a generous, condition-checked
@@ -977,8 +967,6 @@ fn simulcast_survives_combined_jitter_and_loss_like_real_wifi() {
 #[test]
 fn simulcast_tracks_a_real_cap_while_jitter_continues() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     // Connection setup itself rides out the same jitter; check-driven rather
     // than a tight fixed budget (see the WiFi-like test's rationale).
@@ -1114,8 +1102,6 @@ fn simulcast_tracks_a_real_cap_while_jitter_continues() {
 #[test]
 fn simulcast_survives_repeated_disruptions_over_a_long_session() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     const HICCUP_COUNT: usize = 4;
@@ -1205,7 +1191,10 @@ fn simulcast_survives_repeated_disruptions_over_a_long_session() {
             recovered_bits_per_hiccup.push(bps);
         }
 
-        tracing::info!(?recovered_bits_per_hiccup, "recovery rate after each hiccup");
+        tracing::info!(
+            ?recovered_bits_per_hiccup,
+            "recovery rate after each hiccup"
+        );
         // No cumulative degradation: the last recovery must be at least as
         // healthy as a fraction of the first, not trailing off toward zero.
         let first = recovered_bits_per_hiccup[0];
@@ -1231,8 +1220,6 @@ fn simulcast_survives_repeated_disruptions_over_a_long_session() {
 #[test]
 fn simulcast_adapts_to_oscillating_real_bandwidth_without_thrashing() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     const CYCLES: usize = 4;
@@ -1390,8 +1377,6 @@ fn simulcast_adapts_to_oscillating_real_bandwidth_without_thrashing() {
 #[test]
 fn simulcast_upstream_bwe_recovers_after_uplink_congestion() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     const CYCLES: usize = 4;
@@ -1490,7 +1475,11 @@ fn simulcast_upstream_bwe_recovers_after_uplink_congestion() {
                 "stalled during restored-uplink phase of cycle {cycle}: {bps} bps"
             );
             last_bytes = bytes;
-            tracing::info!(cycle, restored_bps = bps, "uplink oscillation cycle high phase");
+            tracing::info!(
+                cycle,
+                restored_bps = bps,
+                "uplink oscillation cycle high phase"
+            );
             high_phase_bps.push(bps);
         }
 
@@ -1523,8 +1512,6 @@ fn simulcast_upstream_bwe_recovers_after_uplink_congestion() {
 #[test]
 fn simulcast_multiple_downstreams_survive_adverse_network() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     // Three concurrent connections riding out jitter+loss for setup; give it
     // a generous, condition-checked budget rather than a tight fixed one.
@@ -1670,8 +1657,6 @@ fn simulcast_multiple_downstreams_survive_adverse_network() {
 #[test]
 fn simulcast_high_stable_latency_still_reaches_full_layer() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(8);
     const RAMP: Duration = Duration::from_secs(30);
@@ -1776,8 +1761,6 @@ fn simulcast_high_stable_latency_still_reaches_full_layer() {
 #[test]
 fn simulcast_no_slot_blips_under_competitive_multi_party_bandwidth() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(20);
     const CYCLES: usize = 4;
@@ -1789,10 +1772,11 @@ fn simulcast_no_slot_blips_under_competitive_multi_party_bandwidth() {
     // One entry into pause per phase is legitimate adaptation; allow two for
     // the BW-restore bounce. More than 3 per cycle is blipping.
     const MAX_PAUSE_TRANSITIONS_PER_CYCLE: usize = 3;
-    // 2.5M: all three streams fit at Medium comfortably.
-    // 350k: pool ~315k; two streams hold Low (150k floor each), one pauses.
-    const HIGH_BW: u64 = 2_500_000;
-    const LOW_BW: u64 = 350_000;
+    // 300k: pool ~270k < 280k Medium-admission threshold, so the greedy walk
+    // stays at Low for two streams and pauses the third. 350k lets the first
+    // slot climb to Medium (280k threshold), which leaves zero for the other
+    // two and stalls them — violating the stalled_count ≤ 1 invariant.
+    const LOW_BW: u64 = 300_000;
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(
@@ -1877,8 +1861,7 @@ fn simulcast_no_slot_blips_under_competitive_multi_party_bandwidth() {
             after_warmup.keys().map(|mid| (*mid, false)).collect();
         let mut last = after_warmup;
 
-        let samples_per_phase =
-            |dur: Duration| (dur.as_secs() / SAMPLE.as_secs()).max(1) as usize;
+        let samples_per_phase = |dur: Duration| (dur.as_secs() / SAMPLE.as_secs()).max(1) as usize;
 
         for cycle in 0..CYCLES {
             common::set_downlink_bandwidth(receiver_ip, Some(LOW_BW));
@@ -1948,25 +1931,22 @@ fn simulcast_no_slot_blips_under_competitive_multi_party_bandwidth() {
 #[test]
 fn simulcast_multiple_downstreams_survive_dynamic_bandwidth() {
     let _guard = simulcast_test_guard();
-    common::setup_tracing();
-
     const TICK: Duration = Duration::from_millis(1);
     const WARMUP: Duration = Duration::from_secs(25);
     const STALL_FLOOR_BPS: u64 = 30_000;
     const SENDER_COUNT: usize = 3;
     const SAMPLE: Duration = Duration::from_secs(3);
 
-    // Non-monotonic bandwidth phases: (downlink_bps or None=uncapped, duration)
-    let bandwidth_plan: &[(Option<u64>, Duration)] = &[
-        (Some(350_000), Duration::from_secs(12)),   // tight: one stream forced to pause
-        (Some(1_200_000), Duration::from_secs(15)), // moderate: all streams at Low or Medium
-        (None, Duration::from_secs(20)),            // ample: streams climb toward High
-        (Some(550_000), Duration::from_secs(12)),   // tight-ish: squeeze back down
-        (Some(2_000_000), Duration::from_secs(15)), // generous: Medium/High reachable
-        (Some(400_000), Duration::from_secs(12)),   // tight again
-        (None, Duration::from_secs(25)),            // fully restored
+    let phase_durations: Vec<Duration> = vec![
+        Duration::from_secs(12),
+        Duration::from_secs(15),
+        Duration::from_secs(20),
+        Duration::from_secs(12),
+        Duration::from_secs(15),
+        Duration::from_secs(12),
+        Duration::from_secs(25),
     ];
-    let total_phases: Duration = bandwidth_plan.iter().map(|(_, d)| *d).sum();
+    let total_phases: Duration = phase_durations.iter().copied().sum();
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(WARMUP + total_phases + Duration::from_secs(10))
@@ -2017,6 +1997,16 @@ fn simulcast_multiple_downstreams_survive_dynamic_bandwidth() {
             builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
         }
         let mut client = builder.connect("multi-party-dynamic-bandwidth").await?;
+
+        let bandwidth_plan: Vec<(Option<u64>, Duration)> = vec![
+            (Some(350_000), Duration::from_secs(12)),
+            (Some(1_200_000), Duration::from_secs(15)),
+            (None, Duration::from_secs(20)),
+            (Some(550_000), Duration::from_secs(12)),
+            (Some(2_000_000), Duration::from_secs(15)),
+            (Some(400_000), Duration::from_secs(12)),
+            (None, Duration::from_secs(25)),
+        ];
 
         client
             .drive_until(Duration::from_secs(20), |ctx| {

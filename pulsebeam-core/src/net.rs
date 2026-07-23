@@ -311,10 +311,12 @@ pub mod shaper {
         }
 
         fn refill(&mut self, now: Instant) {
-            let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+            let elapsed = now
+                .saturating_duration_since(self.last_refill)
+                .as_secs_f64();
             self.last_refill = now;
-            self.available_bytes = (self.available_bytes + elapsed * self.bytes_per_sec)
-                .min(self.burst_bytes);
+            self.available_bytes =
+                (self.available_bytes + elapsed * self.bytes_per_sec).min(self.burst_bytes);
         }
 
         fn admit(&mut self, len: usize, now: Instant) -> bool {
@@ -338,7 +340,11 @@ pub mod shaper {
         BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn set_bandwidth(registry: &Mutex<HashMap<IpAddr, Bucket>>, ip: IpAddr, bytes_per_sec: Option<u64>) {
+    fn set_bandwidth(
+        registry: &Mutex<HashMap<IpAddr, Bucket>>,
+        ip: IpAddr,
+        bytes_per_sec: Option<u64>,
+    ) {
         let now = Instant::now();
         let mut map = registry.lock().unwrap();
         match bytes_per_sec {

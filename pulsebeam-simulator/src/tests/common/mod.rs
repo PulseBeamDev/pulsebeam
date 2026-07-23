@@ -19,6 +19,14 @@ pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
     format!("192.168.{}.{}", subnet, host).parse().unwrap()
 }
 
+pub fn set_downlink_bandwidth(ip: IpAddr, bps: Option<u64>) {
+    pulsebeam_core::net::shaper::set_downlink_bandwidth(ip, bps.map(|b| b / 8));
+}
+
+pub fn set_uplink_bandwidth(ip: IpAddr, bps: Option<u64>) {
+    pulsebeam_core::net::shaper::set_uplink_bandwidth(ip, bps.map(|b| b / 8));
+}
+
 pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);

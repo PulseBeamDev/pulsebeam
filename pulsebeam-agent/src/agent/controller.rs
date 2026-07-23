@@ -438,7 +438,10 @@ mod tests {
         ctrl.update_available(Bitrate::from(2_500_000u64));
 
         ctrl.tick(now);
-        assert!(!ctrl.is_paused(mid, Some(Rid::from("q"))), "tick 1: Low resumes");
+        assert!(
+            !ctrl.is_paused(mid, Some(Rid::from("q"))),
+            "tick 1: Low resumes"
+        );
         assert!(
             ctrl.is_paused(mid, Some(Rid::from("h"))),
             "tick 1: Medium still waits its turn"

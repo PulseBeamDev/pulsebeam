@@ -806,6 +806,13 @@ impl Slot {
         }
 
         if self.paused {
+            // Without this, a slot paused long enough for its hold to expire has
+            // no protection on the very next tick and can oscillate at tick rate.
+            if self.staging.is_some() {
+                self.staging_started_at = Some(Instant::now());
+            } else {
+                self.settling_until = Some(Instant::now() + SWITCH_SETTLE_DURATION);
+            }
             self.paused = false;
             changed = true;
             tracing::debug!(mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
@@ -1484,6 +1491,44 @@ mod assignment_tests {
             Some(LayerQuality::Low),
             "the first staging must not be preempted before its keyframe lands, \
              even when bandwidth would support a higher tier"
+        );
+    }
+
+    #[test]
+    fn paused_slot_has_hold_protection_immediately_after_resume() {
+        let pid = ParticipantId::new(&mut test_rng());
+        let (_, track) = make_video_track(
+            pid,
+            Mid::from("v0"),
+            vec![
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("m"),
+                SimulcastLayer::new("l"),
+            ],
+        );
+        let mut slot = Slot::new(SlotConfig::default(), &mut test_rng());
+        let low = track.by_quality(LayerQuality::Low).unwrap().clone();
+        slot.active = Some(low.clone());
+        slot.paused = true;
+        slot.staging = None;
+        slot.staging_started_at = None;
+        slot.settling_until = None;
+
+        slot.switch_to(&low, false);
+
+        assert!(!slot.paused, "switch_to must clear the paused flag");
+        let now = Instant::now();
+        assert!(
+            slot.should_hold_allocation(now),
+            "slot resumed from pause must be protected from immediate re-pause"
+        );
+        let until = slot
+            .settling_until
+            .expect("settling_until must be set on resume");
+        assert!(slot.should_hold_allocation(until - Duration::from_millis(1)));
+        assert!(
+            !slot.should_hold_allocation(until),
+            "hold must expire at settling_until"
         );
     }
 
