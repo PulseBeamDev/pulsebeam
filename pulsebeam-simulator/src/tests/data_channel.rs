@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 #[test]
@@ -205,11 +206,6 @@ fn data_channel_latency_regression_test() -> turmoil::Result {
     Ok(())
 }
 
-/// Two publishers on the same topic; a subscriber scoped to each publisher
-/// must only ever see that publisher's payloads, while a wildcard
-/// (unscoped) subscriber must still see both — verifying the scoped
-/// subscribe grammar filters by origin without breaking the existing
-/// all-publishers fan-in behavior.
 #[test]
 fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
@@ -237,6 +233,8 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
 
     let pub_a_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let pub_b_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let pub_a_ready = Arc::new(Notify::new());
+    let pub_b_ready = Arc::new(Notify::new());
 
     #[derive(Default)]
     struct Flags {
@@ -252,11 +250,11 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
     }
     let flags = Arc::new(Mutex::new(Flags::default()));
 
-    // Publisher A: keeps sending until every subscriber has reached its goal.
     {
         let topic = topic.clone();
         let payload_a = payload_a.clone();
         let pub_a_id = pub_a_id.clone();
+        let pub_a_ready = pub_a_ready.clone();
         let flags = flags.clone();
         sim.client(pub_a_ip, async move {
             let mut client = common::client::SimClientBuilder::bind(pub_a_ip, server_ip)
@@ -264,6 +262,7 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
                 .connect("room-scoped")
                 .await?;
             *pub_a_id.lock().unwrap() = Some(client.ctx.driver.participant_id().clone());
+            pub_a_ready.notify_waiters();
             client.ctx.driver.declare_publish_topic(&topic)?;
             client
                 .drive_with(move |ctx| {
@@ -277,11 +276,11 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
         });
     }
 
-    // Publisher B: same, with a distinguishable payload.
     {
         let topic = topic.clone();
         let payload_b = payload_b.clone();
         let pub_b_id = pub_b_id.clone();
+        let pub_b_ready = pub_b_ready.clone();
         let flags = flags.clone();
         sim.client(pub_b_ip, async move {
             let mut client = common::client::SimClientBuilder::bind(pub_b_ip, server_ip)
@@ -289,6 +288,7 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
                 .connect("room-scoped")
                 .await?;
             *pub_b_id.lock().unwrap() = Some(client.ctx.driver.participant_id().clone());
+            pub_b_ready.notify_waiters();
             client.ctx.driver.declare_publish_topic(&topic)?;
             client
                 .drive_with(move |ctx| {
@@ -302,19 +302,20 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
         });
     }
 
-    // Subscriber scoped to publisher A: must only ever observe A's payload.
     {
         let topic = topic.clone();
         let payload_a = payload_a.clone();
         let payload_b = payload_b.clone();
         let pub_a_id = pub_a_id.clone();
+        let pub_a_ready = pub_a_ready.clone();
         let flags = flags.clone();
         sim.client(scoped_a_ip, async move {
             let target_id = loop {
+                let notified = pub_a_ready.notified();
                 if let Some(id) = pub_a_id.lock().unwrap().clone() {
                     break id;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                notified.await;
             };
 
             let mut client = common::client::SimClientBuilder::bind(scoped_a_ip, server_ip)
@@ -346,19 +347,20 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
         });
     }
 
-    // Subscriber scoped to publisher B: symmetric to the above.
     {
         let topic = topic.clone();
         let payload_a = payload_a.clone();
         let payload_b = payload_b.clone();
         let pub_b_id = pub_b_id.clone();
+        let pub_b_ready = pub_b_ready.clone();
         let flags = flags.clone();
         sim.client(scoped_b_ip, async move {
             let target_id = loop {
+                let notified = pub_b_ready.notified();
                 if let Some(id) = pub_b_id.lock().unwrap().clone() {
                     break id;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                notified.await;
             };
 
             let mut client = common::client::SimClientBuilder::bind(scoped_b_ip, server_ip)
@@ -390,8 +392,6 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
         });
     }
 
-    // Wildcard (unscoped) subscriber: must see both A's and B's payloads,
-    // regression-checking the pre-existing all-publishers fan-in behavior.
     {
         let topic = topic.clone();
         let payload_a = payload_a.clone();

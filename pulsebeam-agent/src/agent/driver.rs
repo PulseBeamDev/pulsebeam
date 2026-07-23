@@ -113,17 +113,14 @@ pub(crate) enum DataTrackDirection {
 struct DataTrackBinding {
     direction: DataTrackDirection,
     topic: String,
-    /// Scopes a `Subscribe` binding to exactly one publisher. `None` means
-    /// the wildcard form (all publishers of the topic, fanned into this one
-    /// channel). Always `None` for `Publish`.
     scope: Option<String>,
 }
 
-/// Mirrors the label grammar parsed server-side by `pulsebeam::track`'s
-/// `DataTrackIntent` (`pulsebeam/src/track.rs`) — this crate intentionally
-/// hand-rolls its own copy rather than sharing a dependency edge, so keep
-/// the two grammars in lockstep.
 fn data_track_label(direction: DataTrackDirection, topic: &str, scope: Option<&str>) -> String {
+    debug_assert!(!topic.is_empty());
+    debug_assert!(scope.is_none() || direction == DataTrackDirection::Subscribe);
+    debug_assert!(scope.is_none_or(|scope| !scope.is_empty() && !scope.contains('/')));
+
     let lane = match direction {
         DataTrackDirection::Publish => "pub",
         DataTrackDirection::Subscribe => "sub",
@@ -149,6 +146,8 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
     if direction == DataTrackDirection::Publish && scope.is_some() {
         return None;
     }
+    debug_assert!(!topic.is_empty());
+    debug_assert!(scope.as_ref().is_none_or(|scope| !scope.is_empty()));
     Some((direction, topic, scope))
 }
 
@@ -322,10 +321,6 @@ impl AgentDriver {
         Ok(cid)
     }
 
-    /// `scope` restricts the subscription to exactly one publisher's stream
-    /// on this topic (that publisher's `ParticipantId`). Pass `None` for the
-    /// wildcard form: fan-in from every publisher of the topic into this one
-    /// channel (today's default behavior).
     pub fn declare_subscribe_topic(
         &mut self,
         topic: &str,

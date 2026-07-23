@@ -396,18 +396,8 @@ mod data_track {
     use crate::entity::ParticipantId;
     use str0m::channel::{ChannelConfig, Reliability};
 
-    // Unscoped topic budget: 96 - len("v1/rt/sub/") - 0 = 86.
-    // Scoped topic budget: 96 - len("v1/rt/sub/") - len("/") - 29 (ParticipantId::as_str()) = 55.
-    // Raising this from the original 64 is strictly backward compatible (the
-    // check runs before any splitting, so it can only accept labels that were
-    // previously rejected as too long, never reject anything previously accepted).
     const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 96;
 
-    /// Maximum number of distinct (direction, topic, scope) DCEP data-topic
-    /// channels a single participant may have open simultaneously. This is
-    /// independent of `MAX_DATA_CHANNELS` (control/negotiator.rs), which caps
-    /// SCTP associations (m=application lines), not DCEP channel labels
-    /// within one association.
     pub const MAX_DATA_TOPIC_CHANNELS: usize = 64;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -461,15 +451,14 @@ mod data_track {
     pub struct DataTopicChannel {
         pub direction: DataTrackDirection,
         pub topic: crate::track::Topic,
-        /// Scopes a `Subscribe` channel to exactly one publisher's stream on
-        /// this topic. `None` means the wildcard form: fan-in from every
-        /// publisher of the topic into this one channel (today's behavior,
-        /// unchanged). Always `None` for `Publish` — publish never scopes.
         pub scope: Option<ParticipantId>,
     }
 
     impl Display for DataTopicChannel {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            debug_assert!(
+                self.direction == DataTrackDirection::Subscribe || self.scope.is_none()
+            );
             write!(f, "v1/rt/{}/{}", self.direction, self.topic)?;
             if let Some(scope) = &self.scope {
                 write!(f, "/{}", scope.as_str())?;
@@ -658,7 +647,6 @@ mod data_track {
                 panic!("Expected UserTopic variant");
             }
 
-            // Subscribe path (wildcard: no scope, fans in from every publisher)
             let res = DataTrackIntent::try_from(&cfg("v1/rt/sub/audio_stream_12")).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
                 assert_eq!(e.direction, DataTrackDirection::Subscribe);
@@ -738,8 +726,6 @@ mod data_track {
 
         #[test]
         fn test_illegal_characters() {
-            // A trailing segment after the topic is now parsed as a scope,
-            // which is structurally illegal on a publish channel.
             let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/game/engine")).unwrap_err();
             assert_eq!(err, DataTrackIntentError::ScopeNotAllowedForPublish);
 
@@ -753,7 +739,6 @@ mod data_track {
 
         #[test]
         fn test_max_length_boundary() {
-            // Exact boundary (10 bytes prefix + 86 bytes topic = 96 total)
             let exact_valid = format!("v1/rt/pub/{}", "a".repeat(86));
             assert!(DataTrackIntent::try_from(&cfg(&exact_valid)).is_ok());
 

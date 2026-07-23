@@ -143,10 +143,6 @@ pub struct ParticipantCore {
     track_availability: HashMap<TrackId, TrackAvailability>,
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
-    // Keyed by (topic, scope): scope is `None` for the wildcard (all-publishers)
-    // subscribe form and `Some(publisher_id)` for a scoped one, so a participant
-    // can hold a wildcard sub and multiple differently-scoped subs to the same
-    // topic simultaneously.
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
 
     // Cold: touched rarely
@@ -365,11 +361,9 @@ impl ParticipantCore {
 
         match mutation {
             PendingRtcMutation::Sctp { topic, origin, pkt } => {
-                // Wildcard subscriber for this topic (existing all-publishers fan-in).
                 if let Some(cid) = self.data_sub_channels.get(&(topic.clone(), None)).copied() {
                     self.write_to_data_channel(cid, &topic, &pkt);
                 }
-                // Subscriber scoped to exactly this publisher, if any.
                 if let Some(cid) = self
                     .data_sub_channels
                     .get(&(topic.clone(), Some(origin)))
@@ -932,13 +926,8 @@ impl ParticipantCore {
                 events.unpublish_data_topic(ch.topic);
             }
             DataTrackDirection::Subscribe => {
-                self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
-                // Only signal room-level unsubscribe once no sibling scope
-                // (wildcard or another publisher-scoped channel) for this
-                // same topic remains open, so closing one scoped channel
-                // never wrongly evicts the participant from the topic's
-                // room-level subscriber set while another channel for it
-                // is still live.
+                let removed = self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
+                debug_assert!(removed.is_some());
                 let any_remaining_scope_for_topic =
                     self.data_sub_channels.keys().any(|(topic, _)| *topic == ch.topic);
                 if !any_remaining_scope_for_topic {
