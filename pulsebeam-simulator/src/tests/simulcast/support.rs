@@ -156,7 +156,11 @@ pub fn spawn_publisher(
     sim.client(ip, async move {
         let mut client = common::client::SimClientBuilder::bind(ip, server_ip)
             .await?
-            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, simulcast_layers())
+            .with_track(
+                MediaKind::Video,
+                TransceiverDirection::SendOnly,
+                simulcast_layers(),
+            )
             .connect(room)
             .await?;
         client.drive(done).await?;
@@ -194,7 +198,9 @@ pub async fn warmup_until_all_flowing(
     expected_tracks: usize,
 ) -> anyhow::Result<()> {
     client
-        .drive_until(timeout, |ctx| ctx.discovered_tracks.len() >= expected_tracks)
+        .drive_until(timeout, |ctx| {
+            ctx.discovered_tracks.len() >= expected_tracks
+        })
         .await?;
     client
         .drive_until(timeout, |ctx| {

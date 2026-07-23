@@ -323,10 +323,11 @@ async fn drain_remote_track(
 ) {
     while let Ok(frame) = track.recv().await {
         sink.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
-        health
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record(frame.ts, frame.capture_time, &frame.data);
+        health.lock().unwrap_or_else(|p| p.into_inner()).record(
+            frame.ts,
+            frame.capture_time,
+            &frame.data,
+        );
     }
 }
 

@@ -28,7 +28,9 @@ fn cellular_link_never_blacks_out_the_control_feed() {
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(
-            WARMUP + (OUTAGE_DURATION + BETWEEN_OUTAGES) * (OUTAGE_COUNT as u32) + Duration::from_secs(10),
+            WARMUP
+                + (OUTAGE_DURATION + BETWEEN_OUTAGES) * (OUTAGE_COUNT as u32)
+                + Duration::from_secs(10),
         )
         .tick_duration(TICK)
         .min_message_latency(support::CELLULAR_LTE.min_latency)
@@ -44,15 +46,22 @@ fn cellular_link_never_blacks_out_the_control_feed() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "teleop-cellular", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "teleop-cellular",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("teleop-cellular")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("teleop-cellular")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.ctx.mark_qoe_baseline();
@@ -112,15 +121,22 @@ fn satellite_backhaul_still_delivers_a_continuous_feed() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "teleop-satellite", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "teleop-satellite",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("teleop-satellite")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("teleop-satellite")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.drive_for(RAMP).await?;
@@ -128,7 +144,9 @@ fn satellite_backhaul_still_delivers_a_continuous_feed() {
         client.drive_for(SOAK).await?;
 
         client.ctx.assert_all_streams_decodable();
-        client.ctx.assert_max_freeze_under(Duration::from_millis(500));
+        client
+            .ctx
+            .assert_max_freeze_under(Duration::from_millis(500));
         client.ctx.assert_min_qoe_score(85.0);
 
         Ok(())
@@ -154,7 +172,9 @@ fn constrained_device_uplink_never_fully_drops_the_feed() {
     const LOW_UPLINK_BPS: u64 = 220_000;
 
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(WARMUP + (LOW_PHASE + RECOVER_PHASE) * (CYCLES as u32) + Duration::from_secs(10))
+        .simulation_duration(
+            WARMUP + (LOW_PHASE + RECOVER_PHASE) * (CYCLES as u32) + Duration::from_secs(10),
+        )
         .tick_duration(TICK)
         .min_message_latency(support::CELLULAR_LTE.min_latency)
         .max_message_latency(support::CELLULAR_LTE.max_latency)
@@ -169,15 +189,22 @@ fn constrained_device_uplink_never_fully_drops_the_feed() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "teleop-uplink", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "teleop-uplink",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("teleop-uplink")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("teleop-uplink")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.ctx.mark_qoe_baseline();

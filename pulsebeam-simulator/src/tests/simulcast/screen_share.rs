@@ -42,15 +42,22 @@ fn high_detail_share_reaches_and_holds_full_resolution() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "screen-share-full-res", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "screen-share-full-res",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("screen-share-full-res")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("screen-share-full-res")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.drive_for(RAMP).await?;
@@ -58,7 +65,9 @@ fn high_detail_share_reaches_and_holds_full_resolution() {
         client.drive_for(SOAK).await?;
 
         client.ctx.assert_all_streams_decodable();
-        client.ctx.assert_max_freeze_under(Duration::from_millis(500));
+        client
+            .ctx
+            .assert_max_freeze_under(Duration::from_millis(500));
         // High weight on quality/stability, not just availability: a
         // screen share sitting at half resolution the whole time would
         // still clear a generic floor but fail this one.
@@ -89,7 +98,9 @@ fn transient_bandwidth_windows_do_not_cause_thrashing() {
     const NARROW_BPS: u64 = 300_000;
 
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(WARMUP + (NARROW_PHASE + OPEN_PHASE) * (CYCLES as u32) + Duration::from_secs(10))
+        .simulation_duration(
+            WARMUP + (NARROW_PHASE + OPEN_PHASE) * (CYCLES as u32) + Duration::from_secs(10),
+        )
         .tick_duration(TICK)
         .min_message_latency(support::BROADBAND.min_latency)
         .max_message_latency(support::BROADBAND.max_latency)
@@ -103,15 +114,22 @@ fn transient_bandwidth_windows_do_not_cause_thrashing() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "screen-share-transients", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "screen-share-transients",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("screen-share-transients")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("screen-share-transients")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.ctx.mark_qoe_baseline();
@@ -166,15 +184,22 @@ fn presenter_glitch_recovers_without_a_restart() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "screen-share-glitch", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "screen-share-glitch",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("screen-share-glitch")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("screen-share-glitch")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
 

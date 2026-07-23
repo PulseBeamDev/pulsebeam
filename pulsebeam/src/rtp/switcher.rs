@@ -1,5 +1,6 @@
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
+use std::time::Duration;
 use str0m::media::Frequency;
 use tokio::time::Instant;
 
@@ -8,6 +9,16 @@ use crate::rtp::buffer::KeyframeBuffer;
 use crate::rtp::timeline::Timeline;
 
 const SWITCHER_PENDING_CAPACITY: usize = 32;
+
+/// How long to hold an optimistically-detected new-layer segment before
+/// releasing it, if the old stream's currently in-flight frame never
+/// confirms complete (its marker packet never arrives). Releasing on a
+/// bounded timeout instead of waiting forever means a permanently-lost
+/// marker (e.g. dropped and never retransmitted) can't strand the switch
+/// indefinitely. Kept short: this is purely "how much longer is the old
+/// frame's own tail worth waiting for", not a general network recovery
+/// budget.
+const OLD_FRAME_GRACE_PERIOD: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub struct Switcher {
@@ -22,6 +33,16 @@ pub struct Switcher {
     /// triggered.  Used to distinguish same-frame late arrivals (≤ this time,
     /// forward) from next-frame old-stream packets (> this time, drop).
     old_stream_playout: Instant,
+    /// Whether the old stream's in-flight frame (identified by
+    /// `old_stream_playout`) has been confirmed complete, i.e. its marker
+    /// packet has been observed. Gates releasing the staged segment (see
+    /// `pop`): releasing it earlier would strand that frame's remaining
+    /// packets rather than let it finish (`push_inner` keeps accepting
+    /// them, unrelated to whether the new segment has been released yet).
+    old_frame_complete: bool,
+    /// Arrival time of the packet that triggered staging; bounds how long
+    /// `pop` waits for `old_frame_complete` via `OLD_FRAME_GRACE_PERIOD`.
+    switch_triggered_at: Instant,
 }
 
 impl Switcher {
@@ -36,6 +57,8 @@ impl Switcher {
             is_switching: false,
             switched: false,
             old_stream_playout: now,
+            old_frame_complete: true,
+            switch_triggered_at: now,
         }
     }
 
@@ -64,6 +87,19 @@ impl Switcher {
     }
 
     fn push_inner(&mut self, pkt: RtpPacket, bar_if_rebased: bool) -> bool {
+        // A marker packet at the in-flight frame's own playout time confirms
+        // it complete, regardless of whether we still accept this specific
+        // packet below -- even a late/rejected one still tells `pop` it's
+        // safe to release the staged segment now instead of waiting out the
+        // rest of the grace period.
+        if self.is_switching
+            && !self.old_frame_complete
+            && pkt.marker
+            && pkt.playout_time == self.old_stream_playout
+        {
+            self.old_frame_complete = true;
+        }
+
         if bar_if_rebased && self.seen_first {
             return false;
         }
@@ -85,25 +121,38 @@ impl Switcher {
     }
 
     pub fn stage(&mut self, pkt: RtpPacket) {
+        // Already committed to this segment: every further packet for the
+        // same staging target is simply the rest of it (or its successor
+        // frames), not a fresh boundary to detect -- the ring/frame state
+        // that detection needs was already cleared by the initial flush, so
+        // re-running it here would never match again and silently strand
+        // these packets. Accepting the old stream's own concurrent tail
+        // (via `push`/`push_draining`) already handles pacing the actual
+        // release; staging just keeps accumulating in the meantime.
         if self.is_switching {
-            debug_assert!(false, "stage while state is already switching");
+            self.staging.append(pkt);
             return;
         }
 
+        let arrival_ts = pkt.arrival_ts;
         let is_switching = self.staging.push(pkt, self.latest_playout);
         if is_switching {
             self.seen_first = false;
             self.is_switching = true;
+            self.switch_triggered_at = arrival_ts;
             // Snapshot the playout time of the in-flight old-stream frame so
             // push() can tell same-frame late arrivals from next-frame packets.
             self.old_stream_playout = self
                 .pending
                 .back()
                 .map_or(self.latest_playout, |p| p.playout_time);
+            // If nothing was in flight (or it was already complete), there's
+            // nothing to wait for.
+            self.old_frame_complete = self.pending.back().is_none_or(|p| p.marker);
         }
     }
 
-    pub fn pop(&mut self) -> Option<RtpPacket> {
+    pub fn pop(&mut self, now: Instant) -> Option<RtpPacket> {
         if let Some(mut pkt) = self.pending.pop_front() {
             self.update_latest_playout(pkt.playout_time);
             self.timeline.rewrite(&mut pkt);
@@ -111,6 +160,17 @@ impl Switcher {
         }
 
         if self.is_switching {
+            // Hold the optimistically-detected segment until the old
+            // stream's in-flight frame either completes or we've given it a
+            // bounded chance to -- releasing it any earlier would strand
+            // that frame's remaining packets instead of letting them finish
+            // (see `push_inner`'s completion tracking above).
+            if !self.old_frame_complete
+                && now.saturating_duration_since(self.switch_triggered_at) < OLD_FRAME_GRACE_PERIOD
+            {
+                return None;
+            }
+
             if let Some(mut pkt) = self.staging.pop() {
                 // If this is the very first packet of the new stream after a switch.
                 if !self.seen_first {
@@ -183,9 +243,9 @@ mod test {
         }
     }
 
-    fn drain_all(switcher: &mut Switcher) -> Vec<RtpPacket> {
+    fn drain_all(switcher: &mut Switcher, now: Instant) -> Vec<RtpPacket> {
         let mut out = Vec::new();
-        while let Some(pkt) = switcher.pop() {
+        while let Some(pkt) = switcher.pop(now) {
             out.push(pkt);
         }
         out
@@ -198,7 +258,7 @@ mod test {
 
         // Prime active stream and timeline.
         switcher.push(pkt(10, 10, 1_000, now, false, true));
-        let active_out = switcher.pop().expect("active packet should be emitted");
+        let active_out = switcher.pop(now).expect("active packet should be emitted");
 
         // The old-frame marker permits an optimistic cutover on the first IDR
         // packet. The IDR marker has not arrived yet.
@@ -212,7 +272,7 @@ mod test {
             false,
         ));
 
-        let switched = drain_all(&mut switcher);
+        let switched = drain_all(&mut switcher, now);
         assert_eq!(switched.len(), 1);
         assert_eq!(switched[0].ssrc, Ssrc::from(20));
         assert!(
@@ -230,7 +290,7 @@ mod test {
 
         // Prime latest playout from active stream.
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         let old = now - Duration::from_millis(400);
         switcher.stage(pkt(
@@ -243,7 +303,7 @@ mod test {
         ));
         switcher.stage(pkt(20, 200, 2_100, old, true, false));
 
-        assert!(switcher.pop().is_none());
+        assert!(switcher.pop(now).is_none());
         assert!(!switcher.ready_to_switch());
     }
 
@@ -253,7 +313,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(9));
 
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         switcher.stage(pkt(
             20,
@@ -274,7 +334,7 @@ mod test {
 
         switcher.clear();
 
-        assert!(switcher.pop().is_none());
+        assert!(switcher.pop(now).is_none());
         assert!(!switcher.ready_to_switch());
     }
 
@@ -296,7 +356,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
 
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         // Old stream has an in-flight incomplete frame (no marker yet).
         switcher.push(pkt(
@@ -334,7 +394,7 @@ mod test {
             false,
         ));
 
-        let out = drain_all(&mut switcher);
+        let out = drain_all(&mut switcher, now);
         // Old stream packets must be emitted first, then the new stream keyframe.
         assert_eq!(
             out.len(),
@@ -355,7 +415,7 @@ mod test {
 
         // Prime an earlier complete frame to establish latest_playout.
         switcher.push(pkt(10, 0, 900, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         // First packet of the in-flight frame arrives before staging triggers.
         switcher.push(pkt(10, 1, 1_000, frame_time, false, false));
@@ -376,7 +436,7 @@ mod test {
         switcher.push(pkt(10, 2, 1_100, frame_time, false, false));
         switcher.push(pkt(10, 3, 1_200, frame_time, false, true));
 
-        let out = drain_all(&mut switcher);
+        let out = drain_all(&mut switcher, now);
         assert_eq!(
             out.len(),
             4,
@@ -390,13 +450,114 @@ mod test {
     }
 
     #[test]
+    fn old_frame_completes_after_new_layer_is_optimistically_detected() {
+        let now = Instant::now();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(16));
+
+        // Prime an earlier complete frame.
+        switcher.push(pkt(10, 0, 900, now, false, true));
+        let _ = switcher.pop(now);
+
+        let frame_time = now + Duration::from_millis(33);
+        // Old stream's next frame starts, but is NOT yet complete (no marker).
+        switcher.push(pkt(10, 1, 1_000, frame_time, false, false));
+
+        // New layer's keyframe is optimistically detected -- a separate
+        // on_rtp call in the real flow, well before the old frame's marker
+        // has necessarily arrived over the network.
+        switcher.stage(pkt(20, 99, 2_000, frame_time, false, true));
+        switcher.stage(pkt(
+            20,
+            100,
+            2_100,
+            frame_time + Duration::from_millis(1),
+            true,
+            false,
+        ));
+
+        // The old in-flight packet (already buffered) drains normally...
+        assert_eq!(switcher.pop(now).map(|p| p.ssrc), Some(Ssrc::from(10)));
+        // ...but the staged new-layer segment must NOT release yet: the old
+        // frame's marker hasn't arrived, and the grace period hasn't elapsed.
+        // Releasing here would strand the old frame's remaining packet
+        // instead of letting it finish.
+        assert!(switcher.pop(now).is_none());
+        assert!(!switcher.ready_to_switch());
+
+        // More of the new layer's keyframe arrives via a separate on_rtp
+        // call while still holding. `stage`'s boundary-detection no longer
+        // applies once `is_switching` is already true (the ring/frame state
+        // it needs was cleared by the initial flush) -- this packet must be
+        // accumulated via `append`, not silently dropped.
+        switcher.stage(pkt(
+            20,
+            101,
+            2_200,
+            frame_time + Duration::from_millis(1),
+            true,
+            false,
+        ));
+
+        // The old stream's frame finally completes.
+        switcher.push(pkt(10, 2, 1_100, frame_time, false, true));
+
+        let out = drain_all(&mut switcher, now);
+        assert_eq!(
+            out.len(),
+            3,
+            "old frame's marker packet, then both buffered new-layer packets"
+        );
+        assert_eq!(out[0].ssrc, Ssrc::from(10));
+        assert!(out[0].marker, "old-stream frame marker must be forwarded");
+        assert_eq!(out[1].ssrc, Ssrc::from(20));
+        assert_eq!(out[2].ssrc, Ssrc::from(20));
+        assert!(switcher.ready_to_switch());
+    }
+
+    #[test]
+    fn old_frame_grace_period_releases_the_staged_segment_if_marker_never_arrives() {
+        let now = Instant::now();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(17));
+
+        switcher.push(pkt(10, 0, 900, now, false, true));
+        let _ = switcher.pop(now);
+
+        let frame_time = now + Duration::from_millis(33);
+        // This packet never gets a marker -- simulates a permanently lost
+        // final packet for the old stream's in-flight frame.
+        switcher.push(pkt(10, 1, 1_000, frame_time, false, false));
+
+        switcher.stage(pkt(20, 99, 2_000, frame_time, false, true));
+        switcher.stage(pkt(
+            20,
+            100,
+            2_100,
+            frame_time + Duration::from_millis(1),
+            true,
+            false,
+        ));
+
+        let _ = switcher.pop(now);
+        assert!(
+            switcher.pop(now).is_none(),
+            "must hold before the grace period elapses"
+        );
+
+        let after_grace = now + OLD_FRAME_GRACE_PERIOD + Duration::from_millis(1);
+        let released = switcher
+            .pop(after_grace)
+            .expect("segment releases once the grace period elapses, marker or not");
+        assert_eq!(released.ssrc, Ssrc::from(20));
+    }
+
+    #[test]
     fn next_frame_old_stream_packets_are_dropped_after_switch() {
         let now = Instant::now();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(14));
 
         // Old stream: current frame is complete (marker emitted).
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         // Staging triggers; pending is empty so old_stream_playout=latest_playout=now.
         switcher.stage(pkt(20, 99, 2_000, now, false, true));
@@ -427,7 +588,7 @@ mod test {
             true,
         ));
 
-        let out = drain_all(&mut switcher);
+        let out = drain_all(&mut switcher, now);
         assert_eq!(
             out.len(),
             1,
@@ -442,7 +603,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(15));
 
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         // Staging triggers and fully drains in one shot: is_switching flips
         // back to false as soon as pop() exhausts the currently-buffered
@@ -458,7 +619,7 @@ mod test {
             true,
             false,
         ));
-        let drained = drain_all(&mut switcher);
+        let drained = drain_all(&mut switcher, now);
         assert_eq!(
             drained.len(),
             1,
@@ -480,7 +641,7 @@ mod test {
             "old-stream packet arriving after the timeline has rebased must be rejected"
         );
         assert!(
-            switcher.pop().is_none(),
+            switcher.pop(now).is_none(),
             "no corrupted packet should be forwarded"
         );
     }
@@ -492,7 +653,7 @@ mod test {
 
         // Prime active path and latest playout.
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
+        let _ = switcher.pop(now);
 
         // Start one transition and complete it so state reaches Stable.
         switcher.stage(pkt(20, 99, 2_000, now, false, true));
@@ -504,7 +665,7 @@ mod test {
             true,
             false,
         ));
-        let _ = drain_all(&mut switcher);
+        let _ = drain_all(&mut switcher, now);
         assert!(switcher.ready_to_switch());
 
         // User requests a new staging session.
@@ -528,7 +689,7 @@ mod test {
             true,
             false,
         ));
-        let out = drain_all(&mut switcher);
+        let out = drain_all(&mut switcher, now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ssrc, Ssrc::from(30));
         assert!(switcher.ready_to_switch());

@@ -31,13 +31,41 @@ fn heterogeneous_audience_each_gets_their_own_best_quality() {
     const SOAK: Duration = Duration::from_secs(60);
 
     let viewers = [
-        Viewer { label: "broadband_1", profile: support::BROADBAND, min_score: 90.0 },
-        Viewer { label: "broadband_2", profile: support::BROADBAND, min_score: 90.0 },
-        Viewer { label: "congested_wifi_1", profile: support::CONGESTED_WIFI, min_score: 75.0 },
-        Viewer { label: "congested_wifi_2", profile: support::CONGESTED_WIFI, min_score: 75.0 },
-        Viewer { label: "cellular_1", profile: support::CELLULAR_LTE, min_score: 65.0 },
-        Viewer { label: "crowded_venue", profile: support::CROWDED_VENUE_WIFI, min_score: 55.0 },
-        Viewer { label: "hostile_mobile", profile: support::HOSTILE_MOBILE, min_score: 30.0 },
+        Viewer {
+            label: "broadband_1",
+            profile: support::BROADBAND,
+            min_score: 90.0,
+        },
+        Viewer {
+            label: "broadband_2",
+            profile: support::BROADBAND,
+            min_score: 90.0,
+        },
+        Viewer {
+            label: "congested_wifi_1",
+            profile: support::CONGESTED_WIFI,
+            min_score: 75.0,
+        },
+        Viewer {
+            label: "congested_wifi_2",
+            profile: support::CONGESTED_WIFI,
+            min_score: 75.0,
+        },
+        Viewer {
+            label: "cellular_1",
+            profile: support::CELLULAR_LTE,
+            min_score: 65.0,
+        },
+        Viewer {
+            label: "crowded_venue",
+            profile: support::CROWDED_VENUE_WIFI,
+            min_score: 55.0,
+        },
+        Viewer {
+            label: "hostile_mobile",
+            profile: support::HOSTILE_MOBILE,
+            min_score: 30.0,
+        },
     ];
 
     // Every viewer sits on an independent link (a distinct turmoil host
@@ -53,7 +81,10 @@ fn heterogeneous_audience_each_gets_their_own_best_quality() {
             .min_message_latency(viewer.profile.min_latency)
             .max_message_latency(viewer.profile.max_latency)
             .fail_rate(viewer.profile.fail_rate)
-            .rng_seed(support::seed(&format!("broadcast_heterogeneous_{}", viewer.label)))
+            .rng_seed(support::seed(&format!(
+                "broadcast_heterogeneous_{}",
+                viewer.label
+            )))
             .build();
 
         let subnet = crate::tests::common::reserve_subnet();
@@ -63,17 +94,24 @@ fn heterogeneous_audience_each_gets_their_own_best_quality() {
 
         support::spawn_sfu(&mut sim, server_ip);
         let done = CancellationToken::new();
-        support::spawn_publisher(&mut sim, sender_ip, server_ip, "broadcast-heterogeneous", done.clone());
+        support::spawn_publisher(
+            &mut sim,
+            sender_ip,
+            server_ip,
+            "broadcast-heterogeneous",
+            done.clone(),
+        );
 
         let min_score = viewer.min_score;
         let label = viewer.label;
         sim.client(receiver_ip, async move {
             let _done = done.drop_guard();
-            let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-                .connect("broadcast-heterogeneous")
-                .await?;
+            let mut client =
+                crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                    .await?
+                    .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                    .connect("broadcast-heterogeneous")
+                    .await?;
 
             support::warmup_until_all_flowing(&mut client, WARMUP_TIMEOUT, 1).await?;
             client.drive_for(RAMP).await?;
@@ -126,18 +164,25 @@ fn large_audience_stays_stable_through_a_long_soak() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "broadcast-large-audience", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "broadcast-large-audience",
+        done.clone(),
+    );
 
     for i in 0..VIEWER_COUNT {
         let receiver_ip = crate::tests::common::subnet_ip(subnet, 10 + i as u8);
         let done = done.clone();
         sim.client(receiver_ip, async move {
             let _done = done;
-            let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-                .connect("broadcast-large-audience")
-                .await?;
+            let mut client =
+                crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                    .await?
+                    .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                    .connect("broadcast-large-audience")
+                    .await?;
 
             support::warmup_until_all_flowing(&mut client, WARMUP_TIMEOUT, 1).await?;
             let mut last = client.ctx.total_received_media_bytes();

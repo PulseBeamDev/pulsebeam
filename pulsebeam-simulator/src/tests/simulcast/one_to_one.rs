@@ -35,22 +35,31 @@ fn clean_broadband_call_holds_full_layer() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "one-to-one-clean", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "one-to-one-clean",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("one-to-one-clean")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("one-to-one-clean")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.ctx.mark_qoe_baseline();
         client.drive_for(SOAK).await?;
 
         client.ctx.assert_all_streams_decodable();
-        client.ctx.assert_max_freeze_under(Duration::from_millis(500));
+        client
+            .ctx
+            .assert_max_freeze_under(Duration::from_millis(500));
         client.ctx.assert_min_qoe_score(92.0);
 
         Ok(())
@@ -87,15 +96,22 @@ fn congested_home_wifi_call_stays_clearly_watchable() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "one-to-one-congested", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "one-to-one-congested",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("one-to-one-congested")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("one-to-one-congested")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         client.ctx.mark_qoe_baseline();
@@ -123,7 +139,11 @@ fn congested_home_wifi_call_stays_clearly_watchable() {
 fn call_recovers_promptly_after_a_network_handoff() {
     let _guard = support::test_guard();
     const TICK: Duration = Duration::from_millis(1);
-    const WARMUP: Duration = Duration::from_secs(10);
+    // Connection setup itself (TCP-based HTTP signaling, ICE, DTLS) rides
+    // out the same real loss, so it needs a generous, condition-checked
+    // budget rather than a tight fixed one -- matching the pattern used
+    // elsewhere in this suite for lossy-profile warmups.
+    const WARMUP: Duration = Duration::from_secs(30);
     const OUTAGE: Duration = Duration::from_secs(3);
     const RECOVERY_GRACE: Duration = Duration::from_secs(2);
     const SETTLE: Duration = Duration::from_secs(30);
@@ -144,15 +164,22 @@ fn call_recovers_promptly_after_a_network_handoff() {
 
     support::spawn_sfu(&mut sim, server_ip);
     let done = tokio_util::sync::CancellationToken::new();
-    support::spawn_publisher(&mut sim, sender_ip, server_ip, "one-to-one-handoff", done.clone());
+    support::spawn_publisher(
+        &mut sim,
+        sender_ip,
+        server_ip,
+        "one-to-one-handoff",
+        done.clone(),
+    );
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut client = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("one-to-one-handoff")
-            .await?;
+        let mut client =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip)
+                .await?
+                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
+                .connect("one-to-one-handoff")
+                .await?;
 
         support::warmup_until_all_flowing(&mut client, WARMUP, 1).await?;
         assert!(

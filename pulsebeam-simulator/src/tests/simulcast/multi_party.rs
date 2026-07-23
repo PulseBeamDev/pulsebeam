@@ -63,7 +63,8 @@ fn constrained_group_call_prioritizes_active_speaker() {
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut builder = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip).await?;
+        let mut builder =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip).await?;
         for _ in 0..SENDER_COUNT {
             builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
         }
@@ -117,7 +118,11 @@ fn constrained_group_call_prioritizes_active_speaker() {
                     .get(track_id)
                     .copied()
                     .expect("every remote track was subscribed with a known weight");
-                (label, weight as f64, scores.get(mid).copied().unwrap_or(0.0))
+                (
+                    label,
+                    weight as f64,
+                    scores.get(mid).copied().unwrap_or(0.0),
+                )
             })
             .collect();
         assert_eq!(entries.len(), SENDER_COUNT);
@@ -190,7 +195,8 @@ fn active_speaker_handoff_mid_call_stays_healthy() {
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut builder = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip).await?;
+        let mut builder =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip).await?;
         for _ in 0..SENDER_COUNT {
             builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
         }
@@ -211,7 +217,11 @@ fn active_speaker_handoff_mid_call_stays_healthy() {
             .iter()
             .map(|track_id| Subscription {
                 track_id: track_id.clone(),
-                height: if *track_id == promoted_track { 1080 } else { 180 },
+                height: if *track_id == promoted_track {
+                    1080
+                } else {
+                    180
+                },
             })
             .collect();
         client.ctx.driver.set_subscriptions(subscriptions);
@@ -219,9 +229,7 @@ fn active_speaker_handoff_mid_call_stays_healthy() {
         // The property under test: recovery is bounded, not "eventually".
         client.ctx.mark_qoe_baseline();
         client.drive_for(Duration::from_secs(3)).await?;
-        client
-            .ctx
-            .assert_max_freeze_under(Duration::from_secs(3));
+        client.ctx.assert_max_freeze_under(Duration::from_secs(3));
 
         client.drive_for(SUSTAIN).await?;
         client.ctx.assert_all_streams_decodable();
@@ -246,7 +254,11 @@ fn large_group_call_shares_bandwidth_fairly() {
     const WARMUP_TIMEOUT: Duration = Duration::from_secs(40);
     const SUSTAIN_WINDOWS: usize = 12;
     const SUSTAIN_WINDOW: Duration = Duration::from_secs(8);
-    const SENDER_COUNT: usize = 9;
+    // The platform caps concurrent video subscriptions per viewer at
+    // `MAX_SEND_VIDEO_SLOTS = 7` (`pulsebeam::control::negotiator`, private
+    // to that crate); this test deliberately sits right at that real limit
+    // rather than an arbitrary round number.
+    const SENDER_COUNT: usize = 7;
     const STALL_FLOOR_BPS: u64 = 25_000;
     const CONSTRAINED_BPS: u64 = 2_200_000;
 
@@ -279,7 +291,8 @@ fn large_group_call_shares_bandwidth_fairly() {
 
     sim.client(receiver_ip, async move {
         let _done = done.drop_guard();
-        let mut builder = crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip).await?;
+        let mut builder =
+            crate::tests::common::client::SimClientBuilder::bind(receiver_ip, server_ip).await?;
         for _ in 0..SENDER_COUNT {
             builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
         }

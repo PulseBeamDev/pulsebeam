@@ -146,6 +146,17 @@ impl KeyframeBuffer {
         self.pending.pop_front()
     }
 
+    /// Appends a packet directly to the release queue, bypassing boundary
+    /// detection. Once a segment has already been identified (the caller's
+    /// `Switcher` is committed to switching to it), every further packet
+    /// for the same target is unconditionally part of it -- re-running
+    /// `push`'s ring/boundary detection on them would fail (the ring was
+    /// cleared by the segment's own flush) and strand them forever instead
+    /// of forwarding the rest of the keyframe.
+    pub fn append(&mut self, pkt: RtpPacket) {
+        self.pending.push_back(pkt);
+    }
+
     fn flush(&mut self, start_at: Instant) -> bool {
         let Some(state) = self.frames.get(&start_at) else {
             debug_assert!(false, "segments and frames are out-of-sync");
@@ -277,6 +288,28 @@ mod test {
         assert!(buf.push(make(10, now, true, false), now));
 
         assert_eq!(buf.pop().unwrap().seq_no, 10.into());
+        assert_eq!(buf.pop().unwrap().seq_no, 11.into());
+        assert_eq!(buf.pop().unwrap().seq_no, 12.into());
+        assert!(buf.pop().is_none());
+    }
+
+    #[test]
+    fn append_delivers_packets_after_the_ring_was_cleared_by_a_flush() {
+        let mut buf = KeyframeBuffer::new();
+        let now = Instant::now();
+
+        // Detect and flush the initial segment (clears ring/frames).
+        assert!(!buf.push(make(9, now - Duration::from_millis(10), false, true), now));
+        assert!(buf.push(make(10, now, true, false), now));
+        assert_eq!(buf.pop().unwrap().seq_no, 10.into());
+        assert!(buf.pop().is_none());
+
+        // The rest of the keyframe arrives afterward. Re-running `push` on
+        // it would never flush again (no preceding marked packet survives
+        // the clear), so it must go through `append` instead.
+        buf.append(make(11, now, true, false));
+        buf.append(make(12, now, true, true));
+
         assert_eq!(buf.pop().unwrap().seq_no, 11.into());
         assert_eq!(buf.pop().unwrap().seq_no, 12.into());
         assert!(buf.pop().is_none());

@@ -62,7 +62,7 @@ pub fn h264_frame_sizes(data: &[u8]) -> Vec<usize> {
         let nal_type = nalu[0] & 0x1f;
         let nalu_size = nalu_end - nalu_start;
 
-        let is_vcl = matches!(nal_type, 1 | 2 | 3 | 4 | 5);
+        let is_vcl = matches!(nal_type, 1..=5);
         // first_mb_in_slice == 0  ↔  MSB of byte[1] set (Exp-Golomb "1" prefix).
         let starts_new_au = is_vcl && nalu.len() >= 2 && (nalu[1] & 0x80) != 0;
 
@@ -129,7 +129,7 @@ pub fn h264_frames(data: &[u8]) -> Vec<&[u8]> {
         let nalu = &data[nalu_start..nalu_end];
         let nal_type = nalu[0] & 0x1f;
 
-        let is_vcl = matches!(nal_type, 1 | 2 | 3 | 4 | 5);
+        let is_vcl = matches!(nal_type, 1..=5);
         let starts_new_au = is_vcl && nalu.len() >= 2 && (nalu[1] & 0x80) != 0;
 
         if starts_new_au && seen_vcl {
@@ -158,7 +158,12 @@ pub fn h264_nal_types(data: &[u8]) -> Vec<u8> {
     let mut types = Vec::new();
     let mut i = 0;
     while i + 2 < n {
-        let header_start = if i + 3 < n && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+        let header_start = if i + 3 < n
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
             i += 4;
             i
         } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {

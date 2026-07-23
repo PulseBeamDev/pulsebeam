@@ -105,13 +105,16 @@ fn classify_layer(byte_len: usize, is_keyframe: bool) -> LayerClass {
     let (best, best_dist) = refs
         .iter()
         .map(|r| {
-            let reference = if is_keyframe { r.key_bytes } else { r.delta_bytes };
+            let reference = if is_keyframe {
+                r.key_bytes
+            } else {
+                r.delta_bytes
+            };
             (r.class, (byte_len - reference).abs() / reference)
         })
-        .fold(
-            (LayerClass::Unknown, f64::MAX),
-            |acc, cur| if cur.1 < acc.1 { cur } else { acc },
-        );
+        .fold((LayerClass::Unknown, f64::MAX), |acc, cur| {
+            if cur.1 < acc.1 { cur } else { acc }
+        });
     if best_dist <= CLASSIFY_TOLERANCE {
         best
     } else {
@@ -234,7 +237,10 @@ impl StreamHealth {
         for class in &self.window {
             *counts.entry(*class).or_default() += 1;
         }
-        counts.into_iter().max_by_key(|(_, count)| *count).map(|(class, _)| class)
+        counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(class, _)| class)
     }
 
     /// Feed one reassembled access unit (one `MediaFrame`) into the monitor.
@@ -303,9 +309,7 @@ impl StreamHealth {
                             "{}: layer settled on {committed:?} -> {majority:?} around frame {} \
                              with no keyframe in the preceding {} frames -- this would desync a \
                              real decoder",
-                            self.label,
-                            self.frames_total,
-                            self.frames_since_keyframe
+                            self.label, self.frames_total, self.frames_since_keyframe
                         ));
                     }
                     self.committed_layer = Some(majority);
@@ -477,7 +481,9 @@ pub fn new_shared(label: impl Into<String>) -> SharedStreamHealth {
 /// Convenience for tests: decodability + score across every tracked stream.
 pub fn assert_all_decodable(health: &HashMap<Mid, SharedStreamHealth>) {
     for h in health.values() {
-        h.lock().unwrap_or_else(|p| p.into_inner()).assert_decodable();
+        h.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .assert_decodable();
     }
 }
 
@@ -531,7 +537,10 @@ mod tests {
         for (data, expected) in [
             (pulsebeam_testdata::RAW_H264_FULL_CBR, LayerClass::Full),
             (pulsebeam_testdata::RAW_H264_HALF_CBR, LayerClass::Half),
-            (pulsebeam_testdata::RAW_H264_QUARTER_CBR, LayerClass::Quarter),
+            (
+                pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+                LayerClass::Quarter,
+            ),
         ] {
             let health = replay_single_layer(data, expected);
             health.assert_decodable();
@@ -570,12 +579,11 @@ mod tests {
     #[test]
     fn a_switch_without_a_keyframe_is_flagged() {
         let full_frames = pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_FULL_CBR);
-        let quarter_delta_frames: Vec<&[u8]> = pulsebeam_testdata::h264_frames(
-            pulsebeam_testdata::RAW_H264_QUARTER_CBR,
-        )
-        .into_iter()
-        .filter(|f| !pulsebeam_testdata::h264_frame_is_keyframe(f))
-        .collect();
+        let quarter_delta_frames: Vec<&[u8]> =
+            pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_QUARTER_CBR)
+                .into_iter()
+                .filter(|f| !pulsebeam_testdata::h264_frame_is_keyframe(f))
+                .collect();
         let mut health = StreamHealth::new("test");
         let start = Instant::now();
         let push = |i: usize, frame: &[u8], health: &mut StreamHealth| {
@@ -684,7 +692,10 @@ mod tests {
             push(frame, NOMINAL_FRAME_INTERVAL, &mut health);
         }
         let warmup_score = health.qoe_score();
-        assert!(warmup_score > 90.0, "warmup should score high: {warmup_score}");
+        assert!(
+            warmup_score > 90.0,
+            "warmup should score high: {warmup_score}"
+        );
 
         health.mark();
 

@@ -559,8 +559,8 @@ impl VideoAllocator {
 
         let mut state_changed = false;
         slot.process(stream_id, pkt);
-        while let Some(pkt) = slot.switcher.pop() {
-            writer.write_video_owned(pkt, slot.mid, slot.rid, slot.pt);
+        while let Some(out_pkt) = slot.switcher.pop(pkt.arrival_ts) {
+            writer.write_video_owned(out_pkt, slot.mid, slot.rid, slot.pt);
         }
         // Only promote staging→active once we have actually seen packets for the
         // current staging layer. Otherwise an empty staging buffer will appear
@@ -2626,7 +2626,7 @@ mod assignment_tests {
         active_pkt.playout_time = now;
         active_pkt.marker = true;
         slot.process(&old_layer.stream_id(), &active_pkt);
-        let _ = slot.switcher.pop();
+        let _ = slot.switcher.pop(now);
 
         // Stage the new layer's keyframe segment; a single-packet segment
         // drains in one `pop()` pass, exactly like the real timing gap.
@@ -2643,7 +2643,7 @@ mod assignment_tests {
         stage_kf.playout_time = now + Duration::from_millis(1);
         stage_kf.is_keyframe = true;
         slot.process(&new_layer.stream_id(), &stage_kf);
-        while slot.switcher.pop().is_some() {}
+        while slot.switcher.pop(now).is_some() {}
 
         assert!(
             slot.should_promote_staging(),
