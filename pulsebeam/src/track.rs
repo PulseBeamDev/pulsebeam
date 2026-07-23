@@ -456,9 +456,7 @@ mod data_track {
 
     impl Display for DataTopicChannel {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            debug_assert!(
-                self.direction == DataTrackDirection::Subscribe || self.scope.is_none()
-            );
+            debug_assert!(self.direction == DataTrackDirection::Subscribe || self.scope.is_none());
             write!(f, "v1/rt/{}/{}", self.direction, self.topic)?;
             if let Some(scope) = &self.scope {
                 write!(f, "/{}", scope.as_str())?;
@@ -578,9 +576,11 @@ mod data_track {
                             if raw.is_empty() {
                                 return Err(DataTrackIntentError::InvalidScope(raw.to_string()));
                             }
-                            Some(ParticipantId::try_from(raw.to_string()).map_err(|_| {
-                                DataTrackIntentError::InvalidScope(raw.to_string())
-                            })?)
+                            Some(
+                                ParticipantId::try_from(raw.to_string()).map_err(|_| {
+                                    DataTrackIntentError::InvalidScope(raw.to_string())
+                                })?,
+                            )
                         }
                     };
 
@@ -683,9 +683,8 @@ mod data_track {
 
         #[test]
         fn test_scoped_subscribe_invalid_scope() {
-            let err =
-                DataTrackIntent::try_from(&cfg("v1/rt/sub/game-sync/not-a-participant-id"))
-                    .unwrap_err();
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/sub/game-sync/not-a-participant-id"))
+                .unwrap_err();
             assert!(matches!(err, DataTrackIntentError::InvalidScope(_)));
         }
 

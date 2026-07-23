@@ -98,7 +98,9 @@ pub enum DisconnectReason {
     DuplicateDataChannelLabel(DataTopicChannel),
     #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
-    #[error("Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed")]
+    #[error(
+        "Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed"
+    )]
     TooManyDataTopicChannels,
     #[error("Room closed")]
     RoomClosed,
@@ -665,7 +667,8 @@ impl ParticipantCore {
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
-                                self.data_sub_channels.insert((e.topic.clone(), e.scope), cid);
+                                self.data_sub_channels
+                                    .insert((e.topic.clone(), e.scope), cid);
                                 events.subscribe_data_topic(e.topic, e.scope);
                             }
                         }

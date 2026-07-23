@@ -8,8 +8,16 @@ pub trait ParticipantSink {
     fn unsubscribe(&mut self, track: TrackMeta);
     fn publish_track(&mut self, track: Track);
     fn unpublish_track(&mut self, track_id: TrackId);
-    fn subscribe_data_topic(&mut self, topic: Topic, publisher: Option<crate::entity::ParticipantId>);
-    fn unsubscribe_data_topic(&mut self, topic: Topic, publisher: Option<crate::entity::ParticipantId>);
+    fn subscribe_data_topic(
+        &mut self,
+        topic: Topic,
+        publisher: Option<crate::entity::ParticipantId>,
+    );
+    fn unsubscribe_data_topic(
+        &mut self,
+        topic: Topic,
+        publisher: Option<crate::entity::ParticipantId>,
+    );
     fn publish_data_topic(&mut self, topic: Topic);
     fn unpublish_data_topic(&mut self, topic: Topic);
     fn request_keyframe(&mut self, layer: &TrackLayer);
@@ -68,11 +76,19 @@ pub mod test_utils {
             self.unpublish_track_calls.push(track_id);
         }
 
-        fn subscribe_data_topic(&mut self, topic: Topic, _publisher: Option<crate::entity::ParticipantId>) {
+        fn subscribe_data_topic(
+            &mut self,
+            topic: Topic,
+            _publisher: Option<crate::entity::ParticipantId>,
+        ) {
             self.subscribe_data_topic_calls.push(topic);
         }
 
-        fn unsubscribe_data_topic(&mut self, topic: Topic, _publisher: Option<crate::entity::ParticipantId>) {
+        fn unsubscribe_data_topic(
+            &mut self,
+            topic: Topic,
+            _publisher: Option<crate::entity::ParticipantId>,
+        ) {
             self.unsubscribe_data_topic_calls.push(topic);
         }
 

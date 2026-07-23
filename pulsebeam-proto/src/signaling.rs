@@ -9,10 +9,8 @@ pub struct Track {
     pub participant_id: ::prost::alloc::string::String,
     /// Extensible metadata (e.g. "display_name", "is_muted", "avatar_url").
     #[prost(map = "string, string", tag = "4")]
-    pub meta: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub meta:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VideoAssignment {
