@@ -1,5 +1,4 @@
 pub mod signaling;
-pub mod arq;
 pub mod rtp_extensions {
     /// RTP header extension IDs that are reserved by PulseBeam.
     ///
