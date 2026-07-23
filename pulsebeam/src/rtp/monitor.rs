@@ -298,11 +298,6 @@ impl StreamMonitor {
         // even while the conservative admission value hasn't confirmed it.
         let demand_estimate = self.bwe.demand_bps() as u64;
         let demand_bitrate = demand_estimate.max(self.nominal_bitrate_bps);
-        tracing::debug!(
-            stream_id = self.stream_id,
-            "upstream bwe={}",
-            Bitrate::from(allocation_bitrate)
-        );
         self.shared_state
             .bitrate_bps
             .store(allocation_bitrate, Ordering::Relaxed);

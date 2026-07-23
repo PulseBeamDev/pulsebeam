@@ -33,6 +33,12 @@ pub struct Timeline {
     ts_base: u64,
     /// The playout time of the last output packet.
     last_playout_time: Option<Instant>,
+    /// Output RTP timestamp of the first packet of the most recent frame (playout boundary).
+    last_frame_start_ts: u64,
+    /// Measured TS delta between consecutive frames; used as minimum on rebase
+    /// so stream switches don't produce a near-zero delta that receivers
+    /// misinterpret as an extremely high frame rate.
+    interframe_ts_delta: u64,
 }
 
 impl Timeline {
@@ -46,6 +52,8 @@ impl Timeline {
             max_output_ts: 0,
             ts_base: 0,
             last_playout_time: None,
+            last_frame_start_ts: 0,
+            interframe_ts_delta: clock_rate.get() as u64 / 30,
         }
     }
 
@@ -83,14 +91,10 @@ impl Timeline {
         if let Some(last_playout) = self.last_playout_time {
             let time_delta = packet.playout_time.saturating_duration_since(last_playout);
             let ts_delta = (time_delta.as_secs_f64() * (self.clock_rate.get() as f64)) as u64;
-            // A new keyframe can share the old layer's exact capture time; a
-            // zero delta would make receivers treat it as part of that old
-            // frame. A rebase always starts a new frame, so reserve one tick.
-            let ts_delta = ts_delta.max(1);
+            let ts_delta = ts_delta.max(self.interframe_ts_delta);
             let expected_ts = self.max_output_ts.wrapping_add(ts_delta);
             self.ts_base = expected_ts.wrapping_sub(input_ts);
         } else {
-            // Preserve the original timestamp offset on the first packet.
             self.ts_base = 0;
         }
     }
@@ -110,11 +114,23 @@ impl Timeline {
         if !self.started || output_seq > self.max_output {
             self.max_output = output_seq;
         }
+        let first_of_stream = !self.started;
         self.started = true;
 
         let input_ts = pkt.rtp_ts.numer();
         let output_ts = input_ts.wrapping_add(self.ts_base);
         pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);
+
+        let is_new_frame = self.last_playout_time != Some(pkt.playout_time);
+        if is_new_frame {
+            if !first_of_stream {
+                let delta = output_ts.wrapping_sub(self.last_frame_start_ts);
+                if delta > 0 && delta < self.clock_rate.get() as u64 * 2 {
+                    self.interframe_ts_delta = delta;
+                }
+            }
+            self.last_frame_start_ts = output_ts;
+        }
 
         self.max_output_ts = output_ts;
         self.last_playout_time = Some(pkt.playout_time);
@@ -219,6 +235,49 @@ mod test {
         // So B1 should be A2 + 6030 ticks.
         let ts_diff = p_b1.rtp_ts.numer().wrapping_sub(p_a2.rtp_ts.numer());
         assert_eq!(ts_diff, 6030, "Timestamp should be linear across switch");
+    }
+
+    #[test]
+    fn rebase_with_zero_delta_uses_measured_interframe_minimum() {
+        let now = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        // Two frames from stream A at 30 fps (3000-tick interval).
+        let mut p1 = RtpPacket {
+            seq_no: 100.into(),
+            rtp_ts: MediaTime::new(10_000, Frequency::NINETY_KHZ),
+            playout_time: now,
+            is_keyframe: true,
+            ..Default::default()
+        };
+        timeline.rebase(&p1);
+        timeline.rewrite(&mut p1);
+
+        let mut p2 = RtpPacket {
+            seq_no: 101.into(),
+            rtp_ts: MediaTime::new(13_000, Frequency::NINETY_KHZ),
+            playout_time: now + Duration::from_millis(33),
+            ..Default::default()
+        };
+        timeline.rewrite(&mut p2);
+
+        // Switch to stream B whose keyframe shares the same capture time as p2.
+        let mut new_kf = RtpPacket {
+            seq_no: 5_000.into(),
+            rtp_ts: MediaTime::new(80_000, Frequency::NINETY_KHZ),
+            playout_time: now + Duration::from_millis(33),
+            is_keyframe: true,
+            ..Default::default()
+        };
+        timeline.rebase(&new_kf);
+        timeline.rewrite(&mut new_kf);
+
+        let delta = new_kf.rtp_ts.numer().wrapping_sub(p2.rtp_ts.numer());
+        assert!(
+            delta >= 3_000,
+            "rebase with zero playout delta must use the measured interframe interval, not 1 tick (got {})",
+            delta
+        );
     }
 
     #[test]

@@ -36,6 +36,12 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 const SWITCH_SETTLE_DURATION: Duration = Duration::from_secs(2);
 const SWITCH_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a just-promoted-away-from layer stays eligible to receive
+/// late/reordered packets via `Slot::draining`. Wider than
+/// `PLAYOUT_JITTER_TOLERANCE` (50ms, in `rtp::buffer`) so ordinary jitter on
+/// the old stream's tail packets doesn't outlive this window.
+const DRAINING_GRACE_PERIOD: Duration = Duration::from_millis(200);
+
 /// A tier switch costs a keyframe; model that one-time cost as this many
 /// seconds' worth of the target tier's steady bitrate, debited from the
 /// slot's budget ledger. A slot that just switched has a depleted budget
@@ -424,26 +430,41 @@ impl VideoAllocator {
             slot.budget_bps += (fair_share - current_cost) * dt.as_secs_f64();
         }
 
-        // 2. Resolve contention: higher max_height processed first,
-        // then most-owed slot (CFS budget-style), ties broken by mid.
+        // 2. Resolve contention: most-owed slot first (CFS budget-style) so
+        // every slot converges toward its weighted-fair (`weight`) share
+        // over time, instead of a fixed max_height hierarchy that would let
+        // a bigger view claim the shared pool ahead of smaller ones on
+        // every single tick regardless of how long the smaller ones have
+        // gone underserved. Ties (equal budget) fall back to max_height,
+        // then mid, for determinism.
         views.sort_by(|a, b| {
-            b.max_height
-                .cmp(&a.max_height)
-                .then_with(|| {
-                    let budget_a = self.slots.get(a.key).map(|s| s.budget_bps).unwrap_or(0.0);
-                    let budget_b = self.slots.get(b.key).map(|s| s.budget_bps).unwrap_or(0.0);
-                    budget_b
-                        .partial_cmp(&budget_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            let budget_a = self.slots.get(a.key).map(|s| s.budget_bps).unwrap_or(0.0);
+            let budget_b = self.slots.get(b.key).map(|s| s.budget_bps).unwrap_or(0.0);
+            budget_b
+                .partial_cmp(&budget_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.max_height.cmp(&a.max_height))
                 .then_with(|| a.mid.cmp(&b.mid))
         });
 
         // 3. Greedy walk against a shared remaining-bandwidth pool. Held back
         // by RESERVE_FRACTION — see its doc comment — so admission never
         // plans against the full estimate.
+        //
+        // Two phases, both walked in the same priority order:
+        //   a) baseline — every slot's currently-held tier (or floor) is
+        //      reserved first, so a bigger/higher-priority sibling's
+        //      appetite to climb can never bump a smaller slot off its own
+        //      stable tier, or pause it, just to make room. A slot is only
+        //      paused here if the pool can't cover every slot's baseline up
+        //      to and including it.
+        //   b) climb — only the genuine surplus left after every baseline is
+        //      committed gets contested, in the same priority order, for
+        //      upgrades beyond each slot's own baseline.
         let mut remaining = trusted_bandwidth.as_f64() * (1.0 - RESERVE_FRACTION);
         let mut decisions: HashMap<SlotKey, AllocationDecision> = HashMap::new();
+        let mut climbable: Vec<(&SlotView, &TrackLayer)> = Vec::new();
+
         for view in &views {
             let Some(slot) = self.slots.get_mut(view.key) else {
                 continue;
@@ -472,7 +493,19 @@ impl VideoAllocator {
                 continue;
             }
 
-            decisions.insert(view.key, decide_tier(slot, view, &mut remaining));
+            match resolve_baseline(view, &mut remaining) {
+                Err(pause) => {
+                    decisions.insert(view.key, pause);
+                }
+                Ok(start) => climbable.push((view, start)),
+            }
+        }
+
+        for (view, start) in climbable {
+            let Some(slot) = self.slots.get_mut(view.key) else {
+                continue;
+            };
+            decisions.insert(view.key, resolve_climb(slot, view, start, &mut remaining));
         }
 
         let mut changed = false;
@@ -533,6 +566,8 @@ impl VideoAllocator {
         // current staging layer. Otherwise an empty staging buffer will appear
         // ready immediately and can prematurely switch away from the old stream.
         if slot.should_promote_staging() {
+            slot.draining = slot.active.take();
+            slot.draining_started_at = Some(pkt.arrival_ts);
             slot.active = slot.staging.take();
             slot.staging_started_at = None;
             slot.settling_until = Some(pkt.arrival_ts + SWITCH_SETTLE_DURATION);
@@ -560,13 +595,28 @@ impl VideoAllocator {
 
     pub fn reconcile_routes(&mut self, events: &mut impl ParticipantSink) {
         let mut current = HashSet::new();
+        let mut claimed_tracks = HashSet::new();
         for (slot_key, slot) in &self.slots {
             if let Some(staging) = slot.staging.as_ref() {
                 current.insert((staging.meta.id, slot_key));
+                claimed_tracks.insert(staging.meta.id);
             }
 
             if let Some(active) = slot.active.as_ref() {
                 current.insert((active.meta.id, slot_key));
+                claimed_tracks.insert(active.meta.id);
+            }
+        }
+
+        // A draining layer keeps its route alive briefly after promotion so
+        // late/reordered packets for it still reach `Slot::process` (see
+        // `Slot::draining`) — but never at the expense of a track another
+        // slot has since claimed as its own active/staging target.
+        for (slot_key, slot) in &self.slots {
+            if let Some(draining) = slot.draining.as_ref()
+                && !claimed_tracks.contains(&draining.meta.id)
+            {
+                current.insert((draining.meta.id, slot_key));
             }
         }
 
@@ -649,6 +699,13 @@ struct Slot {
 
     active: Option<TrackLayer>,
     staging: Option<TrackLayer>,
+    /// The layer `active` was promoted away from, kept alive briefly so
+    /// late-arriving/reordered packets for it can still reach `switcher`
+    /// instead of being silently dropped by the `active`/`staging` routing
+    /// in `process`. Cleared once `switcher` itself rejects a packet for it
+    /// (no longer needed) or `DRAINING_GRACE_PERIOD` elapses.
+    draining: Option<TrackLayer>,
+    draining_started_at: Option<Instant>,
 
     switcher: Switcher,
 
@@ -688,6 +745,8 @@ impl Slot {
 
             active: None,
             staging: None,
+            draining: None,
+            draining_started_at: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, rng),
             // With no signaling, we assume users are viewing with 720p playback
@@ -780,6 +839,8 @@ impl Slot {
 
         if force && is_track_change {
             changed |= self.active.take().is_some();
+            self.draining = None;
+            self.draining_started_at = None;
             self.switcher.clear();
         }
 
@@ -825,6 +886,8 @@ impl Slot {
         tracing::debug!(mid=%self.mid, "slot stopped");
         self.active = None;
         self.staging = None;
+        self.draining = None;
+        self.draining_started_at = None;
         self.settling_until = None;
         self.staging_started_at = None;
         self.budget_bps = 0.0;
@@ -884,6 +947,13 @@ impl Slot {
             return;
         }
 
+        if let Some(until) = self.draining_started_at
+            && pkt.arrival_ts.saturating_duration_since(until) >= DRAINING_GRACE_PERIOD
+        {
+            self.draining = None;
+            self.draining_started_at = None;
+        }
+
         if let Some(active) = self.active.as_ref()
             && active.is(stream_id)
         {
@@ -892,8 +962,19 @@ impl Slot {
             && staging.is(stream_id)
         {
             self.switcher.stage(pkt.clone());
+        } else if let Some(draining) = self.draining.as_ref()
+            && draining.is(stream_id)
+        {
+            // Late/reordered packet for the layer we just promoted away
+            // from. `switcher` itself decides whether it's still part of
+            // the in-flight old-stream frame or belongs to a frame after
+            // the switch (see `Switcher::push_draining`'s gating).
+            if !self.switcher.push_draining(pkt.clone()) {
+                self.draining = None;
+                self.draining_started_at = None;
+            }
         } else {
-            tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
+            tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active, staging, or draining target");
         }
     }
 
@@ -930,6 +1011,11 @@ impl Slot {
             .unwrap_or(false)
             || self
                 .staging
+                .as_ref()
+                .map(|l| l.meta.id == *track_id)
+                .unwrap_or(false)
+            || self
+                .draining
                 .as_ref()
                 .map(|l| l.meta.id == *track_id)
                 .unwrap_or(false)
@@ -1105,20 +1191,25 @@ fn effective_cost(layer: &TrackLayer) -> f64 {
         .max(nominal)
 }
 
-/// Climbs from `cheapest_active_layer()` (the guaranteed floor) one tier at
-/// a time from `start`, stopping at the first tier that's ineligible,
-/// unhealthy, unaffordable, or (only once climbing *above*
-/// `view.current_quality`) not yet budget-earned.
+/// Climbs from `start` one tier at a time, stopping at the first tier
+/// that's ineligible, unhealthy, unaffordable, or (only once climbing
+/// *above* `view.current_quality`) not yet budget-earned.
+///
+/// `surplus` must already exclude `start`'s own cost — it's the bandwidth
+/// available purely for stepping *above* `start`, not the full pool. This
+/// lets callers reserve `start`'s cost separately (see
+/// `resolve_baseline`/`resolve_climb`) before any climbing is considered, so
+/// one slot's climb can never be charged against bandwidth another slot
+/// needs just to hold its own current tier.
 fn climb_from<'a>(
     slot: &Slot,
     view: &SlotView<'a>,
     start: &'a TrackLayer,
-    remaining: f64,
+    mut surplus: f64,
 ) -> &'a TrackLayer {
     let track = view.track;
     let mut chosen = start;
     let mut chosen_cost = effective_cost(start);
-    let mut remaining_after = (remaining - chosen_cost).max(0.0);
 
     let mut next_quality = track.higher_quality(start.quality).map(|l| l.quality);
     while let Some(quality) = next_quality {
@@ -1142,7 +1233,7 @@ fn climb_from<'a>(
 
         let next_cost = effective_cost(next);
         let incremental = next_cost - chosen_cost;
-        if incremental > remaining_after {
+        if incremental > surplus {
             break; // can't afford stepping up to here, or beyond
         }
         if quality > view.current_quality {
@@ -1152,7 +1243,7 @@ fn climb_from<'a>(
             }
         }
 
-        remaining_after -= incremental;
+        surplus -= incremental;
         chosen = next;
         chosen_cost = next_cost;
         next_quality = track.higher_quality(quality).map(|l| l.quality);
@@ -1161,25 +1252,21 @@ fn climb_from<'a>(
     chosen
 }
 
-/// Decides `slot`'s target layer against the bandwidth left in the shared
-/// tick-wide pool (`remaining`), and updates its ledger accordingly. Called
-/// in budget-descending order by `VideoAllocator::update_allocations_at`, so
-/// `remaining` already reflects what higher-priority slots claimed first.
-///
 /// Hysteresis, not a timer: the tier already being held is judged against a
 /// forgiving threshold (survives a shortfall up to `DOWNGRADE_MARGIN`); a
 /// tier being newly reached is judged against the exact one. A signal
 /// wobbling near a boundary doesn't cross the band in either direction,
 /// regardless of how long it wobbles — the actual problem (magnitude), not
-/// a proxy for it (duration). A real switch in either direction also pays a
-/// one-time burst debit — a slot that just switched has a depleted ledger
-/// and won't be picked again until it rebuilds it, which is what keeps
-/// *repeated* switching down even once a change does cross the band.
-fn decide_tier<'a>(
-    slot: &mut Slot,
+/// a proxy for it (duration).
+///
+/// Reserves `start`'s cost from `remaining` on success — this is a slot's
+/// *baseline*, guaranteed before any slot (including this one) is allowed to
+/// climb above it. `Err` means not even the floor survives its own grace
+/// margin.
+fn resolve_baseline<'a>(
     view: &SlotView<'a>,
     remaining: &mut f64,
-) -> AllocationDecision<'a> {
+) -> Result<&'a TrackLayer, AllocationDecision<'a>> {
     let floor = view.track.cheapest_active_layer();
     let floor_cost = effective_cost(floor);
 
@@ -1189,22 +1276,60 @@ fn decide_tier<'a>(
         .filter(|l| !l.state.is_inactive() && l.state.is_activation_candidate());
     let holding = current.filter(|l| *remaining >= effective_cost(l) * (1.0 - DOWNGRADE_MARGIN));
 
-    // Even the floor doesn't survive its own grace margin: nothing to climb
-    // from, pause outright.
     if holding.is_none() && *remaining < floor_cost * (1.0 - DOWNGRADE_MARGIN) {
-        return AllocationDecision::Pause(floor, Bitrate::from(floor_cost as u64));
+        return Err(AllocationDecision::Pause(
+            floor,
+            Bitrate::from(floor_cost as u64),
+        ));
     }
 
     let start = holding.unwrap_or(floor);
+    *remaining = (*remaining - effective_cost(start)).max(0.0);
+    Ok(start)
+}
+
+/// Climbs `slot` from its already-reserved `start` baseline (see
+/// `resolve_baseline`) using whatever `remaining` reflects as genuine
+/// surplus, and updates its ledger. A real tier change (in either
+/// direction) pays a one-time burst debit — a slot that just switched has a
+/// depleted ledger and won't be picked again until it rebuilds it, which is
+/// what keeps *repeated* switching down even once a change crosses the
+/// hysteresis band.
+fn resolve_climb<'a>(
+    slot: &mut Slot,
+    view: &SlotView<'a>,
+    start: &'a TrackLayer,
+    remaining: &mut f64,
+) -> AllocationDecision<'a> {
+    let start_cost = effective_cost(start);
     let chosen = climb_from(slot, view, start, *remaining);
     let chosen_cost = effective_cost(chosen);
     // Floor at 0: DOWNGRADE_MARGIN lets a tier hold even when remaining < chosen_cost,
     // but the deficit must not propagate as a negative value to subsequent slots.
-    *remaining = (*remaining - chosen_cost).max(0.0);
+    *remaining = (*remaining - (chosen_cost - start_cost)).max(0.0);
     if chosen.quality != view.current_quality {
         slot.budget_bps -= chosen_cost * BURST_COST_SECONDS;
     }
     AllocationDecision::Forward(chosen, Bitrate::from(chosen_cost as u64))
+}
+
+/// Decides `slot`'s target layer against the bandwidth left in the shared
+/// tick-wide pool (`remaining`), and updates its ledger accordingly. Fuses
+/// `resolve_baseline` and `resolve_climb` for tests that evaluate one slot
+/// at a time against a single pool; `VideoAllocator::update_allocations_at`
+/// instead calls them as two separate passes across all slots so no slot's
+/// climb can be charged against bandwidth another slot needs for its own
+/// baseline — see their doc comments.
+#[cfg(test)]
+fn decide_tier<'a>(
+    slot: &mut Slot,
+    view: &SlotView<'a>,
+    remaining: &mut f64,
+) -> AllocationDecision<'a> {
+    match resolve_baseline(view, remaining) {
+        Err(pause) => pause,
+        Ok(start) => resolve_climb(slot, view, start, remaining),
+    }
 }
 
 #[cfg(test)]
@@ -2450,6 +2575,109 @@ mod assignment_tests {
         );
     }
 
+    /// Reproduces the real production timing: promotion (`draining` is set,
+    /// `active` moves to the new layer) can complete before every in-flight
+    /// packet from the old layer has actually arrived over the network —
+    /// `is_switching` clears as soon as whatever's *currently* buffered in
+    /// staging drains, not once the old layer's traffic has quiesced. Any
+    /// such late arrival must still reach `switcher` via `Slot::draining`
+    /// instead of being silently dropped by `process`'s active/staging
+    /// routing, and once `switcher` itself has moved on (timeline rebased),
+    /// `draining` must be cleared so it stops being checked at all.
+    #[test]
+    fn draining_layer_forwards_late_packets_then_clears_after_switcher_rejects() {
+        let pid = ParticipantId::new(&mut test_rng());
+        let mut allocator = setup_allocator();
+
+        let mid = Mid::from("v0");
+        let (_, track) = make_video_track(
+            pid,
+            mid,
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m")],
+        );
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        allocator.add_track(Track {
+            meta: track.meta.clone(),
+            layers: track.layers,
+        });
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.tracks.get(&track.meta.id).unwrap();
+        let old_layer = track.by_quality(LayerQuality::High).unwrap().clone();
+        let new_layer = track.by_quality(LayerQuality::Medium).unwrap().clone();
+
+        let slot_key = allocator.slots.keys().next().unwrap();
+        let slot = allocator.slots.get_mut(slot_key).unwrap();
+        // rebalance() may have already staged something via the natural
+        // configure() flow; reset to a known-clean baseline before manually
+        // driving the switcher below.
+        slot.switcher.clear();
+        slot.active = Some(old_layer.clone());
+        slot.staging = None;
+        slot.paused = false;
+
+        let now = Instant::now();
+
+        // Prime the old stream with one full frame.
+        let mut active_pkt = RtpPacket::default();
+        active_pkt.seq_no = 1.into();
+        active_pkt.playout_time = now;
+        active_pkt.marker = true;
+        slot.process(&old_layer.stream_id(), &active_pkt);
+        let _ = slot.switcher.pop();
+
+        // Stage the new layer's keyframe segment; a single-packet segment
+        // drains in one `pop()` pass, exactly like the real timing gap.
+        slot.staging = Some(new_layer.clone());
+
+        let mut stage_boundary = RtpPacket::default();
+        stage_boundary.seq_no = 99.into();
+        stage_boundary.playout_time = now;
+        stage_boundary.marker = true;
+        slot.process(&new_layer.stream_id(), &stage_boundary);
+
+        let mut stage_kf = RtpPacket::default();
+        stage_kf.seq_no = 100.into();
+        stage_kf.playout_time = now + Duration::from_millis(1);
+        stage_kf.is_keyframe = true;
+        slot.process(&new_layer.stream_id(), &stage_kf);
+        while slot.switcher.pop().is_some() {}
+
+        assert!(
+            slot.should_promote_staging(),
+            "staging segment fully drained"
+        );
+
+        // Mirror exactly what `AllocationEngine::on_rtp` does on promotion.
+        slot.draining = slot.active.take();
+        slot.draining_started_at = Some(now);
+        slot.active = slot.staging.take();
+
+        assert_eq!(
+            slot.draining.as_ref().unwrap().stream_id(),
+            old_layer.stream_id(),
+            "draining must hold the layer active was promoted away from"
+        );
+
+        // A late packet for the old stream_id arrives after promotion. It no
+        // longer matches active (now the new layer) or staging (now None),
+        // so only the draining route can pick it up.
+        let mut late_pkt = RtpPacket::default();
+        late_pkt.seq_no = 2.into();
+        late_pkt.playout_time = now;
+        slot.process(&old_layer.stream_id(), &late_pkt);
+
+        // The timeline already rebased onto the new stream during the drain
+        // above, so `switcher` rejects this late packet — and `process`
+        // must react by dropping `draining` so it isn't checked forever.
+        assert!(
+            slot.draining.is_none(),
+            "draining must be cleared once switcher rejects a late packet for it"
+        );
+    }
+
     #[test]
     fn removing_track_releases_slot() {
         let mut allocator = setup_allocator();
@@ -2807,11 +3035,18 @@ mod assignment_tests {
         assert_eq!(allocator.slots.len(), 1);
     }
 
-    /// Verifies the max_height priority ordering: with bandwidth only enough for one
-    /// stream at the Low tier, the highest max_height subscriber holds while lower ones
-    /// are paused. All three slots use the same 3-layer source track so their floor
-    /// cost (Low = 150kbps) is identical — starvation is driven purely by sort order,
-    /// not by track differences.
+    /// With bandwidth only enough for one stream at the Low tier, the
+    /// biggest subscriber holds while smaller ones are paused. All three
+    /// slots use the same 3-layer source track so their floor cost (Low =
+    /// 150kbps) is identical, and all start this tick at budget_bps=0: the
+    /// sort is budget-first (CFS), but on a fresh tick where every slot pays
+    /// the *same* current_cost, a bigger `weight` (= max_height) earns a
+    /// proportionally bigger `fair_share` and therefore accrues more ledger
+    /// credit in this same tick's accrual step — so budget order and
+    /// max_height order coincide here. This is the expected common case
+    /// (see `higher_max_height_slot_climbing_does_not_starve_a_smaller_sibling`
+    /// for the case where they diverge: a bigger slot's appetite to climb to
+    /// a *pricier* tier must not starve a smaller sibling's floor).
     ///
     /// Note: configure() puts slots into staging (should_hold_allocation = true), which
     /// bypasses decide_tier and never pauses. We manually promote to active to test the
@@ -2975,6 +3210,162 @@ mod assignment_tests {
         assert!(
             slot_180.paused,
             "180p (lowest max_height, last in sort) is paused: 0 remaining after 720p+360p (floor-at-zero)"
+        );
+    }
+
+    /// The core fairness fix: a big slot's appetite to CLIMB to a pricier
+    /// tier must never come at the cost of a smaller sibling's own floor.
+    /// Before the two-phase greedy walk (`resolve_baseline` reserving every
+    /// slot's baseline before anyone climbs), a single greedy pass let a
+    /// bigger/higher-priority slot's climb eat the whole pool first,
+    /// starving smaller slots down to Pause even though the pool had ample
+    /// room for everyone's floor plus the big slot's climb.
+    #[test]
+    fn higher_max_height_slot_climbing_does_not_starve_a_smaller_sibling() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new(&mut test_rng());
+
+        let three_layer_simulcast = || {
+            make_video_track(
+                pid,
+                Mid::from("v"),
+                vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ],
+            )
+        };
+        let (_, track_big) = three_layer_simulcast();
+        let (_, track_small) = three_layer_simulcast();
+        for layer in track_big.layers.iter().chain(track_small.layers.iter()) {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        let id_big = track_big.meta.id;
+        let id_small = track_small.meta.id;
+        allocator.add_track(Track {
+            meta: track_big.meta.clone(),
+            layers: track_big.layers,
+        });
+        allocator.add_track(Track {
+            meta: track_small.meta.clone(),
+            layers: track_small.layers,
+        });
+
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("big"),
+            ..SlotConfig::default()
+        });
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("small"),
+            ..SlotConfig::default()
+        });
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("big"),
+            Intent {
+                track_id: id_big,
+                max_height: 720,
+            },
+        );
+        intents.insert(
+            Mid::from("small"),
+            Intent {
+                track_id: id_small,
+                max_height: 180,
+            },
+        );
+        allocator.configure(&intents);
+
+        let low_big = allocator
+            .tracks
+            .get(&id_big)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+        let low_small = allocator
+            .tracks
+            .get(&id_small)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+
+        // Both start active at Low (150kbps nominal each), out of any
+        // transaction, so decide_tier's greedy walk (not should_hold_allocation)
+        // is what's under test.
+        for slot in allocator.slots.values_mut() {
+            let layer = if slot.mid == Mid::from("big") {
+                low_big.clone()
+            } else {
+                low_small.clone()
+            };
+            slot.active = Some(layer);
+            slot.staging = None;
+            slot.settling_until = None;
+            slot.staging_started_at = None;
+            slot.paused = false;
+        }
+
+        // Give the big slot a large pre-earned budget so it's eligible to
+        // climb Low(150k) -> Medium(400k) immediately (burst-gate:
+        // 400k * BURST_COST_SECONDS). This isolates the fairness property
+        // under test from ledger-accrual timing.
+        {
+            let big_slot = allocator
+                .slots
+                .values_mut()
+                .find(|s| s.mid == Mid::from("big"))
+                .unwrap();
+            big_slot.budget_bps = 1_000_000.0;
+        }
+
+        // Pool (after RESERVE_FRACTION=0.1) = 1450kbps * 0.9 = 1,305,000.
+        // Chosen so the two algorithms genuinely diverge:
+        //   - Single-pass (the old bug): big is still processed first (by
+        //     max_height, or here also by budget), but against the FULL
+        //     pool before small's floor is ever reserved. Its climb chain
+        //     Low(150k)->Medium(400k)->High(1.25M) is entirely affordable
+        //     against 1,305,000, leaving only 55,000 — below small's
+        //     105,000 (Low * (1 - DOWNGRADE_MARGIN)) hold threshold, so
+        //     small gets paused purely as collateral damage from big's climb.
+        //   - Two-phase (this fix): both slots' Low baseline (150k each) is
+        //     reserved FIRST, leaving 1,005,000 genuine surplus. Big climbs
+        //     Low->Medium (250k incremental, affordable) but Medium->High
+        //     needs 850k more, which the remaining 755,000 surplus can't
+        //     cover — big stops at Medium, and small's floor was never at
+        //     risk in the first place.
+        let bandwidth = Bitrate::kbps(1450);
+        let now = Instant::now();
+        allocator.update_allocations_at(bandwidth, now);
+
+        let big = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("big"))
+            .unwrap();
+        let small = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("small"))
+            .unwrap();
+
+        assert_eq!(
+            big.target().map(|l| l.quality),
+            Some(LayerQuality::Medium),
+            "big slot must climb using its own reserved budget/surplus"
+        );
+        assert!(
+            !small.paused,
+            "small slot's Low floor must survive the big slot's climb to a pricier tier"
+        );
+        assert_eq!(
+            small.target().map(|l| l.quality),
+            Some(LayerQuality::Low),
+            "small slot must keep holding its own baseline, untouched by the sibling's climb"
         );
     }
 
