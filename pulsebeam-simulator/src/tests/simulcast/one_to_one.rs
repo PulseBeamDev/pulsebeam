@@ -196,14 +196,18 @@ fn call_recovers_promptly_after_a_network_handoff() {
         .await?;
 
         // The recovery bound itself is the assertion: a genuine handoff
-        // costs one keyframe/NACK round trip, not multiple seconds of
-        // silence while the allocator re-decides from scratch.
-        client.ctx.mark_qoe_baseline();
+        // costs the outage itself plus one keyframe/NACK round trip, not
+        // multiple additional seconds of silence while the allocator
+        // re-decides from scratch. Nothing can arrive during a full
+        // partition, so the bound must cover at least `OUTAGE` -- it is not
+        // a "how fast did it recover" budget on its own.
         client.drive_for(RECOVERY_GRACE).await?;
-        client
-            .ctx
-            .assert_max_freeze_under(RECOVERY_GRACE + Duration::from_millis(500));
+        client.ctx.assert_max_freeze_under(OUTAGE + RECOVERY_GRACE);
 
+        // Measure steady-state quality only after that one-time recovery
+        // cost has been absorbed, so it isn't double-counted into the score
+        // below.
+        client.ctx.mark_qoe_baseline();
         client.drive_for(SETTLE).await?;
         client.ctx.assert_all_streams_decodable();
         client.ctx.assert_min_qoe_score(75.0);

@@ -242,7 +242,7 @@ impl VideoAllocator {
 
             let layer = layer.clone();
             slot.set_max_height(max_height);
-            slot.switch_to(&layer, false);
+            slot.switch_to(&layer, false, Instant::now());
         } else {
             slot.set_max_height(0);
             slot.stop();
@@ -327,7 +327,7 @@ impl VideoAllocator {
         {
             if let Some(track_state) = pending_tracks.next() {
                 let layer = track_state.lowest_quality();
-                slot.switch_to(layer, true);
+                slot.switch_to(layer, true, Instant::now());
                 staged += 1;
             } else {
                 break;
@@ -473,7 +473,13 @@ impl VideoAllocator {
             // A switch is a transaction carrying a PLI that a fresh decision
             // shouldn't preempt. Reaffirm the current layer while that
             // transaction (or its post-promotion settle window) is active;
-            // no ledger debit since nothing actually switched.
+            // no ledger debit since nothing actually switched. Still bounded
+            // by the same lenient affordability check `resolve_baseline` uses
+            // for its own "holding" path: without it, two slots settling at
+            // once (e.g. both just resumed from paused) would each force
+            // their cost through unconditionally, admitting more than
+            // `remaining` can actually cover for as long as both settle
+            // windows overlap, not just for one tick.
             if slot.should_hold_allocation(now) {
                 let layer = view
                     .track
@@ -482,15 +488,15 @@ impl VideoAllocator {
                     .unwrap_or_else(|| view.track.cheapest_active_layer());
                 // Use effective_cost (same ceiling as decide_tier) so a VBR burst
                 // during a settle window can't blow the pool for sibling slots.
-                // Floor at 0: this slot is committed to forwarding (mid-transaction),
-                // but its deficit must not propagate as a negative to later slots.
                 let cost = effective_cost(layer);
-                remaining = (remaining - cost).max(0.0);
-                decisions.insert(
-                    view.key,
-                    AllocationDecision::Forward(layer, Bitrate::from(cost as u64)),
-                );
-                continue;
+                if remaining >= cost * (1.0 - DOWNGRADE_MARGIN) {
+                    remaining = (remaining - cost).max(0.0);
+                    decisions.insert(
+                        view.key,
+                        AllocationDecision::Forward(layer, Bitrate::from(cost as u64)),
+                    );
+                    continue;
+                }
             }
 
             match resolve_baseline(view, &mut remaining) {
@@ -517,10 +523,10 @@ impl VideoAllocator {
 
             match decision {
                 AllocationDecision::Forward(layer, _) => {
-                    changed |= slot.switch_to(layer, false);
+                    changed |= slot.switch_to(layer, false, now);
                 }
                 AllocationDecision::Pause(layer, _) => {
-                    changed |= slot.pause_at(layer);
+                    changed |= slot.pause_at(layer, now);
                 }
             }
         }
@@ -829,7 +835,7 @@ impl Slot {
         events.request_keyframe(staging);
     }
 
-    fn switch_to(&mut self, new_layer: &TrackLayer, force: bool) -> bool {
+    fn switch_to(&mut self, new_layer: &TrackLayer, force: bool, now: Instant) -> bool {
         let mut changed = false;
         let old_target = self.target().map(|l| l.stream_id());
         let is_track_change = self
@@ -856,7 +862,7 @@ impl Slot {
         } else if self.target().as_ref() != Some(&new_layer) {
             self.staging = Some(new_layer.clone());
             self.settling_until = None;
-            self.staging_started_at = Some(Instant::now());
+            self.staging_started_at = Some(now);
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
             self.switcher.clear_staging();
@@ -870,9 +876,9 @@ impl Slot {
             // Without this, a slot paused long enough for its hold to expire has
             // no protection on the very next tick and can oscillate at tick rate.
             if self.staging.is_some() {
-                self.staging_started_at = Some(Instant::now());
+                self.staging_started_at = Some(now);
             } else {
-                self.settling_until = Some(Instant::now() + SWITCH_SETTLE_DURATION);
+                self.settling_until = Some(now + SWITCH_SETTLE_DURATION);
             }
             self.paused = false;
             changed = true;
@@ -894,7 +900,7 @@ impl Slot {
         self.pli_reset();
     }
 
-    fn pause_at(&mut self, layer: &TrackLayer) -> bool {
+    fn pause_at(&mut self, layer: &TrackLayer, now: Instant) -> bool {
         let mut changed = false;
 
         // A pause is a transient shortfall, not a layer switch. Keep an
@@ -926,7 +932,7 @@ impl Slot {
                 // (not just resuming the same one) leaves staging_started_at
                 // unset, and `is_none_or` treats that as "just started" every
                 // single tick, permanently locking the slot out of re-evaluation.
-                self.staging_started_at = Some(Instant::now());
+                self.staging_started_at = Some(now);
                 changed = true;
                 tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
             }
@@ -1273,7 +1279,13 @@ fn resolve_baseline<'a>(
     let current = view
         .track
         .by_quality(view.current_quality)
-        .filter(|l| !l.state.is_inactive() && l.state.is_activation_candidate());
+        .filter(|l| !l.state.is_inactive() && l.state.is_activation_candidate())
+        // A slot can be holding a tier it reached before its own max_height
+        // was lowered (e.g. a fresh subscription's real weight arriving
+        // after the default-height warmup climbed higher than that). This
+        // path only ever *holds*, never climbs, so without this check nothing
+        // would ever step it back down to the new, lower ceiling.
+        .filter(|l| AllocationEngine::max_height_for_quality(l.quality) <= view.max_height);
     let holding = current.filter(|l| *remaining >= effective_cost(l) * (1.0 - DOWNGRADE_MARGIN));
 
     if holding.is_none() && *remaining < floor_cost * (1.0 - DOWNGRADE_MARGIN) {
@@ -1291,23 +1303,30 @@ fn resolve_baseline<'a>(
 /// Climbs `slot` from its already-reserved `start` baseline (see
 /// `resolve_baseline`) using whatever `remaining` reflects as genuine
 /// surplus, and updates its ledger. A real tier change (in either
-/// direction) pays a one-time burst debit — a slot that just switched has a
-/// depleted ledger and won't be picked again until it rebuilds it, which is
-/// what keeps *repeated* switching down even once a change crosses the
-/// hysteresis band.
+/// direction), *or* resuming from paused, pays a one-time burst debit — a
+/// slot that just switched (or just got admitted) has a depleted ledger and
+/// won't be picked again until it rebuilds it, which is what keeps
+/// *repeated* switching down even once a change crosses the hysteresis
+/// band. Resuming must pay this too: a paused slot accrues its full fair
+/// share at zero cost (see the ledger accrual loop above), so without this
+/// debit it would immediately out-earn whatever slot it just displaced and
+/// the two would trade places every tick -- visible as rapid pause/resume
+/// blipping between equal-priority slots sharing a too-small pool, not the
+/// slow, barely-noticeable rotation the ledger is meant to produce.
 fn resolve_climb<'a>(
     slot: &mut Slot,
     view: &SlotView<'a>,
     start: &'a TrackLayer,
     remaining: &mut f64,
 ) -> AllocationDecision<'a> {
+    let resumed_from_pause = slot.paused;
     let start_cost = effective_cost(start);
     let chosen = climb_from(slot, view, start, *remaining);
     let chosen_cost = effective_cost(chosen);
     // Floor at 0: DOWNGRADE_MARGIN lets a tier hold even when remaining < chosen_cost,
     // but the deficit must not propagate as a negative value to subsequent slots.
     *remaining = (*remaining - (chosen_cost - start_cost)).max(0.0);
-    if chosen.quality != view.current_quality {
+    if chosen.quality != view.current_quality || resumed_from_pause {
         slot.budget_bps -= chosen_cost * BURST_COST_SECONDS;
     }
     AllocationDecision::Forward(chosen, Bitrate::from(chosen_cost as u64))
@@ -1639,10 +1658,10 @@ mod assignment_tests {
         slot.staging_started_at = None;
         slot.settling_until = None;
 
-        slot.switch_to(&low, false);
+        let now = Instant::now();
+        slot.switch_to(&low, false, now);
 
         assert!(!slot.paused, "switch_to must clear the paused flag");
-        let now = Instant::now();
         assert!(
             slot.should_hold_allocation(now),
             "slot resumed from pause must be protected from immediate re-pause"
@@ -2726,7 +2745,7 @@ mod assignment_tests {
         slot.paused = false;
 
         assert!(
-            !slot.switch_to(&layer, false),
+            !slot.switch_to(&layer, false, Instant::now()),
             "re-applying the same active layer should not mark a change"
         );
     }
@@ -2760,7 +2779,7 @@ mod assignment_tests {
         slot.staging = Some(staging);
         slot.paused = false;
 
-        assert!(slot.switch_to(&new_stage, false));
+        assert!(slot.switch_to(&new_stage, false, Instant::now()));
         assert_eq!(
             slot.staging.as_ref().unwrap().stream_id(),
             new_stage.stream_id()
@@ -2796,7 +2815,7 @@ mod assignment_tests {
         slot.staging = Some(staging);
         slot.paused = false;
 
-        assert!(slot.switch_to(&active, false));
+        assert!(slot.switch_to(&active, false, Instant::now()));
         assert!(slot.staging.is_none());
         assert_eq!(
             slot.active.as_ref().unwrap().stream_id(),
@@ -2833,7 +2852,7 @@ mod assignment_tests {
         slot.staging = Some(staging.clone());
         slot.paused = false;
 
-        assert!(slot.switch_to(&new_stage, false));
+        assert!(slot.switch_to(&new_stage, false, Instant::now()));
         assert_eq!(
             slot.staging.as_ref().unwrap().stream_id(),
             new_stage.stream_id()
@@ -2856,7 +2875,7 @@ mod assignment_tests {
         slot.staging = None;
         slot.paused = false;
 
-        assert!(slot.switch_to(&new_target, true));
+        assert!(slot.switch_to(&new_target, true, Instant::now()));
         assert!(
             slot.active.is_none(),
             "force switch must clear active stream"
@@ -3022,7 +3041,7 @@ mod assignment_tests {
             slot.active = slot.staging.take();
             slot.paused = false;
             // Force a quality transition for the same track, leaving active + staging in one slot.
-            slot.switch_to(&upgraded_layer, true);
+            slot.switch_to(&upgraded_layer, true, Instant::now());
             assert!(slot.active.is_some());
             assert!(slot.staging.is_some());
             assert_eq!(
@@ -3210,6 +3229,267 @@ mod assignment_tests {
         assert!(
             slot_180.paused,
             "180p (lowest max_height, last in sort) is paused: 0 remaining after 720p+360p (floor-at-zero)"
+        );
+    }
+
+    /// Two equal-priority slots sharing a pool that can only fit one of
+    /// them at a time must not trade places every tick. A paused slot
+    /// accrues its full fair share at zero cost (see the ledger accrual
+    /// loop in `update_allocations_at`), so it out-earns whichever sibling
+    /// is currently active within a couple of ticks unless resuming pays
+    /// the same one-time burst debit a real tier change does -- without
+    /// that, the two slots would swap who's active every single tick, a
+    /// real defect a viewer would see as constant pause/resume flicker.
+    #[test]
+    fn equal_priority_slots_do_not_blip_between_paused_and_active() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new(&mut test_rng());
+
+        let three_layer_simulcast = || {
+            make_video_track(
+                pid,
+                Mid::from("v"),
+                vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ],
+            )
+        };
+        let (_, track_a) = three_layer_simulcast();
+        let (_, track_b) = three_layer_simulcast();
+        let (_, track_c) = three_layer_simulcast();
+        for layer in track_a
+            .layers
+            .iter()
+            .chain(track_b.layers.iter())
+            .chain(track_c.layers.iter())
+        {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        let id_a = track_a.meta.id;
+        let id_b = track_b.meta.id;
+        let id_c = track_c.meta.id;
+        allocator.add_track(Track {
+            meta: track_a.meta.clone(),
+            layers: track_a.layers,
+        });
+        allocator.add_track(Track {
+            meta: track_b.meta.clone(),
+            layers: track_b.layers,
+        });
+        allocator.add_track(Track {
+            meta: track_c.meta.clone(),
+            layers: track_c.layers,
+        });
+
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("s720"),
+            ..SlotConfig::default()
+        });
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("sB180"),
+            ..SlotConfig::default()
+        });
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("sC180"),
+            ..SlotConfig::default()
+        });
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s720"),
+            Intent {
+                track_id: id_a,
+                max_height: 720,
+            },
+        );
+        intents.insert(
+            Mid::from("sB180"),
+            Intent {
+                track_id: id_b,
+                max_height: 180,
+            },
+        );
+        intents.insert(
+            Mid::from("sC180"),
+            Intent {
+                track_id: id_c,
+                max_height: 180,
+            },
+        );
+        allocator.configure(&intents);
+
+        let low_a = allocator
+            .tracks
+            .get(&id_a)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+        let low_b = allocator
+            .tracks
+            .get(&id_b)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+        let low_c = allocator
+            .tracks
+            .get(&id_c)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+        for slot in allocator.slots.values_mut() {
+            let layer = if slot.mid == Mid::from("s720") {
+                low_a.clone()
+            } else if slot.mid == Mid::from("sB180") {
+                low_b.clone()
+            } else {
+                low_c.clone()
+            };
+            slot.active = Some(layer);
+            slot.staging = None;
+            slot.settling_until = None;
+            slot.staging_started_at = None;
+            slot.paused = false;
+        }
+
+        // Tight enough that 720p plus both 180p slots' floors can't all fit
+        // (mirrors `higher_max_height_streams_are_prioritized`'s pool math),
+        // so exactly one of the two 180p slots is paused at any given
+        // moment -- the property under test is how *often* that changes.
+        let tight_bandwidth = Bitrate::kbps(300);
+        let mut now = Instant::now();
+        let mut b_was_paused = false;
+        let mut c_was_paused = false;
+        let mut b_transitions = 0u32;
+        let mut c_transitions = 0u32;
+
+        for i in 0..60 {
+            allocator.update_allocations_at(tight_bandwidth, now);
+            let b = allocator.slots.values().find(|s| s.mid == Mid::from("sB180")).unwrap();
+            let c = allocator.slots.values().find(|s| s.mid == Mid::from("sC180")).unwrap();
+            if b.paused != b_was_paused || c.paused != c_was_paused {
+                eprintln!(
+                    "DIAG tick={i} b_paused={} b_budget={:.0} c_paused={} c_budget={:.0}",
+                    b.paused, b.budget_bps, c.paused, c.budget_bps
+                );
+            }
+            let b_paused = b.paused;
+            let c_paused = c.paused;
+            if b_paused != b_was_paused {
+                b_transitions += 1;
+            }
+            if c_paused != c_was_paused {
+                c_transitions += 1;
+            }
+            b_was_paused = b_paused;
+            c_was_paused = c_paused;
+            now += TICK_INTERVAL;
+        }
+
+        assert!(
+            b_transitions <= 2 && c_transitions <= 2,
+            "equal-priority slots blipped between paused and active too often over 20s: \
+             sB180 transitioned {b_transitions} times, sC180 transitioned {c_transitions} times"
+        );
+    }
+
+    /// A slot can be holding a tier it reached before its own `max_height`
+    /// was lowered (e.g. a subscription update arriving after the slot
+    /// already climbed higher under its old, larger request). `resolve_baseline`
+    /// only ever *holds* or falls back to the floor -- it never climbs -- so
+    /// without checking `max_height` on the holding path too, nothing would
+    /// ever step such a slot back down to its new, lower ceiling.
+    #[test]
+    fn slot_steps_down_when_max_height_is_lowered_after_climbing() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new(&mut test_rng());
+        let (_, track) = make_video_track(
+            pid,
+            Mid::from("v"),
+            vec![
+                SimulcastLayer::new("f"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("q"),
+            ],
+        );
+        for layer in &track.layers {
+            layer.state.update_for_test().inactive(false);
+        }
+        let id = track.meta.id;
+        allocator.add_track(Track {
+            meta: track.meta.clone(),
+            layers: track.layers,
+        });
+        allocator.add_slot(SlotConfig {
+            mid: Mid::from("s"),
+            ..SlotConfig::default()
+        });
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s"),
+            Intent {
+                track_id: id,
+                max_height: 360,
+            },
+        );
+        allocator.configure(&intents);
+
+        let medium = allocator
+            .tracks
+            .get(&id)
+            .unwrap()
+            .by_quality(LayerQuality::Medium)
+            .unwrap()
+            .clone();
+        for slot in allocator.slots.values_mut() {
+            slot.active = Some(medium.clone());
+            slot.staging = None;
+            slot.settling_until = None;
+            slot.staging_started_at = None;
+            slot.paused = false;
+        }
+
+        let now = Instant::now();
+        allocator.update_allocations_at(Bitrate::mbps(5), now);
+        assert_eq!(
+            allocator.slots.values().next().unwrap().active.as_ref().unwrap().quality,
+            LayerQuality::Medium,
+            "sanity check: holds Medium under ample bandwidth while max_height allows it"
+        );
+
+        // The subscription's real weight arrives, lowering max_height below
+        // the tier already being held.
+        let mut lowered_intents = HashMap::new();
+        lowered_intents.insert(
+            Mid::from("s"),
+            Intent {
+                track_id: id,
+                max_height: 180,
+            },
+        );
+        allocator.configure(&lowered_intents);
+        for slot in allocator.slots.values_mut() {
+            slot.settling_until = None;
+        }
+
+        // A genuine tier change targets `staging`, not an instant swap of
+        // `active` -- it still needs the normal keyframe handoff (see
+        // `Switcher`), which only completes once real RTP packets flow
+        // through `on_rtp`. This test only drives the allocation decision,
+        // so the decision to *target* Low is what's under test here.
+        allocator.update_allocations_at(Bitrate::mbps(5), now + TICK_INTERVAL);
+        let slot = allocator.slots.values().next().unwrap();
+        assert_eq!(
+            slot.target().unwrap().quality,
+            LayerQuality::Low,
+            "must step down to the new, lower max_height ceiling instead of continuing to \
+             hold the tier reached under the old one"
         );
     }
 

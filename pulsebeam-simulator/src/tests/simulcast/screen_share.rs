@@ -211,11 +211,20 @@ fn presenter_glitch_recovers_without_a_restart() {
         )
         .await?;
 
+        // Nothing can arrive during the hold itself, so the freeze bound
+        // must cover at least `OUTAGE` plus a real recovery round trip --
+        // not a "how fast did it recover" budget on its own.
+        const RECOVERY_GRACE: Duration = Duration::from_secs(1);
+        client.drive_for(RECOVERY_GRACE).await?;
+        client.ctx.assert_max_freeze_under(OUTAGE + RECOVERY_GRACE);
+
+        // Measure steady-state quality only after that one-time recovery
+        // cost has been absorbed, so it isn't double-counted into the score
+        // below.
         client.ctx.mark_qoe_baseline();
         client.drive_for(SETTLE).await?;
 
         client.ctx.assert_all_streams_decodable();
-        client.ctx.assert_max_freeze_under(Duration::from_secs(3));
         client.ctx.assert_min_qoe_score(85.0);
 
         Ok(())
