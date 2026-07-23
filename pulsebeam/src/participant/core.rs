@@ -290,8 +290,8 @@ impl ParticipantCore {
         &mut self,
         stream_id: StreamId,
         kind: KeyframeRequestKind,
+        now: Instant,
     ) {
-        let now = Instant::now();
         if let Some(last) = self.last_keyframe_request.get(&stream_id)
             && now.duration_since(*last) < KEYFRAME_DEBOUNCE
         {
@@ -344,7 +344,7 @@ impl ParticipantCore {
 
     /// Performs exactly one `Rtc` mutation. The caller must immediately resume
     /// the drain loop before this method can be called again.
-    fn apply_one_rtc_mutation(&mut self) -> bool {
+    fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
         if let Some(write) = self.stream_writer.pop() {
             self.apply_stream_write(write);
             return true;
@@ -367,7 +367,7 @@ impl ParticipantCore {
                 }
             }
             PendingRtcMutation::Keyframe { stream_id, kind } => {
-                self.handle_remote_keyframe_request_now(stream_id, kind);
+                self.handle_remote_keyframe_request_now(stream_id, kind, now);
             }
         }
 
@@ -430,7 +430,7 @@ impl ParticipantCore {
                 continue;
             }
 
-            if self.apply_one_rtc_mutation() {
+            if self.apply_one_rtc_mutation(now) {
                 continue;
             }
 
