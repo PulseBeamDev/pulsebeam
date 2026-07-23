@@ -71,9 +71,15 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         }
     }
 
-    fn forward_sctp(&mut self, subscriber: ParticipantId, topic: &crate::track::Topic, pkt: &[u8]) {
+    fn forward_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &crate::track::Topic,
+        pkt: &[u8],
+    ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
-            p.with_span(|core| core.on_forward_sctp(topic, pkt));
+            p.with_span(|core| core.on_forward_sctp(topic, origin, pkt));
             self.dirty.mark(self.kind, subscriber);
         }
     }
@@ -266,37 +272,39 @@ impl ShardCore {
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
                 ParticipantEvent::Control(ev) => match ev {
-                    ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
-                        if self.routing.register_data_publisher(room_id, topic.clone()) {
-                            self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicPublished {
-                                    room_id,
-                                    topic,
-                                });
-                        }
+                    ParticipantControlEvent::DataTopicPublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => {
+                        self.routing
+                            .register_data_publisher(room_id, publisher, topic);
                     }
-                    ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
-                        if self.routing.unregister_data_publisher(room_id, &topic) {
-                            self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicUnpublished {
-                                    room_id,
-                                    topic,
-                                });
-                        }
+                    ParticipantControlEvent::DataTopicUnpublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => {
+                        self.routing
+                            .unregister_data_publisher(room_id, publisher, &topic);
                     }
                     ParticipantControlEvent::DataTopicSubscribed {
                         room_id,
                         subscriber,
                         topic,
+                        publisher,
                     } => {
-                        if self
-                            .routing
-                            .register_data_subscriber(room_id, subscriber, topic.clone())
-                        {
+                        if self.routing.register_data_subscriber(
+                            room_id,
+                            subscriber,
+                            topic.clone(),
+                            publisher,
+                        ) {
                             self.pipeline
                                 .push_shard_event(ShardEvent::DataTopicSubscribed {
                                     room_id,
                                     topic,
+                                    publisher,
                                 });
                         }
                     }
@@ -304,15 +312,17 @@ impl ShardCore {
                         room_id,
                         subscriber,
                         topic,
+                        publisher,
                     } => {
                         if self
                             .routing
-                            .unregister_data_subscriber(room_id, subscriber, &topic)
+                            .unregister_data_subscriber(room_id, subscriber, &topic, publisher)
                         {
                             self.pipeline
                                 .push_shard_event(ShardEvent::DataTopicUnsubscribed {
                                     room_id,
                                     topic,
+                                    publisher,
                                 });
                         }
                     }
@@ -483,29 +493,30 @@ impl ShardCore {
                 self.routing
                     .unregister_remote_subscriber_shard(from_shard_id, track);
             }
-            ClusterCommand::PublishDataTopic { room_id, topic } => {
-                let _ = (room_id, topic);
-            }
-            ClusterCommand::UnpublishDataTopic { room_id, topic } => {
-                let _ = (room_id, topic);
-            }
             ClusterCommand::SubscribeDataTopic {
                 room_id,
                 from_shard_id,
                 topic,
+                publisher,
             } => {
-                self.routing
-                    .register_remote_data_subscriber_shard(room_id, from_shard_id, topic);
+                self.routing.register_remote_data_subscriber_shard(
+                    room_id,
+                    from_shard_id,
+                    topic,
+                    publisher,
+                );
             }
             ClusterCommand::UnsubscribeDataTopic {
                 room_id,
                 from_shard_id,
                 topic,
+                publisher,
             } => {
                 self.routing.unregister_remote_data_subscriber_shard(
                     room_id,
                     from_shard_id,
                     &topic,
+                    publisher,
                 );
             }
         }

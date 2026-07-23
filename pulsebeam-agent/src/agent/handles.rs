@@ -80,6 +80,7 @@ impl DataPublisher {
 pub struct DataSubscriber {
     pub channel_id: ChannelId,
     pub topic: String,
+    pub scope: Option<String>,
     pub(crate) rx: mailbox::Receiver<Vec<u8>>,
 }
 
@@ -87,11 +88,13 @@ impl DataSubscriber {
     pub(crate) fn new(
         channel_id: ChannelId,
         topic: String,
+        scope: Option<String>,
         rx: mailbox::Receiver<Vec<u8>>,
     ) -> Self {
         Self {
             channel_id,
             topic,
+            scope,
             rx,
         }
     }

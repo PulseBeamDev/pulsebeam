@@ -113,25 +113,42 @@ pub(crate) enum DataTrackDirection {
 struct DataTrackBinding {
     direction: DataTrackDirection,
     topic: String,
+    scope: Option<String>,
 }
 
-fn data_track_label(direction: DataTrackDirection, topic: &str) -> String {
+fn data_track_label(direction: DataTrackDirection, topic: &str, scope: Option<&str>) -> String {
+    debug_assert!(!topic.is_empty());
+    debug_assert!(scope.is_none() || direction == DataTrackDirection::Subscribe);
+    debug_assert!(scope.is_none_or(|scope| !scope.is_empty() && !scope.contains('/')));
+
     let lane = match direction {
         DataTrackDirection::Publish => "pub",
         DataTrackDirection::Subscribe => "sub",
     };
-    format!("v1/rt/{lane}/{topic}")
+    match scope {
+        Some(scope) => format!("v1/rt/{lane}/{topic}/{scope}"),
+        None => format!("v1/rt/{lane}/{topic}"),
+    }
 }
 
-fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String)> {
+fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Option<String>)> {
     let rest = label.strip_prefix("v1/rt/")?;
-    let (lane, topic) = rest.split_once('/')?;
+    let (lane, rest) = rest.split_once('/')?;
     let direction = match lane {
         "pub" => DataTrackDirection::Publish,
         "sub" => DataTrackDirection::Subscribe,
         _ => return None,
     };
-    Some((direction, topic.to_string()))
+    let (topic, scope) = match rest.split_once('/') {
+        Some((topic, scope)) => (topic.to_string(), Some(scope.to_string())),
+        None => (rest.to_string(), None),
+    };
+    if direction == DataTrackDirection::Publish && scope.is_some() {
+        return None;
+    }
+    debug_assert!(!topic.is_empty());
+    debug_assert!(scope.as_ref().is_none_or(|scope| !scope.is_empty()));
+    Some((direction, topic, scope))
 }
 
 pub enum AgentEvent {
@@ -167,8 +184,8 @@ struct DataSubsystem {
     signaling_cid: ChannelId,
     data_channels: HashMap<ChannelId, DataTrackBinding>,
     data_pub_topics: HashMap<String, DataPublisher>,
-    data_sub_topics: HashMap<String, DataSubscriber>,
-    data_targets: HashMap<String, mailbox::Sender<Vec<u8>>>,
+    data_sub_topics: HashMap<(String, Option<String>), DataSubscriber>,
+    data_targets: HashMap<(String, Option<String>), mailbox::Sender<Vec<u8>>>,
 }
 
 struct MediaSubsystem {
@@ -296,7 +313,7 @@ impl AgentDriver {
     }
 
     pub fn declare_publish_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_data_topic(DataTrackDirection::Publish, topic)?;
+        let cid = self.ensure_data_topic(DataTrackDirection::Publish, topic, None)?;
         self.data.data_pub_topics.insert(
             topic.to_string(),
             DataPublisher::new(cid, topic.to_string(), self.outgoing_tx.clone()),
@@ -304,14 +321,19 @@ impl AgentDriver {
         Ok(cid)
     }
 
-    pub fn declare_subscribe_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_data_topic(DataTrackDirection::Subscribe, topic)?;
+    pub fn declare_subscribe_topic(
+        &mut self,
+        topic: &str,
+        scope: Option<&str>,
+    ) -> Result<ChannelId, AgentError> {
+        let cid = self.ensure_data_topic(DataTrackDirection::Subscribe, topic, scope)?;
         let (tx, rx) = mailbox::bounded(8);
+        let key = (topic.to_string(), scope.map(str::to_string));
         self.data.data_sub_topics.insert(
-            topic.to_string(),
-            DataSubscriber::new(cid, topic.to_string(), rx),
+            key.clone(),
+            DataSubscriber::new(cid, topic.to_string(), key.1.clone(), rx),
         );
-        self.data.data_targets.insert(topic.to_string(), tx);
+        self.data.data_targets.insert(key, tx);
         Ok(cid)
     }
 
@@ -547,13 +569,16 @@ impl AgentDriver {
                             self.data.signaling_cid = cid;
                             self.subscriptions.sub_manager.reset_active_assignments();
                             self.subscriptions.pending_deadline = Some(Instant::now());
-                        } else if let Some((direction, topic)) = parse_data_track_label(&label) {
+                        } else if let Some((direction, topic, scope)) =
+                            parse_data_track_label(&label)
+                        {
                             self.data
                                 .data_channels
                                 .entry(cid)
                                 .or_insert(DataTrackBinding {
                                     direction,
                                     topic: topic.to_string(),
+                                    scope: scope.clone(),
                                 });
                             match direction {
                                 DataTrackDirection::Publish => {
@@ -566,10 +591,11 @@ impl AgentDriver {
                                     }
                                 }
                                 DataTrackDirection::Subscribe => {
-                                    if let Some(sub) = self.data.data_sub_topics.get(&topic) {
+                                    let key = (topic.clone(), scope);
+                                    if let Some(sub) = self.data.data_sub_topics.get(&key) {
                                         self.emit(AgentEvent::DataSubscriberDeclared(sub.clone()));
                                     } else {
-                                        tracing::warn!("no pending sub topic for {}.", topic);
+                                        tracing::warn!("no pending sub topic for {:?}.", key);
                                     }
                                 }
                             }
@@ -633,7 +659,8 @@ impl AgentDriver {
         let Some(binding) = self.data.data_channels.get(&data.id) else {
             return;
         };
-        let Some(target) = self.data.data_targets.get(&binding.topic) else {
+        let key = (binding.topic.clone(), binding.scope.clone());
+        let Some(target) = self.data.data_targets.get(&key) else {
             return;
         };
         let _ = target.try_send(data.data);
@@ -800,22 +827,23 @@ impl AgentDriver {
         &mut self,
         direction: DataTrackDirection,
         topic: &str,
+        scope: Option<&str>,
     ) -> Result<ChannelId, AgentError> {
         let existing = match direction {
             DataTrackDirection::Publish => {
                 self.data.data_pub_topics.get(topic).map(|p| p.channel_id)
             }
             DataTrackDirection::Subscribe => {
-                self.data.data_sub_topics.get(topic).map(|s| s.channel_id)
+                let key = (topic.to_string(), scope.map(str::to_string));
+                self.data.data_sub_topics.get(&key).map(|s| s.channel_id)
             }
         };
         if let Some(cid) = existing {
             return Ok(cid);
         }
 
-        let topic_owned = topic.to_string();
         let cfg = ChannelConfig {
-            label: data_track_label(direction, &topic_owned),
+            label: data_track_label(direction, topic, scope),
             ordered: false,
             reliability: Reliability::MaxRetransmits { retransmits: 0 },
             negotiated: None,

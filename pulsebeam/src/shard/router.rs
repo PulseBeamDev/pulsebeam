@@ -44,7 +44,13 @@ pub(crate) trait RoutingContext: CrossShardSend {
         slot_idx: AudioSelectorSlotId,
         pkt: &RtpPacket,
     );
-    fn forward_sctp(&mut self, subscriber: ParticipantId, topic: &Topic, pkt: &[u8]);
+    fn forward_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &Topic,
+        pkt: &[u8],
+    );
     fn notify_tracks_published(&mut self, participant_id: ParticipantId, tracks: &[Track]);
     fn notify_tracks_unpublished(&mut self, participant_id: ParticipantId, track_ids: &[TrackId]);
     fn notify_keyframe_request(
@@ -66,8 +72,8 @@ pub(crate) struct ShardRoomContext {
     pub members: FastIndexSet<ParticipantId>,
     pub remote_shards: FastIndexSet<ShardId>,
     pub audio_selector: TopNAudioSelector,
-    pub data_topics: HashMap<Topic, DataTopicRoute>,
-    pub data_publisher_refcounts: HashMap<Topic, usize>,
+    pub data_streams: HashMap<DataStreamId, DataStreamRoute>,
+    pub all_publisher_subscriptions: AllPublisherSubscriptions,
 }
 
 impl ShardRoomContext {
@@ -76,22 +82,77 @@ impl ShardRoomContext {
             members: fast_set(),
             remote_shards: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
-            data_topics: HashMap::default(),
-            data_publisher_refcounts: HashMap::default(),
+            data_streams: HashMap::default(),
+            all_publisher_subscriptions: AllPublisherSubscriptions::new(),
         }
     }
 }
 
-pub(crate) struct DataTopicRoute {
-    pub subscribers: FastIndexSet<ParticipantId>,
-    pub remote_shards: FastIndexSet<ShardId>,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DataStreamId {
+    publisher_id: ParticipantId,
+    topic: Topic,
 }
 
-impl DataTopicRoute {
+impl DataStreamId {
+    fn new(publisher_id: ParticipantId, topic: Topic) -> Self {
+        Self {
+            publisher_id,
+            topic,
+        }
+    }
+}
+
+pub(crate) struct AllPublisherSubscriptions {
+    local_by_topic: HashMap<Topic, FastIndexSet<ParticipantId>>,
+    remote_by_topic: HashMap<Topic, FastIndexSet<ShardId>>,
+}
+
+impl AllPublisherSubscriptions {
     fn new() -> Self {
         Self {
-            subscribers: fast_set_with_capacity(256),
-            remote_shards: fast_set(),
+            local_by_topic: HashMap::default(),
+            remote_by_topic: HashMap::default(),
+        }
+    }
+}
+
+pub(crate) struct DataStreamRoute {
+    published: bool,
+    local_subscribers: FastIndexSet<ParticipantId>,
+    remote_subscriber_shards: HashMap<ShardId, usize>,
+}
+
+impl DataStreamRoute {
+    fn new() -> Self {
+        Self {
+            published: false,
+            local_subscribers: fast_set_with_capacity(256),
+            remote_subscriber_shards: HashMap::default(),
+        }
+    }
+
+    fn is_unused(&self) -> bool {
+        !self.published
+            && self.local_subscribers.is_empty()
+            && self.remote_subscriber_shards.is_empty()
+    }
+
+    fn attach_remote_subscriber_shard(&mut self, shard_id: ShardId) {
+        let count = self.remote_subscriber_shards.entry(shard_id).or_insert(0);
+        *count += 1;
+        debug_assert!(*count <= 2);
+    }
+
+    fn detach_remote_subscriber_shard(&mut self, shard_id: ShardId) {
+        let Some(count) = self.remote_subscriber_shards.get_mut(&shard_id) else {
+            debug_assert!(false, "detaching an unknown remote subscriber shard");
+            return;
+        };
+        debug_assert!(*count > 0);
+        *count -= 1;
+        if *count == 0 {
+            self.remote_subscriber_shards.remove(&shard_id);
         }
     }
 }
@@ -160,11 +221,16 @@ impl ShardRoutingTable {
             return;
         };
         room.members.swap_remove(participant_id);
-        for route in room.data_topics.values_mut() {
-            route.subscribers.swap_remove(participant_id);
+        for subscribers in room.all_publisher_subscriptions.local_by_topic.values_mut() {
+            subscribers.swap_remove(participant_id);
         }
-        room.data_topics
-            .retain(|_, route| !(route.subscribers.is_empty() && route.remote_shards.is_empty()));
+        room.all_publisher_subscriptions
+            .local_by_topic
+            .retain(|_, subscribers| !subscribers.is_empty());
+        for route in room.data_streams.values_mut() {
+            route.local_subscribers.swap_remove(participant_id);
+        }
+        room.data_streams.retain(|_, route| !route.is_unused());
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -310,29 +376,70 @@ impl ShardRoutingTable {
         }
     }
 
-    pub fn register_data_publisher(&mut self, room_id: RoomId, topic: Topic) -> bool {
+    pub fn register_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return false;
+            return;
         };
-        let count = room.data_publisher_refcounts.entry(topic).or_insert(0);
-        let was_zero = *count == 0;
-        *count += 1;
-        was_zero
+        let all_publisher_subscribers = room
+            .all_publisher_subscriptions
+            .local_by_topic
+            .get(&topic)
+            .cloned()
+            .unwrap_or_else(fast_set);
+        let all_publisher_remote_shards = room
+            .all_publisher_subscriptions
+            .remote_by_topic
+            .get(&topic)
+            .cloned()
+            .unwrap_or_else(fast_set);
+        let route = room
+            .data_streams
+            .entry(DataStreamId::new(publisher, topic))
+            .or_insert_with(DataStreamRoute::new);
+        debug_assert!(!route.published);
+        route.published = true;
+        for subscriber in all_publisher_subscribers {
+            route.local_subscribers.insert(subscriber);
+        }
+        for shard_id in all_publisher_remote_shards {
+            route.attach_remote_subscriber_shard(shard_id);
+        }
     }
 
-    pub fn unregister_data_publisher(&mut self, room_id: RoomId, topic: &Topic) -> bool {
+    pub fn unregister_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return false;
+            return;
         };
-        if let Some(count) = room.data_publisher_refcounts.get_mut(topic) {
-            let was_one = *count == 1;
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                room.data_publisher_refcounts.remove(topic);
+        let key = DataStreamId::new(publisher, topic.clone());
+        let Some(route) = room.data_streams.get_mut(&key) else {
+            debug_assert!(false, "unregistering an unknown data stream");
+            return;
+        };
+        debug_assert!(route.published);
+        route.published = false;
+        if let Some(subscribers) = room.all_publisher_subscriptions.local_by_topic.get(topic) {
+            for subscriber in subscribers {
+                route.local_subscribers.swap_remove(subscriber);
             }
-            return was_one;
         }
-        false
+        if let Some(shard_ids) = room.all_publisher_subscriptions.remote_by_topic.get(topic) {
+            for &shard_id in shard_ids {
+                route.detach_remote_subscriber_shard(shard_id);
+            }
+        }
+        if route.is_unused() {
+            room.data_streams.remove(&key);
+        }
     }
 
     pub fn register_data_subscriber(
@@ -340,17 +447,38 @@ impl ShardRoutingTable {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     ) -> bool {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let route = room
-            .data_topics
-            .entry(topic)
-            .or_insert_with(DataTopicRoute::new);
-        let was_empty = route.subscribers.is_empty();
-        route.subscribers.insert(subscriber);
-        was_empty
+        match publisher {
+            Some(publisher) => {
+                let route = room
+                    .data_streams
+                    .entry(DataStreamId::new(publisher, topic))
+                    .or_insert_with(DataStreamRoute::new);
+                let was_empty = route.local_subscribers.is_empty();
+                route.local_subscribers.insert(subscriber);
+                was_empty
+            }
+            None => {
+                let subscribers = room
+                    .all_publisher_subscriptions
+                    .local_by_topic
+                    .entry(topic.clone())
+                    .or_insert_with(fast_set);
+                let was_empty = subscribers.is_empty();
+                let inserted = subscribers.insert(subscriber);
+                debug_assert!(inserted);
+                for (stream_id, route) in &mut room.data_streams {
+                    if route.published && stream_id.topic == topic {
+                        route.local_subscribers.insert(subscriber);
+                    }
+                }
+                was_empty
+            }
+        }
     }
 
     pub fn unregister_data_subscriber(
@@ -358,20 +486,48 @@ impl ShardRoutingTable {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: &Topic,
+        publisher: Option<ParticipantId>,
     ) -> bool {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let Some(route) = room.data_topics.get_mut(topic) else {
-            return false;
-        };
-        let was_one = route.subscribers.len() == 1 && route.subscribers.contains(&subscriber);
-        route.subscribers.swap_remove(&subscriber);
-        let no_locals = route.subscribers.is_empty();
-        if no_locals && route.remote_shards.is_empty() {
-            room.data_topics.remove(topic);
+        match publisher {
+            Some(publisher) => {
+                let key = DataStreamId::new(publisher, topic.clone());
+                let Some(route) = room.data_streams.get_mut(&key) else {
+                    return false;
+                };
+                let was_one = route.local_subscribers.len() == 1
+                    && route.local_subscribers.contains(&subscriber);
+                route.local_subscribers.swap_remove(&subscriber);
+                if route.is_unused() {
+                    room.data_streams.remove(&key);
+                }
+                was_one
+            }
+            None => {
+                let Some(subscribers) = room
+                    .all_publisher_subscriptions
+                    .local_by_topic
+                    .get_mut(topic)
+                else {
+                    return false;
+                };
+                let was_one = subscribers.len() == 1 && subscribers.contains(&subscriber);
+                subscribers.swap_remove(&subscriber);
+                if subscribers.is_empty() {
+                    room.all_publisher_subscriptions
+                        .local_by_topic
+                        .remove(topic);
+                }
+                for (stream_id, route) in &mut room.data_streams {
+                    if stream_id.topic == *topic {
+                        route.local_subscribers.swap_remove(&subscriber);
+                    }
+                }
+                was_one
+            }
         }
-        was_one
     }
 
     pub fn register_remote_data_subscriber_shard(
@@ -379,15 +535,36 @@ impl ShardRoutingTable {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        room.data_topics
-            .entry(topic)
-            .or_insert_with(DataTopicRoute::new)
-            .remote_shards
-            .insert(from_shard_id);
+        match publisher {
+            Some(publisher) => {
+                let route = room
+                    .data_streams
+                    .entry(DataStreamId::new(publisher, topic))
+                    .or_insert_with(DataStreamRoute::new);
+                route.attach_remote_subscriber_shard(from_shard_id);
+            }
+            None => {
+                let inserted = room
+                    .all_publisher_subscriptions
+                    .remote_by_topic
+                    .entry(topic.clone())
+                    .or_insert_with(fast_set)
+                    .insert(from_shard_id);
+                if !inserted {
+                    return;
+                }
+                for (stream_id, route) in &mut room.data_streams {
+                    if route.published && stream_id.topic == topic {
+                        route.attach_remote_subscriber_shard(from_shard_id);
+                    }
+                }
+            }
+        }
     }
 
     pub fn unregister_remote_data_subscriber_shard(
@@ -395,16 +572,47 @@ impl ShardRoutingTable {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: &Topic,
+        publisher: Option<ParticipantId>,
     ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let Some(route) = room.data_topics.get_mut(topic) else {
-            return;
-        };
-        route.remote_shards.swap_remove(&from_shard_id);
-        if route.subscribers.is_empty() && route.remote_shards.is_empty() {
-            room.data_topics.remove(topic);
+        match publisher {
+            Some(publisher) => {
+                let key = DataStreamId::new(publisher, topic.clone());
+                let Some(route) = room.data_streams.get_mut(&key) else {
+                    return;
+                };
+                route.detach_remote_subscriber_shard(from_shard_id);
+                if route.is_unused() {
+                    room.data_streams.remove(&key);
+                }
+            }
+            None => {
+                let removed = if let Some(shards) = room
+                    .all_publisher_subscriptions
+                    .remote_by_topic
+                    .get_mut(topic)
+                {
+                    let removed = shards.swap_remove(&from_shard_id);
+                    if shards.is_empty() {
+                        room.all_publisher_subscriptions
+                            .remote_by_topic
+                            .remove(topic);
+                    }
+                    removed
+                } else {
+                    false
+                };
+                if !removed {
+                    return;
+                }
+                for (stream_id, route) in &mut room.data_streams {
+                    if route.published && stream_id.topic == *topic {
+                        route.detach_remote_subscriber_shard(from_shard_id);
+                    }
+                }
+            }
         }
     }
 
@@ -535,19 +743,17 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let Some(route) = room.data_topics.get(topic) else {
+        let stream_id = DataStreamId::new(origin, topic.clone());
+        let Some(route) = room.data_streams.get(&stream_id) else {
             return;
         };
-
-        for &subscriber_id in &route.subscribers {
-            // if subscriber_id == origin {
-            //     continue;
-            // }
-            ctx.forward_sctp(subscriber_id, topic, pkt);
+        debug_assert!(route.published);
+        for &subscriber_id in &route.local_subscribers {
+            ctx.forward_sctp(subscriber_id, origin, topic, pkt);
         }
 
         if ctx.is_local(&origin) {
-            for &shard_id in &route.remote_shards {
+            for &shard_id in route.remote_subscriber_shards.keys() {
                 ctx.send(
                     shard_id,
                     CrossShardEvent::DataSctpPublished {
@@ -586,16 +792,15 @@ pub(crate) fn route_participant_control_event(
                 router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
             }
         }
-        ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
-            shard_events.push_back(ShardEvent::DataTopicPublished { room_id, topic });
-        }
-        ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
-            shard_events.push_back(ShardEvent::DataTopicUnpublished { room_id, topic });
+        ParticipantControlEvent::DataTopicPublished { .. }
+        | ParticipantControlEvent::DataTopicUnpublished { .. } => {
+            debug_assert!(false, "data stream lifecycle must be handled by shard core");
         }
         ParticipantControlEvent::DataTopicSubscribed {
             room_id,
             subscriber,
             topic,
+            publisher: _,
         } => {
             tracing::trace!(
                 room_id = %room_id,
@@ -608,6 +813,7 @@ pub(crate) fn route_participant_control_event(
             room_id,
             subscriber,
             topic,
+            publisher: _,
         } => {
             tracing::trace!(
                 room_id = %room_id,
@@ -671,7 +877,13 @@ mod tests {
                 .borrow_mut()
                 .push((subscriber, slot_idx));
         }
-        fn forward_sctp(&mut self, subscriber: ParticipantId, _topic: &Topic, _pkt: &[u8]) {
+        fn forward_sctp(
+            &mut self,
+            subscriber: ParticipantId,
+            _origin: ParticipantId,
+            _topic: &Topic,
+            _pkt: &[u8],
+        ) {
             self.forwarded_sctp.borrow_mut().push(subscriber);
         }
         fn notify_tracks_published(&mut self, participant_id: ParticipantId, _tracks: &[Track]) {

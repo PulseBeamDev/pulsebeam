@@ -60,21 +60,25 @@ pub enum ParticipantControlEvent {
     },
     DataTopicPublished {
         room_id: RoomId,
+        publisher: ParticipantId,
         topic: Topic,
     },
     DataTopicUnpublished {
         room_id: RoomId,
+        publisher: ParticipantId,
         topic: Topic,
     },
     DataTopicSubscribed {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     },
     DataTopicUnsubscribed {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     },
     KeyframeRequested(GlobalKeyframeRequest),
 }
@@ -188,7 +192,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn subscribe_data_topic(&mut self, topic: Topic) {
+    fn subscribe_data_topic(&mut self, topic: Topic, publisher: Option<ParticipantId>) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
@@ -196,12 +200,13 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
+                    publisher,
                 },
             ));
     }
 
     #[inline]
-    fn unsubscribe_data_topic(&mut self, topic: Topic) {
+    fn unsubscribe_data_topic(&mut self, topic: Topic, publisher: Option<ParticipantId>) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
@@ -209,6 +214,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     room_id: self.room_id,
                     subscriber: self.id,
                     topic,
+                    publisher,
                 },
             ));
     }
@@ -220,6 +226,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::DataTopicPublished {
                     room_id: self.room_id,
+                    publisher: self.id,
                     topic,
                 },
             ));
@@ -232,6 +239,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::DataTopicUnpublished {
                     room_id: self.room_id,
+                    publisher: self.id,
                     topic,
                 },
             ));

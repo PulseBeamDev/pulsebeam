@@ -28,7 +28,7 @@ use crate::participant::{
 use crate::rtp::RtpPacket;
 use crate::track::{
     self, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
-    KEYFRAME_DEBOUNCE, StreamId, StreamWrite, StreamWriter, Topic, Track,
+    KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
 };
 use str0m::rtp::RtpWrite;
 
@@ -59,6 +59,7 @@ pub struct TrackMapping {
 enum PendingFanout {
     Sctp {
         topic: Topic,
+        origin: entity::ParticipantId,
         pkt: Vec<u8>,
     },
     Keyframe {
@@ -72,6 +73,7 @@ enum PendingFanout {
 enum PendingRtcMutation {
     Sctp {
         topic: Topic,
+        origin: entity::ParticipantId,
         pkt: Vec<u8>,
     },
     Keyframe {
@@ -96,6 +98,10 @@ pub enum DisconnectReason {
     DuplicateDataChannelLabel(DataTopicChannel),
     #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
+    #[error(
+        "Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed"
+    )]
+    TooManyDataTopicChannels,
     #[error("Room closed")]
     RoomClosed,
     #[error("System terminated")]
@@ -139,7 +145,7 @@ pub struct ParticipantCore {
     track_availability: HashMap<TrackId, TrackAvailability>,
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
-    data_sub_channels: HashMap<Topic, ChannelId>,
+    data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -220,9 +226,10 @@ impl ParticipantCore {
     }
 
     #[inline]
-    pub fn on_forward_sctp(&mut self, topic: &Topic, pkt: &[u8]) {
+    pub fn on_forward_sctp(&mut self, topic: &Topic, origin: entity::ParticipantId, pkt: &[u8]) {
         self.pending_fanout.push_back(PendingFanout::Sctp {
             topic: topic.clone(),
+            origin,
             pkt: pkt.to_vec(),
         });
     }
@@ -329,9 +336,9 @@ impl ParticipantCore {
         };
 
         match work {
-            PendingFanout::Sctp { topic, pkt } => {
+            PendingFanout::Sctp { topic, origin, pkt } => {
                 self.pending_rtc_mutations
-                    .push_back(PendingRtcMutation::Sctp { topic, pkt });
+                    .push_back(PendingRtcMutation::Sctp { topic, origin, pkt });
             }
             PendingFanout::Keyframe { stream_id, kind } => {
                 self.pending_rtc_mutations
@@ -355,15 +362,16 @@ impl ParticipantCore {
         };
 
         match mutation {
-            PendingRtcMutation::Sctp { topic, pkt } => {
-                let Some(cid) = self.data_sub_channels.get(&topic).copied() else {
-                    return true;
-                };
-                let Some(mut ch) = self.rtc.channel(cid) else {
-                    return true;
-                };
-                if let Err(err) = ch.write(true, &pkt) {
-                    tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+            PendingRtcMutation::Sctp { topic, origin, pkt } => {
+                if let Some(cid) = self.data_sub_channels.get(&(topic.clone(), None)).copied() {
+                    self.write_to_data_channel(cid, &topic, &pkt);
+                }
+                if let Some(cid) = self
+                    .data_sub_channels
+                    .get(&(topic.clone(), Some(origin)))
+                    .copied()
+                {
+                    self.write_to_data_channel(cid, &topic, &pkt);
                 }
             }
             PendingRtcMutation::Keyframe { stream_id, kind } => {
@@ -372,6 +380,15 @@ impl ParticipantCore {
         }
 
         true
+    }
+
+    fn write_to_data_channel(&mut self, cid: ChannelId, topic: &Topic, pkt: &[u8]) {
+        let Some(mut ch) = self.rtc.channel(cid) else {
+            return;
+        };
+        if let Err(err) = ch.write(true, pkt) {
+            tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+        }
     }
 
     fn apply_stream_write(&mut self, write: StreamWrite) {
@@ -619,12 +636,27 @@ impl ParticipantCore {
                                 .filter(|existing| *existing != cid),
                             DataTrackDirection::Subscribe => self
                                 .data_sub_channels
-                                .get(&e.topic)
+                                .get(&(e.topic.clone(), e.scope))
                                 .copied()
                                 .filter(|existing| *existing != cid),
                         };
-                        if duplicate.is_some() {
+                        let conflicting_subscribe = e.direction == DataTrackDirection::Subscribe
+                            && match e.scope {
+                                Some(_) => self
+                                    .data_sub_channels
+                                    .contains_key(&(e.topic.clone(), None)),
+                                None => self
+                                    .data_sub_channels
+                                    .keys()
+                                    .any(|(topic, _)| *topic == e.topic),
+                            };
+                        if duplicate.is_some() || conflicting_subscribe {
                             self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
+                            return;
+                        }
+
+                        if self.data_topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
+                            self.disconnect(DisconnectReason::TooManyDataTopicChannels);
                             return;
                         }
 
@@ -635,8 +667,9 @@ impl ParticipantCore {
                                 events.publish_data_topic(e.topic);
                             }
                             DataTrackDirection::Subscribe => {
-                                self.data_sub_channels.insert(e.topic.clone(), cid);
-                                events.subscribe_data_topic(e.topic);
+                                self.data_sub_channels
+                                    .insert((e.topic.clone(), e.scope), cid);
+                                events.subscribe_data_topic(e.topic, e.scope);
                             }
                         }
                     }
@@ -906,8 +939,9 @@ impl ParticipantCore {
                 events.unpublish_data_topic(ch.topic);
             }
             DataTrackDirection::Subscribe => {
-                self.data_sub_channels.remove(&ch.topic);
-                events.unsubscribe_data_topic(ch.topic);
+                let removed = self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
+                debug_assert!(removed.is_some());
+                events.unsubscribe_data_topic(ch.topic, ch.scope);
             }
         }
     }

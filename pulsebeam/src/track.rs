@@ -393,9 +393,12 @@ pub mod test_utils {
 mod data_track {
     use std::fmt::Display;
 
+    use crate::entity::ParticipantId;
     use str0m::channel::{ChannelConfig, Reliability};
 
-    const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 64;
+    const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 96;
+
+    pub const MAX_DATA_TOPIC_CHANNELS: usize = 64;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum DataTrackDirection {
@@ -448,11 +451,17 @@ mod data_track {
     pub struct DataTopicChannel {
         pub direction: DataTrackDirection,
         pub topic: crate::track::Topic,
+        pub scope: Option<ParticipantId>,
     }
 
     impl Display for DataTopicChannel {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "v1/rt/{}/{}", self.direction, self.topic)
+            debug_assert!(self.direction == DataTrackDirection::Subscribe || self.scope.is_none());
+            write!(f, "v1/rt/{}/{}", self.direction, self.topic)?;
+            if let Some(scope) = &self.scope {
+                write!(f, "/{}", scope.as_str())?;
+            }
+            Ok(())
         }
     }
 
@@ -492,6 +501,12 @@ mod data_track {
             "The label contains illegal characters (only alphanumeric, dashes, and underscores allowed)"
         )]
         IllegalCharacters,
+
+        #[error("Scoped subscribe requires a valid participant id, got: {0}")]
+        InvalidScope(String),
+
+        #[error("Publish channels cannot carry a publisher scope segment")]
+        ScopeNotAllowedForPublish,
     }
 
     impl TryFrom<&ChannelConfig> for DataTrackIntent {
@@ -503,7 +518,7 @@ mod data_track {
                 return Err(DataTrackIntentError::LabelTooLong);
             }
 
-            let mut parts = s.splitn(4, '/');
+            let mut parts = s.splitn(5, '/');
 
             if parts.next() != Some("v1") {
                 return Err(DataTrackIntentError::InvalidVersion);
@@ -550,9 +565,29 @@ mod data_track {
                         return Err(DataTrackIntentError::IllegalCharacters);
                     }
 
+                    let scope_slice = parts.next();
+                    let scope = match (direction, scope_slice) {
+                        (DataTrackDirection::Publish, Some(_)) => {
+                            return Err(DataTrackIntentError::ScopeNotAllowedForPublish);
+                        }
+                        (DataTrackDirection::Publish, None) => None,
+                        (DataTrackDirection::Subscribe, None) => None,
+                        (DataTrackDirection::Subscribe, Some(raw)) => {
+                            if raw.is_empty() {
+                                return Err(DataTrackIntentError::InvalidScope(raw.to_string()));
+                            }
+                            Some(
+                                ParticipantId::try_from(raw.to_string()).map_err(|_| {
+                                    DataTrackIntentError::InvalidScope(raw.to_string())
+                                })?,
+                            )
+                        }
+                    };
+
                     let topic = DataTopicChannel {
                         direction,
                         topic: Topic(topic_slice.to_string()),
+                        scope,
                     };
                     Ok(Self::UserTopic(topic))
                 }
@@ -566,6 +601,14 @@ mod data_track {
         use std::ops::Deref;
 
         use super::*;
+        use pulsebeam_runtime::rand::RngCore;
+
+        fn test_rng() -> impl RngCore {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(1);
+            pulsebeam_runtime::rand::seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
+        }
+
         fn cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
                 label: label.to_string(),
@@ -604,14 +647,54 @@ mod data_track {
                 panic!("Expected UserTopic variant");
             }
 
-            // Subscribe path
             let res = DataTrackIntent::try_from(&cfg("v1/rt/sub/audio_stream_12")).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
                 assert_eq!(e.direction, DataTrackDirection::Subscribe);
                 assert_eq!(e.topic.deref(), "audio_stream_12");
+                assert_eq!(e.scope, None);
             } else {
                 panic!("Expected UserTopic variant");
             }
+        }
+
+        #[test]
+        fn test_scoped_subscribe_valid() {
+            let mut rng = test_rng();
+            let participant_id = ParticipantId::new(&mut rng);
+            let label = format!("v1/rt/sub/game-sync/{}", participant_id.as_str());
+            let res = DataTrackIntent::try_from(&cfg(&label)).unwrap();
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.direction, DataTrackDirection::Subscribe);
+                assert_eq!(e.topic.deref(), "game-sync");
+                assert_eq!(e.scope, Some(participant_id));
+            } else {
+                panic!("Expected UserTopic variant");
+            }
+        }
+
+        #[test]
+        fn test_scoped_publish_rejected() {
+            let mut rng = test_rng();
+            let participant_id = ParticipantId::new(&mut rng);
+            let label = format!("v1/rt/pub/game-sync/{}", participant_id.as_str());
+            let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
+            assert_eq!(err, DataTrackIntentError::ScopeNotAllowedForPublish);
+        }
+
+        #[test]
+        fn test_scoped_subscribe_invalid_scope() {
+            let err = DataTrackIntent::try_from(&cfg("v1/rt/sub/game-sync/not-a-participant-id"))
+                .unwrap_err();
+            assert!(matches!(err, DataTrackIntentError::InvalidScope(_)));
+        }
+
+        #[test]
+        fn test_scoped_subscribe_trailing_garbage() {
+            let mut rng = test_rng();
+            let participant_id = ParticipantId::new(&mut rng);
+            let label = format!("v1/rt/sub/game-sync/{}/trailing", participant_id.as_str());
+            let err = DataTrackIntent::try_from(&cfg(&label)).unwrap_err();
+            assert!(matches!(err, DataTrackIntentError::InvalidScope(_)));
         }
 
         #[test]
@@ -642,9 +725,8 @@ mod data_track {
 
         #[test]
         fn test_illegal_characters() {
-            // Forward slashes are caught by char check since splitn stops at 4
             let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/game/engine")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::IllegalCharacters);
+            assert_eq!(err, DataTrackIntentError::ScopeNotAllowedForPublish);
 
             // Spaces and symbols
             let err = DataTrackIntent::try_from(&cfg("v1/rt/pub/my topic")).unwrap_err();
@@ -656,12 +738,11 @@ mod data_track {
 
         #[test]
         fn test_max_length_boundary() {
-            // Exact boundary (10 bytes prefix + 54 bytes topic = 64 total)
-            let exact_valid = format!("v1/rt/pub/{}", "a".repeat(54));
+            let exact_valid = format!("v1/rt/pub/{}", "a".repeat(86));
             assert!(DataTrackIntent::try_from(&cfg(&exact_valid)).is_ok());
 
             // 1 byte over limit
-            let one_byte_over = format!("v1/rt/pub/{}", "a".repeat(55));
+            let one_byte_over = format!("v1/rt/pub/{}", "a".repeat(87));
             let err = DataTrackIntent::try_from(&cfg(&one_byte_over)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::LabelTooLong);
         }
