@@ -638,7 +638,17 @@ impl ParticipantCore {
                                 .copied()
                                 .filter(|existing| *existing != cid),
                         };
-                        if duplicate.is_some() {
+                        let conflicting_subscribe = e.direction == DataTrackDirection::Subscribe
+                            && match e.scope {
+                                Some(_) => self
+                                    .data_sub_channels
+                                    .contains_key(&(e.topic.clone(), None)),
+                                None => self
+                                    .data_sub_channels
+                                    .keys()
+                                    .any(|(topic, _)| *topic == e.topic),
+                            };
+                        if duplicate.is_some() || conflicting_subscribe {
                             self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
                             return;
                         }
@@ -656,7 +666,7 @@ impl ParticipantCore {
                             }
                             DataTrackDirection::Subscribe => {
                                 self.data_sub_channels.insert((e.topic.clone(), e.scope), cid);
-                                events.subscribe_data_topic(e.topic);
+                                events.subscribe_data_topic(e.topic, e.scope);
                             }
                         }
                     }
@@ -928,11 +938,7 @@ impl ParticipantCore {
             DataTrackDirection::Subscribe => {
                 let removed = self.data_sub_channels.remove(&(ch.topic.clone(), ch.scope));
                 debug_assert!(removed.is_some());
-                let any_remaining_scope_for_topic =
-                    self.data_sub_channels.keys().any(|(topic, _)| *topic == ch.topic);
-                if !any_remaining_scope_for_topic {
-                    events.unsubscribe_data_topic(ch.topic);
-                }
+                events.unsubscribe_data_topic(ch.topic, ch.scope);
             }
         }
     }

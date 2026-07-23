@@ -78,11 +78,13 @@ pub enum ClusterCommand {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     },
     UnsubscribeDataTopic {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     },
 }
 
@@ -141,10 +143,12 @@ pub enum ShardEvent {
     DataTopicSubscribed {
         room_id: RoomId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     },
     DataTopicUnsubscribed {
         room_id: RoomId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     },
 }
 

@@ -294,15 +294,17 @@ impl ShardCore {
                         room_id,
                         subscriber,
                         topic,
+                        publisher,
                     } => {
                         if self
                             .routing
-                            .register_data_subscriber(room_id, subscriber, topic.clone())
+                            .register_data_subscriber(room_id, subscriber, topic.clone(), publisher)
                         {
                             self.pipeline
                                 .push_shard_event(ShardEvent::DataTopicSubscribed {
                                     room_id,
                                     topic,
+                                    publisher,
                                 });
                         }
                     }
@@ -310,15 +312,17 @@ impl ShardCore {
                         room_id,
                         subscriber,
                         topic,
+                        publisher,
                     } => {
                         if self
                             .routing
-                            .unregister_data_subscriber(room_id, subscriber, &topic)
+                            .unregister_data_subscriber(room_id, subscriber, &topic, publisher)
                         {
                             self.pipeline
                                 .push_shard_event(ShardEvent::DataTopicUnsubscribed {
                                     room_id,
                                     topic,
+                                    publisher,
                                 });
                         }
                     }
@@ -499,19 +503,26 @@ impl ShardCore {
                 room_id,
                 from_shard_id,
                 topic,
+                publisher,
             } => {
-                self.routing
-                    .register_remote_data_subscriber_shard(room_id, from_shard_id, topic);
+                self.routing.register_remote_data_subscriber_shard(
+                    room_id,
+                    from_shard_id,
+                    topic,
+                    publisher,
+                );
             }
             ClusterCommand::UnsubscribeDataTopic {
                 room_id,
                 from_shard_id,
                 topic,
+                publisher,
             } => {
                 self.routing.unregister_remote_data_subscriber_shard(
                     room_id,
                     from_shard_id,
                     &topic,
+                    publisher,
                 );
             }
         }

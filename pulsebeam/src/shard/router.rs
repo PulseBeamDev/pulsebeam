@@ -73,6 +73,7 @@ pub(crate) struct ShardRoomContext {
     pub remote_shards: FastIndexSet<ShardId>,
     pub audio_selector: TopNAudioSelector,
     pub data_topics: HashMap<Topic, DataTopicRoute>,
+    pub data_streams: HashMap<(ParticipantId, Topic), DataTopicRoute>,
     pub data_publisher_refcounts: HashMap<Topic, usize>,
 }
 
@@ -83,6 +84,7 @@ impl ShardRoomContext {
             remote_shards: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
             data_topics: HashMap::default(),
+            data_streams: HashMap::default(),
             data_publisher_refcounts: HashMap::default(),
         }
     }
@@ -169,7 +171,12 @@ impl ShardRoutingTable {
         for route in room.data_topics.values_mut() {
             route.subscribers.swap_remove(participant_id);
         }
+        for route in room.data_streams.values_mut() {
+            route.subscribers.swap_remove(participant_id);
+        }
         room.data_topics
+            .retain(|_, route| !(route.subscribers.is_empty() && route.remote_shards.is_empty()));
+        room.data_streams
             .retain(|_, route| !(route.subscribers.is_empty() && route.remote_shards.is_empty()));
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
@@ -346,14 +353,21 @@ impl ShardRoutingTable {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     ) -> bool {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let route = room
-            .data_topics
-            .entry(topic)
-            .or_insert_with(DataTopicRoute::new);
+        let route = match publisher {
+            Some(publisher) => room
+                .data_streams
+                .entry((publisher, topic))
+                .or_insert_with(DataTopicRoute::new),
+            None => room
+                .data_topics
+                .entry(topic)
+                .or_insert_with(DataTopicRoute::new),
+        };
         let was_empty = route.subscribers.is_empty();
         route.subscribers.insert(subscriber);
         was_empty
@@ -364,17 +378,38 @@ impl ShardRoutingTable {
         room_id: RoomId,
         subscriber: ParticipantId,
         topic: &Topic,
+        publisher: Option<ParticipantId>,
     ) -> bool {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let Some(route) = room.data_topics.get_mut(topic) else {
+        let Some(publisher) = publisher else {
+            return Self::unregister_wildcard_data_subscriber(room, subscriber, topic);
+        };
+        let key = (publisher, topic.clone());
+        let Some(route) = room.data_streams.get_mut(&key) else {
             return false;
         };
         let was_one = route.subscribers.len() == 1 && route.subscribers.contains(&subscriber);
         route.subscribers.swap_remove(&subscriber);
         let no_locals = route.subscribers.is_empty();
         if no_locals && route.remote_shards.is_empty() {
+            room.data_streams.remove(&key);
+        }
+        was_one
+    }
+
+    fn unregister_wildcard_data_subscriber(
+        room: &mut ShardRoomContext,
+        subscriber: ParticipantId,
+        topic: &Topic,
+    ) -> bool {
+        let Some(route) = room.data_topics.get_mut(topic) else {
+            return false;
+        };
+        let was_one = route.subscribers.len() == 1 && route.subscribers.contains(&subscriber);
+        route.subscribers.swap_remove(&subscriber);
+        if route.subscribers.is_empty() && route.remote_shards.is_empty() {
             room.data_topics.remove(topic);
         }
         was_one
@@ -385,15 +420,25 @@ impl ShardRoutingTable {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: Topic,
+        publisher: Option<ParticipantId>,
     ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        room.data_topics
-            .entry(topic)
-            .or_insert_with(DataTopicRoute::new)
-            .remote_shards
-            .insert(from_shard_id);
+        match publisher {
+            Some(publisher) => room
+                .data_streams
+                .entry((publisher, topic))
+                .or_insert_with(DataTopicRoute::new)
+                .remote_shards
+                .insert(from_shard_id),
+            None => room
+                .data_topics
+                .entry(topic)
+                .or_insert_with(DataTopicRoute::new)
+                .remote_shards
+                .insert(from_shard_id),
+        };
     }
 
     pub fn unregister_remote_data_subscriber_shard(
@@ -401,16 +446,27 @@ impl ShardRoutingTable {
         room_id: RoomId,
         from_shard_id: ShardId,
         topic: &Topic,
+        publisher: Option<ParticipantId>,
     ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let Some(route) = room.data_topics.get_mut(topic) else {
+        let Some(route) = (match publisher {
+            Some(publisher) => room.data_streams.get_mut(&(publisher, topic.clone())),
+            None => room.data_topics.get_mut(topic),
+        }) else {
             return;
         };
         route.remote_shards.swap_remove(&from_shard_id);
         if route.subscribers.is_empty() && route.remote_shards.is_empty() {
-            room.data_topics.remove(topic);
+            match publisher {
+                Some(publisher) => {
+                    room.data_streams.remove(&(publisher, topic.clone()));
+                }
+                None => {
+                    room.data_topics.remove(topic);
+                }
+            }
         }
     }
 
@@ -542,7 +598,7 @@ impl ShardRoutingTable {
             return;
         };
         let Some(route) = room.data_topics.get(topic) else {
-            return;
+            return self.route_targeted_data(room_id, origin, topic, pkt, ctx);
         };
 
         for &subscriber_id in &route.subscribers {
@@ -563,6 +619,29 @@ impl ShardRoutingTable {
                         pkt: pkt.to_vec(),
                     },
                 );
+            }
+        }
+        self.route_targeted_data(room_id, origin, topic, pkt, ctx);
+    }
+
+    fn route_targeted_data(
+        &mut self,
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: &Topic,
+        pkt: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else { return };
+        let Some(route) = room.data_streams.get(&(origin, topic.clone())) else { return };
+        for &subscriber_id in &route.subscribers {
+            ctx.forward_sctp(subscriber_id, origin, topic, pkt);
+        }
+        if ctx.is_local(&origin) {
+            for &shard_id in &route.remote_shards {
+                ctx.send(shard_id, CrossShardEvent::DataSctpPublished {
+                    room_id, origin, topic: topic.clone(), pkt: pkt.to_vec(),
+                });
             }
         }
     }
@@ -602,6 +681,7 @@ pub(crate) fn route_participant_control_event(
             room_id,
             subscriber,
             topic,
+            publisher: _,
         } => {
             tracing::trace!(
                 room_id = %room_id,
@@ -614,6 +694,7 @@ pub(crate) fn route_participant_control_event(
             room_id,
             subscriber,
             topic,
+            publisher: _,
         } => {
             tracing::trace!(
                 room_id = %room_id,
