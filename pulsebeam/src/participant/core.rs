@@ -194,7 +194,7 @@ impl ParticipantCore {
             shard_id,
         };
 
-        p.on_tracks_published(&cfg.available_tracks);
+        p.on_tracks_published(&cfg.available_tracks, Instant::now());
         p
     }
 
@@ -235,7 +235,7 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
-    pub fn on_tracks_published(&mut self, tracks: &[Track]) {
+    pub fn on_tracks_published(&mut self, tracks: &[Track], now: Instant) {
         for track in tracks {
             if track.meta.origin == self.participant_id {
                 continue;
@@ -246,22 +246,22 @@ impl ParticipantCore {
                 origin = %track.meta.origin,
                 "participant received published track"
             );
-            self.downstream.add_track(track.clone());
+            self.downstream.add_track(track.clone(), now);
         }
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        self.signaling.reconcile(&mut self.downstream);
+        self.signaling.reconcile(&mut self.downstream, now);
     }
 
-    pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
+    pub fn on_tracks_unpublished(&mut self, tracks: &[TrackId], now: Instant) -> bool {
         let mut removed = false;
         for track_id in tracks {
-            removed |= self.downstream.remove_track(track_id);
+            removed |= self.downstream.remove_track(track_id, now);
         }
         if removed {
             self.signaling.mark_tracks_dirty();
             self.signaling.mark_assignments_dirty();
-            self.signaling.reconcile(&mut self.downstream);
+            self.signaling.reconcile(&mut self.downstream, now);
         }
         removed
     }
@@ -425,7 +425,7 @@ impl ParticipantCore {
 
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         'drain: loop {
-            let Some(rtc_deadline) = self.poll_rtc(events) else {
+            let Some(rtc_deadline) = self.poll_rtc(now, events) else {
                 self.cleanup_data_topics(events);
                 events.exit();
                 return;
@@ -487,7 +487,8 @@ impl ParticipantCore {
             }
 
             if self.downstream.dirty_allocation {
-                let assignments_changed = self.downstream.update_allocations(&mut self.rtc.bwe());
+                let assignments_changed =
+                    self.downstream.update_allocations(&mut self.rtc.bwe(), now);
                 if assignments_changed {
                     self.signaling.mark_assignments_dirty();
                 }
@@ -505,7 +506,7 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self, events: &mut impl ParticipantSink) -> Option<Instant> {
+    fn poll_rtc(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -548,7 +549,7 @@ impl ParticipantCore {
                         event_count += 1;
                         work_items += 1;
                     }
-                    self.handle_event(event, events);
+                    self.handle_event(now, event, events);
                 }
                 Err(e) => {
                     #[cfg(feature = "deep-metrics")]
@@ -575,12 +576,12 @@ impl ParticipantCore {
         result
     }
 
-    fn handle_event(&mut self, e: Event, events: &mut impl ParticipantSink) {
+    fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
             }
-            Event::MediaAdded(media) => self.handle_media_added(media, events),
+            Event::MediaAdded(media) => self.handle_media_added(media, now, events),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
                 if let Some(layer) = self.downstream.handle_keyframe_request(req) {
@@ -660,7 +661,7 @@ impl ParticipantCore {
                 if Some(data.id) == self.signaling.cid
                     && let Err(err) = self
                         .signaling
-                        .handle_input(&data.data, &mut self.downstream)
+                        .handle_input(&data.data, &mut self.downstream, now)
                         .map(|input_events| {
                             for input_event in input_events {
                                 self.handle_signaling_input(input_event, events);
@@ -744,7 +745,12 @@ impl ParticipantCore {
     }
 
     #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id, mid = %media.mid))]
-    fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
+    fn handle_media_added(
+        &mut self,
+        media: MediaAdded,
+        now: Instant,
+        _events: &mut impl ParticipantSink,
+    ) {
         match media.direction {
             Direction::RecvOnly => {
                 let track_id = self
@@ -785,7 +791,7 @@ impl ParticipantCore {
                 }
             }
             Direction::SendOnly => {
-                self.try_add_downstream_slot(media.mid, media.kind);
+                self.try_add_downstream_slot(media.mid, media.kind, now);
                 // Update signaling slot count AFTER adding the slot so the
                 // server accepts ClientIntent requests up to the actual slot
                 // count (previously this was called before add_slot, so the
@@ -828,7 +834,7 @@ impl ParticipantCore {
             })
     }
 
-    fn try_add_downstream_slot(&mut self, mid: Mid, kind: MediaKind) {
+    fn try_add_downstream_slot(&mut self, mid: Mid, kind: MediaKind, now: Instant) {
         if self.downstream.has_slot(kind, mid) {
             return;
         }
@@ -847,14 +853,17 @@ impl ParticipantCore {
             stream.ssrc()
         };
 
-        self.downstream.add_slot(SlotConfig {
-            mid,
-            // TODO: don't ignore simulcast receivers
-            rid: None,
-            pt,
-            ssrc,
-            kind,
-        });
+        self.downstream.add_slot(
+            SlotConfig {
+                mid,
+                // TODO: don't ignore simulcast receivers
+                rid: None,
+                pt,
+                ssrc,
+                kind,
+            },
+            now,
+        );
     }
 
     fn handle_incoming_rtp(

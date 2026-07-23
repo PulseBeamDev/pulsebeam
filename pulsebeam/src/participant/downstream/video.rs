@@ -44,9 +44,12 @@ const DRAINING_GRACE_PERIOD: Duration = Duration::from_millis(200);
 
 /// A tier switch costs a keyframe; model that one-time cost as this many
 /// seconds' worth of the target tier's steady bitrate, debited from the
-/// slot's budget ledger. A slot that just switched has a depleted budget
-/// and won't be eligible to switch again until it rebuilds it — that's the
-/// entire chatter-suppression mechanism (see `VideoAllocator::update_allocations_at`).
+/// slot's deficit counter on a real tier change or a paused→admitted
+/// transition (`resolve_climb`). A slot that just switched has a depleted
+/// deficit and won't be picked again until it rebuilds it — this damps
+/// repeated *tier* changes within an already-admitted slot. It does not
+/// govern the binary admit/pause boundary between slots; that's the
+/// quantum-gated preemption check in `VideoAllocator::update_allocations_at`.
 const BURST_COST_SECONDS: f64 = 0.5;
 
 /// The allocation ledger and decisions update at most this often, regardless
@@ -167,16 +170,16 @@ impl VideoAllocator {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) {
+    pub fn add_track(&mut self, track: Track, now: Instant) {
         if self.tracks.contains_key(&track.meta.id) {
             return;
         }
         tracing::info!(track = %track.meta.id, "video track added");
         self.tracks.insert(track.meta.id, track);
-        self.rebalance();
+        self.rebalance(now);
     }
 
-    pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
+    pub fn remove_track(&mut self, track_id: &TrackId, now: Instant) -> bool {
         if self.tracks.remove(track_id).is_none() {
             return false;
         }
@@ -193,7 +196,7 @@ impl VideoAllocator {
                 slot.stop();
             }
         }
-        self.rebalance();
+        self.rebalance(now);
         true
     }
 
@@ -201,13 +204,13 @@ impl VideoAllocator {
         self.slots.len()
     }
 
-    pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
+    pub fn configure(&mut self, intents: &HashMap<Mid, Intent>, now: Instant) {
         for (_key, slot) in self.slots.iter_mut() {
             let tracks = &mut self.tracks;
             if let Some(intent) = intents.get(&slot.mid) {
-                Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id));
+                Self::configure_slot(tracks, slot, intent.max_height, Some(&intent.track_id), now);
             } else {
-                Self::configure_slot(tracks, slot, 0, None);
+                Self::configure_slot(tracks, slot, 0, None, now);
             }
         }
     }
@@ -219,6 +222,7 @@ impl VideoAllocator {
         slot: &mut Slot,
         max_height: u32,
         track_id: Option<&TrackId>,
+        now: Instant,
     ) -> Option<()> {
         if let Some(track_id) = track_id
             && max_height > 0
@@ -242,7 +246,7 @@ impl VideoAllocator {
 
             let layer = layer.clone();
             slot.set_max_height(max_height);
-            slot.switch_to(&layer, false, Instant::now());
+            slot.switch_to(&layer, false, now);
         } else {
             slot.set_max_height(0);
             slot.stop();
@@ -272,17 +276,17 @@ impl VideoAllocator {
         self.slots.values().any(|s| s.mid == mid)
     }
 
-    pub fn add_slot(&mut self, config: SlotConfig) {
+    pub fn add_slot(&mut self, config: SlotConfig, now: Instant) {
         if self.has_slot(config.mid) {
             tracing::debug!(mid = %config.mid, "video slot already provisioned; skipping duplicate");
             return;
         }
         let slot = Slot::new(config, &mut self.rng);
         self.slots.insert(slot);
-        self.rebalance();
+        self.rebalance(now);
     }
 
-    fn rebalance(&mut self) {
+    fn rebalance(&mut self, now: Instant) {
         if self.manual_sub {
             return;
         }
@@ -327,7 +331,7 @@ impl VideoAllocator {
         {
             if let Some(track_state) = pending_tracks.next() {
                 let layer = track_state.lowest_quality();
-                slot.switch_to(layer, true, Instant::now());
+                slot.switch_to(layer, true, now);
                 staged += 1;
             } else {
                 break;
@@ -346,11 +350,7 @@ impl VideoAllocator {
         );
     }
 
-    pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, bool) {
-        self.update_allocations_at(available_bandwidth, Instant::now())
-    }
-
-    fn update_allocations_at(
+    pub fn update_allocations_at(
         &mut self,
         available_bandwidth: Bitrate,
         now: Instant,
@@ -361,7 +361,7 @@ impl VideoAllocator {
         // per-decision confirmation delay.
         let trusted_bandwidth = self.bwe_filter.update(now, clamped);
 
-        let mut views: Vec<SlotView> = self
+        let views: Vec<SlotView> = self
             .slots
             .iter()
             .filter_map(|(key, s)| {
@@ -394,11 +394,16 @@ impl VideoAllocator {
             .unwrap_or(TICK_INTERVAL);
         self.last_tick_at = Some(now);
 
-        // 1. Ledger accrual: every active slot earns its weighted share of
-        // `trusted_bandwidth` and spends whatever its current tier costs.
+        // 1. Deficit accrual (DRR-style): every slot earns its weighted share
+        // of `trusted_bandwidth` and spends whatever its current tier costs.
         // Runs for held/paused slots too — a paused slot spends nothing, so
-        // it accrues its full share as credit and naturally rises to the
-        // front of the next sort. This is what replaces `starved_ticks`.
+        // it accrues its full share as credit. Clamped at 0: a real DRR
+        // deficit counter never goes into debt while served — it idles at 0
+        // instead of accumulating an unbounded negative balance that would
+        // otherwise have to be "paid back" before the slot can be
+        // reconsidered, which is what let two overspending incumbents drift
+        // arbitrarily far apart with no bearing on the actual admission
+        // decision.
         let total_weight: f64 = views.iter().map(|v| v.weight).sum();
         for view in &views {
             let Some(slot) = self.slots.get_mut(view.key) else {
@@ -427,59 +432,45 @@ impl VideoAllocator {
             } else {
                 0.0
             };
-            slot.budget_bps += (fair_share - current_cost) * dt.as_secs_f64();
+            slot.deficit_bps =
+                (slot.deficit_bps + (fair_share - current_cost) * dt.as_secs_f64()).max(0.0);
         }
 
-        // 2. Resolve contention: most-owed slot first (CFS budget-style) so
-        // every slot converges toward its weighted-fair (`weight`) share
-        // over time, instead of a fixed max_height hierarchy that would let
-        // a bigger view claim the shared pool ahead of smaller ones on
-        // every single tick regardless of how long the smaller ones have
-        // gone underserved. Ties (equal budget) fall back to max_height,
-        // then mid, for determinism.
-        views.sort_by(|a, b| {
-            let budget_a = self.slots.get(a.key).map(|s| s.budget_bps).unwrap_or(0.0);
-            let budget_b = self.slots.get(b.key).map(|s| s.budget_bps).unwrap_or(0.0);
-            budget_b
-                .partial_cmp(&budget_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.max_height.cmp(&a.max_height))
-                .then_with(|| a.mid.cmp(&b.mid))
-        });
-
-        // 3. Greedy walk against a shared remaining-bandwidth pool. Held back
-        // by RESERVE_FRACTION — see its doc comment — so admission never
-        // plans against the full estimate.
+        // 2. DRR-style sticky admission against a shared remaining-bandwidth
+        // pool, held back by RESERVE_FRACTION — see its doc comment — so
+        // admission never plans against the full estimate.
         //
-        // Two phases, both walked in the same priority order:
-        //   a) baseline — every slot's currently-held tier (or floor) is
-        //      reserved first, so a bigger/higher-priority sibling's
-        //      appetite to climb can never bump a smaller slot off its own
-        //      stable tier, or pause it, just to make room. A slot is only
-        //      paused here if the pool can't cover every slot's baseline up
-        //      to and including it.
-        //   b) climb — only the genuine surplus left after every baseline is
-        //      committed gets contested, in the same priority order, for
-        //      upgrades beyond each slot's own baseline.
+        // Unlike a fresh global sort by instantaneous deficit (which flips
+        // the whole admission set every tick whenever two slots' deficits
+        // are close — the bang-bang instability this replaced), admission
+        // is *sticky*: last tick's Forward/Pause split (`slot.paused`,
+        // still reflecting last tick's committed decision at this point) is
+        // the starting point, and a paused challenger can only preempt an
+        // already-admitted incumbent once it has earned a full, self-scaling
+        // quantum of advantage — its own floor cost — not merely a fresher
+        // instantaneous number. Five phases, in order:
         let mut remaining = trusted_bandwidth.as_f64() * (1.0 - RESERVE_FRACTION);
         let mut decisions: HashMap<SlotKey, AllocationDecision> = HashMap::new();
-        let mut climbable: Vec<(&SlotView, &TrackLayer)> = Vec::new();
+        let mut incumbents: Vec<&SlotView> = Vec::new();
+        let mut challengers: Vec<&SlotView> = Vec::new();
 
+        // Phase 0 — a switch is a transaction carrying a PLI that a fresh
+        // decision shouldn't preempt. Reaffirm the current layer while that
+        // transaction (or its post-promotion settle window) is active; no
+        // ledger debit since nothing actually switched. This fully removes
+        // the slot from admission contention this tick — it can neither
+        // preempt nor be preempted while held. Still bounded by the same
+        // lenient affordability check `resolve_baseline` uses for its own
+        // "holding" path: without it, two slots settling at once (e.g. both
+        // just resumed from paused) would each force their cost through
+        // unconditionally, admitting more than `remaining` can actually
+        // cover for as long as both settle windows overlap, not just for
+        // one tick.
         for view in &views {
-            let Some(slot) = self.slots.get_mut(view.key) else {
+            let Some(slot) = self.slots.get(view.key) else {
                 continue;
             };
 
-            // A switch is a transaction carrying a PLI that a fresh decision
-            // shouldn't preempt. Reaffirm the current layer while that
-            // transaction (or its post-promotion settle window) is active;
-            // no ledger debit since nothing actually switched. Still bounded
-            // by the same lenient affordability check `resolve_baseline` uses
-            // for its own "holding" path: without it, two slots settling at
-            // once (e.g. both just resumed from paused) would each force
-            // their cost through unconditionally, admitting more than
-            // `remaining` can actually cover for as long as both settle
-            // windows overlap, not just for one tick.
             if slot.should_hold_allocation(now) {
                 let layer = view
                     .track
@@ -499,15 +490,132 @@ impl VideoAllocator {
                 }
             }
 
+            if slot.paused {
+                challengers.push(view);
+            } else {
+                incumbents.push(view);
+            }
+        }
+
+        let deficit_of = |v: &SlotView| self.slots.get(v.key).map(|s| s.deficit_bps).unwrap_or(0.0);
+        // Ties (equal deficit) fall back to max_height, then mid, for determinism.
+        let rank = |a: &&SlotView, b: &&SlotView| {
+            deficit_of(b)
+                .partial_cmp(&deficit_of(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.max_height.cmp(&a.max_height))
+                .then_with(|| a.mid.cmp(&b.mid))
+        };
+        incumbents.sort_by(rank);
+        challengers.sort_by(rank);
+
+        // Phase 1 — reserve every incumbent's baseline (currently-held tier,
+        // or floor) in deficit order, so a bigger/higher-priority sibling's
+        // appetite to climb can never bump a smaller incumbent off its own
+        // stable tier just to make room. A slot is only paused here if the
+        // pool can't cover its own baseline — unrelated to preemption.
+        let mut admitted: Vec<(&SlotView, &TrackLayer)> = Vec::new();
+        for view in incumbents.iter().copied() {
             match resolve_baseline(view, &mut remaining) {
                 Err(pause) => {
                     decisions.insert(view.key, pause);
                 }
-                Ok(start) => climbable.push((view, start)),
+                Ok(start) => admitted.push((view, start)),
+            }
+        }
+        let mut surviving_incumbents: Vec<&SlotView> = admitted.iter().map(|(v, _)| *v).collect();
+
+        // Phase 2 — opportunistic admission: a challenger whose own floor
+        // already fits in genuine leftover slack is admitted outright, no
+        // quantum or eviction needed — nobody loses anything, so there's no
+        // oscillation risk. This is also how a brand-new (deficit = 0) slot
+        // gets its first shot without waiting to accrue anything. Deliberately
+        // *not* `resolve_baseline`: its lenient DOWNGRADE_MARGIN threshold
+        // exists to protect an already-admitted incumbent from a transient
+        // shortfall, not to decide whether a fresh challenger gets in — reusing
+        // it here let a challenger slip in on a margin that wasn't really
+        // there, which is exactly the kind of soft over-commit the pool math
+        // is supposed to rule out.
+        let mut still_challenging: Vec<(&SlotView, AllocationDecision)> = Vec::new();
+        for view in challengers.iter().copied() {
+            let floor = view.track.cheapest_active_layer();
+            let cost = effective_cost(floor);
+            if remaining >= cost {
+                remaining -= cost;
+                admitted.push((view, floor));
+            } else {
+                still_challenging.push((
+                    view,
+                    AllocationDecision::Pause(floor, Bitrate::from(cost as u64)),
+                ));
             }
         }
 
-        for (view, start) in climbable {
+        // Phase 3 — quantum-gated preemption for whatever's still
+        // contending: the strongest remaining challenger against the
+        // weakest surviving incumbent, repeated. A challenger only preempts
+        // once its deficit exceeds the incumbent's by more than a full
+        // quantum (its own floor cost — self-scaling, not a magic
+        // duration), and only if it can actually use the capacity the
+        // eviction frees up. Bounded by min(#challengers, #incumbents)
+        // iterations: each pass either commits a swap (consuming one of
+        // each) or drops a challenger that can't currently win (consuming
+        // one).
+        loop {
+            let Some(challenger) = still_challenging.first().map(|(v, _)| *v) else {
+                break;
+            };
+            let Some(weakest) = surviving_incumbents.last().copied() else {
+                break;
+            };
+
+            let quantum = effective_cost(challenger.track.cheapest_active_layer());
+            if deficit_of(challenger) <= deficit_of(weakest) + quantum {
+                break;
+            }
+
+            let weakest_cost = admitted
+                .iter()
+                .find(|(v, _)| v.key == weakest.key)
+                .map(|(_, layer)| effective_cost(layer))
+                .unwrap_or(0.0);
+            // Trial against a scratch copy: only commit the swap — and only
+            // mutate the real `remaining`/`admitted`/`decisions` state — if
+            // the challenger can actually afford what evicting `weakest`
+            // would free up.
+            let mut trial_remaining = remaining + weakest_cost;
+            match resolve_baseline(challenger, &mut trial_remaining) {
+                Ok(start) => {
+                    remaining = trial_remaining;
+                    let floor = weakest.track.cheapest_active_layer();
+                    decisions.insert(
+                        weakest.key,
+                        AllocationDecision::Pause(
+                            floor,
+                            Bitrate::from(effective_cost(floor) as u64),
+                        ),
+                    );
+                    admitted.retain(|(v, _)| v.key != weakest.key);
+                    surviving_incumbents.pop();
+                    still_challenging.remove(0);
+                    admitted.push((challenger, start));
+                }
+                Err(_) => {
+                    let (view, pause) = still_challenging.remove(0);
+                    decisions.insert(view.key, pause);
+                }
+            }
+        }
+        for (view, pause) in still_challenging {
+            decisions.insert(view.key, pause);
+        }
+
+        // Phase 4 — every admitted slot climbs with whatever genuine
+        // surplus is left, re-sorted by deficit so a bigger admitted
+        // sibling's climb still can't starve a smaller admitted sibling's
+        // own climb.
+        admitted.sort_by(|(a, _), (b, _)| rank(a, b));
+        for (view, start) in admitted {
             let Some(slot) = self.slots.get_mut(view.key) else {
                 continue;
             };
@@ -730,11 +838,14 @@ struct Slot {
     staging_started_at: Option<Instant>,
     /// Holds ordinary allocation changes just after a promoted layer switch.
     settling_until: Option<Instant>,
-    /// Running ledger balance, bits. Positive means this slot has received
-    /// less than its fair share recently (owed credit, eligible to spend it
-    /// on an upgrade); negative means it's been costing more than its share.
-    /// See `VideoAllocator::update_allocations_at`.
-    budget_bps: f64,
+    /// DRR-style deficit counter, in accrued bits, clamped to `>= 0`. Rises
+    /// while this slot receives less than its fair share (paused, or
+    /// under-forwarding); falls while it receives more. Never goes negative
+    /// — an incumbent that's overspending its fair share simply idles at 0
+    /// rather than accruing debt. Used both to rank slots within their
+    /// incumbent/challenger group and, for a challenger, as the basis of the
+    /// quantum-gated preemption check. See `VideoAllocator::update_allocations_at`.
+    deficit_bps: f64,
     /// This slot's share of contended bandwidth relative to other slots'
     /// weights — `= max_height` today, kept in sync by `set_max_height`. A
     /// bigger requested view earns a proportionally bigger entitlement.
@@ -764,7 +875,7 @@ impl Slot {
             staging_keyframe_interval: KEYFRAME_RETRY_INTERVAL,
             staging_started_at: None,
             settling_until: None,
-            budget_bps: 0.0,
+            deficit_bps: 0.0,
             weight: 720.0,
         }
     }
@@ -896,7 +1007,7 @@ impl Slot {
         self.draining_started_at = None;
         self.settling_until = None;
         self.staging_started_at = None;
-        self.budget_bps = 0.0;
+        self.deficit_bps = 0.0;
         self.pli_reset();
     }
 
@@ -1171,11 +1282,6 @@ impl AllocationEngine {
     }
 }
 
-/// Decide `slot`'s target layer against the bandwidth left in the shared
-/// tick-wide pool (`remaining`), and update its ledger accordingly. Called in
-/// budget-descending order by `VideoAllocator::update_allocations_at`, so
-/// `remaining` already reflects what higher-priority slots claimed first.
-///
 /// The cost of holding `layer`, for admission math. Never the raw live
 /// `bitrate_bps()` alone — VBR content (screen share especially) can
 /// legitimately swing that reading by 2-4x from one poll to the next with
@@ -1199,7 +1305,7 @@ fn effective_cost(layer: &TrackLayer) -> f64 {
 
 /// Climbs from `start` one tier at a time, stopping at the first tier
 /// that's ineligible, unhealthy, unaffordable, or (only once climbing
-/// *above* `view.current_quality`) not yet budget-earned.
+/// *above* `view.current_quality`) not yet deficit-earned.
 ///
 /// `surplus` must already exclude `start`'s own cost — it's the bandwidth
 /// available purely for stepping *above* `start`, not the full pool. This
@@ -1244,7 +1350,7 @@ fn climb_from<'a>(
         }
         if quality > view.current_quality {
             let burst = next_cost * BURST_COST_SECONDS;
-            if slot.budget_bps < burst {
+            if slot.deficit_bps < burst {
                 break; // hasn't earned this upgrade yet
             }
         }
@@ -1327,7 +1433,7 @@ fn resolve_climb<'a>(
     // but the deficit must not propagate as a negative value to subsequent slots.
     *remaining = (*remaining - (chosen_cost - start_cost)).max(0.0);
     if chosen.quality != view.current_quality || resumed_from_pause {
-        slot.budget_bps -= chosen_cost * BURST_COST_SECONDS;
+        slot.deficit_bps = (slot.deficit_bps - chosen_cost * BURST_COST_SECONDS).max(0.0);
     }
     AllocationDecision::Forward(chosen, Bitrate::from(chosen_cost as u64))
 }
@@ -1613,11 +1719,14 @@ mod assignment_tests {
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        allocator.add_track(Track {
-            meta: sender.meta,
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: sender.meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let slot = allocator.slots.values().next().unwrap();
         assert_eq!(
@@ -1627,7 +1736,7 @@ mod assignment_tests {
         );
 
         // A generous bandwidth reading arrives before the first keyframe.
-        allocator.update_allocations(Bitrate::mbps(10));
+        allocator.update_allocations_at(Bitrate::mbps(10), Instant::now());
 
         let slot = allocator.slots.values().next().unwrap();
         assert_eq!(
@@ -1723,7 +1832,7 @@ mod assignment_tests {
         let mut slot = Slot::new(SlotConfig::default(), &mut test_rng());
         slot.set_max_height(720);
         // Give it plenty of ledger credit and let it upgrade once.
-        slot.budget_bps = 10_000_000.0;
+        slot.deficit_bps = 10_000_000.0;
         let view = SlotView {
             key: SlotMap::<SlotKey, ()>::with_key().insert(()),
             mid: slot.mid,
@@ -1733,14 +1842,14 @@ mod assignment_tests {
             weight: slot.weight,
         };
         let mut remaining = f64::MAX;
-        let before = slot.budget_bps;
+        let before = slot.deficit_bps;
         let decision = decide_tier(&mut slot, &view, &mut remaining);
         assert!(
             matches!(decision, AllocationDecision::Forward(l, _) if l.quality > LayerQuality::Low),
             "expected an upgrade with ample budget and bandwidth"
         );
         assert!(
-            slot.budget_bps < before,
+            slot.deficit_bps < before,
             "a real switch must debit the ledger"
         );
     }
@@ -1774,10 +1883,10 @@ mod assignment_tests {
         // Simulate several ticks of ledger accrual while paused (cost=0).
         let fair_share = 500_000.0;
         for _ in 0..5 {
-            slot.budget_bps += fair_share * TICK_INTERVAL.as_secs_f64();
+            slot.deficit_bps += fair_share * TICK_INTERVAL.as_secs_f64();
         }
         assert!(
-            slot.budget_bps > 0.0,
+            slot.deficit_bps > 0.0,
             "a paused slot must accrue credit over time instead of just aging a counter"
         );
     }
@@ -1814,11 +1923,14 @@ mod assignment_tests {
             .unwrap()
             .state
             .nominal_bitrate_bps();
-        allocator.add_track(Track {
-            meta: sender.meta,
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: sender.meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let mut rng = seeded_rng(0x5EED_F1A9);
         let mut now = Instant::now();
@@ -1912,12 +2024,15 @@ mod assignment_tests {
                 layer.state.update_for_test().inactive(false);
             }
             ids.push(tx.meta.id);
-            allocator.add_track(Track {
-                meta: tx.meta,
-                layers: track.layers,
-            });
+            allocator.add_track(
+                Track {
+                    meta: tx.meta,
+                    layers: track.layers,
+                },
+                Instant::now(),
+            );
         }
-        add_slots(&mut allocator, 3);
+        add_slots(&mut allocator, 3, Instant::now());
 
         // Only enough for a bit more than one Low layer at a time.
         let low_bps = {
@@ -1979,11 +2094,14 @@ mod assignment_tests {
             .unwrap()
             .state
             .bitrate_bps();
-        allocator.add_track(Track {
-            meta: sender.meta,
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: sender.meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         // A fixed, dedicated seed (not `test_rng()`'s shared atomic
         // counter) so this test's noise trace — and its switch count — is
@@ -2055,8 +2173,8 @@ mod assignment_tests {
     #[test]
     fn constant_conditions_converge_to_no_further_switches() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
+        let tracks = add_tracks(&mut allocator, 3, Instant::now());
+        add_slots(&mut allocator, 3, Instant::now());
         for id in &tracks.ids {
             for layer in &allocator.tracks.get(id).unwrap().layers {
                 layer.state.update_for_test().inactive(false);
@@ -2111,11 +2229,14 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let track_id = sender.meta.id;
-        allocator.add_track(Track {
-            meta: sender.meta,
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: sender.meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let high = {
             let track = allocator.tracks.get(&track_id).unwrap();
@@ -2172,11 +2293,14 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let track_id = sender.meta.id;
-        allocator.add_track(Track {
-            meta: sender.meta,
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: sender.meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let (medium, high) = {
             let track = allocator.tracks.get(&track_id).unwrap();
@@ -2240,11 +2364,14 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let track_id = sender.meta.id;
-        allocator.add_track(Track {
-            meta: sender.meta,
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: sender.meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let high = {
             let track = allocator.tracks.get(&track_id).unwrap();
@@ -2287,7 +2414,7 @@ mod assignment_tests {
         );
     }
 
-    fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {
+    fn add_tracks(allocator: &mut VideoAllocator, count: usize, now: Instant) -> TestTracks {
         let pid = ParticipantId::new(&mut test_rng());
 
         let mut senders = Vec::new();
@@ -2304,41 +2431,47 @@ mod assignment_tests {
             }
 
             ids.push(meta.id);
-            allocator.add_track(Track {
-                meta,
-                layers: track.layers,
-            });
+            allocator.add_track(
+                Track {
+                    meta,
+                    layers: track.layers,
+                },
+                now,
+            );
             senders.push(tx);
         }
 
         TestTracks { senders, ids }
     }
 
-    fn add_slots(allocator: &mut VideoAllocator, count: usize) {
+    fn add_slots(allocator: &mut VideoAllocator, count: usize, now: Instant) {
         for i in 0..count {
-            allocator.add_slot(SlotConfig {
-                mid: Mid::from(&format!("s{i}")[..]),
-                ..SlotConfig::default()
-            });
+            allocator.add_slot(
+                SlotConfig {
+                    mid: Mid::from(&format!("s{i}")[..]),
+                    ..SlotConfig::default()
+                },
+                now,
+            );
         }
     }
 
     #[test]
     fn rebalance_assigns_tracks_to_slots() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
+        let _tracks = add_tracks(&mut allocator, 3, Instant::now());
+        add_slots(&mut allocator, 3, Instant::now());
         assert_eq!(allocator.slots().count(), 3);
     }
 
     #[test]
     fn configure_all_slots_after_idle() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
+        let tracks = add_tracks(&mut allocator, 3, Instant::now());
+        add_slots(&mut allocator, 3, Instant::now());
 
         // Empty intent should idle all slots.
-        allocator.configure(&HashMap::new());
+        allocator.configure(&HashMap::new(), Instant::now());
         assert_eq!(allocator.slots().count(), 0);
 
         // Re-activate all slots.
@@ -2365,17 +2498,17 @@ mod assignment_tests {
             },
         );
 
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
         assert_eq!(allocator.slots().count(), 3);
     }
 
     #[test]
     fn configure_missing_requested_track_stops_slot() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 1);
+        let _tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
 
-        allocator.rebalance();
+        allocator.rebalance(Instant::now());
 
         let missing_track_id = ParticipantId::new(&mut test_rng())
             .derive_track_id(TrackKind::Video, &Mid::from("missing"));
@@ -2388,7 +2521,7 @@ mod assignment_tests {
             },
         );
 
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
         assert!(
             allocator
                 .slots
@@ -2400,24 +2533,24 @@ mod assignment_tests {
     #[test]
     fn more_tracks_than_slots() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 5);
-        add_slots(&mut allocator, 2);
+        let _tracks = add_tracks(&mut allocator, 5, Instant::now());
+        add_slots(&mut allocator, 2, Instant::now());
         assert_eq!(allocator.slots().count(), 2);
     }
 
     #[test]
     fn tracks_before_slots() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 2);
-        add_slots(&mut allocator, 2);
+        let _tracks = add_tracks(&mut allocator, 2, Instant::now());
+        add_slots(&mut allocator, 2, Instant::now());
         assert_eq!(allocator.slots().count(), 2);
     }
 
     #[test]
     fn route_subscription_initializes_keyframe_retry_state() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
 
         let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let low = track.lowest_quality().clone();
@@ -2460,11 +2593,14 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let track_id = tx.meta.id;
-        allocator.add_track(Track {
-            meta: tx.meta.clone(),
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: tx.meta.clone(),
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let track = allocator.tracks.get(&track_id).unwrap();
         let low = track.lowest_quality().clone();
@@ -2500,8 +2636,8 @@ mod assignment_tests {
     #[test]
     fn route_removed_only_when_slot_has_no_active_or_staging_target() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
 
         let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let old_stream_id = track.lowest_quality().stream_id();
@@ -2526,8 +2662,8 @@ mod assignment_tests {
     #[test]
     fn reconcile_routes_corrects_invalid_route_slot_mapping() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 2);
+        let tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 2, Instant::now());
 
         let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let low = track.lowest_quality().clone();
@@ -2562,11 +2698,14 @@ mod assignment_tests {
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        allocator.add_track(Track {
-            meta: tx.meta.clone(),
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: tx.meta.clone(),
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let track = allocator.tracks.get(&tx.meta.id).unwrap();
         let high = track.by_quality(LayerQuality::High).unwrap().clone();
@@ -2617,11 +2756,14 @@ mod assignment_tests {
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        allocator.add_track(Track {
-            meta: track.meta.clone(),
-            layers: track.layers,
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: track.meta.clone(),
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
         let track = allocator.tracks.get(&track.meta.id).unwrap();
         let old_layer = track.by_quality(LayerQuality::High).unwrap().clone();
@@ -2700,36 +2842,37 @@ mod assignment_tests {
     #[test]
     fn removing_track_releases_slot() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
         assert_eq!(allocator.slots().count(), 1);
-        allocator.remove_track(&tracks.ids[0]);
+        allocator.remove_track(&tracks.ids[0], Instant::now());
         assert_eq!(allocator.slots().count(), 0);
     }
 
     #[test]
     fn multiple_slot_candidates_exist() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
+        let _tracks = add_tracks(&mut allocator, 3, Instant::now());
+        add_slots(&mut allocator, 3, Instant::now());
         assert_eq!(allocator.slots().count(), 3);
     }
 
     #[test]
     fn allocator_returns_positive_desired_bitrate() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 1);
+        let _tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
 
-        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000));
+        let (desired, _) =
+            allocator.update_allocations_at(Bitrate::from(5_000_000), Instant::now());
         assert!(desired.as_f64() > 0.0);
     }
 
     #[test]
     fn switch_to_same_active_layer_is_idempotent() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
 
         let track_id = tracks.ids[0];
         let layer = allocator
@@ -2770,7 +2913,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_slot(SlotConfig::default());
+        allocator.add_slot(SlotConfig::default(), Instant::now());
         let slot = allocator.slots.values_mut().next().unwrap();
         let staging = track.by_quality(LayerQuality::Medium).unwrap().clone();
         let new_stage = track.by_quality(LayerQuality::High).unwrap().clone();
@@ -2806,7 +2949,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_slot(SlotConfig::default());
+        allocator.add_slot(SlotConfig::default(), Instant::now());
         let slot = allocator.slots.values_mut().next().unwrap();
         let active = track.by_quality(LayerQuality::Low).unwrap().clone();
         let staging = track.by_quality(LayerQuality::High).unwrap().clone();
@@ -2843,7 +2986,7 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_slot(SlotConfig::default());
+        allocator.add_slot(SlotConfig::default(), Instant::now());
         let slot = allocator.slots.values_mut().next().unwrap();
         let staging = track.by_quality(LayerQuality::High).unwrap().clone();
         let new_stage = track.by_quality(LayerQuality::Low).unwrap().clone();
@@ -2862,8 +3005,8 @@ mod assignment_tests {
     #[test]
     fn force_switch_to_different_track_clears_active_immediately() {
         let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 2);
-        add_slots(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 2, Instant::now());
+        add_slots(&mut allocator, 1, Instant::now());
 
         let t0 = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let t1 = allocator.tracks.get(&tracks.ids[1]).unwrap();
@@ -2895,8 +3038,8 @@ mod assignment_tests {
     fn no_double_assignment_after_staging_promoted_to_active() {
         let mut allocator = setup_allocator();
         // 4 senders publishing into a 5-person room → 4 tracks, 7 recv slots.
-        let tracks = add_tracks(&mut allocator, 4);
-        add_slots(&mut allocator, 7);
+        let tracks = add_tracks(&mut allocator, 4, Instant::now());
+        add_slots(&mut allocator, 7, Instant::now());
 
         // Manually promote every staged slot to Stable (simulate the normal
         // on_rtp path that sets active = staging.take()).
@@ -2908,10 +3051,13 @@ mod assignment_tests {
 
         // Adding a new slot triggers rebalance().  Before the fix this would
         // double-assign the active tracks into the newly-idle slots.
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("extra"),
-            ..SlotConfig::default()
-        });
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("extra"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
 
         // Every track must appear in at most one slot.
         assert!(
@@ -2946,8 +3092,8 @@ mod assignment_tests {
     #[test]
     fn no_double_assignment_when_new_track_added_after_stabilisation() {
         let mut allocator = setup_allocator();
-        let existing = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 7);
+        let existing = add_tracks(&mut allocator, 3, Instant::now());
+        add_slots(&mut allocator, 7, Instant::now());
 
         // Promote all staged slots to Stable.
         for slot in allocator.slots.values_mut() {
@@ -2962,10 +3108,13 @@ mod assignment_tests {
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
         }
-        allocator.add_track(Track {
-            meta: tx.meta.clone(),
-            layers: track.layers,
-        });
+        allocator.add_track(
+            Track {
+                meta: tx.meta.clone(),
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
 
         assert!(
             allocator.no_duplicate_slot_assignments(),
@@ -2989,9 +3138,9 @@ mod assignment_tests {
     #[test]
     fn allocator_handles_track_churn() {
         let mut allocator = setup_allocator();
-        let mut tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
-        allocator.remove_track(&tracks.ids[1]);
+        let mut tracks = add_tracks(&mut allocator, 3, Instant::now());
+        add_slots(&mut allocator, 3, Instant::now());
+        allocator.remove_track(&tracks.ids[1], Instant::now());
         let pid = ParticipantId::new(&mut test_rng());
         let (tx, track) = make_video_track(pid, Mid::from("new_track"), vec![]);
         for layer in &track.layers {
@@ -2999,10 +3148,13 @@ mod assignment_tests {
         }
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
-        allocator.add_track(Track {
-            meta,
-            layers: track.layers,
-        });
+        allocator.add_track(
+            Track {
+                meta,
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
         assert_eq!(allocator.slots().count(), 3);
     }
 
@@ -3024,13 +3176,16 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
 
-        allocator.add_track(Track {
-            meta: tx.meta.clone(),
-            layers: track.layers.clone(),
-        });
-        add_slots(&mut allocator, 1);
+        allocator.add_track(
+            Track {
+                meta: tx.meta.clone(),
+                layers: track.layers.clone(),
+            },
+            Instant::now(),
+        );
+        add_slots(&mut allocator, 1, Instant::now());
 
-        allocator.rebalance();
+        allocator.rebalance(Instant::now());
         let upgraded_layer = track
             .by_quality(LayerQuality::Medium)
             .expect("track should have an upgrade layer")
@@ -3057,7 +3212,7 @@ mod assignment_tests {
     /// With bandwidth only enough for one stream at the Low tier, the
     /// biggest subscriber holds while smaller ones are paused. All three
     /// slots use the same 3-layer source track so their floor cost (Low =
-    /// 150kbps) is identical, and all start this tick at budget_bps=0: the
+    /// 150kbps) is identical, and all start this tick at deficit_bps=0: the
     /// sort is budget-first (CFS), but on a fresh tick where every slot pays
     /// the *same* current_cost, a bigger `weight` (= max_height) earns a
     /// proportionally bigger `fair_share` and therefore accrues more ledger
@@ -3104,31 +3259,49 @@ mod assignment_tests {
         let id_a = track_a.meta.id;
         let id_b = track_b.meta.id;
         let id_c = track_c.meta.id;
-        allocator.add_track(Track {
-            meta: track_a.meta.clone(),
-            layers: track_a.layers,
-        });
-        allocator.add_track(Track {
-            meta: track_b.meta.clone(),
-            layers: track_b.layers,
-        });
-        allocator.add_track(Track {
-            meta: track_c.meta.clone(),
-            layers: track_c.layers,
-        });
+        allocator.add_track(
+            Track {
+                meta: track_a.meta.clone(),
+                layers: track_a.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_b.meta.clone(),
+                layers: track_b.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_c.meta.clone(),
+                layers: track_c.layers,
+            },
+            Instant::now(),
+        );
 
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s720"),
-            ..SlotConfig::default()
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s360"),
-            ..SlotConfig::default()
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s180"),
-            ..SlotConfig::default()
-        });
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s720"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s360"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s180"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
 
         let mut intents = HashMap::new();
         intents.insert(
@@ -3152,7 +3325,7 @@ mod assignment_tests {
                 max_height: 180,
             },
         );
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
 
         // Promote all slots to active at Low quality so should_hold_allocation returns
         // false — configure() leaves them in staging, which bypasses decide_tier entirely
@@ -3233,11 +3406,10 @@ mod assignment_tests {
     }
 
     /// Two equal-priority slots sharing a pool that can only fit one of
-    /// them at a time must not trade places every tick. A paused slot
-    /// accrues its full fair share at zero cost (see the ledger accrual
-    /// loop in `update_allocations_at`), so it out-earns whichever sibling
-    /// is currently active within a couple of ticks unless resuming pays
-    /// the same one-time burst debit a real tier change does -- without
+    /// them at a time must not trade places every tick. Admission is
+    /// sticky (see `update_allocations_at`'s phases): a paused challenger
+    /// only preempts the active incumbent once its accrued deficit clears a
+    /// full quantum of advantage, not the instant it edges ahead -- without
     /// that, the two slots would swap who's active every single tick, a
     /// real defect a viewer would see as constant pause/resume flicker.
     #[test]
@@ -3271,31 +3443,49 @@ mod assignment_tests {
         let id_a = track_a.meta.id;
         let id_b = track_b.meta.id;
         let id_c = track_c.meta.id;
-        allocator.add_track(Track {
-            meta: track_a.meta.clone(),
-            layers: track_a.layers,
-        });
-        allocator.add_track(Track {
-            meta: track_b.meta.clone(),
-            layers: track_b.layers,
-        });
-        allocator.add_track(Track {
-            meta: track_c.meta.clone(),
-            layers: track_c.layers,
-        });
+        allocator.add_track(
+            Track {
+                meta: track_a.meta.clone(),
+                layers: track_a.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_b.meta.clone(),
+                layers: track_b.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_c.meta.clone(),
+                layers: track_c.layers,
+            },
+            Instant::now(),
+        );
 
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s720"),
-            ..SlotConfig::default()
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("sB180"),
-            ..SlotConfig::default()
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("sC180"),
-            ..SlotConfig::default()
-        });
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s720"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("sB180"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("sC180"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
 
         let mut intents = HashMap::new();
         intents.insert(
@@ -3319,7 +3509,7 @@ mod assignment_tests {
                 max_height: 180,
             },
         );
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
 
         let low_a = allocator
             .tracks
@@ -3368,16 +3558,18 @@ mod assignment_tests {
         let mut b_transitions = 0u32;
         let mut c_transitions = 0u32;
 
-        for i in 0..60 {
+        for _ in 0..200 {
             allocator.update_allocations_at(tight_bandwidth, now);
-            let b = allocator.slots.values().find(|s| s.mid == Mid::from("sB180")).unwrap();
-            let c = allocator.slots.values().find(|s| s.mid == Mid::from("sC180")).unwrap();
-            if b.paused != b_was_paused || c.paused != c_was_paused {
-                eprintln!(
-                    "DIAG tick={i} b_paused={} b_budget={:.0} c_paused={} c_budget={:.0}",
-                    b.paused, b.budget_bps, c.paused, c.budget_bps
-                );
-            }
+            let b = allocator
+                .slots
+                .values()
+                .find(|s| s.mid == Mid::from("sB180"))
+                .unwrap();
+            let c = allocator
+                .slots
+                .values()
+                .find(|s| s.mid == Mid::from("sC180"))
+                .unwrap();
             let b_paused = b.paused;
             let c_paused = c.paused;
             if b_paused != b_was_paused {
@@ -3391,10 +3583,635 @@ mod assignment_tests {
             now += TICK_INTERVAL;
         }
 
+        // A paused challenger needs its own floor cost (150kbps) worth of
+        // deficit, earned at its fair share (50kbps), to clear the quantum
+        // gate against a pinned-at-0 incumbent -- about 3s per swap, ~6-7
+        // over this 20s window. The floor here is well above that (bang-bang
+        // admission produced 180+/200) so this only fails if the quantum
+        // gate stops working, not from ordinary rotation cadence.
         assert!(
-            b_transitions <= 2 && c_transitions <= 2,
+            b_transitions <= 10 && c_transitions <= 10,
             "equal-priority slots blipped between paused and active too often over 20s: \
              sB180 transitioned {b_transitions} times, sC180 transitioned {c_transitions} times"
+        );
+    }
+
+    /// Builds two equal-weight (180p) slots, `sB` and `sC`, each routed to
+    /// its own healthy track, both starting active/unpaused at their own
+    /// Low tier with a zeroed deficit. Callers directly poke `paused`/
+    /// `deficit_bps` to stage a specific incumbent/challenger scenario
+    /// before calling `update_allocations_at`, mirroring
+    /// `equal_priority_slots_do_not_blip_between_paused_and_active`'s setup
+    /// but factored out for the more targeted quantum-gate tests below.
+    fn setup_two_equal_slots() -> (VideoAllocator, TrackId, TrackId) {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new(&mut test_rng());
+
+        // Distinct `Mid`s: `derive_track_id` is keyed by (participant, mid),
+        // so two tracks sharing a `Mid` under the same test-local `pid`
+        // collapse into the *same* `TrackId` (`add_track` then silently
+        // no-ops the second one) -- fine when every track is mutated
+        // identically, but fatal for tests that need genuinely independent
+        // per-track layer state.
+        let make_track = |mid_str: &str| {
+            make_video_track(
+                pid,
+                Mid::from(mid_str),
+                vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ],
+            )
+        };
+        let (_, track_b) = make_track("vB");
+        let (_, track_c) = make_track("vC");
+        for layer in track_b.layers.iter().chain(track_c.layers.iter()) {
+            layer.state.update_for_test().inactive(false);
+        }
+
+        let id_b = track_b.meta.id;
+        let id_c = track_c.meta.id;
+        allocator.add_track(
+            Track {
+                meta: track_b.meta.clone(),
+                layers: track_b.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_c.meta.clone(),
+                layers: track_c.layers,
+            },
+            Instant::now(),
+        );
+
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("sB"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("sC"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("sB"),
+            Intent {
+                track_id: id_b,
+                max_height: 180,
+            },
+        );
+        intents.insert(
+            Mid::from("sC"),
+            Intent {
+                track_id: id_c,
+                max_height: 180,
+            },
+        );
+        allocator.configure(&intents, Instant::now());
+
+        let low_b = allocator
+            .tracks
+            .get(&id_b)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+        let low_c = allocator
+            .tracks
+            .get(&id_c)
+            .unwrap()
+            .by_quality(LayerQuality::Low)
+            .unwrap()
+            .clone();
+        for slot in allocator.slots.values_mut() {
+            let layer = if slot.mid == Mid::from("sB") {
+                low_b.clone()
+            } else {
+                low_c.clone()
+            };
+            slot.active = Some(layer);
+            slot.staging = None;
+            slot.settling_until = None;
+            slot.staging_started_at = None;
+            slot.paused = false;
+            slot.deficit_bps = 0.0;
+        }
+
+        (allocator, id_b, id_c)
+    }
+
+    fn floor_cost_of(allocator: &VideoAllocator, mid: Mid) -> f64 {
+        let slot = allocator.slots.values().find(|s| s.mid == mid).unwrap();
+        effective_cost(slot.active.as_ref().unwrap())
+    }
+
+    /// A pool tight enough that only one of two equal-weight floors fits,
+    /// mirroring the pool math the blip regression test above uses.
+    fn tight_pool_for_one_floor(floor_cost: f64) -> Bitrate {
+        Bitrate::from(((floor_cost / (1.0 - RESERVE_FRACTION)) * 1.3) as u64)
+    }
+
+    #[test]
+    fn challenger_does_not_preempt_incumbent_before_earning_a_full_quantum() {
+        let (mut allocator, _id_b, _id_c) = setup_two_equal_slots();
+        let floor_cost = floor_cost_of(&allocator, Mid::from("sB"));
+        let tight = tight_pool_for_one_floor(floor_cost);
+
+        for slot in allocator.slots.values_mut() {
+            if slot.mid == Mid::from("sC") {
+                slot.paused = true;
+                // Comfortably below the quantum (the incumbent sits at a
+                // deficit of ~0, so the bar is ~floor_cost).
+                slot.deficit_bps = floor_cost * 0.5;
+            }
+        }
+
+        allocator.update_allocations_at(tight, Instant::now());
+
+        let b = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sB"))
+            .unwrap();
+        let c = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sC"))
+            .unwrap();
+        assert!(
+            !b.paused,
+            "incumbent must keep its spot: challenger hasn't earned a full quantum yet"
+        );
+        assert!(
+            c.paused,
+            "a challenger below the quantum threshold must not preempt the incumbent"
+        );
+    }
+
+    #[test]
+    fn challenger_preempts_incumbent_once_deficit_exceeds_quantum() {
+        let (mut allocator, _id_b, _id_c) = setup_two_equal_slots();
+        let floor_cost = floor_cost_of(&allocator, Mid::from("sB"));
+        let tight = tight_pool_for_one_floor(floor_cost);
+
+        for slot in allocator.slots.values_mut() {
+            if slot.mid == Mid::from("sC") {
+                slot.paused = true;
+                // Comfortably above the quantum.
+                slot.deficit_bps = floor_cost * 2.0;
+            }
+        }
+
+        allocator.update_allocations_at(tight, Instant::now());
+
+        let b = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sB"))
+            .unwrap();
+        let c = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sC"))
+            .unwrap();
+        assert!(
+            b.paused,
+            "incumbent must yield once the challenger has cleared a full quantum"
+        );
+        assert!(
+            !c.paused,
+            "challenger must be admitted once it wins preemption"
+        );
+        assert!(
+            c.deficit_bps < floor_cost * 1.8,
+            "the winning challenger must pay the same resume-burst debit a real tier \
+             change does (deficit_bps={}), or it would immediately out-earn the slot \
+             it just displaced and the two would trade places right back next tick",
+            c.deficit_bps
+        );
+    }
+
+    /// Two challengers contending for one incumbent's spot: only the
+    /// strictly stronger one wins, and the loop doesn't double-swap or
+    /// thrash within the same tick.
+    #[test]
+    fn preemption_generalizes_across_multiple_simultaneous_challengers() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new(&mut test_rng());
+        let make_track = |mid_str: &str| {
+            make_video_track(
+                pid,
+                Mid::from(mid_str),
+                vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ],
+            )
+        };
+        let (_, track_a) = make_track("vA");
+        let (_, track_b) = make_track("vB");
+        let (_, track_c) = make_track("vC");
+        for layer in track_a
+            .layers
+            .iter()
+            .chain(track_b.layers.iter())
+            .chain(track_c.layers.iter())
+        {
+            layer.state.update_for_test().inactive(false);
+        }
+        let id_a = track_a.meta.id;
+        let id_b = track_b.meta.id;
+        let id_c = track_c.meta.id;
+        for (mid, track) in [
+            (
+                Mid::from("sA"),
+                Track {
+                    meta: track_a.meta.clone(),
+                    layers: track_a.layers,
+                },
+            ),
+            (
+                Mid::from("sB"),
+                Track {
+                    meta: track_b.meta.clone(),
+                    layers: track_b.layers,
+                },
+            ),
+            (
+                Mid::from("sC"),
+                Track {
+                    meta: track_c.meta.clone(),
+                    layers: track_c.layers,
+                },
+            ),
+        ] {
+            allocator.add_track(track, Instant::now());
+            allocator.add_slot(
+                SlotConfig {
+                    mid,
+                    ..SlotConfig::default()
+                },
+                Instant::now(),
+            );
+        }
+
+        let mut intents = HashMap::new();
+        for (mid, track_id) in [
+            (Mid::from("sA"), id_a),
+            (Mid::from("sB"), id_b),
+            (Mid::from("sC"), id_c),
+        ] {
+            intents.insert(
+                mid,
+                Intent {
+                    track_id,
+                    max_height: 180,
+                },
+            );
+        }
+        allocator.configure(&intents, Instant::now());
+
+        let low_of = |allocator: &VideoAllocator, id| {
+            allocator
+                .tracks
+                .get(&id)
+                .unwrap()
+                .by_quality(LayerQuality::Low)
+                .unwrap()
+                .clone()
+        };
+        let low_a = low_of(&allocator, id_a);
+        let low_b = low_of(&allocator, id_b);
+        let low_c = low_of(&allocator, id_c);
+        for slot in allocator.slots.values_mut() {
+            let layer = if slot.mid == Mid::from("sA") {
+                low_a.clone()
+            } else if slot.mid == Mid::from("sB") {
+                low_b.clone()
+            } else {
+                low_c.clone()
+            };
+            slot.active = Some(layer);
+            slot.staging = None;
+            slot.settling_until = None;
+            slot.staging_started_at = None;
+            slot.paused = slot.mid != Mid::from("sA");
+            slot.deficit_bps = 0.0;
+        }
+
+        let floor_cost = floor_cost_of(&allocator, Mid::from("sA"));
+        let tight = tight_pool_for_one_floor(floor_cost);
+        for slot in allocator.slots.values_mut() {
+            if slot.mid == Mid::from("sB") {
+                slot.deficit_bps = floor_cost * 3.0; // strongest challenger
+            } else if slot.mid == Mid::from("sC") {
+                slot.deficit_bps = floor_cost * 2.0; // also clears the quantum, but weaker
+            }
+        }
+
+        allocator.update_allocations_at(tight, Instant::now());
+
+        let get = |mid| {
+            allocator
+                .slots
+                .values()
+                .find(|s| s.mid == mid)
+                .unwrap()
+                .paused
+        };
+        assert!(
+            get(Mid::from("sA")),
+            "the incumbent must yield to the stronger challenger"
+        );
+        assert!(
+            !get(Mid::from("sB")),
+            "the strictly stronger challenger must win"
+        );
+        assert!(
+            get(Mid::from("sC")),
+            "the weaker challenger must not also be admitted in the same tick \
+             (only one slot fits the pool)"
+        );
+    }
+
+    #[test]
+    fn new_slot_is_admitted_immediately_into_genuine_slack_without_earning_a_quantum() {
+        let (mut allocator, _id_b, _id_c) = setup_two_equal_slots();
+        let floor_cost = floor_cost_of(&allocator, Mid::from("sB"));
+        // Ample room for both floors -- no contention, no eviction needed.
+        let generous = Bitrate::from(((floor_cost / (1.0 - RESERVE_FRACTION)) * 2.5) as u64);
+
+        for slot in allocator.slots.values_mut() {
+            if slot.mid == Mid::from("sC") {
+                slot.paused = true;
+                slot.deficit_bps = 0.0; // brand new, no accrued advantage at all
+            }
+        }
+
+        allocator.update_allocations_at(generous, Instant::now());
+
+        let c = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sC"))
+            .unwrap();
+        assert!(
+            !c.paused,
+            "a brand-new challenger must be admitted into genuine leftover slack \
+             immediately, without having to earn a quantum against anyone"
+        );
+    }
+
+    #[test]
+    fn deficit_never_goes_negative_under_sustained_overspend() {
+        let (mut allocator, _id_b, _id_c) = setup_two_equal_slots();
+        let floor_cost = floor_cost_of(&allocator, Mid::from("sB"));
+        // Tight enough that the incumbent (sB) spends more than its fair
+        // share every tick it holds the floor, while sC (paused) can never
+        // clear the quantum -- sB should overspend indefinitely without its
+        // deficit ever dropping below 0.
+        let tight = tight_pool_for_one_floor(floor_cost);
+
+        let mut now = Instant::now();
+        for _ in 0..20 {
+            allocator.update_allocations_at(tight, now);
+            now += TICK_INTERVAL;
+        }
+
+        let b = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sB"))
+            .unwrap();
+        assert_eq!(
+            b.deficit_bps, 0.0,
+            "an overspending incumbent's deficit must floor at exactly 0.0, never go negative"
+        );
+    }
+
+    /// A challenger can clear the quantum gate against the weakest
+    /// incumbent yet still be unable to afford what evicting that incumbent
+    /// would actually free up (its own floor tier costs more than the
+    /// incumbent's). The trial must roll back cleanly: nobody gets evicted,
+    /// and the challenger stays paused rather than the pool ending up
+    /// double-booked or the incumbent's decision half-applied.
+    #[test]
+    fn preemption_trial_rolls_back_when_challenger_cannot_afford_the_freed_capacity() {
+        let (mut allocator, _id_b, id_c) = setup_two_equal_slots();
+
+        // Force sC's cheapest active layer up to Medium by marking its Low
+        // layer unhealthy, so its floor costs meaningfully more than sB's.
+        let track_c = allocator.tracks.get_mut(&id_c).unwrap();
+        for layer in track_c.layers.iter_mut() {
+            if layer.quality == LayerQuality::Low {
+                layer.state.update_for_test().inactive(true);
+            }
+        }
+
+        let low_cost = floor_cost_of(&allocator, Mid::from("sB"));
+        let medium_cost = effective_cost(
+            allocator
+                .tracks
+                .get(&id_c)
+                .unwrap()
+                .by_quality(LayerQuality::Medium)
+                .unwrap(),
+        );
+        assert!(
+            medium_cost > low_cost * 1.5,
+            "test assumption: Medium must cost meaningfully more than Low for this \
+             scenario to actually exercise a failed trial (medium={medium_cost}, low={low_cost})"
+        );
+
+        // Just enough pool for sB's own Low floor, with only a sliver of
+        // slack left over -- nowhere near enough to also cover sC's Medium
+        // floor even after freeing sB's reservation.
+        let tight = Bitrate::from(((low_cost / (1.0 - RESERVE_FRACTION)) * 1.05) as u64);
+
+        for slot in allocator.slots.values_mut() {
+            if slot.mid == Mid::from("sC") {
+                slot.paused = true;
+                // Clears the quantum gate (measured against sB's ~0
+                // deficit and sC's own -- more expensive -- floor cost)...
+                slot.deficit_bps = medium_cost * 2.0;
+            }
+        }
+
+        allocator.update_allocations_at(tight, Instant::now());
+
+        let b = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sB"))
+            .unwrap();
+        let c = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sC"))
+            .unwrap();
+        assert!(
+            !b.paused,
+            "the incumbent must not be evicted by a trial that ultimately can't be afforded"
+        );
+        assert!(
+            c.paused,
+            "a challenger that clears the quantum but can't afford the freed capacity \
+             must stay paused, not get admitted into a pool it doesn't fit"
+        );
+    }
+
+    /// Combines a `max_height` ceiling drop with genuine incumbent/challenger
+    /// contention (the single-slot version below only covers the ceiling
+    /// change in isolation): the demoted incumbent must still step down
+    /// under contention, not get stuck holding its old tier because it's
+    /// "protected" as an incumbent; and a waiting challenger must not be
+    /// spuriously admitted by the ceiling change alone -- only by a genuine
+    /// pool or quantum win, exactly as if nothing about the incumbent's own
+    /// request had changed.
+    #[test]
+    fn max_height_drop_steps_down_correctly_under_contention() {
+        let (mut allocator, id_b, id_c) = setup_two_equal_slots();
+
+        // Give sB real headroom to climb to Medium first; sC stays pinned
+        // to Low throughout so it can serve as the challenger below.
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("sB"),
+            Intent {
+                track_id: id_b,
+                max_height: 360,
+            },
+        );
+        intents.insert(
+            Mid::from("sC"),
+            Intent {
+                track_id: id_c,
+                max_height: 180,
+            },
+        );
+        allocator.configure(&intents, Instant::now());
+        let medium_b = allocator
+            .tracks
+            .get(&id_b)
+            .unwrap()
+            .by_quality(LayerQuality::Medium)
+            .unwrap()
+            .clone();
+        for slot in allocator.slots.values_mut() {
+            if slot.mid == Mid::from("sB") {
+                slot.active = Some(medium_b.clone());
+                slot.settling_until = None;
+            }
+        }
+
+        let now = Instant::now();
+        allocator.update_allocations_at(Bitrate::mbps(5), now);
+        assert_eq!(
+            allocator
+                .slots
+                .values()
+                .find(|s| s.mid == Mid::from("sB"))
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .quality,
+            LayerQuality::Medium,
+            "sanity check: sB holds Medium under ample bandwidth"
+        );
+
+        // sB's real (lower) weight arrives, and sC is a challenger with only
+        // a token amount of accrued deficit -- nowhere near a quantum win.
+        // Fetched directly from the track rather than via `floor_cost_of`
+        // (which reads `slot.active`'s cost): sB's `active` is still Medium
+        // at this point, not its floor.
+        let low_cost = effective_cost(
+            allocator
+                .tracks
+                .get(&id_b)
+                .unwrap()
+                .by_quality(LayerQuality::Low)
+                .unwrap(),
+        );
+        let mut lowered = HashMap::new();
+        lowered.insert(
+            Mid::from("sB"),
+            Intent {
+                track_id: id_b,
+                max_height: 180,
+            },
+        );
+        lowered.insert(
+            Mid::from("sC"),
+            Intent {
+                track_id: id_c,
+                max_height: 180,
+            },
+        );
+        allocator.configure(&lowered, Instant::now());
+        for slot in allocator.slots.values_mut() {
+            slot.settling_until = None;
+        }
+
+        // Tight enough that two Low floors still don't both fit. Fed over
+        // enough ticks for `BweFilter`'s fall time constant to actually
+        // settle from the earlier 5mbps reading down to this one -- a
+        // single tick right after a much higher reading barely moves it --
+        // with sC left alone (active, unpaused) so this convergence period
+        // doesn't itself let sC accrue any challenger deficit.
+        let tight = tight_pool_for_one_floor(low_cost);
+        let mut tick_now = now + TICK_INTERVAL;
+        for _ in 0..300 {
+            allocator.update_allocations_at(tight, tick_now);
+            tick_now += TICK_INTERVAL;
+        }
+
+        // Only now stage sC as a fresh challenger with a token deficit --
+        // far below any quantum -- and sB back into mid-transition (as if
+        // its ceiling had just dropped), so the one tick under test is the
+        // only one where either state is in play.
+        for slot in allocator.slots.values_mut() {
+            slot.settling_until = None;
+            if slot.mid == Mid::from("sB") {
+                slot.staging = None;
+                slot.staging_started_at = None;
+            } else {
+                slot.paused = true;
+                slot.deficit_bps = low_cost * 0.1;
+            }
+        }
+        allocator.update_allocations_at(tight, tick_now);
+
+        let b = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sB"))
+            .unwrap();
+        let c = allocator
+            .slots
+            .values()
+            .find(|s| s.mid == Mid::from("sC"))
+            .unwrap();
+        assert_eq!(
+            b.target().unwrap().quality,
+            LayerQuality::Low,
+            "the demoted incumbent must step down to its new ceiling even under contention"
+        );
+        assert!(
+            c.paused,
+            "a ceiling change on an unrelated slot must not by itself admit a challenger \
+             that hasn't earned its own way in"
         );
     }
 
@@ -3421,14 +4238,20 @@ mod assignment_tests {
             layer.state.update_for_test().inactive(false);
         }
         let id = track.meta.id;
-        allocator.add_track(Track {
-            meta: track.meta.clone(),
-            layers: track.layers,
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s"),
-            ..SlotConfig::default()
-        });
+        allocator.add_track(
+            Track {
+                meta: track.meta.clone(),
+                layers: track.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
 
         let mut intents = HashMap::new();
         intents.insert(
@@ -3438,7 +4261,7 @@ mod assignment_tests {
                 max_height: 360,
             },
         );
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
 
         let medium = allocator
             .tracks
@@ -3458,7 +4281,15 @@ mod assignment_tests {
         let now = Instant::now();
         allocator.update_allocations_at(Bitrate::mbps(5), now);
         assert_eq!(
-            allocator.slots.values().next().unwrap().active.as_ref().unwrap().quality,
+            allocator
+                .slots
+                .values()
+                .next()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .quality,
             LayerQuality::Medium,
             "sanity check: holds Medium under ample bandwidth while max_height allows it"
         );
@@ -3473,7 +4304,7 @@ mod assignment_tests {
                 max_height: 180,
             },
         );
-        allocator.configure(&lowered_intents);
+        allocator.configure(&lowered_intents, Instant::now());
         for slot in allocator.slots.values_mut() {
             slot.settling_until = None;
         }
@@ -3524,23 +4355,35 @@ mod assignment_tests {
 
         let id_big = track_big.meta.id;
         let id_small = track_small.meta.id;
-        allocator.add_track(Track {
-            meta: track_big.meta.clone(),
-            layers: track_big.layers,
-        });
-        allocator.add_track(Track {
-            meta: track_small.meta.clone(),
-            layers: track_small.layers,
-        });
+        allocator.add_track(
+            Track {
+                meta: track_big.meta.clone(),
+                layers: track_big.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_small.meta.clone(),
+                layers: track_small.layers,
+            },
+            Instant::now(),
+        );
 
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("big"),
-            ..SlotConfig::default()
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("small"),
-            ..SlotConfig::default()
-        });
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("big"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("small"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
 
         let mut intents = HashMap::new();
         intents.insert(
@@ -3557,7 +4400,7 @@ mod assignment_tests {
                 max_height: 180,
             },
         );
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
 
         let low_big = allocator
             .tracks
@@ -3600,7 +4443,7 @@ mod assignment_tests {
                 .values_mut()
                 .find(|s| s.mid == Mid::from("big"))
                 .unwrap();
-            big_slot.budget_bps = 1_000_000.0;
+            big_slot.deficit_bps = 1_000_000.0;
         }
 
         // Pool (after RESERVE_FRACTION=0.1) = 1450kbps * 0.9 = 1,305,000.
@@ -3698,23 +4541,35 @@ mod assignment_tests {
 
         let track_id_720 = track_720.meta.id;
         let track_id_180 = track_180.meta.id;
-        allocator.add_track(Track {
-            meta: track_720.meta.clone(),
-            layers: track_720.layers,
-        });
-        allocator.add_track(Track {
-            meta: track_180.meta.clone(),
-            layers: track_180.layers,
-        });
+        allocator.add_track(
+            Track {
+                meta: track_720.meta.clone(),
+                layers: track_720.layers,
+            },
+            Instant::now(),
+        );
+        allocator.add_track(
+            Track {
+                meta: track_180.meta.clone(),
+                layers: track_180.layers,
+            },
+            Instant::now(),
+        );
 
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s720"),
-            ..SlotConfig::default()
-        });
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("s180"),
-            ..SlotConfig::default()
-        });
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s720"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
+        allocator.add_slot(
+            SlotConfig {
+                mid: Mid::from("s180"),
+                ..SlotConfig::default()
+            },
+            Instant::now(),
+        );
 
         let mut intents = HashMap::new();
         intents.insert(
@@ -3731,7 +4586,7 @@ mod assignment_tests {
                 max_height: 180,
             },
         );
-        allocator.configure(&intents);
+        allocator.configure(&intents, Instant::now());
 
         // Put the 720p slot into active+settling state so should_hold_allocation returns true.
         let high_layer = allocator
@@ -3873,7 +4728,7 @@ mod allocation_tests {
                 },
                 &mut test_rng(),
             );
-            slot.budget_bps = budgets[&view.key];
+            slot.deficit_bps = budgets[&view.key];
             let decision = decide_tier(&mut slot, view, &mut remaining);
             decisions.insert(view.key, decision);
         }
@@ -4404,7 +5259,7 @@ mod allocation_tests {
             let t = healthy_track();
             let mut s = Slot::new(SlotConfig::default(), &mut test_rng());
             s.set_max_height(1080);
-            s.budget_bps = budget;
+            s.deficit_bps = budget;
             let view = SlotView {
                 key: next_slot_key(),
                 mid: s.mid,

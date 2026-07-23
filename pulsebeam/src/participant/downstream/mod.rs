@@ -70,26 +70,26 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn add_track(&mut self, track: Track) {
+    pub fn add_track(&mut self, track: Track, now: Instant) {
         if track.meta.id.kind() == TrackKind::Video {
-            self.video.add_track(track);
+            self.video.add_track(track, now);
             self.dirty_allocation = true;
         }
         // Audio tracks need no static registration; slots are claimed dynamically.
     }
 
-    pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
-        let removed = self.video.remove_track(track_id);
+    pub(super) fn remove_track(&mut self, track_id: &TrackId, now: Instant) -> bool {
+        let removed = self.video.remove_track(track_id, now);
         if removed {
             self.dirty_allocation = true;
         }
         removed
     }
 
-    pub fn add_slot(&mut self, slot: SlotConfig) {
+    pub fn add_slot(&mut self, slot: SlotConfig, now: Instant) {
         match slot.kind {
             MediaKind::Video => {
-                self.video.add_slot(slot);
+                self.video.add_slot(slot, now);
             }
             MediaKind::Audio => {
                 self.audio.add_slot(slot);
@@ -110,10 +110,11 @@ impl DownstreamAllocator {
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self, bwe: &mut Bwe) -> bool {
+    pub fn update_allocations(&mut self, bwe: &mut Bwe, now: Instant) -> bool {
         self.dirty_allocation = false;
-        let (desired, assignments_changed) =
-            self.video.update_allocations(self.available_bandwidth);
+        let (desired, assignments_changed) = self
+            .video
+            .update_allocations_at(self.available_bandwidth, now);
         if desired_bitrate_changed(self.last_desired, desired) {
             tracing::info!(
                 desired = %desired,
@@ -136,7 +137,7 @@ impl DownstreamAllocator {
         bwe: &mut Bwe,
         events: &mut impl ParticipantSink,
     ) -> bool {
-        let assignments_changed = self.update_allocations(bwe);
+        let assignments_changed = self.update_allocations(bwe, now);
         self.video.poll_slow(now, self.available_bandwidth, events);
         assignments_changed
     }

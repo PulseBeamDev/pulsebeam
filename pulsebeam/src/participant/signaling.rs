@@ -69,9 +69,9 @@ impl Signaling {
         self.slot_count = slot_count;
     }
 
-    pub fn reconcile(&mut self, downstream: &mut DownstreamAllocator) {
+    pub fn reconcile(&mut self, downstream: &mut DownstreamAllocator, now: tokio::time::Instant) {
         if let Some(last_client_intents) = &self.last_client_intents {
-            downstream.video.configure(last_client_intents);
+            downstream.video.configure(last_client_intents, now);
             self.mark_assignments_dirty();
         }
     }
@@ -80,6 +80,7 @@ impl Signaling {
         &mut self,
         data: &[u8],
         downstream: &mut DownstreamAllocator,
+        now: tokio::time::Instant,
     ) -> Result<Vec<SignalingInputEvent>, SignalingError> {
         let mut events = Vec::new();
         if data.len() > MAX_SIGNALING_MSG_SIZE {
@@ -105,7 +106,7 @@ impl Signaling {
                     });
                 }
                 tracing::info!("received client intent: {:?}", intent);
-                self.apply_client_intent(intent, downstream);
+                self.apply_client_intent(intent, downstream, now);
                 self.dirty_assignments = true;
             }
             Some(signaling::client_message::Payload::RequestSync(_)) => {
@@ -121,6 +122,7 @@ impl Signaling {
         &mut self,
         intent: signaling::ClientIntent,
         downstream: &mut DownstreamAllocator,
+        now: tokio::time::Instant,
     ) {
         let mut intents = HashMap::with_capacity(intent.downstream_requests.len());
         for req in intent.downstream_requests {
@@ -149,7 +151,7 @@ impl Signaling {
             );
         }
         self.last_client_intents = Some(intents);
-        self.reconcile(downstream);
+        self.reconcile(downstream, now);
     }
 
     pub fn mark_tracks_dirty(&mut self) {
