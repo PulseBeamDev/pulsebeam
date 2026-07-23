@@ -1,18 +1,21 @@
 //! A receiver-side Quality-of-Experience harness for simulcast tests.
 //!
 //! Prior simulcast tests only checked "did enough bits arrive" (a throughput
-//! floor). That misses two whole classes of regression: (1) a stream that
+//! floor). That misses whole classes of regression: (1) a stream that
 //! delivers plenty of bits but glitches every time the SFU switches which
 //! simulcast layer it forwards (a P-frame spliced onto the wrong layer is
-//! undecodable garbage even though the byte counter looks healthy), and (2)
-//! an allocator that delivers acceptable aggregate throughput while silently
+//! undecodable garbage even though the byte counter looks healthy), (2) an
+//! allocator that delivers acceptable aggregate throughput while silently
 //! starving a viewer's highest-priority stream in favor of a lower-priority
-//! one.
+//! one, and (3) a stream that never fully stalls but freezes for several
+//! seconds at a time -- fatal for a teleoperation feed, invisible to a
+//! byte-rate floor.
 //!
 //! This module reads the actual reassembled H.264 access units the receiver
 //! gets (not RTCP/byte counters) and turns them into:
 //!   - a hard, always-on decodability invariant (`StreamHealth::assert_decodable`)
 //!   - a composite 0-100 QoE score per stream (`StreamHealth::qoe_score`)
+//!   - a worst-single-outage bound (`StreamHealth::max_freeze`)
 //!   - a priority-ordering check across streams (`assert_priority_ordering`)
 
 use pulsebeam_agent::str0m::media::Mid;
@@ -127,6 +130,24 @@ const NOMINAL_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// on the order of one or two transitions total over tens of seconds.
 const FLAPPING_TRANSITIONS_PER_MINUTE: f64 = 10.0;
 
+/// Real encoded frame sizes vary well beyond CBR's nominal target (a static
+/// scene can skip-code down to a few dozen bytes even in a stream averaging
+/// several KB/frame), so any *single* frame's nearest-centroid classification
+/// is noisy: empirically ~0.1-0.4% of frames in each test asset misclassify
+/// in isolation, in runs up to 3 frames long. A per-frame diff would read
+/// that noise as constant illegal layer switching. Instead, classification
+/// is smoothed by majority vote over a rolling window; only a vote flip that
+/// *persists* for a full window counts as a real regime change.
+const CONFIRM_WINDOW: usize = 9;
+
+/// How many recent frames a keyframe must fall within, relative to a
+/// confirmed regime change, to count as explaining that change. Generous
+/// relative to `CONFIRM_WINDOW` (a keyframe can land anywhere in the window
+/// that flipped the vote) and relative to a real PLI/keyframe round trip
+/// (hundreds of ms), while still far short of this asset's ~111s natural
+/// loop period -- so a genuinely unexplained regime change still gets caught.
+const KEYFRAME_LOOKBACK_FRAMES: u64 = (CONFIRM_WINDOW as u64) * 3;
+
 /// Accumulates per-access-unit observations for a single downstream track
 /// and turns them into a decodability verdict and a QoE score.
 pub struct StreamHealth {
@@ -134,7 +155,10 @@ pub struct StreamHealth {
     frames_total: u64,
     keyframes_total: u64,
     violations: Vec<String>,
-    prev_layer: Option<LayerClass>,
+    window: std::collections::VecDeque<LayerClass>,
+    committed_layer: Option<LayerClass>,
+    frames_since_keyframe: u64,
+    raw_layer: Option<LayerClass>,
     prev_capture: Option<Instant>,
     first_capture: Option<Instant>,
     last_capture: Option<Instant>,
@@ -142,7 +166,21 @@ pub struct StreamHealth {
     layer_time: HashMap<LayerClass, Duration>,
     frozen_time: Duration,
     freeze_events: u64,
+    max_freeze: Duration,
     transitions: u64,
+    /// Snapshot taken by `mark()`, letting `qoe_score`/`total_duration`
+    /// report only what happened since the mark (e.g. since a network
+    /// condition change) while `violations` -- the decodability verdict --
+    /// stays cumulative over the stream's whole life regardless of marks.
+    /// Longest single freeze seen since the last `mark()` (or since the
+    /// stream began). Unlike `frozen_time`/`transitions`, a running max
+    /// can't be recovered by subtracting a snapshot, so this is reset to
+    /// zero by `mark()` directly rather than diffed against a baseline.
+    since_mark_max_freeze: Duration,
+    mark_capture: Option<Instant>,
+    mark_layer_time: HashMap<LayerClass, Duration>,
+    mark_frozen_time: Duration,
+    mark_transitions: u64,
 }
 
 impl StreamHealth {
@@ -152,7 +190,10 @@ impl StreamHealth {
             frames_total: 0,
             keyframes_total: 0,
             violations: Vec::new(),
-            prev_layer: None,
+            window: std::collections::VecDeque::with_capacity(CONFIRM_WINDOW),
+            committed_layer: None,
+            frames_since_keyframe: 0,
+            raw_layer: None,
             prev_capture: None,
             first_capture: None,
             last_capture: None,
@@ -160,8 +201,40 @@ impl StreamHealth {
             layer_time: HashMap::new(),
             frozen_time: Duration::ZERO,
             freeze_events: 0,
+            max_freeze: Duration::ZERO,
             transitions: 0,
+            since_mark_max_freeze: Duration::ZERO,
+            mark_capture: None,
+            mark_layer_time: HashMap::new(),
+            mark_frozen_time: Duration::ZERO,
+            mark_transitions: 0,
         }
+    }
+
+    /// Snapshots current accumulators so that `qoe_score`/`total_duration`/
+    /// `max_freeze` subsequently report only what happens *after* this
+    /// point -- e.g. call this right before introducing a network
+    /// constraint so the resulting score reflects the constrained phase, not
+    /// diluted by an earlier healthy warmup. Does not affect the
+    /// decodability verdict, which stays cumulative over the stream's whole
+    /// life.
+    pub fn mark(&mut self) {
+        self.mark_capture = self.last_capture;
+        self.mark_layer_time = self.layer_time.clone();
+        self.mark_frozen_time = self.frozen_time;
+        self.mark_transitions = self.transitions;
+        self.since_mark_max_freeze = Duration::ZERO;
+    }
+
+    fn windowed_majority(&self) -> Option<LayerClass> {
+        if self.window.len() < CONFIRM_WINDOW {
+            return None;
+        }
+        let mut counts: HashMap<LayerClass, u32> = HashMap::new();
+        for class in &self.window {
+            *counts.entry(*class).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|(_, count)| *count).map(|(class, _)| class)
     }
 
     /// Feed one reassembled access unit (one `MediaFrame`) into the monitor.
@@ -196,27 +269,16 @@ impl StreamHealth {
                     ));
                 }
             }
-            if let Some(prev_layer) = self.prev_layer {
-                if prev_layer != layer {
-                    self.transitions += 1;
-                    if !is_keyframe {
-                        self.violations.push(format!(
-                            "{}: layer changed {prev_layer:?} -> {layer:?} at frame {} ({} \
-                             bytes) without a keyframe -- this would desync a real decoder",
-                            self.label,
-                            self.frames_total + 1,
-                            data.len()
-                        ));
-                    }
-                }
-            }
             if let Some(prev_capture) = self.prev_capture {
                 let gap = capture_time.saturating_duration_since(prev_capture);
-                let attributed_layer = self.prev_layer.unwrap_or(layer);
+                let attributed_layer = self.raw_layer.unwrap_or(layer);
                 *self.layer_time.entry(attributed_layer).or_default() += gap;
                 if gap > FREEZE_THRESHOLD {
                     self.freeze_events += 1;
-                    self.frozen_time += gap.saturating_sub(NOMINAL_FRAME_INTERVAL);
+                    let frozen = gap.saturating_sub(NOMINAL_FRAME_INTERVAL);
+                    self.frozen_time += frozen;
+                    self.max_freeze = self.max_freeze.max(frozen);
+                    self.since_mark_max_freeze = self.since_mark_max_freeze.max(frozen);
                 }
             }
         }
@@ -225,14 +287,47 @@ impl StreamHealth {
         if is_keyframe {
             self.keyframes_total += 1;
         }
-        self.prev_layer = Some(layer);
+
+        if self.window.len() == CONFIRM_WINDOW {
+            self.window.pop_front();
+        }
+        self.window.push_back(layer);
+
+        if let Some(majority) = self.windowed_majority() {
+            match self.committed_layer {
+                None => self.committed_layer = Some(majority),
+                Some(committed) if committed != majority => {
+                    self.transitions += 1;
+                    if self.frames_since_keyframe > KEYFRAME_LOOKBACK_FRAMES {
+                        self.violations.push(format!(
+                            "{}: layer settled on {committed:?} -> {majority:?} around frame {} \
+                             with no keyframe in the preceding {} frames -- this would desync a \
+                             real decoder",
+                            self.label,
+                            self.frames_total,
+                            self.frames_since_keyframe
+                        ));
+                    }
+                    self.committed_layer = Some(majority);
+                }
+                Some(_) => {}
+            }
+        }
+
+        self.frames_since_keyframe = if is_keyframe {
+            0
+        } else {
+            self.frames_since_keyframe + 1
+        };
+        self.raw_layer = Some(layer);
         self.prev_capture = Some(capture_time);
         self.last_capture = Some(capture_time);
         self.prev_ts = Some(ts);
     }
 
     pub fn total_duration(&self) -> Duration {
-        match (self.first_capture, self.last_capture) {
+        let start = self.mark_capture.or(self.first_capture);
+        match (start, self.last_capture) {
             (Some(a), Some(b)) => b.saturating_duration_since(a),
             _ => Duration::ZERO,
         }
@@ -242,23 +337,46 @@ impl StreamHealth {
         self.frames_total
     }
 
+    /// The single longest continuous freeze observed since the last `mark()`
+    /// (or since the stream began). The blunt "did it ever completely stall"
+    /// signal a byte-rate floor gives is not enough for latency-sensitive
+    /// use cases (teleoperation, live control feedback): a stream that never
+    /// fully stalls but blacks out for 4 seconds at a time is still a
+    /// failure there, and this is invisible to `qoe_score`'s averaged
+    /// availability term.
+    pub fn max_freeze(&self) -> Duration {
+        self.since_mark_max_freeze
+    }
+
+    fn layer_time_since_mark(&self) -> HashMap<LayerClass, Duration> {
+        self.layer_time
+            .iter()
+            .map(|(class, dur)| {
+                let baseline = self.mark_layer_time.get(class).copied().unwrap_or_default();
+                (*class, dur.saturating_sub(baseline))
+            })
+            .collect()
+    }
+
     /// A composite 0-100 quality score blending availability (time not
     /// frozen), quality (time-weighted layer level reached), and stability
-    /// (freedom from repeated re-tiering). Decodability is intentionally
-    /// *not* part of this score -- see `assert_decodable`, which is a
-    /// separate, unconditional invariant rather than something a good score
-    /// elsewhere can offset.
+    /// (freedom from repeated re-tiering), measured since the last `mark()`
+    /// (or since the stream started, if never marked). Decodability is
+    /// intentionally *not* part of this score -- see `assert_decodable`,
+    /// which is a separate, unconditional invariant rather than something a
+    /// good score elsewhere can offset.
     pub fn qoe_score(&self) -> f64 {
         let total = self.total_duration().as_secs_f64();
         if total <= 0.0 {
             return 0.0;
         }
 
-        let availability = 1.0 - (self.frozen_time.as_secs_f64() / total).clamp(0.0, 1.0);
+        let frozen_time = self.frozen_time.saturating_sub(self.mark_frozen_time);
+        let availability = 1.0 - (frozen_time.as_secs_f64() / total).clamp(0.0, 1.0);
 
-        let tracked_seconds: f64 = self.layer_time.values().map(Duration::as_secs_f64).sum();
-        let level_seconds: f64 = self
-            .layer_time
+        let layer_time = self.layer_time_since_mark();
+        let tracked_seconds: f64 = layer_time.values().map(Duration::as_secs_f64).sum();
+        let level_seconds: f64 = layer_time
             .iter()
             .map(|(class, dur)| class.level() * dur.as_secs_f64())
             .sum();
@@ -269,7 +387,8 @@ impl StreamHealth {
         };
 
         let minutes = (total / 60.0).max(1.0 / 60.0);
-        let transitions_per_minute = self.transitions as f64 / minutes;
+        let transitions = self.transitions.saturating_sub(self.mark_transitions);
+        let transitions_per_minute = transitions as f64 / minutes;
         let stability =
             1.0 - (transitions_per_minute / FLAPPING_TRANSITIONS_PER_MINUTE).clamp(0.0, 1.0);
 
@@ -296,13 +415,24 @@ impl StreamHealth {
         assert!(
             score >= floor,
             "{}: QoE score {score:.1} fell below required floor {floor:.1} \
-             (frames={}, keyframes={}, freezes={}, frozen={:?}, transitions={})",
+             (frames={}, keyframes={}, freezes={}, frozen={:?}, max_freeze={:?}, transitions={})",
             self.label,
             self.frames_total,
             self.keyframes_total,
             self.freeze_events,
             self.frozen_time,
+            self.max_freeze,
             self.transitions
+        );
+    }
+
+    pub fn assert_max_freeze_under(&self, bound: Duration) {
+        let worst = self.max_freeze();
+        assert!(
+            worst <= bound,
+            "{}: worst single outage lasted {worst:?}, exceeding the {bound:?} budget -- a \
+             latency-critical viewer would have lost the feed for that long",
+            self.label
         );
     }
 }
@@ -363,6 +493,14 @@ pub fn scores(health: &HashMap<Mid, SharedStreamHealth>) -> HashMap<Mid, f64> {
         .collect()
 }
 
+/// Marks every tracked stream, so subsequent `scores()` calls reflect only
+/// what happens after this point (see `StreamHealth::mark`).
+pub fn mark_all(health: &HashMap<Mid, SharedStreamHealth>) {
+    for h in health.values() {
+        h.lock().unwrap_or_else(|p| p.into_inner()).mark();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +522,7 @@ mod tests {
             health.record(ts, capture_time, frame);
         }
         assert_eq!(health.frames_total() as usize, frames.len());
-        assert_eq!(health.prev_layer, Some(expected));
+        assert_eq!(health.committed_layer, Some(expected));
         health
     }
 
@@ -432,28 +570,84 @@ mod tests {
     #[test]
     fn a_switch_without_a_keyframe_is_flagged() {
         let full_frames = pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_FULL_CBR);
-        let quarter_frames =
-            pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_QUARTER_CBR);
+        let quarter_delta_frames: Vec<&[u8]> = pulsebeam_testdata::h264_frames(
+            pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+        )
+        .into_iter()
+        .filter(|f| !pulsebeam_testdata::h264_frame_is_keyframe(f))
+        .collect();
         let mut health = StreamHealth::new("test");
         let start = Instant::now();
-        // A few frames of full, then splice directly into a quarter delta
-        // frame (not its keyframe) -- exactly the corruption this harness
-        // exists to catch.
-        for (i, frame) in full_frames.iter().take(5).enumerate() {
+        let push = |i: usize, frame: &[u8], health: &mut StreamHealth| {
             let ts = MediaTime::from_seconds(i as f64 / 30.0);
             let capture_time = start + Duration::from_secs_f64(i as f64 / 30.0);
             health.record(ts, capture_time, frame);
-        }
-        let splice_frame = quarter_frames
+        };
+
+        // Start on a real keyframe, then stay on Full well clear of it (so
+        // the splice below isn't coincidentally excused by that unrelated
+        // startup keyframe), then splice directly into a run of quarter
+        // delta frames -- never a keyframe -- exactly the corruption this
+        // harness exists to catch.
+        push(0, full_frames[0], &mut health);
+        let mut i = 1;
+        for frame in full_frames
             .iter()
-            .find(|f| !pulsebeam_testdata::h264_frame_is_keyframe(f))
-            .expect("asset has delta frames");
-        health.record(MediaTime::from_seconds(5.0 / 30.0), start + Duration::from_secs_f64(5.0 / 30.0), splice_frame);
+            .filter(|f| !pulsebeam_testdata::h264_frame_is_keyframe(f))
+            .cycle()
+            .take(KEYFRAME_LOOKBACK_FRAMES as usize + CONFIRM_WINDOW)
+        {
+            push(i, frame, &mut health);
+            i += 1;
+        }
+        for frame in quarter_delta_frames.iter().take(CONFIRM_WINDOW + 5) {
+            push(i, frame, &mut health);
+            i += 1;
+        }
 
         assert!(
             !health.violations.is_empty(),
             "expected a decodability violation when splicing layers without a keyframe"
         );
+    }
+
+    #[test]
+    fn a_switch_that_starts_on_a_keyframe_is_not_flagged() {
+        let full_frames = pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_FULL_CBR);
+        let quarter_frames =
+            pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_QUARTER_CBR);
+        let mut health = StreamHealth::new("test");
+        let start = Instant::now();
+        let push = |i: usize, frame: &[u8], health: &mut StreamHealth| {
+            let ts = MediaTime::from_seconds(i as f64 / 30.0);
+            let capture_time = start + Duration::from_secs_f64(i as f64 / 30.0);
+            health.record(ts, capture_time, frame);
+        };
+
+        // Sit on Full for well past both the confirm window and the
+        // keyframe lookback, exactly like the negative-case test above --
+        // then switch to Quarter starting at Quarter's own keyframe (index
+        // 0), mirroring the SFU's real "switch lands exactly on the new
+        // layer's IDR" behavior. This must never be flagged.
+        push(0, full_frames[0], &mut health);
+        let mut i = 1;
+        for frame in full_frames
+            .iter()
+            .filter(|f| !pulsebeam_testdata::h264_frame_is_keyframe(f))
+            .cycle()
+            .take(KEYFRAME_LOOKBACK_FRAMES as usize + CONFIRM_WINDOW)
+        {
+            push(i, frame, &mut health);
+            i += 1;
+        }
+        for frame in quarter_frames.iter().take(CONFIRM_WINDOW + 20) {
+            push(i, frame, &mut health);
+            i += 1;
+        }
+
+        health.assert_decodable();
+        assert_eq!(health.committed_layer, Some(LayerClass::Quarter));
+        assert_eq!(health.transitions, 1);
     }
 
     #[test]
@@ -470,5 +664,42 @@ mod tests {
             inverted.is_err(),
             "a lower-weight stream sustainedly beating a higher-weight one must be flagged"
         );
+    }
+
+    #[test]
+    fn mark_isolates_the_measured_window() {
+        let full_frames = pulsebeam_testdata::h264_frames(pulsebeam_testdata::RAW_H264_FULL_CBR);
+        let mut health = StreamHealth::new("test");
+        let start = Instant::now();
+        let mut i = 0usize;
+        let mut push = |frame: &[u8], gap: Duration, health: &mut StreamHealth| {
+            let ts = MediaTime::from_seconds(i as f64 / 30.0);
+            let capture_time = start + gap * i as u32;
+            health.record(ts, capture_time, frame);
+            i += 1;
+        };
+
+        // Healthy warmup at nominal cadence.
+        for frame in full_frames.iter().take(30) {
+            push(frame, NOMINAL_FRAME_INTERVAL, &mut health);
+        }
+        let warmup_score = health.qoe_score();
+        assert!(warmup_score > 90.0, "warmup should score high: {warmup_score}");
+
+        health.mark();
+
+        // A long freeze happens entirely after the mark.
+        push(full_frames[30], Duration::from_secs(3), &mut health);
+        for frame in full_frames.iter().skip(31).take(30) {
+            push(frame, NOMINAL_FRAME_INTERVAL, &mut health);
+        }
+
+        let post_mark_score = health.qoe_score();
+        assert!(
+            post_mark_score < warmup_score,
+            "post-mark score ({post_mark_score}) should reflect the freeze, not the earlier \
+             healthy warmup ({warmup_score})"
+        );
+        assert!(health.max_freeze() >= Duration::from_secs(2));
     }
 }

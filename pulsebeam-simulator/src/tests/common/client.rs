@@ -133,19 +133,29 @@ impl ClientContext {
         qoe::scores(&self.stream_health)
     }
 
-    /// Convenience for single-stream tests.
-    pub fn qoe_score(&self) -> f64 {
-        self.qoe_scores().values().copied().fold(0.0, f64::max)
+    pub fn assert_min_qoe_score(&self, floor: f64) {
+        for health in self.stream_health.values() {
+            health
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .assert_min_score(floor);
+        }
     }
 
-    pub fn assert_min_qoe_score(&self, floor: f64) {
-        for (mid, health) in &self.stream_health {
-            let health = health.lock().unwrap_or_else(|p| p.into_inner());
-            let score = health.qoe_score();
-            assert!(
-                score >= floor,
-                "{mid:?}: QoE score {score:.1} fell below required floor {floor:.1}"
-            );
+    /// Snapshots every tracked stream so subsequent QoE scores/freeze
+    /// measurements reflect only what happens after this point -- call
+    /// right before changing network conditions to isolate the phase under
+    /// test from an earlier warmup.
+    pub fn mark_qoe_baseline(&self) {
+        qoe::mark_all(&self.stream_health);
+    }
+
+    pub fn assert_max_freeze_under(&self, bound: std::time::Duration) {
+        for health in self.stream_health.values() {
+            health
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .assert_max_freeze_under(bound);
         }
     }
 }
