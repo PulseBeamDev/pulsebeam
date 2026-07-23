@@ -1,3 +1,4 @@
+use super::qoe::{self, SharedStreamHealth};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -84,6 +85,7 @@ impl SimClientBuilder {
             remote_tracks: HashMap::new(),
             received_data: Vec::new(),
             received_media_bytes: Arc::new(AtomicU64::new(0)),
+            stream_health: HashMap::new(),
         };
         Ok(SimClient {
             ctx,
@@ -110,11 +112,41 @@ pub struct ClientContext {
     /// tracks — ground truth for "how much media got through", read
     /// directly off frames rather than inferred from RTCP/peer-stats.
     pub received_media_bytes: Arc<AtomicU64>,
+    /// Per-track decodability/QoE accumulator, fed live off the same
+    /// reassembled access units `received_media_bytes` counts bytes from.
+    pub stream_health: HashMap<pulsebeam_agent::str0m::media::Mid, SharedStreamHealth>,
 }
 
 impl ClientContext {
     pub fn total_received_media_bytes(&self) -> u64 {
         self.received_media_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Hard, always-on invariant: every access unit delivered to every
+    /// remote track so far must be decodable in sequence -- no layer switch
+    /// spliced in without a keyframe, no out-of-order timestamps.
+    pub fn assert_all_streams_decodable(&self) {
+        qoe::assert_all_decodable(&self.stream_health);
+    }
+
+    pub fn qoe_scores(&self) -> HashMap<pulsebeam_agent::str0m::media::Mid, f64> {
+        qoe::scores(&self.stream_health)
+    }
+
+    /// Convenience for single-stream tests.
+    pub fn qoe_score(&self) -> f64 {
+        self.qoe_scores().values().copied().fold(0.0, f64::max)
+    }
+
+    pub fn assert_min_qoe_score(&self, floor: f64) {
+        for (mid, health) in &self.stream_health {
+            let health = health.lock().unwrap_or_else(|p| p.into_inner());
+            let score = health.qoe_score();
+            assert!(
+                score >= floor,
+                "{mid:?}: QoE score {score:.1} fell below required floor {floor:.1}"
+            );
+        }
     }
 }
 
@@ -240,8 +272,10 @@ impl SimClient {
                             }
                             AgentEvent::RemoteTrackAdded(t) => {
                                 self.ctx.remote_tracks.insert(t.mid, t.track.id.clone());
+                                let health = qoe::new_shared(format!("{:?}", t.mid));
+                                self.ctx.stream_health.insert(t.mid, health.clone());
                                 let sink = self.ctx.received_media_bytes.clone();
-                                self.join_set.spawn(drain_remote_track(t, sink));
+                                self.join_set.spawn(drain_remote_track(t, sink, health));
                             }
                             AgentEvent::DataPublisherDeclared(publisher) => {
                                 self.ctx.published_topics.insert(publisher.topic.clone(), publisher);
@@ -270,10 +304,19 @@ impl SimClient {
 }
 
 /// Drains a subscribed remote track's decoded frames for the connection's
-/// lifetime, accumulating their sizes into `sink`.
-async fn drain_remote_track(mut track: pulsebeam_agent::agent::RemoteTrack, sink: Arc<AtomicU64>) {
+/// lifetime, accumulating their sizes into `sink` and feeding each access
+/// unit into `health` for decodability/QoE analysis.
+async fn drain_remote_track(
+    mut track: pulsebeam_agent::agent::RemoteTrack,
+    sink: Arc<AtomicU64>,
+    health: SharedStreamHealth,
+) {
     while let Ok(frame) = track.recv().await {
         sink.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+        health
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(frame.ts, frame.capture_time, &frame.data);
     }
 }
 

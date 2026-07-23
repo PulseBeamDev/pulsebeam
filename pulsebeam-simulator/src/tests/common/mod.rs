@@ -1,4 +1,5 @@
 pub mod client;
+pub mod qoe;
 
 use pulsebeam_runtime::net::UdpMode;
 use std::{
