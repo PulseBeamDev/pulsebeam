@@ -41,7 +41,7 @@ fn data_channel_pubsub_forwarding_test() -> turmoil::Result {
             client.ctx.driver.declare_publish_topic(&topic)?;
             client
                 .drive_with(|ctx| {
-                    let Some(publisher) = ctx.published_topics.get_mut(&topic) else {
+                    let Some(publisher) = ctx.data_publisher(&topic) else {
                         return false;
                     };
 
@@ -65,8 +65,7 @@ fn data_channel_pubsub_forwarding_test() -> turmoil::Result {
             client.ctx.driver.declare_subscribe_topic(&topic, None)?;
             client
                 .drive_with(|ctx| {
-                    let Some(subscriber) = ctx.subscribed_topics.get_mut(&(topic.clone(), None))
-                    else {
+                    let Some(subscriber) = ctx.data_subscriber(&topic, None) else {
                         return false;
                     };
 
@@ -134,7 +133,7 @@ fn data_channel_latency_regression_test() -> turmoil::Result {
                         return false;
                     }
 
-                    let Some(publisher) = ctx.published_topics.get_mut(&topic) else {
+                    let Some(publisher) = ctx.data_publisher(&topic) else {
                         return false;
                     };
 
@@ -164,8 +163,7 @@ fn data_channel_latency_regression_test() -> turmoil::Result {
             client.ctx.driver.declare_subscribe_topic(&topic, None)?;
             client
                 .drive_with_interval(Duration::from_micros(100), |ctx| {
-                    let Some(subscriber) = ctx.subscribed_topics.get_mut(&(topic.clone(), None))
-                    else {
+                    let Some(subscriber) = ctx.data_subscriber(&topic, None) else {
                         return false;
                     };
                     *subscriber_ready.lock().unwrap() = true;
@@ -310,13 +308,7 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
         let pub_a_ready = pub_a_ready.clone();
         let flags = flags.clone();
         sim.client(scoped_a_ip, async move {
-            let target_id = loop {
-                let notified = pub_a_ready.notified();
-                if let Some(id) = pub_a_id.lock().unwrap().clone() {
-                    break id;
-                }
-                notified.await;
-            };
+            let target_id = common::wait_for_publisher_id(&pub_a_id, &pub_a_ready).await;
 
             let mut client = common::client::SimClientBuilder::bind(scoped_a_ip, server_ip)
                 .await?
@@ -329,7 +321,7 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
             let key = (topic.clone(), Some(target_id));
             client
                 .drive_with(move |ctx| {
-                    let Some(subscriber) = ctx.subscribed_topics.get_mut(&key) else {
+                    let Some(subscriber) = ctx.data_subscriber(&key.0, key.1.as_deref()) else {
                         return false;
                     };
                     while let Ok(payload) = subscriber.try_recv() {
@@ -355,13 +347,7 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
         let pub_b_ready = pub_b_ready.clone();
         let flags = flags.clone();
         sim.client(scoped_b_ip, async move {
-            let target_id = loop {
-                let notified = pub_b_ready.notified();
-                if let Some(id) = pub_b_id.lock().unwrap().clone() {
-                    break id;
-                }
-                notified.await;
-            };
+            let target_id = common::wait_for_publisher_id(&pub_b_id, &pub_b_ready).await;
 
             let mut client = common::client::SimClientBuilder::bind(scoped_b_ip, server_ip)
                 .await?
@@ -374,7 +360,7 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
             let key = (topic.clone(), Some(target_id));
             client
                 .drive_with(move |ctx| {
-                    let Some(subscriber) = ctx.subscribed_topics.get_mut(&key) else {
+                    let Some(subscriber) = ctx.data_subscriber(&key.0, key.1.as_deref()) else {
                         return false;
                     };
                     while let Ok(payload) = subscriber.try_recv() {
@@ -403,10 +389,9 @@ fn data_channel_scoped_subscribe_routing_test() -> turmoil::Result {
                 .connect("room-scoped")
                 .await?;
             client.ctx.driver.declare_subscribe_topic(&topic, None)?;
-            let key = (topic.clone(), None);
             client
                 .drive_with(move |ctx| {
-                    let Some(subscriber) = ctx.subscribed_topics.get_mut(&key) else {
+                    let Some(subscriber) = ctx.data_subscriber(&topic, None) else {
                         return false;
                     };
                     while let Ok(payload) = subscriber.try_recv() {

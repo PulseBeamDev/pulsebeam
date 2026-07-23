@@ -105,6 +105,21 @@ pub struct ClientContext {
     pub received_data: Vec<(String, Vec<u8>)>,
 }
 
+impl ClientContext {
+    pub fn data_publisher(&mut self, topic: &str) -> Option<&mut DataPublisher> {
+        self.published_topics.get_mut(topic)
+    }
+
+    pub fn data_subscriber(
+        &mut self,
+        topic: &str,
+        publisher: Option<&str>,
+    ) -> Option<&mut DataSubscriber> {
+        self.subscribed_topics
+            .get_mut(&(topic.to_string(), publisher.map(str::to_string)))
+    }
+}
+
 pub struct SimClient {
     pub ctx: ClientContext,
     join_set: JoinSet<()>,
