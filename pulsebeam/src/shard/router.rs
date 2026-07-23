@@ -72,9 +72,9 @@ pub(crate) struct ShardRoomContext {
     pub members: FastIndexSet<ParticipantId>,
     pub remote_shards: FastIndexSet<ShardId>,
     pub audio_selector: TopNAudioSelector,
-    pub data_topics: HashMap<Topic, DataTopicRoute>,
     pub data_streams: HashMap<(ParticipantId, Topic), DataTopicRoute>,
-    pub data_publisher_refcounts: HashMap<Topic, usize>,
+    pub wildcard_data_subscribers: HashMap<Topic, FastIndexSet<ParticipantId>>,
+    pub wildcard_data_remote_shards: HashMap<Topic, FastIndexSet<ShardId>>,
 }
 
 impl ShardRoomContext {
@@ -83,24 +83,36 @@ impl ShardRoomContext {
             members: fast_set(),
             remote_shards: fast_set(),
             audio_selector: TopNAudioSelector::new(rng),
-            data_topics: HashMap::default(),
             data_streams: HashMap::default(),
-            data_publisher_refcounts: HashMap::default(),
+            wildcard_data_subscribers: HashMap::default(),
+            wildcard_data_remote_shards: HashMap::default(),
         }
     }
 }
 
 pub(crate) struct DataTopicRoute {
-    pub subscribers: FastIndexSet<ParticipantId>,
-    pub remote_shards: FastIndexSet<ShardId>,
+    published: bool,
+    targeted_subscribers: FastIndexSet<ParticipantId>,
+    wildcard_subscribers: FastIndexSet<ParticipantId>,
+    targeted_remote_shards: FastIndexSet<ShardId>,
+    wildcard_remote_shards: FastIndexSet<ShardId>,
 }
 
 impl DataTopicRoute {
     fn new() -> Self {
         Self {
-            subscribers: fast_set_with_capacity(256),
-            remote_shards: fast_set(),
+            published: false,
+            targeted_subscribers: fast_set_with_capacity(256),
+            wildcard_subscribers: fast_set_with_capacity(256),
+            targeted_remote_shards: fast_set(),
+            wildcard_remote_shards: fast_set(),
         }
+    }
+
+    fn is_unused(&self) -> bool {
+        !self.published
+            && self.targeted_subscribers.is_empty()
+            && self.targeted_remote_shards.is_empty()
     }
 }
 
@@ -168,16 +180,16 @@ impl ShardRoutingTable {
             return;
         };
         room.members.swap_remove(participant_id);
-        for route in room.data_topics.values_mut() {
-            route.subscribers.swap_remove(participant_id);
+        for subscribers in room.wildcard_data_subscribers.values_mut() {
+            subscribers.swap_remove(participant_id);
         }
+        room.wildcard_data_subscribers
+            .retain(|_, subscribers| !subscribers.is_empty());
         for route in room.data_streams.values_mut() {
-            route.subscribers.swap_remove(participant_id);
+            route.targeted_subscribers.swap_remove(participant_id);
+            route.wildcard_subscribers.swap_remove(participant_id);
         }
-        room.data_topics
-            .retain(|_, route| !(route.subscribers.is_empty() && route.remote_shards.is_empty()));
-        room.data_streams
-            .retain(|_, route| !(route.subscribers.is_empty() && route.remote_shards.is_empty()));
+        room.data_streams.retain(|_, route| !route.is_unused());
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -323,29 +335,56 @@ impl ShardRoutingTable {
         }
     }
 
-    pub fn register_data_publisher(&mut self, room_id: RoomId, topic: Topic) -> bool {
+    pub fn register_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return false;
+            return;
         };
-        let count = room.data_publisher_refcounts.entry(topic).or_insert(0);
-        let was_zero = *count == 0;
-        *count += 1;
-        was_zero
+        let wildcard_subscribers = room
+            .wildcard_data_subscribers
+            .get(&topic)
+            .cloned()
+            .unwrap_or_else(fast_set);
+        let wildcard_remote_shards = room
+            .wildcard_data_remote_shards
+            .get(&topic)
+            .cloned()
+            .unwrap_or_else(fast_set);
+        let route = room
+            .data_streams
+            .entry((publisher, topic))
+            .or_insert_with(DataTopicRoute::new);
+        debug_assert!(!route.published);
+        route.published = true;
+        route.wildcard_subscribers = wildcard_subscribers;
+        route.wildcard_remote_shards = wildcard_remote_shards;
     }
 
-    pub fn unregister_data_publisher(&mut self, room_id: RoomId, topic: &Topic) -> bool {
+    pub fn unregister_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) {
         let Some(room) = self.rooms.get_mut(&room_id) else {
-            return false;
+            return;
         };
-        if let Some(count) = room.data_publisher_refcounts.get_mut(topic) {
-            let was_one = *count == 1;
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                room.data_publisher_refcounts.remove(topic);
-            }
-            return was_one;
+        let key = (publisher, topic.clone());
+        let Some(route) = room.data_streams.get_mut(&key) else {
+            debug_assert!(false, "unregistering an unknown data stream");
+            return;
+        };
+        debug_assert!(route.published);
+        route.published = false;
+        route.wildcard_subscribers.clear();
+        route.wildcard_remote_shards.clear();
+        if route.is_unused() {
+            room.data_streams.remove(&key);
         }
-        false
     }
 
     pub fn register_data_subscriber(
@@ -358,19 +397,31 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let route = match publisher {
-            Some(publisher) => room
-                .data_streams
-                .entry((publisher, topic))
-                .or_insert_with(DataTopicRoute::new),
-            None => room
-                .data_topics
-                .entry(topic)
-                .or_insert_with(DataTopicRoute::new),
-        };
-        let was_empty = route.subscribers.is_empty();
-        route.subscribers.insert(subscriber);
-        was_empty
+        match publisher {
+            Some(publisher) => {
+                let route = room
+                    .data_streams
+                    .entry((publisher, topic))
+                    .or_insert_with(DataTopicRoute::new);
+                let was_empty = route.targeted_subscribers.is_empty();
+                route.targeted_subscribers.insert(subscriber);
+                was_empty
+            }
+            None => {
+                let subscribers = room
+                    .wildcard_data_subscribers
+                    .entry(topic.clone())
+                    .or_insert_with(fast_set);
+                let was_empty = subscribers.is_empty();
+                subscribers.insert(subscriber);
+                for ((_, stream_topic), route) in &mut room.data_streams {
+                    if route.published && stream_topic == &topic {
+                        route.wildcard_subscribers.insert(subscriber);
+                    }
+                }
+                was_empty
+            }
+        }
     }
 
     pub fn unregister_data_subscriber(
@@ -383,36 +434,37 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let Some(publisher) = publisher else {
-            return Self::unregister_wildcard_data_subscriber(room, subscriber, topic);
-        };
-        let key = (publisher, topic.clone());
-        let Some(route) = room.data_streams.get_mut(&key) else {
-            return false;
-        };
-        let was_one = route.subscribers.len() == 1 && route.subscribers.contains(&subscriber);
-        route.subscribers.swap_remove(&subscriber);
-        let no_locals = route.subscribers.is_empty();
-        if no_locals && route.remote_shards.is_empty() {
-            room.data_streams.remove(&key);
+        match publisher {
+            Some(publisher) => {
+                let key = (publisher, topic.clone());
+                let Some(route) = room.data_streams.get_mut(&key) else {
+                    return false;
+                };
+                let was_one = route.targeted_subscribers.len() == 1
+                    && route.targeted_subscribers.contains(&subscriber);
+                route.targeted_subscribers.swap_remove(&subscriber);
+                if route.is_unused() {
+                    room.data_streams.remove(&key);
+                }
+                was_one
+            }
+            None => {
+                let Some(subscribers) = room.wildcard_data_subscribers.get_mut(topic) else {
+                    return false;
+                };
+                let was_one = subscribers.len() == 1 && subscribers.contains(&subscriber);
+                subscribers.swap_remove(&subscriber);
+                if subscribers.is_empty() {
+                    room.wildcard_data_subscribers.remove(topic);
+                }
+                for ((_, stream_topic), route) in &mut room.data_streams {
+                    if stream_topic == topic {
+                        route.wildcard_subscribers.swap_remove(&subscriber);
+                    }
+                }
+                was_one
+            }
         }
-        was_one
-    }
-
-    fn unregister_wildcard_data_subscriber(
-        room: &mut ShardRoomContext,
-        subscriber: ParticipantId,
-        topic: &Topic,
-    ) -> bool {
-        let Some(route) = room.data_topics.get_mut(topic) else {
-            return false;
-        };
-        let was_one = route.subscribers.len() == 1 && route.subscribers.contains(&subscriber);
-        route.subscribers.swap_remove(&subscriber);
-        if route.subscribers.is_empty() && route.remote_shards.is_empty() {
-            room.data_topics.remove(topic);
-        }
-        was_one
     }
 
     pub fn register_remote_data_subscriber_shard(
@@ -426,19 +478,25 @@ impl ShardRoutingTable {
             return;
         };
         match publisher {
-            Some(publisher) => room
-                .data_streams
-                .entry((publisher, topic))
-                .or_insert_with(DataTopicRoute::new)
-                .remote_shards
-                .insert(from_shard_id),
-            None => room
-                .data_topics
-                .entry(topic)
-                .or_insert_with(DataTopicRoute::new)
-                .remote_shards
-                .insert(from_shard_id),
-        };
+            Some(publisher) => {
+                room.data_streams
+                    .entry((publisher, topic))
+                    .or_insert_with(DataTopicRoute::new)
+                    .targeted_remote_shards
+                    .insert(from_shard_id);
+            }
+            None => {
+                room.wildcard_data_remote_shards
+                    .entry(topic.clone())
+                    .or_insert_with(fast_set)
+                    .insert(from_shard_id);
+                for ((_, stream_topic), route) in &mut room.data_streams {
+                    if route.published && stream_topic == &topic {
+                        route.wildcard_remote_shards.insert(from_shard_id);
+                    }
+                }
+            }
+        }
     }
 
     pub fn unregister_remote_data_subscriber_shard(
@@ -451,20 +509,28 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let Some(route) = (match publisher {
-            Some(publisher) => room.data_streams.get_mut(&(publisher, topic.clone())),
-            None => room.data_topics.get_mut(topic),
-        }) else {
-            return;
-        };
-        route.remote_shards.swap_remove(&from_shard_id);
-        if route.subscribers.is_empty() && route.remote_shards.is_empty() {
-            match publisher {
-                Some(publisher) => {
-                    room.data_streams.remove(&(publisher, topic.clone()));
+        match publisher {
+            Some(publisher) => {
+                let key = (publisher, topic.clone());
+                let Some(route) = room.data_streams.get_mut(&key) else {
+                    return;
+                };
+                route.targeted_remote_shards.swap_remove(&from_shard_id);
+                if route.is_unused() {
+                    room.data_streams.remove(&key);
                 }
-                None => {
-                    room.data_topics.remove(topic);
+            }
+            None => {
+                if let Some(shards) = room.wildcard_data_remote_shards.get_mut(topic) {
+                    shards.swap_remove(&from_shard_id);
+                    if shards.is_empty() {
+                        room.wildcard_data_remote_shards.remove(topic);
+                    }
+                }
+                for ((_, stream_topic), route) in &mut room.data_streams {
+                    if stream_topic == topic {
+                        route.wildcard_remote_shards.swap_remove(&from_shard_id);
+                    }
                 }
             }
         }
@@ -597,19 +663,20 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let Some(route) = room.data_topics.get(topic) else {
-            return self.route_targeted_data(room_id, origin, topic, pkt, ctx);
+        let Some(route) = room.data_streams.get(&(origin, topic.clone())) else {
+            return;
         };
-
-        for &subscriber_id in &route.subscribers {
-            // if subscriber_id == origin {
-            //     continue;
-            // }
+        debug_assert!(route.published);
+        for &subscriber_id in &route.targeted_subscribers {
+            ctx.forward_sctp(subscriber_id, origin, topic, pkt);
+        }
+        for &subscriber_id in &route.wildcard_subscribers {
+            debug_assert!(!route.targeted_subscribers.contains(&subscriber_id));
             ctx.forward_sctp(subscriber_id, origin, topic, pkt);
         }
 
         if ctx.is_local(&origin) {
-            for &shard_id in &route.remote_shards {
+            for &shard_id in &route.targeted_remote_shards {
                 ctx.send(
                     shard_id,
                     CrossShardEvent::DataSctpPublished {
@@ -620,28 +687,19 @@ impl ShardRoutingTable {
                     },
                 );
             }
-        }
-        self.route_targeted_data(room_id, origin, topic, pkt, ctx);
-    }
-
-    fn route_targeted_data(
-        &mut self,
-        room_id: RoomId,
-        origin: ParticipantId,
-        topic: &Topic,
-        pkt: &[u8],
-        ctx: &mut impl RoutingContext,
-    ) {
-        let Some(room) = self.rooms.get_mut(&room_id) else { return };
-        let Some(route) = room.data_streams.get(&(origin, topic.clone())) else { return };
-        for &subscriber_id in &route.subscribers {
-            ctx.forward_sctp(subscriber_id, origin, topic, pkt);
-        }
-        if ctx.is_local(&origin) {
-            for &shard_id in &route.remote_shards {
-                ctx.send(shard_id, CrossShardEvent::DataSctpPublished {
-                    room_id, origin, topic: topic.clone(), pkt: pkt.to_vec(),
-                });
+            for &shard_id in &route.wildcard_remote_shards {
+                if route.targeted_remote_shards.contains(&shard_id) {
+                    continue;
+                }
+                ctx.send(
+                    shard_id,
+                    CrossShardEvent::DataSctpPublished {
+                        room_id,
+                        origin,
+                        topic: topic.clone(),
+                        pkt: pkt.to_vec(),
+                    },
+                );
             }
         }
     }
@@ -671,11 +729,9 @@ pub(crate) fn route_participant_control_event(
                 router.send(req.shard_id, CrossShardEvent::KeyframeRequested(req));
             }
         }
-        ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
-            shard_events.push_back(ShardEvent::DataTopicPublished { room_id, topic });
-        }
-        ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
-            shard_events.push_back(ShardEvent::DataTopicUnpublished { room_id, topic });
+        ParticipantControlEvent::DataTopicPublished { .. }
+        | ParticipantControlEvent::DataTopicUnpublished { .. } => {
+            debug_assert!(false, "data stream lifecycle must be handled by shard core");
         }
         ParticipantControlEvent::DataTopicSubscribed {
             room_id,

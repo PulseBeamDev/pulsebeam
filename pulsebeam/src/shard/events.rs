@@ -60,10 +60,12 @@ pub enum ParticipantControlEvent {
     },
     DataTopicPublished {
         room_id: RoomId,
+        publisher: ParticipantId,
         topic: Topic,
     },
     DataTopicUnpublished {
         room_id: RoomId,
+        publisher: ParticipantId,
         topic: Topic,
     },
     DataTopicSubscribed {
@@ -224,6 +226,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::DataTopicPublished {
                     room_id: self.room_id,
+                    publisher: self.id,
                     topic,
                 },
             ));
@@ -236,6 +239,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::DataTopicUnpublished {
                     room_id: self.room_id,
+                    publisher: self.id,
                     topic,
                 },
             ));

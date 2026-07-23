@@ -272,23 +272,21 @@ impl ShardCore {
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
                 ParticipantEvent::Control(ev) => match ev {
-                    ParticipantControlEvent::DataTopicPublished { room_id, topic } => {
-                        if self.routing.register_data_publisher(room_id, topic.clone()) {
-                            self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicPublished {
-                                    room_id,
-                                    topic,
-                                });
-                        }
+                    ParticipantControlEvent::DataTopicPublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => {
+                        self.routing
+                            .register_data_publisher(room_id, publisher, topic);
                     }
-                    ParticipantControlEvent::DataTopicUnpublished { room_id, topic } => {
-                        if self.routing.unregister_data_publisher(room_id, &topic) {
-                            self.pipeline
-                                .push_shard_event(ShardEvent::DataTopicUnpublished {
-                                    room_id,
-                                    topic,
-                                });
-                        }
+                    ParticipantControlEvent::DataTopicUnpublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => {
+                        self.routing
+                            .unregister_data_publisher(room_id, publisher, &topic);
                     }
                     ParticipantControlEvent::DataTopicSubscribed {
                         room_id,
@@ -296,10 +294,12 @@ impl ShardCore {
                         topic,
                         publisher,
                     } => {
-                        if self
-                            .routing
-                            .register_data_subscriber(room_id, subscriber, topic.clone(), publisher)
-                        {
+                        if self.routing.register_data_subscriber(
+                            room_id,
+                            subscriber,
+                            topic.clone(),
+                            publisher,
+                        ) {
                             self.pipeline
                                 .push_shard_event(ShardEvent::DataTopicSubscribed {
                                     room_id,
@@ -492,12 +492,6 @@ impl ShardCore {
             } => {
                 self.routing
                     .unregister_remote_subscriber_shard(from_shard_id, track);
-            }
-            ClusterCommand::PublishDataTopic { room_id, topic } => {
-                let _ = (room_id, topic);
-            }
-            ClusterCommand::UnpublishDataTopic { room_id, topic } => {
-                let _ = (room_id, topic);
             }
             ClusterCommand::SubscribeDataTopic {
                 room_id,

@@ -66,14 +66,6 @@ pub enum ClusterCommand {
         from_shard_id: ShardId,
         track: TrackMeta,
     },
-    PublishDataTopic {
-        room_id: RoomId,
-        topic: Topic,
-    },
-    UnpublishDataTopic {
-        room_id: RoomId,
-        topic: Topic,
-    },
     SubscribeDataTopic {
         room_id: RoomId,
         from_shard_id: ShardId,
@@ -132,14 +124,6 @@ pub enum ShardEvent {
     TrackSubscribed(TrackMeta),
     /// Subscriber shard → Publisher shard: no more local subscribers; stop forwarding.
     TrackUnsubscribed(TrackMeta),
-    DataTopicPublished {
-        room_id: RoomId,
-        topic: Topic,
-    },
-    DataTopicUnpublished {
-        room_id: RoomId,
-        topic: Topic,
-    },
     DataTopicSubscribed {
         room_id: RoomId,
         topic: Topic,
