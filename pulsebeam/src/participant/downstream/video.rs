@@ -2803,6 +2803,7 @@ mod assignment_tests {
         stage_kf.seq_no = 100.into();
         stage_kf.playout_time = now + Duration::from_millis(1);
         stage_kf.is_keyframe = true;
+        stage_kf.marker = true;
         slot.process(&new_layer.stream_id(), &stage_kf);
         while slot.switcher.pop(now).is_some() {}
 

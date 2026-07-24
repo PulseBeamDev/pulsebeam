@@ -251,6 +251,32 @@ mod test {
         out
     }
 
+    /// A brand-new `Switcher` (a slot's very first-ever layer acquisition,
+    /// before anything has ever been `push()`-ed) staging straight into a
+    /// keyframe, with nothing preceding it -- unlike every other test in
+    /// this module, which primes an "active" stream first via `push()` to
+    /// model a mid-stream switch. This is the actual first-acquisition
+    /// shape: there is no old stream to protect a boundary against, so the
+    /// keyframe must still release.
+    #[test]
+    fn fresh_switcher_releases_its_first_ever_keyframe_with_no_prior_stream() {
+        let now = Instant::now();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(42));
+
+        switcher.stage(pkt(20, 1, 1_000, now, true, false));
+        switcher.stage(pkt(20, 2, 1_100, now, false, true));
+
+        let out = drain_all(&mut switcher, now);
+        assert_eq!(
+            out.len(),
+            2,
+            "a fresh switcher must release its first-ever keyframe without \
+             requiring a preceding stream to find a boundary against"
+        );
+        assert!(out[0].is_keyframe);
+        assert!(switcher.ready_to_switch());
+    }
+
     #[test]
     fn optimistic_switch_starts_before_new_keyframe_marker_arrives() {
         let now = Instant::now();
@@ -655,7 +681,10 @@ mod test {
         switcher.push(pkt(10, 1, 1_000, now, false, true));
         let _ = switcher.pop(now);
 
-        // Start one transition and complete it so state reaches Stable.
+        // Start one transition and complete it so state reaches Stable. A
+        // single-packet frame (marker on the keyframe packet itself) so
+        // the segment is complete immediately, not just optimistically
+        // staged.
         switcher.stage(pkt(20, 99, 2_000, now, false, true));
         switcher.stage(pkt(
             20,
@@ -663,7 +692,7 @@ mod test {
             2_100,
             now + Duration::from_millis(1),
             true,
-            false,
+            true,
         ));
         let _ = drain_all(&mut switcher, now);
         assert!(switcher.ready_to_switch());
@@ -687,7 +716,7 @@ mod test {
             3_100,
             now + Duration::from_millis(3),
             true,
-            false,
+            true,
         ));
         let out = drain_all(&mut switcher, now);
         assert_eq!(out.len(), 1);

@@ -80,6 +80,26 @@ pub struct KeyframeBuffer {
     frames: BTreeMap<Instant, FrameState>,
 
     pending: VecDeque<RtpPacket>,
+    /// The playout time of the most recently flushed segment, once one has
+    /// flushed. Gates `append`: a packet that arrives late enough to have
+    /// missed the boundary/cold-start detection for its own (earlier)
+    /// frame, but happens to straggle in after a *later* frame has already
+    /// flushed and started draining, must not be tacked onto the tail of
+    /// that later frame's release queue -- it belongs before it, and
+    /// appending it out of chronological order corrupts the reassembled
+    /// access-unit sequence instead of just losing one stale frame.
+    segment_start: Option<Instant>,
+    /// True until this buffer's first segment ever flushes (since
+    /// construction or the last `clear()`). A brand-new acquisition (a
+    /// slot's very first layer, or a fresh switch target) starts with a
+    /// genuinely empty ring -- there is no preceding frame to find a
+    /// boundary against, and there never will be, since nothing was ever
+    /// staged before this target started. That's expected, not a sign of
+    /// loss, so the first keyframe seen by a cold buffer is allowed to
+    /// start a segment without one. Once warm, a missing boundary again
+    /// means real loss/reordering and is correctly treated as unsafe to
+    /// splice on.
+    cold: bool,
 }
 
 impl Default for KeyframeBuffer {
@@ -94,6 +114,8 @@ impl KeyframeBuffer {
             ring: RingBuffer::new(),
             frames: BTreeMap::new(),
             pending: VecDeque::with_capacity(KEYFRAME_BUFFER_CAPACITY),
+            segment_start: None,
+            cold: true,
         }
     }
 
@@ -133,11 +155,14 @@ impl KeyframeBuffer {
         // keyframe packet are present. Waiting for this keyframe's final RTP
         // marker is incorrect here: Switcher transitions immediately and the
         // remaining keyframe packets are then forwarded through the new route.
+        // A cold buffer has no boundary to find in the first place -- see
+        // `cold`'s doc comment -- so it's exempted from that requirement.
         let is_segment = frame.is_keyframe
-            && frame.found_boundary
+            && (frame.found_boundary || self.cold)
             && Self::segment_within_tolerance(playout_time, target_playout);
         if is_segment {
             self.flush(playout_time);
+            self.cold = false;
         }
         is_segment
     }
@@ -153,8 +178,36 @@ impl KeyframeBuffer {
     /// `push`'s ring/boundary detection on them would fail (the ring was
     /// cleared by the segment's own flush) and strand them forever instead
     /// of forwarding the rest of the keyframe.
+    ///
+    /// Dropped instead if it's older than the flushed segment's own start:
+    /// a genuine straggler from *before* the released frame (delayed enough
+    /// to miss its own boundary/cold-start detection, but not delayed
+    /// enough to be dropped by the network) must not be tacked onto the
+    /// tail of a later frame's release queue -- unlike `flush`'s own ring
+    /// scan, `append` has no ordering pass to put it back in place, so
+    /// letting it through here would corrupt the reassembled access-unit
+    /// sequence instead of just losing one stale, now-unusable frame.
     pub fn append(&mut self, pkt: RtpPacket) {
-        self.pending.push_back(pkt);
+        if self
+            .segment_start
+            .is_some_and(|start| pkt.playout_time < start)
+        {
+            return;
+        }
+        // Insert in sequence order rather than blindly at the back: under
+        // real network jitter, a packet belonging to the segment already
+        // draining can arrive after a *later*-sequenced packet of the same
+        // frame was already appended (the ring only captures whatever had
+        // arrived by flush time; anything still in flight lands here,
+        // out of arrival order relative to its neighbors). Appending it
+        // blindly would splice it into the wrong position in the
+        // reassembled access unit instead of its correct one.
+        let idx = self
+            .pending
+            .iter()
+            .position(|queued| queued.seq_no > pkt.seq_no)
+            .unwrap_or(self.pending.len());
+        self.pending.insert(idx, pkt);
     }
 
     fn flush(&mut self, start_at: Instant) -> bool {
@@ -181,6 +234,7 @@ impl KeyframeBuffer {
 
         self.ring.clear();
         self.frames.clear();
+        self.segment_start = Some(start_at);
         true
     }
 
@@ -188,6 +242,8 @@ impl KeyframeBuffer {
         self.pending.clear();
         self.ring.clear();
         self.frames.clear();
+        self.segment_start = None;
+        self.cold = true;
     }
 }
 
@@ -207,12 +263,43 @@ mod test {
     }
 
     #[test]
-    fn does_not_segment_without_frame_boundary() {
+    fn cold_buffer_segments_its_first_keyframe_without_a_preceding_boundary() {
         let mut buf = KeyframeBuffer::new();
         let now = Instant::now();
 
+        // A brand-new acquisition (a slot's very first layer, or a fresh
+        // switch target): the very first packet this buffer ever sees is a
+        // keyframe, with nothing preceding it in the ring. There's no
+        // history to find a boundary against and there never will be --
+        // that's expected, not a sign of loss, so it must still segment.
         let segmented = buf.push(make(100, now, true, false), now);
-        assert!(!segmented);
+        assert!(
+            segmented,
+            "a cold buffer's first keyframe must start a segment without requiring a boundary"
+        );
+        assert_eq!(buf.pop().unwrap().seq_no, 100.into());
+        assert!(buf.pop().is_none());
+    }
+
+    #[test]
+    fn warm_buffer_still_requires_a_boundary_after_its_first_segment() {
+        let mut buf = KeyframeBuffer::new();
+        let now = Instant::now();
+
+        // Cold-start the buffer with an initial segment.
+        assert!(buf.push(make(100, now, true, false), now));
+        assert!(buf.pop().is_some());
+
+        // A later keyframe arrives with nothing preceding it in the ring
+        // (e.g. the intervening frame was entirely lost) -- once warm, a
+        // missing boundary is real loss again, not a fresh acquisition, and
+        // must not be treated as a safe segment start.
+        let later = now + Duration::from_millis(200);
+        let segmented = buf.push(make(500, later, true, false), later);
+        assert!(
+            !segmented,
+            "a warm buffer must still require a real boundary, not just any keyframe"
+        );
         assert!(buf.pop().is_none());
     }
 
@@ -312,6 +399,65 @@ mod test {
 
         assert_eq!(buf.pop().unwrap().seq_no, 11.into());
         assert_eq!(buf.pop().unwrap().seq_no, 12.into());
+        assert!(buf.pop().is_none());
+    }
+
+    #[test]
+    fn append_drops_a_straggler_older_than_the_flushed_segment() {
+        let mut buf = KeyframeBuffer::new();
+        let now = Instant::now();
+
+        // Cold-start flush of a keyframe at `now`.
+        assert!(buf.push(make(100, now, true, false), now));
+        assert_eq!(buf.pop().unwrap().seq_no, 100.into());
+
+        // A packet belonging to an *earlier* frame than the one just
+        // flushed straggles in late (delayed enough on the network to miss
+        // its own boundary/cold-start detection entirely, but not delayed
+        // enough to be dropped outright). It must not be spliced onto the
+        // tail of the segment that already started draining -- that frame
+        // is chronologically obsolete and unusable at this point.
+        let straggler_time = now - Duration::from_millis(33);
+        buf.append(make(50, straggler_time, false, true));
+
+        // A genuine continuation of the flushed segment (same or later
+        // playout time) must still go through normally.
+        buf.append(make(101, now, true, true));
+
+        assert_eq!(
+            buf.pop().unwrap().seq_no,
+            101.into(),
+            "a stale straggler from before the flushed segment must be dropped, not \
+             delivered ahead of (or interleaved with) the segment that already started"
+        );
+        assert!(buf.pop().is_none());
+    }
+
+    #[test]
+    fn append_inserts_a_late_arriving_packet_in_sequence_order() {
+        let mut buf = KeyframeBuffer::new();
+        let now = Instant::now();
+
+        // Cold-start flush captures only what had arrived by then -- 102's
+        // slot in the ring is still empty.
+        assert!(buf.push(make(100, now, true, false), now));
+        assert_eq!(buf.pop().unwrap().seq_no, 100.into());
+
+        // Same frame's remaining packets arrive out of sequence order (real
+        // network jitter can delay any one of them independently) -- 103
+        // shows up before 102.
+        buf.append(make(103, now, false, false));
+        buf.append(make(102, now, false, false));
+        buf.append(make(104, now, false, true));
+
+        assert_eq!(buf.pop().unwrap().seq_no, 102.into());
+        assert_eq!(buf.pop().unwrap().seq_no, 103.into());
+        assert_eq!(
+            buf.pop().unwrap().seq_no,
+            104.into(),
+            "append must insert by sequence number, not arrival order, so a frame's \
+             packets reassemble correctly regardless of which one is delayed"
+        );
         assert!(buf.pop().is_none());
     }
 
