@@ -112,6 +112,10 @@ pub struct UpstreamTrackLayer {
     pub quality: LayerQuality,
     pub monitor: StreamMonitor,
     synchronizer: Synchronizer,
+    /// The Video Layers Allocation simulcast-stream index this layer is sent on,
+    /// learned from its own packets. Used to read this layer's state out of a
+    /// VLA carried on any sibling's packet.
+    vla_index: Option<u8>,
 }
 
 impl PartialEq for UpstreamTrackLayer {
@@ -130,9 +134,81 @@ impl UpstreamTrackLayer {
     pub fn process(&mut self, pkt: &mut RtpPacket, sr: Option<SenderInfo>) -> bool {
         self.synchronizer.process(pkt, sr);
         self.monitor.process_packet(pkt);
+        // Learn which VLA simulcast-stream index this layer is sent on, so a VLA
+        // carried on any sibling's packet can address this layer's state.
+        if let Some(vla) = pkt
+            .ext_vals
+            .user_values
+            .get::<str0m::rtp::vla::VideoLayersAllocation>()
+        {
+            self.vla_index = Some(vla.current_simulcast_stream_index);
+        }
         // audio will only be filtered at the centralized audio_selector
         true
     }
+
+    /// Apply a (track-wide) Video Layers Allocation to this layer using its
+    /// learned stream index: the sender's declared target bitrate, resolution,
+    /// and active/inactive state.
+    fn apply_vla(&self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
+        let Some(idx) = self.vla_index.map(usize::from) else {
+            return;
+        };
+        let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
+        // A stream with no active spatial layers (or absent from the list) is
+        // declared inactive by the sender.
+        let active = vla
+            .simulcast_streams
+            .get(idx)
+            .is_some_and(|s| !s.spatial_layers.is_empty());
+        let state = self.monitor.shared_state();
+        let first_declaration = state.declared_target_bps() == 0.0 && target_bps > 0;
+        state.set_declared_target_bps(target_bps);
+        // Resolution is optional in VLA; only override the height guess when present.
+        if let Some(height) = vla_stream_height_px(vla, idx) {
+            state.set_declared_height(height as u32);
+        }
+        state.set_vla_inactive(!active);
+        if first_declaration {
+            tracing::info!(
+                mid = %self.mid,
+                rid = ?self.rid,
+                target_kbps = target_bps / 1000,
+                height = state.declared_height(),
+                "VLA: sender declared layer target bitrate; allocating on it"
+            );
+        }
+    }
+}
+
+/// Declared target bitrate (bps) for simulcast stream `idx` in a Video Layers
+/// Allocation: the highest cumulative temporal bitrate across its spatial
+/// layers. `None` when the stream is absent or declared inactive.
+pub(crate) fn vla_stream_target_bps(
+    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    idx: usize,
+) -> Option<u64> {
+    let stream = vla.simulcast_streams.get(idx)?;
+    let kbps = stream
+        .spatial_layers
+        .iter()
+        .filter_map(|sl| sl.temporal_layers.iter().map(|t| t.cumulative_kbps).max())
+        .max()?;
+    Some(kbps.saturating_mul(1000))
+}
+
+/// Declared frame height (px) for simulcast stream `idx`: the tallest spatial
+/// layer that carries a resolution. `None` when absent (VLA omits resolution).
+pub(crate) fn vla_stream_height_px(
+    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    idx: usize,
+) -> Option<u16> {
+    let stream = vla.simulcast_streams.get(idx)?;
+    stream
+        .spatial_layers
+        .iter()
+        .filter_map(|sl| sl.resolution_and_framerate.as_ref().map(|r| r.height))
+        .max()
 }
 
 pub struct UpstreamTrack {
@@ -155,12 +231,25 @@ impl UpstreamTrack {
         packet: &mut RtpPacket,
         sr: Option<SenderInfo>,
     ) -> bool {
-        let sender = self
+        let processed = self
             .layers
             .iter_mut()
             .find(|s| s.rid.as_ref() == rid)
-            .expect("expected sender to always be available");
-        sender.process(packet, sr)
+            .expect("expected sender to always be available")
+            .process(packet, sr);
+
+        // A VLA on any layer's packet describes every simulcast stream; push it
+        // to every layer whose stream index we've already learned.
+        if let Some(vla) = packet
+            .ext_vals
+            .user_values
+            .get::<str0m::rtp::vla::VideoLayersAllocation>()
+        {
+            for layer in &self.layers {
+                layer.apply_vla(vla);
+            }
+        }
+        processed
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
@@ -273,6 +362,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             quality: LayerQuality::Low,
             synchronizer: Synchronizer::new(rtp::AUDIO_FREQUENCY),
             monitor,
+            vla_index: None,
         }],
     };
     (
@@ -335,6 +425,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             quality,
             synchronizer: Synchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor,
+            vla_index: None,
         });
         layers.push(TrackLayer {
             meta: meta.clone(),
@@ -746,5 +837,72 @@ mod data_track {
             let err = DataTrackIntent::try_from(&cfg(&one_byte_over)).unwrap_err();
             assert_eq!(err, DataTrackIntentError::LabelTooLong);
         }
+    }
+}
+
+#[cfg(test)]
+mod vla_tests {
+    use super::vla_stream_target_bps;
+    use str0m::rtp::vla::{
+        SimulcastStreamAllocation, SpatialLayerAllocation, TemporalLayerAllocation,
+        VideoLayersAllocation,
+    };
+
+    fn stream(cumulative_kbps: &[u64]) -> SimulcastStreamAllocation {
+        SimulcastStreamAllocation {
+            spatial_layers: vec![SpatialLayerAllocation {
+                temporal_layers: cumulative_kbps
+                    .iter()
+                    .map(|&c| TemporalLayerAllocation { cumulative_kbps: c })
+                    .collect(),
+                resolution_and_framerate: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn target_is_top_cumulative_temporal_rate() {
+        let vla = VideoLayersAllocation {
+            current_simulcast_stream_index: 1,
+            simulcast_streams: vec![stream(&[100, 150]), stream(&[300, 500, 800])],
+        };
+        assert_eq!(vla_stream_target_bps(&vla, 0), Some(150_000));
+        assert_eq!(vla_stream_target_bps(&vla, 1), Some(800_000));
+    }
+
+    #[test]
+    fn inactive_or_missing_stream_has_no_target() {
+        let vla = VideoLayersAllocation {
+            current_simulcast_stream_index: 0,
+            simulcast_streams: vec![SimulcastStreamAllocation {
+                spatial_layers: vec![],
+            }],
+        };
+        assert_eq!(vla_stream_target_bps(&vla, 0), None);
+        assert_eq!(vla_stream_target_bps(&vla, 5), None);
+    }
+
+    #[test]
+    fn height_is_tallest_declared_spatial_layer_or_none() {
+        use str0m::rtp::vla::ResolutionAndFramerate;
+        let with_height = |h: u16| SimulcastStreamAllocation {
+            spatial_layers: vec![SpatialLayerAllocation {
+                temporal_layers: vec![TemporalLayerAllocation {
+                    cumulative_kbps: 500,
+                }],
+                resolution_and_framerate: Some(ResolutionAndFramerate {
+                    width: 640,
+                    height: h,
+                    framerate: 30,
+                }),
+            }],
+        };
+        let vla = VideoLayersAllocation {
+            current_simulcast_stream_index: 0,
+            simulcast_streams: vec![with_height(360), stream(&[100])],
+        };
+        assert_eq!(super::vla_stream_height_px(&vla, 0), Some(360));
+        // Stream 1 carries no resolution → fall back to the height guess.
+        assert_eq!(super::vla_stream_height_px(&vla, 1), None);
     }
 }

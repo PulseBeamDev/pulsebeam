@@ -74,6 +74,7 @@ fn declarative_subscription_test() -> turmoil::Result {
         client.ctx.driver.set_subscriptions(vec![Subscription {
             track_id: track_id.clone(),
             height: 720,
+            ..Default::default()
         }]);
 
         // 2. Wait for media flow
@@ -93,10 +94,12 @@ fn declarative_subscription_test() -> turmoil::Result {
             Subscription {
                 track_id: track_id.clone(),
                 height: 360,
+                ..Default::default()
             },
             Subscription {
                 track_id: "non_existent".to_string(),
                 height: 360,
+                ..Default::default()
             },
         ]);
 

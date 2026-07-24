@@ -8,6 +8,11 @@ pub mod rtp_extensions {
     ///
     /// We use 9 for abs-capture-time so it does not collide with these defaults.
     pub const ABS_CAPTURE_TIME: u8 = 9;
+
+    /// Video Layers Allocation (`video-layers-allocation00`). 12 is free of the
+    /// str0m defaults above; as the SDP answerer str0m adopts the offerer's id,
+    /// so this is only our local preference.
+    pub const VIDEO_LAYERS_ALLOCATION: u8 = 12;
 }
 
 pub mod namespace {

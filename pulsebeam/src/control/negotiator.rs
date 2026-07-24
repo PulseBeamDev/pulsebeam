@@ -97,6 +97,13 @@ impl Negotiator {
                 rtp_extensions::ABS_CAPTURE_TIME,
                 Extension::AbsoluteCaptureTime,
             )
+            // Sender-declared per-layer target bitrates. Browsers emit this for
+            // simulcast/SVC; we allocate on the declared targets instead of
+            // measured (VBR) throughput. Falls back to measurement when absent.
+            .set_extension(
+                rtp_extensions::VIDEO_LAYERS_ALLOCATION,
+                Extension::with_serializer(str0m::rtp::vla::URI, str0m::rtp::vla::Serializer),
+            )
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))

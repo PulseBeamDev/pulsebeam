@@ -1,11 +1,14 @@
 mod audio;
 mod video;
 
+use std::time::Duration;
+
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
 use crate::id::AudioSelectorSlotId;
 use crate::participant::downstream::audio::AudioAllocator;
+use crate::participant::downstream::video::MIN_BANDWIDTH;
 use crate::participant::downstream::video::VideoAllocator;
 use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
@@ -38,13 +41,66 @@ impl Default for SlotConfig {
     }
 }
 
+const BWE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
+const BWE_FALL_TIME_CONSTANT: Duration = Duration::from_millis(800);
+
+slotmap::new_key_type! {
+    pub struct SlotKey;
+}
+
+#[derive(Debug)]
+struct BweFilter {
+    filtered_bps: f64,
+    last_update: Option<Instant>,
+}
+
+impl BweFilter {
+    fn new(initial: Bitrate) -> Self {
+        Self {
+            filtered_bps: initial.as_f64(),
+            last_update: None,
+        }
+    }
+
+    fn tick(&mut self, now: Instant, overusing: bool) {
+        self.update(now, self.current(), overusing);
+    }
+
+    fn update(&mut self, now: Instant, raw: Bitrate, overusing: bool) {
+        let raw_bps = raw.as_f64();
+        let Some(last_update) = self.last_update.replace(now) else {
+            self.filtered_bps = raw_bps;
+            return;
+        };
+        let elapsed = now.saturating_duration_since(last_update);
+        if raw_bps >= self.filtered_bps {
+            let alpha = (-elapsed.as_secs_f64() / BWE_RISE_TIME_CONSTANT.as_secs_f64()).exp();
+            self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
+        } else if overusing {
+            // Genuine congestion (delay detector overusing): follow the estimate down.
+            let alpha = (-elapsed.as_secs_f64() / BWE_FALL_TIME_CONSTANT.as_secs_f64()).exp();
+            self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
+        }
+        // Otherwise str0m is lowering the estimate without congestion (it keeps
+        // shrinking bwe when we're application-limited) — hold, don't let that
+        // drag the allocator down.
+    }
+
+    fn current(&self) -> Bitrate {
+        Bitrate::from(self.filtered_bps as u64)
+    }
+}
+
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
     pub video: VideoAllocator,
     audio: AudioAllocator,
 
-    available_bandwidth: Bitrate,
+    available_bandwidth: BweFilter,
     last_desired: Bitrate,
+    /// Whether str0m's delay detector currently signals congestion. Refreshed
+    /// each allocation tick and consulted when the BWE estimate falls.
+    overusing: bool,
 }
 
 impl DownstreamAllocator {
@@ -54,8 +110,9 @@ impl DownstreamAllocator {
             audio: AudioAllocator::new(),
             dirty_allocation: false,
 
-            available_bandwidth: video::MIN_BANDWIDTH,
+            available_bandwidth: BweFilter::new(MIN_BANDWIDTH),
             last_desired: video::MIN_BANDWIDTH,
+            overusing: false,
         }
     }
 
@@ -94,18 +151,21 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn update_bitrate(&mut self, available_bandwidth: Bitrate) {
-        self.available_bandwidth = available_bandwidth;
+    pub fn update_bitrate(&mut self, now: Instant, available_bandwidth: Bitrate) {
+        self.available_bandwidth
+            .update(now, available_bandwidth, self.overusing);
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self, bwe: &mut Bwe) -> bool {
+    pub fn update_allocations(&mut self, now: Instant, bwe: &mut Bwe) -> bool {
+        self.overusing = bwe.is_overusing();
+        // update rate per time
+        self.available_bandwidth.tick(now, self.overusing);
         self.dirty_allocation = false;
-        let (desired, assignments_changed) =
-            self.video.update_allocations(self.available_bandwidth);
-        // let desired = Bitrate::kbps(300);
+        let (desired, assignments_changed) = self
+            .video
+            .update_allocations(self.available_bandwidth.current());
         if self.last_desired != desired {
-            tracing::info!("set desired to {}", desired);
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;
         }
@@ -122,8 +182,9 @@ impl DownstreamAllocator {
         bwe: &mut Bwe,
         events: &mut impl ParticipantSink,
     ) -> bool {
-        let assignments_changed = self.update_allocations(bwe);
-        self.video.poll_slow(now, self.available_bandwidth, events);
+        let assignments_changed = self.update_allocations(now, bwe);
+        self.video
+            .poll_slow(now, self.available_bandwidth.current(), events);
         assignments_changed
     }
 
