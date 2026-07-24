@@ -420,6 +420,11 @@ impl ParticipantCore {
                 "Writing RTP packet"
             );
         }
+        // The sender's Video Layers Allocation describes its simulcast layers,
+        // which is meaningless on the single stream we forward to the viewer —
+        // strip it (abs-capture-time et al. are typed fields, kept intact).
+        let mut ext_vals = pkt.ext_vals;
+        ext_vals.user_values = Default::default();
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
@@ -429,14 +434,14 @@ impl ParticipantCore {
         )
         .nackable(nackable)
         .marker(pkt.marker)
-        .ext_vals(pkt.ext_vals);
+        .ext_vals(ext_vals);
         stream.write_rtp(rtp);
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         let mut budget = 3;
         'drain: loop {
-            let Some(rtc_deadline) = self.poll_rtc(events) else {
+            let Some(rtc_deadline) = self.poll_rtc(now, events) else {
                 self.cleanup_data_topics(events);
                 events.exit();
                 return;
@@ -498,7 +503,8 @@ impl ParticipantCore {
             }
 
             if self.downstream.dirty_allocation {
-                let assignments_changed = self.downstream.update_allocations(&mut self.rtc.bwe());
+                let assignments_changed =
+                    self.downstream.update_allocations(now, &mut self.rtc.bwe());
                 if assignments_changed {
                     self.signaling.mark_assignments_dirty();
                 }
@@ -524,7 +530,7 @@ impl ParticipantCore {
 
     /// Internal helper: Drains the RTC engine until it yields a Timeout.
     /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self, events: &mut impl ParticipantSink) -> Option<Instant> {
+    fn poll_rtc(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
         // Count of useful outputs (Transmit / Event) processed in this call.
         #[cfg(feature = "deep-metrics")]
         let mut work_items: u64 = 0;
@@ -567,7 +573,7 @@ impl ParticipantCore {
                         event_count += 1;
                         work_items += 1;
                     }
-                    self.handle_event(event, events);
+                    self.handle_event(now, event, events);
                 }
                 Err(e) => {
                     #[cfg(feature = "deep-metrics")]
@@ -594,7 +600,7 @@ impl ParticipantCore {
         result
     }
 
-    fn handle_event(&mut self, e: Event, events: &mut impl ParticipantSink) {
+    fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
         match e {
             Event::IceConnectionStateChange(state) if state.is_disconnected() => {
                 self.disconnect(DisconnectReason::IceDisconnected);
@@ -607,7 +613,7 @@ impl ParticipantCore {
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                self.downstream.update_bitrate(available)
+                self.downstream.update_bitrate(now, available)
             }
             Event::ChannelOpen(cid, _label) => {
                 let Some(ch) = self.rtc.channel(cid) else {

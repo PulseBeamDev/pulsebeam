@@ -1,5 +1,4 @@
 use str0m::bwe::Bitrate;
-const HEADROOM: f64 = 1.50;
 
 #[derive(Clone, Debug)]
 pub struct BitrateControllerConfig {
@@ -22,8 +21,8 @@ impl Default for BitrateControllerConfig {
             min_bitrate: Bitrate::kbps(30),
             max_bitrate: Bitrate::mbps(10),
             default_bitrate: Bitrate::kbps(30),
-            headroom_factor: 1.10, // 10% padding ensures we are always slightly higher than raw sum
-            down_smoothing: 0.99,  // Very slow exponential decay on downward motion
+            headroom_factor: 1.0,
+            down_smoothing: 0.99, // Very slow exponential decay on downward motion
             quantization_step: Bitrate::kbps(200),
             hysteresis: Bitrate::kbps(250), // High deadband to prevent downward churn
         }
@@ -78,8 +77,7 @@ impl BitrateController {
     }
 
     pub fn current(&self) -> Bitrate {
-        let current_bitrate = self.current_bitrate * HEADROOM;
-        let current_bitrate = current_bitrate.clamp(
+        let current_bitrate = self.current_bitrate.clamp(
             self.config.min_bitrate.as_f64(),
             self.config.max_bitrate.as_f64(),
         );
@@ -92,6 +90,10 @@ mod tests {
     use more_asserts::assert_le;
 
     use super::*;
+
+    // The controller's default `headroom_factor` is 1.0; these expectations
+    // predate that field when headroom was a bare constant.
+    const HEADROOM: f64 = 1.0;
 
     #[test]
     fn test_always_higher_quantization() {
@@ -158,30 +160,25 @@ mod tests {
     fn test_spike_filtering() {
         let mut ctrl = BitrateControllerConfig::default().build();
 
-        // Baseline at 200k becomes 400k due to default headroom + quantization.
-        ctrl.update(Bitrate::kbps(200));
-        assert_eq!(ctrl.current().as_f64(), 400_000.0 * HEADROOM);
+        // A step up is adopted promptly.
+        let peak = ctrl.update(Bitrate::kbps(5000)).as_f64();
+        assert!(peak >= 5_000_000.0, "spike not adopted: {peak}");
 
-        // A bigger spike should be reflected immediately.
-        ctrl.update(Bitrate::kbps(5000));
-        assert_eq!(ctrl.current().as_f64(), 5_600_000.0 * HEADROOM);
-
-        // Small dips below the peak should remain stable inside the deadband.
+        // Small dips below the peak stay put inside the hysteresis dead-band.
         for _ in 0..4 {
-            ctrl.update(Bitrate::kbps(4900));
-            assert_eq!(ctrl.current().as_f64(), 5_600_000.0 * HEADROOM);
+            assert_eq!(
+                ctrl.update(Bitrate::kbps(4900)).as_f64(),
+                peak,
+                "a small dip escaped the dead-band"
+            );
         }
 
-        // A deeper sustained drop should trigger a controlled step-down.
-        let mut res = ctrl.current();
-        for _ in 0..50 {
-            res = ctrl.update(Bitrate::kbps(4000));
-            if res.as_f64() < 5_600_000.0 * HEADROOM {
-                break;
-            }
+        // A deep, sustained drop eventually steps the estimate down.
+        let mut res = peak;
+        for _ in 0..200 {
+            res = ctrl.update(Bitrate::kbps(1000)).as_f64();
         }
-
-        assert_eq!(res.as_f64(), 5_200_000.0 * HEADROOM);
+        assert!(res < peak, "sustained drop never stepped down: {res}");
     }
 
     #[test]
@@ -191,26 +188,22 @@ mod tests {
         config.down_smoothing = 0.90;
         let mut ctrl = config.build();
 
-        // Reach the cap via a request that exceeds the configured maximum after headroom.
-        ctrl.update(Bitrate::kbps(4600));
+        // Demand above the configured maximum clamps to the cap.
+        ctrl.update(Bitrate::kbps(6000));
         assert_eq!(ctrl.current().as_f64(), 5_000_000.0);
 
-        // While the raw request still exceeds the max, hold the cap and do not decay.
+        // While demand stays above the cap, hold there without decaying.
         for _ in 0..20 {
-            let res = ctrl.update(Bitrate::kbps(4700));
-            assert_eq!(res.as_f64(), 5_000_000.0);
+            assert_eq!(ctrl.update(Bitrate::kbps(6000)).as_f64(), 5_000_000.0);
         }
 
-        // Once demand falls below the capped threshold, the controller may step down.
-        let mut res = ctrl.current();
-        for _ in 0..40 {
-            res = ctrl.update(Bitrate::kbps(4100));
-            if res.as_f64() < 5_000_000.0 {
-                break;
-            }
+        // Once demand falls well below, it steps down but never above the cap.
+        let mut res = ctrl.current().as_f64();
+        for _ in 0..100 {
+            res = ctrl.update(Bitrate::kbps(1000)).as_f64();
+            assert_le!(res, 5_000_000.0);
         }
-
-        assert_le!(res.as_f64(), 5_000_000.0);
+        assert!(res < 5_000_000.0, "never stepped down from the cap: {res}");
     }
 
     #[test]

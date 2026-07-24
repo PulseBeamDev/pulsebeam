@@ -145,6 +145,8 @@ impl Signaling {
                 Intent {
                     track_id,
                     max_height: req.height,
+                    min_height: req.min_height.min(req.height),
+                    priority: req.priority,
                 },
             );
         }

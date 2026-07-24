@@ -80,10 +80,12 @@ fn slots_layout_update_test() -> turmoil::Result {
             Subscription {
                 track_id: track1.clone(),
                 height: 720,
+                ..Default::default()
             },
             Subscription {
                 track_id: track2.clone(),
                 height: 720,
+                ..Default::default()
             },
         ]);
 
@@ -105,10 +107,12 @@ fn slots_layout_update_test() -> turmoil::Result {
             Subscription {
                 track_id: track2.clone(),
                 height: 720,
+                ..Default::default()
             },
             Subscription {
                 track_id: track1.clone(),
                 height: 720,
+                ..Default::default()
             },
         ]);
 
@@ -218,10 +222,12 @@ fn slots_prioritization_test() -> turmoil::Result {
             Subscription {
                 track_id: track1.clone(),
                 height: 720,
+                ..Default::default()
             },
             Subscription {
                 track_id: track2.clone(),
                 height: 180,
+                ..Default::default()
             },
         ]);
 

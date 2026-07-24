@@ -2,10 +2,17 @@ use pulsebeam_proto::signaling::VideoRequest;
 use std::collections::{HashMap, HashSet};
 use str0m::media::Mid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A desired downstream video subscription. See `VideoRequest` in the signaling
+/// proto for the QoS field semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub track_id: String,
+    /// Target render height (px); `0` = hidden.
     pub height: u32,
+    /// Floor render height (px) to keep under contention; `0` = droppable.
+    pub min_height: u32,
+    /// Contention order; higher wins bandwidth first.
+    pub priority: u32,
 }
 
 pub struct SubscriptionManager {
@@ -82,6 +89,8 @@ impl SubscriptionManager {
                 mid: mid.to_string(),
                 track_id: sub.track_id.clone(),
                 height: sub.height,
+                min_height: sub.min_height,
+                priority: sub.priority,
             });
         }
 

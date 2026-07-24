@@ -9,8 +9,10 @@ pub struct Track {
     pub participant_id: ::prost::alloc::string::String,
     /// Extensible metadata (e.g. "display_name", "is_muted", "avatar_url").
     #[prost(map = "string, string", tag = "4")]
-    pub meta:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub meta: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VideoAssignment {
@@ -43,17 +45,66 @@ pub struct StateUpdate {
     #[prost(string, repeated, tag = "6")]
     pub assignments_remove: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// Per received video stream, `VideoRequest` tells the server how the stream is
+/// being consumed so it can spend the subscriber's limited downlink bandwidth
+/// where it matters most. The server chooses one simulcast layer per stream to
+/// maximize perceived quality within the available budget.
+///
+/// Under bandwidth contention the server, per subscriber:
+///    1. guarantees each stream its `min_height` floor, in `priority` order
+///       (least-important droppable streams give way first), then
+///    2. raises streams toward their `height` target, in `priority` order, one
+///       quality step at a time.
+///
+/// Optimal use: set `height` to what you actually render, `min_height` to the
+/// lowest quality you still want (or 0 to allow pausing), and `priority` to how
+/// much this stream matters relative to your others.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VideoRequest {
     #[prost(string, tag = "1")]
     pub mid: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub track_id: ::prost::alloc::string::String,
-    /// Render height in physical pixels.
-    /// 0 = Off-screen/Hidden (Server pauses stream).
-    /// >0 = Visible (Server optimizes simulcast layer).
+    /// TARGET render height in physical pixels — the size you are actually
+    /// displaying this stream at. Primary quality lever: the server will not send
+    /// meaningfully more than this, because pixels beyond your display size are
+    /// invisible. Update it whenever your layout changes (resize, pin, fullscreen).
+    ///    0  = hidden / off-screen → the server sends nothing (frees bandwidth).
+    ///    >0 = the server picks the simulcast layer that best matches this size.
+    /// Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
+    /// the streams you are actually looking at.
     #[prost(uint32, tag = "3")]
     pub height: u32,
+    /// Relative importance for bandwidth contention — decides the ORDER in which
+    /// streams keep and gain quality when not everything fits. Higher = more
+    /// important; 0 = least. It is an order only, not a size (size is `height`),
+    /// so do not encode display size here.
+    ///
+    /// A free scalar, so it can be driven continuously and dynamically — e.g. from
+    /// an active-speaker score, gaze/focus, or a proximity/danger sensor.
+    /// Suggested (non-binding) convention: 0 background, 100 normal, 200 focused /
+    /// active speaker, 255+ safety-critical. Any monotonically increasing scheme
+    /// works.
+    #[prost(uint32, tag = "4")]
+    pub priority: u32,
+    /// FLOOR: the lowest render height to keep for this stream under contention.
+    /// The server holds the stream at or above this resolution as long as it
+    /// possibly can, dropping below it (to paused) only when no budget remains
+    /// after higher-`priority` streams.
+    ///    0              = droppable: may be paused entirely under contention
+    ///                     (use for background/auxiliary streams).
+    ///    0 < n < height = keep at least ~n px (e.g. a small always-visible tile).
+    ///    n == height    = pin at full quality: never degrade (safety-critical /
+    ///                     focused stream).
+    ///
+    /// Examples:
+    ///    Teleoperation front camera : height=1080 priority=255 min_height=1080
+    ///    Teleoperation side camera  : height=480  priority=5   min_height=0
+    ///    Conference active speaker  : height=720  priority=200 min_height=180
+    ///    Conference other tile      : height=360  priority=10  min_height=90
+    ///    Conference minimized tile  : height=0
+    #[prost(uint32, tag = "5")]
+    pub min_height: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpstreamIntent {
