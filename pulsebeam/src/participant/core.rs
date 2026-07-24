@@ -434,6 +434,7 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        let mut budget = 3;
         'drain: loop {
             let Some(rtc_deadline) = self.poll_rtc(events) else {
                 self.cleanup_data_topics(events);
@@ -507,6 +508,14 @@ impl ParticipantCore {
 
             let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
             let deadline = rtc_deadline.min(next_slow_poll);
+
+            // upper bounded to 3 ticks to defensively avoid spin loops from bugs or just to give fairness
+            // to other participants
+            if deadline <= now && budget > 0 {
+                budget -= 1;
+                let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                continue;
+            }
 
             events.update_deadline(deadline);
             break;

@@ -12,7 +12,7 @@ TEST =
 all: build
 
 dev:
-	$(CARGO_CMD) run -p pulsebeam --features deep-metrics -- --dev
+	$(CARGO_CMD) run -p pulsebeam -- --dev -i enp0s13f0u1u2
 
 build:
 	$(CARGO_CMD) build
