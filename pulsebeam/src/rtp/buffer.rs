@@ -142,6 +142,15 @@ impl KeyframeBuffer {
             self.frames.remove(&oldest);
         }
 
+        eprintln!(
+            "DIAGBUF push seq={:?} rtp_ts={:?} playout={:?} is_kf={} marker={} buckets={}",
+            pkt.seq_no,
+            pkt.rtp_ts,
+            playout_time,
+            pkt.is_keyframe,
+            pkt.marker,
+            self.frames.len()
+        );
         let frame = self.frames.entry(playout_time).or_default();
         frame.is_keyframe |= pkt.is_keyframe;
         frame.min_seqno = frame.min_seqno.min(pkt.seq_no);
