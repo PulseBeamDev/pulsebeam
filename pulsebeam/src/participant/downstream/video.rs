@@ -1198,8 +1198,16 @@ fn desired_from_allocation_envelope(views: &[SlotView<'_>]) -> Bitrate {
         views
             .iter()
             .filter_map(|view| {
-                let current = view.track.by_quality(view.current_quality)?;
-                let current_bps = current.state.nominal_bitrate_bps();
+                // Deliberately keyed off the best *reachable* layer, NOT the
+                // slot's flapping current tier: `set_desired_bitrate` wakes
+                // str0m's probe controller (see `DownstreamAllocator::
+                // update_allocations`), so a demand that swings tick-to-tick
+                // with the current tier re-wakes the prober constantly and it
+                // never completes a probe cycle -- leaving BWE pinned just
+                // below the top layer's cost forever (a self-reinforcing
+                // trap: low BWE -> low tier -> low demand -> no probe ->
+                // low BWE). Anchoring the demand to the stable ceiling we'd
+                // *like* to reach lets the prober run uninterrupted and climb.
                 let best_reachable = view
                     .track
                     .layers
@@ -1209,32 +1217,22 @@ fn desired_from_allocation_envelope(views: &[SlotView<'_>]) -> Bitrate {
                             && AllocationEngine::max_height_for_quality(layer.quality)
                                 <= view.max_height
                     })
-                    .max_by_key(|layer| layer.quality);
+                    .max_by_key(|layer| layer.quality)
+                    .or_else(|| view.track.by_quality(view.current_quality))?;
 
-                let demand_bps = match best_reachable {
-                    Some(layer) if layer.quality > view.current_quality => {
-                        // What it would cost to actually afford the next
-                        // tier: its ongoing rate plus its one-time switch
-                        // burst — see `BURST_COST_SECONDS`.
-                        let cost = layer.state.nominal_bitrate_bps();
-                        cost + cost * BURST_COST_SECONDS
-                    }
-                    // Already at (or above) the best reachable layer: no tier
-                    // to climb toward, but still ask for a bit more than
-                    // strictly needed. `demand_bitrate_bps` is the fast,
-                    // reactive signal (unlike the conservative
-                    // `bitrate_bps`/`effective_cost` used for admission) —
-                    // a live in-tier burst (VBR/screen-share content getting
-                    // busier with no tier change) should bump this ask
-                    // immediately. `PROBE_HEADROOM_FRACTION` adds a small
-                    // standing margin even at rest, so str0m's prober always
-                    // has a reason to test for spare capacity instead of
-                    // only reacting after a burst already demands it.
-                    _ => {
-                        current_bps.max(current.state.demand_bitrate_bps())
-                            * (1.0 + PROBE_HEADROOM_FRACTION)
-                    }
-                };
+                // `demand_bitrate_bps` is the fast, reactive signal (unlike
+                // the conservative `bitrate_bps`/`effective_cost` used for
+                // admission) so a live in-tier burst (VBR/screen-share
+                // getting busier) bumps the ask immediately.
+                // `PROBE_HEADROOM_FRACTION` keeps a standing margin above the
+                // target even at rest, so the prober always has a reason to
+                // test for the spare capacity that would let us hold this
+                // ceiling.
+                let base_bps = best_reachable
+                    .state
+                    .nominal_bitrate_bps()
+                    .max(best_reachable.state.demand_bitrate_bps());
+                let demand_bps = base_bps * (1.0 + PROBE_HEADROOM_FRACTION);
                 Some(demand_bps as u64)
             })
             .sum::<u64>(),
