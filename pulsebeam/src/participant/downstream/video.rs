@@ -610,6 +610,50 @@ impl VideoAllocator {
             decisions.insert(view.key, pause);
         }
 
+        // Forward-progress guarantee: an allocator that forwards nothing
+        // starves the very estimate it's waiting on. str0m cannot measure a
+        // link carrying zero packets, so a downlink estimate that cold-starts
+        // below the cheapest layer would pause every slot forever, and the
+        // resulting zero throughput keeps the estimate pinned (observed: two
+        // 800kbit/s slots deadlocked on a clean, uncapped link whose estimate
+        // never grew past its 503kbit/s cold start). If nothing is being
+        // forwarded this tick, admit the single highest-priority slot at its
+        // cheapest tier so real traffic flows and the estimate can climb; on a
+        // genuinely capped link it self-corrects downward via normal loss
+        // feedback, still forwarding the one most-important stream.
+        let forwarding = decisions
+            .values()
+            .any(|d| matches!(d, AllocationDecision::Forward(..)));
+        if !forwarding {
+            let mut candidates: Vec<&SlotView> = views
+                .iter()
+                .filter(|v| {
+                    self.slots
+                        .get(v.key)
+                        .is_some_and(|s| !s.should_hold_allocation(now))
+                })
+                .collect();
+            candidates.sort_by(rank);
+            if let Some(view) = candidates.first().copied() {
+                // Resume the layer this slot is already synced to when it's
+                // still live, rather than force-switching to the cheapest one:
+                // a switch requires a fresh keyframe (the test assets carry
+                // only one natural keyframe per loop), so forcing a downgrade
+                // here would emit a layer transition the decoder can't follow.
+                // Only a slot whose current layer has gone inactive needs the
+                // (keyframe-gated) switch to the cheapest active layer.
+                let layer = view
+                    .track
+                    .by_quality(view.current_quality)
+                    .filter(|l| !l.state.is_inactive())
+                    .unwrap_or_else(|| view.track.cheapest_active_layer());
+                decisions.insert(
+                    view.key,
+                    AllocationDecision::Forward(layer, Bitrate::from(effective_cost(layer) as u64)),
+                );
+            }
+        }
+
         // Phase 4 — every admitted slot climbs with whatever genuine
         // surplus is left, re-sorted by deficit so a bigger admitted
         // sibling's climb still can't starve a smaller admitted sibling's
