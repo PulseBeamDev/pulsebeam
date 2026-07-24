@@ -321,19 +321,7 @@ async fn drain_remote_track(
     sink: Arc<AtomicU64>,
     health: SharedStreamHealth,
 ) {
-    let mut n = 0u64;
     while let Ok(frame) = track.recv().await {
-        n += 1;
-        if n <= 20 {
-            let is_kf = pulsebeam_testdata::h264_frame_is_keyframe(&frame.data);
-            eprintln!(
-                "DIAGCLIENT n={n} ts={:?} capture={:?} len={} is_kf={is_kf} first_bytes={:?}",
-                frame.ts,
-                frame.capture_time,
-                frame.data.len(),
-                &frame.data[..frame.data.len().min(16)],
-            );
-        }
         sink.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
         health.lock().unwrap_or_else(|p| p.into_inner()).record(
             frame.ts,

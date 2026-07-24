@@ -20,6 +20,24 @@ const SWITCHER_PENDING_CAPACITY: usize = 32;
 /// budget.
 const OLD_FRAME_GRACE_PERIOD: Duration = Duration::from_millis(200);
 
+/// How long a packet sits in the active-layer queue before it's eligible to
+/// release, keyed off its own arrival time. `push_inner` inserts by seq_no
+/// rather than arrival order, but that alone does nothing if `pop` drains
+/// the queue back to empty on every single call (the normal case: one
+/// packet arrives, gets pushed, and is immediately popped again before its
+/// next-door neighbor -- delayed by ordinary jitter -- has a chance to
+/// arrive and get sorted ahead of it). This window gives a same-generation
+/// sibling that few extra milliseconds. It matters most right after a fresh
+/// promotion: this is a downstream receiver's *first-ever* reassembled
+/// segment, and some receivers (confirmed via str0m's `DepacketizingBuffer`)
+/// treat their first-ever emission as automatically contiguous regardless
+/// of what's still missing before it -- so a later packet that outraces an
+/// earlier, still-in-flight one doesn't just arrive out of order, it can
+/// cause the receiver to release the wrong (later) segment first and drop
+/// the real one for good. Kept short enough not to meaningfully add to
+/// end-to-end latency for ordinary steady-state playback.
+pub(crate) const ACTIVE_REORDER_WINDOW: Duration = Duration::from_millis(20);
+
 #[derive(Debug)]
 pub struct Switcher {
     timeline: Timeline,
@@ -115,7 +133,17 @@ impl Switcher {
             self.timeline.drop_count(1);
         }
 
-        self.pending.push_back(pkt);
+        // Insert by seq_no rather than blindly at the back: a sibling
+        // delayed by ordinary jitter can arrive after a later-sequenced
+        // packet was already queued. See `ACTIVE_REORDER_WINDOW` for why
+        // this matters even though `pop` usually drains this queue back to
+        // empty on every call.
+        let idx = self
+            .pending
+            .iter()
+            .position(|queued| queued.seq_no > pkt.seq_no)
+            .unwrap_or(self.pending.len());
+        self.pending.insert(idx, pkt);
         self.switched = false;
         true
     }
@@ -153,7 +181,16 @@ impl Switcher {
     }
 
     pub fn pop(&mut self, now: Instant) -> Option<RtpPacket> {
-        if let Some(mut pkt) = self.pending.pop_front() {
+        if let Some(front) = self.pending.front() {
+            if now.saturating_duration_since(front.arrival_ts) < ACTIVE_REORDER_WINDOW {
+                // Not stale enough to release yet -- give a same-generation
+                // sibling delayed by ordinary jitter a chance to arrive and
+                // get sorted ahead of it. Must not fall through to staging
+                // below: that would let a new-layer packet overtake this
+                // still-fresh active-layer one in emission order.
+                return None;
+            }
+            let mut pkt = self.pending.pop_front().expect("front already checked");
             self.update_latest_playout(pkt.playout_time);
             self.timeline.rewrite(&mut pkt);
             return Some(pkt);
@@ -243,9 +280,17 @@ mod test {
         }
     }
 
-    fn drain_all(switcher: &mut Switcher, now: Instant) -> Vec<RtpPacket> {
+    /// Pops everything currently available. `pop`'s `ACTIVE_REORDER_WINDOW`
+    /// gate keys off each packet's own `arrival_ts`, which `pkt()` leaves at
+    /// its real-wall-clock construction time (not the test's logical
+    /// `playout_time`) -- so draining needs a `now` measured from the real
+    /// clock too, comfortably past that window, rather than the test's own
+    /// `now` variable (captured before any packet existed, so on its own
+    /// it's always earlier than every packet's `arrival_ts`).
+    fn drain_all(switcher: &mut Switcher, _now: Instant) -> Vec<RtpPacket> {
+        let far_future = Instant::now() + Duration::from_secs(1);
         let mut out = Vec::new();
-        while let Some(pkt) = switcher.pop(now) {
+        while let Some(pkt) = switcher.pop(far_future) {
             out.push(pkt);
         }
         out
@@ -284,7 +329,9 @@ mod test {
 
         // Prime active stream and timeline.
         switcher.push(pkt(10, 10, 1_000, now, false, true));
-        let active_out = switcher.pop(now).expect("active packet should be emitted");
+        let active_out = switcher
+            .pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1))
+            .expect("active packet should be emitted");
 
         // The old-frame marker permits an optimistic cutover on the first IDR
         // packet. The IDR marker has not arrived yet.
@@ -316,7 +363,7 @@ mod test {
 
         // Prime latest playout from active stream.
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         let old = now - Duration::from_millis(400);
         switcher.stage(pkt(
@@ -339,7 +386,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(9));
 
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         switcher.stage(pkt(
             20,
@@ -382,7 +429,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
 
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         // Old stream has an in-flight incomplete frame (no marker yet).
         switcher.push(pkt(
@@ -441,7 +488,7 @@ mod test {
 
         // Prime an earlier complete frame to establish latest_playout.
         switcher.push(pkt(10, 0, 900, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         // First packet of the in-flight frame arrives before staging triggers.
         switcher.push(pkt(10, 1, 1_000, frame_time, false, false));
@@ -482,7 +529,7 @@ mod test {
 
         // Prime an earlier complete frame.
         switcher.push(pkt(10, 0, 900, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         let frame_time = now + Duration::from_millis(33);
         // Old stream's next frame starts, but is NOT yet complete (no marker).
@@ -502,7 +549,12 @@ mod test {
         ));
 
         // The old in-flight packet (already buffered) drains normally...
-        assert_eq!(switcher.pop(now).map(|p| p.ssrc), Some(Ssrc::from(10)));
+        assert_eq!(
+            switcher
+                .pop(frame_time + ACTIVE_REORDER_WINDOW + Duration::from_millis(1))
+                .map(|p| p.ssrc),
+            Some(Ssrc::from(10))
+        );
         // ...but the staged new-layer segment must NOT release yet: the old
         // frame's marker hasn't arrived, and the grace period hasn't elapsed.
         // Releasing here would strand the old frame's remaining packet
@@ -546,7 +598,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(17));
 
         switcher.push(pkt(10, 0, 900, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         let frame_time = now + Duration::from_millis(33);
         // This packet never gets a marker -- simulates a permanently lost
@@ -563,7 +615,7 @@ mod test {
             false,
         ));
 
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
         assert!(
             switcher.pop(now).is_none(),
             "must hold before the grace period elapses"
@@ -583,7 +635,7 @@ mod test {
 
         // Old stream: current frame is complete (marker emitted).
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         // Staging triggers; pending is empty so old_stream_playout=latest_playout=now.
         switcher.stage(pkt(20, 99, 2_000, now, false, true));
@@ -629,7 +681,7 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(15));
 
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         // Staging triggers and fully drains in one shot: is_switching flips
         // back to false as soon as pop() exhausts the currently-buffered
@@ -679,7 +731,7 @@ mod test {
 
         // Prime active path and latest playout.
         switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop(now);
+        let _ = switcher.pop(now + ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         // Start one transition and complete it so state reaches Stable. A
         // single-packet frame (marker on the keyframe packet itself) so

@@ -22,7 +22,7 @@ use std::time::Duration;
 use str0m::IceConnectionState;
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
-use str0m::media::{Direction, MediaAdded, MediaKind, Mid, Rid};
+use str0m::media::{Direction, KeyframeRequestKind, MediaAdded, MediaKind, Mid, Rid};
 use str0m::rtp::AbsCaptureTime;
 use str0m::{
     Event, Input, Output, Rtc,
@@ -33,6 +33,25 @@ use tokio::time::Instant;
 const MIN_QUANTA: Duration = Duration::from_millis(1);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
 const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
+/// Per-mid cap on frames buffered in `MediaSubsystem::pending_media` while
+/// waiting for signaling to register that mid's target. The signaling
+/// update travels over its own reliable data channel (its own SCTP/DTLS
+/// setup, its own round trips) and can legitimately take several seconds
+/// longer than plain RTP to arrive under high-latency links -- confirmed
+/// via simulation: a satellite-latency link needed over 80 buffered video
+/// frames (~2.7s at 30fps) before signaling caught up. Sized generously
+/// (10s at 30fps) so that delay doesn't cost the opening keyframe FIFO
+/// eviction would otherwise throw away first; still bounded so a mid that's
+/// discovered but never actually assigned can't accumulate unbounded
+/// memory.
+const PENDING_MEDIA_CAPACITY: usize = 1000;
+/// Leading-edge debounce between receive-side keyframe (PLI) requests for one
+/// mid. Long enough that a single lost GOP doesn't trigger a keyframe storm
+/// (each keyframe is itself a large bandwidth burst that would worsen the
+/// very congestion that caused the loss), short enough to recover a stalled
+/// stream within a second or two. Comfortably below the test suite's
+/// freeze-tolerance budgets.
+const RECV_KEYFRAME_REQUEST_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub type ParticipantId = String;
 
@@ -173,6 +192,47 @@ struct DataSubsystem {
 
 struct MediaSubsystem {
     media_targets: HashMap<Mid, mailbox::Sender<MediaFrame>>,
+    /// RTP and signaling arrive over independent transports (plain RTP vs.
+    /// the reliable data channel carrying track assignments), so a remote
+    /// track's first packets -- including its opening keyframe -- can and
+    /// regularly do reach this agent before `handle_signaling_data` has
+    /// registered a `media_targets` sender for its mid. Buffering here
+    /// instead of dropping means that race never costs the very keyframe a
+    /// decoder needs to start. Bounded per mid and capped in total age (see
+    /// `PENDING_MEDIA_CAPACITY`) so a mid that's discovered but never
+    /// actually assigned doesn't grow this without bound.
+    pending_media: HashMap<Mid, VecDeque<MediaFrame>>,
+    /// Mids for which the first decodable keyframe has already been passed
+    /// through to the application. A decoder cannot use any access unit that
+    /// arrives before the stream's first keyframe -- and str0m's receive
+    /// buffer, on its very first emission for a stream, does *not* wait for
+    /// contiguity (`is_following_last` short-circuits true when nothing has
+    /// been emitted yet), so under packet loss it can hand us a delta frame
+    /// first while the larger keyframe is still one lost-and-being-
+    /// retransmitted packet short of complete. Real decoder pipelines
+    /// (e.g. libwebrtc's `VideoReceiveStream`) discard everything until the
+    /// first keyframe for exactly this reason; we do the same here so the
+    /// application never starts mid-GOP on garbage.
+    keyframe_seen: std::collections::HashSet<Mid>,
+    /// Highest RTP media time already delivered to the application per video
+    /// mid. Under packet loss + reordering, str0m's receive buffer can emit
+    /// a gap-recovered (or, occasionally, duplicated) access unit *after* a
+    /// later one it already released -- i.e. out of timestamp order. A real
+    /// decoder cannot render a frame older than the one it has already
+    /// displayed; it drops it. We do the same, so the application only ever
+    /// sees a monotonically advancing timeline. Reset when a mid's first
+    /// keyframe is (re-)established (see `keyframe_seen`).
+    last_delivered_ts: HashMap<Mid, u64>,
+    /// Last time we asked the SFU for a fresh keyframe on a given receive
+    /// mid, for leading-edge debouncing. A decoder that has lost the ability
+    /// to decode (still waiting for its first keyframe, or hit an
+    /// unrecoverable gap that RTX didn't repair) must actively request a new
+    /// one -- str0m does not do this on its own, and the test assets carry
+    /// only a single keyframe per (long) loop, so without this a stream that
+    /// loses its GOP head never recovers until the next natural keyframe,
+    /// which may be many seconds away. The SFU forwards these PLIs upstream
+    /// to the publisher.
+    keyframe_request_at: HashMap<Mid, Instant>,
     layer_ctrl: LayerController,
     desired_ctrl: BitrateController,
     last_desired: Bitrate,
@@ -248,6 +308,10 @@ impl AgentDriver {
             },
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
+                pending_media: HashMap::new(),
+                keyframe_seen: std::collections::HashSet::new(),
+                last_delivered_ts: HashMap::new(),
+                keyframe_request_at: HashMap::new(),
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
                 last_desired: Bitrate::bps(0),
@@ -602,8 +666,64 @@ impl AgentDriver {
                     }
                     Event::MediaAdded(media) => self.handle_media_added(media),
                     Event::MediaData(data) => {
-                        if let Some(tx) = self.media.media_targets.get(&data.mid) {
-                            let _ = tx.try_send(data.into());
+                        let mid = data.mid;
+                        // Video-only decoder-fidelity gating (audio has no
+                        // keyframes and its own timing model, so never gate
+                        // it):
+                        let mut request_keyframe = false;
+                        if data.params.spec().codec.is_video() {
+                            // 1. Drop everything until this stream's first
+                            //    decodable keyframe. See `keyframe_seen`.
+                            if !self.media.keyframe_seen.contains(&mid) {
+                                if data.is_keyframe() {
+                                    self.media.keyframe_seen.insert(mid);
+                                    self.media.last_delivered_ts.remove(&mid);
+                                } else {
+                                    // Still can't decode anything -- ask the
+                                    // SFU for a keyframe and drop this one.
+                                    self.request_recv_keyframe(mid);
+                                    continue;
+                                }
+                            }
+                            // 2. Drop any access unit whose media time does
+                            //    not advance past the last one delivered -- a
+                            //    decoder cannot render a frame older than what
+                            //    it already displayed. See `last_delivered_ts`.
+                            let ts = data.time.numer();
+                            if let Some(&last) = self.media.last_delivered_ts.get(&mid)
+                                && ts <= last
+                            {
+                                continue;
+                            }
+                            self.media.last_delivered_ts.insert(mid, ts);
+                            // 3. A non-contiguous frame means RTX did not
+                            //    repair a gap in time; the decoder will show
+                            //    artifacts until the next keyframe, so ask for
+                            //    one now (debounced).
+                            request_keyframe = !data.contiguous;
+                        }
+
+                        if request_keyframe {
+                            self.request_recv_keyframe(mid);
+                        }
+
+                        if let Some(tx) = self.media.media_targets.get(&mid) {
+                            if let Err(err) = tx.try_send(data.into()) {
+                                tracing::warn!(%mid, ?err, "dropping remote media frame: consumer not keeping up");
+                            }
+                        } else {
+                            // Signaling hasn't registered this mid's target
+                            // yet -- RTP and the signaling data channel are
+                            // independent transports with no ordering
+                            // guarantee between them. Buffer instead of
+                            // dropping so the eventual `RemoteTrackAdded`
+                            // doesn't start the consumer mid-stream on a
+                            // non-keyframe access unit.
+                            let queue = self.media.pending_media.entry(mid).or_default();
+                            if queue.len() == PENDING_MEDIA_CAPACITY {
+                                queue.pop_front();
+                            }
+                            queue.push_back(data.into());
                         }
                     }
                     Event::IceConnectionStateChange(state) => {
@@ -644,6 +764,27 @@ impl AgentDriver {
                     return None;
                 }
             }
+        }
+    }
+
+    /// Ask the SFU (which forwards it upstream to the publisher) for a fresh
+    /// keyframe on a receive-only video mid, leading-edge debounced per mid.
+    fn request_recv_keyframe(&mut self, mid: Mid) {
+        let now = Instant::now();
+        let due = self
+            .media
+            .keyframe_request_at
+            .get(&mid)
+            .is_none_or(|last| now.duration_since(*last) >= RECV_KEYFRAME_REQUEST_DEBOUNCE);
+        if !due {
+            return;
+        }
+        if let Some(mut writer) = self.rtc.writer(mid)
+            && writer
+                .request_keyframe(None, KeyframeRequestKind::Pli)
+                .is_ok()
+        {
+            self.media.keyframe_request_at.insert(mid, now);
         }
     }
 
@@ -706,6 +847,13 @@ impl AgentDriver {
                 }
                 for (mid, track) in assignments {
                     let (tx, rx) = mailbox::bounded(256);
+                    if let Some(buffered) = self.media.pending_media.remove(&mid) {
+                        for frame in buffered {
+                            if let Err(err) = tx.try_send(frame) {
+                                tracing::warn!(%mid, ?err, "dropping buffered remote media frame on track assignment");
+                            }
+                        }
+                    }
                     self.media.media_targets.insert(mid, tx);
                     self.emit(AgentEvent::RemoteTrackAdded(RemoteTrack { mid, track, rx }));
                 }

@@ -82,6 +82,13 @@ impl AgentBuilder {
                 rtp_extensions::ABS_CAPTURE_TIME,
                 str0m::rtp::Extension::AbsoluteCaptureTime,
             )
+            // Real-time video prefers a brief glitch over a multi-frame
+            // freeze: keep the receive reordering buffer shallow so a lost
+            // packet is skipped past quickly (the decoder conceals the gap
+            // and we request a keyframe) instead of stalling delivery for a
+            // full RTT while NACK/RTX recovers it. str0m's default (30
+            // frames ~= 1s) is tuned for buffered playback, not a live call.
+            .set_reordering_size_video(3)
             .set_stats_interval(Some(Duration::from_millis(200)));
         let codec_config = rtc_builder.codec_config();
         codec_config.enable_opus(true);

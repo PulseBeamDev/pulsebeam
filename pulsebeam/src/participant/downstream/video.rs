@@ -2787,7 +2787,9 @@ mod assignment_tests {
         active_pkt.playout_time = now;
         active_pkt.marker = true;
         slot.process(&old_layer.stream_id(), &active_pkt);
-        let _ = slot.switcher.pop(now);
+        let _ = slot
+            .switcher
+            .pop(now + crate::rtp::switcher::ACTIVE_REORDER_WINDOW + Duration::from_millis(1));
 
         // Stage the new layer's keyframe segment; a single-packet segment
         // drains in one `pop()` pass, exactly like the real timing gap.
