@@ -15,8 +15,8 @@ use crate::rtp::RtpPacket;
 use crate::track::{StreamId, StreamWriter, Track, TrackLayer};
 use pulsebeam_runtime::rand::RngCore;
 use str0m::bwe::{Bitrate, Bwe};
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid};
-use str0m::rtp::Ssrc;
+use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
+use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 pub use video::Intent;
 
@@ -91,6 +91,12 @@ impl BweFilter {
     }
 }
 
+struct PlayoutDelayConfirm {
+    mid: Mid,
+    rid: Option<Rid>,
+    seq: SeqNo,
+}
+
 pub struct DownstreamAllocator {
     pub dirty_allocation: bool,
     pub video: VideoAllocator,
@@ -101,6 +107,10 @@ pub struct DownstreamAllocator {
     /// Whether str0m's delay detector currently signals congestion. Refreshed
     /// each allocation tick and consulted when the BWE estimate falls.
     overusing: bool,
+
+    playout_delay: Option<(MediaTime, MediaTime)>,
+    playout_delay_pending: bool,
+    playout_delay_confirm: Option<PlayoutDelayConfirm>,
 }
 
 impl DownstreamAllocator {
@@ -113,6 +123,61 @@ impl DownstreamAllocator {
             available_bandwidth: BweFilter::new(MIN_BANDWIDTH),
             last_desired: video::MIN_BANDWIDTH,
             overusing: false,
+            playout_delay: None,
+            playout_delay_pending: false,
+            playout_delay_confirm: None,
+        }
+    }
+
+    pub fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
+        const MAX_HUNDREDTHS: u64 = 0xfff;
+        let to_hundredths = |ms: u32| ((ms as u64 + 5) / 10).min(MAX_HUNDREDTHS);
+        let Some(bounds) = bounds else {
+            return;
+        };
+        let max = to_hundredths(bounds.1);
+        let min = to_hundredths(bounds.0).min(max);
+        let delay = (
+            MediaTime::from_hundredths(min),
+            MediaTime::from_hundredths(max),
+        );
+        if self.playout_delay == Some(delay) {
+            return;
+        }
+        self.playout_delay = Some(delay);
+        self.playout_delay_pending = true;
+        self.playout_delay_confirm = None;
+    }
+
+    /// Returns the playout delay to stamp if the receiver has not yet confirmed
+    /// receipt. Returns `None` once confirmed — extension is sticky so no need
+    /// to keep sending unchanged values.
+    #[inline]
+    pub fn playout_delay_to_stamp(&self) -> Option<(MediaTime, MediaTime)> {
+        if self.playout_delay_pending {
+            self.playout_delay
+        } else {
+            None
+        }
+    }
+
+    /// Record that a packet with the current playout delay values was stamped.
+    /// Tracks the first such packet per change for RTCP confirmation.
+    pub fn record_playout_delay_stamp(&mut self, mid: Mid, rid: Option<Rid>, seq: SeqNo) {
+        if self.playout_delay_confirm.is_none() {
+            self.playout_delay_confirm = Some(PlayoutDelayConfirm { mid, rid, seq });
+        }
+    }
+
+    /// Called when RTCP receiver report stats arrive for a stream. Clears the
+    /// pending flag once the remote has acknowledged receipt past our tracked seq.
+    pub fn handle_egress_stats(&mut self, mid: Mid, rid: Option<Rid>, remote_max_seq: SeqNo) {
+        let Some(confirm) = &self.playout_delay_confirm else {
+            return;
+        };
+        if confirm.mid == mid && confirm.rid == rid && remote_max_seq >= confirm.seq {
+            self.playout_delay_pending = false;
+            self.playout_delay_confirm = None;
         }
     }
 

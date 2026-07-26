@@ -119,9 +119,38 @@ message UpstreamIntent {
   bool active = 2;
 }
 
+// Fixed receiver jitter-buffer bounds, signaled via the `playout-delay` RTP
+// header extension (ms, rounded to 10ms on wire).
+//
+//   min == max == 0 → render-ASAP: bypass the jitter buffer entirely
+//                     (interactive/cloud-gaming). Lowest latency; no concealment.
+//   min > 0, max    → clamp the buffer to [min, max]. `min` holds the buffer up;
+//                     `max` is the hard latency ceiling — the receiver conceals
+//                     rather than buffer past it.
+//
+// ONE-WAY: every session starts in adaptive mode (browser owns the jitter buffer;
+// no extension is sent). This message transitions the session to FIXED mode.
+// The extension is sticky in libwebrtc — there is no wire "unset" — so returning
+// to true adaptive requires a new session. Client SDKs must encode this constraint
+// in their API (e.g. `setLatency` is a one-way call; `latencyLocked` flag).
+message PlayoutDelay {
+  uint32 min_ms = 1;
+  uint32 max_ms = 2;
+}
+
 message ClientIntent {
   repeated VideoRequest downstream_requests = 1;
   repeated UpstreamIntent upstream_intents = 2;
+
+  // Absent → adaptive (initial) state: browser owns the jitter buffer; SFU
+  //          stamps no extension. This is the ONLY way to get true adaptive
+  //          behavior — once `playout_delay` is sent it is permanent for the
+  //          session (sticky extension, no wire unset). Do NOT send this field
+  //          and then omit it hoping to reset; omission after a prior send does
+  //          nothing to the receiver's already-stamped bounds.
+  // Present → fixed mode: SFU stamps these bounds on ALL egress RTP (audio +
+  //           video together, preserving A/V lip-sync).
+  optional PlayoutDelay playout_delay = 3;
 }
 
 // ========================================================================

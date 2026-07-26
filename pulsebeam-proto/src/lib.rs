@@ -13,6 +13,11 @@ pub mod rtp_extensions {
     /// str0m defaults above; as the SDP answerer str0m adopts the offerer's id,
     /// so this is only our local preference.
     pub const VIDEO_LAYERS_ALLOCATION: u8 = 12;
+
+    /// Playout delay (`playout-delay`). Sent on egress RTP to bound the
+    /// receiver's jitter buffer (see `ClientIntent.max_playout_delay_ms`). 6 is
+    /// free of the str0m defaults above.
+    pub const PLAYOUT_DELAY: u8 = 6;
 }
 
 pub mod namespace {

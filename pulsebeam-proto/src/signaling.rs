@@ -116,12 +116,43 @@ pub struct UpstreamIntent {
     #[prost(bool, tag = "2")]
     pub active: bool,
 }
+/// Fixed receiver jitter-buffer bounds, signaled via the `playout-delay` RTP
+/// header extension (ms, rounded to 10ms on wire).
+///
+///    min == max == 0 → render-ASAP: bypass the jitter buffer entirely
+///                      (interactive/cloud-gaming). Lowest latency; no concealment.
+///    min > 0, max    → clamp the buffer to \[min, max\]. `min` holds the buffer up;
+///                      `max` is the hard latency ceiling — the receiver conceals
+///                      rather than buffer past it.
+///
+/// ONE-WAY: every session starts in adaptive mode (browser owns the jitter buffer;
+/// no extension is sent). This message transitions the session to FIXED mode.
+/// The extension is sticky in libwebrtc — there is no wire "unset" — so returning
+/// to true adaptive requires a new session. Client SDKs must encode this constraint
+/// in their API (e.g. `setLatency` is a one-way call; `latencyLocked` flag).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PlayoutDelay {
+    #[prost(uint32, tag = "1")]
+    pub min_ms: u32,
+    #[prost(uint32, tag = "2")]
+    pub max_ms: u32,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientIntent {
     #[prost(message, repeated, tag = "1")]
     pub downstream_requests: ::prost::alloc::vec::Vec<VideoRequest>,
     #[prost(message, repeated, tag = "2")]
     pub upstream_intents: ::prost::alloc::vec::Vec<UpstreamIntent>,
+    /// Absent → adaptive (initial) state: browser owns the jitter buffer; SFU
+    ///           stamps no extension. This is the ONLY way to get true adaptive
+    ///           behavior — once `playout_delay` is sent it is permanent for the
+    ///           session (sticky extension, no wire unset). Do NOT send this field
+    ///           and then omit it hoping to reset; omission after a prior send does
+    ///           nothing to the receiver's already-stamped bounds.
+    /// Present → fixed mode: SFU stamps these bounds on ALL egress RTP (audio +
+    ///            video together, preserving A/V lip-sync).
+    #[prost(message, optional, tag = "3")]
+    pub playout_delay: ::core::option::Option<PlayoutDelay>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientMessage {
