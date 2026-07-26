@@ -14,6 +14,7 @@ use str0m::net::Protocol;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded, Pt},
+    stats::MediaEgressStats,
 };
 use tokio::time::Instant;
 
@@ -425,6 +426,12 @@ impl ParticipantCore {
         // strip it (abs-capture-time et al. are typed fields, kept intact).
         let mut ext_vals = pkt.ext_vals;
         ext_vals.user_values = Default::default();
+        if let Some((min, max)) = self.downstream.playout_delay_to_stamp() {
+            ext_vals.play_delay_min = Some(min);
+            ext_vals.play_delay_max = Some(max);
+            self.downstream
+                .record_playout_delay_stamp(mid, rid, pkt.seq_no);
+        }
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
@@ -614,6 +621,15 @@ impl ParticipantCore {
             }
             Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
                 self.downstream.update_bitrate(now, available)
+            }
+            Event::MediaEgressStats(stats) => {
+                if let Some(remote) = stats.remote {
+                    self.downstream.handle_egress_stats(
+                        stats.mid,
+                        stats.rid,
+                        remote.maximum_sequence_number,
+                    );
+                }
             }
             Event::ChannelOpen(cid, _label) => {
                 let Some(ch) = self.rtc.channel(cid) else {

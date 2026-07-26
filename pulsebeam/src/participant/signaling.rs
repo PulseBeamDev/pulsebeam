@@ -150,6 +150,7 @@ impl Signaling {
                 },
             );
         }
+        downstream.set_playout_delay(intent.playout_delay.map(|p| (p.min_ms, p.max_ms)));
         self.last_client_intents = Some(intents);
         self.reconcile(downstream);
     }

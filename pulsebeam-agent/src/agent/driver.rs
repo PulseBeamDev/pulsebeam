@@ -199,6 +199,8 @@ struct SubscriptionSubsystem {
     sub_manager: SubscriptionManager,
     desired_subscriptions: HashMap<String, Subscription>,
     pending_deadline: Option<Instant>,
+    /// (min, max) receiver playout delay in ms; `None` = adaptive default.
+    playout_delay_ms: Option<(u32, u32)>,
 }
 
 struct SessionSubsystem {
@@ -279,6 +281,7 @@ impl AgentDriver {
                 ),
                 desired_subscriptions: HashMap::new(),
                 pending_deadline: None,
+                playout_delay_ms: None,
             },
             session: SessionSubsystem {
                 api: init.api,
@@ -355,6 +358,18 @@ impl AgentDriver {
         for sub in subs {
             self.handle_outgoing_command(OutgoingCommand::SetSubscription(sub));
         }
+        self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+        self.flush_pending_state();
+        self.timers.notifier.notify_one();
+    }
+
+    /// Set the receiver playout-delay bounds (ms) signaled to the server. Forces
+    /// a full intent resend so the change takes effect even without a
+    /// subscription change. `None` restores the adaptive default; `Some((0, 0))`
+    /// disables all receiver smoothing.
+    pub fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
+        self.subscriptions.playout_delay_ms = bounds;
+        self.subscriptions.sub_manager.reset_active_assignments();
         self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
         self.flush_pending_state();
         self.timers.notifier.notify_one();
@@ -746,6 +761,10 @@ impl AgentDriver {
                 signaling::ClientIntent {
                     upstream_intents: vec![],
                     downstream_requests: requests,
+                    playout_delay: self
+                        .subscriptions
+                        .playout_delay_ms
+                        .map(|(min_ms, max_ms)| signaling::PlayoutDelay { min_ms, max_ms }),
                 },
             )),
         };

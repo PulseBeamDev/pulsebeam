@@ -104,6 +104,9 @@ impl Negotiator {
                 rtp_extensions::VIDEO_LAYERS_ALLOCATION,
                 Extension::with_serializer(str0m::rtp::vla::URI, str0m::rtp::vla::Serializer),
             )
+            // Lets the SFU bound each subscriber's jitter buffer (latency cap)
+            // by stamping min/max playout delay on egress RTP.
+            .set_extension(rtp_extensions::PLAYOUT_DELAY, Extension::PlayoutDelay)
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
             .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))
