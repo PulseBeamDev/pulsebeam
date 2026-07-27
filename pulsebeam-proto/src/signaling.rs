@@ -9,10 +9,8 @@ pub struct Track {
     pub participant_id: ::prost::alloc::string::String,
     /// Extensible metadata (e.g. "display_name", "is_muted", "avatar_url").
     #[prost(map = "string, string", tag = "4")]
-    pub meta: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub meta:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VideoAssignment {
@@ -71,8 +69,8 @@ pub struct VideoRequest {
     /// invisible. Update it whenever your layout changes (resize, pin, fullscreen).
     ///    0  = hidden / off-screen → the server sends nothing (frees bandwidth).
     ///    >0 = the server picks the simulcast layer that best matches this size.
-    /// Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
-    /// the streams you are actually looking at.
+    /// > Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
+    /// > the streams you are actually looking at.
     #[prost(uint32, tag = "3")]
     pub height: u32,
     /// Relative importance for bandwidth contention — decides the ORDER in which
