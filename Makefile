@@ -133,3 +133,7 @@ cpu-tune:
 
 system-tune:
 	sudo grubby --update-kernel=ALL --args="isolcpus=1-4 nohz_full=1-4 rcu_nocbs=1-4"
+
+net-tune:
+	sudo sysctl -w net.core.wmem_max=134217728 >/dev/null
+	sudo sysctl -w net.core.rmem_max=134217728 >/dev/null
