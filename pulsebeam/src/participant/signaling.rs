@@ -1,6 +1,7 @@
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use crate::entity::TrackId;
+use crate::log::{LogCtx, plog_info, plog_warn};
 use crate::participant::downstream::{DownstreamAllocator, Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
@@ -25,6 +26,7 @@ pub enum SignalingInputEvent {
 }
 
 pub struct Signaling {
+    ctx: LogCtx,
     pub cid: Option<ChannelId>,
     seq: u64,
     slot_count: usize,
@@ -45,8 +47,9 @@ pub struct Signaling {
 }
 
 impl Signaling {
-    pub fn new() -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
+            ctx,
             cid: None,
             seq: 0,
             dirty_tracks: false,
@@ -83,19 +86,23 @@ impl Signaling {
     ) -> Result<Vec<SignalingInputEvent>, SignalingError> {
         let mut events = Vec::new();
         if data.len() > MAX_SIGNALING_MSG_SIZE {
-            tracing::warn!(len = data.len(), "Fatal: Oversized signaling message");
+            plog_warn!(
+                self.ctx,
+                len = data.len(),
+                "Fatal: Oversized signaling message"
+            );
             return Err(SignalingError::OversizedPacket);
         }
 
         let Ok(msg) = signaling::ClientMessage::decode(data) else {
-            tracing::warn!("Fatal: Invalid Protobuf");
+            plog_warn!(self.ctx, "Fatal: Invalid Protobuf");
             return Err(SignalingError::DecodeFailed);
         };
 
         match msg.payload {
             Some(signaling::client_message::Payload::Intent(intent)) => {
                 if intent.downstream_requests.len() > self.slot_count {
-                    tracing::warn!("Fatal: Complexity limit exceeded");
+                    plog_warn!(self.ctx, "Fatal: Complexity limit exceeded");
                     return Err(SignalingError::ComplexityExceeded);
                 }
                 for state in &intent.upstream_intents {
@@ -104,7 +111,7 @@ impl Signaling {
                         active: state.active,
                     });
                 }
-                tracing::info!("received client intent: {:?}", intent);
+                plog_info!(self.ctx, "received client intent: {:?}", intent);
                 self.apply_client_intent(intent, downstream);
                 self.dirty_assignments = true;
             }
@@ -128,7 +135,7 @@ impl Signaling {
             let track_id = match TrackId::try_from(track_id_str.clone()) {
                 Ok(id) => id,
                 Err(_) => {
-                    tracing::warn!(track_id = %track_id_str, "invalid track_id in client intent");
+                    plog_warn!(self.ctx, track_id = %track_id_str, "invalid track_id in client intent");
                     continue;
                 }
             };
@@ -279,7 +286,7 @@ impl Signaling {
 
         // 5. Send and Commit State
         if let Err(e) = channel.write(true, &buf) {
-            tracing::warn!("Failed to write signaling: {:?}", e);
+            plog_warn!(self.ctx, "Failed to write signaling: {:?}", e);
             // DO NOT reset flags or state; retry next poll
             return false;
         }

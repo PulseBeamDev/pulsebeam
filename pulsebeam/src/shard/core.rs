@@ -54,7 +54,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         pkt: &RtpPacket,
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
-            p.with_span(|core| core.on_forward_rtp(stream_id, pkt));
+            p.on_forward_rtp(stream_id, pkt);
             self.dirty.mark(self.kind, subscriber);
         }
     }
@@ -66,7 +66,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         pkt: &RtpPacket,
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
-            p.with_span(|core| core.on_forward_audio_rtp(slot_idx, pkt));
+            p.on_forward_audio_rtp(slot_idx, pkt);
             self.dirty.mark(self.kind, subscriber);
         }
     }
@@ -79,7 +79,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         pkt: &[u8],
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
-            p.with_span(|core| core.on_forward_sctp(topic, origin, pkt));
+            p.on_forward_sctp(topic, origin, pkt);
             self.dirty.mark(self.kind, subscriber);
         }
     }
@@ -116,7 +116,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         kind: str0m::media::KeyframeRequestKind,
     ) {
         if let Some(p) = self.registry.get_mut(&participant_id) {
-            p.with_span(|core| core.handle_remote_keyframe_request(stream_id, kind));
+            p.handle_remote_keyframe_request(stream_id, kind);
             self.dirty.mark(self.kind, participant_id);
         }
     }
@@ -163,7 +163,7 @@ impl ShardCore {
         let dirty = &mut self.dirty;
         self.timers.drain_expired(now, |participant_id| {
             if let Some(participant) = registry.get_mut(&participant_id) {
-                participant.with_span(|core| core.on_timeout(now));
+                participant.on_timeout(now);
                 dirty.mark_input(participant_id);
             }
         });
@@ -178,7 +178,7 @@ impl ShardCore {
             return;
         };
         if let Some(participant) = self.registry.get_mut(&participant_id) {
-            participant.with_span(|core| core.on_ingress(batch));
+            participant.on_ingress(batch);
             self.dirty.mark_input(participant_id);
         } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
             router.send(
@@ -221,7 +221,7 @@ impl ShardCore {
             };
             let room_id = participant.room_id;
             let mut sink = pipeline.participant_sink(room_id, participant_id);
-            participant.with_span(|core| core.poll(now, &mut sink));
+            participant.poll(now, &mut sink);
         }
     }
 
@@ -564,7 +564,7 @@ impl ShardCore {
                 batch,
             } => {
                 if let Some(participant) = self.registry.get_mut(&participant_id) {
-                    participant.with_span(|core| core.on_ingress(batch));
+                    participant.on_ingress(batch);
                     self.dirty.mark_input(participant_id);
                 }
             }

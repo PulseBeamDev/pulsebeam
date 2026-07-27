@@ -14,12 +14,12 @@ use str0m::net::Protocol;
 use str0m::{
     Event, Input, Output, Rtc, RtcError,
     media::{Direction, MediaAdded, Pt},
-    stats::MediaEgressStats,
 };
 use tokio::time::Instant;
 
 use crate::entity::{self, TrackId};
 use crate::id::ShardId;
+use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::participant::signaling;
@@ -165,7 +165,11 @@ impl ParticipantCore {
         rng: &mut impl RngCore,
     ) -> Self {
         let rtc = cfg.rtc;
-        let signaling = Signaling::new();
+        let ctx = LogCtx {
+            room_id: cfg.room_id,
+            participant_id: cfg.participant_id,
+        };
+        let signaling = Signaling::new(ctx);
         let udp_batcher = Batcher::with_capacity(udp_gso_size);
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
@@ -179,8 +183,8 @@ impl ParticipantCore {
             rtc,
             udp_batcher,
             tcp_batcher,
-            upstream: UpstreamAllocator::new(),
-            downstream: DownstreamAllocator::new(cfg.participant_id, cfg.manual_sub, rng),
+            upstream: UpstreamAllocator::new(ctx),
+            downstream: DownstreamAllocator::new(ctx, cfg.manual_sub, rng),
             disconnect_reason: None,
             signaling,
             last_slow_poll: Instant::now(),
@@ -196,6 +200,13 @@ impl ParticipantCore {
 
         p.on_tracks_published(&cfg.available_tracks);
         p
+    }
+
+    pub(crate) fn log_ctx(&self) -> LogCtx {
+        LogCtx {
+            room_id: self.room_id,
+            participant_id: self.participant_id,
+        }
     }
 
     pub fn on_ingress(&mut self, batch: net::RecvPacketBatch) {
@@ -235,14 +246,14 @@ impl ParticipantCore {
         });
     }
 
-    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id))]
     pub fn on_tracks_published(&mut self, tracks: &[Track]) {
         for track in tracks {
             if track.meta.origin == self.participant_id {
                 continue;
             }
 
-            tracing::info!(
+            plog_info!(
+                self.log_ctx(),
                 track = %track.meta.id,
                 origin = %track.meta.origin,
                 "participant received published track"
@@ -276,12 +287,13 @@ impl ParticipantCore {
     }
 
     fn handle_keyframe_request_now(&mut self, key: KeyframeRequest) {
+        let ctx = self.log_ctx();
         let mut api = self.rtc.direct_api();
         if let Some(stream) = api.stream_rx_by_mid(key.mid, key.rid) {
             stream.request_keyframe(key.kind);
-            tracing::debug!(?key, "requested keyframe for upstream");
+            plog_debug!(ctx, ?key, "requested keyframe for upstream");
         } else {
-            tracing::warn!(?key, "stream not found for keyframe request");
+            plog_warn!(ctx, ?key, "stream not found for keyframe request");
         }
     }
 
@@ -303,12 +315,16 @@ impl ParticipantCore {
         if let Some(last) = self.last_keyframe_request.get(&stream_id)
             && now.duration_since(*last) < KEYFRAME_DEBOUNCE
         {
-            tracing::debug!(?stream_id, "debounced duplicate keyframe request");
+            plog_debug!(
+                self.log_ctx(),
+                ?stream_id,
+                "debounced duplicate keyframe request"
+            );
             return;
         }
 
         let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
-            tracing::warn!(track = ?stream_id.0, "unknown upstream track for keyframe request");
+            plog_warn!(self.log_ctx(), track = ?stream_id.0, "unknown upstream track for keyframe request");
             return;
         };
 
@@ -384,11 +400,18 @@ impl ParticipantCore {
     }
 
     fn write_to_data_channel(&mut self, cid: ChannelId, topic: &Topic, pkt: &[u8]) {
+        let ctx = self.log_ctx();
         let Some(mut ch) = self.rtc.channel(cid) else {
             return;
         };
         if let Err(err) = ch.write(true, pkt) {
-            tracing::warn!(?topic, ?cid, ?err, "failed to forward data topic packet");
+            plog_warn!(
+                ctx,
+                ?topic,
+                ?cid,
+                ?err,
+                "failed to forward data topic packet"
+            );
         }
     }
 
@@ -398,24 +421,27 @@ impl ParticipantCore {
             StreamWrite::Audio { pkt, mid, pt } => (pkt, mid, None, pt, false),
         };
 
+        let ctx = self.log_ctx();
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_tx_by_mid(mid, rid) else {
             if nackable {
-                tracing::warn!(target: crate::log::TARGET_VIDEO, %mid, ?rid, "no stream_tx_by_mid found");
+                plog_warn!(ctx, target: crate::log::TARGET_VIDEO, %mid, ?rid, "no stream_tx_by_mid found");
             } else {
-                tracing::warn!(target: crate::log::TARGET_AUDIO, %mid, "no stream_tx_by_mid found");
+                plog_warn!(ctx, target: crate::log::TARGET_AUDIO, %mid, "no stream_tx_by_mid found");
             }
             return;
         };
         let ssrc = stream.ssrc();
         if nackable {
-            tracing::trace!(
+            plog_trace!(
+                ctx,
                 target: crate::log::TARGET_VIDEO,
                 %mid, ?rid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker,
                 "Writing RTP packet"
             );
         } else {
-            tracing::trace!(
+            plog_trace!(
+                ctx,
                 target: crate::log::TARGET_AUDIO,
                 %mid, %ssrc, %pt, seq = %pkt.seq_no, len = pkt.payload.len(), marker = pkt.marker,
                 "Writing RTP packet"
@@ -470,6 +496,7 @@ impl ParticipantCore {
                 continue;
             }
 
+            let ctx = self.log_ctx();
             while let Some(batch) = self.pending_ingress.front_mut() {
                 let transport = match batch.transport {
                     Transport::Udp(_) => str0m::net::Protocol::Udp,
@@ -484,7 +511,7 @@ impl ParticipantCore {
                 };
 
                 let Ok(contents) = (*pkt).try_into() else {
-                    tracing::warn!(src = %batch.src, "Dropping malformed UDP packet");
+                    plog_warn!(ctx, src = %batch.src, "Dropping malformed UDP packet");
                     // no point iterating the batch, this is already malicous
                     self.pending_ingress.pop_front();
                     continue;
@@ -649,12 +676,12 @@ impl ParticipantCore {
 
                 match intent {
                     DataTrackIntent::InternalSignaling => {
-                        tracing::info!("internal media signaling is opened");
+                        plog_info!(self.log_ctx(), "internal media signaling is opened");
                         self.signaling.set_cid(cid);
                     }
 
                     DataTrackIntent::UserTopic(e) => {
-                        tracing::info!("{} is opened", e);
+                        plog_info!(self.log_ctx(), "{} is opened", e);
                         if let Some(previous) = self.data_topic_channels.remove(&cid) {
                             self.release_data_topic_channel(previous, events);
                         }
@@ -710,7 +737,7 @@ impl ParticipantCore {
                 let Some(ch) = self.data_topic_channels.remove(&cid) else {
                     return;
                 };
-                tracing::info!("{} is closed", ch.topic);
+                plog_info!(self.log_ctx(), "{} is closed", ch.topic);
                 self.release_data_topic_channel(ch, events);
             }
             Event::ChannelData(data) => {
@@ -800,7 +827,6 @@ impl ParticipantCore {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(participant_id = %self.participant_id, mid = %media.mid))]
     fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
         match media.direction {
             Direction::RecvOnly => {
@@ -890,15 +916,16 @@ impl ParticipantCore {
             return;
         }
 
+        let ctx = self.log_ctx();
         let Some(pt) = self.preferred_send_pt(mid, kind) else {
-            tracing::warn!(%mid, ?kind, "no negotiated PT available for downstream slot");
+            plog_warn!(ctx, %mid, ?kind, "no negotiated PT available for downstream slot");
             return;
         };
 
         let ssrc = {
             let mut api = self.rtc.direct_api();
             let Some(stream) = api.stream_tx_by_mid(mid, None) else {
-                tracing::warn!(%mid, ?kind, "missing stream_tx_by_mid while adding downstream slot");
+                plog_warn!(ctx, %mid, ?kind, "missing stream_tx_by_mid while adding downstream slot");
                 return;
             };
             stream.ssrc()
@@ -919,7 +946,7 @@ impl ParticipantCore {
         rtp: str0m::rtp::RtpPacket,
         events: &mut impl ParticipantSink,
     ) {
-        tracing::trace!("tracing:rtp_event={}", rtp.seq_no);
+        plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.seq_no);
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx(&rtp.header.ssrc) else {
             return;
@@ -977,12 +1004,11 @@ impl ParticipantCore {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(participant_id = %self.participant_id, %reason))]
     pub fn disconnect(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_some() {
             return;
         }
-        tracing::info!("Participant core disconnecting");
+        plog_info!(self.log_ctx(), %reason, "Participant core disconnecting");
         self.disconnect_reason = Some(reason);
         self.rtc.disconnect();
     }

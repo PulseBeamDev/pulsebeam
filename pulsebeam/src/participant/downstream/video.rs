@@ -15,6 +15,7 @@ use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
+use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
 /// Maximum number of video slots per participant.
@@ -42,6 +43,7 @@ pub struct VideoAllocator {
     slots: SlotMap<SlotKey, Slot>,
 
     // Cold
+    ctx: LogCtx,
     manual_sub: bool,
     tracks: HashMap<TrackId, Track>,
     rng: Rng,
@@ -50,7 +52,7 @@ pub struct VideoAllocator {
 }
 
 impl VideoAllocator {
-    pub fn new<R: RngCore>(manual_sub: bool, rng: &mut R) -> Self {
+    pub(crate) fn new<R: RngCore>(ctx: LogCtx, manual_sub: bool, rng: &mut R) -> Self {
         let desired_ctrl = BitrateControllerConfig {
             min_bitrate: MIN_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
@@ -59,6 +61,7 @@ impl VideoAllocator {
         }
         .build();
         Self {
+            ctx,
             manual_sub,
             tracks: HashMap::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
@@ -73,7 +76,7 @@ impl VideoAllocator {
         if self.tracks.contains_key(&track.meta.id) {
             return;
         }
-        tracing::info!(track = %track.meta.id, "video track added");
+        plog_info!(self.ctx, track = %track.meta.id, "video track added");
         self.tracks.insert(track.meta.id, track);
         self.rebalance();
     }
@@ -82,7 +85,7 @@ impl VideoAllocator {
         if self.tracks.remove(track_id).is_none() {
             return false;
         }
-        tracing::info!(track = %track_id, "video track removed");
+        plog_info!(self.ctx, track = %track_id, "video track removed");
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
         for slot in self.slots.values_mut() {
@@ -126,7 +129,7 @@ impl VideoAllocator {
         {
             let track_id = &intent.track_id;
             let Some(track_state) = tracks.get_mut(track_id) else {
-                tracing::warn!(track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
+                plog_warn!(slot.ctx, track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
                 slot.max_height = 0;
                 slot.stop();
                 return None;
@@ -180,10 +183,10 @@ impl VideoAllocator {
 
     pub fn add_slot(&mut self, config: SlotConfig) {
         if self.has_slot(config.mid) {
-            tracing::debug!(mid = %config.mid, "video slot already provisioned; skipping duplicate");
+            plog_debug!(self.ctx, mid = %config.mid, "video slot already provisioned; skipping duplicate");
             return;
         }
-        let slot = Slot::new(config, &mut self.rng);
+        let slot = Slot::new(self.ctx, config, &mut self.rng);
         self.slots.insert(slot);
         self.rebalance();
     }
@@ -218,7 +221,8 @@ impl VideoAllocator {
             .count();
         let pending_count = self.tracks.len().saturating_sub(already_assigned.len());
         if pending_count > 0 && idle_slot_count == 0 {
-            tracing::debug!(
+            plog_debug!(
+                self.ctx,
                 pending_tracks = pending_count,
                 total_slots = self.slots.len(),
                 "rebalance: pending tracks but no idle slots, tracks will wait"
@@ -240,7 +244,8 @@ impl VideoAllocator {
             }
         }
         if staged > 0 {
-            tracing::debug!(
+            plog_debug!(
+                self.ctx,
                 staged,
                 "rebalance: staged tracks into idle slots, awaiting BWE to activate"
             );
@@ -284,7 +289,7 @@ impl VideoAllocator {
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
         for (key, decision) in &decisions {
             let Some(slot) = self.slots.get_mut(key) else {
-                tracing::warn!("no slot found from decision");
+                plog_warn!(self.ctx, "no slot found from decision");
                 continue;
             };
 
@@ -300,7 +305,7 @@ impl VideoAllocator {
         }
 
         if changed {
-            log_allocation(available_bandwidth, desired, &decisions, &views);
+            log_allocation(self.ctx, available_bandwidth, desired, &decisions, &views);
         }
 
         (desired, changed)
@@ -327,7 +332,7 @@ impl VideoAllocator {
         };
 
         let Some(slot) = self.slots.get_mut(*slot_key) else {
-            tracing::warn!("no slot found for {:?}", stream_id);
+            plog_warn!(self.ctx, "no slot found for {:?}", stream_id);
             return false;
         };
 
@@ -423,7 +428,8 @@ impl VideoAllocator {
             {
                 if let Some(existing_slot) = seen.get(&layer.meta.id) {
                     if existing_slot != &slot_key {
-                        tracing::error!(
+                        plog_error!(
+                            self.ctx,
                             track = %layer.meta.id,
                             first_slot = ?existing_slot,
                             second_slot = ?slot_key,
@@ -449,6 +455,7 @@ enum SlotState {
 }
 
 struct Slot {
+    ctx: LogCtx,
     ssrc: Ssrc,
     pt: Pt,
 
@@ -473,8 +480,9 @@ struct Slot {
 }
 
 impl Slot {
-    fn new<R: RngCore>(cfg: SlotConfig, rng: &mut R) -> Self {
+    fn new<R: RngCore>(ctx: LogCtx, cfg: SlotConfig, rng: &mut R) -> Self {
         Self {
+            ctx,
             mid: cfg.mid,
             rid: cfg.rid,
             ssrc: cfg.ssrc,
@@ -544,7 +552,8 @@ impl Slot {
 
         if reached_keepalive {
             self.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
-            tracing::debug!(
+            plog_debug!(
+                self.ctx,
                 mid = %self.mid,
                 retries = KEYFRAME_MAX_RETRIES,
                 interval = ?self.staging_keyframe_interval,
@@ -574,7 +583,7 @@ impl Slot {
                 self.switcher.clear_staging();
                 self.pli_reset();
                 changed = true;
-                tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
+                plog_debug!(self.ctx, mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
             }
         } else if self.target().as_ref() != Some(&new_layer) {
             self.staging = Some(new_layer.clone());
@@ -584,20 +593,20 @@ impl Slot {
             // Reset retry state so the new staging layer gets fresh PLI attempts.
             self.pli_reset();
             changed = true;
-            tracing::debug!(mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
+            plog_debug!(self.ctx, mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
         }
 
         if self.paused {
             self.paused = false;
             changed = true;
-            tracing::debug!(mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
+            plog_debug!(self.ctx, mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
         }
 
         changed
     }
 
     fn stop(&mut self) {
-        tracing::debug!(mid=%self.mid, "slot stopped");
+        plog_debug!(self.ctx, mid=%self.mid, "slot stopped");
         self.active = None;
         self.staging = None;
         self.pli_reset();
@@ -616,13 +625,13 @@ impl Slot {
         if self.staging.as_ref() != Some(layer) {
             self.staging = Some(layer.clone());
             changed = true;
-            tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
+            plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
         }
 
         if !self.paused {
             self.paused = true;
             changed = true;
-            tracing::debug!(mid=%self.mid, target=?layer.stream_id(), "slot paused");
+            plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot paused");
         }
 
         changed
@@ -630,7 +639,7 @@ impl Slot {
 
     fn process(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
         if self.paused {
-            tracing::trace!(mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
+            plog_trace!(self.ctx, mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
             return;
         }
 
@@ -643,7 +652,7 @@ impl Slot {
         {
             self.switcher.stage(pkt.clone());
         } else {
-            tracing::trace!(mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
+            plog_trace!(self.ctx, mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
         }
     }
 
@@ -665,6 +674,7 @@ impl Slot {
 }
 
 pub fn log_allocation(
+    ctx: LogCtx,
     bwe: Bitrate,
     desired: Bitrate,
     decisions: &SecondaryMap<SlotKey, AllocationDecision>,
@@ -690,7 +700,8 @@ pub fn log_allocation(
         reports.push(entry);
     }
 
-    tracing::info!(
+    plog_info!(
+        ctx,
         %bwe,
         used = %Bitrate::from(total_used_bps as u64),
         want = %desired,
@@ -965,8 +976,16 @@ mod assignment_tests {
         pub ids: Vec<TrackId>,
     }
 
+    fn test_ctx() -> LogCtx {
+        use crate::entity::{ExternalRoomId, RoomId};
+        LogCtx {
+            room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
+            participant_id: ParticipantId::new(&mut test_rng()),
+        }
+    }
+
     fn setup_allocator() -> VideoAllocator {
-        VideoAllocator::new(false, &mut test_rng())
+        VideoAllocator::new(test_ctx(), false, &mut test_rng())
     }
 
     fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {

@@ -5,6 +5,7 @@ use str0m::rtp::Ssrc;
 
 use crate::audio_selector::SELECTOR_SLOTS;
 use crate::id::AudioSelectorSlotId;
+use crate::log::{LogCtx, plog_debug, plog_warn};
 use crate::participant::downstream::SlotConfig;
 use crate::rtp::RtpPacket;
 use crate::track::StreamWriter;
@@ -15,6 +16,7 @@ use crate::track::StreamWriter;
 /// Timeline rewriting and marker-on-switch are handled upstream by the shard-level
 /// [`TopNAudioSelector`]; packets arriving here are already continuous.
 pub struct AudioAllocator {
+    ctx: LogCtx,
     /// M ≤ N provisioned slots; `None` entries are unfilled.
     slots: [Option<Slot>; SELECTOR_SLOTS],
 }
@@ -29,15 +31,17 @@ pub struct Slot {
 }
 
 impl AudioAllocator {
-    pub fn new() -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
+            ctx,
             slots: array::from_fn(|_| None),
         }
     }
 
     pub fn add_slot(&mut self, slot: SlotConfig) {
         if self.has_slot(slot.mid) {
-            tracing::debug!(
+            plog_debug!(
+                self.ctx,
                 target: crate::log::TARGET_AUDIO,
                 mid = %slot.mid,
                 "audio slot already provisioned; skipping duplicate"
@@ -52,7 +56,8 @@ impl AudioAllocator {
                 pending_marker: true,
             });
         } else {
-            tracing::warn!(
+            plog_warn!(
+                self.ctx,
                 target: crate::log::TARGET_AUDIO,
                 mid = %slot.mid,
                 pt = %slot.pt,
@@ -74,7 +79,8 @@ impl AudioAllocator {
         writer: &mut StreamWriter,
     ) -> Option<()> {
         let Some(slot_entry) = self.slots.get_mut(slot_idx.index()) else {
-            tracing::warn!(
+            plog_warn!(
+                self.ctx,
                 target: crate::log::TARGET_AUDIO,
                 slot_idx = %slot_idx,
                 slots = self.slots.len(),
@@ -83,7 +89,8 @@ impl AudioAllocator {
             return None;
         };
         let Some(slot) = slot_entry.as_mut() else {
-            tracing::debug!(
+            plog_debug!(
+                self.ctx,
                 target: crate::log::TARGET_AUDIO,
                 slot_idx = %slot_idx,
                 slots = self.slots.len(),
@@ -109,6 +116,14 @@ mod tests {
     use str0m::media::{MediaKind, Mid, Pt};
     use str0m::rtp::Ssrc;
 
+    fn test_ctx() -> LogCtx {
+        use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
+        LogCtx {
+            room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
+            participant_id: ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(1)),
+        }
+    }
+
     fn make_audio_slot() -> SlotConfig {
         SlotConfig {
             mid: Mid::from("a0"),
@@ -121,7 +136,7 @@ mod tests {
 
     #[test]
     fn first_forwarded_packet_clears_pending_marker() {
-        let mut alloc = AudioAllocator::new();
+        let mut alloc = AudioAllocator::new(test_ctx());
         alloc.add_slot(make_audio_slot());
         assert!(
             alloc.slots[0].as_ref().is_some_and(|s| s.pending_marker),
@@ -153,7 +168,7 @@ mod tests {
 
     #[test]
     fn unprovisioned_slot_does_not_toggle_other_slots() {
-        let mut alloc = AudioAllocator::new();
+        let mut alloc = AudioAllocator::new(test_ctx());
         alloc.add_slot(make_audio_slot());
 
         let pkt = RtpPacket::default();
@@ -167,7 +182,7 @@ mod tests {
 
     #[test]
     fn duplicate_mid_is_ignored() {
-        let mut alloc = AudioAllocator::new();
+        let mut alloc = AudioAllocator::new(test_ctx());
         let slot = make_audio_slot();
         alloc.add_slot(slot.clone());
         alloc.add_slot(slot);

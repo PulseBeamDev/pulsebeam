@@ -3,10 +3,10 @@ mod video;
 
 use std::time::Duration;
 
-use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
 use crate::id::AudioSelectorSlotId;
+use crate::log::LogCtx;
 use crate::participant::downstream::audio::AudioAllocator;
 use crate::participant::downstream::video::MIN_BANDWIDTH;
 use crate::participant::downstream::video::VideoAllocator;
@@ -114,10 +114,10 @@ pub struct DownstreamAllocator {
 }
 
 impl DownstreamAllocator {
-    pub fn new(_participant_id: ParticipantId, manual_sub: bool, rng: &mut impl RngCore) -> Self {
+    pub(crate) fn new(ctx: LogCtx, manual_sub: bool, rng: &mut impl RngCore) -> Self {
         Self {
-            video: VideoAllocator::new(manual_sub, rng),
-            audio: AudioAllocator::new(),
+            video: VideoAllocator::new(ctx, manual_sub, rng),
+            audio: AudioAllocator::new(ctx),
             dirty_allocation: false,
 
             available_bandwidth: BweFilter::new(MIN_BANDWIDTH),

@@ -14,7 +14,6 @@ use crate::{
 };
 
 pub(crate) struct ParticipantMeta {
-    span: tracing::Span,
     core: ParticipantCore,
 }
 
@@ -28,13 +27,6 @@ impl Deref for ParticipantMeta {
 impl DerefMut for ParticipantMeta {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.core
-    }
-}
-
-impl ParticipantMeta {
-    pub(super) fn with_span<R>(&mut self, f: impl FnOnce(&mut ParticipantCore) -> R) -> R {
-        let _guard = self.span.enter();
-        f(&mut self.core)
     }
 }
 
@@ -61,8 +53,6 @@ impl ParticipantRegistry {
 
     pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantId {
         let participant_id = cfg.participant_id;
-        let room_id = cfg.room_id;
-        let span = tracing::info_span!("participant", %room_id, %participant_id);
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -72,7 +62,7 @@ impl ParticipantRegistry {
             &mut participant_rng,
         );
         self.participants
-            .insert(participant_id, ParticipantMeta { core, span });
+            .insert(participant_id, ParticipantMeta { core });
         tracing::info!(%participant_id, "participant added to shard");
         participant_id
     }

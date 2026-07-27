@@ -3,6 +3,7 @@ use tokio::time::Instant;
 
 use crate::{
     entity::{TrackId, TrackKind},
+    log::{LogCtx, plog_warn},
     rtp::RtpPacket,
     track::UpstreamTrack,
 };
@@ -24,12 +25,14 @@ impl PartialEq for UpstreamSlot {
 impl Eq for UpstreamSlot {}
 
 pub struct UpstreamAllocator {
+    ctx: LogCtx,
     published_tracks: Vec<UpstreamSlot>,
 }
 
 impl UpstreamAllocator {
-    pub fn new() -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
+            ctx,
             published_tracks: Vec::new(),
         }
     }
@@ -37,7 +40,7 @@ impl UpstreamAllocator {
     /// Adds a new locally published track that will receive RTP packets.
     pub fn add_published_track(&mut self, mid: Mid, track: UpstreamTrack) -> bool {
         if self.published_tracks.iter().any(|s| s.mid == mid) {
-            tracing::warn!("duplicated slot mid={}.", mid);
+            plog_warn!(self.ctx, "duplicated slot mid={}.", mid);
             return false;
         }
 
@@ -83,7 +86,7 @@ impl UpstreamAllocator {
             rtp.ext_vals.rid = rid.cloned();
             slot.track.process(rid, rtp, sr)
         } else {
-            tracing::warn!(%mid, ?rid, "Dropping incoming RTP packet; no published track found");
+            plog_warn!(self.ctx, %mid, ?rid, "Dropping incoming RTP packet; no published track found");
             false
         }
     }
