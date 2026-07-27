@@ -3,6 +3,106 @@ use std::{collections::VecDeque, net::SocketAddr};
 
 const MAX_FREE_STATES: usize = 3;
 
+pub struct OwnedPacketQueue {
+    max_segments: usize,
+    packets: VecDeque<OwnedPacket>,
+}
+
+struct OwnedPacket {
+    dst: SocketAddr,
+    contents: Vec<u8>,
+}
+
+impl OwnedPacketQueue {
+    pub fn with_capacity(max_segments: usize) -> Self {
+        debug_assert_ne!(max_segments, 0);
+        Self {
+            max_segments,
+            packets: VecDeque::with_capacity(max_segments),
+        }
+    }
+
+    pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) {
+        debug_assert!(!contents.is_empty(), "Pushed content must not be empty");
+        debug_assert!(
+            contents.len() <= net::MAX_UDP_PAYLOAD_SIZE,
+            "Packet exceeds maximum supported MTU"
+        );
+        self.packets.push_back(OwnedPacket { dst, contents });
+    }
+
+    pub fn fill_next_gso(&mut self, output: &mut GsoBuffer) -> bool {
+        debug_assert!(output.buf.is_empty(), "GSO output must start empty");
+        debug_assert_eq!(output.segment_size, 0);
+        debug_assert_eq!(output.segment_count, 0);
+
+        let Some(first) = self.packets.front() else {
+            return false;
+        };
+        debug_assert!(!first.contents.is_empty());
+        debug_assert!(first.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
+
+        output.dst = first.dst;
+        output.segment_size = first.contents.len();
+
+        while let Some(packet) = self.packets.front() {
+            debug_assert!(!packet.contents.is_empty());
+            debug_assert!(packet.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
+            debug_assert!(output.segment_count <= self.max_segments);
+            debug_assert!(output.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+
+            if packet.dst != output.dst
+                || output.segment_count >= self.max_segments
+                || output.buf.len() + packet.contents.len() > net::MAX_UDP_GSO_PAYLOAD_SIZE
+                || packet.contents.len() > output.segment_size
+            {
+                break;
+            }
+
+            let is_tail = packet.contents.len() < output.segment_size;
+            output.buf.extend_from_slice(&packet.contents);
+            output.segment_count += 1;
+            self.packets.pop_front();
+
+            debug_assert!(output.segment_count <= self.max_segments);
+            debug_assert!(output.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+            if is_tail {
+                break;
+            }
+        }
+
+        debug_assert_ne!(output.segment_count, 0);
+        debug_assert!(!output.buf.is_empty());
+        debug_assert_ne!(output.segment_size, 0);
+        true
+    }
+}
+
+pub struct GsoBuffer {
+    pub dst: SocketAddr,
+    pub segment_size: usize,
+    segment_count: usize,
+    pub buf: Vec<u8>,
+}
+
+impl GsoBuffer {
+    pub fn preallocated() -> Self {
+        Self {
+            dst: SocketAddr::from(([0, 0, 0, 0], 0)),
+            segment_size: 0,
+            segment_count: 0,
+            buf: Vec::with_capacity(net::MAX_UDP_GSO_PAYLOAD_SIZE),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.segment_size = 0;
+        self.segment_count = 0;
+        self.buf.clear();
+        debug_assert!(self.buf.capacity() >= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+    }
+}
+
 /// Manages a pool of `BatcherState` objects to build GSO-compatible datagrams efficiently.
 pub struct Batcher {
     cap: usize,
@@ -230,6 +330,61 @@ mod tests {
 
     fn create_test_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+    }
+
+    #[test]
+    fn owned_packets_fill_preallocated_gso_buffer() {
+        let addr = create_test_addr();
+        let mut packets = OwnedPacketQueue::with_capacity(4);
+        packets.push_back(addr, vec![1; 1000]);
+        packets.push_back(addr, vec![2; 1000]);
+        packets.push_back(addr, vec![3; 500]);
+        let mut output = GsoBuffer::preallocated();
+
+        assert!(packets.fill_next_gso(&mut output));
+        assert_eq!(output.dst, addr);
+        assert_eq!(output.segment_size, 1000);
+        assert_eq!(output.segment_count, 3);
+        assert_eq!(output.buf.len(), 2500);
+        assert!(!packets.fill_next_gso(&mut GsoBuffer::preallocated()));
+    }
+
+    #[test]
+    fn owned_packets_preserve_incompatible_packet_for_next_buffer() {
+        let addr = create_test_addr();
+        let other = SocketAddr::new(addr.ip(), addr.port() + 1);
+        let mut packets = OwnedPacketQueue::with_capacity(4);
+        packets.push_back(addr, vec![1; 500]);
+        packets.push_back(addr, vec![2; 600]);
+        packets.push_back(other, vec![3; 600]);
+
+        let mut first = GsoBuffer::preallocated();
+        let mut second = GsoBuffer::preallocated();
+        let mut third = GsoBuffer::preallocated();
+        assert!(packets.fill_next_gso(&mut first));
+        assert!(packets.fill_next_gso(&mut second));
+        assert!(packets.fill_next_gso(&mut third));
+
+        assert_eq!(first.buf, [1; 500]);
+        assert_eq!(second.buf, [2; 600]);
+        assert_eq!(third.buf, [3; 600]);
+        assert_eq!(third.dst, other);
+    }
+
+    #[test]
+    fn cleared_gso_buffer_retains_full_preallocated_capacity() {
+        let addr = create_test_addr();
+        let mut packets = OwnedPacketQueue::with_capacity(1);
+        packets.push_back(addr, vec![1; 100]);
+        let mut output = GsoBuffer::preallocated();
+        assert!(packets.fill_next_gso(&mut output));
+
+        output.clear();
+
+        assert!(output.buf.is_empty());
+        assert!(output.buf.capacity() >= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        assert_eq!(output.segment_size, 0);
+        assert_eq!(output.segment_count, 0);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::id::AudioSelectorSlotId;
 use crate::{
     entity::{ParticipantId, TrackKind},
     id::ShardId,
-    participant::ParticipantConfig,
+    participant::{ParticipantConfig, batcher::GsoBuffer},
     rtp::RtpPacket,
     shard::{
         dirty::{DirtyKind, DirtyTracker},
@@ -135,6 +135,7 @@ pub(crate) struct ShardCore {
     /// Reused participant-id storage for the output phase. This avoids an
     /// allocation on every media tick and makes the final recycle pass linear.
     egress_dirty: Vec<ParticipantId>,
+    gso_buffers: Vec<GsoBuffer>,
     pipeline: EventPipeline,
     rng: Rng,
 }
@@ -142,6 +143,9 @@ pub(crate) struct ShardCore {
 impl ShardCore {
     pub(crate) fn new(shard_id: impl Into<ShardId>, max_gso_segments: usize, mut rng: Rng) -> Self {
         let shard_id = shard_id.into();
+        let gso_buffers = (0..net::BATCH_SIZE)
+            .map(|_| GsoBuffer::preallocated())
+            .collect();
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
@@ -149,6 +153,7 @@ impl ShardCore {
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
             dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD, &mut rng),
             egress_dirty: Vec::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            gso_buffers,
             pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rng,
         }
@@ -350,41 +355,57 @@ impl ShardCore {
         self.egress_dirty.clear();
         self.dirty.drain_all_into(&mut self.egress_dirty);
 
-        // Only stage one syscall-sized borrowed packet list at a time. The
-        // previous whole-tick Vec allocated and traversed every queued state
-        // before the first packet could reach the socket.
-        let mut udp_packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
+        debug_assert_eq!(self.gso_buffers.len(), net::BATCH_SIZE);
+        let mut filled = 0;
         for participant_id in &self.egress_dirty {
-            if let Some(participant) = self.registry.get(participant_id) {
-                for packet in participant.udp_batcher.packets() {
-                    if udp_packets.is_full() {
-                        Self::flush_udp_packet_batch(udp_socket, &udp_packets);
-                        udp_packets.clear();
-                    }
-                    udp_packets.push(packet);
+            let Some(participant) = self.registry.get_mut(participant_id) else {
+                continue;
+            };
+            while participant
+                .udp_packets
+                .fill_next_gso(&mut self.gso_buffers[filled])
+            {
+                filled += 1;
+                debug_assert!(filled <= self.gso_buffers.len());
+                if filled == self.gso_buffers.len() {
+                    Self::flush_gso_buffers(udp_socket, &mut self.gso_buffers, filled);
+                    filled = 0;
                 }
             }
         }
-        if !udp_packets.is_empty() {
-            Self::flush_udp_packet_batch(udp_socket, &udp_packets);
+        if filled != 0 {
+            Self::flush_gso_buffers(udp_socket, &mut self.gso_buffers, filled);
         }
-        drop(udp_packets);
 
-        // References are gone, so recycle UDP state and flush TCP while each
-        // participant is looked up only once in the mutable registry.
         for participant_id in self.egress_dirty.drain(..) {
             if let Some(participant) = self.registry.get_mut(&participant_id) {
-                participant.udp_batcher.discard_all();
                 participant.tcp_batcher.flush_tcp(tcp_socket);
             }
         }
     }
 
     #[inline]
-    fn flush_udp_packet_batch(udp_socket: &mut UnifiedSocket, packets: &[net::SendPacket<'_>]) {
-        let batch = net::SendPacketBatch { packets };
+    fn flush_gso_buffers(udp_socket: &mut UnifiedSocket, buffers: &mut [GsoBuffer], filled: usize) {
+        debug_assert_ne!(filled, 0);
+        debug_assert!(filled <= buffers.len());
+        let mut packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
+        for buffer in &buffers[..filled] {
+            debug_assert!(!buffer.buf.is_empty());
+            debug_assert_ne!(buffer.segment_size, 0);
+            packets.push(net::SendPacket {
+                dst: buffer.dst,
+                buf: &buffer.buf,
+                segment_size: buffer.segment_size,
+            });
+        }
+        debug_assert_eq!(packets.len(), filled);
+        let batch = net::SendPacketBatch { packets: &packets };
         if let Err(err) = udp_socket.try_send_batch(&batch) {
             tracing::trace!(error = ?err, "error writing UDP egress batch");
+        }
+        drop(packets);
+        for buffer in &mut buffers[..filled] {
+            buffer.clear();
         }
     }
 

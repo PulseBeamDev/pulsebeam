@@ -1,4 +1,4 @@
-mod batcher;
+pub(crate) mod batcher;
 mod core;
 mod downstream;
 pub mod event;

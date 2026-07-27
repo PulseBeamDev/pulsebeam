@@ -24,7 +24,9 @@ use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::participant::signaling;
 use crate::participant::{
-    batcher::Batcher, downstream::DownstreamAllocator, upstream::UpstreamAllocator,
+    batcher::{Batcher, OwnedPacketQueue},
+    downstream::DownstreamAllocator,
+    upstream::UpstreamAllocator,
 };
 use crate::rtp::RtpPacket;
 use crate::track::{
@@ -128,7 +130,7 @@ impl ParticipantConfig {
 pub struct ParticipantCore {
     // Hot: touched on every packet
     pub rtc: Rtc,
-    pub udp_batcher: Batcher,
+    pub udp_packets: OwnedPacketQueue,
     pub tcp_batcher: Batcher,
     pub downstream: DownstreamAllocator,
     stream_writer: StreamWriter,
@@ -170,7 +172,7 @@ impl ParticipantCore {
             participant_id: cfg.participant_id,
         };
         let signaling = Signaling::new(ctx);
-        let udp_batcher = Batcher::with_capacity(udp_gso_size);
+        let udp_packets = OwnedPacketQueue::with_capacity(udp_gso_size);
         let tcp_batcher = Batcher::with_capacity(tcp_gso_size);
 
         let mut p = Self {
@@ -181,7 +183,7 @@ impl ParticipantCore {
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             rtc,
-            udp_batcher,
+            udp_packets,
             tcp_batcher,
             upstream: UpstreamAllocator::new(ctx),
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub, rng),
@@ -596,7 +598,9 @@ impl ParticipantCore {
                         work_items += 1;
                     }
                     match tx.proto {
-                        Protocol::Udp => self.udp_batcher.push_back(tx.destination, &tx.contents),
+                        Protocol::Udp => self
+                            .udp_packets
+                            .push_back(tx.destination, tx.contents.into()),
                         Protocol::Tcp => self.tcp_batcher.push_back(tx.destination, &tx.contents),
                         _ => {}
                     }
