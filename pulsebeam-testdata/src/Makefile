@@ -33,7 +33,7 @@ BASE_COMMON = tune=zerolatency \
               option-string="repeat-headers=1:open-gop=0:scenecut=0"
 
 # Specific rate-control modifiers
-CBR_FLAGS = pass=cbr nal-hrd=cbr vbv-buf-capacity=200
+CBR_FLAGS = pass=cbr vbv-buf-capacity=200
 
 .PHONY: all clean prepare estimate download distclean
 
