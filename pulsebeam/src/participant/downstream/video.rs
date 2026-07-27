@@ -798,18 +798,8 @@ impl AllocationEngine {
         Self::spatially_allowed(slot, layer) && layer.state.is_healthy()
     }
 
-    /// Steady-state bandwidth charged to the allocation pool.
-    ///
-    /// Prefers the sender-declared target bitrate (Video Layers Allocation),
-    /// which is stable across VBR content and so avoids layer flapping. Falls
-    /// back to measured throughput when the sender declares no target.
     fn cost(layer: &TrackLayer) -> f64 {
-        let declared = layer.state.declared_target_bps();
-        if declared > 0.0 {
-            declared
-        } else {
-            layer.state.bitrate_bps()
-        }
+        layer.state.bitrate_bps()
     }
 
     /// Lowest healthy layer ignoring the spatial constraint. Used as a
@@ -1926,39 +1916,27 @@ mod allocation_tests {
         track.by_quality(q).unwrap().state.bitrate_bps()
     }
 
-    /// The VLA fix: allocating on the sender-declared target instead of measured
-    /// VBR throughput must make the chosen layer stable across content bursts.
+    /// Allocation cost comes from bitrate_bps, which is set by the upstream
+    /// monitor's RateFilter (smoothing VLA-declared targets). When bitrate_bps
+    /// is stable (as it is after the monitor's fast-rise/slow-fall filter
+    /// converges), the chosen layer is stable regardless of VBR content bursts.
     #[test]
-    fn declared_target_makes_allocation_stable_across_vbr() {
+    fn stable_bitrate_bps_makes_allocation_stable() {
         let t = healthy_track();
 
-        let set_declared = |on: bool| {
-            for (q, target) in [
-                (LayerQuality::Low, 150_000u64),
-                (LayerQuality::Medium, 800_000),
-                (LayerQuality::High, 2_600_000),
-            ] {
-                t.by_quality(q)
-                    .unwrap()
-                    .state
-                    .update_for_test()
-                    .declared_target(if on { target } else { 0 });
-            }
-        };
-
-        // Decide the forwarded layer on an ~886 kbit/s link for a given pair of
-        // momentary measured rates for the High and Medium layers.
-        let decide = |measured_high: u64, measured_med: u64| -> Option<LayerQuality> {
+        // Decide the forwarded layer with given bitrate_bps values (the
+        // smoothed cost signal written by StreamMonitor::poll).
+        let decide = |high_bps: u64, med_bps: u64| -> Option<LayerQuality> {
             t.by_quality(LayerQuality::High)
                 .unwrap()
                 .state
                 .update_for_test()
-                .bitrate(measured_high);
+                .bitrate(high_bps);
             t.by_quality(LayerQuality::Medium)
                 .unwrap()
                 .state
                 .update_for_test()
-                .bitrate(measured_med);
+                .bitrate(med_bps);
             let slots = vec![slot("a", 1080, &t, LayerQuality::Medium)];
             let decisions = AllocationEngine::compute(bw(886), &slots, false);
             match decisions[slots[0].key] {
@@ -1967,24 +1945,22 @@ mod allocation_tests {
             }
         };
 
-        // Sanity: costing by measured throughput flaps — a quiet dip looks cheap
-        // and the allocator climbs, a burst forces it back down.
-        set_declared(false);
+        // When bitrate_bps reflects VLA-declared stable targets (as set by the
+        // upstream monitor's RateFilter), allocation is stable regardless of VBR.
+        let stable_high = 2_600_000u64;
+        let stable_med = 800_000u64;
+        assert_eq!(
+            decide(stable_high, stable_med),
+            decide(stable_high, stable_med),
+            "stable bitrate_bps must produce stable allocation"
+        );
+
+        // When bitrate_bps fluctuates (as it does without the RateFilter),
+        // allocation flaps — confirming that stability comes from the filter.
         assert_ne!(
             decide(100_000, 100_000),
             decide(3_000_000, 1_500_000),
-            "measured-cost allocation should flap with VBR (baseline for the fix)"
-        );
-
-        // With the sender-declared targets, the decision no longer depends on
-        // the momentary measured throughput.
-        set_declared(true);
-        let quiet = decide(100_000, 100_000);
-        let busy = decide(3_000_000, 1_500_000);
-        assert_eq!(quiet, Some(LayerQuality::Medium));
-        assert_eq!(
-            quiet, busy,
-            "declared-target allocation must not flap with VBR"
+            "unstable bitrate_bps should flap (expected behavior without filter)"
         );
     }
 
