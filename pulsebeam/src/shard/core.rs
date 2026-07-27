@@ -14,9 +14,7 @@ use crate::{
     participant::{ParticipantConfig, batcher::GsoBuffer},
     rtp::RtpPacket,
     shard::{
-        dirty::{DirtyKind, DirtyTracker},
-        events::EventPipeline,
-        participants::ParticipantRegistry,
+        dirty::DirtyTracker, events::EventPipeline, participants::ParticipantRegistry,
         timer::TimerWheel,
     },
     track::StreamId,
@@ -32,7 +30,6 @@ const MAX_PARTICIPANTS_PER_SHARD: usize = 2048;
 struct DispatchCtx<'a, R: CrossShardSend> {
     registry: &'a mut ParticipantRegistry,
     dirty: &'a mut DirtyTracker,
-    kind: DirtyKind,
     router: &'a R,
 }
 
@@ -55,7 +52,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_rtp(stream_id, pkt);
-            self.dirty.mark(self.kind, subscriber);
+            self.dirty.mark(subscriber);
         }
     }
 
@@ -67,7 +64,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_audio_rtp(slot_idx, pkt);
-            self.dirty.mark(self.kind, subscriber);
+            self.dirty.mark(subscriber);
         }
     }
 
@@ -80,7 +77,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_sctp(topic, origin, pkt);
-            self.dirty.mark(self.kind, subscriber);
+            self.dirty.mark(subscriber);
         }
     }
 
@@ -91,7 +88,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&participant_id) {
             p.on_tracks_published(tracks);
-            self.dirty.mark(self.kind, participant_id);
+            self.dirty.mark(participant_id);
         }
     }
 
@@ -105,7 +102,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         };
 
         if p.on_tracks_unpublished(track_ids) {
-            self.dirty.mark(self.kind, participant_id);
+            self.dirty.mark(participant_id);
         }
     }
 
@@ -117,7 +114,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&participant_id) {
             p.handle_remote_keyframe_request(stream_id, kind);
-            self.dirty.mark(self.kind, participant_id);
+            self.dirty.mark(participant_id);
         }
     }
 
@@ -132,9 +129,7 @@ pub(crate) struct ShardCore {
     pub(super) routing: ShardRoutingTable,
     timers: TimerWheel<ParticipantId>,
     dirty: DirtyTracker,
-    /// Reused participant-id storage for the output phase. This avoids an
-    /// allocation on every media tick and makes the final recycle pass linear.
-    egress_dirty: Vec<ParticipantId>,
+    dirty_participants: Vec<ParticipantId>,
     gso_buffers: Vec<GsoBuffer>,
     pipeline: EventPipeline,
     rng: Rng,
@@ -152,7 +147,7 @@ impl ShardCore {
             routing: ShardRoutingTable::new(),
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
             dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD, &mut rng),
-            egress_dirty: Vec::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            dirty_participants: Vec::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             gso_buffers,
             pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rng,
@@ -169,7 +164,7 @@ impl ShardCore {
         self.timers.drain_expired(now, |participant_id| {
             if let Some(participant) = registry.get_mut(&participant_id) {
                 participant.on_timeout(now);
-                dirty.mark_input(participant_id);
+                dirty.mark(participant_id);
             }
         });
     }
@@ -184,7 +179,7 @@ impl ShardCore {
         };
         if let Some(participant) = self.registry.get_mut(&participant_id) {
             participant.on_ingress(batch);
-            self.dirty.mark_input(participant_id);
+            self.dirty.mark(participant_id);
         } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
             router.send(
                 shard_id,
@@ -196,27 +191,9 @@ impl ShardCore {
         }
     }
 
-    pub(crate) fn poll_input(&mut self, now: Instant) {
-        Self::poll_participants(
-            now,
-            self.dirty.input(),
-            &mut self.registry,
-            &mut self.pipeline,
-        );
-    }
-
-    pub(crate) fn poll_fanout(&mut self, now: Instant) {
-        Self::poll_participants(
-            now,
-            self.dirty.fanout(),
-            &mut self.registry,
-            &mut self.pipeline,
-        );
-    }
-
     fn poll_participants(
         now: Instant,
-        ids: &indexmap::IndexSet<ParticipantId, ahash::RandomState>,
+        ids: &[ParticipantId],
         registry: &mut ParticipantRegistry,
         pipeline: &mut EventPipeline,
     ) {
@@ -234,7 +211,6 @@ impl ShardCore {
         let mut ctx = DispatchCtx {
             registry: &mut self.registry,
             dirty: &mut self.dirty,
-            kind: DirtyKind::Fanout,
             router,
         };
         while let Some(ev) = self.pipeline.pop_audio_rtp() {
@@ -272,7 +248,7 @@ impl ShardCore {
                 }) => {
                     self.remove_participant(&participant_id);
                     self.timers.cancel(&participant_id);
-                    self.dirty.clear_input(&participant_id);
+                    self.dirty.clear(&participant_id);
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
@@ -347,17 +323,29 @@ impl ShardCore {
         self.pipeline.pop_shard_event()
     }
 
-    pub(crate) fn flush_egress(
+    pub(crate) fn poll_and_flush_dirty(
         &mut self,
+        now: Instant,
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
-        self.egress_dirty.clear();
-        self.dirty.drain_all_into(&mut self.egress_dirty);
+        debug_assert!(self.dirty_participants.is_empty());
+        self.dirty.drain_into(&mut self.dirty_participants);
+        debug_assert!(self.dirty.is_empty());
+        Self::poll_participants(
+            now,
+            &self.dirty_participants,
+            &mut self.registry,
+            &mut self.pipeline,
+        );
+        debug_assert!(
+            self.dirty.is_empty(),
+            "participant polling must not dirty the next phase"
+        );
 
         debug_assert_eq!(self.gso_buffers.len(), net::BATCH_SIZE);
         let mut filled = 0;
-        for participant_id in &self.egress_dirty {
+        for participant_id in &self.dirty_participants {
             let Some(participant) = self.registry.get_mut(participant_id) else {
                 continue;
             };
@@ -377,11 +365,13 @@ impl ShardCore {
             Self::flush_gso_buffers(udp_socket, &mut self.gso_buffers, filled);
         }
 
-        for participant_id in self.egress_dirty.drain(..) {
+        for participant_id in self.dirty_participants.drain(..) {
             if let Some(participant) = self.registry.get_mut(&participant_id) {
                 participant.tcp_batcher.flush_tcp(tcp_socket);
             }
         }
+        debug_assert!(self.dirty_participants.is_empty());
+        debug_assert!(self.dirty.is_empty());
     }
 
     #[inline]
@@ -448,7 +438,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Input,
                     router,
                 };
                 ctx.notify_keyframe_request(req.origin, req.stream_id, req.kind);
@@ -482,7 +471,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Input,
                     router,
                 };
                 self.routing.publish_track(track, room_id, &mut ctx);
@@ -495,7 +483,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Input,
                     router,
                 };
                 self.routing.unpublish_tracks(room_id, &track_ids, &mut ctx);
@@ -555,7 +542,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Fanout,
                     router,
                 };
                 self.routing.route_video(stream_id, &pkt, &mut ctx);
@@ -575,7 +561,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Fanout,
                     router,
                 };
                 self.routing.route_audio(ev, &mut ctx);
@@ -586,14 +571,13 @@ impl ShardCore {
             } => {
                 if let Some(participant) = self.registry.get_mut(&participant_id) {
                     participant.on_ingress(batch);
-                    self.dirty.mark_input(participant_id);
+                    self.dirty.mark(participant_id);
                 }
             }
             CrossShardEvent::KeyframeRequested(req) => {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Input,
                     router,
                 };
                 ctx.notify_keyframe_request(req.origin, req.stream_id, req.kind);
@@ -607,7 +591,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Fanout,
                     router,
                 };
                 self.routing
@@ -624,7 +607,7 @@ impl ShardCore {
         let participant_id = self.registry.insert(cfg, &mut self.rng);
         self.routing
             .add_local_member(participant_id, room_id, &mut self.rng);
-        self.dirty.mark_input(participant_id);
+        self.dirty.mark(participant_id);
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
@@ -739,7 +722,7 @@ mod test {
     }
 
     #[test]
-    fn add_participant_populates_registry_and_marks_input_dirty() {
+    fn add_participant_populates_registry_and_marks_dirty() {
         let router = TestRouter::new(0, 3);
         let mut core = new_core();
         let p = pid();
@@ -749,17 +732,14 @@ mod test {
 
         assert!(core.registry.contains(&p));
         assert!(core.routing.rooms.contains_key(&r));
-        // add_participant() in common.rs drains the dirty side-effects via
-        // take_sent, but input-dirty is local state, not router traffic —
-        // re-add to check it directly without the helper's drain.
         let mut core2 = new_core();
         core2.on_command(
             ShardCommand::AddParticipant(make_participant_cfg(p, r)),
             &router,
         );
         assert!(
-            core2.dirty.input().contains(&p),
-            "newly added participant must be input-dirty"
+            core2.dirty.contains(&p),
+            "newly added participant must be dirty"
         );
     }
 
@@ -872,7 +852,7 @@ mod test {
     }
 
     #[test]
-    fn keyframe_request_command_marks_input_dirty_not_fanout() {
+    fn keyframe_request_command_marks_participant_dirty() {
         let router = TestRouter::new(0, 3);
         let mut core = new_core();
         let p = pid();
@@ -892,13 +872,13 @@ mod test {
         );
 
         assert!(
-            core.dirty.input().contains(&p),
-            "keyframe delivery is an input event for the target participant"
+            core.dirty.contains(&p),
+            "keyframe delivery must dirty the target participant"
         );
     }
 
     #[test]
-    fn cross_shard_rtp_published_marks_fanout_dirty_not_input() {
+    fn cross_shard_rtp_published_marks_subscriber_dirty() {
         let router = TestRouter::new(0, 3);
         let mut core = new_core();
         let publisher = pid();
@@ -913,10 +893,8 @@ mod test {
             }),
             &router,
         );
-        assert!(core.dirty.input().contains(&subscriber));
-        core.dirty.clear_input(&subscriber);
-        // Directly seed a local subscriber into routing to isolate fanout behavior
-        // from the topology event path (covered separately in router.rs's tests).
+        assert!(core.dirty.contains(&subscriber));
+        core.dirty.clear(&subscriber);
         core.routing
             .register_subscriber(subscriber, video_track(publisher, 1));
 
@@ -930,32 +908,24 @@ mod test {
         );
 
         assert!(
-            core.dirty.fanout().contains(&subscriber),
-            "forwarded RTP is a fanout event for the subscriber"
+            core.dirty.contains(&subscriber),
+            "forwarded RTP must dirty the subscriber"
         );
-        assert!(!core.dirty.input().contains(&subscriber));
     }
 
     #[test]
-    fn fire_timers_marks_input_dirty_and_clears_on_exit() {
+    fn fire_timers_does_not_spuriously_mark_participants() {
         let router = TestRouter::new(0, 3);
         let mut core = new_core();
         let p = pid();
         let r = room_id("timer1");
         add_participant(&mut core, &router, p, r);
-        core.dirty.clear_input(&p); // isolate from add's own dirty marking
+        core.dirty.clear(&p);
 
-        // fire_timers only fires what's actually scheduled; this checks the
-        // wiring (registry lookup + dirty marking), not TimerWheel's own logic.
         core.fire_timers(tokio::time::Instant::now());
-        // No timer was scheduled, so nothing should fire — this asserts the
-        // no-op path doesn't spuriously mark anyone dirty.
-        assert!(!core.dirty.input().contains(&p));
+        assert!(!core.dirty.contains(&p));
 
         core.on_command(ShardCommand::RemoveParticipant(p), &router);
-        // timers.cancel + dirty.clear_input both run on exit — asserting no
-        // panic and registry no longer contains the id is the meaningful check
-        // here, since there's no scheduled timer to observe firing.
         assert!(!core.registry.contains(&p));
     }
 }

@@ -282,15 +282,13 @@ impl ShardWorker {
             self.core.on_udp_batch(batch, &self.router);
         }
 
-        // phase 2: compute
-        self.core.poll_input(now);
+        self.core
+            .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
         self.core.flush_stream_buffers(&self.router);
-        self.core.poll_fanout(now);
+        self.core
+            .poll_and_flush_dirty(now, &mut self.udp_socket, &mut self.tcp_socket);
         self.core.flush_participant_events(&self.router);
 
-        // phase 3: output
-        self.core
-            .flush_egress(&mut self.udp_socket, &mut self.tcp_socket);
         self.core
             .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
     }
