@@ -16,9 +16,10 @@ use tokio::{fs::File, io::BufWriter};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio::{runtime::Builder, time::Instant};
 
-#[cfg(not(target_env = "msvc"))]
+use mimalloc::MiMalloc;
+
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Clone)]
 struct VideoAssets {

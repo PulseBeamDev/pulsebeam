@@ -7,23 +7,23 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-// References:
-//   * https://jemalloc.net/jemalloc.3.html#opt.percpu_arena
-//   * https://github.com/jemalloc/jemalloc/blob/dev/TUNING.md
-#[allow(non_upper_case_globals)]
-#[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = concat!(
-    "lg_tcache_max:19,", // 512KB limit: buffers GRO/GSO packets & hash expansions lock-free
-    "dirty_decay_ms:30000,", // Soft 1s amortization window prevents huge inline purge spikes
-    "muzzy_decay_ms:0,", // Bypass the unpredictable kernel muzzy gray-zone entirely
-    "abort_conf:true",   // Safely crash on boot if any setting above is invalid
-    "\0"                 // Null-terminator required for C-compatibility
-)
-.as_bytes();
+// #[cfg(not(target_env = "msvc"))]
+// #[global_allocator]
+// static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+//
+// // References:
+// //   * https://jemalloc.net/jemalloc.3.html#opt.percpu_arena
+// //   * https://github.com/jemalloc/jemalloc/blob/dev/TUNING.md
+// #[allow(non_upper_case_globals)]
+// #[unsafe(export_name = "malloc_conf")]
+// pub static malloc_conf: &[u8] = concat!(
+//     "lg_tcache_max:19,", // 512KB limit: buffers GRO/GSO packets & hash expansions lock-free
+//     "dirty_decay_ms:30000,", // Soft 1s amortization window prevents huge inline purge spikes
+//     "muzzy_decay_ms:0,", // Bypass the unpredictable kernel muzzy gray-zone entirely
+//     "abort_conf:true",   // Safely crash on boot if any setting above is invalid
+//     "\0"                 // Null-terminator required for C-compatibility
+// )
+// .as_bytes();
 
 // TODO: disabled heap profiler for now. This keeps causing latency spikes by a few ms.
 // #[allow(non_upper_case_globals)]
@@ -40,10 +40,10 @@ pub static malloc_conf: &[u8] = concat!(
 //     abort_conf:true\
 //     \0";
 
-// use mimalloc::MiMalloc;
-//
-// #[global_allocator]
-// static GLOBAL: MiMalloc = MiMalloc;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
