@@ -166,6 +166,44 @@ impl ControllerCore {
                     }
                 }
             }
+            ShardEvent::ReliableDataTopicSubscribed {
+                room_id,
+                topic,
+                publisher,
+            } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::SubscribeReliableDataTopic {
+                                room_id,
+                                from_shard_id: e.from_shard_id,
+                                topic: topic.clone(),
+                                publisher,
+                            },
+                        );
+                    }
+                }
+            }
+            ShardEvent::ReliableDataTopicUnsubscribed {
+                room_id,
+                topic,
+                publisher,
+            } => {
+                if let Some(room) = self.registry.get_room(&room_id) {
+                    for shard_id in room.recipient_shard_ids(e.from_shard_id) {
+                        eq.send_cluster(
+                            shard_id,
+                            ClusterCommand::UnsubscribeReliableDataTopic {
+                                room_id,
+                                from_shard_id: e.from_shard_id,
+                                topic: topic.clone(),
+                                publisher,
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -108,6 +108,51 @@ impl DataSubscriber {
     }
 }
 
+#[derive(Clone)]
+pub struct ReliableDataMessage {
+    pub stream_id: u64,
+    pub seq: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub enum ReliableDataEvent {
+    Message(ReliableDataMessage),
+    StreamReset { new_stream_id: u64 },
+}
+
+#[derive(Clone)]
+pub struct ReliableDataPublisher {
+    pub topic: String,
+    pub(crate) channel_id: ChannelId,
+    pub(crate) tx: mailbox::Sender<OutgoingCommand>,
+}
+
+impl ReliableDataPublisher {
+    pub async fn send(&self, payload: Vec<u8>) -> Result<(), mailbox::SendError<Vec<u8>>> {
+        let command = OutgoingCommand::SendData(SendData {
+            channel_id: self.channel_id,
+            payload,
+        });
+        self.tx.send(command).await.map_err(|err| match err.0 {
+            OutgoingCommand::SendData(data) => mailbox::SendError(data.payload),
+            _ => unreachable!(),
+        })
+    }
+}
+
+pub struct ReliableDataSubscriber {
+    pub topic: String,
+    pub publisher_id: String,
+    pub(crate) rx: mailbox::Receiver<ReliableDataEvent>,
+}
+
+impl ReliableDataSubscriber {
+    pub async fn recv(&mut self) -> Result<ReliableDataEvent, mailbox::RecvError> {
+        self.rx.recv().await
+    }
+}
+
 pub struct LocalTrack {
     pub kind: str0m::media::MediaKind,
     pub mid: Mid,

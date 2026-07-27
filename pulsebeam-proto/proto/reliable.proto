@@ -1,0 +1,19 @@
+syntax = "proto3";
+package reliable;
+
+message RelMsg {
+  uint64 stream_id = 1;
+  uint64 seq       = 2;
+  bytes  payload   = 3;
+}
+
+message RelNack {
+  uint64 stream_id = 1;
+  uint64 from_seq  = 2;
+}
+
+message RelControl {
+  oneof msg {
+    RelNack nack = 1;
+  }
+}

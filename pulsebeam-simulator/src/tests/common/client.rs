@@ -366,7 +366,7 @@ impl SimClient {
                                 let key = (subscriber.topic.clone(), subscriber.scope.clone());
                                 self.ctx.subscribed_topics.insert(key, subscriber);
                             }
-                            AgentEvent::Connected | AgentEvent::Disconnected(_) => {}
+                            AgentEvent::Connected | AgentEvent::Disconnected(_) | AgentEvent::ReliableDataPublisherReady(_) | AgentEvent::ReliableDataSubscriberReady(_) => {}
                         }
 
                         // Re-check the predicate after processing an event, since a new

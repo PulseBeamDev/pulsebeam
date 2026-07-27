@@ -32,7 +32,7 @@ use crate::participant::{
 };
 use crate::rtp::RtpPacket;
 use crate::track::{
-    self, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
+    self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, MAX_DATA_TOPIC_CHANNELS, StreamId, StreamWrite, StreamWriter, Topic, Track,
 };
 use str0m::rtp::RtpWrite;
@@ -67,6 +67,15 @@ enum PendingFanout {
         origin: entity::ParticipantId,
         pkt: Vec<u8>,
     },
+    ReliableSctp {
+        topic: Topic,
+        origin: entity::ParticipantId,
+        frame: Vec<u8>,
+    },
+    ReliableControl {
+        topic: Topic,
+        bytes: Vec<u8>,
+    },
     Keyframe {
         stream_id: StreamId,
         kind: KeyframeRequestKind,
@@ -80,6 +89,15 @@ enum PendingRtcMutation {
         topic: Topic,
         origin: entity::ParticipantId,
         pkt: Vec<u8>,
+    },
+    ReliableSctp {
+        topic: Topic,
+        origin: entity::ParticipantId,
+        frame: Vec<u8>,
+    },
+    ReliableControl {
+        topic: Topic,
+        bytes: Vec<u8>,
     },
     Keyframe {
         stream_id: StreamId,
@@ -156,6 +174,8 @@ pub struct ParticipantCore {
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
+    rel_pub_channels: HashMap<Topic, ChannelId>,
+    rel_sub_channels: HashMap<(Topic, entity::ParticipantId), ChannelId>,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -208,6 +228,8 @@ impl ParticipantCore {
             data_topic_channels: HashMap::new(),
             data_pub_channels: HashMap::new(),
             data_sub_channels: HashMap::new(),
+            rel_pub_channels: HashMap::new(),
+            rel_sub_channels: HashMap::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -263,6 +285,27 @@ impl ParticipantCore {
             origin,
             pkt: pkt.to_vec(),
         });
+    }
+
+    pub fn on_forward_reliable_sctp(
+        &mut self,
+        topic: &Topic,
+        origin: entity::ParticipantId,
+        frame: &[u8],
+    ) {
+        self.pending_fanout.push_back(PendingFanout::ReliableSctp {
+            topic: topic.clone(),
+            origin,
+            frame: frame.to_vec(),
+        });
+    }
+
+    pub fn on_deliver_reliable_control(&mut self, topic: &Topic, bytes: &[u8]) {
+        self.pending_fanout
+            .push_back(PendingFanout::ReliableControl {
+                topic: topic.clone(),
+                bytes: bytes.to_vec(),
+            });
     }
 
     pub fn on_tracks_published(&mut self, tracks: &[Track]) {
@@ -376,6 +419,22 @@ impl ParticipantCore {
                 self.pending_rtc_mutations
                     .push_back(PendingRtcMutation::Sctp { topic, origin, pkt });
             }
+            PendingFanout::ReliableSctp {
+                topic,
+                origin,
+                frame,
+            } => {
+                self.pending_rtc_mutations
+                    .push_back(PendingRtcMutation::ReliableSctp {
+                        topic,
+                        origin,
+                        frame,
+                    });
+            }
+            PendingFanout::ReliableControl { topic, bytes } => {
+                self.pending_rtc_mutations
+                    .push_back(PendingRtcMutation::ReliableControl { topic, bytes });
+            }
             PendingFanout::Keyframe { stream_id, kind } => {
                 self.pending_rtc_mutations
                     .push_back(PendingRtcMutation::Keyframe { stream_id, kind });
@@ -408,6 +467,20 @@ impl ParticipantCore {
                     .copied()
                 {
                     self.write_to_data_channel(cid, &topic, &pkt);
+                }
+            }
+            PendingRtcMutation::ReliableSctp {
+                topic,
+                origin,
+                frame,
+            } => {
+                if let Some(cid) = self.rel_sub_channels.get(&(topic.clone(), origin)).copied() {
+                    self.write_to_data_channel(cid, &topic, &frame);
+                }
+            }
+            PendingRtcMutation::ReliableControl { topic, bytes } => {
+                if let Some(cid) = self.rel_pub_channels.get(&topic).copied() {
+                    self.write_to_data_channel(cid, &topic, &bytes);
                 }
             }
             PendingRtcMutation::Keyframe { stream_id, kind } => {
@@ -746,6 +819,28 @@ impl ParticipantCore {
                             self.release_data_topic_channel(previous, events);
                         }
 
+                        if self.data_topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
+                            self.disconnect(DisconnectReason::TooManyDataTopicChannels);
+                            return;
+                        }
+
+                        if e.lane == DataLane::Reliable {
+                            self.data_topic_channels.insert(cid, e.clone());
+                            match e.direction {
+                                DataTrackDirection::Publish => {
+                                    self.rel_pub_channels.insert(e.topic.clone(), cid);
+                                    events.publish_reliable_data_topic(e.topic);
+                                }
+                                DataTrackDirection::Subscribe => {
+                                    let publisher = e.scope.expect("reliable sub always has scope");
+                                    self.rel_sub_channels
+                                        .insert((e.topic.clone(), publisher), cid);
+                                    events.subscribe_reliable_data_topic(e.topic, publisher);
+                                }
+                            }
+                            return;
+                        }
+
                         let duplicate = match e.direction {
                             DataTrackDirection::Publish => self
                                 .data_pub_channels
@@ -770,11 +865,6 @@ impl ParticipantCore {
                             };
                         if duplicate.is_some() || conflicting_subscribe {
                             self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
-                            return;
-                        }
-
-                        if self.data_topic_channels.len() >= MAX_DATA_TOPIC_CHANNELS {
-                            self.disconnect(DisconnectReason::TooManyDataTopicChannels);
                             return;
                         }
 
@@ -816,10 +906,27 @@ impl ParticipantCore {
                 }
 
                 if let Some(ch) = self.data_topic_channels.get(&data.id)
-                    && ch.direction == DataTrackDirection::Publish
                     && data.binary
                 {
-                    events.publish_sctp(ch.topic.clone(), data.data.to_vec());
+                    match (ch.lane, ch.direction) {
+                        (DataLane::Realtime, DataTrackDirection::Publish) => {
+                            events.publish_sctp(ch.topic.clone(), data.data.to_vec());
+                        }
+                        (DataLane::Reliable, DataTrackDirection::Publish) => {
+                            events.publish_reliable_sctp(ch.topic.clone(), data.data.to_vec());
+                        }
+                        (DataLane::Reliable, DataTrackDirection::Subscribe) => {
+                            let publisher = ch
+                                .scope
+                                .expect("reliable sub channel always has publisher scope");
+                            events.forward_reliable_control(
+                                publisher,
+                                ch.topic.clone(),
+                                data.data.to_vec(),
+                            );
+                        }
+                        (DataLane::Realtime, DataTrackDirection::Subscribe) => {}
+                    }
                 }
             }
             Event::StreamPaused(stream) => {
@@ -1044,6 +1151,8 @@ impl ParticipantCore {
 
         self.data_pub_channels.clear();
         self.data_sub_channels.clear();
+        self.rel_pub_channels.clear();
+        self.rel_sub_channels.clear();
     }
 
     fn release_data_topic_channel(
@@ -1051,6 +1160,23 @@ impl ParticipantCore {
         ch: DataTopicChannel,
         events: &mut impl ParticipantSink,
     ) {
+        if ch.lane == DataLane::Reliable {
+            match ch.direction {
+                DataTrackDirection::Publish => {
+                    self.rel_pub_channels.remove(&ch.topic);
+                    events.unpublish_reliable_data_topic(ch.topic);
+                }
+                DataTrackDirection::Subscribe => {
+                    let publisher = ch
+                        .scope
+                        .expect("reliable sub channel always has publisher scope");
+                    self.rel_sub_channels.remove(&(ch.topic.clone(), publisher));
+                    events.unsubscribe_reliable_data_topic(ch.topic, publisher);
+                }
+            }
+            return;
+        }
+
         match ch.direction {
             DataTrackDirection::Publish => {
                 self.data_pub_channels.remove(&ch.topic);

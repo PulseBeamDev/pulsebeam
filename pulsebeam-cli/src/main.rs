@@ -302,7 +302,7 @@ async fn spawn_agent(
                     AgentEvent::RemoteTrackAdded(t) => {
                         join_set.spawn(handle_receiving(t, ctx.clone()));
                     }
-                    AgentEvent::Connected | AgentEvent::Disconnected(_) | AgentEvent::RemoteTrackDiscovered(_) | AgentEvent::DataPublisherDeclared(_) | AgentEvent::DataSubscriberDeclared(_)  => {}
+                    AgentEvent::Connected | AgentEvent::Disconnected(_) | AgentEvent::RemoteTrackDiscovered(_) | AgentEvent::DataPublisherDeclared(_) | AgentEvent::DataSubscriberDeclared(_) | AgentEvent::ReliableDataPublisherReady(_) | AgentEvent::ReliableDataSubscriberReady(_)  => {}
                 }
             }
         }

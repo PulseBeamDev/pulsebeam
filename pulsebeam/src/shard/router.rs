@@ -63,6 +63,15 @@ pub(crate) trait RoutingContext: CrossShardSend {
         kind: KeyframeRequestKind,
     );
     fn is_local(&self, id: &ParticipantId) -> bool;
+
+    fn forward_reliable_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &Topic,
+        frame: &[u8],
+    );
+    fn deliver_reliable_control(&mut self, publisher: ParticipantId, topic: &Topic, bytes: &[u8]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +86,7 @@ pub(crate) struct ShardRoomContext {
     pub audio_selector: TopNAudioSelector,
     pub data_streams: HashMap<DataStreamId, DataStreamRoute>,
     pub all_publisher_subscriptions: AllPublisherSubscriptions,
+    pub rel_data_streams: HashMap<DataStreamId, DataStreamRoute>,
 }
 
 impl ShardRoomContext {
@@ -87,6 +97,7 @@ impl ShardRoomContext {
             audio_selector: TopNAudioSelector::new(rng),
             data_streams: HashMap::default(),
             all_publisher_subscriptions: AllPublisherSubscriptions::new(),
+            rel_data_streams: HashMap::default(),
         }
     }
 }
@@ -275,6 +286,10 @@ impl ShardRoutingTable {
             route.local_subscribers.swap_remove(participant_id);
         }
         room.data_streams.retain(|_, route| !route.is_unused());
+        for route in room.rel_data_streams.values_mut() {
+            route.local_subscribers.swap_remove(participant_id);
+        }
+        room.rel_data_streams.retain(|_, route| !route.is_unused());
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -823,6 +838,179 @@ impl ShardRoutingTable {
             }
         }
     }
+
+    pub fn register_reliable_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let route = room
+            .rel_data_streams
+            .entry(DataStreamId::new(publisher, topic))
+            .or_insert_with(DataStreamRoute::new);
+        debug_assert!(!route.published);
+        route.published = true;
+    }
+
+    pub fn unregister_reliable_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let key = DataStreamId::new(publisher, topic.clone());
+        let Some(route) = room.rel_data_streams.get_mut(&key) else {
+            debug_assert!(false, "unregistering an unknown reliable data stream");
+            return;
+        };
+        debug_assert!(route.published);
+        route.published = false;
+        if route.is_unused() {
+            room.rel_data_streams.remove(&key);
+        }
+    }
+
+    pub fn register_reliable_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        publisher: ParticipantId,
+        topic: Topic,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        let route = room
+            .rel_data_streams
+            .entry(DataStreamId::new(publisher, topic))
+            .or_insert_with(DataStreamRoute::new);
+        let was_empty = route.local_subscribers.is_empty();
+        route.local_subscribers.insert(subscriber);
+        was_empty
+    }
+
+    pub fn unregister_reliable_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        let key = DataStreamId::new(publisher, topic.clone());
+        let Some(route) = room.rel_data_streams.get_mut(&key) else {
+            return false;
+        };
+        let was_one =
+            route.local_subscribers.len() == 1 && route.local_subscribers.contains(&subscriber);
+        route.local_subscribers.swap_remove(&subscriber);
+        if route.is_unused() {
+            room.rel_data_streams.remove(&key);
+        }
+        was_one
+    }
+
+    pub fn register_remote_reliable_data_subscriber_shard(
+        &mut self,
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        publisher: ParticipantId,
+        topic: Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let route = room
+            .rel_data_streams
+            .entry(DataStreamId::new(publisher, topic))
+            .or_insert_with(DataStreamRoute::new);
+        route.attach_remote_subscriber_shard(from_shard_id);
+    }
+
+    pub fn unregister_remote_reliable_data_subscriber_shard(
+        &mut self,
+        room_id: RoomId,
+        from_shard_id: ShardId,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let key = DataStreamId::new(publisher, topic.clone());
+        let Some(route) = room.rel_data_streams.get_mut(&key) else {
+            return;
+        };
+        route.detach_remote_subscriber_shard(from_shard_id);
+        if route.is_unused() {
+            room.rel_data_streams.remove(&key);
+        }
+    }
+
+    pub fn route_reliable_data(
+        &mut self,
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: &Topic,
+        frame: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let stream_id = DataStreamId::new(origin, topic.clone());
+        let Some(route) = room.rel_data_streams.get(&stream_id) else {
+            return;
+        };
+        debug_assert!(route.published);
+        for &subscriber_id in &route.local_subscribers {
+            ctx.forward_reliable_sctp(subscriber_id, origin, topic, frame);
+        }
+
+        if ctx.is_local(&origin) {
+            for &shard_id in route.remote_subscriber_shards.keys() {
+                ctx.send(
+                    shard_id,
+                    CrossShardEvent::ReliableDataSctpPublished {
+                        room_id,
+                        origin,
+                        topic: topic.clone(),
+                        frame: frame.to_vec(),
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn route_reliable_control(
+        &self,
+        publisher: ParticipantId,
+        topic: &Topic,
+        bytes: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
+        if ctx.is_local(&publisher) {
+            ctx.deliver_reliable_control(publisher, topic, bytes);
+        } else if let Some(shard_id) = self.remote_shard_for(&publisher) {
+            ctx.send(
+                shard_id,
+                CrossShardEvent::ReliableControlForward {
+                    publisher,
+                    topic: topic.clone(),
+                    bytes: bytes.to_vec(),
+                },
+            );
+        }
+    }
 }
 
 // -- participant-originated control-event routing -------------------------
@@ -877,6 +1065,16 @@ pub(crate) fn route_participant_control_event(
                 subscriber = %subscriber,
                 topic = %topic.as_ref(),
                 "data topic unsubscribe is handled directly in shard core"
+            );
+        }
+        ParticipantControlEvent::ReliableDataTopicPublished { .. }
+        | ParticipantControlEvent::ReliableDataTopicUnpublished { .. }
+        | ParticipantControlEvent::ReliableDataTopicSubscribed { .. }
+        | ParticipantControlEvent::ReliableDataTopicUnsubscribed { .. }
+        | ParticipantControlEvent::ReliableControlReceived { .. } => {
+            debug_assert!(
+                false,
+                "reliable data channel events must be handled by shard core"
             );
         }
     }
@@ -968,6 +1166,24 @@ mod tests {
         }
         fn is_local(&self, id: &ParticipantId) -> bool {
             self.local.contains(id)
+        }
+
+        fn forward_reliable_sctp(
+            &mut self,
+            subscriber: ParticipantId,
+            _origin: ParticipantId,
+            _topic: &Topic,
+            _frame: &[u8],
+        ) {
+            self.forwarded_sctp.borrow_mut().push(subscriber);
+        }
+
+        fn deliver_reliable_control(
+            &mut self,
+            _publisher: ParticipantId,
+            _topic: &Topic,
+            _bytes: &[u8],
+        ) {
         }
     }
 

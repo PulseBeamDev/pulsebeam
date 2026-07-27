@@ -122,6 +122,31 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     fn is_local(&self, id: &ParticipantId) -> bool {
         self.registry.contains(id)
     }
+
+    fn forward_reliable_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &crate::track::Topic,
+        frame: &[u8],
+    ) {
+        if let Some(p) = self.registry.get_mut(&subscriber) {
+            p.on_forward_reliable_sctp(topic, origin, frame);
+            self.dirty.mark(self.kind, subscriber);
+        }
+    }
+
+    fn deliver_reliable_control(
+        &mut self,
+        publisher: ParticipantId,
+        topic: &crate::track::Topic,
+        bytes: &[u8],
+    ) {
+        if let Some(p) = self.registry.get_mut(&publisher) {
+            p.on_deliver_reliable_control(topic, bytes);
+            self.dirty.mark(self.kind, publisher);
+        }
+    }
 }
 
 pub(crate) struct ShardCore {
@@ -207,6 +232,11 @@ impl ShardCore {
             self.routing
                 .route_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
         }
+
+        while let Some(ev) = self.pipeline.pop_reliable_data_sctp() {
+            self.routing
+                .route_reliable_data(ev.room_id, ev.origin, &ev.topic, &ev.pkt, &mut ctx);
+        }
     }
 
     pub(crate) fn flush_participant_events(&mut self, router: &impl CrossShardSend) {
@@ -278,6 +308,75 @@ impl ShardCore {
                                     publisher,
                                 });
                         }
+                    }
+                    ParticipantControlEvent::ReliableDataTopicPublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => {
+                        self.routing
+                            .register_reliable_data_publisher(room_id, publisher, topic);
+                    }
+                    ParticipantControlEvent::ReliableDataTopicUnpublished {
+                        room_id,
+                        publisher,
+                        topic,
+                    } => {
+                        self.routing
+                            .unregister_reliable_data_publisher(room_id, publisher, &topic);
+                    }
+                    ParticipantControlEvent::ReliableDataTopicSubscribed {
+                        room_id,
+                        subscriber,
+                        publisher,
+                        topic,
+                    } => {
+                        if self.routing.register_reliable_data_subscriber(
+                            room_id,
+                            subscriber,
+                            publisher,
+                            topic.clone(),
+                        ) {
+                            self.pipeline.push_shard_event(
+                                ShardEvent::ReliableDataTopicSubscribed {
+                                    room_id,
+                                    topic,
+                                    publisher,
+                                },
+                            );
+                        }
+                    }
+                    ParticipantControlEvent::ReliableDataTopicUnsubscribed {
+                        room_id,
+                        subscriber,
+                        publisher,
+                        topic,
+                    } => {
+                        if self.routing.unregister_reliable_data_subscriber(
+                            room_id, subscriber, publisher, &topic,
+                        ) {
+                            self.pipeline.push_shard_event(
+                                ShardEvent::ReliableDataTopicUnsubscribed {
+                                    room_id,
+                                    topic,
+                                    publisher,
+                                },
+                            );
+                        }
+                    }
+                    ParticipantControlEvent::ReliableControlReceived {
+                        publisher,
+                        topic,
+                        bytes,
+                    } => {
+                        let mut ctx = DispatchCtx {
+                            registry: &mut self.registry,
+                            dirty: &mut self.dirty,
+                            kind: DirtyKind::Input,
+                            router,
+                        };
+                        self.routing
+                            .route_reliable_control(publisher, &topic, &bytes, &mut ctx);
                     }
                     ev => {
                         router::route_participant_control_event(
@@ -469,6 +568,33 @@ impl ShardCore {
                     publisher,
                 );
             }
+            ClusterCommand::SubscribeReliableDataTopic {
+                room_id,
+                from_shard_id,
+                topic,
+                publisher,
+            } => {
+                self.routing.register_remote_reliable_data_subscriber_shard(
+                    room_id,
+                    from_shard_id,
+                    publisher,
+                    topic,
+                );
+            }
+            ClusterCommand::UnsubscribeReliableDataTopic {
+                room_id,
+                from_shard_id,
+                topic,
+                publisher,
+            } => {
+                self.routing
+                    .unregister_remote_reliable_data_subscriber_shard(
+                        room_id,
+                        from_shard_id,
+                        publisher,
+                        &topic,
+                    );
+            }
         }
         Some(())
     }
@@ -537,6 +663,34 @@ impl ShardCore {
                 };
                 self.routing
                     .route_data(room_id, origin, &topic, &pkt, &mut ctx);
+            }
+            CrossShardEvent::ReliableDataSctpPublished {
+                room_id,
+                origin,
+                topic,
+                frame,
+            } => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    kind: DirtyKind::Fanout,
+                    router,
+                };
+                self.routing
+                    .route_reliable_data(room_id, origin, &topic, &frame, &mut ctx);
+            }
+            CrossShardEvent::ReliableControlForward {
+                publisher,
+                topic,
+                bytes,
+            } => {
+                let mut ctx = DispatchCtx {
+                    registry: &mut self.registry,
+                    dirty: &mut self.dirty,
+                    kind: DirtyKind::Input,
+                    router,
+                };
+                ctx.deliver_reliable_control(publisher, &topic, &bytes);
             }
         }
     }
