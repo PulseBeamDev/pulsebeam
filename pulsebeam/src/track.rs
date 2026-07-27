@@ -290,6 +290,18 @@ impl Track {
             .expect("at least one layer")
     }
 
+    /// Lowest layer that is currently healthy, falling back to the absolute
+    /// lowest when no layer is healthy yet. Prefer this over `lowest_quality`
+    /// when staging an initial layer so the slot can actually receive a keyframe
+    /// (an inactive layer never produces packets and the slot would stall).
+    pub fn lowest_healthy_quality(&self) -> &TrackLayer {
+        self.layers
+            .iter()
+            .filter(|l| l.state.is_healthy())
+            .min_by_key(|l| l.quality)
+            .unwrap_or_else(|| self.lowest_quality())
+    }
+
     pub fn by_quality(&self, quality: LayerQuality) -> Option<&TrackLayer> {
         self.layers.iter().find(|l| l.quality == quality)
     }

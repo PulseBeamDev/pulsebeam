@@ -142,7 +142,7 @@ impl VideoAllocator {
             {
                 target
             } else {
-                track_state.lowest_quality()
+                track_state.lowest_healthy_quality()
             };
 
             let layer = layer.clone();
@@ -236,7 +236,7 @@ impl VideoAllocator {
             .filter(|s| s.state() == SlotState::Idle)
         {
             if let Some(track_state) = pending_tracks.next() {
-                let layer = track_state.lowest_quality();
+                let layer = track_state.lowest_healthy_quality();
                 slot.switch_to(layer, true);
                 staged += 1;
             } else {
