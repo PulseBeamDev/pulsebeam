@@ -16,7 +16,7 @@ fn layer_seed_bps(rid: Option<Rid>) -> f64 {
         0 => 30_000.0,
         1 => 900_000.0,
         2 => 1_400_000.0,
-        _ => 30_000.0,
+        _ => 1_400_000.0,
     }
 }
 
@@ -41,7 +41,7 @@ pub struct BitrateEstimate {
 
 impl BitrateEstimate {
     const HEADROOM: f64 = 1.05;
-    const TICK_MS: f64 = 500.0;
+    const TICK_MS: f64 = 200.0;
 
     pub fn new_with_seed(seed_bps: f64) -> Self {
         let mut raw_ticks = VecDeque::with_capacity(6);
