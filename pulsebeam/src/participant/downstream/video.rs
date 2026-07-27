@@ -812,17 +812,35 @@ impl AllocationEngine {
         }
     }
 
+    /// Lowest healthy layer ignoring the spatial constraint. Used as a
+    /// last-resort fallback when all spatially-allowed layers are inactive
+    /// (e.g. "f"/"h"/"q" negotiated but only "f" and "h" are active and the
+    /// client requests a height that only "q" would satisfy).
+    fn closest_healthy<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
+        slot.track
+            .layers
+            .iter()
+            .filter(|l| l.state.is_healthy())
+            .min_by_key(|l| l.quality)
+    }
+
     /// A legal layer to retain as the pause target even when no layer is
-    /// currently healthy enough to forward.
+    /// currently healthy enough to forward. Falls back to the lowest healthy
+    /// layer (closest rank) when no spatially-allowed layer exists.
     fn pause_target<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
             .layers
             .iter()
             .filter(|layer| Self::spatially_allowed(slot, layer))
             .min_by_key(|layer| layer.quality)
+            .or_else(|| Self::closest_healthy(slot))
     }
 
     /// The lowest eligible layer strictly above the selected layer.
+    /// When starting from nothing (`current = None`) and no spatially-allowed
+    /// healthy layer exists, falls back to the closest-rank healthy layer so
+    /// the slot always gets an initial allocation rather than being silently
+    /// dropped.
     fn next_layer<'a>(
         slot: &'a SlotView<'a>,
         current: Option<&'a TrackLayer>,
@@ -833,6 +851,13 @@ impl AllocationEngine {
             .filter(|layer| Self::eligible(slot, layer))
             .filter(|layer| current.is_none_or(|current| layer.quality > current.quality))
             .min_by_key(|layer| layer.quality)
+            .or_else(|| {
+                if current.is_none() {
+                    Self::closest_healthy(slot)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Higher priority first, with MID as a deterministic tie-breaker.
@@ -876,6 +901,7 @@ impl AllocationEngine {
             .filter(|l| Self::height(l) >= slot.min_height)
             .min_by_key(|l| l.quality)
             .or_else(|| eligible().max_by_key(|l| l.quality))
+            .or_else(|| Self::closest_healthy(slot))
     }
 
     /// Strict-priority allocation. `slots` must be pre-sorted by `priority_order`
@@ -2426,5 +2452,43 @@ mod allocation_tests {
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
             "lowest layer must be forwarded when the budget affords it"
         );
+    }
+
+    /// When "f"/"h"/"q" are negotiated but only "f" (High) and "h" (Medium)
+    /// are active, a client requesting max_height=180 (which only the inactive
+    /// "q"/Low would satisfy) must still receive a Forward decision rather than
+    /// being silently dropped. The engine should pick the lowest active layer
+    /// (Medium/"h") as the closest-rank fallback.
+    #[test]
+    fn closest_rank_fallback_when_low_layer_inactive() {
+        use crate::rtp::monitor::StreamQuality;
+
+        let t = healthy_track();
+        // Mark Low/"q" inactive — only High and Medium are publishing.
+        t.by_quality(LayerQuality::Low)
+            .unwrap()
+            .state
+            .update_for_test()
+            .quality(StreamQuality::Bad);
+
+        let med_bps = layer_bps(&t, LayerQuality::Medium);
+
+        // Client requests max_height=180 (only the inactive Low would normally fit).
+        let slots = sorted(vec![qos_slot("a", 180, 0, 0, &t, LayerQuality::Low)]);
+        let available = bw((med_bps * 2.0) as u64 / 1_000);
+        let decisions = AllocationEngine::compute(available, &slots, false);
+
+        assert!(
+            matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
+            "expected Forward (closest-rank fallback) when the spatially-preferred layer is inactive"
+        );
+
+        if let AllocationDecision::Forward(layer, _) = decisions[slots[0].key] {
+            assert!(
+                layer.state.is_healthy(),
+                "forwarded layer must be healthy; got {:?}",
+                layer.quality
+            );
+        }
     }
 }
