@@ -1,20 +1,20 @@
-use arrayvec::ArrayVec;
 use pulsebeam_runtime::net::{self, UnifiedSocket};
 use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
 use super::events::{
     AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
-    ParticipantTimerEvent,
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
     entity::{ParticipantId, TrackKind},
     id::ShardId,
-    participant::{ParticipantConfig, batcher::GsoBuffer},
+    participant::{ParticipantConfig, batcher::GsoSendBatch},
     rtp::RtpPacket,
     shard::{
-        dirty::DirtyTracker, events::EventPipeline, participants::ParticipantRegistry,
+        dirty::DirtyTracker,
+        events::EventPipeline,
+        participants::{ParticipantHandle, ParticipantRegistry},
         timer::TimerWheel,
     },
     track::StreamId,
@@ -46,14 +46,14 @@ impl<'a, R: CrossShardSend> CrossShardSend for DispatchCtx<'a, R> {
 impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     fn forward_video_rtp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         stream_id: &StreamId,
         pkt: &RtpPacket,
         cache: Option<&crate::rtp::cache::StreamCache>,
     ) {
-        if let Some(p) = self.registry.get_mut(&subscriber) {
+        if let Some(p) = self.registry.resolve_mut(subscriber) {
             p.on_forward_rtp(stream_id, pkt, cache);
-            self.dirty.mark(subscriber, p);
+            self.dirty.mark(subscriber.participant_id(), p);
         }
     }
 
@@ -128,9 +128,9 @@ pub(crate) struct ShardCore {
     pub(crate) shard_id: ShardId,
     registry: ParticipantRegistry,
     pub(super) routing: ShardRoutingTable,
-    timers: TimerWheel<ParticipantId>,
+    timers: TimerWheel,
     dirty: DirtyTracker,
-    gso_buffers: Vec<GsoBuffer>,
+    udp_send_batch: GsoSendBatch,
     pipeline: EventPipeline,
     rng: Rng,
 }
@@ -138,16 +138,13 @@ pub(crate) struct ShardCore {
 impl ShardCore {
     pub(crate) fn new(shard_id: impl Into<ShardId>, max_gso_segments: usize, rng: Rng) -> Self {
         let shard_id = shard_id.into();
-        let gso_buffers = (0..net::BATCH_SIZE)
-            .map(|_| GsoBuffer::preallocated())
-            .collect();
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
             routing: ShardRoutingTable::new(),
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
             dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
-            gso_buffers,
+            udp_send_batch: GsoSendBatch::preallocated(),
             pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rng,
         }
@@ -160,16 +157,12 @@ impl ShardCore {
     pub(crate) fn fire_timers(&mut self, now: Instant) {
         let registry = &mut self.registry;
         let dirty = &mut self.dirty;
-        self.timers
-            .drain_expired(now, |participant_id, generation| {
-                if let Some(participant) = registry.get_mut(&participant_id) {
-                    if participant.generation != generation {
-                        return;
-                    }
-                    participant.on_timeout(now);
-                    dirty.mark(participant_id, participant);
-                }
-            });
+        self.timers.drain_expired(now, |handle| {
+            if let Some(participant) = registry.resolve_mut(handle) {
+                participant.on_timeout(now);
+                dirty.mark(handle.participant_id(), participant);
+            }
+        });
     }
 
     pub(crate) fn on_udp_batch(
@@ -222,15 +215,6 @@ impl ShardCore {
                 ParticipantEvent::Topology(ev) => {
                     if let Some(shard_event) = self.routing.handle_topology_event(ev) {
                         self.pipeline.push_shard_event(shard_event);
-                    }
-                }
-                ParticipantEvent::Timer(ParticipantTimerEvent::DeadlineUpdated {
-                    at,
-                    participant_id,
-                }) => {
-                    if let Some(participant) = self.registry.get(&participant_id) {
-                        self.timers
-                            .schedule(participant_id, participant.generation, at);
                     }
                 }
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
@@ -317,11 +301,13 @@ impl ShardCore {
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
-        debug_assert_eq!(self.gso_buffers.len(), net::BATCH_SIZE);
-        let mut filled = 0;
+        debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
         while let Some(entry) = self.dirty.next() {
-            let Some(participant) = self.registry.get_mut(&entry.participant_id) else {
+            let Some(handle) = self.registry.handle(&entry.participant_id) else {
+                continue;
+            };
+            let Some(participant) = self.registry.resolve_mut(handle) else {
                 continue;
             };
             if participant.generation != entry.generation {
@@ -334,51 +320,25 @@ impl ShardCore {
             let mut sink = self
                 .pipeline
                 .participant_sink(room_id, entry.participant_id);
-            participant.poll(now, &mut sink);
+            let deadline = participant.poll(now, &mut sink);
+            if let Some(deadline) = deadline {
+                self.timers.schedule(handle, deadline);
+            }
 
-            while participant
-                .udp_packets
-                .fill_next_gso(&mut self.gso_buffers[filled])
+            while self
+                .udp_send_batch
+                .append_from(&mut participant.udp_packets)
             {
-                filled += 1;
-                debug_assert!(filled <= self.gso_buffers.len());
-                if filled == self.gso_buffers.len() {
-                    Self::flush_gso_buffers(udp_socket, &mut self.gso_buffers, filled);
-                    filled = 0;
+                if self.udp_send_batch.is_full() {
+                    self.udp_send_batch.flush(udp_socket);
                 }
             }
             participant.tcp_batcher.flush_tcp(tcp_socket);
         }
         self.dirty.finish_phase();
         debug_assert!(self.dirty.is_empty());
-        if filled != 0 {
-            Self::flush_gso_buffers(udp_socket, &mut self.gso_buffers, filled);
-        }
-    }
-
-    #[inline]
-    fn flush_gso_buffers(udp_socket: &mut UnifiedSocket, buffers: &mut [GsoBuffer], filled: usize) {
-        debug_assert_ne!(filled, 0);
-        debug_assert!(filled <= buffers.len());
-        let mut packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
-        for buffer in &buffers[..filled] {
-            debug_assert!(!buffer.buf.is_empty());
-            debug_assert_ne!(buffer.segment_size, 0);
-            packets.push(net::SendPacket {
-                dst: buffer.dst,
-                buf: &buffer.buf,
-                segment_size: buffer.segment_size,
-            });
-        }
-        debug_assert_eq!(packets.len(), filled);
-        let batch = net::SendPacketBatch { packets: &packets };
-        if let Err(err) = udp_socket.try_send_batch(&batch) {
-            tracing::trace!(error = ?err, "error writing UDP egress batch");
-        }
-        drop(packets);
-        for buffer in &mut buffers[..filled] {
-            buffer.clear();
-        }
+        self.udp_send_batch.flush(udp_socket);
+        debug_assert!(self.udp_send_batch.is_empty());
     }
 
     pub(crate) fn flush_close_peers(
@@ -587,8 +547,12 @@ impl ShardCore {
         self.remove_participant(&participant_id);
         let _ = router; // reserved: re-add currently needs no cross-shard notice
         let participant_id = self.registry.insert(cfg, &mut self.rng);
+        let handle = self
+            .registry
+            .handle(&participant_id)
+            .expect("new participant must have a local handle");
         self.routing
-            .add_local_member(participant_id, room_id, &mut self.rng);
+            .add_local_member(participant_id, handle, room_id, &mut self.rng);
         let participant = self
             .registry
             .get_mut(&participant_id)
@@ -597,7 +561,9 @@ impl ShardCore {
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
-        self.timers.cancel(participant_id);
+        if let Some(handle) = self.registry.handle(participant_id) {
+            self.timers.cancel(handle);
+        }
         let meta = self.registry.remove(participant_id)?;
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing

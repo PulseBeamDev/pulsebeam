@@ -1,6 +1,8 @@
-use ahash::{HashMap, HashMapExt};
-use std::{array, hash::Hash, time::Duration};
+use slotmap::SecondaryMap;
+use std::{array, time::Duration};
 use tokio::time::Instant;
+
+use super::participants::{LocalParticipantKey, ParticipantHandle};
 
 const SLOT_COUNT: usize = 256;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
@@ -9,15 +11,15 @@ const DISARMED_LOCATION: u16 = DUE_LOCATION + 1;
 const MAX_DEADLINE_TICKS: u64 = 101;
 
 #[derive(Clone, Copy)]
-struct TimerNode<T> {
+struct TimerNode {
     generation: u64,
     deadline_tick: u64,
-    prev: Option<T>,
-    next: Option<T>,
+    prev: Option<ParticipantHandle>,
+    next: Option<ParticipantHandle>,
     location: u16,
 }
 
-impl<T> TimerNode<T> {
+impl TimerNode {
     fn new(generation: u64) -> Self {
         Self {
             generation,
@@ -33,17 +35,17 @@ impl<T> TimerNode<T> {
     }
 }
 
-pub struct TimerWheel<T: Eq + Hash + Copy> {
+pub struct TimerWheel {
     epoch: Instant,
     last_now: Instant,
     current_tick: u64,
-    heads: [Option<T>; SLOT_COUNT],
-    due_head: Option<T>,
+    heads: [Option<ParticipantHandle>; SLOT_COUNT],
+    due_head: Option<ParticipantHandle>,
     occupied: [u64; OCCUPANCY_WORDS],
-    nodes: HashMap<T, TimerNode<T>>,
+    nodes: SecondaryMap<LocalParticipantKey, TimerNode>,
 }
 
-impl<T: Eq + Hash + Copy> TimerWheel<T> {
+impl TimerWheel {
     pub fn new(capacity: usize) -> Self {
         let epoch = Instant::now();
         Self {
@@ -53,11 +55,12 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
             heads: array::from_fn(|_| None),
             due_head: None,
             occupied: [0; OCCUPANCY_WORDS],
-            nodes: HashMap::with_capacity(capacity),
+            nodes: SecondaryMap::with_capacity(capacity),
         }
     }
 
-    pub fn schedule(&mut self, id: T, generation: u64, deadline: Instant) {
+    pub fn schedule(&mut self, handle: ParticipantHandle, deadline: Instant) {
+        let generation = handle.generation();
         debug_assert_ne!(generation, 0);
         let (location, deadline_tick) = if deadline <= self.last_now {
             (DUE_LOCATION, self.current_tick)
@@ -72,7 +75,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
             (u16::from(deadline_tick as u8), deadline_tick)
         };
 
-        if let Some(node) = self.nodes.get(&id) {
+        if let Some(node) = self.nodes.get(handle.key()) {
             debug_assert_eq!(
                 node.generation, generation,
                 "timer generation changed without cancellation"
@@ -81,23 +84,25 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
                 return;
             }
             if node.is_armed() {
-                self.unlink(id);
+                self.unlink(handle);
             }
         } else {
-            self.nodes.insert(id, TimerNode::new(generation));
+            let previous = self.nodes.insert(handle.key(), TimerNode::new(generation));
+            debug_assert!(previous.is_none());
         }
 
-        self.link(id, location, deadline_tick);
+        self.link(handle, location, deadline_tick);
     }
 
-    pub fn cancel(&mut self, id: &T) {
-        let Some(node) = self.nodes.get(id) else {
+    pub fn cancel(&mut self, handle: ParticipantHandle) {
+        let Some(node) = self.nodes.get(handle.key()) else {
             return;
         };
+        debug_assert_eq!(node.generation, handle.generation());
         if node.is_armed() {
-            self.unlink(*id);
+            self.unlink(handle);
         }
-        let removed = self.nodes.remove(id);
+        let removed = self.nodes.remove(handle.key());
         debug_assert!(removed.is_some());
     }
 
@@ -117,7 +122,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
         None
     }
 
-    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(T, u64)) {
+    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantHandle)) {
         debug_assert!(now >= self.last_now, "timer clock moved backwards");
         self.drain_location(DUE_LOCATION, &mut f);
 
@@ -137,7 +142,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
         self.last_now = now;
     }
 
-    fn drain_location(&mut self, location: u16, f: &mut impl FnMut(T, u64)) {
+    fn drain_location(&mut self, location: u16, f: &mut impl FnMut(ParticipantHandle)) {
         loop {
             let id = if location == DUE_LOCATION {
                 self.due_head
@@ -147,8 +152,9 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
             let Some(id) = id else {
                 break;
             };
-            let node = *self.nodes.get(&id).expect("armed timer node missing");
+            let node = *self.nodes.get(id.key()).expect("armed timer node missing");
             debug_assert_eq!(node.location, location);
+            debug_assert_eq!(node.generation, id.generation());
             if location != DUE_LOCATION {
                 debug_assert!(
                     node.deadline_tick <= self.current_tick
@@ -157,11 +163,11 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
                 );
             }
             self.unlink(id);
-            f(id, node.generation);
+            f(id);
         }
     }
 
-    fn link(&mut self, id: T, location: u16, deadline_tick: u64) {
+    fn link(&mut self, id: ParticipantHandle, location: u16, deadline_tick: u64) {
         debug_assert!(location <= DUE_LOCATION);
         let old_head = if location == DUE_LOCATION {
             self.due_head
@@ -170,7 +176,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
         };
 
         {
-            let node = self.nodes.get_mut(&id).expect("timer node missing");
+            let node = self.nodes.get_mut(id.key()).expect("timer node missing");
             debug_assert!(!node.is_armed());
             node.deadline_tick = deadline_tick;
             node.prev = None;
@@ -180,7 +186,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
         if let Some(old_head) = old_head {
             let head = self
                 .nodes
-                .get_mut(&old_head)
+                .get_mut(old_head.key())
                 .expect("timer slot head missing");
             debug_assert_eq!(head.location, location);
             debug_assert!(head.prev.is_none());
@@ -196,12 +202,16 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
         }
     }
 
-    fn unlink(&mut self, id: T) {
-        let node = *self.nodes.get(&id).expect("timer node missing");
+    fn unlink(&mut self, id: ParticipantHandle) {
+        let node = *self.nodes.get(id.key()).expect("timer node missing");
         debug_assert!(node.is_armed());
+        debug_assert_eq!(node.generation, id.generation());
 
         if let Some(prev) = node.prev {
-            let prev_node = self.nodes.get_mut(&prev).expect("previous timer missing");
+            let prev_node = self
+                .nodes
+                .get_mut(prev.key())
+                .expect("previous timer missing");
             debug_assert_eq!(prev_node.location, node.location);
             debug_assert_eq!(prev_node.next.map(|v| v == id), Some(true));
             prev_node.next = node.next;
@@ -215,7 +225,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
         }
 
         if let Some(next) = node.next {
-            let next_node = self.nodes.get_mut(&next).expect("next timer missing");
+            let next_node = self.nodes.get_mut(next.key()).expect("next timer missing");
             debug_assert_eq!(next_node.location, node.location);
             debug_assert_eq!(next_node.prev.map(|v| v == id), Some(true));
             next_node.prev = node.prev;
@@ -228,7 +238,7 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
             }
         }
 
-        let node = self.nodes.get_mut(&id).expect("timer node missing");
+        let node = self.nodes.get_mut(id.key()).expect("timer node missing");
         node.prev = None;
         node.next = None;
         node.location = DISARMED_LOCATION;
@@ -264,114 +274,122 @@ impl<T: Eq + Hash + Copy> TimerWheel<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::ParticipantId;
+    use slotmap::SlotMap;
 
-    fn wheel() -> TimerWheel<u32> {
-        TimerWheel::new(16)
+    fn handles(count: u8) -> Vec<ParticipantHandle> {
+        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+        (1..=count)
+            .map(|generation| {
+                let key = slots.insert(());
+                ParticipantHandle::new(
+                    key,
+                    ParticipantId::from_bytes([generation; 16]),
+                    u64::from(generation),
+                )
+            })
+            .collect()
     }
 
     #[test]
     fn deadlines_fire_once_after_their_ceiling_tick() {
-        let mut wheel = wheel();
+        let mut wheel = TimerWheel::new(16);
+        let handle = handles(1)[0];
         let start = wheel.epoch;
-        wheel.schedule(1, 1, start + Duration::from_micros(1_001));
+        wheel.schedule(handle, start + Duration::from_micros(1_001));
 
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_micros(1_999), |id, _| {
-            expired.push(id)
+        wheel.drain_expired(start + Duration::from_micros(1_999), |entry| {
+            expired.push(entry.participant_id())
         });
         assert!(expired.is_empty());
-        wheel.drain_expired(start + Duration::from_millis(2), |id, _| expired.push(id));
-        assert_eq!(expired, vec![1]);
+        wheel.drain_expired(start + Duration::from_millis(2), |entry| {
+            expired.push(entry.participant_id())
+        });
+        assert_eq!(expired, vec![handle.participant_id()]);
         assert_eq!(wheel.next_deadline(), None);
     }
 
     #[test]
     fn rescheduling_replaces_the_only_entry() {
-        let mut wheel = wheel();
+        let mut wheel = TimerWheel::new(16);
+        let handle = handles(1)[0];
         let start = wheel.epoch;
-        wheel.schedule(1, 7, start + Duration::from_millis(20));
-        wheel.schedule(1, 7, start + Duration::from_millis(40));
-        wheel.schedule(1, 7, start + Duration::from_millis(10));
+        wheel.schedule(handle, start + Duration::from_millis(20));
+        wheel.schedule(handle, start + Duration::from_millis(40));
+        wheel.schedule(handle, start + Duration::from_millis(10));
 
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_millis(10), |id, generation| {
-            expired.push((id, generation))
+        wheel.drain_expired(start + Duration::from_millis(10), |entry| {
+            expired.push((entry.participant_id(), entry.generation()))
         });
-        assert_eq!(expired, vec![(1, 7)]);
-        wheel.drain_expired(start + Duration::from_millis(50), |id, generation| {
-            expired.push((id, generation))
+        assert_eq!(
+            expired,
+            vec![(handle.participant_id(), handle.generation())]
+        );
+        wheel.drain_expired(start + Duration::from_millis(50), |entry| {
+            expired.push((entry.participant_id(), entry.generation()))
         });
-        assert_eq!(expired, vec![(1, 7)]);
+        assert_eq!(expired.len(), 1);
     }
 
     #[test]
     fn due_deadlines_do_not_wrap() {
-        let mut wheel = wheel();
+        let mut wheel = TimerWheel::new(16);
+        let handle = handles(1)[0];
         let start = wheel.epoch;
-        wheel.drain_expired(start + Duration::from_millis(10), |_, _| {});
-        wheel.schedule(1, 1, start + Duration::from_millis(9));
+        wheel.drain_expired(start + Duration::from_millis(10), |_| {});
+        wheel.schedule(handle, start + Duration::from_millis(9));
 
         assert_eq!(
             wheel.next_deadline(),
             Some(start + Duration::from_millis(10))
         );
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_millis(10), |id, _| expired.push(id));
-        assert_eq!(expired, vec![1]);
+        wheel.drain_expired(start + Duration::from_millis(10), |entry| {
+            expired.push(entry.participant_id())
+        });
+        assert_eq!(expired, vec![handle.participant_id()]);
     }
 
     #[test]
     fn cancellation_removes_only_the_target() {
-        let mut wheel = wheel();
+        let mut wheel = TimerWheel::new(16);
+        let handles = handles(2);
         let start = wheel.epoch;
-        wheel.schedule(1, 1, start + Duration::from_millis(10));
-        wheel.schedule(2, 2, start + Duration::from_millis(10));
-        wheel.cancel(&1);
+        wheel.schedule(handles[0], start + Duration::from_millis(10));
+        wheel.schedule(handles[1], start + Duration::from_millis(10));
+        wheel.cancel(handles[0]);
 
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_millis(10), |id, generation| {
-            expired.push((id, generation))
+        wheel.drain_expired(start + Duration::from_millis(10), |entry| {
+            expired.push((entry.participant_id(), entry.generation()))
         });
-        assert_eq!(expired, vec![(2, 2)]);
-    }
-
-    #[test]
-    fn cancelled_id_can_be_reused_with_a_new_generation() {
-        let mut wheel = wheel();
-        let start = wheel.epoch;
-        wheel.schedule(1, 1, start + Duration::from_millis(10));
-        wheel.cancel(&1);
-        wheel.schedule(1, 2, start + Duration::from_millis(20));
-
-        let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_millis(20), |id, generation| {
-            expired.push((id, generation))
-        });
-        assert_eq!(expired, vec![(1, 2)]);
+        assert_eq!(
+            expired,
+            vec![(handles[1].participant_id(), handles[1].generation())]
+        );
     }
 
     #[test]
     fn late_advance_expires_every_armed_participant_once() {
-        let mut wheel = wheel();
+        let mut wheel = TimerWheel::new(16);
+        let handles = handles(16);
         let start = wheel.epoch;
-        for id in 0..16 {
-            wheel.schedule(
-                id,
-                u64::from(id) + 1,
-                start + Duration::from_millis(id.into()),
-            );
+        for (offset, handle) in handles.iter().copied().enumerate() {
+            wheel.schedule(handle, start + Duration::from_millis(offset as u64));
         }
 
         let mut expired = Vec::new();
-        wheel.drain_expired(start + Duration::from_secs(1), |id, generation| {
-            expired.push((id, generation))
+        wheel.drain_expired(start + Duration::from_secs(1), |entry| {
+            expired.push((entry.participant_id(), entry.generation()))
         });
         expired.sort_unstable();
-        assert_eq!(
-            expired,
-            (0..16)
-                .map(|id| (id, u64::from(id) + 1))
-                .collect::<Vec<_>>()
-        );
+        let mut expected = handles
+            .iter()
+            .map(|entry| (entry.participant_id(), entry.generation()))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(expired, expected);
     }
 }

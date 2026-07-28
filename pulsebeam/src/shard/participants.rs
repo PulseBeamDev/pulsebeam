@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 use ahash::HashMap;
 use pulsebeam_runtime::net::RecvPacketBatch;
 use pulsebeam_runtime::rand::{Rng, RngCore, SeedableRng};
+use slotmap::{SlotMap, new_key_type};
 
 use crate::{
     entity::ParticipantId,
@@ -12,6 +13,43 @@ use crate::{
     participant::{ParticipantConfig, ParticipantCore},
     shard::demux::Demuxer,
 };
+
+new_key_type! {
+    pub(crate) struct LocalParticipantKey;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ParticipantHandle {
+    key: LocalParticipantKey,
+    participant_id: ParticipantId,
+    generation: u64,
+}
+
+impl ParticipantHandle {
+    pub(super) fn new(
+        key: LocalParticipantKey,
+        participant_id: ParticipantId,
+        generation: u64,
+    ) -> Self {
+        Self {
+            key,
+            participant_id,
+            generation,
+        }
+    }
+
+    pub(super) fn key(self) -> LocalParticipantKey {
+        self.key
+    }
+
+    pub fn participant_id(self) -> ParticipantId {
+        self.participant_id
+    }
+
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+}
 
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
@@ -35,7 +73,8 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    participants: HashMap<ParticipantId, ParticipantMeta>,
+    participants: SlotMap<LocalParticipantKey, ParticipantMeta>,
+    participant_keys: HashMap<ParticipantId, LocalParticipantKey>,
     next_generation: u64,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
@@ -48,7 +87,8 @@ impl ParticipantRegistry {
         Self {
             shard_id,
             max_gso_segments,
-            participants: HashMap::default(),
+            participants: SlotMap::with_key(),
+            participant_keys: HashMap::default(),
             next_generation: 1,
             demuxer: Demuxer::new(shard_id.into()),
             pending_close: VecDeque::new(),
@@ -71,14 +111,18 @@ impl ParticipantRegistry {
             1,
             &mut participant_rng,
         );
-        self.participants.insert(
-            participant_id,
-            ParticipantMeta {
-                core,
-                queued_dirty: false,
-                generation,
-            },
+        let previous = self.participant_keys.get(&participant_id);
+        debug_assert!(
+            previous.is_none(),
+            "duplicate participant registry insertion"
         );
+        let key = self.participants.insert(ParticipantMeta {
+            core,
+            queued_dirty: false,
+            generation,
+        });
+        let previous = self.participant_keys.insert(participant_id, key);
+        debug_assert!(previous.is_none());
         tracing::info!(%participant_id, "participant added to shard");
         participant_id
     }
@@ -87,7 +131,12 @@ impl ParticipantRegistry {
     /// Returns the removed state so the caller can read final fields
     /// (room_id, upstream track ids) before it's dropped.
     pub fn remove(&mut self, id: &ParticipantId) -> Option<ParticipantMeta> {
-        let meta = self.participants.remove(id)?;
+        let key = self.participant_keys.remove(id)?;
+        let meta = self
+            .participants
+            .remove(key)
+            .expect("participant ID mapped to a missing local slot");
+        debug_assert_eq!(meta.participant_id, *id);
         let addrs = self.demuxer.unregister(*id);
         self.pending_close.extend(addrs);
         Some(meta)
@@ -102,15 +151,40 @@ impl ParticipantRegistry {
     }
 
     pub fn get_mut(&mut self, id: &ParticipantId) -> Option<&mut ParticipantMeta> {
-        self.participants.get_mut(id)
+        let key = *self.participant_keys.get(id)?;
+        let participant = self.participants.get_mut(key)?;
+        debug_assert_eq!(participant.participant_id, *id);
+        Some(participant)
     }
 
+    #[cfg(test)]
     pub fn get(&self, id: &ParticipantId) -> Option<&ParticipantMeta> {
-        self.participants.get(id)
+        let key = *self.participant_keys.get(id)?;
+        let participant = self.participants.get(key)?;
+        debug_assert_eq!(participant.participant_id, *id);
+        Some(participant)
     }
 
     pub fn contains(&self, id: &ParticipantId) -> bool {
-        self.participants.contains_key(id)
+        self.participant_keys.contains_key(id)
+    }
+
+    pub fn handle(&self, id: &ParticipantId) -> Option<ParticipantHandle> {
+        let key = *self.participant_keys.get(id)?;
+        let participant = self.participants.get(key)?;
+        debug_assert_eq!(participant.participant_id, *id);
+        Some(ParticipantHandle::new(key, *id, participant.generation))
+    }
+
+    pub fn resolve_mut(&mut self, handle: ParticipantHandle) -> Option<&mut ParticipantMeta> {
+        let participant = self.participants.get_mut(handle.key)?;
+        if participant.participant_id != handle.participant_id
+            || participant.generation != handle.generation
+        {
+            debug_assert!(false, "stale local participant handle");
+            return None;
+        }
+        Some(participant)
     }
 
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<ParticipantId> {
@@ -201,6 +275,23 @@ mod tests {
             registry.remove(&p).is_none(),
             "removing an already-removed participant must be a safe no-op, not panic"
         );
+    }
+
+    #[test]
+    fn removed_handle_never_resolves_to_replacement_with_same_id() {
+        let mut registry = ParticipantRegistry::new(ShardId::new(0), 1);
+        let mut rng = pulsebeam_runtime::rand::seeded_rng(1);
+        let participant_id = pid();
+        registry.insert(cfg(participant_id, room_id("r5")), &mut rng);
+        let removed_handle = registry.handle(&participant_id).unwrap();
+
+        assert!(registry.remove(&participant_id).is_some());
+        registry.insert(cfg(participant_id, room_id("r5")), &mut rng);
+        let replacement_handle = registry.handle(&participant_id).unwrap();
+
+        assert_ne!(removed_handle, replacement_handle);
+        assert!(registry.resolve_mut(removed_handle).is_none());
+        assert!(registry.resolve_mut(replacement_handle).is_some());
     }
 
     #[test]
