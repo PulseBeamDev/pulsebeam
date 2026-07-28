@@ -150,27 +150,19 @@ impl UpstreamTrackLayer {
     /// Apply a (track-wide) Video Layers Allocation to this layer using its
     /// learned stream index: the sender's declared target bitrate, resolution,
     /// and active/inactive state.
-    fn apply_vla(&self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
+    fn apply_vla(&mut self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
         let Some(idx) = self.vla_index.map(usize::from) else {
             return;
         };
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
-        let active = target_bps > 0;
-        debug_assert_eq!(active, vla_stream_target_bps(vla, idx).is_some());
-        let state = self.monitor.shared_state();
-        let first_declaration = state.declared_target_bps() == 0.0 && target_bps > 0;
-        state.set_declared_target_bps(target_bps);
-        // Resolution is optional in VLA; only override the height guess when present.
-        if let Some(height) = vla_stream_height_px(vla, idx) {
-            state.set_declared_height(height as u32);
-        }
-        state.set_vla_inactive(!active);
+        let height = vla_stream_height_px(vla, idx).map(u32::from);
+        let first_declaration = self.monitor.apply_vla(target_bps, height);
         if first_declaration {
             tracing::info!(
                 mid = %self.mid,
                 rid = ?self.rid,
                 target_kbps = target_bps / 1000,
-                height = state.declared_height(),
+                height = self.monitor.shared_state().height(),
                 "VLA: sender declared layer target bitrate; allocating on it"
             );
         }
@@ -241,7 +233,7 @@ impl UpstreamTrack {
             .user_values
             .get::<str0m::rtp::vla::VideoLayersAllocation>()
         {
-            for layer in &self.layers {
+            for layer in &mut self.layers {
                 layer.apply_vla(vla);
             }
         }
@@ -423,7 +415,12 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
             (Some(_), _) => (150_000, LayerQuality::Low),
         };
 
-        let stream_state = StreamState::new(true, bitrate);
+        let fallback_height = match quality {
+            LayerQuality::Low => 180,
+            LayerQuality::Medium => 360,
+            LayerQuality::High => 720,
+        };
+        let stream_state = StreamState::new_with_height(true, bitrate, fallback_height);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());
 

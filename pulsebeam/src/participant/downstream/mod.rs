@@ -73,7 +73,9 @@ impl BweFilter {
             return;
         };
 
+        debug_assert!(now >= last_update);
         let elapsed = now.saturating_duration_since(last_update);
+        self.last_update = Some(now);
         let raw = raw.as_f64();
         if raw >= self.filtered_bps {
             let alpha = (-elapsed.as_secs_f64() / BWE_RISE_TIME_CONSTANT.as_secs_f64()).exp();
@@ -269,5 +271,78 @@ impl DownstreamAllocator {
 
     pub fn handle_keyframe_request(&mut self, req: KeyframeRequest) -> Option<&TrackLayer> {
         self.video.handle_keyframe_request(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {
+        let alpha = (-elapsed.as_secs_f64() / time_constant.as_secs_f64()).exp();
+        target + (initial - target) * alpha
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 2.0,
+            "actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn bwe_filter_rise_uses_each_update_interval_once() {
+        let start = Instant::now();
+        let initial = 300_000.0;
+        let target = 1_300_000.0;
+        let mut filter = BweFilter::new(Bitrate::from(initial as u64));
+
+        filter.update(start, Bitrate::from(initial as u64));
+        filter.update(
+            start + Duration::from_millis(100),
+            Bitrate::from(target as u64),
+        );
+        filter.update(
+            start + Duration::from_millis(200),
+            Bitrate::from(target as u64),
+        );
+
+        assert_close(
+            filter.current().as_f64(),
+            expected(
+                initial,
+                target,
+                Duration::from_millis(200),
+                BWE_RISE_TIME_CONSTANT,
+            ),
+        );
+    }
+
+    #[test]
+    fn bwe_filter_fall_uses_each_update_interval_once() {
+        let start = Instant::now();
+        let initial = 2_000_000.0;
+        let target = 300_000.0;
+        let mut filter = BweFilter::new(Bitrate::from(initial as u64));
+
+        filter.update(start, Bitrate::from(initial as u64));
+        filter.update(
+            start + Duration::from_millis(100),
+            Bitrate::from(target as u64),
+        );
+        filter.update(
+            start + Duration::from_millis(200),
+            Bitrate::from(target as u64),
+        );
+
+        assert_close(
+            filter.current().as_f64(),
+            expected(
+                initial,
+                target,
+                Duration::from_millis(200),
+                BWE_FALL_TIME_CONSTANT,
+            ),
+        );
     }
 }

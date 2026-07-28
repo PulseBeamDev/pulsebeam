@@ -292,8 +292,13 @@ impl VideoAllocator {
 
         views.sort_by(AllocationEngine::priority_order);
 
-        let desired_raw = AllocationEngine::desired_bitrate(&views);
         let decisions = AllocationEngine::compute(available_bandwidth, &views);
+        let desired_raw = AllocationEngine::desired_bitrate(&views);
+        let used = AllocationEngine::used_bitrate(&decisions);
+        debug_assert!(
+            desired_raw >= used,
+            "raw desired bitrate {desired_raw} is below allocated bitrate {used}"
+        );
         let desired = self.desired_ctrl.update(desired_raw);
 
         let mut changed = false;
@@ -823,15 +828,9 @@ impl AllocationEngine {
     /// from Video Layers Allocation when available, otherwise a per-quality
     /// fallback for senders that don't advertise resolution.
     fn height(layer: &TrackLayer) -> u32 {
-        let declared = layer.state.declared_height();
-        if declared > 0 {
-            return declared;
-        }
-        match layer.quality {
-            LayerQuality::Low => 180,
-            LayerQuality::Medium => 360,
-            LayerQuality::High => 720,
-        }
+        let height = layer.state.height();
+        debug_assert_ne!(height, 0);
+        height
     }
 
     /// Shortest declared/fallback height among a track's layers. A layer at
@@ -937,7 +936,8 @@ impl AllocationEngine {
             .layers
             .iter()
             .filter(|layer| Self::eligible(slot, layer))
-            .max_by_key(|layer| layer.quality)
+            .max_by(|a, b| Self::cost(a).total_cmp(&Self::cost(b)))
+            .or_else(|| Self::closest_healthy(slot))
     }
 
     /// Aggregate bitrate the SFU would like BWE to grant next: simply the sum
@@ -950,6 +950,17 @@ impl AllocationEngine {
             .filter_map(Self::best_healthy)
             .map(Self::cost)
             .sum();
+        Bitrate::from(total as u64)
+    }
+
+    fn used_bitrate(decisions: &SecondaryMap<SlotKey, AllocationDecision<'_>>) -> Bitrate {
+        let total = decisions
+            .values()
+            .filter_map(|decision| match decision {
+                AllocationDecision::Forward(_, bitrate) => Some(bitrate.as_f64()),
+                AllocationDecision::Pause(_, _) => None,
+            })
+            .sum::<f64>();
         Bitrate::from(total as u64)
     }
 
@@ -2025,7 +2036,7 @@ mod allocation_tests {
             .unwrap()
             .state
             .update_for_test()
-            .declared_height(180);
+            .height(180);
 
         // Client caps at 200p. The hard-coded fallback rates High at 720p and
         // would forbid it, but the declared 180p must be allowed.
@@ -2050,7 +2061,7 @@ mod allocation_tests {
                 .unwrap()
                 .state
                 .update_for_test()
-                .declared_height(1080);
+                .height(1080);
         }
 
         // Client caps at 480p, below the shared 1080p every tier declares.
@@ -2336,6 +2347,92 @@ mod allocation_tests {
             desired.as_f64(),
             expected_total
         );
+    }
+
+    #[test]
+    fn desired_bitrate_covers_all_forwarded_layers() {
+        let t = healthy_track();
+        let slots = vec![
+            slot("a", 1080, &t, LayerQuality::Low),
+            slot("b", 180, &t, LayerQuality::Low),
+        ];
+        let decisions = AllocationEngine::compute(bw(100_000), &slots);
+
+        assert!(
+            AllocationEngine::desired_bitrate(&slots) >= AllocationEngine::used_bitrate(&decisions)
+        );
+    }
+
+    #[test]
+    fn desired_bitrate_includes_healthy_fallback_above_height_cap() {
+        let t = healthy_track();
+        t.by_quality(LayerQuality::Low)
+            .unwrap()
+            .state
+            .update_for_test()
+            .inactive(true);
+        let slots = vec![slot("a", 180, &t, LayerQuality::Medium)];
+
+        assert_eq!(
+            AllocationEngine::desired_bitrate(&slots).as_f64(),
+            layer_bps(&t, LayerQuality::Medium)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn desired_bitrate_is_exact_and_covers_usage(
+            high_bps in 1u64..=2_000_000,
+            medium_bps in 1u64..=2_000_000,
+            low_bps in 1u64..=2_000_000,
+            high_healthy in any::<bool>(),
+            medium_healthy in any::<bool>(),
+            low_healthy in any::<bool>(),
+            height_index in 0usize..3,
+            slot_count in 1usize..=5,
+            available_bps in 0u64..=10_000_000,
+        ) {
+            let t = healthy_track();
+            let cases = [
+                (LayerQuality::High, high_bps, high_healthy, 720u32),
+                (LayerQuality::Medium, medium_bps, medium_healthy, 360u32),
+                (LayerQuality::Low, low_bps, low_healthy, 180u32),
+            ];
+            for &(quality, bitrate, healthy, _) in &cases {
+                t.by_quality(quality)
+                    .unwrap()
+                    .state
+                    .update_for_test()
+                    .bitrate(bitrate)
+                    .inactive(!healthy);
+            }
+
+            let max_height = [180, 360, 720][height_index];
+            let mids: Vec<String> = (0..slot_count).map(|i| format!("d{i}")).collect();
+            let slots: Vec<_> = mids
+                .iter()
+                .map(|mid| slot(mid, max_height, &t, LayerQuality::Low))
+                .collect();
+
+            let spatial_max = cases
+                .iter()
+                .filter(|(_, _, healthy, height)| *healthy && *height <= max_height)
+                .map(|(_, bitrate, _, _)| *bitrate)
+                .max();
+            let fallback = cases
+                .iter()
+                .filter(|(_, _, healthy, _)| *healthy)
+                .min_by_key(|(quality, _, _, _)| *quality)
+                .map(|(_, bitrate, _, _)| *bitrate);
+            let expected_per_slot = spatial_max.or(fallback).unwrap_or(0);
+            let expected = expected_per_slot * slot_count as u64;
+            let desired = AllocationEngine::desired_bitrate(&slots);
+
+            prop_assert_eq!(desired.as_f64(), expected as f64);
+
+            let decisions = AllocationEngine::compute(Bitrate::from(available_bps), &slots);
+            prop_assert!(desired >= AllocationEngine::used_bitrate(&decisions));
+        }
     }
 
     // ─── Property: downgrade hysteresis absorbs small bandwidth noise ────────────

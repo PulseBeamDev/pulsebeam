@@ -1,5 +1,7 @@
 use pulsebeam_runtime::sync::Arc;
-use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use pulsebeam_runtime::sync::atomic::AtomicU8;
+use pulsebeam_runtime::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::ops::Deref;
 use std::time::Duration;
 use str0m::bwe::Bitrate;
@@ -93,7 +95,15 @@ pub struct StreamState(Arc<StreamStateInner>);
 
 impl StreamState {
     pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
-        Self(Arc::new(StreamStateInner::new(inactive, bitrate_bps)))
+        Self::new_with_height(inactive, bitrate_bps, 0)
+    }
+
+    pub fn new_with_height(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
+        Self(Arc::new(StreamStateInner::new(
+            inactive,
+            bitrate_bps,
+            height,
+        )))
     }
 
     #[cfg(test)]
@@ -119,62 +129,27 @@ impl AsRef<StreamStateInner> for StreamState {
 #[derive(Debug)]
 pub struct StreamStateInner {
     inactive: AtomicBool,
-    // Kept separate from the rolling ingress measurement: an inactive
-    // encoding has no current rate, but reactivating it still costs its
-    // nominal rate plus a keyframe.
-    nominal_bitrate_bps: u64,
+    healthy: AtomicBool,
     bitrate_bps: AtomicU64,
-    // Sender-declared target bitrate for this layer, from the Video Layers
-    // Allocation RTP header extension. `0` means "not declared". Read by
-    // StreamMonitor::poll to feed the RateFilter as the raw upstream target.
-    declared_target_bps: AtomicU64,
-    // Sender-declared frame height (px) for this layer, also from Video Layers
-    // Allocation. `0` means "not declared" — spatial gating then falls back to
-    // a per-quality height guess.
-    declared_height: AtomicU32,
-    // Whether the sender has declared this layer inactive in its Video Layers
-    // Allocation. Lets the SFU drop a stopped layer immediately instead of
-    // waiting out the packet-timeout. Defaults false (not declared inactive).
-    vla_inactive: AtomicBool,
-    // Raw (unfiltered) upstream target — for BWE probing demand signaling.
-    // Never used for admission/cost accounting; that uses `bitrate_bps`.
-    demand_bitrate_bps: AtomicU64,
+    height: AtomicU32,
+    #[cfg(test)]
     quality: AtomicU8,
-
-    audio_envelope_bits: AtomicU32,
-    silence_duration_ms: AtomicU64,
-    normalized_volume_bits: AtomicU32,
 }
 
 impl StreamStateInner {
-    pub fn new(inactive: bool, bitrate_bps: u64) -> Self {
+    pub fn new(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
         Self {
             inactive: AtomicBool::new(inactive),
-            nominal_bitrate_bps: bitrate_bps,
+            healthy: AtomicBool::new(!inactive),
             bitrate_bps: AtomicU64::new(bitrate_bps),
-            declared_target_bps: AtomicU64::new(0),
-            declared_height: AtomicU32::new(0),
-            vla_inactive: AtomicBool::new(false),
-            demand_bitrate_bps: AtomicU64::new(bitrate_bps),
+            height: AtomicU32::new(height),
+            #[cfg(test)]
             quality: AtomicU8::new(StreamQuality::Good as u8),
-            audio_envelope_bits: AtomicU32::new(0.0f32.to_bits()),
-            silence_duration_ms: AtomicU64::new(0),
-            normalized_volume_bits: AtomicU32::new(0.0f32.to_bits()),
         }
     }
 
     pub fn is_healthy(&self) -> bool {
-        !self.is_inactive() && self.quality() != StreamQuality::Bad
-    }
-
-    /// Whether an encoding may be targeted by a keyframe-gated switch.
-    ///
-    /// Inactive isn't evidence of loss — publishers commonly pause an
-    /// encoding until requested, so a known-good paused encoding stays
-    /// eligible for one-PLI reactivation. Only sustained real loss (`Bad`)
-    /// makes it ineligible.
-    pub fn is_activation_candidate(&self) -> bool {
-        self.quality() != StreamQuality::Bad
+        self.healthy.load(Ordering::Relaxed)
     }
 
     pub fn is_inactive(&self) -> bool {
@@ -185,68 +160,22 @@ impl StreamStateInner {
         self.bitrate_bps.load(Ordering::Relaxed) as f64
     }
 
-    pub fn declared_target_bps(&self) -> f64 {
-        self.declared_target_bps.load(Ordering::Relaxed) as f64
+    pub fn height(&self) -> u32 {
+        self.height.load(Ordering::Relaxed)
     }
 
-    pub fn set_declared_target_bps(&self, bps: u64) {
-        self.declared_target_bps.store(bps, Ordering::Relaxed);
-    }
-
-    /// Sender-declared frame height (px) from Video Layers Allocation, or `0`
-    /// if the sender hasn't declared one. See `declared_height`.
-    pub fn declared_height(&self) -> u32 {
-        self.declared_height.load(Ordering::Relaxed)
-    }
-
-    pub fn set_declared_height(&self, px: u32) {
-        self.declared_height.store(px, Ordering::Relaxed);
-    }
-
-    /// Whether the sender declared this layer inactive via Video Layers Allocation.
-    pub fn is_vla_inactive(&self) -> bool {
-        self.vla_inactive.load(Ordering::Relaxed)
-    }
-
-    pub fn set_vla_inactive(&self, inactive: bool) {
-        self.vla_inactive.store(inactive, Ordering::Relaxed);
-        if inactive {
-            self.inactive.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Fast-reacting bandwidth *demand* signal — for asking str0m to probe
-    /// for more headroom, never for admission/cost accounting (that's
-    /// `bitrate_bps`, deliberately more conservative). See
-    /// `BitrateEstimate::demand_bps`.
-    pub fn demand_bitrate_bps(&self) -> f64 {
-        self.demand_bitrate_bps.load(Ordering::Relaxed) as f64
-    }
-
-    /// Configured bitrate envelope for this encoding, independent of whether
-    /// it is currently producing packets.
-    pub fn nominal_bitrate_bps(&self) -> f64 {
-        self.nominal_bitrate_bps as f64
-    }
-
-    pub fn audio_envelope(&self) -> f32 {
-        f32::from_bits(self.audio_envelope_bits.load(Ordering::Relaxed))
-    }
-
-    pub fn silence_duration(&self) -> Duration {
-        Duration::from_millis(self.silence_duration_ms.load(Ordering::Relaxed))
-    }
-
-    pub fn normalized_volume(&self) -> f32 {
-        f32::from_bits(self.normalized_volume_bits.load(Ordering::Relaxed))
-    }
-
+    #[cfg(test)]
     pub fn quality(&self) -> StreamQuality {
         match self.quality.load(Ordering::Relaxed) {
             0 => StreamQuality::Bad,
             2 => StreamQuality::Excellent,
             _ => StreamQuality::Good,
         }
+    }
+
+    #[cfg(test)]
+    pub fn is_activation_candidate(&self) -> bool {
+        self.quality() != StreamQuality::Bad
     }
 }
 
@@ -261,24 +190,21 @@ impl<'a> StreamStateUpdater<'a> {
         self.state.bitrate_bps.store(bps, Ordering::Relaxed);
         self
     }
-    pub fn declared_target(self, bps: u64) -> Self {
-        self.state.declared_target_bps.store(bps, Ordering::Relaxed);
-        self
-    }
-    pub fn declared_height(self, px: u32) -> Self {
-        self.state.declared_height.store(px, Ordering::Relaxed);
-        self
-    }
-    pub fn demand_bitrate(self, bps: u64) -> Self {
-        self.state.demand_bitrate_bps.store(bps, Ordering::Relaxed);
+    pub fn height(self, height: u32) -> Self {
+        self.state.height.store(height, Ordering::Relaxed);
         self
     }
     pub fn quality(self, q: StreamQuality) -> Self {
+        self.state.healthy.store(
+            q != StreamQuality::Bad && !self.state.inactive.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.state.quality.store(q as u8, Ordering::Relaxed);
         self
     }
     pub fn inactive(self, val: bool) -> Self {
         self.state.inactive.store(val, Ordering::Relaxed);
+        self.state.healthy.store(!val, Ordering::Relaxed);
         self
     }
 }
@@ -287,6 +213,8 @@ impl<'a> StreamStateUpdater<'a> {
 pub struct StreamMonitor {
     shared_state: StreamState,
     nominal_bitrate_bps: u64,
+    declared_target_bps: u64,
+    vla_inactive: bool,
 
     stream_id: String,
     kind: TrackKind, // distinguish Audio/Video for scoring
@@ -324,6 +252,7 @@ impl StreamMonitor {
             TrackKind::Audio => StreamQuality::Excellent,
             TrackKind::Video | TrackKind::Data => StreamQuality::Good,
         };
+        #[cfg(test)]
         shared_state
             .quality
             .store(current_quality as u8, Ordering::Relaxed);
@@ -332,6 +261,8 @@ impl StreamMonitor {
             kind,
             shared_state,
             nominal_bitrate_bps,
+            declared_target_bps: 0,
+            vla_inactive: false,
             last_packet_at: now,
             window_start_ts: now,
             window_start_seq: 0,
@@ -350,10 +281,11 @@ impl StreamMonitor {
 
     pub fn process_packet(&mut self, packet: &RtpPacket) {
         let was_inactive = self.shared_state.is_inactive();
-        let may_activate = !self.shared_state.is_vla_inactive();
+        let may_activate = !self.vla_inactive;
         self.last_packet_at = packet.arrival_ts;
         if may_activate {
             self.shared_state.inactive.store(false, Ordering::Relaxed);
+            self.publish_health();
         }
         self.bwe.record(packet);
 
@@ -388,16 +320,42 @@ impl StreamMonitor {
         &self.shared_state
     }
 
+    fn publish_health(&self) {
+        let healthy =
+            !self.shared_state.is_inactive() && self.current_quality != StreamQuality::Bad;
+        self.shared_state.healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    fn publish_inactive(&self) {
+        self.shared_state.inactive.store(true, Ordering::Relaxed);
+        self.shared_state.healthy.store(false, Ordering::Relaxed);
+        self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
+        debug_assert!(self.shared_state.is_inactive());
+        debug_assert!(!self.shared_state.is_healthy());
+        debug_assert_eq!(self.shared_state.bitrate_bps(), 0.0);
+    }
+
+    pub fn apply_vla(&mut self, target_bps: u64, height: Option<u32>) -> bool {
+        let first_declaration = self.declared_target_bps == 0 && target_bps > 0;
+        self.declared_target_bps = target_bps;
+        self.vla_inactive = target_bps == 0;
+        if let Some(height) = height {
+            debug_assert_ne!(height, 0);
+            self.shared_state.height.store(height, Ordering::Relaxed);
+        }
+        if self.vla_inactive {
+            self.publish_inactive();
+        }
+        first_declaration
+    }
+
     pub fn poll(&mut self, now: Instant, is_any_sibling_active: bool) {
         self.bwe.poll(now);
         // Unified raw target: prefer the VLA-declared target (set by apply_vla in
         // track.rs) because it reflects the encoder's committed rate and is therefore
         // more stable than instantaneous byte measurements. Fall back to the measured
         // tick rate when no VLA is present.
-        let declared = self
-            .shared_state
-            .declared_target_bps
-            .load(Ordering::Relaxed);
+        let declared = self.declared_target_bps;
         let raw_bps = if declared > 0 {
             declared as f64
         } else {
@@ -414,25 +372,8 @@ impl StreamMonitor {
         self.shared_state
             .bitrate_bps
             .store(smooth_bps, Ordering::Relaxed);
-        // demand stays reactive for BWE probing — use the raw (unfiltered) value
-        self.shared_state
-            .demand_bitrate_bps
-            .store(raw_with_floor as u64, Ordering::Relaxed);
-
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
-            let audio_metrics = audio_monitor.get_metrics(now);
-            self.shared_state.audio_envelope_bits.store(
-                audio_metrics.speech_intensity_envelope.to_bits(),
-                Ordering::Relaxed,
-            );
-            self.shared_state
-                .normalized_volume_bits
-                .store(audio_metrics.normalized_volume.to_bits(), Ordering::Relaxed);
-            self.shared_state.silence_duration_ms.store(
-                audio_metrics.silence_duration.as_millis() as u64,
-                Ordering::Relaxed,
-            );
         }
 
         // Step A: Inactivity & Flap Prevention
@@ -443,20 +384,16 @@ impl StreamMonitor {
         // which lets us deactivate it at once instead of waiting out the packet
         // timeout. Unlike the timeout path this doesn't require a live sibling —
         // an explicit "off" from the sender is authoritative even for a solo layer.
-        let vla_active = self
-            .shared_state
-            .declared_target_bps
-            .load(Ordering::Relaxed)
-            > 0;
+        let vla_active = self.declared_target_bps > 0;
         let pause_timeout = if vla_active {
             SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA
         } else {
             SIMULCAST_LAYER_PAUSE_TIMEOUT
         };
         let timed_out = time_since_last_packet > pause_timeout && is_any_sibling_active;
-        if timed_out || self.shared_state.is_vla_inactive() {
+        if timed_out || self.vla_inactive {
+            self.publish_inactive();
             if !was_inactive {
-                self.shared_state.inactive.store(true, Ordering::Relaxed);
                 tracing::debug!(
                     stream_id = %self.stream_id,
                     "Simulcast layer paused while siblings active; retaining its last loss classification for keyframe-gated reactivation"
@@ -465,16 +402,6 @@ impl StreamMonitor {
                 self.quality_transition_target = None;
                 self.quality_transition_last_evidence = None;
                 self.cost_filter.reset();
-                self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
-                self.shared_state
-                    .demand_bitrate_bps
-                    .store(0, Ordering::Relaxed);
-                self.shared_state
-                    .declared_target_bps
-                    .store(0, Ordering::Relaxed);
-                self.shared_state
-                    .declared_height
-                    .store(0, Ordering::Relaxed);
             }
             return;
         }
@@ -485,7 +412,7 @@ impl StreamMonitor {
             STREAM_DEAD_TIMEOUT
         };
         if time_since_last_packet > dead_timeout {
-            self.shared_state.inactive.store(true, Ordering::Relaxed);
+            self.publish_inactive();
             if !was_inactive {
                 self.reset(now);
             }
@@ -493,6 +420,7 @@ impl StreamMonitor {
         }
 
         self.shared_state.inactive.store(false, Ordering::Relaxed);
+        self.publish_health();
 
         // Resuming from any form of inactivity: reset the measurement window so that
         // stale seq numbers don't produce a phantom loss spike on the first window.
@@ -635,15 +563,17 @@ impl StreamMonitor {
                 interval_loss * 100.0,
                 expected,
                 actual,
-                Bitrate::from(self.bwe.tick_bps() as u64),
+                Bitrate::from(self.nominal_bitrate_bps),
             );
             self.current_quality = new_quality;
             self.quality_transition_since = None;
             self.quality_transition_target = None;
             self.quality_transition_last_evidence = None;
+            #[cfg(test)]
             self.shared_state
                 .quality
                 .store(new_quality as u8, Ordering::Relaxed);
+            self.publish_health();
         }
     }
 
@@ -667,23 +597,13 @@ impl StreamMonitor {
             TrackKind::Audio => StreamQuality::Excellent,
             TrackKind::Video | TrackKind::Data => StreamQuality::Good,
         };
+        #[cfg(test)]
         self.shared_state
             .quality
             .store(self.current_quality as u8, Ordering::Relaxed);
-
-        self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
-        self.shared_state
-            .demand_bitrate_bps
-            .store(0, Ordering::Relaxed);
-        self.shared_state
-            .declared_target_bps
-            .store(0, Ordering::Relaxed);
-        self.shared_state
-            .declared_height
-            .store(0, Ordering::Relaxed);
-        self.shared_state
-            .vla_inactive
-            .store(false, Ordering::Relaxed);
+        self.declared_target_bps = 0;
+        self.vla_inactive = false;
+        self.publish_inactive();
     }
 }
 
@@ -930,7 +850,7 @@ mod test {
         // The sender declares this layer inactive via VLA. It deactivates on the
         // next poll even though the packet is recent and there's no sibling — no
         // 1s timeout wait.
-        shared.set_vla_inactive(true);
+        monitor.apply_vla(0, None);
         assert!(shared.is_inactive());
         monitor.poll(now + Duration::from_millis(50), false);
         assert!(
@@ -939,7 +859,7 @@ mod test {
         );
 
         // Sender re-activates it; fresh packets bring it back.
-        shared.set_vla_inactive(false);
+        monitor.apply_vla(400_000, None);
         monitor.process_packet(&packet(2, now + Duration::from_millis(60)));
         monitor.poll(now + Duration::from_millis(70), false);
         assert!(
@@ -954,17 +874,31 @@ mod test {
         let mut monitor = StreamMonitor::new(TrackKind::Video, "q".into(), shared.clone());
         let now = Instant::now();
 
-        shared.set_vla_inactive(true);
+        monitor.apply_vla(0, None);
         monitor.process_packet(&packet(1, now));
 
         assert!(shared.is_inactive());
         assert!(!shared.is_healthy());
 
-        shared.set_vla_inactive(false);
+        monitor.apply_vla(400_000, None);
         monitor.process_packet(&packet(2, now + Duration::from_millis(10)));
 
         assert!(!shared.is_inactive());
         assert!(shared.is_healthy());
+    }
+
+    #[test]
+    fn height_is_always_resolved_to_fallback_or_vla_value() {
+        let shared = StreamState::new_with_height(true, 400_000, 360);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "h".into(), shared.clone());
+
+        assert_eq!(shared.height(), 360);
+
+        monitor.apply_vla(400_000, None);
+        assert_eq!(shared.height(), 360);
+
+        monitor.apply_vla(400_000, Some(1056));
+        assert_eq!(shared.height(), 1056);
     }
 
     #[test]
@@ -1412,7 +1346,7 @@ mod test {
         monitor.poll(now + BitrateEstimate::TICK, false);
 
         // Now inject a VLA-declared target of 1 Mbit/s.
-        shared.set_declared_target_bps(1_000_000);
+        monitor.apply_vla(1_000_000, None);
         monitor.poll(now + BitrateEstimate::TICK * 2, false);
 
         // bitrate_bps should now be influenced by the VLA target (rising toward 1M).
@@ -1421,8 +1355,6 @@ mod test {
             400_000.0,
             "after 1 rise-tau with VLA=1M, bitrate_bps should have risen substantially"
         );
-        // demand_bitrate_bps should be the raw VLA value (no filter).
-        assert_ge!(shared.demand_bitrate_bps(), 1_000_000.0);
     }
 
     #[test]
@@ -1433,7 +1365,7 @@ mod test {
         let now = Instant::now();
 
         monitor.process_packet(&packet(1, now));
-        shared.set_declared_target_bps(875_000);
+        monitor.apply_vla(875_000, None);
 
         // >1 s of silence with an active sibling — old 1 s timeout would fire.
         monitor.poll(now + Duration::from_millis(1500), true);
