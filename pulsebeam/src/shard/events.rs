@@ -8,12 +8,16 @@ use crate::participant::event::ParticipantSink;
 use crate::rtp::RtpPacket;
 use crate::track::{GlobalKeyframeRequest, StreamId, Topic, Track, TrackLayer, TrackMeta};
 
-pub struct RtpEvent {
+pub struct AudioRtpEvent {
     pub stream_id: StreamId,
     pub pkt: RtpPacket,
     pub room_id: RoomId,
-    /// The participant that published this packet (used to skip self-forwarding on audio fanout).
     pub origin: ParticipantId,
+}
+
+pub struct VideoRtpEvent {
+    pub stream_id: StreamId,
+    pub pkt: RtpPacket,
 }
 
 pub struct SctpEvent {
@@ -85,8 +89,8 @@ pub enum ParticipantControlEvent {
 
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
-    audio_queue: VecDeque<RtpEvent>,
-    video_queue: VecDeque<RtpEvent>,
+    audio_queue: VecDeque<AudioRtpEvent>,
+    video_queue: VecDeque<VideoRtpEvent>,
     data_queue: VecDeque<SctpEvent>,
     shard_events: VecDeque<ShardEvent>,
 }
@@ -114,11 +118,11 @@ impl EventPipeline {
         self.participant_events.pop_front()
     }
 
-    pub fn pop_audio_rtp(&mut self) -> Option<RtpEvent> {
+    pub fn pop_audio_rtp(&mut self) -> Option<AudioRtpEvent> {
         self.audio_queue.pop_front()
     }
 
-    pub fn pop_video_rtp(&mut self) -> Option<RtpEvent> {
+    pub fn pop_video_rtp(&mut self) -> Option<VideoRtpEvent> {
         self.video_queue.pop_front()
     }
 
@@ -284,16 +288,17 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
 
     #[inline]
     fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket) {
-        let event = RtpEvent {
-            stream_id,
-            pkt,
-            room_id: self.room_id,
-            origin: self.id,
-        };
-
         match stream_id.0.kind() {
-            TrackKind::Audio => self.pipeline.audio_queue.push_back(event),
-            TrackKind::Video => self.pipeline.video_queue.push_back(event),
+            TrackKind::Audio => self.pipeline.audio_queue.push_back(AudioRtpEvent {
+                stream_id,
+                pkt,
+                room_id: self.room_id,
+                origin: self.id,
+            }),
+            TrackKind::Video => self
+                .pipeline
+                .video_queue
+                .push_back(VideoRtpEvent { stream_id, pkt }),
             TrackKind::Data => {}
         }
     }

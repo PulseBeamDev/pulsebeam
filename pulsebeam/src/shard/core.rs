@@ -4,8 +4,8 @@ use pulsebeam_runtime::rand::Rng;
 use tokio::time::Instant;
 
 use super::events::{
-    ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent, ParticipantTimerEvent,
-    RtpEvent,
+    AudioRtpEvent, ParticipantControlEvent, ParticipantEvent, ParticipantLifecycleEvent,
+    ParticipantTimerEvent,
 };
 use crate::id::AudioSelectorSlotId;
 use crate::{
@@ -52,7 +52,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_rtp(stream_id, pkt);
-            self.dirty.mark(subscriber);
+            self.dirty.mark(subscriber, p);
         }
     }
 
@@ -64,7 +64,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_audio_rtp(slot_idx, pkt);
-            self.dirty.mark(subscriber);
+            self.dirty.mark(subscriber, p);
         }
     }
 
@@ -77,7 +77,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_sctp(topic, origin, pkt);
-            self.dirty.mark(subscriber);
+            self.dirty.mark(subscriber, p);
         }
     }
 
@@ -88,7 +88,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&participant_id) {
             p.on_tracks_published(tracks);
-            self.dirty.mark(participant_id);
+            self.dirty.mark(participant_id, p);
         }
     }
 
@@ -102,7 +102,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         };
 
         if p.on_tracks_unpublished(track_ids) {
-            self.dirty.mark(participant_id);
+            self.dirty.mark(participant_id, p);
         }
     }
 
@@ -114,7 +114,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&participant_id) {
             p.handle_remote_keyframe_request(stream_id, kind);
-            self.dirty.mark(participant_id);
+            self.dirty.mark(participant_id, p);
         }
     }
 
@@ -129,14 +129,13 @@ pub(crate) struct ShardCore {
     pub(super) routing: ShardRoutingTable,
     timers: TimerWheel<ParticipantId>,
     dirty: DirtyTracker,
-    dirty_participants: Vec<ParticipantId>,
     gso_buffers: Vec<GsoBuffer>,
     pipeline: EventPipeline,
     rng: Rng,
 }
 
 impl ShardCore {
-    pub(crate) fn new(shard_id: impl Into<ShardId>, max_gso_segments: usize, mut rng: Rng) -> Self {
+    pub(crate) fn new(shard_id: impl Into<ShardId>, max_gso_segments: usize, rng: Rng) -> Self {
         let shard_id = shard_id.into();
         let gso_buffers = (0..net::BATCH_SIZE)
             .map(|_| GsoBuffer::preallocated())
@@ -146,8 +145,7 @@ impl ShardCore {
             registry: ParticipantRegistry::new(shard_id, max_gso_segments),
             routing: ShardRoutingTable::new(),
             timers: TimerWheel::new(MAX_PARTICIPANTS_PER_SHARD),
-            dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD, &mut rng),
-            dirty_participants: Vec::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
+            dirty: DirtyTracker::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             gso_buffers,
             pipeline: EventPipeline::with_capacity(MAX_PARTICIPANTS_PER_SHARD),
             rng,
@@ -164,7 +162,7 @@ impl ShardCore {
         self.timers.drain_expired(now, |participant_id| {
             if let Some(participant) = registry.get_mut(&participant_id) {
                 participant.on_timeout(now);
-                dirty.mark(participant_id);
+                dirty.mark(participant_id, participant);
             }
         });
     }
@@ -179,7 +177,7 @@ impl ShardCore {
         };
         if let Some(participant) = self.registry.get_mut(&participant_id) {
             participant.on_ingress(batch);
-            self.dirty.mark(participant_id);
+            self.dirty.mark(participant_id, participant);
         } else if let Some(shard_id) = self.routing.remote_shard_for(&participant_id) {
             router.send(
                 shard_id,
@@ -188,22 +186,6 @@ impl ShardCore {
                     batch,
                 },
             );
-        }
-    }
-
-    fn poll_participants(
-        now: Instant,
-        ids: &[ParticipantId],
-        registry: &mut ParticipantRegistry,
-        pipeline: &mut EventPipeline,
-    ) {
-        for &participant_id in ids {
-            let Some(participant) = registry.get_mut(&participant_id) else {
-                continue;
-            };
-            let room_id = participant.room_id;
-            let mut sink = pipeline.participant_sink(room_id, participant_id);
-            participant.poll(now, &mut sink);
         }
     }
 
@@ -248,7 +230,6 @@ impl ShardCore {
                 }) => {
                     self.remove_participant(&participant_id);
                     self.timers.cancel(&participant_id);
-                    self.dirty.clear(&participant_id);
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
@@ -329,26 +310,25 @@ impl ShardCore {
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
-        debug_assert!(self.dirty_participants.is_empty());
-        self.dirty.drain_into(&mut self.dirty_participants);
-        debug_assert!(self.dirty.is_empty());
-        Self::poll_participants(
-            now,
-            &self.dirty_participants,
-            &mut self.registry,
-            &mut self.pipeline,
-        );
-        debug_assert!(
-            self.dirty.is_empty(),
-            "participant polling must not dirty the next phase"
-        );
-
         debug_assert_eq!(self.gso_buffers.len(), net::BATCH_SIZE);
         let mut filled = 0;
-        for participant_id in &self.dirty_participants {
-            let Some(participant) = self.registry.get_mut(participant_id) else {
+        self.dirty.begin_phase();
+        while let Some(entry) = self.dirty.next() {
+            let Some(participant) = self.registry.get_mut(&entry.participant_id) else {
                 continue;
             };
+            if participant.generation != entry.generation {
+                continue;
+            }
+            debug_assert!(participant.queued_dirty);
+            debug_assert_eq!(participant.participant_id, entry.participant_id);
+            participant.queued_dirty = false;
+            let room_id = participant.room_id;
+            let mut sink = self
+                .pipeline
+                .participant_sink(room_id, entry.participant_id);
+            participant.poll(now, &mut sink);
+
             while participant
                 .udp_packets
                 .fill_next_gso(&mut self.gso_buffers[filled])
@@ -360,18 +340,13 @@ impl ShardCore {
                     filled = 0;
                 }
             }
+            participant.tcp_batcher.flush_tcp(tcp_socket);
         }
+        self.dirty.finish_phase();
+        debug_assert!(self.dirty.is_empty());
         if filled != 0 {
             Self::flush_gso_buffers(udp_socket, &mut self.gso_buffers, filled);
         }
-
-        for participant_id in self.dirty_participants.drain(..) {
-            if let Some(participant) = self.registry.get_mut(&participant_id) {
-                participant.tcp_batcher.flush_tcp(tcp_socket);
-            }
-        }
-        debug_assert!(self.dirty_participants.is_empty());
-        debug_assert!(self.dirty.is_empty());
     }
 
     #[inline]
@@ -552,7 +527,7 @@ impl ShardCore {
                 stream_id,
                 pkt,
             } => {
-                let ev = RtpEvent {
+                let ev = AudioRtpEvent {
                     stream_id,
                     pkt,
                     room_id,
@@ -571,7 +546,7 @@ impl ShardCore {
             } => {
                 if let Some(participant) = self.registry.get_mut(&participant_id) {
                     participant.on_ingress(batch);
-                    self.dirty.mark(participant_id);
+                    self.dirty.mark(participant_id, participant);
                 }
             }
             CrossShardEvent::KeyframeRequested(req) => {
@@ -607,7 +582,11 @@ impl ShardCore {
         let participant_id = self.registry.insert(cfg, &mut self.rng);
         self.routing
             .add_local_member(participant_id, room_id, &mut self.rng);
-        self.dirty.mark(participant_id);
+        let participant = self
+            .registry
+            .get_mut(&participant_id)
+            .expect("newly inserted participant must be present");
+        self.dirty.mark(participant_id, participant);
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
@@ -721,6 +700,18 @@ mod test {
         ShardCore::new(0, 1, pulsebeam_runtime::rand::seeded_rng(42))
     }
 
+    fn clear_dirty(core: &mut ShardCore) {
+        core.dirty.begin_phase();
+        while let Some(entry) = core.dirty.next() {
+            if let Some(participant) = core.registry.get_mut(&entry.participant_id)
+                && participant.generation == entry.generation
+            {
+                participant.queued_dirty = false;
+            }
+        }
+        core.dirty.finish_phase();
+    }
+
     #[test]
     fn add_participant_populates_registry_and_marks_dirty() {
         let router = TestRouter::new(0, 3);
@@ -761,6 +752,35 @@ mod test {
             !core.routing.rooms.contains_key(&r),
             "last member leaving must remove the room"
         );
+    }
+
+    #[test]
+    fn readding_dirty_participant_ignores_stale_generation() {
+        let router = TestRouter::new(0, 3);
+        let mut core = new_core();
+        let participant = pid();
+        let room = room_id("readd-dirty");
+
+        core.on_command(
+            ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
+            &router,
+        );
+        core.on_command(
+            ShardCommand::AddParticipant(make_participant_cfg(participant, room)),
+            &router,
+        );
+
+        let current_generation = core.registry.get(&participant).unwrap().generation;
+        core.dirty.begin_phase();
+        let stale = core.dirty.next().unwrap();
+        let current = core.dirty.next().unwrap();
+        assert!(core.dirty.next().is_none());
+        core.dirty.finish_phase();
+
+        assert_eq!(stale.participant_id, participant);
+        assert_ne!(stale.generation, current_generation);
+        assert_eq!(current.participant_id, participant);
+        assert_eq!(current.generation, current_generation);
     }
 
     #[test]
@@ -894,7 +914,7 @@ mod test {
             &router,
         );
         assert!(core.dirty.contains(&subscriber));
-        core.dirty.clear(&subscriber);
+        clear_dirty(&mut core);
         core.routing
             .register_subscriber(subscriber, video_track(publisher, 1));
 
@@ -920,7 +940,7 @@ mod test {
         let p = pid();
         let r = room_id("timer1");
         add_participant(&mut core, &router, p, r);
-        core.dirty.clear(&p);
+        clear_dirty(&mut core);
 
         core.fire_timers(tokio::time::Instant::now());
         assert!(!core.dirty.contains(&p));

@@ -5,7 +5,7 @@ use indexmap::IndexSet;
 use pulsebeam_runtime::rand;
 use str0m::media::KeyframeRequestKind;
 
-use super::events::{ParticipantControlEvent, ParticipantTopologyEvent, RtpEvent};
+use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
@@ -691,7 +691,7 @@ impl ShardRoutingTable {
     }
 
     #[inline]
-    pub fn route_audio(&mut self, mut ev: RtpEvent, ctx: &mut impl RoutingContext) {
+    pub fn route_audio(&mut self, mut ev: AudioRtpEvent, ctx: &mut impl RoutingContext) {
         tracing::trace!(
             target: crate::log::TARGET_AUDIO,
             room_id = %ev.room_id,

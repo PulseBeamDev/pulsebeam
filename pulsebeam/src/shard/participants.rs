@@ -15,6 +15,8 @@ use crate::{
 
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
+    pub(super) queued_dirty: bool,
+    pub(super) generation: u64,
 }
 
 impl Deref for ParticipantMeta {
@@ -34,6 +36,7 @@ pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
     participants: HashMap<ParticipantId, ParticipantMeta>,
+    next_generation: u64,
     demuxer: Demuxer,
     /// Addresses freed by a removal/unregister, waiting for the worker to
     /// actually close the sockets during the output phase.
@@ -46,6 +49,7 @@ impl ParticipantRegistry {
             shard_id,
             max_gso_segments,
             participants: HashMap::default(),
+            next_generation: 1,
             demuxer: Demuxer::new(shard_id.into()),
             pending_close: VecDeque::new(),
         }
@@ -53,6 +57,12 @@ impl ParticipantRegistry {
 
     pub fn insert(&mut self, cfg: ParticipantConfig, rng: &mut Rng) -> ParticipantId {
         let participant_id = cfg.participant_id;
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("participant generation exhausted");
+        debug_assert_ne!(generation, 0);
         let mut participant_rng = Rng::seed_from_u64(rng.next_u64());
         let core = ParticipantCore::new(
             cfg,
@@ -61,8 +71,14 @@ impl ParticipantRegistry {
             1,
             &mut participant_rng,
         );
-        self.participants
-            .insert(participant_id, ParticipantMeta { core });
+        self.participants.insert(
+            participant_id,
+            ParticipantMeta {
+                core,
+                queued_dirty: false,
+                generation,
+            },
+        );
         tracing::info!(%participant_id, "participant added to shard");
         participant_id
     }
