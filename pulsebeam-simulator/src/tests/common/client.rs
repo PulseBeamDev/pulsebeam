@@ -10,6 +10,7 @@ use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +82,7 @@ impl SimClientBuilder {
             subscribed_topics: HashMap::new(),
             remote_tracks: HashMap::new(),
             received_data: Vec::new(),
+            video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
         };
         Ok(SimClient {
             ctx,
@@ -89,9 +91,85 @@ impl SimClientBuilder {
     }
 }
 
+/// What the subscriber's depacketizer made of the stream the SFU sent it.
+///
+/// `contiguous` is str0m's own reassembly verdict: it is false whenever a frame
+/// was preceded by a sequence-number hole, which is exactly what a botched
+/// switch produces. `is_keyframe` lets a test assert that each switch actually
+/// delivered a decodable entry point.
+#[derive(Default, Debug, Clone)]
+pub struct VideoReceiveLog {
+    pub frames: u64,
+    pub keyframes: u64,
+    pub non_contiguous: u64,
+    /// Frames whose RTP timestamp had already been used by an earlier frame.
+    /// str0m re-emits a frame when a retransmission for it lands after it was
+    /// already delivered, so this is bounded by the NACK count rather than zero.
+    pub duplicate_ts_frames: u64,
+    /// Largest backwards jump in RTP time, in 90kHz ticks. Ordinary reordering
+    /// moves this by a frame or two; a broken switch moves it by far more.
+    pub max_ts_regression: u64,
+    /// Keyframes that arrived without the SPS/PPS describing them. The decoder
+    /// cannot render these: the SFU keeps one egress SSRC across switches while
+    /// every simulcast layer has its own SPS.
+    pub keyframes_missing_parameter_sets: u64,
+    pub bytes: u64,
+    last_ts: Option<u64>,
+    seen_ts: HashSet<u64>,
+}
+
+/// Scans an Annex-B frame for the H.264 NAL unit types it contains.
+fn annexb_nalu_types(data: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        let short = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+        let long = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+        if short || long {
+            let start = i + if short { 3 } else { 4 };
+            if let Some(&b) = data.get(start) {
+                types.push(b & 0x1F);
+            }
+            i = start + 1;
+        } else {
+            i += 1;
+        }
+    }
+    types
+}
+
+impl VideoReceiveLog {
+    fn record(&mut self, frame: &pulsebeam_agent::MediaFrame) {
+        self.frames += 1;
+        self.bytes += frame.data.len() as u64;
+        if frame.is_keyframe {
+            self.keyframes += 1;
+            let nalus = annexb_nalu_types(&frame.data);
+            if !nalus.contains(&7) || !nalus.contains(&8) {
+                self.keyframes_missing_parameter_sets += 1;
+            }
+        }
+        if !frame.contiguous {
+            self.non_contiguous += 1;
+        }
+        let ts = frame.ts.numer();
+        if !self.seen_ts.insert(ts) {
+            self.duplicate_ts_frames += 1;
+        }
+        if let Some(prev) = self.last_ts
+            && ts < prev
+        {
+            self.max_ts_regression = self.max_ts_regression.max(prev - ts);
+        }
+        self.last_ts = Some(ts);
+    }
+}
+
 pub struct ClientContext {
     pub ip: IpAddr,
     pub driver: AgentDriver,
+    /// Aggregated decode-side view of every remote video track.
+    pub video_rx: Arc<Mutex<VideoReceiveLog>>,
 
     /// Local track mids (as reported by LocalTrackAdded events).
     pub local_mids: HashSet<pulsebeam_agent::str0m::media::Mid>,
@@ -240,8 +318,14 @@ impl SimClient {
                                     self.ctx.discovered_tracks.insert(track.id.clone());
                                 }
                             }
-                            AgentEvent::RemoteTrackAdded(t) => {
+                            AgentEvent::RemoteTrackAdded(mut t) => {
                                 self.ctx.remote_tracks.insert(t.mid, t.track.id.clone());
+                                let log = self.ctx.video_rx.clone();
+                                self.join_set.spawn(async move {
+                                    while let Ok(frame) = t.recv().await {
+                                        log.lock().unwrap().record(&frame);
+                                    }
+                                });
                             }
                             AgentEvent::DataPublisherDeclared(publisher) => {
                                 self.ctx.published_topics.insert(publisher.topic.clone(), publisher);

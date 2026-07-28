@@ -137,6 +137,8 @@ impl H264Looper {
                 data: frame_data,
                 capture_time: tick_time,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
+                contiguous: true,
+                is_keyframe: false,
             };
 
             sender.send(frame).await;

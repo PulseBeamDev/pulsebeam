@@ -1,8 +1,16 @@
 pub mod cache;
+#[cfg(debug_assertions)]
+pub mod egress_guard;
+pub mod h264;
 pub mod monitor;
 pub mod switcher;
 pub mod sync;
 pub mod timeline;
+
+#[cfg(test)]
+pub mod conformance;
+#[cfg(test)]
+mod switch_test;
 
 use std::sync::Arc;
 use str0m::media::{Frequency, MediaTime};
@@ -51,7 +59,12 @@ pub struct RtpPacket {
     /// Since all streams in this process share the same monotonic clock, this time can
     /// be compared directly between unrelated streams for scheduling or synchronization.
     pub playout_time: Instant,
+    /// Whether this packet begins a frame that can be decoded without any
+    /// preceding frame (an H.264 IDR, or any Opus packet).
     pub is_keyframe: bool,
+    /// Which switch-relevant H.264 NAL units this payload carries. Always empty
+    /// for audio.
+    pub nal: h264::NalFlags,
     pub payload: Arc<[u8]>,
 }
 
@@ -67,6 +80,7 @@ impl Default for RtpPacket {
             arrival_ts: Instant::now(),
             playout_time: Instant::now(),
             is_keyframe: false,
+            nal: h264::NalFlags::empty(),
             payload: Arc::new([0u8; 1200]), // 1.2KB payload for test realism
         }
     }
@@ -79,8 +93,12 @@ impl RtpPacket {
     /// on this packet by str0m (present on ~1/30 packets). The caller must thread `sr`
     /// to the `Synchronizer` so it never has to live in the ring struct.
     pub fn from_str0m(rtp: str0m::rtp::RtpPacket, codec: Codec) -> (Self, Option<SenderInfo>) {
+        let mut nal = h264::NalFlags::empty();
         let is_keyframe_start = match codec {
-            Codec::H264 => str0m::format::detect_h264_keyframe(&rtp.payload),
+            Codec::H264 => {
+                nal = h264::classify(&rtp.payload);
+                nal.idr()
+            }
             Codec::VP8 => str0m::format::detect_vp8_keyframe(&rtp.payload),
             Codec::VP9 => str0m::format::detect_vp9_keyframe(&rtp.payload),
             Codec::Opus => true, // audio frame has not dependencies,
@@ -97,6 +115,7 @@ impl RtpPacket {
             arrival_ts: rtp.timestamp.into(),
             playout_time: rtp.timestamp.into(),
             is_keyframe: is_keyframe_start,
+            nal,
             payload: rtp.payload,
         };
         (pkt, sr)
@@ -113,6 +132,7 @@ impl RtpPacket {
             arrival_ts: self.arrival_ts,
             playout_time: self.playout_time,
             is_keyframe: self.is_keyframe,
+            nal: self.nal,
             payload: Arc::from(&self.payload[..]),
         }
     }
@@ -201,5 +221,160 @@ pub mod test_utils {
             packets.push(current.clone());
         }
         packets
+    }
+
+    /// Time between packets of the same frame as they arrive off the wire.
+    const INTRA_FRAME_ARRIVAL: Duration = Duration::from_micros(200);
+
+    /// Builds RTP packet streams whose payloads are real H.264 NAL structures,
+    /// packetized the way libwebrtc packetizes them: a keyframe is a STAP-A of
+    /// SPS+PPS followed by the IDR split into FU-A fragments, and a delta frame
+    /// is one or more non-IDR slices.
+    ///
+    /// Tests that care about switch decodability must use this rather than
+    /// hand-setting `is_keyframe`, because the whole class of bugs it guards
+    /// against lives in the gap between "carries an IDR" and "is decodable".
+    pub struct H264StreamBuilder {
+        ssrc: Ssrc,
+        seq: u64,
+        rtp_ts: u64,
+        clock: Instant,
+        frame_interval: Duration,
+        parameter_sets: ParameterSetStyle,
+        sent_parameter_sets: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum ParameterSetStyle {
+        /// SPS and PPS ride in their own packet ahead of the IDR (Chrome).
+        SeparatePacket,
+        /// SPS, PPS and the first IDR fragment share one STAP-A.
+        AggregatedWithIdr,
+        /// The encoder sends parameter sets only once, at stream start.
+        OnceAtStreamStart,
+    }
+
+    impl H264StreamBuilder {
+        pub fn new(ssrc: u32, seq: u64, rtp_ts: u64, clock: Instant) -> Self {
+            Self {
+                ssrc: Ssrc::from(ssrc),
+                seq,
+                rtp_ts,
+                clock,
+                frame_interval: Duration::from_millis(1000 / 30),
+                parameter_sets: ParameterSetStyle::SeparatePacket,
+                sent_parameter_sets: false,
+            }
+        }
+
+        pub fn with_parameter_sets(mut self, style: ParameterSetStyle) -> Self {
+            self.parameter_sets = style;
+            self
+        }
+
+        pub fn with_frame_interval(mut self, interval: Duration) -> Self {
+            self.frame_interval = interval;
+            self
+        }
+
+        pub fn next_seq(&self) -> u64 {
+            self.seq
+        }
+
+        /// Advance as if `n` packets were sent but lost before reaching us.
+        pub fn drop_packets(&mut self, n: u64) {
+            self.seq += n;
+        }
+
+        fn packet(&mut self, payload: Vec<u8>, marker: bool, offset: usize) -> RtpPacket {
+            let at = self.clock + INTRA_FRAME_ARRIVAL * offset as u32;
+            let nal = crate::rtp::h264::classify(&payload);
+            let pkt = RtpPacket {
+                ssrc: self.ssrc,
+                marker,
+                seq_no: SeqNo::from(self.seq),
+                rtp_ts: MediaTime::new(self.rtp_ts, VIDEO_FREQUENCY),
+                arrival_ts: at,
+                playout_time: at,
+                is_keyframe: nal.idr(),
+                nal,
+                payload: Arc::from(payload.as_slice()),
+                ..Default::default()
+            };
+            self.seq += 1;
+            pkt
+        }
+
+        fn end_frame(&mut self) {
+            self.rtp_ts +=
+                (VIDEO_FREQUENCY.get() as u64 * self.frame_interval.as_micros() as u64) / 1_000_000;
+            self.clock += self.frame_interval;
+        }
+
+        /// A decodable keyframe: parameter sets followed by `fragments` FU-A
+        /// fragments of an IDR, terminated by the marker bit.
+        pub fn keyframe(&mut self, fragments: usize) -> Vec<RtpPacket> {
+            self.keyframe_with_slices(1, fragments)
+        }
+
+        /// A keyframe coded as `slices` independent IDR slices. Each slice
+        /// produces its own FU-A start fragment, so multiple packets in the one
+        /// frame report as carrying an IDR.
+        pub fn keyframe_with_slices(
+            &mut self,
+            slices: usize,
+            fragments_per_slice: usize,
+        ) -> Vec<RtpPacket> {
+            debug_assert!(slices >= 1 && fragments_per_slice >= 1);
+            let mut out = Vec::new();
+            let send_parameter_sets = self.parameter_sets != ParameterSetStyle::OnceAtStreamStart
+                || !self.sent_parameter_sets;
+            self.sent_parameter_sets = true;
+
+            let aggregate = self.parameter_sets == ParameterSetStyle::AggregatedWithIdr;
+            if send_parameter_sets && !aggregate {
+                let payload = h264::test_utils::stap_a(&[(7, 24), (8, 6)]);
+                let p = self.packet(payload, false, out.len());
+                out.push(p);
+            }
+
+            for slice in 0..slices {
+                for frag in 0..fragments_per_slice {
+                    let start = frag == 0;
+                    let end = frag == fragments_per_slice - 1;
+                    let payload = if start && slice == 0 && aggregate {
+                        h264::test_utils::stap_a(&[(7, 24), (8, 6), (5, 900)])
+                    } else {
+                        h264::test_utils::idr_fu_a(start, end, 1100)
+                    };
+                    let last = slice == slices - 1 && end;
+                    let p = self.packet(payload, last, out.len());
+                    out.push(p);
+                }
+            }
+
+            self.end_frame();
+            out
+        }
+
+        /// An ordinary inter-coded frame of `packets` non-IDR slice packets.
+        pub fn delta_frame(&mut self, packets: usize) -> Vec<RtpPacket> {
+            debug_assert!(packets >= 1);
+            let mut out = Vec::new();
+            for i in 0..packets {
+                let payload = h264::test_utils::non_idr(1100);
+                let p = self.packet(payload, i == packets - 1, i);
+                out.push(p);
+            }
+            self.end_frame();
+            out
+        }
+
+        /// `n` delta frames, flattened.
+        pub fn delta_frames(&mut self, n: usize, packets_each: usize) -> Vec<RtpPacket> {
+            (0..n)
+                .flat_map(|_| self.delta_frame(packets_each))
+                .collect()
+        }
     }
 }

@@ -1,7 +1,7 @@
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
 use str0m::media::Frequency;
-use tokio::time::Instant;
+use str0m::rtp::SeqNo;
 
 use crate::rtp::RtpPacket;
 use crate::rtp::timeline::Timeline;
@@ -10,16 +10,24 @@ const SWITCHER_PENDING_CAPACITY: usize = 32;
 
 /// Handles RTP stream switching with seamless seq/timestamp rewriting.
 ///
-/// Callers feed the active stream via `push` and pre-validated cache packets
+/// Callers feed the active stream via `push` and a pre-validated switch segment
 /// via `stage_direct`. `pop` drains the active queue first, then the staged
-/// queue, rebasing the timeline on the first staged packet so the subscriber
-/// sees a continuous output sequence.
+/// segment, rebasing the timeline on the first staged packet so the subscriber
+/// sees one continuous output stream.
+///
+/// The staged segment is emitted onto consecutive output sequence numbers: the
+/// cache has already ordered and deduplicated it, and it may carry synthesized
+/// parameter-set packets whose original sequence numbers are unrelated. Live
+/// packets resume the stream's own numbering afterwards so later upstream loss
+/// still reaches the subscriber as a gap.
 #[derive(Debug)]
 pub struct Switcher {
     timeline: Timeline,
     pending: VecDeque<RtpPacket>,
     staged: VecDeque<RtpPacket>,
-    latest_playout: Instant,
+    /// Highest input seq emitted from the staged burst. Live packets at or below
+    /// it were already sent and must not be emitted a second time.
+    replay_floor: Option<SeqNo>,
     seen_first: bool,
     is_switching: bool,
     switched: bool,
@@ -31,7 +39,7 @@ impl Switcher {
             timeline: Timeline::new(clock_rate, rng),
             pending: VecDeque::with_capacity(SWITCHER_PENDING_CAPACITY),
             staged: VecDeque::new(),
-            latest_playout: Instant::now(),
+            replay_floor: None,
             seen_first: false,
             is_switching: false,
             switched: false,
@@ -44,25 +52,56 @@ impl Switcher {
             return;
         }
 
+        // Already delivered as part of the switch burst.
+        if self.replay_floor.is_some_and(|floor| *pkt.seq_no <= *floor) {
+            return;
+        }
+
         if self.pending.len() == SWITCHER_PENDING_CAPACITY {
+            // Callers drain after every push, so this is unreachable in practice.
+            // Drop rather than close the gap: silently renumbering around a lost
+            // packet leaves the subscriber decoding a hole it cannot detect.
+            debug_assert!(false, "switcher pending queue overflowed");
             let _ = self.pending.pop_front();
-            self.timeline.drop_count(1);
         }
 
         self.pending.push_back(pkt);
         self.switched = false;
     }
 
-    /// Load pre-validated packets from the shared stream cache. Drains the
-    /// active pending queue so output transitions cleanly to the new stream.
+    /// Load a switch segment produced by `StreamCache::replay`.
+    ///
+    /// The segment must be ordered by sequence number and start a decodable
+    /// frame; the cache is responsible for both.
     pub fn stage_direct(&mut self, packets: impl IntoIterator<Item = RtpPacket>) {
         debug_assert!(!self.is_switching);
+        debug_assert!(
+            self.pending.is_empty(),
+            "stage_direct must follow a full drain"
+        );
+
+        self.staged.clear();
         self.staged.extend(packets);
-        if !self.staged.is_empty() {
-            self.pending.clear();
-            self.seen_first = false;
-            self.is_switching = true;
+        if self.staged.is_empty() {
+            return;
         }
+
+        debug_assert!(
+            self.staged.iter().any(|p| p.is_keyframe),
+            "staged segment must be decodable on its own"
+        );
+        debug_assert!(
+            self.staged
+                .make_contiguous()
+                .windows(2)
+                .all(|w| *w[0].seq_no <= *w[1].seq_no),
+            "staged segment must be ordered"
+        );
+
+        self.pending.clear();
+        self.seen_first = false;
+        self.is_switching = true;
+        self.replay_floor = None;
     }
 
     pub fn is_switching(&self) -> bool {
@@ -71,7 +110,6 @@ impl Switcher {
 
     pub fn pop(&mut self) -> Option<RtpPacket> {
         if let Some(mut pkt) = self.pending.pop_front() {
-            self.update_latest_playout(pkt.playout_time);
             self.timeline.rewrite(&mut pkt);
             return Some(pkt);
         }
@@ -82,22 +120,23 @@ impl Switcher {
                     self.timeline.rebase(&pkt);
                     self.seen_first = true;
                 }
-                self.update_latest_playout(pkt.playout_time);
-                self.timeline.rewrite(&mut pkt);
+                let input_seq = pkt.seq_no;
+                self.timeline.rewrite_sequential(&mut pkt);
+                if self.replay_floor.is_none_or(|floor| *input_seq > *floor) {
+                    self.replay_floor = Some(input_seq);
+                }
                 return Some(pkt);
+            }
+
+            // Burst complete: realign so the stream's own numbering resumes.
+            if let Some(floor) = self.replay_floor {
+                self.timeline.resync_to_input(floor);
             }
             self.is_switching = false;
             self.switched = true;
         }
 
         None
-    }
-
-    #[inline]
-    fn update_latest_playout(&mut self, time: Instant) {
-        if time > self.latest_playout {
-            self.latest_playout = time;
-        }
     }
 
     pub fn ready_to_switch(&self) -> bool {
@@ -109,6 +148,7 @@ impl Switcher {
         self.is_switching = false;
         self.seen_first = false;
         self.switched = false;
+        self.replay_floor = None;
     }
 
     pub fn clear(&mut self) {
@@ -121,12 +161,14 @@ impl Switcher {
 mod test {
     use super::*;
     use crate::rtp;
+    use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use pulsebeam_runtime::rand::seeded_rng;
     use std::time::Duration;
     use str0m::{
         media::{Frequency, MediaTime},
         rtp::Ssrc,
     };
+    use tokio::time::Instant;
 
     fn pkt(ssrc: u32, seq_no: u64, rtp_ts: u64, playout_time: Instant) -> RtpPacket {
         RtpPacket {
@@ -134,6 +176,8 @@ mod test {
             seq_no: seq_no.into(),
             rtp_ts: MediaTime::new(rtp_ts, Frequency::NINETY_KHZ),
             playout_time,
+            arrival_ts: playout_time,
+            is_keyframe: true,
             ..Default::default()
         }
     }
@@ -179,18 +223,6 @@ mod test {
     }
 
     #[test]
-    fn pending_queue_is_bounded_under_backpressure() {
-        let now = Instant::now();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(10));
-
-        for i in 0..(SWITCHER_PENDING_CAPACITY as u64 * 4) {
-            switcher.push(pkt(10, 10_000 + i, 100_000 + i, now));
-        }
-
-        assert_eq!(switcher.pending.len(), SWITCHER_PENDING_CAPACITY);
-    }
-
-    #[test]
     fn clear_staging_resets_and_accepts_new_stage_direct() {
         let now = Instant::now();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(11));
@@ -210,5 +242,64 @@ mod test {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ssrc, Ssrc::from(30));
         assert!(switcher.ready_to_switch());
+    }
+
+    #[test]
+    fn a_replayed_burst_is_emitted_contiguously_and_never_twice() {
+        let t0 = Instant::now();
+        let mut b = H264StreamBuilder::new(9, 500, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
+
+        switcher.push(pkt(1, 5, 1_000, t0));
+        let last_active = switcher.pop().unwrap();
+
+        let burst = b.keyframe(3);
+        let burst_last_seq = *burst.last().unwrap().seq_no;
+        switcher.stage_direct(burst.clone());
+        let out = drain_all(&mut switcher);
+
+        assert_eq!(out.len(), burst.len());
+        assert_eq!(*out[0].seq_no, *last_active.seq_no + 1);
+        assert!(out.windows(2).all(|w| *w[1].seq_no == *w[0].seq_no + 1));
+
+        // Reordering redelivers a packet that was already in the burst.
+        for p in burst.iter().rev() {
+            switcher.push(p.clone());
+        }
+        assert!(
+            drain_all(&mut switcher).is_empty(),
+            "packets already sent in the burst must not be emitted again"
+        );
+
+        // The next genuinely-new live packet continues seamlessly.
+        let live = b.delta_frame(1);
+        assert_eq!(*live[0].seq_no, burst_last_seq + 1);
+        switcher.push(live[0].clone());
+        let out2 = drain_all(&mut switcher);
+        assert_eq!(*out2[0].seq_no, *out.last().unwrap().seq_no + 1);
+    }
+
+    #[test]
+    fn live_loss_after_a_switch_still_reaches_the_subscriber_as_a_gap() {
+        let t0 = Instant::now();
+        let mut b = H264StreamBuilder::new(9, 500, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(13));
+
+        switcher.stage_direct(b.keyframe(3));
+        let out = drain_all(&mut switcher);
+        let last_out = *out.last().unwrap().seq_no;
+
+        b.drop_packets(4);
+        let f = b.delta_frame(1);
+        switcher.push(f[0].clone());
+        let out2 = drain_all(&mut switcher);
+
+        assert_eq!(
+            *out2[0].seq_no - last_out,
+            5,
+            "4 lost upstream packets must leave a detectable hole"
+        );
     }
 }
