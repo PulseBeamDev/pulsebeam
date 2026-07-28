@@ -687,7 +687,7 @@ impl Slot {
         }
         if self.staging.as_ref().is_some_and(|s| s.is(stream_id))
             && !self.switcher.is_switching()
-            && let Some(pkts) = cache.and_then(|c| c.replay(pkt.arrival_ts))
+            && let Some(pkts) = cache.and_then(|c| c.replay())
         {
             if !self.may_switch_now(pkt.arrival_ts) {
                 return false;
@@ -2470,7 +2470,7 @@ mod slot_switch_tests {
     use super::*;
     use crate::entity::ParticipantId;
     use crate::log::LogCtx;
-    use crate::rtp::cache::{MAX_REPLAY_AGE, StreamCache};
+    use crate::rtp::cache::StreamCache;
     use crate::rtp::conformance::assert_decodable;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use crate::track::test_utils::make_video_track;
@@ -2616,8 +2616,8 @@ mod slot_switch_tests {
         let lo_kf = lo.keyframe(2);
         fx.ingest_all(&low, &mut lo_cache, &lo_kf);
 
-        // Age the low layer's segment well past the replay window.
-        let frames = (MAX_REPLAY_AGE.as_millis() / 33) as usize + 5;
+        // Push the low layer's segment past the replay window.
+        let frames = 10;
         for _ in 0..frames {
             let f = hi.delta_frame(3);
             fx.ingest_all(&high, &mut hi_cache, &f);

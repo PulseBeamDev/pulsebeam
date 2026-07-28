@@ -95,7 +95,7 @@ impl Forwarder {
 
         if self.staging == Some(layer) && !self.switcher.is_switching() {
             let cache = &self.caches[&layer];
-            if let Some(pkts) = cache.replay(pkt.arrival_ts) {
+            if let Some(pkts) = cache.replay() {
                 if !self.may_switch_now(pkt.arrival_ts) {
                     return;
                 }
@@ -151,6 +151,21 @@ impl Forwarder {
         let max = self.out.iter().map(|p| *p.seq_no).max().unwrap();
         let seen: ahash::HashSet<u64> = self.out.iter().map(|p| *p.seq_no).collect();
         (max - min + 1) - seen.len() as u64
+    }
+
+    /// How far the output RTP clock has run ahead of real time, in ms. This is
+    /// latency the subscriber pays: its jitter buffer holds frames whose
+    /// timestamps say they fall due later than they really do.
+    pub fn clock_lead_ms(&self) -> f64 {
+        let (Some(first), Some(last)) = (self.out.first(), self.out.last()) else {
+            return 0.0;
+        };
+        let ts_elapsed = last.rtp_ts.numer() as f64 - first.rtp_ts.numer() as f64;
+        let wall = last
+            .playout_time
+            .saturating_duration_since(first.playout_time)
+            .as_secs_f64();
+        (ts_elapsed - wall * rtp::VIDEO_FREQUENCY.get() as f64) / 90.0
     }
 
     /// Output frame timestamps in emission order, deduplicated.
@@ -310,7 +325,7 @@ fn cache_segments_on_frames_not_arrival_time() {
     }
     let last = kf.last().unwrap();
     let replay = cache
-        .replay(last.arrival_ts)
+        .replay()
         .expect("a complete keyframe must be replayable");
 
     assert_eq!(
@@ -1072,4 +1087,151 @@ fn a_gap_can_only_be_filled_by_the_stream_that_left_it() {
         "a straggler from an earlier generation must not be placed"
     );
     assert_decodable(fwd.emitted(), "two switches with a stale straggler");
+}
+
+/// Screen share: the publisher sends a keyframe and then goes quiet because
+/// nothing on screen changed. A viewer attaching later must be shown that
+/// keyframe as soon as anything arrives, not held on black until a PLI round
+/// trip produces a duplicate of the frame the SFU already has.
+#[test]
+fn a_viewer_joining_a_still_screen_share_gets_the_cached_keyframe() {
+    let start = now();
+    // Screen share runs slowly and mostly emits nothing at all.
+    let mut screen = H264StreamBuilder::new(0x5C, 900, 90_000, start)
+        .with_parameter_sets(ParameterSetStyle::SeparatePacket)
+        .with_fps(5);
+    let mut camera = H264StreamBuilder::new(0xCA, 300, 40_000, start);
+    let mut fwd = Forwarder::new(71);
+
+    // The viewer is watching a camera; the screen share published one keyframe
+    // long ago and has been static ever since.
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &camera.keyframe(3));
+    fwd.ingest_all(1, &screen.keyframe(4));
+    for _ in 0..40 {
+        let f = camera.delta_frame(3);
+        fwd.ingest_all(0, &f);
+    }
+
+    // The viewer switches to the screen share. The only thing that arrives is a
+    // single packet from the long-idle screen.
+    fwd.switch_to(1);
+    let nudge = screen.delta_frame(1);
+    fwd.ingest_all(1, &nudge);
+
+    assert!(
+        fwd.switched(),
+        "a still screen must render from cache, not wait on a keyframe request"
+    );
+    let emitted = fwd.emitted();
+    assert_decodable(emitted, "viewer joining a still screen share");
+
+    // The last thing sent must be the screen's keyframe with its parameter sets,
+    // not the camera frames that preceded the switch.
+    let tail = &emitted[emitted.len().saturating_sub(6)..];
+    assert!(
+        tail.iter().any(|p| p.nal.idr()),
+        "the viewer must receive a decodable entry point"
+    );
+    assert!(
+        tail.iter().any(|p| p.nal.sps()) && tail.iter().any(|p| p.nal.pps()),
+        "and the parameter sets describing it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What a switch is allowed to cost the subscriber.
+// ---------------------------------------------------------------------------
+
+/// Runs `fps` video on two layers, lets both build a full GOP, then switches to
+/// the stale one and answers the resulting keyframe request.
+fn switch_onto_a_stale_layer(fps: u32, gop_frames: usize, seed: u64) -> Forwarder {
+    let start = now();
+    let mut a = H264StreamBuilder::new(1, 100, 90_000, start).with_fps(fps);
+    let mut b = H264StreamBuilder::new(2, 50_000, 700_000, start).with_fps(fps);
+    let mut fwd = Forwarder::new(seed);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &a.keyframe(30));
+    fwd.ingest_all(1, &b.keyframe(30));
+    for _ in 0..gop_frames {
+        let f = a.delta_frame(8);
+        fwd.ingest_all(0, &f);
+        let f = b.delta_frame(8);
+        fwd.ingest_all(1, &f);
+    }
+
+    fwd.switch_to(1);
+    let f = b.delta_frame(8);
+    fwd.ingest_all(1, &f);
+    assert!(
+        !fwd.switched(),
+        "a whole GOP of backlog must not be replayed at the subscriber"
+    );
+
+    // The keyframe request is answered.
+    fwd.ingest_all(1, &b.keyframe(30));
+    for _ in 0..5 {
+        let f = b.delta_frame(8);
+        fwd.ingest_all(1, &f);
+    }
+    assert!(
+        fwd.switched(),
+        "the switch must complete once a keyframe arrives"
+    );
+    fwd
+}
+
+/// Whatever a switch hands over goes into str0m's pacer, so releasing a lot at
+/// once turns into queueing delay for the subscriber. A switch should hand over
+/// the entry point and then let the stream flow, not dump a backlog.
+#[test]
+fn a_switch_releases_only_a_handful_of_packets_at_once() {
+    for (fps, gop) in [(30u32, 60usize), (15, 30), (5, 10)] {
+        let fwd = switch_onto_a_stale_layer(fps, gop, 100 + fps as u64);
+        let burst = fwd.largest_burst();
+        assert!(
+            burst <= 8,
+            "at {fps}fps a switch released {burst} packets in one go; that queues \
+             in the pacer and comes out as latency"
+        );
+    }
+}
+
+/// Replaying media the subscriber has not seen yet puts the output clock ahead
+/// of real time, and it stays there — every switch would add to it.
+#[test]
+fn a_switch_does_not_put_the_subscriber_behind_live() {
+    for (fps, gop) in [(30u32, 60usize), (15, 30), (5, 10)] {
+        let fwd = switch_onto_a_stale_layer(fps, gop, 200 + fps as u64);
+        let lead = fwd.clock_lead_ms();
+        assert!(
+            lead.abs() < 50.0,
+            "at {fps}fps a switch left the output clock {lead:.0}ms ahead of real \
+             time; the subscriber pays that as latency for the rest of the call"
+        );
+    }
+}
+
+/// The cache is shared and long-lived; it must not grow with the stream.
+#[test]
+fn the_cache_does_not_grow_without_bound() {
+    let start = now();
+    let mut b = H264StreamBuilder::new(9, 1000, 90_000, start);
+    let mut cache = StreamCache::default();
+
+    for p in b.keyframe(4) {
+        cache.push(&p);
+    }
+    for _ in 0..2000 {
+        for p in b.delta_frame(8) {
+            cache.push(&p);
+        }
+    }
+
+    // Whatever it still holds must not be replayable as a backlog.
+    assert!(
+        cache.replay().is_none(),
+        "a stream that has run for a long time must not be replayable in one go"
+    );
 }
