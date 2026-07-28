@@ -28,7 +28,7 @@ futures-lite = "2.6.1"
 more-asserts = "0.3.1"
 rand = "0.10.1"
 serde = { version = "1", features = ["derive"] }
-str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/overusing" }
+str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "feat/overusing-readiness" }
 # str0m = { git = "https://github.com/algesten/str0m.git", rev = "92fac41" }
 # str0m = { git = "https://github.com/algesten/str0m.git", branch = "poll-output-readiness" }
 # str0m = { version = "0.21.0" }
