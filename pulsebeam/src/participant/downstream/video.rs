@@ -31,6 +31,15 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
+/// How long a ready switch waits for the active layer to finish the frame it is
+/// midway through.
+///
+/// A frame's packets arrive back-to-back, so this only ever costs a millisecond
+/// or two in the normal case; it is short because a packet that has not turned
+/// up by now is late enough that waiting is worse than switching. Whatever the
+/// switch leaves behind can still be filled afterwards by the drain tail.
+const FRAME_ALIGN_GRACE: Duration = Duration::from_millis(15);
+
 pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
@@ -449,6 +458,9 @@ struct Slot {
 
     active: Option<TrackLayer>,
     staging: Option<TrackLayer>,
+    /// The layer this slot has just switched away from. Its packets are still
+    /// arriving and some complete frames the subscriber already has part of.
+    draining: Option<TrackLayer>,
 
     switcher: Switcher,
 
@@ -465,6 +477,9 @@ struct Slot {
     staging_keyframe_last_at: Option<Instant>,
     /// Current retry interval for PLI probes while waiting for the staging keyframe.
     staging_keyframe_interval: Duration,
+    /// When the staged layer first became switchable but the active layer was
+    /// still midway through a frame.
+    switch_blocked_since: Option<Instant>,
 }
 
 impl Slot {
@@ -478,6 +493,7 @@ impl Slot {
 
             active: None,
             staging: None,
+            draining: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, rng),
             // With no signaling, we assume users are viewing with 720p playback
@@ -489,6 +505,7 @@ impl Slot {
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
             staging_keyframe_interval: KEYFRAME_RETRY_INTERVAL,
+            switch_blocked_since: None,
         }
     }
 
@@ -509,6 +526,18 @@ impl Slot {
         self.staging_keyframe_retries = 0;
         self.staging_keyframe_last_at = None;
         self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
+        self.switch_blocked_since = None;
+    }
+
+    /// Whether the switch may land now, or should wait for the active layer to
+    /// finish the frame it is partway through.
+    fn may_switch_now(&mut self, now: Instant) -> bool {
+        if self.switcher.at_clean_frame_boundary() {
+            self.switch_blocked_since = None;
+            return true;
+        }
+        let blocked_since = *self.switch_blocked_since.get_or_insert(now);
+        now.saturating_duration_since(blocked_since) >= FRAME_ALIGN_GRACE
     }
 
     fn pli_retry(&mut self, now: Instant, events: &mut impl ParticipantSink) {
@@ -574,6 +603,9 @@ impl Slot {
                 plog_debug!(self.ctx, mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
             }
         } else if self.target().as_ref() != Some(&new_layer) {
+            if self.draining.as_ref() == Some(new_layer) {
+                self.draining = None;
+            }
             self.staging = Some(new_layer.clone());
             // Reset the switcher staging buffer so stale seq-no state from a
             // previous stream doesn't mix with the new stream's packets.
@@ -597,6 +629,7 @@ impl Slot {
         plog_debug!(self.ctx, mid=%self.mid, "slot stopped");
         self.active = None;
         self.staging = None;
+        self.draining = None;
         self.pli_reset();
     }
 
@@ -643,15 +676,29 @@ impl Slot {
             }
             return false;
         }
+        if self.draining.as_ref().is_some_and(|d| d.is(stream_id)) {
+            if let Some(out) = self.switcher.drain_tail(pkt, pkt.arrival_ts) {
+                writer.write_video_owned(out, self.mid, self.rid, self.pt);
+            }
+            if !self.switcher.has_tail() {
+                self.draining = None;
+            }
+            return false;
+        }
         if self.staging.as_ref().is_some_and(|s| s.is(stream_id))
             && !self.switcher.is_switching()
             && let Some(pkts) = cache.and_then(|c| c.replay(pkt.arrival_ts))
         {
-            self.switcher.stage_direct(pkts);
+            if !self.may_switch_now(pkt.arrival_ts) {
+                return false;
+            }
+            self.switch_blocked_since = None;
+            self.switcher.stage_direct(pkts, pkt.arrival_ts);
             while let Some(out) = self.switcher.pop() {
                 writer.write_video_owned(out, self.mid, self.rid, self.pt);
             }
             if self.should_promote_staging() {
+                self.draining = self.active.take();
                 self.active = self.staging.take();
                 return true;
             }

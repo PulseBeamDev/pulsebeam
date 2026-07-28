@@ -5,6 +5,8 @@
 //! a switching forwarder owes that decoder, independent of how switching is
 //! implemented internally.
 
+use ahash::{HashSet, HashSetExt};
+
 use crate::rtp::RtpPacket;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,12 +15,19 @@ pub struct Violation {
     pub reason: String,
 }
 
-/// Verifies an emitted egress stream.
+/// Verifies an emitted egress stream, assuming nothing was lost upstream.
 ///
-/// `expect_leading_parameter_sets` requires that the very first decodable frame
-/// carries SPS and PPS; every later keyframe must carry them too, because the
-/// SFU keeps one egress SSRC across switches and each simulcast layer has its
-/// own SPS.
+/// Every keyframe must carry SPS and PPS, because the SFU keeps one egress SSRC
+/// across switches while each simulcast layer has its own parameter sets.
+///
+/// Sequence gaps are not themselves defects — they are how loss is reported, and
+/// a subscriber knows to discard what they damage. The dangerous case is the
+/// opposite one: a frame the forwarder cut short but delivered contiguously, so
+/// the decoder has no way to know it is incomplete and renders it anyway.
+///
+/// Frame structure is judged in sequence order rather than the order packets
+/// were written, because sequence order is what the subscriber reassembles.
+/// Emitting a packet late is the network's doing and ours to pass on faithfully.
 pub fn check_egress(packets: &[RtpPacket]) -> Vec<Violation> {
     let mut violations = Vec::new();
     let mut push = |index: usize, reason: String| violations.push(Violation { index, reason });
@@ -27,24 +36,31 @@ pub fn check_egress(packets: &[RtpPacket]) -> Vec<Violation> {
         return violations;
     }
 
+    // A packet may legitimately come out below the ones before it: the network
+    // reordered it and we forward it where it belongs. What must never happen is
+    // the same output sequence number being used twice.
+    let mut seen = HashSet::new();
+    for (i, pkt) in packets.iter().enumerate() {
+        if !seen.insert(*pkt.seq_no) {
+            push(i, format!("output sequence {} emitted twice", *pkt.seq_no));
+        }
+    }
+
+    let mut ordered: Vec<&RtpPacket> = packets.iter().collect();
+    ordered.sort_by_key(|p| *p.seq_no);
+    let packets: Vec<RtpPacket> = ordered.into_iter().cloned().collect();
+    let packets = &packets[..];
+
     for (i, w) in packets.windows(2).enumerate() {
         let (prev, cur) = (&w[0], &w[1]);
-        let expected = (*prev.seq_no).wrapping_add(1);
-        if *cur.seq_no != expected {
-            push(
-                i + 1,
-                format!(
-                    "sequence discontinuity: {} followed by {} (expected {})",
-                    *prev.seq_no, *cur.seq_no, expected
-                ),
-            );
-        }
         if cur.rtp_ts.numer() < prev.rtp_ts.numer() {
             push(
                 i + 1,
                 format!(
-                    "rtp timestamp went backwards: {} followed by {}",
+                    "rtp timestamp went backwards: sequence {} carried {} but {} carried {}",
+                    *prev.seq_no,
                     prev.rtp_ts.numer(),
+                    *cur.seq_no,
                     cur.rtp_ts.numer()
                 ),
             );
@@ -80,6 +96,25 @@ pub fn check_egress(packets: &[RtpPacket]) -> Vec<Violation> {
         let boundary = i == packets.len() || packets[i].rtp_ts.numer() != frame_ts;
         if boundary {
             let frame = &packets[frame_start..i];
+
+            // A frame the forwarder cut short must be followed by a sequence
+            // gap, or the subscriber reassembles a partial frame believing it
+            // is whole and feeds it to the decoder.
+            if i < packets.len() && !frame.iter().any(|p| p.marker) {
+                let last = &packets[i - 1];
+                let next = &packets[i];
+                if *next.seq_no == (*last.seq_no).wrapping_add(1) {
+                    push(
+                        frame_start,
+                        format!(
+                            "frame at rtp_ts {frame_ts} was truncated (no marker) but the next \
+                             frame follows contiguously, so the subscriber cannot tell it is \
+                             incomplete"
+                        ),
+                    );
+                }
+            }
+
             let has_idr = frame.iter().any(|p| p.nal.idr());
             if has_idr {
                 let has_sps = frame.iter().any(|p| p.nal.sps());

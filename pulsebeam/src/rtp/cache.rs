@@ -13,6 +13,15 @@ const STREAM_CACHE_CAPACITY: usize = 512;
 /// forwarding its current layer and waits for the PLI-driven keyframe instead.
 pub const MAX_REPLAY_AGE: Duration = Duration::from_millis(200);
 
+/// How many frames a switch segment may span.
+///
+/// The keyframe itself is an unavoidable burst — the encoder built it that way.
+/// Everything after it is backlog, and releasing backlog in one go reads as
+/// queue build-up to the subscriber's congestion control, lowering the estimate
+/// exactly when the newly switched layer needs headroom. Past this the segment
+/// is refused and the slot waits for the PLI-driven keyframe instead.
+const MAX_REPLAY_FRAMES: usize = 3;
+
 /// Per-stream ring buffer seeded from the last keyframe onward.
 ///
 /// Shared across all subscribers of the same upstream stream. A new subscriber
@@ -130,6 +139,19 @@ impl StreamCache {
         segment.dedup_by_key(|p| *p.seq_no);
 
         if !segment.iter().any(|p| p.is_keyframe) {
+            return None;
+        }
+
+        let mut frames = 0usize;
+        let mut seen_ts = None;
+        for p in &segment {
+            let ts = p.rtp_ts.numer();
+            if seen_ts != Some(ts) {
+                frames += 1;
+                seen_ts = Some(ts);
+            }
+        }
+        if frames > MAX_REPLAY_FRAMES {
             return None;
         }
 
