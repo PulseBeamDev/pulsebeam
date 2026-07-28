@@ -241,8 +241,9 @@ impl DownstreamAllocator {
         assignments_changed
     }
 
-    pub fn reconcile_routes(&mut self, _now: Instant, events: &mut impl ParticipantSink) {
-        self.video.reconcile_routes(events);
+    pub fn reconcile_routes(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        self.video
+            .poll_slow(now, self.available_bandwidth.current(), events);
     }
 
     pub fn poll_slow(
