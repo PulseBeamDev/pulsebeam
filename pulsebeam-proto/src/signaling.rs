@@ -72,7 +72,7 @@ pub struct VideoRequest {
     /// > Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
     /// > the streams you are actually looking at.
     #[prost(uint32, tag = "3")]
-    pub height: u32,
+    pub target_height: u32,
     /// Relative importance for bandwidth contention — decides the ORDER in which
     /// streams keep and gain quality when not everything fits. Higher = more
     /// important; 0 = least. It is an order only, not a size (size is `height`),

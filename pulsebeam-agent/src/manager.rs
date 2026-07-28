@@ -88,7 +88,7 @@ impl SubscriptionManager {
             requests.push(VideoRequest {
                 mid: mid.to_string(),
                 track_id: sub.track_id.clone(),
-                height: sub.height,
+                target_height: sub.height,
                 min_height: sub.min_height,
                 priority: sub.priority,
             });

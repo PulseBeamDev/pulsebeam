@@ -78,7 +78,7 @@ message VideoRequest {
   //   >0 = the server picks the simulcast layer that best matches this size.
   // Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
   // the streams you are actually looking at.
-  uint32 height = 3;
+  uint32 target_height = 3;
 
   // Relative importance for bandwidth contention — decides the ORDER in which
   // streams keep and gain quality when not everything fits. Higher = more

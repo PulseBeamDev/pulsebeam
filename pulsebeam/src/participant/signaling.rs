@@ -143,7 +143,7 @@ impl Signaling {
             // `Mid` is a fixed-size (16-byte) identifier and will truncate longer strings.
             let mid = Mid::from(req.mid.as_str());
 
-            if req.height == 0 {
+            if req.target_height == 0 {
                 continue;
             }
 
@@ -151,8 +151,8 @@ impl Signaling {
                 mid,
                 Intent {
                     track_id,
-                    max_height: req.height,
-                    min_height: req.min_height.min(req.height),
+                    target_height: req.target_height,
+                    min_height: req.min_height.min(req.target_height),
                     priority: req.priority,
                 },
             );

@@ -127,7 +127,7 @@ impl VideoAllocator {
         intent: Option<&Intent>,
     ) -> Option<()> {
         if let Some(intent) = intent
-            && intent.max_height > 0
+            && intent.target_height > 0
         {
             let track_id = &intent.track_id;
             let Some(track_state) = tracks.get_mut(track_id) else {
@@ -148,7 +148,7 @@ impl VideoAllocator {
             };
 
             let layer = layer.clone();
-            slot.max_height = intent.max_height;
+            slot.max_height = intent.target_height;
             slot.min_height = intent.min_height;
             slot.priority = intent.priority;
             slot.switch_to(&layer, false);
@@ -722,7 +722,7 @@ pub struct SlotAssignment {
 pub struct Intent {
     pub track_id: TrackId,
     /// Target render height (px); `0` hides the stream.
-    pub max_height: u32,
+    pub target_height: u32,
     /// Floor render height (px) to keep under contention; `0` = droppable.
     pub min_height: u32,
     /// Contention order; higher wins bandwidth first.
@@ -787,9 +787,25 @@ impl AllocationEngine {
         }
     }
 
-    /// Whether a layer is permitted by the client's spatial request.
+    /// Shortest declared/fallback height among a track's layers. A layer at
+    /// this height can never be excluded by spatial gating — there is nothing
+    /// shorter to fall back to.
+    fn min_track_height(track: &Track) -> u32 {
+        track
+            .layers
+            .iter()
+            .map(Self::height)
+            .min()
+            .expect("track has at least one layer")
+    }
+
+    /// Whether a layer is permitted by the client's spatial request. The
+    /// ceiling is raised to the track's shortest layer height so a track
+    /// whose layers are all taller than `max_height` (e.g. screen-share
+    /// simulcast tiers that only differ in fps) still has something eligible
+    /// instead of every layer being rejected.
     fn spatially_allowed(slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        Self::height(layer) <= slot.max_height
+        Self::height(layer) <= slot.max_height.max(Self::min_track_height(slot.track))
     }
 
     /// Whether a layer may currently be forwarded or switched into.
@@ -1068,7 +1084,7 @@ mod assignment_tests {
             Mid::from("s0"),
             Intent {
                 track_id: tracks.ids[0],
-                max_height: 720,
+                target_height: 720,
                 min_height: 0,
                 priority: 0,
             },
@@ -1077,7 +1093,7 @@ mod assignment_tests {
             Mid::from("s1"),
             Intent {
                 track_id: tracks.ids[1],
-                max_height: 720,
+                target_height: 720,
                 min_height: 0,
                 priority: 0,
             },
@@ -1086,7 +1102,7 @@ mod assignment_tests {
             Mid::from("s2"),
             Intent {
                 track_id: tracks.ids[2],
-                max_height: 720,
+                target_height: 720,
                 min_height: 0,
                 priority: 0,
             },
@@ -1111,7 +1127,7 @@ mod assignment_tests {
             Mid::from("s0"),
             Intent {
                 track_id: missing_track_id,
-                max_height: 720,
+                target_height: 720,
                 min_height: 0,
                 priority: 0,
             },
@@ -1960,6 +1976,38 @@ mod allocation_tests {
         // The Medium layer declared nothing → keeps its 360p fallback → forbidden.
         let medium = t.by_quality(LayerQuality::Medium).unwrap();
         assert!(!AllocationEngine::spatially_allowed(&slot, medium));
+    }
+
+    /// Screen-share simulcast tiers often share one resolution and differ
+    /// only in fps/bitrate. A client cap below that shared height must not
+    /// reject every layer — there's nothing shorter to fall back to, so all
+    /// tiers stay eligible and `desired_bitrate` must still be nonzero.
+    #[test]
+    fn uniform_layer_heights_all_stay_spatially_allowed_below_cap() {
+        let t = healthy_track();
+        for quality in [LayerQuality::High, LayerQuality::Medium, LayerQuality::Low] {
+            t.by_quality(quality)
+                .unwrap()
+                .state
+                .update_for_test()
+                .declared_height(1080);
+        }
+
+        // Client caps at 480p, below the shared 1080p every tier declares.
+        let slot = slot("a", 480, &t, LayerQuality::Low);
+        for quality in [LayerQuality::High, LayerQuality::Medium, LayerQuality::Low] {
+            let layer = t.by_quality(quality).unwrap();
+            assert!(
+                AllocationEngine::spatially_allowed(&slot, layer),
+                "{quality:?} at the shared minimum height must stay allowed"
+            );
+        }
+
+        let desired = AllocationEngine::desired_bitrate(std::slice::from_ref(&slot));
+        assert!(
+            desired.as_f64() > 0.0,
+            "a slot with an eligible layer must desire nonzero bitrate"
+        );
     }
 
     // ─── Property: every slot receives exactly one decision ─────────────────────
