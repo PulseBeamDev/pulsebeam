@@ -33,8 +33,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     os::fd::AsRawFd,
 };
-use zerocopy::FromZeros;
-
 const MEBIBYTE: usize = 1024 * 1024;
 const GSO_PROBE_SEGMENT_SIZE: i32 = 1200;
 const DISABLE_GSO_SEGMENT_SIZE: i32 = 0;
@@ -47,6 +45,33 @@ pub const SOCKET_RECV_SIZE: usize = 4 * MEBIBYTE;
 
 const UDP_MAX_GSO_SEGMENTS: usize = 64;
 const GRO_SLOT_SIZE: usize = UDP_MAX_GSO_SEGMENTS * MAX_UDP_PAYLOAD_SIZE;
+const RECV_ARENA_SIZE: usize = BATCH_SIZE * GRO_SLOT_SIZE;
+
+struct UdpRecvArena {
+    bytes: Box<[u8]>,
+}
+
+impl UdpRecvArena {
+    fn preallocated() -> Self {
+        let bytes = vec![0; RECV_ARENA_SIZE].into_boxed_slice();
+        debug_assert_eq!(bytes.len(), RECV_ARENA_SIZE);
+        Self { bytes }
+    }
+
+    fn slots_mut(&mut self) -> impl ExactSizeIterator<Item = &mut [u8]> {
+        debug_assert_eq!(self.bytes.len(), RECV_ARENA_SIZE);
+        self.bytes.chunks_exact_mut(GRO_SLOT_SIZE)
+    }
+
+    fn packet(&self, slot: usize, len: usize) -> &[u8] {
+        debug_assert!(slot < BATCH_SIZE);
+        debug_assert!(len <= GRO_SLOT_SIZE);
+        let start = slot * GRO_SLOT_SIZE;
+        let end = start + len;
+        debug_assert!(end <= self.bytes.len());
+        &self.bytes[start..end]
+    }
+}
 
 fn normalize_v4_mapped(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
@@ -167,14 +192,11 @@ pub fn from_socket(
     let reader_sock = writer_sock.clone();
     drop(state_fd);
 
-    let buffer = <[[u8; GRO_SLOT_SIZE]; BATCH_SIZE]>::new_box_zeroed()
-        .expect("failed to allocate zeroed UDP receive buffer");
-
     let reader = UdpTransportReader {
         sock: reader_sock,
         local_addr,
         gro_enabled,
-        buffer,
+        arena: UdpRecvArena::preallocated(),
     };
 
     let writer = UdpTransportWriter {
@@ -206,7 +228,7 @@ pub struct UdpTransportReader {
     local_addr: SocketAddr,
     gro_enabled: bool,
 
-    buffer: Box<[[u8; GRO_SLOT_SIZE]; BATCH_SIZE]>,
+    arena: UdpRecvArena,
 }
 
 impl UdpTransportReader {
@@ -230,18 +252,18 @@ impl UdpTransportReader {
             sock,
             local_addr,
             gro_enabled,
-            buffer,
+            arena,
         } = self;
         let local_addr = *local_addr;
         let gro_enabled = *gro_enabled;
 
         sock.try_io(tokio::io::Interest::READABLE, || {
-            let mut slot_iter = buffer.iter_mut();
+            let mut slot_iter = arena.slots_mut();
             let mut iovs: [[IoSliceMut; 1]; BATCH_SIZE] = std::array::from_fn(|_| {
                 let slot = slot_iter
                     .next()
                     .expect("buffer has exactly BATCH_SIZE slots");
-                [IoSliceMut::new(slot.as_mut_slice())]
+                [IoSliceMut::new(slot)]
             });
             drop(slot_iter);
 
@@ -298,7 +320,7 @@ impl UdpTransportReader {
                 let Some((src, stride, total_len)) = entry else {
                     continue;
                 };
-                let buf = buffer[slot_idx][..total_len].to_vec();
+                let buf = arena.packet(slot_idx, total_len).to_vec();
                 out.push(RecvPacketBatch {
                     src,
                     dst: local_addr,
@@ -507,6 +529,22 @@ mod tests {
     use crate::net::{SendPacket, SendPacketBatch};
     use std::{net::SocketAddr, time::Duration};
     use tokio::net::UdpSocket;
+
+    #[test]
+    fn receive_arena_exposes_exact_contiguous_slots() {
+        let mut arena = UdpRecvArena::preallocated();
+        let base = arena.bytes.as_ptr() as usize;
+        let slots = arena
+            .slots_mut()
+            .map(|slot| (slot.as_ptr() as usize, slot.len()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(slots.len(), BATCH_SIZE);
+        for (index, (address, len)) in slots.into_iter().enumerate() {
+            assert_eq!(address, base + index * GRO_SLOT_SIZE);
+            assert_eq!(len, GRO_SLOT_SIZE);
+        }
+    }
 
     #[tokio::test]
     async fn udp_transport_reader_receives_packet() {

@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use str0m::media::KeyframeRequestKind;
-use tokio::time::Instant;
 
 use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
@@ -29,7 +28,6 @@ pub struct SctpEvent {
 
 pub enum ParticipantEvent {
     Topology(ParticipantTopologyEvent),
-    Timer(ParticipantTimerEvent),
     Lifecycle(ParticipantLifecycleEvent),
     Control(ParticipantControlEvent),
 }
@@ -42,13 +40,6 @@ pub enum ParticipantTopologyEvent {
     TrackUnsubscribed {
         subscriber: ParticipantId,
         track: TrackMeta,
-    },
-}
-
-pub enum ParticipantTimerEvent {
-    DeadlineUpdated {
-        at: Instant,
-        participant_id: ParticipantId,
     },
 }
 
@@ -260,18 +251,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     stream_id: layer.stream_id(),
                     kind: KeyframeRequestKind::Pli,
                 }),
-            ));
-    }
-
-    #[inline]
-    fn update_deadline(&mut self, deadline: Instant) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Timer(
-                ParticipantTimerEvent::DeadlineUpdated {
-                    at: deadline,
-                    participant_id: self.id,
-                },
             ));
     }
 

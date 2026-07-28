@@ -6,6 +6,7 @@ use pulsebeam_runtime::rand;
 use str0m::media::KeyframeRequestKind;
 
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
+use super::participants::ParticipantHandle;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
@@ -35,7 +36,7 @@ pub(crate) trait CrossShardSend {
 pub(crate) trait RoutingContext: CrossShardSend {
     fn forward_video_rtp(
         &mut self,
-        subscriber: ParticipantId,
+        subscriber: ParticipantHandle,
         stream_id: &StreamId,
         pkt: &RtpPacket,
         cache: Option<&StreamCache>,
@@ -161,8 +162,8 @@ impl DataStreamRoute {
 
 pub(crate) struct TrackRoute {
     pub kind: TrackKind,
-    pub subscribers: FastIndexSet<ParticipantId>,
-    pub remote_shards: FastIndexSet<ShardId>,
+    pub subscribers: Vec<ParticipantHandle>,
+    pub remote_shards: Vec<ShardId>,
     stream_caches: Vec<(Option<Rid>, StreamCache)>,
 }
 
@@ -170,8 +171,8 @@ impl TrackRoute {
     fn new(kind: TrackKind) -> Self {
         Self {
             kind,
-            subscribers: fast_set_with_capacity(256),
-            remote_shards: fast_set(),
+            subscribers: Vec::with_capacity(256),
+            remote_shards: Vec::new(),
             stream_caches: Vec::with_capacity(4),
         }
     }
@@ -192,6 +193,22 @@ impl TrackRoute {
     }
 }
 
+fn insert_unique<T: Eq + Copy>(values: &mut Vec<T>, value: T) -> bool {
+    if values.contains(&value) {
+        return false;
+    }
+    values.push(value);
+    true
+}
+
+fn swap_remove_value<T: Eq>(values: &mut Vec<T>, value: &T) -> bool {
+    let Some(index) = values.iter().position(|candidate| candidate == value) else {
+        return false;
+    };
+    values.swap_remove(index);
+    true
+}
+
 /// Pure pub/sub state for a shard: which participants are in which rooms,
 /// which shards subscribe to which tracks, and where remote participants
 /// live.
@@ -199,6 +216,7 @@ pub(crate) struct ShardRoutingTable {
     pub rooms: HashMap<RoomId, ShardRoomContext>,
     pub tracks: HashMap<TrackId, TrackRoute>,
     participant_shards: HashMap<ParticipantId, ParticipantShardMeta>,
+    local_participants: HashMap<ParticipantId, ParticipantHandle>,
     remote_participant_counts: HashMap<(RoomId, ShardId), usize>,
 }
 
@@ -208,6 +226,7 @@ impl ShardRoutingTable {
             rooms: HashMap::new(),
             tracks: HashMap::new(),
             participant_shards: HashMap::new(),
+            local_participants: HashMap::new(),
             remote_participant_counts: HashMap::new(),
         }
     }
@@ -217,9 +236,13 @@ impl ShardRoutingTable {
     pub fn add_local_member(
         &mut self,
         participant_id: ParticipantId,
+        handle: ParticipantHandle,
         room_id: RoomId,
         rng: &mut impl rand::RngCore,
     ) {
+        debug_assert_eq!(participant_id, handle.participant_id());
+        let previous = self.local_participants.insert(participant_id, handle);
+        debug_assert!(previous.is_none(), "duplicate local participant route");
         self.rooms
             .entry(room_id)
             .or_insert_with(|| ShardRoomContext::new(rng))
@@ -236,6 +259,8 @@ impl ShardRoutingTable {
         room_id: RoomId,
         audio_track_ids: impl IntoIterator<Item = TrackId>,
     ) {
+        let removed_handle = self.local_participants.remove(participant_id);
+        debug_assert!(removed_handle.is_some());
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
@@ -364,8 +389,13 @@ impl ShardRoutingTable {
             .tracks
             .entry(track.id)
             .or_insert_with(|| TrackRoute::new(track.id.kind()));
+        let handle = *self.local_participants.get(&subscriber)?;
+        debug_assert_eq!(handle.participant_id(), subscriber);
         let was_empty = entry.subscribers.is_empty();
-        entry.subscribers.insert(subscriber);
+        entry
+            .subscribers
+            .retain(|existing| existing.participant_id() != subscriber);
+        entry.subscribers.push(handle);
         was_empty.then_some(ShardEvent::TrackSubscribed(track))
     }
 
@@ -377,11 +407,12 @@ impl ShardRoutingTable {
         track: TrackMeta,
     ) -> Option<ShardEvent> {
         let entry = self.tracks.get_mut(&track.id)?;
-        entry.subscribers.swap_remove(&subscriber);
+        let previous_len = entry.subscribers.len();
         entry
             .subscribers
-            .is_empty()
-            .then_some(ShardEvent::TrackUnsubscribed(track))
+            .retain(|handle| handle.participant_id() != subscriber);
+        let removed = entry.subscribers.len() != previous_len;
+        (removed && entry.subscribers.is_empty()).then_some(ShardEvent::TrackUnsubscribed(track))
     }
 
     pub fn handle_topology_event(&mut self, ev: ParticipantTopologyEvent) -> Option<ShardEvent> {
@@ -638,16 +669,16 @@ impl ShardRoutingTable {
     // -- track subscription topology (remote shards) ---------------------
 
     pub fn register_remote_subscriber_shard(&mut self, from_shard_id: ShardId, track: TrackMeta) {
-        self.tracks
+        let route = self
+            .tracks
             .entry(track.id)
-            .or_insert_with(|| TrackRoute::new(track.id.kind()))
-            .remote_shards
-            .insert(from_shard_id);
+            .or_insert_with(|| TrackRoute::new(track.id.kind()));
+        insert_unique(&mut route.remote_shards, from_shard_id);
     }
 
     pub fn unregister_remote_subscriber_shard(&mut self, from_shard_id: ShardId, track: TrackMeta) {
         if let Some(route) = self.tracks.get_mut(&track.id) {
-            route.remote_shards.swap_remove(&from_shard_id);
+            swap_remove_value(&mut route.remote_shards, &from_shard_id);
         }
     }
 
@@ -702,8 +733,8 @@ impl ShardRoutingTable {
         };
         route.cache_for(stream_id.1).push(pkt);
         let cache = route.get_cache(stream_id.1);
-        for &subscriber_id in &route.subscribers {
-            ctx.forward_video_rtp(subscriber_id, &stream_id, pkt, cache);
+        for &subscriber in &route.subscribers {
+            ctx.forward_video_rtp(subscriber, &stream_id, pkt, cache);
         }
         for &shard_id in &route.remote_shards {
             ctx.send(
@@ -854,10 +885,12 @@ pub(crate) fn route_participant_control_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slotmap::SlotMap;
     use std::cell::RefCell;
     use std::collections::HashSet as StdHashSet;
 
     use crate::entity::ExternalRoomId;
+    use crate::shard::participants::LocalParticipantKey;
 
     /// A `RoutingContext` fake that just records calls. No `ParticipantCore`,
     /// no tracing spans, no `ShardCore` — this is the whole point of the
@@ -887,12 +920,14 @@ mod tests {
     impl RoutingContext for RecordingCtx {
         fn forward_video_rtp(
             &mut self,
-            subscriber: ParticipantId,
+            subscriber: ParticipantHandle,
             _stream_id: &StreamId,
             _pkt: &RtpPacket,
             _cache: Option<&StreamCache>,
         ) {
-            self.forwarded_video.borrow_mut().push(subscriber);
+            self.forwarded_video
+                .borrow_mut()
+                .push(subscriber.participant_id());
         }
         fn forward_audio_rtp(
             &mut self,
@@ -946,6 +981,24 @@ mod tests {
         ParticipantId::new(&mut pulsebeam_runtime::rand::seeded_rng(
             COUNTER.fetch_add(1, Ordering::Relaxed),
         ))
+    }
+
+    fn add_local_subscriber(table: &mut ShardRoutingTable, participant_id: ParticipantId) {
+        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+        let key = slots.insert(());
+        let handle = ParticipantHandle::new(key, participant_id, 1);
+        table.local_participants.insert(participant_id, handle);
+    }
+
+    fn replace_local_subscriber(
+        table: &mut ShardRoutingTable,
+        participant_id: ParticipantId,
+    ) -> ParticipantHandle {
+        let mut slots = SlotMap::<LocalParticipantKey, ()>::with_key();
+        let key = slots.insert(());
+        let handle = ParticipantHandle::new(key, participant_id, 2);
+        table.local_participants.insert(participant_id, handle);
+        handle
     }
 
     // -- the bug this refactor exists to prevent recurring ------------------
@@ -1006,11 +1059,43 @@ mod tests {
             origin: pid(),
         };
 
-        let ev = table.register_subscriber(pid(), track.clone());
+        let first = pid();
+        let second = pid();
+        add_local_subscriber(&mut table, first);
+        add_local_subscriber(&mut table, second);
+
+        let ev = table.register_subscriber(first, track.clone());
         assert!(matches!(ev, Some(ShardEvent::TrackSubscribed(t)) if t == track));
 
-        let ev2 = table.register_subscriber(pid(), track);
+        let ev2 = table.register_subscriber(second, track);
         assert!(ev2.is_none(), "second subscriber must not re-notify");
+    }
+
+    #[test]
+    fn replacement_subscriber_evicts_stale_route_without_duplicate_notification() {
+        let mut table = ShardRoutingTable::new();
+        let subscriber = pid();
+        let track = TrackMeta {
+            shard_id: ShardId::new(1),
+            id: pid().derive_track_id(TrackKind::Video, "v"),
+            origin: pid(),
+        };
+        add_local_subscriber(&mut table, subscriber);
+        assert!(
+            table
+                .register_subscriber(subscriber, track.clone())
+                .is_some()
+        );
+
+        let replacement = replace_local_subscriber(&mut table, subscriber);
+        assert!(
+            table
+                .register_subscriber(subscriber, track.clone())
+                .is_none()
+        );
+
+        assert_eq!(table.tracks[&track.id].subscribers, vec![replacement]);
+        assert!(table.unregister_subscriber(subscriber, track).is_some());
     }
 
     // -- fanout ---------------------------------------------------------------
@@ -1021,6 +1106,7 @@ mod tests {
         let track_id = pid().derive_track_id(TrackKind::Video, "v");
         let stream_id: StreamId = (track_id, None);
         let subscriber = pid();
+        add_local_subscriber(&mut table, subscriber);
 
         table.register_subscriber(
             subscriber,
@@ -1035,7 +1121,7 @@ mod tests {
             .get_mut(&track_id)
             .unwrap()
             .remote_shards
-            .insert(ShardId::new(3));
+            .push(ShardId::new(3));
 
         let mut ctx = RecordingCtx {
             shard_id: ShardId::new(0),

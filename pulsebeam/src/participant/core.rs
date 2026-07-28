@@ -138,6 +138,8 @@ pub struct ParticipantCore {
     pending_timeout: Option<Instant>,
     pending_fanout: VecDeque<PendingFanout>,
     pending_rtc_mutations: VecDeque<PendingRtcMutation>,
+    rtc_deadline: Option<Instant>,
+    rtc_needs_drain: bool,
 
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
@@ -180,6 +182,8 @@ impl ParticipantCore {
             pending_timeout: None,
             pending_fanout: VecDeque::new(),
             pending_rtc_mutations: VecDeque::new(),
+            rtc_deadline: None,
+            rtc_needs_drain: true,
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             rtc,
@@ -478,28 +482,38 @@ impl ParticipantCore {
         stream.write_rtp(rtp);
     }
 
-    pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+    pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
         let mut budget = 3;
         'drain: loop {
-            let Some(rtc_deadline) = self.poll_rtc(now, events) else {
-                self.cleanup_data_topics(events);
-                events.exit();
-                return;
-            };
+            if self.rtc_needs_drain {
+                let Some(rtc_deadline) = self.poll_rtc(now, events) else {
+                    self.rtc_deadline = None;
+                    self.rtc_needs_drain = false;
+                    self.cleanup_data_topics(events);
+                    events.exit();
+                    return None;
+                };
+                self.rtc_deadline = Some(rtc_deadline);
+                self.rtc_needs_drain = false;
+            }
+            debug_assert!(self.rtc_deadline.is_some());
 
             if let Some(deadline) = self.pending_timeout.take() {
                 let now = deadline.max(now);
                 let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                self.rtc_needs_drain = true;
                 continue;
             }
 
             if self.apply_one_rtc_mutation(now) {
+                self.rtc_needs_drain = true;
                 continue;
             }
 
             if now >= self.last_slow_poll + SLOW_POLL_INTERVAL {
                 self.poll_slow(now, events);
                 self.last_slow_poll = now;
+                self.rtc_needs_drain = true;
                 continue;
             }
 
@@ -531,6 +545,7 @@ impl ParticipantCore {
                     contents,
                 };
                 let _ = self.rtc.handle_input(Input::Receive(now.into(), recv));
+                self.rtc_needs_drain = true;
                 continue 'drain;
             }
 
@@ -540,6 +555,7 @@ impl ParticipantCore {
 
             let did_work = self.signaling.poll(&mut self.rtc, &self.downstream);
             if did_work {
+                self.rtc_needs_drain = true;
                 continue;
             }
 
@@ -550,22 +566,26 @@ impl ParticipantCore {
                     self.signaling.mark_assignments_dirty();
                 }
                 self.downstream.reconcile_routes(now, events);
+                self.rtc_needs_drain = true;
                 continue;
             }
 
             let next_slow_poll = self.last_slow_poll + SLOW_POLL_INTERVAL;
-            let deadline = rtc_deadline.min(next_slow_poll);
+            let deadline = self
+                .rtc_deadline
+                .expect("drained RTC must have a deadline")
+                .min(next_slow_poll);
 
             // upper bounded to 3 ticks to defensively avoid spin loops from bugs or just to give fairness
             // to other participants
             if deadline <= now && budget > 0 {
                 budget -= 1;
                 let _ = self.rtc.handle_input(Input::Timeout(now.into()));
+                self.rtc_needs_drain = true;
                 continue;
             }
 
-            events.update_deadline(deadline);
-            break;
+            return Some(deadline);
         }
     }
 
@@ -1020,5 +1040,6 @@ impl ParticipantCore {
         plog_info!(self.log_ctx(), %reason, "Participant core disconnecting");
         self.disconnect_reason = Some(reason);
         self.rtc.disconnect();
+        self.rtc_needs_drain = true;
     }
 }

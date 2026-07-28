@@ -1,7 +1,6 @@
 use crate::entity::TrackId;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
-use tokio::time::Instant;
 
 pub trait ParticipantSink {
     fn subscribe(&mut self, track: TrackMeta);
@@ -21,7 +20,6 @@ pub trait ParticipantSink {
     fn publish_data_topic(&mut self, topic: Topic);
     fn unpublish_data_topic(&mut self, topic: Topic);
     fn request_keyframe(&mut self, layer: &TrackLayer);
-    fn update_deadline(&mut self, deadline: Instant);
     fn exit(&mut self);
 
     fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket);
@@ -43,7 +41,6 @@ pub mod test_utils {
         pub publish_data_topic_calls: Vec<Topic>,
         pub unpublish_data_topic_calls: Vec<Topic>,
         pub request_keyframe_calls: Vec<(StreamId, crate::entity::ParticipantId)>,
-        pub update_deadline_calls: Vec<Instant>,
         pub exit_count: usize,
         pub publish_rtp_calls: Vec<StreamId>,
         pub publish_sctp_calls: Vec<Topic>,
@@ -103,10 +100,6 @@ pub mod test_utils {
         fn request_keyframe(&mut self, layer: &TrackLayer) {
             self.request_keyframe_calls
                 .push((layer.stream_id(), layer.meta.origin));
-        }
-
-        fn update_deadline(&mut self, deadline: Instant) {
-            self.update_deadline_calls.push(deadline);
         }
 
         fn exit(&mut self) {

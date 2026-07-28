@@ -1,3 +1,4 @@
+use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;
 use std::{collections::VecDeque, net::SocketAddr};
 
@@ -30,76 +31,110 @@ impl OwnedPacketQueue {
         );
         self.packets.push_back(OwnedPacket { dst, contents });
     }
+}
 
-    pub fn fill_next_gso(&mut self, output: &mut GsoBuffer) -> bool {
-        debug_assert!(output.buf.is_empty(), "GSO output must start empty");
-        debug_assert_eq!(output.segment_size, 0);
-        debug_assert_eq!(output.segment_count, 0);
+#[derive(Clone, Copy)]
+struct GsoPacketMeta {
+    dst: SocketAddr,
+    segment_size: usize,
+    start: usize,
+    end: usize,
+}
 
-        let Some(first) = self.packets.front() else {
+pub struct GsoSendBatch {
+    arena: Vec<u8>,
+    packets: ArrayVec<GsoPacketMeta, { net::BATCH_SIZE }>,
+}
+
+impl GsoSendBatch {
+    pub fn preallocated() -> Self {
+        Self {
+            arena: Vec::with_capacity(net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE),
+            packets: ArrayVec::new(),
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.packets.len() == self.packets.capacity()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    pub fn append_from(&mut self, queue: &mut OwnedPacketQueue) -> bool {
+        debug_assert!(!self.is_full());
+        let Some(first) = queue.packets.front() else {
             return false;
         };
         debug_assert!(!first.contents.is_empty());
         debug_assert!(first.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
 
-        output.dst = first.dst;
-        output.segment_size = first.contents.len();
+        let dst = first.dst;
+        let segment_size = first.contents.len();
+        let start = self.arena.len();
+        let mut segment_count = 0;
 
-        while let Some(packet) = self.packets.front() {
+        while let Some(packet) = queue.packets.front() {
             debug_assert!(!packet.contents.is_empty());
             debug_assert!(packet.contents.len() <= net::MAX_UDP_PAYLOAD_SIZE);
-            debug_assert!(output.segment_count <= self.max_segments);
-            debug_assert!(output.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+            debug_assert!(segment_count <= queue.max_segments);
+            debug_assert!(self.arena.len() - start <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
 
-            if packet.dst != output.dst
-                || output.segment_count >= self.max_segments
-                || output.buf.len() + packet.contents.len() > net::MAX_UDP_GSO_PAYLOAD_SIZE
-                || packet.contents.len() > output.segment_size
+            if packet.dst != dst
+                || segment_count >= queue.max_segments
+                || self.arena.len() - start + packet.contents.len() > net::MAX_UDP_GSO_PAYLOAD_SIZE
+                || packet.contents.len() > segment_size
             {
                 break;
             }
 
-            let is_tail = packet.contents.len() < output.segment_size;
-            output.buf.extend_from_slice(&packet.contents);
-            output.segment_count += 1;
-            self.packets.pop_front();
-
-            debug_assert!(output.segment_count <= self.max_segments);
-            debug_assert!(output.buf.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+            let is_tail = packet.contents.len() < segment_size;
+            self.arena.extend_from_slice(&packet.contents);
+            segment_count += 1;
+            queue.packets.pop_front();
             if is_tail {
                 break;
             }
         }
 
-        debug_assert_ne!(output.segment_count, 0);
-        debug_assert!(!output.buf.is_empty());
-        debug_assert_ne!(output.segment_size, 0);
+        let end = self.arena.len();
+        debug_assert_ne!(segment_count, 0);
+        debug_assert!(end > start);
+        debug_assert!(end - start <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        self.packets.push(GsoPacketMeta {
+            dst,
+            segment_size,
+            start,
+            end,
+        });
         true
     }
-}
 
-pub struct GsoBuffer {
-    pub dst: SocketAddr,
-    pub segment_size: usize,
-    segment_count: usize,
-    pub buf: Vec<u8>,
-}
-
-impl GsoBuffer {
-    pub fn preallocated() -> Self {
-        Self {
-            dst: SocketAddr::from(([0, 0, 0, 0], 0)),
-            segment_size: 0,
-            segment_count: 0,
-            buf: Vec::with_capacity(net::MAX_UDP_GSO_PAYLOAD_SIZE),
+    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) {
+        if self.packets.is_empty() {
+            return;
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.segment_size = 0;
-        self.segment_count = 0;
-        self.buf.clear();
-        debug_assert!(self.buf.capacity() >= net::MAX_UDP_GSO_PAYLOAD_SIZE);
+        debug_assert!(self.packets.len() <= net::BATCH_SIZE);
+        let mut packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
+        for packet in &self.packets {
+            debug_assert!(packet.start < packet.end);
+            debug_assert!(packet.end <= self.arena.len());
+            debug_assert_ne!(packet.segment_size, 0);
+            packets.push(net::SendPacket {
+                dst: packet.dst,
+                buf: &self.arena[packet.start..packet.end],
+                segment_size: packet.segment_size,
+            });
+        }
+        let batch = net::SendPacketBatch { packets: &packets };
+        if let Err(err) = socket.try_send_batch(&batch) {
+            tracing::trace!(error = ?err, "error writing UDP egress batch");
+        }
+        drop(packets);
+        self.packets.clear();
+        self.arena.clear();
+        debug_assert!(self.arena.capacity() >= net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE);
     }
 }
 
@@ -333,20 +368,41 @@ mod tests {
     }
 
     #[test]
-    fn owned_packets_fill_preallocated_gso_buffer() {
+    fn owned_packets_fill_preallocated_send_batch() {
         let addr = create_test_addr();
         let mut packets = OwnedPacketQueue::with_capacity(4);
         packets.push_back(addr, vec![1; 1000]);
         packets.push_back(addr, vec![2; 1000]);
         packets.push_back(addr, vec![3; 500]);
-        let mut output = GsoBuffer::preallocated();
+        let mut output = GsoSendBatch::preallocated();
 
-        assert!(packets.fill_next_gso(&mut output));
-        assert_eq!(output.dst, addr);
-        assert_eq!(output.segment_size, 1000);
-        assert_eq!(output.segment_count, 3);
-        assert_eq!(output.buf.len(), 2500);
-        assert!(!packets.fill_next_gso(&mut GsoBuffer::preallocated()));
+        assert!(output.append_from(&mut packets));
+        assert_eq!(output.packets[0].dst, addr);
+        assert_eq!(output.packets[0].segment_size, 1000);
+        assert_eq!(output.packets[0].end - output.packets[0].start, 2500);
+        assert!(!output.append_from(&mut packets));
+    }
+
+    #[test]
+    fn send_batch_packs_datagrams_into_one_contiguous_arena() {
+        let first_addr = create_test_addr();
+        let second_addr = SocketAddr::new(first_addr.ip(), first_addr.port() + 1);
+        let mut packets = OwnedPacketQueue::with_capacity(4);
+        packets.push_back(first_addr, vec![1; 1000]);
+        packets.push_back(first_addr, vec![2; 500]);
+        packets.push_back(second_addr, vec![3; 700]);
+        let mut batch = GsoSendBatch::preallocated();
+        let capacity = batch.arena.capacity();
+
+        assert!(batch.append_from(&mut packets));
+        assert!(batch.append_from(&mut packets));
+
+        assert_eq!(batch.packets.len(), 2);
+        assert_eq!(batch.packets[0].start, 0);
+        assert_eq!(batch.packets[0].end, 1500);
+        assert_eq!(batch.packets[1].start, batch.packets[0].end);
+        assert_eq!(batch.packets[1].end, 2200);
+        assert_eq!(batch.arena.capacity(), capacity);
     }
 
     #[test]
@@ -358,33 +414,15 @@ mod tests {
         packets.push_back(addr, vec![2; 600]);
         packets.push_back(other, vec![3; 600]);
 
-        let mut first = GsoBuffer::preallocated();
-        let mut second = GsoBuffer::preallocated();
-        let mut third = GsoBuffer::preallocated();
-        assert!(packets.fill_next_gso(&mut first));
-        assert!(packets.fill_next_gso(&mut second));
-        assert!(packets.fill_next_gso(&mut third));
+        let mut batch = GsoSendBatch::preallocated();
+        assert!(batch.append_from(&mut packets));
+        assert!(batch.append_from(&mut packets));
+        assert!(batch.append_from(&mut packets));
 
-        assert_eq!(first.buf, [1; 500]);
-        assert_eq!(second.buf, [2; 600]);
-        assert_eq!(third.buf, [3; 600]);
-        assert_eq!(third.dst, other);
-    }
-
-    #[test]
-    fn cleared_gso_buffer_retains_full_preallocated_capacity() {
-        let addr = create_test_addr();
-        let mut packets = OwnedPacketQueue::with_capacity(1);
-        packets.push_back(addr, vec![1; 100]);
-        let mut output = GsoBuffer::preallocated();
-        assert!(packets.fill_next_gso(&mut output));
-
-        output.clear();
-
-        assert!(output.buf.is_empty());
-        assert!(output.buf.capacity() >= net::MAX_UDP_GSO_PAYLOAD_SIZE);
-        assert_eq!(output.segment_size, 0);
-        assert_eq!(output.segment_count, 0);
+        assert_eq!(&batch.arena[0..500], &[1; 500]);
+        assert_eq!(&batch.arena[500..1100], &[2; 600]);
+        assert_eq!(&batch.arena[1100..1700], &[3; 600]);
+        assert_eq!(batch.packets[2].dst, other);
     }
 
     #[test]

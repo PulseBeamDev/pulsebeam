@@ -57,6 +57,7 @@ pub fn from_socket(
     let reader = UdpTransportReader {
         sock: socket.clone(),
         local_addr,
+        arena: vec![0; CHUNK_SIZE].into_boxed_slice(),
     };
     let writer = UdpTransportWriter {
         sock: socket.clone(),
@@ -73,6 +74,7 @@ pub async fn bind(addr: SocketAddr, external_addr: Option<SocketAddr>) -> io::Re
 pub struct UdpTransportReader {
     sock: Arc<UdpSocket>,
     local_addr: SocketAddr,
+    arena: Box<[u8]>,
 }
 
 impl UdpTransportReader {
@@ -92,19 +94,19 @@ impl UdpTransportReader {
 
     #[inline]
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
-        let mut slot = vec![0u8; CHUNK_SIZE];
-        match self.sock.try_recv_from(&mut slot) {
+        debug_assert_eq!(self.arena.len(), CHUNK_SIZE);
+        match self.sock.try_recv_from(&mut self.arena) {
             Ok((n, source)) => {
                 debug_assert!(
                     n <= CHUNK_SIZE,
                     "scalar recv length exceeds maximum UDP chunk size"
                 );
-                slot.truncate(n);
+                debug_assert!(n <= self.arena.len());
                 out.push(RecvPacketBatch {
                     transport: Transport::Udp(UdpMode::Scalar),
                     src: source,
                     dst: self.local_addr,
-                    buf: slot,
+                    buf: self.arena[..n].to_vec(),
                     stride: n,
                     len: n,
                     offset: 0,
