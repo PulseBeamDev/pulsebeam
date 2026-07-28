@@ -159,12 +159,16 @@ impl ShardCore {
     pub(crate) fn fire_timers(&mut self, now: Instant) {
         let registry = &mut self.registry;
         let dirty = &mut self.dirty;
-        self.timers.drain_expired(now, |participant_id| {
-            if let Some(participant) = registry.get_mut(&participant_id) {
-                participant.on_timeout(now);
-                dirty.mark(participant_id, participant);
-            }
-        });
+        self.timers
+            .drain_expired(now, |participant_id, generation| {
+                if let Some(participant) = registry.get_mut(&participant_id) {
+                    if participant.generation != generation {
+                        return;
+                    }
+                    participant.on_timeout(now);
+                    dirty.mark(participant_id, participant);
+                }
+            });
     }
 
     pub(crate) fn on_udp_batch(
@@ -223,13 +227,15 @@ impl ShardCore {
                     at,
                     participant_id,
                 }) => {
-                    self.timers.schedule(participant_id, at);
+                    if let Some(participant) = self.registry.get(&participant_id) {
+                        self.timers
+                            .schedule(participant_id, participant.generation, at);
+                    }
                 }
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
                     participant_id,
                 }) => {
                     self.remove_participant(&participant_id);
-                    self.timers.cancel(&participant_id);
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantExited(participant_id));
                 }
@@ -590,6 +596,7 @@ impl ShardCore {
     }
 
     fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<()> {
+        self.timers.cancel(participant_id);
         let meta = self.registry.remove(participant_id)?;
         let audio_ids: Vec<_> = meta.upstream.audio_track_ids().collect();
         self.routing
