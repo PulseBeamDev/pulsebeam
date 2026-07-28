@@ -49,9 +49,10 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
         subscriber: ParticipantId,
         stream_id: &StreamId,
         pkt: &RtpPacket,
+        cache: Option<&crate::rtp::cache::StreamCache>,
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
-            p.on_forward_rtp(stream_id, pkt);
+            p.on_forward_rtp(stream_id, pkt, cache);
             self.dirty.mark(subscriber, p);
         }
     }

@@ -9,8 +9,9 @@ use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyE
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
-use crate::rtp::RtpPacket;
+use crate::rtp::{RtpPacket, cache::StreamCache};
 use crate::track::{StreamId, Topic, Track, TrackMeta};
+use str0m::media::Rid;
 
 use super::worker::{CrossShardEvent, ShardEvent};
 
@@ -37,6 +38,7 @@ pub(crate) trait RoutingContext: CrossShardSend {
         subscriber: ParticipantId,
         stream_id: &StreamId,
         pkt: &RtpPacket,
+        cache: Option<&StreamCache>,
     );
     fn forward_audio_rtp(
         &mut self,
@@ -161,6 +163,7 @@ pub(crate) struct TrackRoute {
     pub kind: TrackKind,
     pub subscribers: FastIndexSet<ParticipantId>,
     pub remote_shards: FastIndexSet<ShardId>,
+    stream_caches: Vec<(Option<Rid>, StreamCache)>,
 }
 
 impl TrackRoute {
@@ -169,7 +172,23 @@ impl TrackRoute {
             kind,
             subscribers: fast_set_with_capacity(256),
             remote_shards: fast_set(),
+            stream_caches: Vec::with_capacity(4),
         }
+    }
+
+    fn cache_for(&mut self, rid: Option<Rid>) -> &mut StreamCache {
+        if let Some(pos) = self.stream_caches.iter().position(|(r, _)| *r == rid) {
+            return &mut self.stream_caches[pos].1;
+        }
+        self.stream_caches.push((rid, StreamCache::default()));
+        &mut self.stream_caches.last_mut().unwrap().1
+    }
+
+    fn get_cache(&self, rid: Option<Rid>) -> Option<&StreamCache> {
+        self.stream_caches
+            .iter()
+            .find(|(r, _)| *r == rid)
+            .map(|(_, c)| c)
     }
 }
 
@@ -672,12 +691,19 @@ impl ShardRoutingTable {
     // -- hot-path packet fanout --------------------------------------------
 
     #[inline]
-    pub fn route_video(&self, stream_id: StreamId, pkt: &RtpPacket, ctx: &mut impl RoutingContext) {
-        let Some(route) = self.tracks.get(&stream_id.0) else {
+    pub fn route_video(
+        &mut self,
+        stream_id: StreamId,
+        pkt: &RtpPacket,
+        ctx: &mut impl RoutingContext,
+    ) {
+        let Some(route) = self.tracks.get_mut(&stream_id.0) else {
             return;
         };
+        route.cache_for(stream_id.1).push(pkt);
+        let cache = route.get_cache(stream_id.1);
         for &subscriber_id in &route.subscribers {
-            ctx.forward_video_rtp(subscriber_id, &stream_id, pkt);
+            ctx.forward_video_rtp(subscriber_id, &stream_id, pkt, cache);
         }
         for &shard_id in &route.remote_shards {
             ctx.send(
@@ -864,6 +890,7 @@ mod tests {
             subscriber: ParticipantId,
             _stream_id: &StreamId,
             _pkt: &RtpPacket,
+            _cache: Option<&StreamCache>,
         ) {
             self.forwarded_video.borrow_mut().push(subscriber);
         }

@@ -1,4 +1,4 @@
-pub mod buffer;
+pub mod cache;
 pub mod monitor;
 pub mod switcher;
 pub mod sync;

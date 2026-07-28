@@ -4,18 +4,21 @@ use str0m::media::Frequency;
 use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
-use crate::rtp::buffer::KeyframeBuffer;
 use crate::rtp::timeline::Timeline;
 
 const SWITCHER_PENDING_CAPACITY: usize = 32;
 
+/// Handles RTP stream switching with seamless seq/timestamp rewriting.
+///
+/// Callers feed the active stream via `push` and pre-validated cache packets
+/// via `stage_direct`. `pop` drains the active queue first, then the staged
+/// queue, rebasing the timeline on the first staged packet so the subscriber
+/// sees a continuous output sequence.
 #[derive(Debug)]
 pub struct Switcher {
     timeline: Timeline,
-    /// Packets from the OLD stream currently being drained.
     pending: VecDeque<RtpPacket>,
-    /// The staging area for the NEW stream.
-    staging: KeyframeBuffer,
+    staged: VecDeque<RtpPacket>,
     latest_playout: Instant,
     seen_first: bool,
     is_switching: bool,
@@ -27,7 +30,7 @@ impl Switcher {
         Self {
             timeline: Timeline::new(clock_rate, rng),
             pending: VecDeque::with_capacity(SWITCHER_PENDING_CAPACITY),
-            staging: KeyframeBuffer::new(),
+            staged: VecDeque::new(),
             latest_playout: Instant::now(),
             seen_first: false,
             is_switching: false,
@@ -36,13 +39,12 @@ impl Switcher {
     }
 
     pub fn push(&mut self, pkt: RtpPacket) {
+        debug_assert!(!self.is_switching, "push while state is switching");
         if self.is_switching {
-            debug_assert!(false, "push while state is switching");
             return;
         }
 
         if self.pending.len() == SWITCHER_PENDING_CAPACITY {
-            // Keep output sequence continuity even when dropping oldest pending packet.
             let _ = self.pending.pop_front();
             self.timeline.drop_count(1);
         }
@@ -51,18 +53,20 @@ impl Switcher {
         self.switched = false;
     }
 
-    pub fn stage(&mut self, pkt: RtpPacket) {
-        if self.is_switching {
-            debug_assert!(false, "stage while state is already switching");
-            return;
-        }
-
-        let is_switching = self.staging.push(pkt, self.latest_playout);
-        if is_switching {
+    /// Load pre-validated packets from the shared stream cache. Drains the
+    /// active pending queue so output transitions cleanly to the new stream.
+    pub fn stage_direct(&mut self, packets: impl IntoIterator<Item = RtpPacket>) {
+        debug_assert!(!self.is_switching);
+        self.staged.extend(packets);
+        if !self.staged.is_empty() {
             self.pending.clear();
             self.seen_first = false;
             self.is_switching = true;
         }
+    }
+
+    pub fn is_switching(&self) -> bool {
+        self.is_switching
     }
 
     pub fn pop(&mut self) -> Option<RtpPacket> {
@@ -73,13 +77,11 @@ impl Switcher {
         }
 
         if self.is_switching {
-            if let Some(mut pkt) = self.staging.pop() {
-                // If this is the very first packet of the new stream after a switch.
+            if let Some(mut pkt) = self.staged.pop_front() {
                 if !self.seen_first {
                     self.timeline.rebase(&pkt);
                     self.seen_first = true;
                 }
-
                 self.update_latest_playout(pkt.playout_time);
                 self.timeline.rewrite(&mut pkt);
                 return Some(pkt);
@@ -103,7 +105,7 @@ impl Switcher {
     }
 
     pub fn clear_staging(&mut self) {
-        self.staging.clear();
+        self.staged.clear();
         self.is_switching = false;
         self.seen_first = false;
         self.switched = false;
@@ -126,21 +128,12 @@ mod test {
         rtp::Ssrc,
     };
 
-    fn pkt(
-        ssrc: u32,
-        seq_no: u64,
-        rtp_ts: u64,
-        playout_time: Instant,
-        is_keyframe: bool,
-        marker: bool,
-    ) -> RtpPacket {
+    fn pkt(ssrc: u32, seq_no: u64, rtp_ts: u64, playout_time: Instant) -> RtpPacket {
         RtpPacket {
             ssrc: Ssrc::from(ssrc),
             seq_no: seq_no.into(),
             rtp_ts: MediaTime::new(rtp_ts, Frequency::NINETY_KHZ),
             playout_time,
-            is_keyframe,
-            marker,
             ..Default::default()
         }
     }
@@ -158,20 +151,10 @@ mod test {
         let now = Instant::now();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(7));
 
-        // Prime active stream and timeline.
-        switcher.push(pkt(10, 10, 1_000, now, false, true));
+        switcher.push(pkt(10, 10, 1_000, now));
         let active_out = switcher.pop().expect("active packet should be emitted");
 
-        // Stage new stream with boundary marker from previous frame then keyframe.
-        switcher.stage(pkt(20, 99, 2_000, now, false, true));
-        switcher.stage(pkt(
-            20,
-            100,
-            2_100,
-            now + Duration::from_millis(1),
-            true,
-            false,
-        ));
+        switcher.stage_direct([pkt(20, 100, 2_100, now + Duration::from_millis(1))]);
 
         let switched = drain_all(&mut switcher);
         assert_eq!(switched.len(), 1);
@@ -181,54 +164,14 @@ mod test {
     }
 
     #[test]
-    fn does_not_switch_when_staged_playout_is_too_old() {
-        let now = Instant::now();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(8));
-
-        // Prime latest playout from active stream.
-        switcher.push(pkt(10, 1, 1_000, now, false, true));
-        let _ = switcher.pop();
-
-        let old = now - Duration::from_millis(100);
-        switcher.stage(pkt(
-            20,
-            199,
-            2_000,
-            old - Duration::from_millis(1),
-            false,
-            true,
-        ));
-        switcher.stage(pkt(20, 200, 2_100, old, true, false));
-
-        assert!(switcher.pop().is_none());
-        assert!(!switcher.ready_to_switch());
-    }
-
-    #[test]
     fn clear_resets_in_flight_transition_state() {
         let now = Instant::now();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(9));
 
-        switcher.push(pkt(10, 1, 1_000, now, false, true));
+        switcher.push(pkt(10, 1, 1_000, now));
         let _ = switcher.pop();
 
-        switcher.stage(pkt(
-            20,
-            49,
-            2_000,
-            now + Duration::from_millis(1),
-            false,
-            true,
-        ));
-        switcher.stage(pkt(
-            20,
-            50,
-            2_100,
-            now + Duration::from_millis(1),
-            true,
-            false,
-        ));
-
+        switcher.stage_direct([pkt(20, 50, 2_100, now + Duration::from_millis(1))]);
         switcher.clear();
 
         assert!(switcher.pop().is_none());
@@ -241,55 +184,28 @@ mod test {
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(10));
 
         for i in 0..(SWITCHER_PENDING_CAPACITY as u64 * 4) {
-            switcher.push(pkt(10, 10_000 + i, 100_000 + i, now, false, false));
+            switcher.push(pkt(10, 10_000 + i, 100_000 + i, now));
         }
 
         assert_eq!(switcher.pending.len(), SWITCHER_PENDING_CAPACITY);
     }
 
     #[test]
-    fn prepare_for_staging_clears_staging_and_resets_state() {
+    fn clear_staging_resets_and_accepts_new_stage_direct() {
         let now = Instant::now();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(11));
 
-        // Prime active path and latest playout.
-        switcher.push(pkt(10, 1, 1_000, now, false, true));
+        switcher.push(pkt(10, 1, 1_000, now));
         let _ = switcher.pop();
 
-        // Start one transition and complete it so state reaches Stable.
-        switcher.stage(pkt(20, 99, 2_000, now, false, true));
-        switcher.stage(pkt(
-            20,
-            100,
-            2_100,
-            now + Duration::from_millis(1),
-            true,
-            false,
-        ));
+        switcher.stage_direct([pkt(20, 100, 2_100, now + Duration::from_millis(1))]);
         let _ = drain_all(&mut switcher);
         assert!(switcher.ready_to_switch());
 
-        // User requests a new staging session.
         switcher.clear_staging();
         assert!(!switcher.ready_to_switch());
 
-        // New staging should be accepted and complete normally.
-        switcher.stage(pkt(
-            30,
-            199,
-            3_000,
-            now + Duration::from_millis(2),
-            false,
-            true,
-        ));
-        switcher.stage(pkt(
-            30,
-            200,
-            3_100,
-            now + Duration::from_millis(3),
-            true,
-            false,
-        ));
+        switcher.stage_direct([pkt(30, 200, 3_100, now + Duration::from_millis(2))]);
         let out = drain_all(&mut switcher);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ssrc, Ssrc::from(30));

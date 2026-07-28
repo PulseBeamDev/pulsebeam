@@ -1,6 +1,7 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
+use crate::rtp::cache::StreamCache;
 use crate::rtp::switcher::Switcher;
 use crate::rtp::{self, RtpPacket};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -326,31 +327,17 @@ impl VideoAllocator {
         &mut self,
         stream_id: &StreamId,
         pkt: &RtpPacket,
+        cache: Option<&StreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        let Some(slot_key) = self.routes.get(&stream_id.0) else {
+        let Some(&slot_key) = self.routes.get(&stream_id.0) else {
             return false;
         };
-
-        let Some(slot) = self.slots.get_mut(*slot_key) else {
+        let Some(slot) = self.slots.get_mut(slot_key) else {
             plog_warn!(self.ctx, "no slot found for {:?}", stream_id);
             return false;
         };
-
-        let mut state_changed = false;
-        slot.process(stream_id, pkt);
-        while let Some(pkt) = slot.switcher.pop() {
-            writer.write_video_owned(pkt, slot.mid, slot.rid, slot.pt);
-        }
-        // Only promote staging→active once we have actually seen packets for the
-        // current staging layer. Otherwise an empty staging buffer will appear
-        // ready immediately and can prematurely switch away from the old stream.
-        if slot.should_promote_staging() {
-            slot.active = slot.staging.take();
-            state_changed = true;
-        }
-
-        state_changed
+        slot.on_rtp(stream_id, pkt, cache, writer)
     }
 
     pub fn poll_slow(
@@ -638,23 +625,38 @@ impl Slot {
         changed
     }
 
-    fn process(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
+    fn on_rtp(
+        &mut self,
+        stream_id: &StreamId,
+        pkt: &RtpPacket,
+        cache: Option<&StreamCache>,
+        writer: &mut StreamWriter,
+    ) -> bool {
         if self.paused {
             plog_trace!(self.ctx, mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
-            return;
+            return false;
         }
-
-        if let Some(active) = self.active.as_ref()
-            && active.is(stream_id)
-        {
+        if self.active.as_ref().is_some_and(|a| a.is(stream_id)) {
             self.switcher.push(pkt.clone());
-        } else if let Some(staging) = self.staging.as_ref()
-            && staging.is(stream_id)
-        {
-            self.switcher.stage(pkt.clone());
-        } else {
-            plog_trace!(self.ctx, mid=%self.mid, stream_id=?stream_id, active_target=?self.active.as_ref().map(|l| l.stream_id()), staging_target=?self.staging.as_ref().map(|l| l.stream_id()), "incoming packet ignored: stream does not match active or staging target");
+            while let Some(out) = self.switcher.pop() {
+                writer.write_video_owned(out, self.mid, self.rid, self.pt);
+            }
+            return false;
         }
+        if self.staging.as_ref().is_some_and(|s| s.is(stream_id))
+            && !self.switcher.is_switching()
+            && let Some(pkts) = cache.and_then(|c| c.replay())
+        {
+            self.switcher.stage_direct(pkts);
+            while let Some(out) = self.switcher.pop() {
+                writer.write_video_owned(out, self.mid, self.rid, self.pt);
+            }
+            if self.should_promote_staging() {
+                self.active = self.staging.take();
+                return true;
+            }
+        }
+        false
     }
 
     fn should_promote_staging(&self) -> bool {
@@ -1308,7 +1310,8 @@ mod assignment_tests {
         let mut pkt = RtpPacket::default();
         pkt.seq_no = 1.into();
 
-        slot.process(&high.stream_id(), &pkt);
+        let mut writer = crate::track::StreamWriter::new();
+        slot.on_rtp(&high.stream_id(), &pkt, None, &mut writer);
 
         assert!(
             !slot.should_promote_staging(),

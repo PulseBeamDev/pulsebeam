@@ -220,10 +220,15 @@ impl ParticipantCore {
     }
 
     #[inline]
-    pub fn on_forward_rtp(&mut self, stream_id: &StreamId, pkt: &RtpPacket) {
-        let promoted = self
-            .downstream
-            .on_forward_rtp(stream_id, pkt, &mut self.stream_writer);
+    pub fn on_forward_rtp(
+        &mut self,
+        stream_id: &StreamId,
+        pkt: &RtpPacket,
+        cache: Option<&crate::rtp::cache::StreamCache>,
+    ) {
+        let promoted =
+            self.downstream
+                .on_forward_rtp(stream_id, pkt, cache, &mut self.stream_writer);
         if promoted {
             self.signaling.mark_assignments_dirty();
         }
