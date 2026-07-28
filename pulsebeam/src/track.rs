@@ -155,12 +155,8 @@ impl UpstreamTrackLayer {
             return;
         };
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
-        // A stream with no active spatial layers (or absent from the list) is
-        // declared inactive by the sender.
-        let active = vla
-            .simulcast_streams
-            .get(idx)
-            .is_some_and(|s| !s.spatial_layers.is_empty());
+        let active = target_bps > 0;
+        debug_assert_eq!(active, vla_stream_target_bps(vla, idx).is_some());
         let state = self.monitor.shared_state();
         let first_declaration = state.declared_target_bps() == 0.0 && target_bps > 0;
         state.set_declared_target_bps(target_bps);

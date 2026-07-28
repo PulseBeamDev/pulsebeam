@@ -210,6 +210,9 @@ impl StreamStateInner {
 
     pub fn set_vla_inactive(&self, inactive: bool) {
         self.vla_inactive.store(inactive, Ordering::Relaxed);
+        if inactive {
+            self.inactive.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Fast-reacting bandwidth *demand* signal — for asking str0m to probe
@@ -347,11 +350,14 @@ impl StreamMonitor {
 
     pub fn process_packet(&mut self, packet: &RtpPacket) {
         let was_inactive = self.shared_state.is_inactive();
+        let may_activate = !self.shared_state.is_vla_inactive();
         self.last_packet_at = packet.arrival_ts;
-        self.shared_state.inactive.store(false, Ordering::Relaxed);
+        if may_activate {
+            self.shared_state.inactive.store(false, Ordering::Relaxed);
+        }
         self.bwe.record(packet);
 
-        if was_inactive {
+        if was_inactive && may_activate {
             self.window_highest_seq = None;
             self.window_start_seq = 0;
             self.window_actual_packets = 0;
@@ -925,6 +931,7 @@ mod test {
         // next poll even though the packet is recent and there's no sibling — no
         // 1s timeout wait.
         shared.set_vla_inactive(true);
+        assert!(shared.is_inactive());
         monitor.poll(now + Duration::from_millis(50), false);
         assert!(
             shared.is_inactive(),
@@ -939,6 +946,25 @@ mod test {
             !shared.is_inactive(),
             "layer must reactivate once the sender declares it active again"
         );
+    }
+
+    #[test]
+    fn packet_cannot_reactivate_vla_inactive_layer() {
+        let shared = StreamState::new(false, 400_000);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "q".into(), shared.clone());
+        let now = Instant::now();
+
+        shared.set_vla_inactive(true);
+        monitor.process_packet(&packet(1, now));
+
+        assert!(shared.is_inactive());
+        assert!(!shared.is_healthy());
+
+        shared.set_vla_inactive(false);
+        monitor.process_packet(&packet(2, now + Duration::from_millis(10)));
+
+        assert!(!shared.is_inactive());
+        assert!(shared.is_healthy());
     }
 
     #[test]

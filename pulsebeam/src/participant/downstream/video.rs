@@ -880,12 +880,25 @@ impl AllocationEngine {
     /// currently healthy enough to forward. Falls back to the lowest healthy
     /// layer (closest rank) when no spatially-allowed layer exists.
     fn pause_target<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
-        slot.track
+        let target = slot
+            .track
             .layers
             .iter()
-            .filter(|layer| Self::spatially_allowed(slot, layer))
+            .filter(|layer| Self::eligible(slot, layer))
             .min_by_key(|layer| layer.quality)
             .or_else(|| Self::closest_healthy(slot))
+            .or_else(|| {
+                slot.track
+                    .layers
+                    .iter()
+                    .filter(|layer| Self::spatially_allowed(slot, layer))
+                    .min_by_key(|layer| layer.quality)
+            });
+        debug_assert!(
+            Self::closest_healthy(slot).is_none()
+                || target.is_some_and(|layer| layer.state.is_healthy())
+        );
+        target
     }
 
     /// The lowest eligible layer strictly above the selected layer.
@@ -2481,15 +2494,13 @@ mod allocation_tests {
     /// (Medium/"h") as the closest-rank fallback.
     #[test]
     fn closest_rank_fallback_when_low_layer_inactive() {
-        use crate::rtp::monitor::StreamQuality;
-
         let t = healthy_track();
         // Mark Low/"q" inactive — only High and Medium are publishing.
         t.by_quality(LayerQuality::Low)
             .unwrap()
             .state
             .update_for_test()
-            .quality(StreamQuality::Bad);
+            .inactive(true);
 
         let med_bps = layer_bps(&t, LayerQuality::Medium);
 
@@ -2510,6 +2521,25 @@ mod allocation_tests {
                 layer.quality
             );
         }
+    }
+
+    #[test]
+    fn pause_targets_live_h_when_q_is_inactive() {
+        let t = healthy_track();
+        t.by_quality(LayerQuality::Low)
+            .unwrap()
+            .state
+            .update_for_test()
+            .inactive(true);
+
+        let slots = sorted(vec![qos_slot("a", 180, 360, 0, &t, LayerQuality::Low)]);
+        let decisions = AllocationEngine::compute(bw(1), &slots);
+
+        let AllocationDecision::Pause(layer, _) = decisions[slots[0].key] else {
+            panic!("insufficient bandwidth must pause the slot");
+        };
+        assert_eq!(layer.quality, LayerQuality::Medium);
+        assert!(layer.state.is_healthy());
     }
 }
 
