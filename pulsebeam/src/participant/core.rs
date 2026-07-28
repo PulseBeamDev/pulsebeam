@@ -706,9 +706,9 @@ impl ParticipantCore {
                     events.request_keyframe(layer);
                 }
             }
-            Event::EgressBitrateEstimate(BweKind::Twcc(available)) => self
-                .downstream
-                .update_bitrate(now, available, self.rtc.bwe().is_overusing()),
+            Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
+                self.downstream.update_bitrate(now, available)
+            }
             Event::MediaEgressStats(stats) => {
                 if let Some(remote) = stats.remote {
                     self.downstream.handle_egress_stats(
