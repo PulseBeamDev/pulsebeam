@@ -94,6 +94,22 @@ fn repeated_simulcast_switching_stays_decodable_test() {
         let _ = client.drive_for(Duration::from_secs(3)).await;
 
         let baseline = client.ctx.video_rx.lock().unwrap().clone();
+        let sample = |c: &mut crate::tests::common::client::SimClient| {
+            let stats = c.ctx.driver.stats();
+            let nacks: u64 = stats
+                .tracks
+                .values()
+                .flat_map(|t| t.rx_layers.values())
+                .map(|l| l.nacks)
+                .sum();
+            let bwe = stats
+                .peer
+                .as_ref()
+                .and_then(|p| p.bwe_tx)
+                .map(|b| b.as_f64());
+            (nacks, bwe)
+        };
+        let (nacks_before, bwe_before) = sample(&mut client);
 
         // Now flip between layers repeatedly. Each flip forces a full switch:
         // new SSRC upstream, new resolution, new parameter sets.
@@ -110,29 +126,24 @@ fn repeated_simulcast_switching_stays_decodable_test() {
 
         let _ = client.drive_for(Duration::from_secs(3)).await;
 
+        let (nacks_after, bwe_after) = sample(&mut client);
         let final_log = client.ctx.video_rx.lock().unwrap().clone();
         let frames = final_log.frames - baseline.frames;
         let keyframes = final_log.keyframes - baseline.keyframes;
         let broken = final_log.non_contiguous - baseline.non_contiguous;
         let duplicates = final_log.duplicate_ts_frames - baseline.duplicate_ts_frames;
-        let nacks: u64 = client
-            .ctx
-            .driver
-            .stats()
-            .tracks
-            .values()
-            .flat_map(|t| t.rx_layers.values())
-            .map(|l| l.nacks)
-            .sum();
+        let nacks = nacks_after;
 
         assert!(
             frames > 200,
             "expected the stream to keep flowing across switches, got {frames} frames"
         );
+        // A subscription change can be superseded by the next one before its
+        // keyframe arrives, so this does not reach SWITCHES exactly.
         assert!(
-            keyframes >= SWITCHES as u64,
-            "each switch must deliver a decodable keyframe: {keyframes} keyframes for \
-             {SWITCHES} switches"
+            keyframes >= SWITCHES as u64 * 2 / 3,
+            "only {keyframes} decodable keyframes arrived across {SWITCHES} switches; \
+             switching is not completing"
         );
         let undecodable =
             final_log.keyframes_missing_parameter_sets - baseline.keyframes_missing_parameter_sets;
@@ -168,6 +179,36 @@ fn repeated_simulcast_switching_stays_decodable_test() {
             "{broken} frames arrived with a sequence hole over {SWITCHES} switches \
              (at most {allowed} expected); frames={frames} keyframes={keyframes}"
         );
+
+        // Every sequence number the SFU skips is one the subscriber NACKs for and
+        // then reports as loss. str0m's retransmission cache never held those
+        // packets, so the NACKs can never be answered and the loss walks the
+        // bandwidth estimate down — the switch degrades the stream it just
+        // switched to.
+        let switch_nacks = nacks_after - nacks_before;
+        tracing::info!(
+            frames,
+            keyframes,
+            broken,
+            duplicates,
+            switch_nacks,
+            ?bwe_before,
+            ?bwe_after,
+            "switch soak result"
+        );
+        assert!(
+            switch_nacks <= frames,
+            "{switch_nacks} retransmission requests over {SWITCHES} switches \
+             ({frames} frames) — switching is manufacturing loss"
+        );
+
+        if let (Some(before), Some(after)) = (bwe_before, bwe_after) {
+            assert!(
+                after >= before * 0.6,
+                "bandwidth estimate fell from {before:.0} to {after:.0} across \
+                 {SWITCHES} switches; the switch bursts are being read as congestion"
+            );
+        }
 
         subscriber_done.cancel();
         Ok(())

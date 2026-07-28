@@ -34,6 +34,11 @@ pub struct Timeline {
     /// (wall time, output rtp_ts) of the first packet ever forwarded. Every
     /// rebase re-anchors against this so switches do not accumulate skew.
     epoch: Option<(Instant, u64)>,
+    /// Interval between consecutive output frames, learned from the source.
+    frame_interval: Option<u64>,
+    /// Set by a rebase: the first frame of a new source must not teach the
+    /// cadence, because the interval across the seam is the one being chosen.
+    awaiting_first_frame: bool,
 }
 
 impl std::fmt::Debug for Timeline {
@@ -55,6 +60,8 @@ impl Timeline {
             max_output_ts: 0,
             ts_base: 0,
             epoch: None,
+            frame_interval: None,
+            awaiting_first_frame: false,
         }
     }
 
@@ -64,15 +71,36 @@ impl Timeline {
         Self::new_with_base(clock_rate, base_seq_no)
     }
 
-    /// Smallest RTP-timestamp advance a switch may make.
-    ///
-    /// The frame that starts the new stream must never share a timestamp with
-    /// the frame that ended the old one, or the subscriber's decoder treats the
-    /// two as one frame. One 60fps frame interval is the smallest gap that also
-    /// reads as a plausible frame duration.
+    /// Smallest RTP-timestamp advance a switch may make when the source cadence
+    /// is not known yet. The frame starting the new stream must never share a
+    /// timestamp with the frame that ended the old one.
     #[inline]
     fn min_switch_advance(&self) -> u64 {
         (self.clock_rate.get() as u64 / 60).max(1)
+    }
+
+    /// Where the new source's first frame should land.
+    ///
+    /// Wall-clock alone puts the seam wherever the two sources happen to sit
+    /// relative to each other, which is almost never a whole frame after the
+    /// last one — the subscriber then renders one frame short or long and the
+    /// video visibly hitches. Snapping the advance to the source's own cadence
+    /// keeps playback even. Rounding to the nearest frame keeps the result
+    /// within half a frame of real time, so this does not reintroduce drift.
+    fn switch_target(&self, raw_target: u64) -> u64 {
+        let Some(interval) = self.frame_interval.filter(|i| *i > 0) else {
+            return raw_target.max(self.max_output_ts + self.min_switch_advance());
+        };
+        let advance = raw_target.saturating_sub(self.max_output_ts);
+        let frames = ((advance + interval / 2) / interval).max(1);
+        self.max_output_ts + frames * interval
+    }
+
+    /// Whether `delta` between consecutive frames is a believable frame interval
+    /// rather than a stall or a clock glitch.
+    #[inline]
+    fn plausible_interval(&self, delta: u64) -> bool {
+        delta > 0 && delta <= self.clock_rate.get() as u64
     }
 
     #[inline]
@@ -104,9 +132,8 @@ impl Timeline {
             None => 0,
             Some((epoch_at, epoch_ts)) => {
                 let elapsed = packet.playout_time.saturating_duration_since(epoch_at);
-                let target = epoch_ts.wrapping_add(self.ticks(elapsed));
-                let floor = self.max_output_ts.wrapping_add(self.min_switch_advance());
-                let target = if target < floor { floor } else { target };
+                let raw_target = epoch_ts.wrapping_add(self.ticks(elapsed));
+                let target = self.switch_target(raw_target);
                 debug_assert!(
                     target > self.max_output_ts,
                     "rebase must move the output clock forward"
@@ -114,6 +141,7 @@ impl Timeline {
                 target.wrapping_sub(input_ts)
             }
         };
+        self.awaiting_first_frame = true;
     }
 
     /// Rewrite `pkt` preserving its position relative to its own stream, so gaps
@@ -133,6 +161,26 @@ impl Timeline {
         let output_seq: SeqNo = self.max_output.wrapping_add(1).into();
         let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
         self.apply(pkt, output_seq, output_ts);
+    }
+
+    /// The current input-to-output translation, so a caller can keep forwarding
+    /// a stream it has switched away from into the gaps that switch left.
+    pub fn seq_base(&self) -> SeqNo {
+        self.seq_base
+    }
+
+    pub fn ts_base(&self) -> u64 {
+        self.ts_base
+    }
+
+    /// Burn `n` output sequence numbers without emitting anything.
+    ///
+    /// Leaves a hole the subscriber will read as loss. Used to mark a frame the
+    /// forwarder cut short, which is otherwise indistinguishable from a complete
+    /// one and would be decoded as if whole.
+    pub fn skip_output_sequence(&mut self, n: u64) {
+        debug_assert!(n > 0);
+        self.max_output = (*self.max_output).wrapping_add(n).into();
     }
 
     /// After a burst rewritten with `rewrite_sequential`, realign the sequence
@@ -157,6 +205,12 @@ impl Timeline {
             self.max_output = output_seq;
         }
         if output_ts > self.max_output_ts {
+            let delta = output_ts - self.max_output_ts;
+            if self.awaiting_first_frame {
+                self.awaiting_first_frame = false;
+            } else if self.plausible_interval(delta) {
+                self.frame_interval = Some(delta);
+            }
             self.max_output_ts = output_ts;
         }
     }
@@ -368,6 +422,151 @@ mod test {
         timeline.rebase(&next);
         timeline.rewrite(&mut next);
         assert_eq!(*next.seq_no, *p3.seq_no + 1);
+    }
+
+    #[test]
+    fn every_packet_of_a_frame_keeps_one_timestamp_across_a_switch() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut seq = 0u64;
+        let mut emit = |timeline: &mut Timeline, ts: u64, at: Instant, rebase: bool| {
+            let mut out = Vec::new();
+            for i in 0..4u64 {
+                let mut p = pkt(seq + i, ts, at);
+                if i == 0 && rebase {
+                    timeline.rebase(&p);
+                }
+                timeline.rewrite(&mut p);
+                out.push(p.rtp_ts.numer());
+            }
+            seq += 4;
+            out
+        };
+
+        let a = emit(&mut timeline, 10_000, t0, true);
+        assert!(
+            a.iter().all(|&ts| ts == a[0]),
+            "frame split across timestamps"
+        );
+
+        // A new source with an unrelated timestamp base.
+        let b = emit(
+            &mut timeline,
+            4_000_000_000,
+            t0 + Duration::from_millis(33),
+            true,
+        );
+        assert!(
+            b.iter().all(|&ts| ts == b[0]),
+            "frame split across timestamps"
+        );
+        assert!(b[0] > a[0]);
+    }
+
+    #[test]
+    fn a_source_timestamp_base_far_above_ours_still_maps_forward() {
+        // `ts_base` is computed with wrapping arithmetic, so a source whose
+        // timestamps sit near the top of the 32-bit space produces a base that
+        // wraps. The mapped output must still land where we intend.
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a = pkt(1, 100_000, t0);
+        timeline.rebase(&a);
+        timeline.rewrite(&mut a);
+
+        let mut b = pkt(2, u32::MAX as u64 - 500, t0 + Duration::from_millis(100));
+        timeline.rebase(&b);
+        timeline.rewrite(&mut b);
+
+        assert!(
+            b.rtp_ts.numer() > a.rtp_ts.numer(),
+            "wrapping base produced a backwards timestamp: {} then {}",
+            a.rtp_ts.numer(),
+            b.rtp_ts.numer()
+        );
+        assert_eq!(
+            b.rtp_ts.numer() - a.rtp_ts.numer(),
+            9000,
+            "the switch must advance by the real elapsed time"
+        );
+
+        // And the stream continues linearly from there, including across the
+        // point where the source's own 32-bit timestamps wrap.
+        let mut c = pkt(3, u32::MAX as u64 + 2500, t0 + Duration::from_millis(133));
+        timeline.rewrite(&mut c);
+        assert_eq!(c.rtp_ts.numer() - b.rtp_ts.numer(), 3000);
+    }
+
+    #[test]
+    fn a_source_timestamp_base_far_below_ours_still_maps_forward() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a = pkt(1, 4_100_000_000, t0);
+        timeline.rebase(&a);
+        timeline.rewrite(&mut a);
+
+        let mut b = pkt(2, 900, t0 + Duration::from_millis(100));
+        timeline.rebase(&b);
+        timeline.rewrite(&mut b);
+
+        assert!(b.rtp_ts.numer() > a.rtp_ts.numer());
+        assert_eq!(b.rtp_ts.numer() - a.rtp_ts.numer(), 9000);
+    }
+
+    #[test]
+    fn a_stream_keeps_its_own_frame_pacing_between_switches() {
+        // The forwarder re-anchors a stream at the switch, but must not distort
+        // the frame-to-frame timing inside it: that timing is the source's.
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut first = pkt(1, 50_000, t0);
+        timeline.rebase(&first);
+        timeline.rewrite(&mut first);
+
+        // Deliberately irregular source pacing (variable frame rate).
+        let deltas = [3000u64, 1500, 6000, 3000, 750, 12_000];
+        let mut input_ts = 50_000u64;
+        let mut prev_out = first.rtp_ts.numer();
+        for (i, delta) in deltas.iter().enumerate() {
+            input_ts += delta;
+            let mut p = pkt(
+                2 + i as u64,
+                input_ts,
+                t0 + Duration::from_millis(33 * (i as u64 + 1)),
+            );
+            timeline.rewrite(&mut p);
+            assert_eq!(
+                p.rtp_ts.numer() - prev_out,
+                *delta,
+                "frame interval {i} was distorted"
+            );
+            prev_out = p.rtp_ts.numer();
+        }
+    }
+
+    #[test]
+    fn a_switch_after_a_long_pause_advances_by_the_time_that_passed() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a = pkt(1, 10_000, t0);
+        timeline.rebase(&a);
+        timeline.rewrite(&mut a);
+
+        // The slot was paused for ten seconds, then resumed on another source.
+        let mut b = pkt(2, 777_000, t0 + Duration::from_secs(10));
+        timeline.rebase(&b);
+        timeline.rewrite(&mut b);
+
+        assert_eq!(
+            b.rtp_ts.numer() - a.rtp_ts.numer(),
+            10 * 90_000,
+            "the output clock must reflect the real gap, not invent one"
+        );
     }
 
     #[test]

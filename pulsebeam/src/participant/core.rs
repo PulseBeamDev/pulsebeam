@@ -435,10 +435,11 @@ impl ParticipantCore {
     }
 
     fn apply_stream_write(&mut self, write: StreamWrite, now: Instant) {
-        let (pkt, mid, rid, pt, nackable) = match write {
-            StreamWrite::Video { pkt, mid, rid, pt } => (pkt, mid, rid, pt, true),
-            StreamWrite::Audio { pkt, mid, pt } => (pkt, mid, None, pt, false),
+        let (pkt, mid, rid, pt, kind) = match write {
+            StreamWrite::Video { pkt, mid, rid, pt } => (pkt, mid, rid, pt, MediaKind::Video),
+            StreamWrite::Audio { pkt, mid, pt } => (pkt, mid, None, pt, MediaKind::Audio),
         };
+        let nackable = kind == MediaKind::Video;
 
         let ctx = self.log_ctx();
         let mut api = self.rtc.direct_api();
@@ -452,12 +453,16 @@ impl ParticipantCore {
         };
         let ssrc = stream.ssrc();
         #[cfg(debug_assertions)]
-        if let Some(violation) = self
-            .egress_guard
-            .check(mid, rid, *pkt.seq_no, pkt.rtp_ts.numer())
+        if let Some(violation) =
+            self.egress_guard
+                .check(mid, rid, *pkt.seq_no, pkt.rtp_ts.numer(), pkt.marker, kind)
         {
             plog_error!(ctx, %mid, ?rid, %violation, "egress stream invariant violated");
-            debug_assert!(false, "egress stream invariant violated: {violation}");
+            // Hard failure in simulation, where this is a bug to be found. A dev
+            // build carrying real media keeps serving: one malformed stream is
+            // not worth taking the node down for.
+            #[cfg(feature = "sim")]
+            panic!("egress stream invariant violated: {violation}");
         }
         if nackable {
             plog_trace!(

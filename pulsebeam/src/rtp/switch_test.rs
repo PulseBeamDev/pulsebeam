@@ -8,6 +8,7 @@
 
 use ahash::HashMap;
 use pulsebeam_runtime::rand::seeded_rng;
+use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::rtp::cache::StreamCache;
@@ -25,7 +26,12 @@ pub struct Forwarder {
     switcher: Switcher,
     active: Option<LayerId>,
     staging: Option<LayerId>,
+    draining: Option<LayerId>,
     out: Vec<RtpPacket>,
+    /// Packets emitted by each single ingest, which is what actually leaves the
+    /// SFU back-to-back.
+    bursts: Vec<usize>,
+    switch_blocked_since: Option<Instant>,
 }
 
 impl Forwarder {
@@ -35,7 +41,10 @@ impl Forwarder {
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(seed)),
             active: None,
             staging: None,
+            draining: None,
             out: Vec::new(),
+            bursts: Vec::new(),
+            switch_blocked_since: None,
         }
     }
 
@@ -47,12 +56,22 @@ impl Forwarder {
             self.switcher.clear_staging();
             return;
         }
+        if self.draining == Some(layer) {
+            self.draining = None;
+        }
         self.staging = Some(layer);
         self.switcher.clear_staging();
+        self.switch_blocked_since = None;
     }
 
     /// Mirrors `route_video` + `Slot::on_rtp` for one packet of `layer`.
     pub fn ingest(&mut self, layer: LayerId, pkt: &RtpPacket) {
+        let before = self.out.len();
+        self.ingest_inner(layer, pkt);
+        self.bursts.push(self.out.len() - before);
+    }
+
+    fn ingest_inner(&mut self, layer: LayerId, pkt: &RtpPacket) {
         let cache = self.caches.entry(layer).or_default();
         cache.push(pkt);
 
@@ -64,18 +83,43 @@ impl Forwarder {
             return;
         }
 
+        if self.draining == Some(layer) {
+            if let Some(out) = self.switcher.drain_tail(pkt, pkt.arrival_ts) {
+                self.out.push(out);
+            }
+            if !self.switcher.has_tail() {
+                self.draining = None;
+            }
+            return;
+        }
+
         if self.staging == Some(layer) && !self.switcher.is_switching() {
             let cache = &self.caches[&layer];
             if let Some(pkts) = cache.replay(pkt.arrival_ts) {
-                self.switcher.stage_direct(pkts);
+                if !self.may_switch_now(pkt.arrival_ts) {
+                    return;
+                }
+                self.switch_blocked_since = None;
+                self.switcher.stage_direct(pkts, pkt.arrival_ts);
                 while let Some(out) = self.switcher.pop() {
                     self.out.push(out);
                 }
                 if self.switcher.ready_to_switch() {
+                    self.draining = self.active.take();
                     self.active = self.staging.take();
                 }
             }
         }
+    }
+
+    /// Mirrors `Slot::may_switch_now`.
+    fn may_switch_now(&mut self, now: Instant) -> bool {
+        if self.switcher.at_clean_frame_boundary() {
+            self.switch_blocked_since = None;
+            return true;
+        }
+        let blocked_since = *self.switch_blocked_since.get_or_insert(now);
+        now.saturating_duration_since(blocked_since) >= Duration::from_millis(15)
     }
 
     pub fn ingest_all(&mut self, layer: LayerId, pkts: &[RtpPacket]) {
@@ -90,6 +134,35 @@ impl Forwarder {
 
     pub fn switched(&self) -> bool {
         self.staging.is_none()
+    }
+
+    /// The most packets this forwarder ever pushed out in one go.
+    pub fn largest_burst(&self) -> usize {
+        self.bursts.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Output sequence numbers that were never emitted. The subscriber counts
+    /// these as lost, NACKs for them, and reports them as loss in its feedback —
+    /// which walks the bandwidth estimate down.
+    pub fn sequence_holes(&self) -> u64 {
+        let Some(min) = self.out.iter().map(|p| *p.seq_no).min() else {
+            return 0;
+        };
+        let max = self.out.iter().map(|p| *p.seq_no).max().unwrap();
+        let seen: ahash::HashSet<u64> = self.out.iter().map(|p| *p.seq_no).collect();
+        (max - min + 1) - seen.len() as u64
+    }
+
+    /// Output frame timestamps in emission order, deduplicated.
+    pub fn frame_timestamps(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+        for p in &self.out {
+            let ts = p.rtp_ts.numer();
+            if out.last() != Some(&ts) {
+                out.push(ts);
+            }
+        }
+        out
     }
 }
 
@@ -527,4 +600,476 @@ fn switching_mid_gop_does_not_walk_the_output_clock_away_from_real_time() {
          switches ({:.1}ms per switch) — video would run ahead of audio",
         skew_ms / SWITCHES as f64
     );
+}
+
+// ---------------------------------------------------------------------------
+// Switching away from a stream whose current frame is still in flight.
+// ---------------------------------------------------------------------------
+
+/// If the active layer stops sending, the frame it was midway through will
+/// never complete. Rather than stall the slot forever, the switch goes ahead
+/// after a grace period — and burns a sequence number so the subscriber reads
+/// the fragment as damaged instead of decoding it.
+#[test]
+fn a_dead_active_layer_does_not_stall_the_switch_forever() {
+    let start = now();
+    let mut hi = H264StreamBuilder::new(0xA1, 200, 90_000, start);
+    let mut lo = H264StreamBuilder::new(0xB1, 7000, 300_000, start);
+    let mut fwd = Forwarder::new(31);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &hi.keyframe(3));
+    for _ in 0..4 {
+        let f = hi.delta_frame(3);
+        fwd.ingest_all(0, &f);
+        let f = lo.delta_frame(2);
+        fwd.ingest_all(1, &f);
+    }
+
+    // The active layer goes silent partway through a frame.
+    let partial = hi.delta_frame(3);
+    fwd.ingest_all(0, &partial[..2]);
+    let truncated_ts = partial[0].rtp_ts.numer();
+
+    let kf = lo.keyframe(2);
+    fwd.switch_to(1);
+    fwd.ingest_all(1, &kf);
+
+    // The staged layer keeps running; the active one never comes back.
+    for _ in 0..4 {
+        let f = lo.delta_frame(2);
+        fwd.ingest_all(1, &f);
+    }
+
+    assert!(
+        fwd.switched(),
+        "the slot must not stall waiting on a layer that stopped"
+    );
+    assert_decodable(fwd.emitted(), "switch forced past a dead layer");
+
+    let truncated: Vec<_> = fwd
+        .emitted()
+        .iter()
+        .filter(|p| p.rtp_ts.numer() == truncated_ts)
+        .collect();
+    assert_eq!(
+        truncated.len(),
+        2,
+        "only what arrived before the layer died"
+    );
+    assert!(!truncated.iter().any(|p| p.marker));
+}
+
+/// The marker packet overtakes an earlier packet of the same frame, so the
+/// frame looks finished while a hole remains inside it. Switching on that
+/// appearance abandons the in-flight packet; the switch has to wait for the
+/// frame to actually be whole, not merely marked.
+#[test]
+fn a_reordered_marker_does_not_look_like_a_frame_boundary() {
+    let start = now();
+    let mut hi = H264StreamBuilder::new(0xA2, 400, 90_000, start);
+    let mut lo = H264StreamBuilder::new(0xB2, 9100, 700_000, start);
+    let mut fwd = Forwarder::new(32);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &hi.keyframe(3));
+    for _ in 0..4 {
+        let f = hi.delta_frame(3);
+        fwd.ingest_all(0, &f);
+        let f = lo.delta_frame(2);
+        fwd.ingest_all(1, &f);
+    }
+
+    // Packets 0 and 2 of the frame arrive; packet 1 is still in flight. The
+    // marker has been forwarded, so the frame *looks* complete.
+    let frame = hi.delta_frame(3);
+    let frame_ts = frame[0].rtp_ts.numer();
+    fwd.ingest(0, &frame[0]);
+    fwd.ingest(0, &frame[2]);
+
+    let kf = lo.keyframe(2);
+    fwd.switch_to(1);
+    fwd.ingest_all(1, &kf);
+
+    // The missing middle packet arrives.
+    fwd.ingest(0, &frame[1]);
+    for _ in 0..4 {
+        let f = lo.delta_frame(2);
+        fwd.ingest_all(1, &f);
+    }
+
+    assert!(fwd.switched());
+    assert_decodable(fwd.emitted(), "switch after a reordered marker");
+
+    let forwarded: Vec<_> = fwd
+        .emitted()
+        .iter()
+        .filter(|p| p.rtp_ts.numer() == frame_ts)
+        .collect();
+    assert_eq!(
+        forwarded.len(),
+        3,
+        "the switch must wait for the in-flight packet rather than abandon it"
+    );
+    assert_eq!(
+        fwd.sequence_holes(),
+        0,
+        "abandoning the in-flight packet would read as congestion loss"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Switching must not disturb pacing, and must not manufacture loss.
+// ---------------------------------------------------------------------------
+
+/// Sets up two layers publishing 30fps, switches repeatedly, and returns the
+/// forwarder so a test can inspect what the switch did to the output stream.
+fn run_switch_workload(seed: u64, switches: usize, gap_frames: usize) -> Forwarder {
+    let start = now();
+    let mut pubr = TwoLayerPublisher::new(start, ParameterSetStyle::SeparatePacket);
+    let mut fwd = Forwarder::new(seed);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &pubr.high.keyframe(3));
+
+    for round in 0..switches {
+        for _ in 0..gap_frames {
+            let f = pubr.high.delta_frame(3);
+            fwd.ingest_all(0, &f);
+            let f = pubr.low.delta_frame(3);
+            fwd.ingest_all(1, &f);
+        }
+
+        let target = (round % 2) as LayerId;
+        fwd.switch_to(target);
+        let kf = if target == 0 {
+            pubr.high.keyframe(3)
+        } else {
+            pubr.low.keyframe(3)
+        };
+        fwd.ingest_all(target, &kf);
+        let other = 1 - target;
+        let f = if other == 0 {
+            pubr.high.delta_frame(3)
+        } else {
+            pubr.low.delta_frame(3)
+        };
+        fwd.ingest_all(other, &f);
+    }
+    fwd
+}
+
+/// A switch must not manufacture a sequence hole. The subscriber cannot tell an
+/// SFU-created hole from real congestion loss: it NACKs for packets that were
+/// never written to str0m's retransmission cache and can never be served, and it
+/// reports the loss in its feedback, walking the bandwidth estimate down.
+#[test]
+fn switching_does_not_manufacture_packet_loss() {
+    let fwd = run_switch_workload(41, 12, 4);
+    assert!(fwd.switched());
+
+    let holes = fwd.sequence_holes();
+    assert_eq!(
+        holes, 0,
+        "switching invented {holes} lost packets over 12 switches; the subscriber \
+         will NACK for packets that were never sent and report them as congestion loss"
+    );
+}
+
+/// The output frame rate must be the source's. A switch that replays buffered
+/// media compresses several frames into one instant and then resumes at 1x: the
+/// subscriber sees a speed-up followed by a step change in buffer depth.
+#[test]
+fn switching_keeps_the_source_frame_cadence() {
+    let fwd = run_switch_workload(42, 12, 4);
+    let timestamps = fwd.frame_timestamps();
+    assert!(timestamps.len() > 50);
+
+    // The publishers run at a steady 30fps, so every output frame interval must
+    // be one frame long.
+    const FRAME: u64 = 90_000 / 30;
+    for (i, w) in timestamps.windows(2).enumerate() {
+        let delta = w[1] - w[0];
+        assert_eq!(
+            delta,
+            FRAME,
+            "frame interval {i} was {delta} ticks ({:.1}ms) instead of one frame; \
+             the switch changed the playback rate",
+            delta as f64 / 90.0
+        );
+    }
+}
+
+/// A switch must not dump buffered media in one burst. The subscriber's
+/// congestion control reads that spike as queue build-up and lowers the
+/// estimate, so the SFU degrades the very stream it just switched to.
+#[test]
+fn switching_does_not_burst_buffered_media_at_the_subscriber() {
+    let fwd = run_switch_workload(43, 12, 4);
+
+    // Forwarding is one-in-one-out except at a switch, where the keyframe
+    // already received is released together. One frame is the most that can be.
+    let largest = fwd.largest_burst();
+    assert!(
+        largest <= 5,
+        "a switch released {largest} packets back-to-back; that spike reads as \
+         congestion to the subscriber's bandwidth estimator"
+    );
+}
+
+/// The decision to switch arrives while the active layer is midway through a
+/// frame. Cutting there costs the subscriber twice: the frame is incomplete, and
+/// the packets never sent read as congestion loss it will NACK for and report.
+#[test]
+fn a_switch_waits_for_the_active_frame_instead_of_cutting_it() {
+    let start = now();
+    let mut hi = H264StreamBuilder::new(0xC1, 900, 90_000, start);
+    let mut lo = H264StreamBuilder::new(0xC2, 44_000, 600_000, start);
+    let mut fwd = Forwarder::new(51);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &hi.keyframe(3));
+    for _ in 0..4 {
+        let f = hi.delta_frame(4);
+        fwd.ingest_all(0, &f);
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+
+    // Two of four packets of the active frame have been forwarded.
+    let partial = hi.delta_frame(4);
+    fwd.ingest_all(0, &partial[..2]);
+
+    // The staged layer's keyframe lands mid-frame.
+    let kf = lo.keyframe(3);
+    fwd.switch_to(1);
+    fwd.ingest_all(1, &kf);
+
+    // The rest of the active frame arrives right behind it.
+    fwd.ingest_all(0, &partial[2..]);
+    for _ in 0..4 {
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+
+    assert!(fwd.switched(), "the switch must still complete");
+    assert_decodable(fwd.emitted(), "switch deferred to a frame boundary");
+
+    let holes = fwd.sequence_holes();
+    assert_eq!(
+        holes, 0,
+        "the switch cut into a frame and left {holes} sequence numbers unsent; \
+         the subscriber will NACK for packets str0m never cached and count them \
+         as congestion loss"
+    );
+
+    // And the frame that was in progress must have been delivered whole.
+    let frame_ts = partial[0].rtp_ts.numer();
+    let delivered = fwd
+        .emitted()
+        .iter()
+        .filter(|p| p.rtp_ts.numer() == frame_ts)
+        .count();
+    assert_eq!(delivered, 4, "the in-progress frame must not be truncated");
+}
+
+/// A layer that has been flowing for a while has a keyframe well behind the
+/// live edge. Switching to it must not release everything since that keyframe in
+/// one go: that spike reads as queue build-up to the subscriber's congestion
+/// control, which lowers the estimate right when the new layer needs headroom.
+#[test]
+fn switching_to_an_already_flowing_layer_does_not_release_a_backlog() {
+    let start = now();
+    let mut hi = H264StreamBuilder::new(0xD1, 100, 90_000, start);
+    let mut lo = H264StreamBuilder::new(0xD2, 70_000, 200_000, start);
+    let mut fwd = Forwarder::new(52);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &hi.keyframe(3));
+
+    // The low layer sent a keyframe and has been running ever since.
+    fwd.ingest_all(1, &lo.keyframe(3));
+    for _ in 0..5 {
+        let f = hi.delta_frame(3);
+        fwd.ingest_all(0, &f);
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+
+    fwd.switch_to(1);
+    for _ in 0..5 {
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+        let f = hi.delta_frame(3);
+        fwd.ingest_all(0, &f);
+    }
+
+    let largest = fwd.largest_burst();
+    assert!(
+        largest <= 6,
+        "switching released {largest} packets back-to-back from the layer's backlog"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The abandoned stream still finishes what it started.
+// ---------------------------------------------------------------------------
+
+/// The switch does not wait around for a packet that is merely late. It goes
+/// ahead, and the abandoned stream is still allowed to fill the gap it left, so
+/// the frame the subscriber already has part of gets completed rather than
+/// counting as loss.
+#[test]
+fn the_abandoned_stream_completes_its_frame_after_the_switch() {
+    let start = now();
+    let mut hi = H264StreamBuilder::new(0xE1, 500, 90_000, start);
+    let mut lo = H264StreamBuilder::new(0xE2, 31_000, 800_000, start);
+    let mut fwd = Forwarder::new(61);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &hi.keyframe(3));
+    for _ in 0..4 {
+        let f = hi.delta_frame(4);
+        fwd.ingest_all(0, &f);
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+
+    // The active layer's frame arrives with a hole: the marker packet overtook
+    // one of the middle packets, which is still on the wire.
+    let frame = hi.delta_frame(4);
+    let frame_ts = frame[0].rtp_ts.numer();
+    fwd.ingest(0, &frame[0]);
+    fwd.ingest(0, &frame[1]);
+    fwd.ingest(0, &frame[3]);
+
+    // Enough of the staged layer arrives that the grace period lapses and the
+    // switch proceeds without the missing packet.
+    fwd.switch_to(1);
+    for _ in 0..3 {
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+    let kf = lo.keyframe(3);
+    fwd.ingest_all(1, &kf);
+    let f = lo.delta_frame(3);
+    fwd.ingest_all(1, &f);
+    assert!(fwd.switched(), "the switch must not wait on a late packet");
+
+    let before = fwd.emitted().len();
+
+    // The straggler finally arrives, after the new layer is already flowing.
+    fwd.ingest(0, &frame[2]);
+
+    assert_eq!(
+        fwd.emitted().len(),
+        before + 1,
+        "the abandoned stream's packet must still be forwarded to finish the frame"
+    );
+    let filled = fwd.emitted().last().unwrap();
+    assert_eq!(
+        filled.rtp_ts.numer(),
+        frame_ts,
+        "it must carry the timestamp of the frame it belongs to, not the new one"
+    );
+    assert_eq!(
+        fwd.sequence_holes(),
+        0,
+        "the gap the switch left must have been filled, not counted as loss"
+    );
+    assert_decodable(fwd.emitted(), "tail-completed frame across a switch");
+}
+
+/// A packet from the abandoned stream that does not fit a gap the switch left
+/// must never be emitted: the new stream owns everything past the switch point.
+#[test]
+fn the_abandoned_stream_cannot_write_into_the_new_streams_sequence_space() {
+    let start = now();
+    let mut hi = H264StreamBuilder::new(0xF1, 800, 90_000, start);
+    let mut lo = H264StreamBuilder::new(0xF2, 21_000, 500_000, start);
+    let mut fwd = Forwarder::new(62);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &hi.keyframe(3));
+    for _ in 0..4 {
+        let f = hi.delta_frame(3);
+        fwd.ingest_all(0, &f);
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+
+    fwd.switch_to(1);
+    let kf = lo.keyframe(3);
+    fwd.ingest_all(1, &kf);
+    assert!(fwd.switched());
+    for _ in 0..3 {
+        let f = lo.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+
+    let before = fwd.emitted().len();
+    // The old layer keeps producing whole new frames. None of them belong to
+    // anything the subscriber is waiting for.
+    for _ in 0..3 {
+        let f = hi.delta_frame(3);
+        fwd.ingest_all(0, &f);
+    }
+    assert_eq!(
+        fwd.emitted().len(),
+        before,
+        "the abandoned stream may only fill gaps, never extend past the switch"
+    );
+    assert_decodable(fwd.emitted(), "abandoned stream kept out of the new stream");
+}
+
+/// Gaps belong to the stream that left them. After a second switch, a straggler
+/// from two streams ago must not be translated into a gap the newer stream left,
+/// which would drop a packet carrying the wrong timestamp into that frame.
+#[test]
+fn a_gap_can_only_be_filled_by_the_stream_that_left_it() {
+    let start = now();
+    let mut a = H264StreamBuilder::new(0x11, 600, 90_000, start);
+    let mut b = H264StreamBuilder::new(0x22, 25_000, 400_000, start);
+    let mut fwd = Forwarder::new(63);
+
+    fwd.switch_to(0);
+    fwd.ingest_all(0, &a.keyframe(3));
+
+    // Stream A leaves a gap behind when we switch away from it.
+    let orphan = a.delta_frame(4);
+    fwd.ingest(0, &orphan[0]);
+    fwd.ingest(0, &orphan[1]);
+    fwd.ingest(0, &orphan[3]);
+
+    fwd.switch_to(1);
+    for _ in 0..2 {
+        let f = b.delta_frame(3);
+        fwd.ingest_all(1, &f);
+    }
+    fwd.ingest_all(1, &b.keyframe(3));
+    let f = b.delta_frame(3);
+    fwd.ingest_all(1, &f);
+    assert!(fwd.switched());
+
+    // Switch back to A, so B becomes the stream being drained.
+    fwd.switch_to(0);
+    for _ in 0..2 {
+        let f = a.delta_frame(3);
+        fwd.ingest_all(0, &f);
+    }
+    fwd.ingest_all(0, &a.keyframe(3));
+    let f = a.delta_frame(3);
+    fwd.ingest_all(0, &f);
+    assert!(fwd.switched());
+
+    let before = fwd.emitted().len();
+    // A's long-lost packet finally arrives. Its gap belonged to a generation
+    // that is no longer drainable.
+    fwd.ingest(0, &orphan[2]);
+    assert_eq!(
+        fwd.emitted().len(),
+        before,
+        "a straggler from an earlier generation must not be placed"
+    );
+    assert_decodable(fwd.emitted(), "two switches with a stale straggler");
 }

@@ -239,6 +239,9 @@ pub mod test_utils {
         seq: u64,
         rtp_ts: u64,
         clock: Instant,
+        /// RTP ticks per frame, and the wall-clock interval that matches it
+        /// exactly, so tests measure the forwarder rather than rounding.
+        ts_step: u64,
         frame_interval: Duration,
         parameter_sets: ParameterSetStyle,
         sent_parameter_sets: bool,
@@ -261,7 +264,8 @@ pub mod test_utils {
                 seq,
                 rtp_ts,
                 clock,
-                frame_interval: Duration::from_millis(1000 / 30),
+                ts_step: VIDEO_FREQUENCY.get() as u64 / 30,
+                frame_interval: Duration::from_nanos(1_000_000_000 / 30),
                 parameter_sets: ParameterSetStyle::SeparatePacket,
                 sent_parameter_sets: false,
             }
@@ -272,9 +276,15 @@ pub mod test_utils {
             self
         }
 
-        pub fn with_frame_interval(mut self, interval: Duration) -> Self {
-            self.frame_interval = interval;
+        pub fn with_fps(mut self, fps: u32) -> Self {
+            self.ts_step = VIDEO_FREQUENCY.get() as u64 / fps as u64;
+            self.frame_interval = Duration::from_nanos(1_000_000_000 / fps as u64);
             self
+        }
+
+        /// RTP ticks between consecutive frames of this stream.
+        pub fn ts_step(&self) -> u64 {
+            self.ts_step
         }
 
         pub fn next_seq(&self) -> u64 {
@@ -306,8 +316,7 @@ pub mod test_utils {
         }
 
         fn end_frame(&mut self) {
-            self.rtp_ts +=
-                (VIDEO_FREQUENCY.get() as u64 * self.frame_interval.as_micros() as u64) / 1_000_000;
+            self.rtp_ts += self.ts_step;
             self.clock += self.frame_interval;
         }
 
