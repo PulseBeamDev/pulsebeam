@@ -62,32 +62,24 @@ impl BweFilter {
         }
     }
 
-    fn tick(&mut self, now: Instant, desired: Bitrate, overusing: bool) {
-        self.update(now, self.current(), desired, overusing);
-    }
-
-    fn update(&mut self, now: Instant, raw: Bitrate, desired: Bitrate, overusing: bool) {
+    fn update(&mut self, now: Instant, raw: Bitrate) {
         let raw_bps = raw.as_f64();
-        // In ALR (!overusing), treat desired as a rising floor so the allocator can
-        // commit floors that exceed the current (pessimistic) BWE estimate.
-        let target_bps = if overusing {
-            raw_bps
-        } else {
-            raw_bps.max(desired.as_f64())
-        };
+        debug_assert!(raw_bps.is_finite());
+        debug_assert!(raw_bps >= 0.0);
         let Some(last_update) = self.last_update.replace(now) else {
             self.filtered_bps = raw_bps;
             return;
         };
         let elapsed = now.saturating_duration_since(last_update);
-        if target_bps >= self.filtered_bps {
+        if raw_bps >= self.filtered_bps {
             let alpha = (-elapsed.as_secs_f64() / BWE_RISE_TIME_CONSTANT.as_secs_f64()).exp();
-            self.filtered_bps = target_bps + (self.filtered_bps - target_bps) * alpha;
-        } else if overusing {
+            self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
+        } else {
             let alpha = (-elapsed.as_secs_f64() / BWE_FALL_TIME_CONSTANT.as_secs_f64()).exp();
-            self.filtered_bps = target_bps + (self.filtered_bps - target_bps) * alpha;
+            self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
         }
-        // !overusing and target < filtered: already above desired, hold.
+        debug_assert!(self.filtered_bps.is_finite());
+        debug_assert!(self.filtered_bps >= 0.0);
     }
 
     fn current(&self) -> Bitrate {
@@ -216,24 +208,17 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn update_bitrate(
-        &mut self,
-        now: Instant,
-        available_bandwidth: Bitrate,
-        is_overusing: bool,
-    ) {
-        self.available_bandwidth
-            .update(now, available_bandwidth, self.last_desired, is_overusing);
+    pub fn update_bitrate(&mut self, now: Instant, available_bandwidth: Bitrate) {
+        self.available_bandwidth.update(now, available_bandwidth);
         self.dirty_allocation = true;
     }
 
-    pub fn update_allocations(&mut self, now: Instant, bwe: &mut Bwe) -> bool {
-        self.available_bandwidth
-            .tick(now, self.last_desired, bwe.is_overusing());
+    pub fn update_allocations(&mut self, _now: Instant, bwe: &mut Bwe) -> bool {
         self.dirty_allocation = false;
         let (desired, assignments_changed) = self
             .video
             .update_allocations(self.available_bandwidth.current());
+        bwe.set_current_bitrate(self.video.current_allocation());
         if self.last_desired != desired {
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;

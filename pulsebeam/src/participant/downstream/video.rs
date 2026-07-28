@@ -60,6 +60,7 @@ pub struct VideoAllocator {
     rng: Rng,
     last_reconciled: HashSet<(TrackId, SlotKey)>,
     desired_ctrl: BitrateController,
+    current_allocation: Bitrate,
 }
 
 impl VideoAllocator {
@@ -80,6 +81,7 @@ impl VideoAllocator {
             rng: Rng::seed_from_u64(rng.next_u64()),
             last_reconciled: HashSet::new(),
             desired_ctrl,
+            current_allocation: Bitrate::ZERO,
         }
     }
 
@@ -294,7 +296,18 @@ impl VideoAllocator {
 
         let desired_raw = AllocationEngine::desired_bitrate(&views);
         let decisions = AllocationEngine::compute(available_bandwidth, &views);
-        let desired = self.desired_ctrl.update(desired_raw);
+        self.current_allocation = decisions
+            .values()
+            .filter_map(|decision| match decision {
+                AllocationDecision::Forward(_, bitrate) => Some(*bitrate),
+                AllocationDecision::Pause(_, _) => None,
+            })
+            .fold(Bitrate::ZERO, |total, bitrate| total + bitrate);
+        let desired = self
+            .desired_ctrl
+            .update(desired_raw)
+            .max(self.current_allocation);
+        debug_assert!(self.current_allocation <= desired);
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
@@ -320,6 +333,10 @@ impl VideoAllocator {
         }
 
         (desired, changed)
+    }
+
+    pub fn current_allocation(&self) -> Bitrate {
+        self.current_allocation
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
