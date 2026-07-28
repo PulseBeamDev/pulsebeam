@@ -1,17 +1,9 @@
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use crate::rtp::RtpPacket;
 use str0m::media::MediaTime;
-use tokio::time::Instant;
 
 const STREAM_CACHE_CAPACITY: usize = 512;
-
-/// A cached segment older than this is not worth replaying. Bursting a stale
-/// segment at the subscriber costs a congestion spike and pushes the output RTP
-/// clock forward by the segment's whole duration. Past this age the slot keeps
-/// forwarding its current layer and waits for the PLI-driven keyframe instead.
-pub const MAX_REPLAY_AGE: Duration = Duration::from_millis(200);
 
 /// How many frames a switch segment may span.
 ///
@@ -21,6 +13,27 @@ pub const MAX_REPLAY_AGE: Duration = Duration::from_millis(200);
 /// exactly when the newly switched layer needs headroom. Past this the segment
 /// is refused and the slot waits for the PLI-driven keyframe instead.
 const MAX_REPLAY_FRAMES: usize = 3;
+
+/// Ceiling on the packets a switch may release at once.
+///
+/// str0m paces egress, so a burst handed over in one go is not sprayed at the
+/// network — it queues, and shows up as delay instead. Either way it is latency
+/// the subscriber pays, so the amount released at once is what needs bounding.
+///
+/// Never applied to a lone keyframe: that is the smallest decodable unit there
+/// is, so refusing one would livelock — the keyframe request it triggers just
+/// produces another of the same size.
+const MAX_REPLAY_PACKETS: usize = 96;
+
+/// Ceiling on the media a switch segment may straddle, in milliseconds.
+///
+/// This is not a freshness test — how long ago a segment arrived costs nothing.
+/// It bounds latency: the output clock lands ahead of real time by whatever the
+/// segment spans, and stays there. Loose enough for screen share, where a few
+/// frames a second means one frame interval is already a fifth of a second, and
+/// tight enough that no single switch can put the subscriber a noticeable
+/// distance behind live.
+const MAX_REPLAY_SPAN_MS: u64 = 400;
 
 /// Per-stream ring buffer seeded from the last keyframe onward.
 ///
@@ -39,8 +52,7 @@ pub struct StreamCache {
     packets: VecDeque<RtpPacket>,
     /// RTP timestamp of the keyframe frame the current segment starts at.
     segment_ts: Option<u64>,
-    /// Arrival time of the keyframe that opened the current segment.
-    segment_at: Option<Instant>,
+
     /// Most recent packets carrying SPS / PPS, retained independently of the
     /// segment so a switch can be prefixed with parameter sets even when the
     /// encoder only emits them once at stream start.
@@ -59,7 +71,6 @@ impl StreamCache {
         Self {
             packets: VecDeque::new(),
             segment_ts: None,
-            segment_at: None,
             sps: None,
             pps: None,
         }
@@ -77,7 +88,7 @@ impl StreamCache {
 
         let frame_ts = pkt.rtp_ts.numer();
         if pkt.is_keyframe && self.segment_ts != Some(frame_ts) {
-            self.open_segment(frame_ts, pkt.arrival_ts);
+            self.open_segment(frame_ts);
         }
 
         while self.packets.len() > STREAM_CACHE_CAPACITY {
@@ -87,7 +98,6 @@ impl StreamCache {
                 && evicted.rtp_ts.numer() == segment_ts
             {
                 self.segment_ts = None;
-                self.segment_at = None;
             }
         }
     }
@@ -95,7 +105,7 @@ impl StreamCache {
     /// Anchor the segment at the earliest buffered packet belonging to the
     /// keyframe's frame, so parameter-set packets that arrived just ahead of the
     /// IDR are kept rather than trimmed away.
-    fn open_segment(&mut self, frame_ts: u64, at: Instant) {
+    fn open_segment(&mut self, frame_ts: u64) {
         debug_assert!(!self.packets.is_empty(), "open_segment needs the keyframe");
         let start = self
             .packets
@@ -104,7 +114,6 @@ impl StreamCache {
             .unwrap_or(self.packets.len() - 1);
         self.packets.drain(..start);
         self.segment_ts = Some(frame_ts);
-        self.segment_at = Some(at);
         debug_assert_eq!(
             self.packets.front().map(|p| p.rtp_ts.numer()),
             Some(frame_ts),
@@ -123,13 +132,8 @@ impl StreamCache {
     /// carry SPS, PPS and an IDR — the subscriber has no jitter buffer ahead of
     /// it and the egress SSRC is shared across layers, so it cannot reorder the
     /// burst itself nor fall back on parameter sets from the previous layer.
-    pub fn replay(&self, now: Instant) -> Option<Vec<RtpPacket>> {
+    pub fn replay(&self) -> Option<Vec<RtpPacket>> {
         let segment_ts = self.segment_ts?;
-        let segment_at = self.segment_at?;
-
-        if now.saturating_duration_since(segment_at) > MAX_REPLAY_AGE {
-            return None;
-        }
         if self.packets.is_empty() {
             return None;
         }
@@ -152,6 +156,15 @@ impl StreamCache {
             }
         }
         if frames > MAX_REPLAY_FRAMES {
+            return None;
+        }
+        if frames > 1 && segment.len() > MAX_REPLAY_PACKETS {
+            return None;
+        }
+
+        let clock_rate = segment[0].rtp_ts.frequency().get() as u64;
+        let span = seen_ts.unwrap_or(segment_ts).saturating_sub(segment_ts);
+        if span > clock_rate * MAX_REPLAY_SPAN_MS / 1000 {
             return None;
         }
 
@@ -212,7 +225,6 @@ impl StreamCache {
     pub fn clear(&mut self) {
         self.packets.clear();
         self.segment_ts = None;
-        self.segment_at = None;
         self.sps = None;
         self.pps = None;
     }
@@ -222,6 +234,8 @@ impl StreamCache {
 mod test {
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     fn builder(style: ParameterSetStyle) -> H264StreamBuilder {
         H264StreamBuilder::new(1, 1000, 90_000, Instant::now()).with_parameter_sets(style)
@@ -239,7 +253,7 @@ mod test {
             cache.push(p);
         }
 
-        let replay = cache.replay(last[0].arrival_ts).expect("replayable");
+        let replay = cache.replay().expect("replayable");
         assert!(replay.iter().any(|p| p.nal.sps()));
         assert!(replay.iter().any(|p| p.nal.pps()));
         assert!(replay.iter().any(|p| p.is_keyframe));
@@ -261,9 +275,7 @@ mod test {
             cache.push(p);
         }
 
-        let replay = cache
-            .replay(kf.last().unwrap().arrival_ts)
-            .expect("replayable");
+        let replay = cache.replay().expect("replayable");
         assert!(replay.iter().any(|p| p.nal.sps()));
         assert!(replay.iter().any(|p| p.nal.pps()));
         assert_eq!(
@@ -281,27 +293,111 @@ mod test {
         for p in &kf {
             cache.push(p);
         }
-        let replay = cache
-            .replay(kf.last().unwrap().arrival_ts)
-            .expect("replayable");
+        let replay = cache.replay().expect("replayable");
         assert_eq!(replay.len(), kf.len());
     }
 
+    /// Screen share sits still for long stretches: one keyframe, then nothing
+    /// until the picture changes. That keyframe is still exactly what the
+    /// subscriber should see, and replaying it costs nothing — it is a single
+    /// frame, so there is no backlog to burst and no span to jump the clock
+    /// over. Refusing it leaves the viewer on a black screen until a PLI round
+    /// trip produces a duplicate of the frame already in hand.
     #[test]
-    fn a_stale_segment_is_not_replayable() {
+    fn a_long_idle_keyframe_is_still_replayable() {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
-        let kf = b.keyframe(2);
+        let kf = b.keyframe(4);
         for p in &kf {
             cache.push(p);
         }
-        let at = kf.last().unwrap().arrival_ts;
-        assert!(cache.replay(at).is_some());
+        let arrived = kf.last().unwrap().arrival_ts;
+
+        let much_later = arrived + Duration::from_secs(30);
         assert!(
-            cache
-                .replay(at + MAX_REPLAY_AGE + Duration::from_millis(1))
-                .is_none(),
-            "a stale GOP must not be burst at the subscriber"
+            cache.replay().is_some(),
+            "a still screen must not be withheld just because it has been still"
+        );
+    }
+
+    /// A segment straddling a long idle gap is refused: replaying both sides
+    /// would jump the output clock forward by the length of the gap.
+    #[test]
+    fn a_segment_straddling_a_long_gap_is_not_replayable() {
+        // One frame per second: three frames is two seconds of media.
+        let mut b = builder(ParameterSetStyle::SeparatePacket).with_fps(1);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(2) {
+            cache.push(&p);
+        }
+        assert!(cache.replay().is_some(), "the keyframe alone is free");
+
+        for p in b.delta_frames(2, 1) {
+            cache.push(&p);
+        }
+        assert!(
+            cache.replay().is_none(),
+            "a segment spanning seconds of media would jump the output clock"
+        );
+    }
+
+    /// A keyframe can be larger than any bound worth putting on a replay. It
+    /// must stay replayable anyway: refusing one only triggers a keyframe
+    /// request, which produces another exactly as large — the stream would
+    /// never start.
+    #[test]
+    fn a_lone_keyframe_is_replayable_however_large() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        let huge = b.keyframe(400);
+        assert!(
+            huge.len() > MAX_REPLAY_PACKETS,
+            "fixture must exceed the bound"
+        );
+        for p in &huge {
+            cache.push(p);
+        }
+        assert!(
+            cache.replay().is_some(),
+            "refusing a lone keyframe livelocks the stream"
+        );
+    }
+
+    /// Once there is more than the entry point, the packet ceiling applies —
+    /// there is a smaller segment to be had by asking for a fresh keyframe.
+    #[test]
+    fn a_large_segment_past_the_keyframe_is_refused() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(MAX_REPLAY_PACKETS) {
+            cache.push(&p);
+        }
+        assert!(cache.replay().is_some());
+
+        for p in b.delta_frame(4) {
+            cache.push(&p);
+        }
+        assert!(
+            cache.replay().is_none(),
+            "a segment past the entry point must respect the packet ceiling"
+        );
+    }
+
+    /// Screen share runs at a few frames a second. A couple of its frames is a
+    /// normal segment and must not be mistaken for a backlog.
+    #[test]
+    fn ordinary_screen_share_pacing_is_replayable() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket).with_fps(5);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(3) {
+            cache.push(&p);
+        }
+        for p in b.delta_frame(1) {
+            cache.push(&p);
+        }
+        assert!(
+            cache.replay().is_some(),
+            "a 5fps screen share must switch from cache, not fall back to a keyframe request"
         );
     }
 
@@ -314,7 +410,7 @@ mod test {
             cache.push(p);
         }
         assert!(!cache.has_keyframe());
-        assert!(cache.replay(frames.last().unwrap().arrival_ts).is_none());
+        assert!(cache.replay().is_none());
     }
 
     #[test]
@@ -328,9 +424,7 @@ mod test {
             cache.push(p);
         }
 
-        let replay = cache
-            .replay(kf.last().unwrap().arrival_ts)
-            .expect("replayable");
+        let replay = cache.replay().expect("replayable");
         assert!(replay.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no));
         assert_eq!(replay.len(), kf.len());
     }
@@ -349,6 +443,6 @@ mod test {
             cache.push(p);
         }
         assert!(!cache.has_keyframe(), "an over-long GOP is not switchable");
-        assert!(cache.replay(flood.last().unwrap().arrival_ts).is_none());
+        assert!(cache.replay().is_none());
     }
 }
