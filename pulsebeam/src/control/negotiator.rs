@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::participant::downstream::INITIAL_BANDWIDTH;
 use pulsebeam_proto::rtp_extensions;
 use str0m::{
     Candidate, IceCreds, Rtc, RtcConfig, RtcError,
@@ -109,7 +110,7 @@ impl Negotiator {
             .set_extension(rtp_extensions::PLAYOUT_DELAY, Extension::PlayoutDelay)
             // .set_stats_interval(Some(Duration::from_millis(200)))
             // TODO: enable bwe
-            .enable_bwe(Some(str0m::bwe::Bitrate::kbps(500)))
+            .enable_bwe(Some(INITIAL_BANDWIDTH))
             // Uncomment this to see statistics
             // .set_stats_interval(Some(Duration::from_secs(1)))
             .set_ice_lite(true)

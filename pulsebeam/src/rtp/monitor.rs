@@ -12,8 +12,8 @@ const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
 const SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA: Duration = Duration::from_secs(10);
 const STREAM_DEAD_TIMEOUT: Duration = Duration::from_millis(3000);
 const LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_millis(500);
-const RATE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(500);
-const RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(4);
+const RATE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
+const RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(6);
 // An eligibility signal, not a per-packet alarm: small 500ms windows on a
 // lossy WAN regularly contain one late/missing packet, and treating those
 // as health transitions causes false layer churn and PLI storms.
@@ -346,8 +346,17 @@ impl StreamMonitor {
     }
 
     pub fn process_packet(&mut self, packet: &RtpPacket) {
+        let was_inactive = self.shared_state.is_inactive();
         self.last_packet_at = packet.arrival_ts;
+        self.shared_state.inactive.store(false, Ordering::Relaxed);
         self.bwe.record(packet);
+
+        if was_inactive {
+            self.window_highest_seq = None;
+            self.window_start_seq = 0;
+            self.window_actual_packets = 0;
+            self.window_start_ts = packet.arrival_ts;
+        }
 
         let seq = *packet.seq_no;
         if self.window_highest_seq.is_none() {
@@ -464,7 +473,12 @@ impl StreamMonitor {
             return;
         }
 
-        if time_since_last_packet > STREAM_DEAD_TIMEOUT {
+        let dead_timeout = if vla_active {
+            SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA
+        } else {
+            STREAM_DEAD_TIMEOUT
+        };
+        if time_since_last_packet > dead_timeout {
             self.shared_state.inactive.store(true, Ordering::Relaxed);
             if !was_inactive {
                 self.reset(now);
@@ -1324,7 +1338,7 @@ mod test {
         f.update(now, 100_000.0);
         assert_eq!(f.current(), 100_000.0);
 
-        // Rise: jump to 1 Mbit/s. After 500ms (one RATE_RISE_TIME_CONSTANT tau)
+        // Rise: jump to 1 Mbit/s. After one RATE_RISE_TIME_CONSTANT tau
         // the filter should be > 50% of the way there.
         let t1 = now + RATE_RISE_TIME_CONSTANT;
         f.update(t1, 1_000_000.0);
@@ -1335,7 +1349,7 @@ mod test {
             "fast rise: filter should be at least 55% toward new value after 1 tau"
         );
 
-        // Fall: drop to 0. After RATE_RISE_TIME_CONSTANT (much less than RATE_FALL_TIME_CONSTANT)
+        // Fall: drop to 0 — after RATE_RISE_TIME_CONSTANT (much less than RATE_FALL_TIME_CONSTANT)
         // the filter should still hold most of its value.
         let t2 = t1 + RATE_RISE_TIME_CONSTANT;
         f.update(t2, 0.0);

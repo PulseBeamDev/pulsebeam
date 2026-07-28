@@ -18,7 +18,7 @@ use str0m::bwe::{Bitrate, Bwe};
 use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
 use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
-pub use video::Intent;
+pub use video::{INITIAL_BANDWIDTH, Intent};
 
 #[derive(Clone)]
 pub struct SlotConfig {
@@ -62,28 +62,32 @@ impl BweFilter {
         }
     }
 
-    fn tick(&mut self, now: Instant, overusing: bool) {
-        self.update(now, self.current(), overusing);
+    fn tick(&mut self, now: Instant, desired: Bitrate, overusing: bool) {
+        self.update(now, self.current(), desired, overusing);
     }
 
-    fn update(&mut self, now: Instant, raw: Bitrate, overusing: bool) {
+    fn update(&mut self, now: Instant, raw: Bitrate, desired: Bitrate, overusing: bool) {
         let raw_bps = raw.as_f64();
+        // In ALR (!overusing), treat desired as a rising floor so the allocator can
+        // commit floors that exceed the current (pessimistic) BWE estimate.
+        let target_bps = if overusing {
+            raw_bps
+        } else {
+            raw_bps.max(desired.as_f64())
+        };
         let Some(last_update) = self.last_update.replace(now) else {
             self.filtered_bps = raw_bps;
             return;
         };
         let elapsed = now.saturating_duration_since(last_update);
-        if raw_bps >= self.filtered_bps {
+        if target_bps >= self.filtered_bps {
             let alpha = (-elapsed.as_secs_f64() / BWE_RISE_TIME_CONSTANT.as_secs_f64()).exp();
-            self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
+            self.filtered_bps = target_bps + (self.filtered_bps - target_bps) * alpha;
         } else if overusing {
-            // Genuine congestion (delay detector overusing): follow the estimate down.
             let alpha = (-elapsed.as_secs_f64() / BWE_FALL_TIME_CONSTANT.as_secs_f64()).exp();
-            self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
+            self.filtered_bps = target_bps + (self.filtered_bps - target_bps) * alpha;
         }
-        // Otherwise str0m is lowering the estimate without congestion (it keeps
-        // shrinking bwe when we're application-limited) — hold, don't let that
-        // drag the allocator down.
+        // !overusing and target < filtered: already above desired, hold.
     }
 
     fn current(&self) -> Bitrate {
@@ -104,9 +108,6 @@ pub struct DownstreamAllocator {
 
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
-    /// Whether str0m's delay detector currently signals congestion. Refreshed
-    /// each allocation tick and consulted when the BWE estimate falls.
-    overusing: bool,
 
     playout_delay: Option<(MediaTime, MediaTime)>,
     playout_delay_pending: bool,
@@ -122,7 +123,6 @@ impl DownstreamAllocator {
 
             available_bandwidth: BweFilter::new(MIN_BANDWIDTH),
             last_desired: video::MIN_BANDWIDTH,
-            overusing: false,
             playout_delay: None,
             playout_delay_pending: false,
             playout_delay_confirm: None,
@@ -216,20 +216,24 @@ impl DownstreamAllocator {
         }
     }
 
-    pub fn update_bitrate(&mut self, now: Instant, available_bandwidth: Bitrate) {
+    pub fn update_bitrate(
+        &mut self,
+        now: Instant,
+        available_bandwidth: Bitrate,
+        is_overusing: bool,
+    ) {
         self.available_bandwidth
-            .update(now, available_bandwidth, self.overusing);
+            .update(now, available_bandwidth, self.last_desired, is_overusing);
         self.dirty_allocation = true;
     }
 
     pub fn update_allocations(&mut self, now: Instant, bwe: &mut Bwe) -> bool {
-        self.overusing = bwe.is_overusing();
-        // update rate per time
-        self.available_bandwidth.tick(now, self.overusing);
+        self.available_bandwidth
+            .tick(now, self.last_desired, bwe.is_overusing());
         self.dirty_allocation = false;
         let (desired, assignments_changed) = self
             .video
-            .update_allocations(self.available_bandwidth.current(), self.overusing);
+            .update_allocations(self.available_bandwidth.current());
         if self.last_desired != desired {
             bwe.set_desired_bitrate(desired);
             self.last_desired = desired;

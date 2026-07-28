@@ -1,6 +1,6 @@
 pub(crate) mod batcher;
 mod core;
-mod downstream;
+pub(crate) mod downstream;
 pub mod event;
 mod signaling;
 mod upstream;

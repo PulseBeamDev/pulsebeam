@@ -32,6 +32,7 @@ const KEYFRAME_MAX_RETRIES: u32 = 5;
 
 pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
+pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 slotmap::new_key_type! {
     pub struct SlotKey;
@@ -56,7 +57,7 @@ impl VideoAllocator {
         let desired_ctrl = BitrateControllerConfig {
             min_bitrate: MIN_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
-            default_bitrate: MIN_BANDWIDTH,
+            default_bitrate: INITIAL_BANDWIDTH,
             ..Default::default()
         }
         .build();
@@ -257,11 +258,7 @@ impl VideoAllocator {
         );
     }
 
-    pub fn update_allocations(
-        &mut self,
-        available_bandwidth: Bitrate,
-        overusing: bool,
-    ) -> (Bitrate, bool) {
+    pub fn update_allocations(&mut self, available_bandwidth: Bitrate) -> (Bitrate, bool) {
         let available_bandwidth = available_bandwidth.max(MIN_BANDWIDTH).min(MAX_BANDWIDTH);
         // 1. Prepare the input views
         let mut views: Vec<SlotView> = self
@@ -285,9 +282,9 @@ impl VideoAllocator {
 
         views.sort_by(AllocationEngine::priority_order);
 
-        let decisions = AllocationEngine::compute(available_bandwidth, &views, overusing);
-        let desired = AllocationEngine::desired_bitrate(&views);
-        let desired = self.desired_ctrl.update(desired);
+        let desired_raw = AllocationEngine::desired_bitrate(&views);
+        let decisions = AllocationEngine::compute(available_bandwidth, &views);
+        let desired = self.desired_ctrl.update(desired_raw);
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
@@ -899,15 +896,9 @@ impl AllocationEngine {
     /// floor first; leftover budget then raises streams toward their target in
     /// the same priority order, one genuine upgrade per call so send-rate rises
     /// gradually enough for BWE to track it.
-    ///
-    /// `overusing`: true when the delay detector signals genuine congestion.
-    /// When false (application-limited region) and all slots would pause, the
-    /// highest-priority slot is forced to forward its lowest eligible layer so
-    /// that traffic flows and the BWE estimate can recover.
     pub fn compute<'a>(
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
-        overusing: bool,
     ) -> SecondaryMap<SlotKey, AllocationDecision<'a>> {
         debug_assert!(
             slots.is_sorted_by(|a, b| Self::priority_order(a, b).is_le()),
@@ -968,25 +959,6 @@ impl AllocationEngine {
                 decisions.insert(
                     slot.key,
                     AllocationDecision::Pause(target, Bitrate::from(Self::cost(target) as u64)),
-                );
-            }
-        }
-
-        // ALR rescue: when the link is application-limited (not genuinely congested)
-        // and every slot would be paused, force the lowest eligible layer on the
-        // highest-priority slot. Without any forwarding, BWE receives no feedback
-        // and the estimate can never recover, leaving the allocator permanently stuck.
-        if !overusing
-            && !decisions
-                .values()
-                .any(|d| matches!(d, AllocationDecision::Forward(..)))
-            && let Some(slot) = slots.first()
-        {
-            let rescue = Self::next_layer(slot, None).or_else(|| Self::pause_target(slot));
-            if let Some(layer) = rescue {
-                decisions.insert(
-                    slot.key,
-                    AllocationDecision::Forward(layer, Bitrate::from(Self::cost(layer) as u64)),
                 );
             }
         }
@@ -1373,7 +1345,7 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
-        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000), false);
+        let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
     }
 
@@ -1825,7 +1797,7 @@ mod allocation_tests {
             qos_slot("a", 1080, 0, 10, &t, LayerQuality::Low),
             qos_slot("b", 1080, 0, 5, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
         let upgrades = slots
             .iter()
             .filter(|s| forwarded_quality(&decisions, s.key).is_some_and(|q| q > s.current_quality))
@@ -1846,7 +1818,7 @@ mod allocation_tests {
             qos_slot("hi", 1080, 0, 100, &t, LayerQuality::Low),
             qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
         let hi = slots.iter().find(|s| s.priority == 100).unwrap();
         let lo = slots.iter().find(|s| s.priority == 0).unwrap();
         assert!(
@@ -1873,7 +1845,7 @@ mod allocation_tests {
             qos_slot("pin", 1080, high_h, 100, &t, LayerQuality::High),
             qos_slot("bg", 1080, 0, 0, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
         let pin = slots.iter().find(|s| s.mid == Mid::from("pin")).unwrap();
         assert_eq!(
             forwarded_quality(&decisions, pin.key),
@@ -1895,7 +1867,7 @@ mod allocation_tests {
             // Floored: must stay visible.
             qos_slot("keep", 1080, low_h, 0, &t, LayerQuality::Low),
         ]);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
         let drop = slots.iter().find(|s| s.mid == Mid::from("drop")).unwrap();
         let keep = slots.iter().find(|s| s.mid == Mid::from("keep")).unwrap();
         assert!(
@@ -1938,7 +1910,7 @@ mod allocation_tests {
                 .update_for_test()
                 .bitrate(med_bps);
             let slots = vec![slot("a", 1080, &t, LayerQuality::Medium)];
-            let decisions = AllocationEngine::compute(bw(886), &slots, false);
+            let decisions = AllocationEngine::compute(bw(886), &slots);
             match decisions[slots[0].key] {
                 AllocationDecision::Forward(l, _) => Some(l.quality),
                 AllocationDecision::Pause(..) => None,
@@ -1997,7 +1969,7 @@ mod allocation_tests {
             slot("b", 720, &t, LayerQuality::Low),
             slot("c", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots, false);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots);
         for s in &slots {
             assert!(
                 decisions.contains_key(s.key),
@@ -2013,7 +1985,7 @@ mod allocation_tests {
     fn decisions_are_forward_or_pause() {
         let t = healthy_track();
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots, false);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots);
         for (_, d) in &decisions {
             assert!(
                 matches!(
@@ -2046,7 +2018,7 @@ mod allocation_tests {
             slot("b", 720, &t, LayerQuality::Low),
             slot("c", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(100_000), &slots, false);
+        let decisions = AllocationEngine::compute(bw(100_000), &slots);
         for s in &slots {
             assert!(
                 matches!(decisions[s.key], AllocationDecision::Forward(..)),
@@ -2065,7 +2037,7 @@ mod allocation_tests {
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(0), &slots, true);
+        let decisions = AllocationEngine::compute(bw(0), &slots);
         for s in &slots {
             assert!(
                 matches!(decisions[s.key], AllocationDecision::Pause(..)),
@@ -2087,7 +2059,7 @@ mod allocation_tests {
             slot("a", 1080, &t, LayerQuality::Low),
             slot("b", 360, &t, LayerQuality::Low),
         ];
-        let decisions = AllocationEngine::compute(bw(0), &slots, true);
+        let decisions = AllocationEngine::compute(bw(0), &slots);
         for (key, d) in &decisions {
             if let AllocationDecision::Pause(receiver, needed) = d {
                 // The receiver field must point somewhere meaningful (non-null
@@ -2117,7 +2089,7 @@ mod allocation_tests {
             priority: 0,
             current_quality: LayerQuality::High,
         }];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots, false);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots);
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
             "expected Forward fallback when High is bad, got {:?}",
@@ -2131,7 +2103,7 @@ mod allocation_tests {
     fn forwarded_layer_is_always_healthy() {
         let t = track_with_bad_layer(LayerQuality::High);
         let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
-        let decisions = AllocationEngine::compute(bw(10_000), &slots, false);
+        let decisions = AllocationEngine::compute(bw(10_000), &slots);
         if let AllocationDecision::Forward(receiver, _) = &decisions[slots[0].key] {
             assert!(
                 receiver.state.is_healthy(),
@@ -2175,7 +2147,7 @@ mod allocation_tests {
             },
         ];
 
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -2204,12 +2176,12 @@ mod allocation_tests {
                 .map(|name| slot(name, priority, &t, LayerQuality::Low))
                 .collect();
 
-            let decisions1 = AllocationEngine::compute(available, &slots, false);
+            let decisions1 = AllocationEngine::compute(available, &slots);
 
             // Reorder the input slots and verify outcome stays the same.
             let mut reversed = slots.clone();
             reversed.reverse();
-            let decisions2 = AllocationEngine::compute(available, &reversed, false);
+            let decisions2 = AllocationEngine::compute(available, &reversed);
 
             prop_assert_eq!(decisions1.len(), decisions2.len());
             for s in &slots {
@@ -2270,7 +2242,7 @@ mod allocation_tests {
         let available = bw((low_bps * 0.95) as u64 / 1_000);
 
         let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -2282,7 +2254,7 @@ mod allocation_tests {
 
     #[test]
     fn no_slots_yields_empty_decisions_and_zero_desired() {
-        let decisions = AllocationEngine::compute(bw(1_000), &[], false);
+        let decisions = AllocationEngine::compute(bw(1_000), &[]);
         assert!(
             decisions.is_empty(),
             "expected no decisions for empty slots"
@@ -2294,62 +2266,37 @@ mod allocation_tests {
         );
     }
 
-    // ─── ALR rescue: stuck-state prevention ─────────────────────────────────────
-    //
-    // When BWE drops so low that even the cheapest layer exceeds the budget,
-    // all slots would be paused → no traffic → BWE gets no feedback → stuck.
-    // When !overusing (application-limited, not genuinely congested), the engine
-    // must force the lowest eligible layer on the highest-priority slot so some
-    // traffic flows and BWE can recover.
+    // ─── Budget-floor invariants ────────────────────────────────────────────────
 
     #[test]
-    fn alr_forces_forward_when_budget_too_low_and_not_overusing() {
+    fn tight_budget_pauses_floored_slot() {
         let t = healthy_track();
         let low_bps = layer_bps(&t, LayerQuality::Low);
+        let low_h = AllocationEngine::height(t.by_quality(LayerQuality::Low).unwrap());
 
-        // Budget below even Low + reserve: all slots would pause without rescue.
         let tight = bw((low_bps * 0.5) as u64 / 1_000);
-        let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
+        let slots = vec![qos_slot("a", 1080, low_h, 0, &t, LayerQuality::Low)];
 
-        let decisions = AllocationEngine::compute(tight, &slots, false);
-        assert!(
-            matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
-            "ALR rescue must forward at least one slot when !overusing and all would pause; got {:?}",
-            decisions[slots[0].key]
-        );
-    }
-
-    #[test]
-    fn overusing_respects_budget_and_pauses_all() {
-        let t = healthy_track();
-        let low_bps = layer_bps(&t, LayerQuality::Low);
-
-        // Same tight budget, but now overusing=true — real congestion, must Pause.
-        let tight = bw((low_bps * 0.5) as u64 / 1_000);
-        let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
-
-        let decisions = AllocationEngine::compute(tight, &slots, true);
+        let decisions = AllocationEngine::compute(tight, &slots);
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
-            "overusing must pause when budget is insufficient; got {:?}",
+            "budget below floor must pause; got {:?}",
             decisions[slots[0].key]
         );
     }
 
     #[test]
-    fn alr_rescue_only_fires_when_all_slots_paused() {
+    fn tight_budget_pauses_lower_priority_slot() {
         let t = healthy_track();
         let low_bps = layer_bps(&t, LayerQuality::Low);
 
-        // Budget fits exactly one Low layer: first slot forwards, second pauses.
-        // No rescue should fire since at least one slot already forwards.
         let available = bw((low_bps as u64) / 1_000 + 5);
         let slots = sorted(vec![
             qos_slot("hi", 1080, 0, 100, &t, LayerQuality::Low),
             qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
         ]);
 
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
         let hi = slots.iter().find(|s| s.priority == 100).unwrap();
         let lo = slots.iter().find(|s| s.priority == 0).unwrap();
 
@@ -2359,34 +2306,33 @@ mod allocation_tests {
         );
         assert!(
             matches!(decisions[lo.key], AllocationDecision::Pause(..)),
-            "low-priority slot must pause — ALR rescue must not over-admit"
+            "lower-priority slot must pause when budget is exhausted"
         );
     }
 
     #[test]
-    fn alr_rescue_prefers_highest_priority_slot() {
+    fn tight_budget_pauses_all_slots() {
         let t = healthy_track();
         let low_bps = layer_bps(&t, LayerQuality::Low);
+        let low_h = AllocationEngine::height(t.by_quality(LayerQuality::Low).unwrap());
 
-        // No budget for anything.
         let tight = bw((low_bps * 0.3) as u64 / 1_000);
         let slots = sorted(vec![
-            qos_slot("hi", 1080, 0, 100, &t, LayerQuality::Low),
-            qos_slot("lo", 1080, 0, 0, &t, LayerQuality::Low),
+            qos_slot("hi", 1080, low_h, 100, &t, LayerQuality::Low),
+            qos_slot("lo", 1080, low_h, 0, &t, LayerQuality::Low),
         ]);
 
-        let decisions = AllocationEngine::compute(tight, &slots, false);
+        let decisions = AllocationEngine::compute(tight, &slots);
         let hi = slots.iter().find(|s| s.priority == 100).unwrap();
         let lo = slots.iter().find(|s| s.priority == 0).unwrap();
 
-        // Exactly the highest-priority slot should be rescued; the other pauses.
         assert!(
-            matches!(decisions[hi.key], AllocationDecision::Forward(..)),
-            "ALR rescue must pick the highest-priority slot"
+            matches!(decisions[hi.key], AllocationDecision::Pause(..)),
+            "high-priority slot must pause when budget is insufficient"
         );
         assert!(
             matches!(decisions[lo.key], AllocationDecision::Pause(..)),
-            "lower-priority slot must remain paused in ALR rescue"
+            "low-priority slot must pause when budget is insufficient"
         );
     }
 
@@ -2407,7 +2353,7 @@ mod allocation_tests {
 
         // Bandwidth comfortably covers the only healthy layer.
         let available = bw((low_bps * 2.0) as u64 / 1_000);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -2422,7 +2368,7 @@ mod allocation_tests {
         let slots = vec![slot("a", 720, &t, LayerQuality::Low)];
         // Budget covers the lowest layer but not the next one up.
         let available = bw((low_bps * 2.0) as u64 / 1_000);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
@@ -2452,7 +2398,7 @@ mod allocation_tests {
         // Client requests max_height=180 (only the inactive Low would normally fit).
         let slots = sorted(vec![qos_slot("a", 180, 0, 0, &t, LayerQuality::Low)]);
         let available = bw((med_bps * 2.0) as u64 / 1_000);
-        let decisions = AllocationEngine::compute(available, &slots, false);
+        let decisions = AllocationEngine::compute(available, &slots);
 
         assert!(
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
