@@ -34,6 +34,19 @@ test-unit:
 test-sim:
 	$(CARGO_CMD) test --profile $(SIM) -p pulsebeam-simulator -- --no-capture $(TEST)
 
+# Data-plane throughput/CPU benchmark against a real NodeBuilder instance.
+# See pulsebeam-bench/README.md. Usage:
+#   make bench                                   run and compare to the last local baseline
+#   make bench BENCH_ARGS="-- --save-baseline main"   snapshot the current tree as `main`
+bench:
+	$(CARGO_CMD) bench -p pulsebeam-bench $(BENCH_ARGS)
+
+# Quick single-scenario probe, useful for sizing a new scenario before
+# freezing it into benches/forwarding.rs. Usage:
+#   make bench-probe SHARDS=1 ROOMS=4 PEERS=4
+bench-probe:
+	$(CARGO_CMD) run --release -p pulsebeam-bench -- $(or $(SHARDS),1) $(or $(ROOMS),4) $(or $(PEERS),4)
+
 lint:
 	cargo fix --allow-dirty && cargo clippy --fix --allow-dirty && cargo fmt --all
 

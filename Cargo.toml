@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "pulsebeam",
+  "pulsebeam-bench",
   "pulsebeam-agent",
   "pulsebeam-cli",
   "pulsebeam-core",
@@ -23,6 +24,7 @@ license = "AGPL-3.0"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1.11.1"
+criterion = { version = "0.7", features = ["html_reports"] }
 derive_more = { version = "2.1.1", features = ["full"] }
 futures-lite = "2.6.1"
 more-asserts = "0.3.1"

@@ -1,0 +1,43 @@
+[package]
+name = "pulsebeam-bench"
+publish = false
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Without these, `cargo bench` also runs the lib and the probe binary under
+# Rust's built-in (unstable, libtest) bench harness, which doesn't understand
+# criterion's `--save-baseline`/`--baseline` flags and errors out before the
+# real benchmark runs.
+[lib]
+bench = false
+
+[[bin]]
+name = "pulsebeam-bench"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+anyhow = { workspace = true }
+core_affinity = "0.8.3"
+mimalloc = "0.1.52"
+pulsebeam = { path = "../pulsebeam" }
+pulsebeam-agent = { path = "../pulsebeam-agent" }
+pulsebeam-core = { path = "../pulsebeam-core" }
+pulsebeam-runtime = { path = "../pulsebeam-runtime" }
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+reqwest = "0.13.4"
+socket2 = "0.6.4"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "forwarding"
+harness = false
