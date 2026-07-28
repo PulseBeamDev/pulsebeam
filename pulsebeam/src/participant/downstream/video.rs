@@ -645,7 +645,7 @@ impl Slot {
         }
         if self.staging.as_ref().is_some_and(|s| s.is(stream_id))
             && !self.switcher.is_switching()
-            && let Some(pkts) = cache.and_then(|c| c.replay())
+            && let Some(pkts) = cache.and_then(|c| c.replay(pkt.arrival_ts))
         {
             self.switcher.stage_direct(pkts);
             while let Some(out) = self.switcher.pop() {
@@ -2414,6 +2414,257 @@ mod allocation_tests {
                 "forwarded layer must be healthy; got {:?}",
                 layer.quality
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_switch_tests {
+    use super::*;
+    use crate::entity::ParticipantId;
+    use crate::log::LogCtx;
+    use crate::rtp::cache::{MAX_REPLAY_AGE, StreamCache};
+    use crate::rtp::conformance::assert_decodable;
+    use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
+    use crate::track::test_utils::make_video_track;
+    use crate::track::{StreamWrite, StreamWriter};
+    use pulsebeam_runtime::rand::seeded_rng;
+    use str0m::media::SimulcastLayer;
+
+    fn test_rng() -> impl RngCore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(9000);
+        seeded_rng(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn test_ctx() -> LogCtx {
+        use crate::entity::{ExternalRoomId, RoomId};
+        LogCtx {
+            room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
+            participant_id: ParticipantId::new(&mut test_rng()),
+        }
+    }
+
+    /// A slot with two simulcast layers of one track available to switch between.
+    struct Fixture {
+        slot: Slot,
+        high: TrackLayer,
+        low: TrackLayer,
+        writer: StreamWriter,
+        emitted: Vec<RtpPacket>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let pid = ParticipantId::new(&mut test_rng());
+            let (_, track) = make_video_track(
+                pid,
+                Mid::from("v0"),
+                vec![
+                    SimulcastLayer::new("f"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("q"),
+                ],
+            );
+            let high = track.by_quality(LayerQuality::High).unwrap().clone();
+            let low = track.by_quality(LayerQuality::Low).unwrap().clone();
+
+            let mut slot = Slot::new(test_ctx(), SlotConfig::default(), &mut test_rng());
+            slot.paused = false;
+
+            Self {
+                slot,
+                high,
+                low,
+                writer: StreamWriter::new(),
+                emitted: Vec::new(),
+            }
+        }
+
+        /// Mirrors `route_video`: cache first, then hand the packet to the slot.
+        fn ingest(&mut self, layer: &TrackLayer, cache: &mut StreamCache, pkt: &RtpPacket) -> bool {
+            cache.push(pkt);
+            let stream_id = layer.stream_id();
+            let promoted = self
+                .slot
+                .on_rtp(&stream_id, pkt, Some(cache), &mut self.writer);
+            while let Some(w) = self.writer.pop() {
+                if let StreamWrite::Video { pkt, .. } = w {
+                    self.emitted.push(pkt);
+                }
+            }
+            promoted
+        }
+
+        fn ingest_all(
+            &mut self,
+            layer: &TrackLayer,
+            cache: &mut StreamCache,
+            pkts: &[RtpPacket],
+        ) -> bool {
+            let mut promoted = false;
+            for p in pkts {
+                promoted |= self.ingest(layer, cache, p);
+            }
+            promoted
+        }
+    }
+
+    #[test]
+    fn slot_switch_emits_a_decodable_stream_to_the_subscriber() {
+        let t0 = Instant::now();
+        let mut fx = Fixture::new();
+        let (high, low) = (fx.high.clone(), fx.low.clone());
+        let mut hi_cache = StreamCache::new();
+        let mut lo_cache = StreamCache::new();
+        let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut lo = H264StreamBuilder::new(2, 40_000, 600_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+
+        fx.slot.switch_to(&high, false);
+        let kf = hi.keyframe(3);
+        assert!(fx.ingest_all(&high, &mut hi_cache, &kf));
+
+        for _ in 0..10 {
+            let f = hi.delta_frame(3);
+            fx.ingest_all(&high, &mut hi_cache, &f);
+            let f = lo.delta_frame(2);
+            fx.ingest_all(&low, &mut lo_cache, &f);
+        }
+
+        fx.slot.switch_to(&low, false);
+        let kf = lo.keyframe(2);
+        assert!(
+            fx.ingest_all(&low, &mut lo_cache, &kf),
+            "a fresh keyframe must promote the staged layer"
+        );
+        for _ in 0..5 {
+            let f = lo.delta_frame(2);
+            fx.ingest_all(&low, &mut lo_cache, &f);
+        }
+
+        assert_eq!(
+            fx.slot.active.as_ref().map(|l| l.stream_id()),
+            Some(low.stream_id())
+        );
+        assert_decodable(&fx.emitted, "Slot::on_rtp across a simulcast switch");
+    }
+
+    #[test]
+    fn a_stale_gop_defers_the_switch_and_keeps_the_current_layer_flowing() {
+        let t0 = Instant::now();
+        let mut fx = Fixture::new();
+        let (high, low) = (fx.high.clone(), fx.low.clone());
+        let mut hi_cache = StreamCache::new();
+        let mut lo_cache = StreamCache::new();
+        let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        // The low layer's keyframe is far in the past; its GOP is long.
+        let mut lo = H264StreamBuilder::new(2, 40_000, 600_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+
+        fx.slot.switch_to(&high, false);
+        fx.ingest_all(&high, &mut hi_cache, &hi.keyframe(3));
+        let lo_kf = lo.keyframe(2);
+        fx.ingest_all(&low, &mut lo_cache, &lo_kf);
+
+        // Age the low layer's segment well past the replay window.
+        let frames = (MAX_REPLAY_AGE.as_millis() / 33) as usize + 5;
+        for _ in 0..frames {
+            let f = hi.delta_frame(3);
+            fx.ingest_all(&high, &mut hi_cache, &f);
+            let f = lo.delta_frame(2);
+            fx.ingest_all(&low, &mut lo_cache, &f);
+        }
+
+        let before = fx.emitted.len();
+        fx.slot.switch_to(&low, false);
+        for _ in 0..3 {
+            let f = lo.delta_frame(2);
+            fx.ingest_all(&low, &mut lo_cache, &f);
+        }
+
+        assert_eq!(
+            fx.slot.active.as_ref().map(|l| l.stream_id()),
+            Some(high.stream_id()),
+            "a stale GOP must not be burst at the subscriber"
+        );
+        assert_eq!(
+            fx.emitted.len(),
+            before,
+            "the staged layer must not leak packets before it is promoted"
+        );
+
+        // The high layer keeps flowing while we wait.
+        let f = hi.delta_frame(3);
+        fx.ingest_all(&high, &mut hi_cache, &f);
+        assert!(fx.emitted.len() > before);
+
+        // PLI is what unblocks the switch.
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        fx.slot.pli_retry(Instant::now(), &mut sink);
+        assert_eq!(
+            sink.request_keyframe_calls.first().map(|c| c.0),
+            Some(low.stream_id()),
+            "a deferred switch must keep asking the publisher for a keyframe"
+        );
+
+        // And once the publisher answers, the switch completes.
+        let kf = lo.keyframe(2);
+        assert!(fx.ingest_all(&low, &mut lo_cache, &kf));
+        assert_eq!(
+            fx.slot.active.as_ref().map(|l| l.stream_id()),
+            Some(low.stream_id())
+        );
+        assert_decodable(&fx.emitted, "deferred switch after PLI");
+    }
+
+    #[test]
+    fn many_slot_switches_stay_decodable_and_never_reuse_a_sequence_number() {
+        let t0 = Instant::now();
+        let mut fx = Fixture::new();
+        let (high, low) = (fx.high.clone(), fx.low.clone());
+        let mut hi_cache = StreamCache::new();
+        let mut lo_cache = StreamCache::new();
+        let mut hi = H264StreamBuilder::new(1, 65_000, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::AggregatedWithIdr);
+        let mut lo = H264StreamBuilder::new(2, 65_500, 4_000_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+
+        fx.slot.switch_to(&high, false);
+        fx.ingest_all(&high, &mut hi_cache, &hi.keyframe(3));
+
+        for round in 0..30 {
+            for _ in 0..4 {
+                let f = hi.delta_frame(3);
+                fx.ingest_all(&high, &mut hi_cache, &f);
+                let f = lo.delta_frame(2);
+                fx.ingest_all(&low, &mut lo_cache, &f);
+            }
+            let to_low = round % 2 == 0;
+            let target = if to_low { low.clone() } else { high.clone() };
+            fx.slot.switch_to(&target, false);
+            if to_low {
+                let kf = lo.keyframe(2);
+                fx.ingest_all(&low, &mut lo_cache, &kf);
+                let f = hi.delta_frame(3);
+                fx.ingest_all(&high, &mut hi_cache, &f);
+            } else {
+                let kf = hi.keyframe(3);
+                fx.ingest_all(&high, &mut hi_cache, &kf);
+                let f = lo.delta_frame(2);
+                fx.ingest_all(&low, &mut lo_cache, &f);
+            }
+        }
+
+        assert_decodable(&fx.emitted, "30 slot switches");
+
+        let mut seen = std::collections::HashMap::new();
+        for (i, p) in fx.emitted.iter().enumerate() {
+            if let Some(prev) = seen.insert(*p.seq_no, i) {
+                panic!("output seq {} emitted at both {prev} and {i}", *p.seq_no);
+            }
         }
     }
 }

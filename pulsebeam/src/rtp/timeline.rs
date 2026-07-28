@@ -1,38 +1,48 @@
 use crate::rtp::RtpPacket;
 use pulsebeam_runtime::rand::RngCore;
+use std::time::Duration;
 use str0m::{
     media::{Frequency, MediaTime},
     rtp::SeqNo,
 };
 use tokio::time::Instant;
 
-// Timeline allows switching between input streams that outputs a stream with a
-// continuous seq_no and playout_time as if it comes from a single stream.
+// Timeline maps a succession of input streams onto one output stream that looks
+// to the subscriber like it came from a single sender.
 //
-// Sequence rewriting:
+//   output_seq = input_seq + seq_base
+//   output_ts  = input_ts  + ts_base
 //
-//   output = (input_seq + base) mod 2^16
+// Both bases are recomputed on every switch (`rebase`).  Sequence numbers are
+// offset so the new stream continues where the old one stopped; gaps inside a
+// stream are preserved so upstream loss stays visible to the subscriber.
 //
-// `base` is adjusted on every stream switch (rebase) to make the new stream's
-// first packet follow the previous stream's last output.  `drop_count` decrements
-// `base` by the number of upstream-filtered packets between consecutive forwarded
-// ones, closing those gaps in the output seq space without needing to see the
-// dropped packets here.
-#[derive(Debug)]
+// Timestamps are anchored to a fixed epoch rather than chained off the previous
+// stream's last timestamp.  Chaining lets every switch add whatever skew that
+// switch introduced, and the error accumulates over a call; anchoring makes each
+// rebase an absolute correction against real elapsed time instead.
 pub struct Timeline {
     clock_rate: Frequency,
-    /// The last output seq_no actually written (used to compute `base` on rebase).
+    /// Highest output seq_no written so far.
     max_output: SeqNo,
-    /// Additive offset: output = input + base.
+    /// Additive offset: output = input + seq_base.
     seq_base: SeqNo,
-    /// Whether any packet has been forwarded yet.
-    started: bool,
-    /// The last output rtp_ts written (used to compute `ts_base` on rebase).
+    /// Highest output rtp_ts written so far.
     max_output_ts: u64,
     /// Additive offset for RTP timestamps.
     ts_base: u64,
-    /// The playout time of the last output packet.
-    last_playout_time: Option<Instant>,
+    /// (wall time, output rtp_ts) of the first packet ever forwarded. Every
+    /// rebase re-anchors against this so switches do not accumulate skew.
+    epoch: Option<(Instant, u64)>,
+}
+
+impl std::fmt::Debug for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timeline")
+            .field("max_output", &*self.max_output)
+            .field("max_output_ts", &self.max_output_ts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Timeline {
@@ -42,10 +52,9 @@ impl Timeline {
             clock_rate,
             max_output: SeqNo::from(base_seq_no as u64),
             seq_base: SeqNo::default(),
-            started: false,
             max_output_ts: 0,
             ts_base: 0,
-            last_playout_time: None,
+            epoch: None,
         }
     }
 
@@ -55,254 +64,344 @@ impl Timeline {
         Self::new_with_base(clock_rate, base_seq_no)
     }
 
-    /// Re-aligns the timeline to a new video stream starting with `packet`.
-    /// `packet` must be a keyframe (start of a new GOP).
+    /// Smallest RTP-timestamp advance a switch may make.
+    ///
+    /// The frame that starts the new stream must never share a timestamp with
+    /// the frame that ended the old one, or the subscriber's decoder treats the
+    /// two as one frame. One 60fps frame interval is the smallest gap that also
+    /// reads as a plausible frame duration.
+    #[inline]
+    fn min_switch_advance(&self) -> u64 {
+        (self.clock_rate.get() as u64 / 60).max(1)
+    }
+
+    #[inline]
+    fn ticks(&self, d: Duration) -> u64 {
+        ((d.as_nanos() * self.clock_rate.get() as u128) / 1_000_000_000u128) as u64
+    }
+
+    /// Re-aligns the timeline to a new source stream starting with `packet`.
     pub fn rebase(&mut self, packet: &RtpPacket) {
         self.rebase_inner(packet);
     }
 
     /// Re-aligns the timeline to a new audio stream.
-    ///
-    /// Identical to `rebase` but without the keyframe assertion.
     pub fn rebase_audio(&mut self, packet: &RtpPacket) {
         self.rebase_inner(packet);
     }
 
     fn rebase_inner(&mut self, packet: &RtpPacket) {
         let input_seq = *packet.seq_no;
-        // Make the first output from the new stream follow max_output.
         self.seq_base = self
             .max_output
             .wrapping_add(1)
             .wrapping_sub(input_seq)
             .into();
-        self.started = false;
 
         let input_ts = packet.rtp_ts.numer();
-
-        if let Some(last_playout) = self.last_playout_time {
-            let time_delta = packet.playout_time.saturating_duration_since(last_playout);
-            let ts_delta = (time_delta.as_secs_f64() * (self.clock_rate.get() as f64)) as u64;
-            let expected_ts = self.max_output_ts.wrapping_add(ts_delta);
-            self.ts_base = expected_ts.wrapping_sub(input_ts);
-        } else {
-            // Preserve the original timestamp offset on the first packet.
-            self.ts_base = 0;
-        }
+        self.ts_base = match self.epoch {
+            // Nothing forwarded yet: keep the source's own timestamps.
+            None => 0,
+            Some((epoch_at, epoch_ts)) => {
+                let elapsed = packet.playout_time.saturating_duration_since(epoch_at);
+                let target = epoch_ts.wrapping_add(self.ticks(elapsed));
+                let floor = self.max_output_ts.wrapping_add(self.min_switch_advance());
+                let target = if target < floor { floor } else { target };
+                debug_assert!(
+                    target > self.max_output_ts,
+                    "rebase must move the output clock forward"
+                );
+                target.wrapping_sub(input_ts)
+            }
+        };
     }
 
-    /// Adjust `base` to account for `n` upstream-filtered packets that will
-    /// never arrive here.  Call this before `rewrite` for the packet immediately
-    /// following the filtered run.
-    pub fn drop_count(&mut self, n: u16) {
-        self.seq_base = self.seq_base.wrapping_sub(n as u64).into();
-    }
-
+    /// Rewrite `pkt` preserving its position relative to its own stream, so gaps
+    /// left by upstream loss stay visible to the subscriber.
     pub fn rewrite(&mut self, pkt: &mut RtpPacket) {
-        let input_seq = *pkt.seq_no;
-        let output_seq = input_seq.wrapping_add(*self.seq_base).into();
+        let output_seq: SeqNo = (*pkt.seq_no).wrapping_add(*self.seq_base).into();
+        let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
+        self.apply(pkt, output_seq, output_ts);
+    }
+
+    /// Rewrite `pkt` onto the next free output sequence number.
+    ///
+    /// Used for a replayed switch burst, which the cache has already ordered and
+    /// deduplicated and which may carry synthesized parameter-set packets whose
+    /// original sequence numbers are unrelated to the segment.
+    pub fn rewrite_sequential(&mut self, pkt: &mut RtpPacket) {
+        let output_seq: SeqNo = self.max_output.wrapping_add(1).into();
+        let output_ts = pkt.rtp_ts.numer().wrapping_add(self.ts_base);
+        self.apply(pkt, output_seq, output_ts);
+    }
+
+    /// After a burst rewritten with `rewrite_sequential`, realign the sequence
+    /// offset so the stream's next live packet (`last_input_seq + 1`) continues
+    /// from where the burst stopped.
+    pub fn resync_to_input(&mut self, last_input_seq: SeqNo) {
+        self.seq_base = (*self.max_output).wrapping_sub(*last_input_seq).into();
+    }
+
+    fn apply(&mut self, pkt: &mut RtpPacket, output_seq: SeqNo, output_ts: u64) {
         pkt.seq_no = output_seq;
-
-        if !self.started || output_seq > self.max_output {
-            self.max_output = output_seq;
-        }
-        self.started = true;
-
-        let input_ts = pkt.rtp_ts.numer();
-        let output_ts = input_ts.wrapping_add(self.ts_base);
         pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);
 
-        self.max_output_ts = output_ts;
-        self.last_playout_time = Some(pkt.playout_time);
+        if self.epoch.is_none() {
+            self.epoch = Some((pkt.playout_time, output_ts));
+            self.max_output = output_seq;
+            self.max_output_ts = output_ts;
+            return;
+        }
+
+        if output_seq > self.max_output {
+            self.max_output = output_seq;
+        }
+        if output_ts > self.max_output_ts {
+            self.max_output_ts = output_ts;
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::time::Duration;
+    use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
+
+    fn pkt(seq: u64, ts: u64, at: Instant) -> RtpPacket {
+        RtpPacket {
+            seq_no: seq.into(),
+            rtp_ts: MediaTime::new(ts, Frequency::NINETY_KHZ),
+            playout_time: at,
+            arrival_ts: at,
+            ..Default::default()
+        }
+    }
 
     #[test]
-    fn test_simple_continuity() {
-        let start_time = Instant::now();
+    fn sequence_and_timestamps_are_continuous_within_a_stream() {
+        let t0 = Instant::now();
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
-        // Packet 1: First packet (Keyframe) - requires rebase
-        let mut p1 = RtpPacket {
-            seq_no: 100.into(),
-            rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
-            playout_time: start_time,
-            is_keyframe: true,
-            ..Default::default()
-        };
-
+        let mut p1 = pkt(100, 10_000, t0);
         timeline.rebase(&p1);
         timeline.rewrite(&mut p1);
-        let base_seq = *p1.seq_no;
 
-        // Packet 2: Regular packet, 100ms later
-        let mut p2 = RtpPacket {
-            seq_no: 101.into(),
-            rtp_ts: MediaTime::new(19000, Frequency::NINETY_KHZ),
-            playout_time: start_time + Duration::from_millis(100),
-            is_keyframe: false,
-            ..Default::default()
-        };
-
+        let mut p2 = pkt(101, 19_000, t0 + Duration::from_millis(100));
         timeline.rewrite(&mut p2);
 
-        // Verify Sequence Continuity
-        assert_eq!(
-            *p2.seq_no,
-            base_seq + 1,
-            "Sequence number should increment by 1"
-        );
-
-        // Verify Timestamp: 100ms at 90kHz = 9000 ticks
-        let ts_diff = p2.rtp_ts.numer().wrapping_sub(p1.rtp_ts.numer());
-        assert_eq!(ts_diff, 9000, "Timestamp should correspond to 100ms delta");
+        assert_eq!(*p2.seq_no, *p1.seq_no + 1);
+        assert_eq!(p2.rtp_ts.numer() - p1.rtp_ts.numer(), 9000);
     }
 
     #[test]
-    fn test_switching_streams() {
-        let start_time = Instant::now();
+    fn upstream_loss_stays_visible_as_a_sequence_gap() {
+        let t0 = Instant::now();
         let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
 
-        // --- Stream A (Seq 1000-1001) ---
-        let mut p_a1 = RtpPacket {
-            seq_no: 1000.into(),
-            rtp_ts: MediaTime::new(10000, Frequency::NINETY_KHZ),
-            playout_time: start_time,
-            is_keyframe: true,
-            ..Default::default()
-        };
-
-        timeline.rebase(&p_a1);
-        timeline.rewrite(&mut p_a1);
-
-        let mut p_a2 = RtpPacket {
-            seq_no: 1001.into(),
-            rtp_ts: MediaTime::new(13000, Frequency::NINETY_KHZ),
-            playout_time: start_time + Duration::from_millis(33),
-            is_keyframe: false,
-            ..Default::default()
-        };
-        timeline.rewrite(&mut p_a2);
-
-        // --- Switch to Stream B (Seq 5000) ---
-        // Stream B arrives 100ms after start, starting at random Seq 5000
-        let mut p_b1 = RtpPacket {
-            seq_no: 5000.into(),
-            rtp_ts: MediaTime::new(80000, Frequency::NINETY_KHZ), // Random initial timestamp
-            playout_time: start_time + Duration::from_millis(100),
-            is_keyframe: true,
-            ..Default::default()
-        };
-
-        timeline.rebase(&p_b1); // Rebase aligns Stream B to follow Stream A
-        timeline.rewrite(&mut p_b1);
-
-        // Verify Continuity across switch
-        assert_eq!(
-            *p_b1.seq_no,
-            (*p_a2.seq_no).wrapping_add(1),
-            "Output sequence must be continuous across switch"
-        );
-
-        // Verify Timestamp linearity
-        // A2 was at 33ms. B1 is at 100ms. Time delta is 67ms.
-        // 67ms at 90kHz = 6030 ticks.
-        // So B1 should be A2 + 6030 ticks.
-        let ts_diff = p_b1.rtp_ts.numer().wrapping_sub(p_a2.rtp_ts.numer());
-        assert_eq!(ts_diff, 6030, "Timestamp should be linear across switch");
-    }
-
-    #[test]
-    fn test_sequence_wrapping_u64() {
-        let start_time = Instant::now();
-        let mut timeline = Timeline::new(
-            Frequency::NINETY_KHZ,
-            &mut pulsebeam_runtime::rand::seeded_rng(42),
-        );
-
-        // Start normally
-        let mut p1 = RtpPacket {
-            seq_no: 10.into(),
-            playout_time: start_time,
-            is_keyframe: true,
-            ..Default::default()
-        };
+        let mut p1 = pkt(100, 10_000, t0);
         timeline.rebase(&p1);
         timeline.rewrite(&mut p1);
 
-        // Manually force the internal highest_seq_no to u64 boundary - 1
-        // We can't modify private state directly, so we simulate a stream
-        // that pushes the timeline to the edge.
-        // Or, we rely on the fact that `rebase` calculates offset based on wrapping arithmetic.
-
-        // Let's simulate a switch to a stream where the calculation wraps.
-        // Current Out: X.
-        // We want next Out: X+1.
-        // Input is Y.
-        // Offset = (X+1) - Y.
-
-        // We simply verify strict +1 increments even if input jumps largely
-        let mut p_next = RtpPacket {
-            seq_no: u64::MAX.into(), // Input at boundary
-            playout_time: start_time + Duration::from_millis(33),
-            is_keyframe: true,
-            ..Default::default()
-        };
-
-        // Switch to high sequence number
-        timeline.rebase(&p_next);
-        timeline.rewrite(&mut p_next);
-
-        assert_eq!(*p_next.seq_no, (*p1.seq_no).wrapping_add(1));
-
-        // Next packet wraps the input
-        let mut p_wrap = RtpPacket {
-            seq_no: 0.into(),
-            playout_time: start_time + Duration::from_millis(66),
-            is_keyframe: false,
-            ..Default::default()
-        };
-
-        // Normal rewrite (no rebase needed for contiguous input)
-        // Input: u64::MAX -> 0 (wrapped)
-        // Output: X+1 -> X+2
-        timeline.rewrite(&mut p_wrap);
-        assert_eq!(*p_wrap.seq_no, (*p_next.seq_no).wrapping_add(1));
-    }
-
-    // removed test test_panic_if_no_rebase
-
-    #[test]
-    fn test_late_packet_ordering() {
-        let start_time = Instant::now();
-        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
-
-        let mut p1 = RtpPacket {
-            seq_no: 10.into(),
-            rtp_ts: MediaTime::new(1000, Frequency::NINETY_KHZ),
-            playout_time: start_time + Duration::from_millis(100),
-            is_keyframe: true,
-            ..Default::default()
-        };
-        timeline.rebase(&p1);
-        timeline.rewrite(&mut p1);
-
-        let mut p2 = RtpPacket {
-            seq_no: 11.into(),
-            rtp_ts: MediaTime::new(1500, Frequency::NINETY_KHZ),
-            playout_time: start_time + Duration::from_millis(50),
-            is_keyframe: false,
-            ..Default::default()
-        };
-
+        // Packets 101..=104 were lost upstream.
+        let mut p2 = pkt(105, 25_000, t0 + Duration::from_millis(160));
         timeline.rewrite(&mut p2);
 
-        // rtp_ts should just be linearly transformed, preserving input timing
-        assert_eq!(p2.rtp_ts.numer().wrapping_sub(p1.rtp_ts.numer()), 500);
+        assert_eq!(
+            *p2.seq_no - *p1.seq_no,
+            5,
+            "the subscriber must be able to see that 4 packets were lost"
+        );
+    }
+
+    #[test]
+    fn a_switch_is_seamless_in_sequence_and_forward_in_time() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a1 = pkt(1000, 10_000, t0);
+        timeline.rebase(&a1);
+        timeline.rewrite(&mut a1);
+        let mut a2 = pkt(1001, 13_000, t0 + Duration::from_millis(33));
+        timeline.rewrite(&mut a2);
+
+        // Stream B has completely unrelated sequence and timestamp bases.
+        let mut b1 = pkt(5000, 80_000, t0 + Duration::from_millis(100));
+        timeline.rebase(&b1);
+        timeline.rewrite(&mut b1);
+
+        assert_eq!(*b1.seq_no, (*a2.seq_no).wrapping_add(1));
+        assert!(b1.rtp_ts.numer() > a2.rtp_ts.numer());
+        assert_eq!(b1.rtp_ts.numer() - a1.rtp_ts.numer(), 9000);
+    }
+
+    #[test]
+    fn a_switch_to_an_older_source_still_moves_the_clock_forward() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a1 = pkt(10, 10_000, t0 + Duration::from_millis(500));
+        timeline.rebase(&a1);
+        timeline.rewrite(&mut a1);
+
+        // A replayed segment whose first packet is older than what we just sent.
+        let mut b1 = pkt(900, 4_000, t0 + Duration::from_millis(300));
+        timeline.rebase(&b1);
+        timeline.rewrite(&mut b1);
+
+        assert!(
+            b1.rtp_ts.numer() > a1.rtp_ts.numer(),
+            "two frames must never share a timestamp: {} vs {}",
+            a1.rtp_ts.numer(),
+            b1.rtp_ts.numer()
+        );
+    }
+
+    #[test]
+    fn repeated_switches_do_not_accumulate_clock_skew() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+        let mut first_out = None;
+        let mut last: Option<RtpPacket> = None;
+
+        // Alternate between two sources every 10 frames for 100 switches, each
+        // source keeping its own unrelated timestamp base.
+        for switch in 0..100u64 {
+            let source_base = if switch % 2 == 0 { 7_000_000 } else { 250 };
+            for frame in 0..10u64 {
+                let elapsed = Duration::from_millis((switch * 10 + frame) * 33);
+                let input_ts = source_base + (switch * 10 + frame) * 2970;
+                let mut p = pkt(switch * 1000 + frame, input_ts, t0 + elapsed);
+                if frame == 0 {
+                    timeline.rebase(&p);
+                }
+                timeline.rewrite(&mut p);
+                if first_out.is_none() {
+                    first_out = Some(p.clone());
+                }
+                if let Some(prev) = &last {
+                    assert!(
+                        p.rtp_ts.numer() > prev.rtp_ts.numer(),
+                        "output clock went backwards at switch {switch} frame {frame}"
+                    );
+                }
+                last = Some(p);
+            }
+        }
+
+        let first = first_out.unwrap();
+        let last = last.unwrap();
+        let ts_elapsed = last.rtp_ts.numer() - first.rtp_ts.numer();
+        let wall_ticks = (last
+            .playout_time
+            .duration_since(first.playout_time)
+            .as_secs_f64()
+            * 90_000.0) as u64;
+        let skew_ms = ts_elapsed.abs_diff(wall_ticks) as f64 / 90.0;
+        assert!(
+            skew_ms < 50.0,
+            "output clock drifted {skew_ms:.1}ms from real time over 100 switches"
+        );
+    }
+
+    #[test]
+    fn sequential_rewrite_then_resync_continues_the_live_stream() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut a = pkt(10, 1_000, t0);
+        timeline.rebase(&a);
+        timeline.rewrite(&mut a);
+
+        // A replayed burst with unrelated, non-contiguous input sequence numbers.
+        let mut burst_out = Vec::new();
+        for (i, input_seq) in [990u64, 991, 995, 996].into_iter().enumerate() {
+            let mut p = pkt(
+                input_seq,
+                50_000 + i as u64 * 3000,
+                t0 + Duration::from_millis(10),
+            );
+            if i == 0 {
+                timeline.rebase(&p);
+            }
+            timeline.rewrite_sequential(&mut p);
+            burst_out.push(p);
+        }
+
+        assert!(
+            burst_out
+                .windows(2)
+                .all(|w| *w[1].seq_no == *w[0].seq_no + 1),
+            "a replayed burst is contiguous by construction"
+        );
+        assert_eq!(*burst_out[0].seq_no, *a.seq_no + 1);
+
+        timeline.resync_to_input(996.into());
+        let mut live = pkt(997, 62_000, t0 + Duration::from_millis(43));
+        timeline.rewrite(&mut live);
+        assert_eq!(*live.seq_no, *burst_out.last().unwrap().seq_no + 1);
+
+        // And loss after the burst still shows up as a gap.
+        let mut after_loss = pkt(1000, 71_000, t0 + Duration::from_millis(76));
+        timeline.rewrite(&mut after_loss);
+        assert_eq!(*after_loss.seq_no - *live.seq_no, 3);
+    }
+
+    #[test]
+    fn reordered_input_is_passed_through_without_reordering_the_output() {
+        let t0 = Instant::now();
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut p1 = pkt(10, 1_000, t0);
+        timeline.rebase(&p1);
+        timeline.rewrite(&mut p1);
+
+        let mut p3 = pkt(12, 7_000, t0 + Duration::from_millis(66));
+        timeline.rewrite(&mut p3);
+        let mut p2 = pkt(11, 4_000, t0 + Duration::from_millis(33));
+        timeline.rewrite(&mut p2);
+
+        assert_eq!(*p2.seq_no + 1, *p3.seq_no);
+        assert!(p2.rtp_ts.numer() < p3.rtp_ts.numer());
+
+        // A late packet must not drag the switch anchor backwards.
+        let mut next = pkt(13, 10_000, t0 + Duration::from_millis(99));
+        timeline.rebase(&next);
+        timeline.rewrite(&mut next);
+        assert_eq!(*next.seq_no, *p3.seq_no + 1);
+    }
+
+    #[test]
+    fn real_h264_streams_switch_without_a_timestamp_collision() {
+        let t0 = Instant::now();
+        let mut a = H264StreamBuilder::new(1, 100, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut b = H264StreamBuilder::new(2, 60_000, 5_000_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+
+        let mut out = Vec::new();
+        let mut first = true;
+        for p in a.keyframe(3).into_iter().chain(a.delta_frames(10, 3)) {
+            let mut p = p;
+            if first {
+                timeline.rebase(&p);
+                first = false;
+            }
+            timeline.rewrite(&mut p);
+            out.push(p);
+        }
+        let _ = b.delta_frames(11, 2);
+        let mut first = true;
+        for p in b.keyframe(2).into_iter().chain(b.delta_frames(5, 2)) {
+            let mut p = p;
+            if first {
+                timeline.rebase(&p);
+                first = false;
+            }
+            timeline.rewrite(&mut p);
+            out.push(p);
+        }
+
+        crate::rtp::conformance::assert_decodable(&out, "timeline-only switch");
     }
 }

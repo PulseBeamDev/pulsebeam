@@ -8,6 +8,7 @@ pub mod ramp;
 pub mod scenario;
 pub mod simulcast;
 pub mod slots;
+pub mod switching;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

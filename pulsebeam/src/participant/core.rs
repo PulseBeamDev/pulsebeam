@@ -19,6 +19,8 @@ use tokio::time::Instant;
 
 use crate::entity::{self, TrackId};
 use crate::id::ShardId;
+#[cfg(debug_assertions)]
+use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
@@ -140,6 +142,9 @@ pub struct ParticipantCore {
     pending_rtc_mutations: VecDeque<PendingRtcMutation>,
     rtc_deadline: Option<Instant>,
     rtc_needs_drain: bool,
+    exited: bool,
+    #[cfg(debug_assertions)]
+    egress_guard: crate::rtp::egress_guard::EgressGuard,
 
     // Warm: touched per poll cycle
     pub upstream: UpstreamAllocator,
@@ -184,6 +189,9 @@ impl ParticipantCore {
             pending_rtc_mutations: VecDeque::new(),
             rtc_deadline: None,
             rtc_needs_drain: true,
+            exited: false,
+            #[cfg(debug_assertions)]
+            egress_guard: crate::rtp::egress_guard::EgressGuard::new(),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             rtc,
@@ -381,7 +389,7 @@ impl ParticipantCore {
     /// the drain loop before this method can be called again.
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
         if let Some(write) = self.stream_writer.pop() {
-            self.apply_stream_write(write);
+            self.apply_stream_write(write, now);
             return true;
         }
 
@@ -426,7 +434,7 @@ impl ParticipantCore {
         }
     }
 
-    fn apply_stream_write(&mut self, write: StreamWrite) {
+    fn apply_stream_write(&mut self, write: StreamWrite, now: Instant) {
         let (pkt, mid, rid, pt, nackable) = match write {
             StreamWrite::Video { pkt, mid, rid, pt } => (pkt, mid, rid, pt, true),
             StreamWrite::Audio { pkt, mid, pt } => (pkt, mid, None, pt, false),
@@ -443,6 +451,14 @@ impl ParticipantCore {
             return;
         };
         let ssrc = stream.ssrc();
+        #[cfg(debug_assertions)]
+        if let Some(violation) = self
+            .egress_guard
+            .check(mid, rid, *pkt.seq_no, pkt.rtp_ts.numer())
+        {
+            plog_error!(ctx, %mid, ?rid, %violation, "egress stream invariant violated");
+            debug_assert!(false, "egress stream invariant violated: {violation}");
+        }
         if nackable {
             plog_trace!(
                 ctx,
@@ -469,11 +485,14 @@ impl ParticipantCore {
             self.downstream
                 .record_playout_delay_stamp(mid, rid, pkt.seq_no);
         }
+        // str0m derives Sender Report and TWCC timing from this instant, so it
+        // must be when the packet is handed over — not when it arrived. A switch
+        // replays cached packets whose arrival is already in the past.
         let rtp = RtpWrite::new(
             pt,
             pkt.seq_no,
             pkt.rtp_ts.numer() as u32,
-            pkt.playout_time.into(),
+            now.into(),
             pkt.payload,
         )
         .nackable(nackable)
@@ -483,12 +502,19 @@ impl ParticipantCore {
     }
 
     pub fn poll(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
+        // A disconnect can be observed while work for this participant is still
+        // queued, so poll can be re-entered after it has already exited.
+        if self.exited {
+            return None;
+        }
+
         let mut budget = 3;
         'drain: loop {
             if self.rtc_needs_drain {
                 let Some(rtc_deadline) = self.poll_rtc(now, events) else {
                     self.rtc_deadline = None;
                     self.rtc_needs_drain = false;
+                    self.exited = true;
                     self.cleanup_data_topics(events);
                     events.exit();
                     return None;

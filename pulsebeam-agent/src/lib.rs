@@ -25,15 +25,25 @@ pub struct MediaFrame {
     pub data: Arc<[u8]>,
     pub capture_time: Instant,
     pub abs_capture_time: Option<SystemTime>,
+    /// Whether this frame follows the previous one with no missing packets.
+    pub contiguous: bool,
+    pub is_keyframe: bool,
 }
 
 impl From<MediaData> for MediaFrame {
     fn from(value: MediaData) -> Self {
+        let is_keyframe = match value.codec_extra {
+            str0m::format::CodecExtra::H264(e) => e.is_keyframe,
+            str0m::format::CodecExtra::Vp9(e) => e.is_keyframe,
+            _ => false,
+        };
         Self {
             ts: value.time,
             data: value.data,
             capture_time: value.network_time.into(),
             abs_capture_time: value.ext_vals.abs_capture_time.map(|act| act.capture_time),
+            contiguous: value.contiguous,
+            is_keyframe,
         }
     }
 }
