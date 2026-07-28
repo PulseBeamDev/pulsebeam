@@ -1,4 +1,5 @@
 use crate::media::KeyframeNotifier;
+use pulsebeam_core::simulcast::LayerQuality;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
@@ -12,20 +13,10 @@ const DEBT_IMMEDIATE_THRESHOLD: f64 = 0.25;
 const KEYFRAME_REQUEST_THROTTLE: Duration = Duration::from_secs(1);
 
 fn layer_seed_bps(rid: Option<Rid>) -> f64 {
-    match rid_quality_rank(rid) {
-        0 => 30_000.0,
-        1 => 900_000.0,
-        2 => 1_400_000.0,
-        _ => 1_400_000.0,
-    }
-}
-
-fn rid_quality_rank(rid: Option<Rid>) -> u8 {
-    match rid.as_ref().map(|r| r.as_ref()) {
-        Some("q") => 0,
-        Some("h") => 1,
-        Some("f") => 2,
-        _ => 255,
+    match LayerQuality::from_rid(rid.as_ref().map(|r| r.as_ref())) {
+        LayerQuality::Low => 30_000.0,
+        LayerQuality::Medium => 900_000.0,
+        LayerQuality::High => 1_400_000.0,
     }
 }
 

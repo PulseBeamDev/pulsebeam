@@ -856,7 +856,10 @@ impl AllocationEngine {
 
     /// Whether a layer may currently be forwarded or switched into.
     fn eligible(slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        Self::spatially_allowed(slot, layer) && layer.state.is_healthy()
+        let bitrate = Self::cost(layer);
+        debug_assert!(bitrate.is_finite());
+        debug_assert!(bitrate >= 0.0);
+        Self::spatially_allowed(slot, layer) && layer.state.is_healthy() && bitrate > 0.0
     }
 
     fn cost(layer: &TrackLayer) -> f64 {
@@ -871,7 +874,7 @@ impl AllocationEngine {
         slot.track
             .layers
             .iter()
-            .filter(|l| l.state.is_healthy())
+            .filter(|layer| layer.state.is_healthy() && Self::cost(layer) > 0.0)
             .min_by_key(|l| l.quality)
     }
 
@@ -1267,9 +1270,9 @@ mod assignment_tests {
 
         let mid = Mid::from("v0");
         let track_layers = vec![
+            SimulcastLayer::new("q"),
             SimulcastLayer::new("h"),
-            SimulcastLayer::new("m"),
-            SimulcastLayer::new("l"),
+            SimulcastLayer::new("f"),
         ];
         let (tx, track) = make_video_track(pid, mid, track_layers);
         for layer in &track.layers {
@@ -1373,7 +1376,7 @@ mod assignment_tests {
         let (tx, track) = make_video_track(
             pid,
             mid,
-            vec![SimulcastLayer::new("h"), SimulcastLayer::new("m")],
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
         );
         for layer in &track.layers {
             layer.state.update_for_test().inactive(false);
@@ -1474,9 +1477,9 @@ mod assignment_tests {
             pid,
             mid,
             vec![
+                SimulcastLayer::new("q"),
                 SimulcastLayer::new("h"),
-                SimulcastLayer::new("m"),
-                SimulcastLayer::new("l"),
+                SimulcastLayer::new("f"),
             ],
         );
         let mut track = track;
@@ -1510,9 +1513,9 @@ mod assignment_tests {
             pid,
             mid,
             vec![
+                SimulcastLayer::new("q"),
                 SimulcastLayer::new("h"),
-                SimulcastLayer::new("m"),
-                SimulcastLayer::new("l"),
+                SimulcastLayer::new("f"),
             ],
         );
         let mut track = track;
@@ -1547,9 +1550,9 @@ mod assignment_tests {
             pid,
             mid,
             vec![
+                SimulcastLayer::new("q"),
                 SimulcastLayer::new("h"),
-                SimulcastLayer::new("m"),
-                SimulcastLayer::new("l"),
+                SimulcastLayer::new("f"),
             ],
         );
         let mut track = track;
@@ -1728,9 +1731,9 @@ mod assignment_tests {
             pid,
             Mid::from("t"),
             vec![
-                SimulcastLayer::new("f"),
-                SimulcastLayer::new("h"),
                 SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
             ],
         );
 
@@ -1800,9 +1803,9 @@ mod allocation_tests {
             ParticipantId::new(&mut test_rng()),
             Mid::from("t"),
             vec![
+                SimulcastLayer::new("q"),
                 SimulcastLayer::new("h"),
-                SimulcastLayer::new("m"),
-                SimulcastLayer::new("l"),
+                SimulcastLayer::new("f"),
             ],
         );
         for layer in &track.layers {
@@ -2233,6 +2236,24 @@ mod allocation_tests {
                 receiver.quality
             );
         }
+    }
+
+    #[test]
+    fn healthy_zero_bitrate_layer_is_never_forwarded() {
+        let t = healthy_track();
+        for layer in &t.layers {
+            layer.state.update_for_test().bitrate(0);
+        }
+        let slots = vec![slot("a", 1080, &t, LayerQuality::High)];
+        let decisions = AllocationEngine::compute(bw(10_000), &slots);
+
+        assert!(
+            !matches!(
+                decisions.get(slots[0].key),
+                Some(AllocationDecision::Forward(..))
+            ),
+            "zero-bitrate layer must not be forwarded"
+        );
     }
 
     // ─── Property: higher-priority slot is preferred when budget is tight ────────
@@ -2683,9 +2704,9 @@ mod slot_switch_tests {
                 pid,
                 Mid::from("v0"),
                 vec![
-                    SimulcastLayer::new("f"),
-                    SimulcastLayer::new("h"),
                     SimulcastLayer::new("q"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("f"),
                 ],
             );
             let high = track.by_quality(LayerQuality::High).unwrap().clone();

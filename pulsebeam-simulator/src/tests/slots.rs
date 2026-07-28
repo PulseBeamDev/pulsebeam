@@ -163,9 +163,9 @@ fn slots_prioritization_test() -> turmoil::Result {
                     MediaKind::Video,
                     TransceiverDirection::SendOnly,
                     Some(vec![
-                        SimulcastLayer::new("f"),
-                        SimulcastLayer::new("h"),
                         SimulcastLayer::new("q"),
+                        SimulcastLayer::new("h"),
+                        SimulcastLayer::new("f"),
                     ]),
                 )
                 .connect("room1")
@@ -186,9 +186,9 @@ fn slots_prioritization_test() -> turmoil::Result {
                     MediaKind::Video,
                     TransceiverDirection::SendOnly,
                     Some(vec![
-                        SimulcastLayer::new("f"),
-                        SimulcastLayer::new("h"),
                         SimulcastLayer::new("q"),
+                        SimulcastLayer::new("h"),
+                        SimulcastLayer::new("f"),
                     ]),
                 )
                 .connect("room1")

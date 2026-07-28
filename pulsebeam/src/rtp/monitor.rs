@@ -284,6 +284,19 @@ impl StreamMonitor {
         let may_activate = !self.vla_inactive;
         self.last_packet_at = packet.arrival_ts;
         if may_activate {
+            if was_inactive {
+                let activation_bitrate = if self.declared_target_bps > 0 {
+                    self.declared_target_bps
+                } else {
+                    self.nominal_bitrate_bps
+                };
+                if activation_bitrate > 0 {
+                    self.shared_state
+                        .bitrate_bps
+                        .store(activation_bitrate, Ordering::Relaxed);
+                    debug_assert_ne!(self.shared_state.bitrate_bps(), 0.0);
+                }
+            }
             self.shared_state.inactive.store(false, Ordering::Relaxed);
             self.publish_health();
         }
@@ -327,8 +340,8 @@ impl StreamMonitor {
     }
 
     fn publish_inactive(&self) {
-        self.shared_state.inactive.store(true, Ordering::Relaxed);
         self.shared_state.healthy.store(false, Ordering::Relaxed);
+        self.shared_state.inactive.store(true, Ordering::Relaxed);
         self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
         debug_assert!(self.shared_state.is_inactive());
         debug_assert!(!self.shared_state.is_healthy());
@@ -885,6 +898,7 @@ mod test {
 
         assert!(!shared.is_inactive());
         assert!(shared.is_healthy());
+        assert_eq!(shared.bitrate_bps(), 400_000.0);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::rtp::{
     sync::Synchronizer,
 };
 pub use data_track::*;
+pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
@@ -75,25 +76,6 @@ impl StreamWriter {
 
     pub fn pop(&mut self) -> Option<StreamWrite> {
         self.pending.pop_front()
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum LayerQuality {
-    Low = 1,
-    Medium = 2,
-    High = 3,
-}
-
-impl std::fmt::Debug for LayerQuality {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let txt = match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        };
-        f.write_str(txt)
     }
 }
 
@@ -382,20 +364,16 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 /// * `meta` - Metadata describing the track. `meta.kind` **must** be `Video`.
 /// * `layers` - A vector of configurations defining the simulcast layers.
 ///
-/// # Layer Index Mapping Behavior
+/// # Layer Quality Mapping
 ///
-/// This constructor assigns bitrates and `LayerQuality` profiles positionally based on
-/// the insertion order of the `layers` parameter:
-///
-/// | Vector Index | Layer Quality | Target Bitrate | Typical Target RID |
-/// | :--- | :--- | :--- | :--- |
-/// | `0` | `LayerQuality::High` | 1,250,000 bits/s | `"f"` (Full) |
-/// | `1` | `LayerQuality::Medium` | 400,000 bits/s | `"h"` (Half) |
-/// | `2+` or Empty | `LayerQuality::Low` | 150,000 bits/s | `"q"` (Quarter) |
+/// `LayerQuality` is derived from each layer's rid string
+/// (`pulsebeam_core::simulcast::LayerQuality::from_rid`), never from vector position —
+/// `"f"` → High, `"h"` → Medium, `"q"` → Low, anything else defaults to Low.
 ///
 /// ### Sorting Post-Processing
 /// After initialization, both the internal `UpstreamTrack` and `Track` layers are
-/// **sorted in descending order** by their `LayerQuality` enum fields (`High -> Medium -> Low`).
+/// **sorted in descending order** by their `LayerQuality` enum fields (`High -> Medium -> Low`),
+/// regardless of the order `layers` was supplied in.
 pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (UpstreamTrack, Track) {
     debug_assert_eq!(meta.id.kind(), TrackKind::Video);
     let simulcast_rids: Vec<Option<Rid>> = if layers.is_empty() {
@@ -407,19 +385,10 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     let mut senders = Vec::new();
     let mut layers = Vec::with_capacity(simulcast_rids.len());
 
-    for (index, &rid) in simulcast_rids.iter().enumerate() {
-        let (bitrate, quality) = match (rid, index) {
-            (None, _) => (150_000, LayerQuality::Low),
-            (Some(_), 0) => (1_250_000, LayerQuality::High),
-            (Some(_), 1) => (400_000, LayerQuality::Medium),
-            (Some(_), _) => (150_000, LayerQuality::Low),
-        };
-
-        let fallback_height = match quality {
-            LayerQuality::Low => 180,
-            LayerQuality::Medium => 360,
-            LayerQuality::High => 720,
-        };
+    for &rid in &simulcast_rids {
+        let quality = LayerQuality::from_rid(rid.as_deref());
+        let bitrate = quality.seed_bitrate_bps();
+        let fallback_height = quality.fallback_height();
         let stream_state = StreamState::new_with_height(true, bitrate, fallback_height);
         let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
         let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state.clone());

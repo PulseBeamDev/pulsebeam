@@ -48,9 +48,9 @@ fn fast_initial_ramp_up_on_good_network_test() {
                     MediaKind::Video,
                     TransceiverDirection::SendOnly,
                     Some(vec![
-                        SimulcastLayer::new("f"),
-                        SimulcastLayer::new("h"),
                         SimulcastLayer::new("q"),
+                        SimulcastLayer::new("h"),
+                        SimulcastLayer::new("f"),
                     ]),
                 )
                 .connect("room1")
