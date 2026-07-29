@@ -144,24 +144,30 @@ impl AsRef<StreamStateInner> for StreamState {
 pub struct StreamStateInner {
     inactive: AtomicBool,
     healthy: AtomicBool,
-    /// Reactive cost — matches str0m's BWE timescale (3 s fall). Used by
-    /// the allocator's budget-fitting logic in `AllocationEngine::cost()`.
-    bitrate_bps: AtomicU64,
-    /// Stable cost — very slow fall (30 s). Used by `AllocationEngine::desired_bitrate()`
-    /// so str0m's probe controller sees a conservatively high, sticky demand signal.
-    stable_bitrate_bps: AtomicU64,
+    /// Both bitrate signals packed into one atomic so they are always written
+    /// and read together — eliminating the race where a snapshot could observe
+    /// a new reactive value paired with a stale stable value (or vice versa).
+    ///
+    /// Layout: upper 32 bits = stable_bps, lower 32 bits = reactive_bps.
+    /// Max representable bitrate = u32::MAX ≈ 4.3 Gbps, far above any real stream.
+    bitrates: AtomicU64,
     height: AtomicU32,
     #[cfg(test)]
     quality: AtomicU8,
 }
 
 impl StreamStateInner {
+    fn pack(reactive_bps: u64, stable_bps: u64) -> u64 {
+        let r = reactive_bps.min(u32::MAX as u64);
+        let s = stable_bps.min(u32::MAX as u64);
+        (s << 32) | r
+    }
+
     pub fn new(inactive: bool, bitrate_bps: u64, height: u32) -> Self {
         Self {
             inactive: AtomicBool::new(inactive),
             healthy: AtomicBool::new(!inactive),
-            bitrate_bps: AtomicU64::new(bitrate_bps),
-            stable_bitrate_bps: AtomicU64::new(bitrate_bps),
+            bitrates: AtomicU64::new(Self::pack(bitrate_bps, bitrate_bps)),
             height: AtomicU32::new(height),
             #[cfg(test)]
             quality: AtomicU8::new(StreamQuality::Good as u8),
@@ -177,11 +183,21 @@ impl StreamStateInner {
     }
 
     pub fn bitrate_bps(&self) -> f64 {
-        self.bitrate_bps.load(Ordering::Relaxed) as f64
+        (self.bitrates.load(Ordering::Relaxed) & 0xFFFF_FFFF) as f64
     }
 
     pub fn stable_bitrate_bps(&self) -> f64 {
-        self.stable_bitrate_bps.load(Ordering::Relaxed) as f64
+        (self.bitrates.load(Ordering::Relaxed) >> 32) as f64
+    }
+
+    /// Read both signals from a single atomic load — guarantees they come from
+    /// the same write and can never be a (reactive, stable) pair that was never
+    /// stored together.
+    pub fn bitrates_snapshot(&self) -> (f64, f64) {
+        let packed = self.bitrates.load(Ordering::Relaxed);
+        let reactive = (packed & 0xFFFF_FFFF) as f64;
+        let stable = (packed >> 32) as f64;
+        (reactive, stable)
     }
 
     pub fn height(&self) -> u32 {
@@ -211,13 +227,17 @@ pub struct StreamStateUpdater<'a> {
 #[cfg(test)]
 impl<'a> StreamStateUpdater<'a> {
     pub fn bitrate(self, bps: u64) -> Self {
-        self.state.bitrate_bps.store(bps, Ordering::Relaxed);
-        self.state.stable_bitrate_bps.store(bps, Ordering::Relaxed);
+        let packed = StreamStateInner::pack(bps, bps);
+        self.state.bitrates.store(packed, Ordering::Relaxed);
         self
     }
 
     pub fn stable_bitrate(self, bps: u64) -> Self {
-        self.state.stable_bitrate_bps.store(bps, Ordering::Relaxed);
+        let current = self.state.bitrates.load(Ordering::Relaxed);
+        let reactive = current & 0xFFFF_FFFF;
+        self.state
+            .bitrates
+            .store(StreamStateInner::pack(reactive, bps), Ordering::Relaxed);
         self
     }
     pub fn height(self, height: u32) -> Self {
@@ -326,12 +346,10 @@ impl StreamMonitor {
                     self.nominal_bitrate_bps
                 };
                 if activation_bitrate > 0 {
-                    self.shared_state
-                        .bitrate_bps
-                        .store(activation_bitrate, Ordering::Relaxed);
-                    self.shared_state
-                        .stable_bitrate_bps
-                        .store(activation_bitrate, Ordering::Relaxed);
+                    self.shared_state.bitrates.store(
+                        StreamStateInner::pack(activation_bitrate, activation_bitrate),
+                        Ordering::Relaxed,
+                    );
                     debug_assert_ne!(self.shared_state.bitrate_bps(), 0.0);
                 }
             }
@@ -380,10 +398,7 @@ impl StreamMonitor {
     fn publish_inactive(&mut self) {
         self.shared_state.healthy.store(false, Ordering::Relaxed);
         self.shared_state.inactive.store(true, Ordering::Relaxed);
-        self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
-        self.shared_state
-            .stable_bitrate_bps
-            .store(0, Ordering::Relaxed);
+        self.shared_state.bitrates.store(0, Ordering::Relaxed);
         self.stable_filter.reset();
         debug_assert!(self.shared_state.is_inactive());
         debug_assert!(!self.shared_state.is_healthy());
@@ -423,14 +438,16 @@ impl StreamMonitor {
         };
 
         self.cost_filter.update(now, raw_with_floor);
-        self.shared_state
-            .bitrate_bps
-            .store(self.cost_filter.current() as u64, Ordering::Relaxed);
-
         self.stable_filter.update(now, raw_with_floor);
-        self.shared_state
-            .stable_bitrate_bps
-            .store(self.stable_filter.current() as u64, Ordering::Relaxed);
+
+        // Single packed write — reactive and stable are always observed together.
+        self.shared_state.bitrates.store(
+            StreamStateInner::pack(
+                self.cost_filter.current() as u64,
+                self.stable_filter.current() as u64,
+            ),
+            Ordering::Relaxed,
+        );
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
         }

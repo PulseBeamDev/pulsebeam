@@ -814,9 +814,10 @@ impl AllocationEngine {
             .iter()
             .flat_map(|s| s.track.layers.iter())
             .map(|l| {
+                let (bitrate_bps, stable_bitrate_bps) = l.state.bitrates_snapshot();
                 let snap = LayerSnap {
-                    bitrate_bps: l.state.bitrate_bps(),
-                    stable_bitrate_bps: l.state.stable_bitrate_bps(),
+                    bitrate_bps,
+                    stable_bitrate_bps,
                     healthy: l.state.is_healthy(),
                     height: l.state.height(),
                 };
@@ -1075,10 +1076,21 @@ impl AllocationEngine {
         // Pass 1: guarantee each stream's floor, in priority order. A stream we
         // can't afford the floor for is left paused; droppable streams (no floor)
         // wait for Pass 2.
+        //
+        // Retention hysteresis: if the slot was already forwarding at or above
+        // the floor layer, apply DOWNGRADE_FACTOR so we keep the floor until
+        // budget < floor_cost × DOWNGRADE_FACTOR rather than dropping it the
+        // moment BWE dips 1% below floor cost. Without this, a tiny BWE dip can
+        // pause a high-priority stream and cause severe underuse oscillation.
         for (i, slot) in slots.iter().enumerate() {
             if let Some(floor) = self.floor_layer(slot) {
                 let cost = self.cost(floor);
-                if cost <= budget {
+                let threshold = if slot.current_quality >= floor.quality {
+                    cost * Self::DOWNGRADE_FACTOR
+                } else {
+                    cost
+                };
+                if threshold <= budget {
                     budget -= cost;
                     allocs[i] = Some(floor);
                 }
@@ -2635,6 +2647,88 @@ mod allocation_tests {
         assert!(
             matches!(decisions[lo.key], AllocationDecision::Pause(..)),
             "low-priority slot must pause when budget is insufficient"
+        );
+    }
+
+    // ─── Floor hysteresis ─────────────────────────────────────────────────────────
+    //
+    // A slot that was already forwarding at its floor should be retained when
+    // budget dips into the 75–100% zone (DOWNGRADE_FACTOR dead-band). A slot
+    // that was NOT previously forwarding at the floor gets no such benefit.
+
+    #[test]
+    fn floor_hysteresis_retains_forwarding_slot_inside_downgrade_dead_band() {
+        let t = healthy_track();
+        let med_bps = layer_bps(&t, LayerQuality::Medium);
+        let med_h = t.by_quality(LayerQuality::Medium).unwrap().state.height();
+
+        // Budget is 80% of floor cost — below floor but above DOWNGRADE_FACTOR×floor.
+        // The slot is currently forwarding at the floor (current_quality == Medium).
+        let available = bw((med_bps * 0.80) as u64 / 1_000);
+        let slots = vec![qos_slot("a", 1080, med_h, 0, &t, LayerQuality::Medium)];
+        let decisions = AllocationEngine::compute(available, &slots);
+
+        assert!(
+            matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
+            "floor layer should be retained via DOWNGRADE_FACTOR hysteresis when \
+             budget is inside the 75–100%% dead-band and slot was already forwarding; \
+             got {:?}", decisions[slots[0].key]
+        );
+    }
+
+    #[test]
+    fn floor_hysteresis_does_not_apply_to_new_subscriber() {
+        // Make only Medium healthy so there's no sub-floor fallback layer.
+        let t = healthy_track();
+        for q in [LayerQuality::High, LayerQuality::Low] {
+            t.by_quality(q).unwrap().state.update_for_test().quality(StreamQuality::Bad);
+        }
+        let med_bps = layer_bps(&t, LayerQuality::Medium);
+        let med_h = t.by_quality(LayerQuality::Medium).unwrap().state.height();
+
+        // Budget is 80% of floor cost. current_quality = Low (below floor) so
+        // the slot was NOT previously forwarding at the floor → no hysteresis.
+        // With no other eligible layer to fall back to, expect Pause.
+        let available = bw((med_bps * 0.80) as u64 / 1_000);
+        let slots = vec![qos_slot("a", 1080, med_h, 0, &t, LayerQuality::Low)];
+        let decisions = AllocationEngine::compute(available, &slots);
+
+        assert!(
+            matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
+            "new subscriber with no fallback layer should pause when budget \
+             is below floor cost and hysteresis does not apply; \
+             got {:?}", decisions[slots[0].key]
+        );
+    }
+
+    // ─── desired_bitrate uses stable_cost, not reactive cost ─────────────────────
+
+    #[test]
+    fn desired_bitrate_reads_stable_bitrate_bps_not_reactive() {
+        // Use only a single healthy layer so best_healthy is unambiguous.
+        let t = healthy_track();
+        for q in [LayerQuality::Medium, LayerQuality::Low] {
+            t.by_quality(q).unwrap().state.update_for_test().quality(StreamQuality::Bad);
+        }
+
+        let reactive_bps: u64 = 400_000;
+        let stable_bps: u64 = 900_000;
+
+        // Set reactive and stable to different values to distinguish them.
+        t.by_quality(LayerQuality::High)
+            .unwrap()
+            .state
+            .update_for_test()
+            .bitrate(reactive_bps)          // sets both reactive and stable
+            .stable_bitrate(stable_bps);    // overrides stable independently
+
+        let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
+        let desired = AllocationEngine::desired_bitrate(&slots);
+
+        assert!(
+            (desired.as_f64() - stable_bps as f64).abs() < 1.0,
+            "desired_bitrate should use stable_bitrate_bps ({stable_bps}) not \
+             reactive bitrate_bps ({reactive_bps}); got {:.0}", desired.as_f64()
         );
     }
 
