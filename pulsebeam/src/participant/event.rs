@@ -27,8 +27,8 @@ pub trait ParticipantSink {
 
     fn publish_reliable_data_topic(&mut self, topic: Topic);
     fn unpublish_reliable_data_topic(&mut self, topic: Topic);
-    fn subscribe_reliable_data_topic(&mut self, topic: Topic, publisher: ParticipantId);
-    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic, publisher: ParticipantId);
+    fn subscribe_reliable_data_topic(&mut self, topic: Topic);
+    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic);
     fn publish_reliable_sctp(&mut self, topic: Topic, frame: Vec<u8>);
     fn forward_reliable_control(&mut self, publisher: ParticipantId, topic: Topic, bytes: Vec<u8>);
 }
@@ -123,8 +123,8 @@ pub mod test_utils {
 
         fn publish_reliable_data_topic(&mut self, _topic: Topic) {}
         fn unpublish_reliable_data_topic(&mut self, _topic: Topic) {}
-        fn subscribe_reliable_data_topic(&mut self, _topic: Topic, _publisher: ParticipantId) {}
-        fn unsubscribe_reliable_data_topic(&mut self, _topic: Topic, _publisher: ParticipantId) {}
+        fn subscribe_reliable_data_topic(&mut self, _topic: Topic) {}
+        fn unsubscribe_reliable_data_topic(&mut self, _topic: Topic) {}
         fn publish_reliable_sctp(&mut self, _topic: Topic, _frame: Vec<u8>) {}
         fn forward_reliable_control(
             &mut self,

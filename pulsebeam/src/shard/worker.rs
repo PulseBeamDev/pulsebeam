@@ -78,18 +78,6 @@ pub enum ClusterCommand {
         topic: Topic,
         publisher: Option<ParticipantId>,
     },
-    SubscribeReliableDataTopic {
-        room_id: RoomId,
-        from_shard_id: ShardId,
-        topic: Topic,
-        publisher: ParticipantId,
-    },
-    UnsubscribeReliableDataTopic {
-        room_id: RoomId,
-        from_shard_id: ShardId,
-        topic: Topic,
-        publisher: ParticipantId,
-    },
 }
 
 pub enum CrossShardEvent {
@@ -156,16 +144,6 @@ pub enum ShardEvent {
         room_id: RoomId,
         topic: Topic,
         publisher: Option<ParticipantId>,
-    },
-    ReliableDataTopicSubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: ParticipantId,
-    },
-    ReliableDataTopicUnsubscribed {
-        room_id: RoomId,
-        topic: Topic,
-        publisher: ParticipantId,
     },
 }
 

@@ -112,3 +112,8 @@ pub fn bounded<T: Clone>(cap: usize) -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = flume::bounded(cap);
     (Sender { inner: tx }, Receiver { inner: rx })
 }
+
+pub fn unbounded<T: Clone>() -> (Sender<T>, Receiver<T>) {
+    let (tx, rx) = flume::unbounded();
+    (Sender { inner: tx }, Receiver { inner: rx })
+}

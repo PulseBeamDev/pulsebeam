@@ -595,8 +595,8 @@ mod data_track {
         #[error("Publish channels cannot carry a publisher scope segment")]
         ScopeNotAllowedForPublish,
 
-        #[error("Reliable subscribe channels require a publisher_id scope segment")]
-        ReliableScopeRequired,
+        #[error("Reliable subscribe channels cannot carry a publisher scope segment")]
+        ScopeNotAllowedForReliableSubscribe,
     }
 
     impl TryFrom<&ChannelConfig> for DataTrackIntent {
@@ -673,10 +673,10 @@ mod data_track {
                             return Err(DataTrackIntentError::ScopeNotAllowedForPublish);
                         }
                         (_, DataTrackDirection::Publish, None) => None,
-                        (DataLane::Reliable, DataTrackDirection::Subscribe, None) => {
-                            return Err(DataTrackIntentError::ReliableScopeRequired);
-                        }
                         (_, DataTrackDirection::Subscribe, None) => None,
+                        (DataLane::Reliable, DataTrackDirection::Subscribe, Some(_)) => {
+                            return Err(DataTrackIntentError::ScopeNotAllowedForReliableSubscribe);
+                        }
                         (_, DataTrackDirection::Subscribe, Some(raw)) => {
                             if raw.is_empty() {
                                 return Err(DataTrackIntentError::InvalidScope(raw.to_string()));
@@ -788,25 +788,27 @@ mod data_track {
         }
 
         #[test]
-        fn test_reliable_subscribe_requires_scope() {
-            let err = DataTrackIntent::try_from(&rel_cfg("v1/rel/sub/chat")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::ReliableScopeRequired);
+        fn test_reliable_subscribe_is_topic_wide() {
+            let res = DataTrackIntent::try_from(&rel_cfg("v1/rel/sub/chat")).unwrap();
+            let DataTrackIntent::UserTopic(channel) = res else {
+                panic!("Expected UserTopic variant");
+            };
+            assert_eq!(channel.direction, DataTrackDirection::Subscribe);
+            assert_eq!(channel.topic.deref(), "chat");
+            assert_eq!(channel.lane, DataLane::Reliable);
+            assert_eq!(channel.scope, None);
         }
 
         #[test]
-        fn test_reliable_subscribe_with_scope() {
+        fn test_reliable_subscribe_rejects_publisher_scope() {
             let mut rng = test_rng();
             let publisher_id = ParticipantId::new(&mut rng);
             let label = format!("v1/rel/sub/chat/{}", publisher_id.as_str());
-            let res = DataTrackIntent::try_from(&rel_cfg(&label)).unwrap();
-            if let DataTrackIntent::UserTopic(e) = res {
-                assert_eq!(e.direction, DataTrackDirection::Subscribe);
-                assert_eq!(e.topic.deref(), "chat");
-                assert_eq!(e.lane, DataLane::Reliable);
-                assert_eq!(e.scope, Some(publisher_id));
-            } else {
-                panic!("Expected UserTopic variant");
-            }
+            let err = DataTrackIntent::try_from(&rel_cfg(&label)).unwrap_err();
+            assert_eq!(
+                err,
+                DataTrackIntentError::ScopeNotAllowedForReliableSubscribe
+            );
         }
 
         #[test]
@@ -820,8 +822,6 @@ mod data_track {
 
         #[test]
         fn test_reliable_display() {
-            let mut rng = test_rng();
-            let publisher_id = ParticipantId::new(&mut rng);
             let pub_ch = DataTopicChannel {
                 direction: DataTrackDirection::Publish,
                 topic: Topic("chat".to_string()),
@@ -833,13 +833,10 @@ mod data_track {
             let sub_ch = DataTopicChannel {
                 direction: DataTrackDirection::Subscribe,
                 topic: Topic("chat".to_string()),
-                scope: Some(publisher_id.clone()),
+                scope: None,
                 lane: DataLane::Reliable,
             };
-            assert_eq!(
-                sub_ch.to_string(),
-                format!("v1/rel/sub/chat/{}", publisher_id.as_str())
-            );
+            assert_eq!(sub_ch.to_string(), "v1/rel/sub/chat");
         }
 
         #[test]

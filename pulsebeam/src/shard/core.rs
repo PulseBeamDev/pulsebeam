@@ -328,41 +328,18 @@ impl ShardCore {
                     ParticipantControlEvent::ReliableDataTopicSubscribed {
                         room_id,
                         subscriber,
-                        publisher,
                         topic,
                     } => {
-                        if self.routing.register_reliable_data_subscriber(
-                            room_id,
-                            subscriber,
-                            publisher,
-                            topic.clone(),
-                        ) {
-                            self.pipeline.push_shard_event(
-                                ShardEvent::ReliableDataTopicSubscribed {
-                                    room_id,
-                                    topic,
-                                    publisher,
-                                },
-                            );
-                        }
+                        self.routing
+                            .register_reliable_data_subscriber(room_id, subscriber, topic);
                     }
                     ParticipantControlEvent::ReliableDataTopicUnsubscribed {
                         room_id,
                         subscriber,
-                        publisher,
                         topic,
                     } => {
-                        if self.routing.unregister_reliable_data_subscriber(
-                            room_id, subscriber, publisher, &topic,
-                        ) {
-                            self.pipeline.push_shard_event(
-                                ShardEvent::ReliableDataTopicUnsubscribed {
-                                    room_id,
-                                    topic,
-                                    publisher,
-                                },
-                            );
-                        }
+                        self.routing
+                            .unregister_reliable_data_subscriber(room_id, subscriber, &topic);
                     }
                     ParticipantControlEvent::ReliableControlReceived {
                         publisher,
@@ -566,33 +543,6 @@ impl ShardCore {
                     &topic,
                     publisher,
                 );
-            }
-            ClusterCommand::SubscribeReliableDataTopic {
-                room_id,
-                from_shard_id,
-                topic,
-                publisher,
-            } => {
-                self.routing.register_remote_reliable_data_subscriber_shard(
-                    room_id,
-                    from_shard_id,
-                    publisher,
-                    topic,
-                );
-            }
-            ClusterCommand::UnsubscribeReliableDataTopic {
-                room_id,
-                from_shard_id,
-                topic,
-                publisher,
-            } => {
-                self.routing
-                    .unregister_remote_reliable_data_subscriber_shard(
-                        room_id,
-                        from_shard_id,
-                        publisher,
-                        &topic,
-                    );
             }
         }
         Some(())

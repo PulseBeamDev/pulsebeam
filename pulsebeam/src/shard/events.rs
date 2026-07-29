@@ -89,13 +89,11 @@ pub enum ParticipantControlEvent {
     ReliableDataTopicSubscribed {
         room_id: RoomId,
         subscriber: ParticipantId,
-        publisher: ParticipantId,
         topic: Topic,
     },
     ReliableDataTopicUnsubscribed {
         room_id: RoomId,
         subscriber: ParticipantId,
-        publisher: ParticipantId,
         topic: Topic,
     },
     ReliableControlReceived {
@@ -352,28 +350,26 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn subscribe_reliable_data_topic(&mut self, topic: Topic, publisher: ParticipantId) {
+    fn subscribe_reliable_data_topic(&mut self, topic: Topic) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::ReliableDataTopicSubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
-                    publisher,
                     topic,
                 },
             ));
     }
 
     #[inline]
-    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic, publisher: ParticipantId) {
+    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ParticipantControlEvent::ReliableDataTopicUnsubscribed {
                     room_id: self.room_id,
                     subscriber: self.id,
-                    publisher,
                     topic,
                 },
             ));

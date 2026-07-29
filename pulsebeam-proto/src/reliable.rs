@@ -7,22 +7,33 @@ pub struct RelMsg {
     pub seq: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bool, tag = "4")]
+    pub resync_required: bool,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelNack {
     #[prost(uint64, tag = "1")]
     pub stream_id: u64,
     #[prost(uint64, tag = "2")]
     pub from_seq: u64,
+    #[prost(string, tag = "3")]
+    pub publisher_id: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RelDelivery {
+    #[prost(string, tag = "1")]
+    pub publisher_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub frame: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RelControl {
     #[prost(oneof = "rel_control::Msg", tags = "1")]
     pub msg: ::core::option::Option<rel_control::Msg>,
 }
 /// Nested message and enum types in `RelControl`.
 pub mod rel_control {
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Msg {
         #[prost(message, tag = "1")]
         Nack(super::RelNack),

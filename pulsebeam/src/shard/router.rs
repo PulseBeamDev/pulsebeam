@@ -865,55 +865,24 @@ impl ShardRoutingTable {
         &mut self,
         room_id: RoomId,
         subscriber: ParticipantId,
-        publisher: ParticipantId,
         topic: Topic,
     ) -> bool {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        room.reliable.subscribe_local(subscriber, publisher, topic)
+        room.reliable.subscribe_local(subscriber, topic)
     }
 
     pub fn unregister_reliable_data_subscriber(
         &mut self,
         room_id: RoomId,
         subscriber: ParticipantId,
-        publisher: ParticipantId,
         topic: &Topic,
     ) -> bool {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        room.reliable
-            .unsubscribe_local(subscriber, publisher, topic)
-    }
-
-    pub fn register_remote_reliable_data_subscriber_shard(
-        &mut self,
-        room_id: RoomId,
-        from_shard_id: ShardId,
-        publisher: ParticipantId,
-        topic: Topic,
-    ) {
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
-        };
-        room.reliable
-            .subscribe_remote(from_shard_id, publisher, topic);
-    }
-
-    pub fn unregister_remote_reliable_data_subscriber_shard(
-        &mut self,
-        room_id: RoomId,
-        from_shard_id: ShardId,
-        publisher: ParticipantId,
-        topic: &Topic,
-    ) {
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
-        };
-        room.reliable
-            .unsubscribe_remote(from_shard_id, publisher, topic);
+        room.reliable.unsubscribe_local(subscriber, topic)
     }
 
     pub fn route_reliable_data(
@@ -927,7 +896,21 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        room.reliable.route(room_id, origin, topic, frame, ctx);
+        let local_origin = ctx.is_local(&origin);
+        if local_origin {
+            for &shard_id in &room.remote_shards {
+                ctx.send(
+                    shard_id,
+                    CrossShardEvent::ReliableDataSctpPublished {
+                        room_id,
+                        origin,
+                        topic: topic.clone(),
+                        frame: frame.to_vec(),
+                    },
+                );
+            }
+        }
+        room.reliable.route(origin, topic, frame, local_origin, ctx);
     }
 
     pub fn route_reliable_control(

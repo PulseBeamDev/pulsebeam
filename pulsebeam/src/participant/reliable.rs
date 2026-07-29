@@ -1,13 +1,12 @@
 use ahash::{HashMap, HashMapExt};
 use str0m::channel::ChannelId;
 
-use crate::entity::ParticipantId;
 use crate::participant::event::ParticipantSink;
 use crate::track::{DataTopicChannel, DataTrackDirection, Topic};
 
 pub(super) struct ReliableChannels {
     publishers: HashMap<Topic, ChannelId>,
-    subscribers: HashMap<(Topic, ParticipantId), ChannelId>,
+    subscribers: HashMap<Topic, ChannelId>,
 }
 
 impl ReliableChannels {
@@ -22,12 +21,8 @@ impl ReliableChannels {
         self.publishers.get(topic).copied()
     }
 
-    pub(super) fn subscriber_channel(
-        &self,
-        topic: &Topic,
-        publisher: ParticipantId,
-    ) -> Option<ChannelId> {
-        self.subscribers.get(&(topic.clone(), publisher)).copied()
+    pub(super) fn subscriber_channel(&self, topic: &Topic) -> Option<ChannelId> {
+        self.subscribers.get(topic).copied()
     }
 
     pub(super) fn open(
@@ -47,16 +42,12 @@ impl ReliableChannels {
                 events.publish_reliable_data_topic(channel.topic.clone());
             }
             DataTrackDirection::Subscribe => {
-                let Some(publisher) = channel.scope else {
-                    debug_assert!(false, "reliable subscriber must identify its publisher");
-                    return Err(());
-                };
-                let key = (channel.topic.clone(), publisher);
-                if self.subscribers.contains_key(&key) {
+                debug_assert!(channel.scope.is_none());
+                if self.subscribers.contains_key(&channel.topic) {
                     return Err(());
                 }
-                self.subscribers.insert(key, channel_id);
-                events.subscribe_reliable_data_topic(channel.topic.clone(), publisher);
+                self.subscribers.insert(channel.topic.clone(), channel_id);
+                events.subscribe_reliable_data_topic(channel.topic.clone());
             }
         }
         Ok(())
@@ -72,12 +63,10 @@ impl ReliableChannels {
                 events.unpublish_reliable_data_topic(channel.topic);
             }
             DataTrackDirection::Subscribe => {
-                let publisher = channel
-                    .scope
-                    .expect("reliable subscriber must identify its publisher");
-                let removed = self.subscribers.remove(&(channel.topic.clone(), publisher));
+                debug_assert!(channel.scope.is_none());
+                let removed = self.subscribers.remove(&channel.topic);
                 debug_assert!(removed.is_some());
-                events.unsubscribe_reliable_data_topic(channel.topic, publisher);
+                events.unsubscribe_reliable_data_topic(channel.topic);
             }
         }
     }

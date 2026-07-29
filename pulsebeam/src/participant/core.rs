@@ -2,6 +2,8 @@ use super::signaling::Signaling;
 use ahash::{HashMap, HashMapExt};
 #[cfg(feature = "deep-metrics")]
 use metrics::{counter, histogram};
+use pulsebeam_proto::prelude::Message;
+use pulsebeam_proto::reliable::{RelControl, RelDelivery, rel_control};
 use pulsebeam_runtime::net::{self, RecvPacketBatch, Transport};
 use pulsebeam_runtime::rand::RngCore;
 use std::collections::VecDeque;
@@ -473,8 +475,12 @@ impl ParticipantCore {
                 origin,
                 frame,
             } => {
-                if let Some(cid) = self.reliable_channels.subscriber_channel(&topic, origin) {
-                    self.write_to_data_channel(cid, &topic, &frame);
+                if let Some(cid) = self.reliable_channels.subscriber_channel(&topic) {
+                    let delivery = RelDelivery {
+                        publisher_id: origin.as_str().to_string(),
+                        frame,
+                    };
+                    self.write_to_data_channel(cid, &topic, &delivery.encode_to_vec());
                 }
             }
             PendingRtcMutation::ReliableControl { topic, bytes } => {
@@ -907,9 +913,17 @@ impl ParticipantCore {
                             events.publish_reliable_sctp(ch.topic.clone(), data.data.to_vec());
                         }
                         (DataLane::Reliable, DataTrackDirection::Subscribe) => {
-                            let publisher = ch
-                                .scope
-                                .expect("reliable sub channel always has publisher scope");
+                            debug_assert!(ch.scope.is_none());
+                            let Ok(control) = RelControl::decode(data.data.as_ref()) else {
+                                return;
+                            };
+                            let Some(rel_control::Msg::Nack(nack)) = control.msg else {
+                                return;
+                            };
+                            let Ok(publisher) = entity::ParticipantId::try_from(nack.publisher_id)
+                            else {
+                                return;
+                            };
                             events.forward_reliable_control(
                                 publisher,
                                 ch.topic.clone(),

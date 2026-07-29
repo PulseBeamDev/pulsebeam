@@ -1,11 +1,11 @@
 use crate::MediaFrame;
 use crate::agent::controller::{BitrateController, BitrateControllerConfig, LayerController};
-use crate::agent::e2e_reliable::{ChannelReady, E2eReliable};
 use crate::agent::handles::{
-    DataPublisher, DataSubscriber, LocalTrack, OutgoingCommand, ReliableDataPublisher,
-    ReliableDataSubscriber, RemoteTrack,
+    DataPublisher, DataSubscriber, LocalTrack, OrderedTopicPublisher, OrderedTopicSubscriber,
+    OutgoingCommand, RemoteTrack,
 };
 use crate::agent::mailbox;
+use crate::agent::ordered_topic::OrderedTopics;
 use crate::agent::slots::SlotManager;
 use crate::api::{ApiError, HttpApiClient, UpdateParticipantRequest};
 use crate::manager::{Subscription, SubscriptionManager};
@@ -37,6 +37,57 @@ const STATE_DEBOUNCE: Duration = Duration::from_millis(300);
 const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
 
 pub type ParticipantId = String;
+
+pub struct TopicBuilder<'a> {
+    driver: &'a mut AgentDriver,
+    topic: String,
+}
+
+pub struct OrderedTopic<'a> {
+    driver: &'a mut AgentDriver,
+    topic: String,
+}
+
+pub struct LatestTopic<'a> {
+    driver: &'a mut AgentDriver,
+    topic: String,
+}
+
+impl<'a> TopicBuilder<'a> {
+    pub fn ordered(self) -> OrderedTopic<'a> {
+        OrderedTopic {
+            driver: self.driver,
+            topic: self.topic,
+        }
+    }
+
+    pub fn latest(self) -> LatestTopic<'a> {
+        LatestTopic {
+            driver: self.driver,
+            topic: self.topic,
+        }
+    }
+}
+
+impl OrderedTopic<'_> {
+    pub fn publish(self) -> Result<OrderedTopicPublisher, AgentError> {
+        self.driver.declare_ordered_publish_topic(&self.topic)
+    }
+
+    pub fn subscribe(self) -> Result<OrderedTopicSubscriber, AgentError> {
+        self.driver.declare_ordered_subscribe_topic(&self.topic)
+    }
+}
+
+impl LatestTopic<'_> {
+    pub fn publish(self) -> Result<ChannelId, AgentError> {
+        self.driver.declare_publish_topic(&self.topic)
+    }
+
+    pub fn subscribe(self) -> Result<ChannelId, AgentError> {
+        self.driver.declare_subscribe_topic(&self.topic, None)
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct AgentStats {
@@ -156,8 +207,6 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
 pub enum AgentEvent {
     DataPublisherDeclared(DataPublisher),
     DataSubscriberDeclared(DataSubscriber),
-    ReliableDataPublisherReady(ReliableDataPublisher),
-    ReliableDataSubscriberReady(ReliableDataSubscriber),
     LocalTrackAdded(LocalTrack),
     RemoteTrackDiscovered(Track),
     RemoteTrackAdded(RemoteTrack),
@@ -237,7 +286,7 @@ pub struct AgentDriver {
 
     network: NetworkSubsystem,
     data: DataSubsystem,
-    e2e_reliable: E2eReliable,
+    ordered_topics: OrderedTopics,
     media: MediaSubsystem,
     subscriptions: SubscriptionSubsystem,
     session: SessionSubsystem,
@@ -270,7 +319,7 @@ impl AgentDriver {
                 data_sub_topics: HashMap::new(),
                 data_targets: HashMap::new(),
             },
-            e2e_reliable: E2eReliable::new(),
+            ordered_topics: OrderedTopics::new(),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
                 layer_ctrl: LayerController::new(),
@@ -321,6 +370,15 @@ impl AgentDriver {
         &self.session.participant_id
     }
 
+    pub fn topic(&mut self, topic: impl Into<String>) -> TopicBuilder<'_> {
+        let topic = topic.into();
+        debug_assert!(!topic.is_empty());
+        TopicBuilder {
+            driver: self,
+            topic,
+        }
+    }
+
     pub fn declare_publish_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
         let cid = self.ensure_data_topic(DataTrackDirection::Publish, topic, None)?;
         self.data.data_pub_topics.insert(
@@ -346,8 +404,11 @@ impl AgentDriver {
         Ok(cid)
     }
 
-    pub fn declare_reliable_publish_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
-        self.e2e_reliable
+    fn declare_ordered_publish_topic(
+        &mut self,
+        topic: &str,
+    ) -> Result<OrderedTopicPublisher, AgentError> {
+        self.ordered_topics
             .declare_publisher(&mut self.rtc, topic, self.outgoing_tx.clone())
             .map_err(|()| {
                 AgentError::Protocol(
@@ -356,13 +417,12 @@ impl AgentDriver {
             })
     }
 
-    pub fn declare_reliable_subscribe_topic(
+    fn declare_ordered_subscribe_topic(
         &mut self,
         topic: &str,
-        publisher_id: &str,
-    ) -> Result<ChannelId, AgentError> {
-        self.e2e_reliable
-            .declare_subscriber(&mut self.rtc, topic, publisher_id)
+    ) -> Result<OrderedTopicSubscriber, AgentError> {
+        self.ordered_topics
+            .declare_subscriber(&mut self.rtc, topic)
             .map_err(|()| {
                 AgentError::Protocol(
                     "reliable channel declaration unexpectedly requires renegotiation".into(),
@@ -543,9 +603,9 @@ impl AgentDriver {
     fn handle_outgoing_command(&mut self, cmd: OutgoingCommand) {
         match cmd {
             OutgoingCommand::SendData(e) => {
-                if let Err(payload) = self
-                    .e2e_reliable
-                    .send(&mut self.rtc, e.channel_id, e.payload)
+                if let Err(payload) =
+                    self.ordered_topics
+                        .send(&mut self.rtc, e.channel_id, e.payload)
                 {
                     let Some(mut channel) = self.rtc.channel(e.channel_id) else {
                         return;
@@ -649,21 +709,14 @@ impl AgentDriver {
                                     }
                                 }
                             }
-                        } else if let Some(ready) = self.e2e_reliable.open_channel(cid, &label) {
-                            self.emit(match ready {
-                                ChannelReady::Publisher(handle) => {
-                                    AgentEvent::ReliableDataPublisherReady(handle)
-                                }
-                                ChannelReady::Subscriber(handle) => {
-                                    AgentEvent::ReliableDataSubscriberReady(handle)
-                                }
-                            });
+                        } else {
+                            self.ordered_topics.open_channel(cid, &label);
                         }
                     }
                     Event::ChannelData(data) => {
                         if data.id == self.data.signaling_cid {
                             self.handle_signaling_data(data);
-                        } else if !self.e2e_reliable.handle_data(&mut self.rtc, &data) {
+                        } else if !self.ordered_topics.handle_data(&mut self.rtc, &data) {
                             self.dispatch_data_message(data);
                         }
                     }

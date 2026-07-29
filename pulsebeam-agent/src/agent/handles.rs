@@ -108,27 +108,31 @@ impl DataSubscriber {
     }
 }
 
-#[derive(Clone)]
-pub struct ReliableDataMessage {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedTopicMessage {
+    pub publisher_id: String,
     pub stream_id: u64,
     pub seq: u64,
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone)]
-pub enum ReliableDataEvent {
-    Message(ReliableDataMessage),
-    StreamReset { new_stream_id: u64 },
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrderedTopicDelivery {
+    Message(OrderedTopicMessage),
+    ResyncRequired {
+        publisher_id: String,
+        new_stream_id: u64,
+    },
 }
 
 #[derive(Clone)]
-pub struct ReliableDataPublisher {
+pub struct OrderedTopicPublisher {
     pub topic: String,
     pub(crate) channel_id: ChannelId,
     pub(crate) tx: mailbox::Sender<OutgoingCommand>,
 }
 
-impl ReliableDataPublisher {
+impl OrderedTopicPublisher {
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), mailbox::SendError<Vec<u8>>> {
         let command = OutgoingCommand::SendData(SendData {
             channel_id: self.channel_id,
@@ -141,14 +145,13 @@ impl ReliableDataPublisher {
     }
 }
 
-pub struct ReliableDataSubscriber {
+pub struct OrderedTopicSubscriber {
     pub topic: String,
-    pub publisher_id: String,
-    pub(crate) rx: mailbox::Receiver<ReliableDataEvent>,
+    pub(crate) rx: mailbox::Receiver<OrderedTopicDelivery>,
 }
 
-impl ReliableDataSubscriber {
-    pub async fn recv(&mut self) -> Result<ReliableDataEvent, mailbox::RecvError> {
+impl OrderedTopicSubscriber {
+    pub async fn recv(&mut self) -> Result<OrderedTopicDelivery, mailbox::RecvError> {
         self.rx.recv().await
     }
 }
