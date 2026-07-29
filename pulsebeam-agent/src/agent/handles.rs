@@ -5,14 +5,27 @@ use pulsebeam_proto::signaling::Track;
 use str0m::channel::ChannelId;
 use str0m::media::{Mid, Rid};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublicationLease {
+    pub(crate) mid: Mid,
+    pub(crate) generation: u64,
+}
+
 pub(crate) enum OutgoingCommand {
     SendData(SendData),
     SendMedia(SendMedia),
-    SetSubscriptions(Vec<VideoSubscription>),
     SetPlayoutDelay(Option<(u32, u32)>),
-    SetUpstreamActive {
-        mid: Mid,
-        active: bool,
+    Publish {
+        kind: str0m::media::MediaKind,
+        response: tokio::sync::oneshot::Sender<Result<super::LocalTrack, super::AgentError>>,
+    },
+    Unpublish {
+        lease: PublicationLease,
+        response: Option<tokio::sync::oneshot::Sender<Result<(), super::AgentError>>>,
+    },
+    SubscribeMedia {
+        subscription: VideoSubscription,
+        response: tokio::sync::oneshot::Sender<Result<RemoteTrack, super::AgentError>>,
     },
     Shutdown(tokio::sync::oneshot::Sender<()>),
     DeclareOrderedPublisher {
@@ -43,15 +56,15 @@ pub(crate) struct SendData {
 /// Payload for sending media.
 #[derive(Clone, Debug)]
 pub(crate) struct SendMedia {
-    pub(crate) mid: Mid,
+    pub(crate) lease: PublicationLease,
     pub(crate) rid: Option<Rid>,
     pub(crate) frame: MediaFrame,
 }
 
 #[derive(Clone)]
 pub struct DataPublisher {
-    pub channel_id: ChannelId,
-    pub topic: String,
+    channel_id: ChannelId,
+    topic: String,
     pub(crate) tx: mailbox::Sender<OutgoingCommand>,
 }
 
@@ -66,6 +79,10 @@ impl DataPublisher {
             topic,
             tx,
         }
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
     }
 
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), mailbox::SendError<Vec<u8>>> {
@@ -100,25 +117,26 @@ impl DataPublisher {
 
 #[derive(Clone)]
 pub struct DataSubscriber {
-    pub channel_id: ChannelId,
-    pub topic: String,
-    pub scope: Option<String>,
+    topic: String,
+    scope: Option<String>,
     pub(crate) rx: mailbox::Receiver<Vec<u8>>,
 }
 
 impl DataSubscriber {
     pub(crate) fn new(
-        channel_id: ChannelId,
         topic: String,
         scope: Option<String>,
         rx: mailbox::Receiver<Vec<u8>>,
     ) -> Self {
-        Self {
-            channel_id,
-            topic,
-            scope,
-            rx,
-        }
+        Self { topic, scope, rx }
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn publisher_id(&self) -> Option<&str> {
+        self.scope.as_deref()
     }
 
     pub async fn recv(&mut self) -> Result<Vec<u8>, mailbox::RecvError> {
@@ -149,12 +167,16 @@ pub enum OrderedTopicDelivery {
 
 #[derive(Clone)]
 pub struct OrderedTopicPublisher {
-    pub topic: String,
+    pub(crate) topic: String,
     pub(crate) channel_id: ChannelId,
     pub(crate) tx: mailbox::Sender<OutgoingCommand>,
 }
 
 impl OrderedTopicPublisher {
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), mailbox::SendError<Vec<u8>>> {
         let command = OutgoingCommand::SendData(SendData {
             channel_id: self.channel_id,
@@ -168,45 +190,102 @@ impl OrderedTopicPublisher {
 }
 
 pub struct OrderedTopicSubscriber {
-    pub topic: String,
+    pub(crate) topic: String,
     pub(crate) rx: mailbox::Receiver<OrderedTopicDelivery>,
 }
 
 impl OrderedTopicSubscriber {
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
     pub async fn recv(&mut self) -> Result<OrderedTopicDelivery, mailbox::RecvError> {
         self.rx.recv().await
     }
 }
 
 #[derive(Clone)]
-pub struct LocalTrack {
-    pub kind: str0m::media::MediaKind,
-    pub mid: Mid,
-    pub rid: Option<Rid>,
-    pub keyframe_rx: crate::media::KeyframeReceiver,
+pub struct LocalEncoding {
+    pub(crate) mid: Mid,
+    pub(crate) rid: Option<Rid>,
+    pub(crate) lease: PublicationLease,
+    pub(crate) keyframe_rx: crate::media::KeyframeReceiver,
     pub(crate) tx: mailbox::Sender<OutgoingCommand>,
 }
 
-impl LocalTrack {
-    pub async fn send(&self, frame: MediaFrame) {
-        let _ = self
-            .tx
+impl LocalEncoding {
+    pub fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
+    pub async fn send(&self, frame: MediaFrame) -> Result<(), mailbox::SendError<MediaFrame>> {
+        self.tx
             .send(OutgoingCommand::SendMedia(SendMedia {
-                mid: self.mid,
+                lease: self.lease,
                 rid: self.rid,
                 frame,
             }))
-            .await;
+            .await
+            .map_err(|error| match error.0 {
+                OutgoingCommand::SendMedia(media) => mailbox::SendError(media.frame),
+                _ => unreachable!(),
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Publication {
+    id: String,
+    publisher_id: String,
+    kind: Option<str0m::media::MediaKind>,
+}
+
+impl Publication {
+    pub(crate) fn from_signaling(track: Track) -> Self {
+        debug_assert!(!track.id.is_empty());
+        debug_assert!(!track.participant_id.is_empty());
+        let kind = match track.kind {
+            1 => Some(str0m::media::MediaKind::Video),
+            2 => Some(str0m::media::MediaKind::Audio),
+            _ => None,
+        };
+        Self {
+            id: track.id,
+            publisher_id: track.participant_id,
+            kind,
+        }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn publisher_id(&self) -> &str {
+        &self.publisher_id
+    }
+
+    pub(crate) fn kind(&self) -> Option<str0m::media::MediaKind> {
+        self.kind
     }
 }
 
 pub struct RemoteTrack {
-    pub mid: Mid,
-    pub track: Track,
+    publication: Publication,
     pub(crate) rx: mailbox::Receiver<MediaFrame>,
 }
 
 impl RemoteTrack {
+    pub(crate) fn new(_mid: Mid, track: Track, rx: mailbox::Receiver<MediaFrame>) -> Self {
+        Self {
+            publication: Publication::from_signaling(track),
+            rx,
+        }
+    }
+
+    pub fn publisher_id(&self) -> &str {
+        self.publication.publisher_id()
+    }
+
     pub async fn recv(&mut self) -> Result<MediaFrame, mailbox::RecvError> {
         self.rx.recv().await
     }

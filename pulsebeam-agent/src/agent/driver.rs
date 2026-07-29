@@ -1,15 +1,15 @@
 use crate::MediaFrame;
 use crate::agent::controller::{BitrateController, BitrateControllerConfig, LayerController};
 use crate::agent::handles::{
-    DataPublisher, DataSubscriber, LocalTrack, OrderedTopicPublisher, OrderedTopicSubscriber,
-    OutgoingCommand, RemoteTrack,
+    DataPublisher, DataSubscriber, LocalEncoding, OrderedTopicPublisher, OrderedTopicSubscriber,
+    OutgoingCommand, PublicationLease, RemoteTrack,
 };
 use crate::agent::mailbox;
 use crate::agent::ordered_topic::OrderedTopics;
 use crate::agent::slots::SlotManager;
 use crate::api::{ApiError, HttpApiClient, UpdateParticipantRequest};
 use crate::manager::{SubscriptionManager, VideoSubscription};
-use crate::media::KeyframeNotifier;
+use crate::media::{KeyframeNotifier, KeyframeReceiver};
 use crate::tcp::TcpSession;
 use http::Uri;
 use pulsebeam_core::net::UdpSocket;
@@ -39,12 +39,39 @@ const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
 pub type ParticipantId = String;
 
 #[derive(Debug, Default, Clone)]
-pub struct AgentStats {
-    pub peer: Option<str0m::stats::PeerStats>,
-    pub tracks: HashMap<Mid, TrackStats>,
+pub struct StatisticsSnapshot {
+    pub(crate) peer: Option<str0m::stats::PeerStats>,
+    pub(crate) tracks: HashMap<Mid, TrackStats>,
 }
 
-impl AgentStats {
+impl StatisticsSnapshot {
+    pub fn is_connected(&self) -> bool {
+        self.peer.is_some()
+    }
+
+    pub fn bytes_sent(&self) -> u64 {
+        self.peer.as_ref().map_or(0, |peer| peer.bytes_tx)
+    }
+
+    pub fn bytes_received(&self) -> u64 {
+        self.peer.as_ref().map_or(0, |peer| peer.bytes_rx)
+    }
+
+    pub fn round_trip_time(&self) -> Option<Duration> {
+        self.peer
+            .as_ref()?
+            .selected_candidate_pair
+            .as_ref()?
+            .current_round_trip_time
+    }
+
+    pub fn receive_loss(&self) -> Option<f32> {
+        self.tracks
+            .values()
+            .flat_map(|track| track.rx_layers.values())
+            .find_map(|layer| layer.loss)
+    }
+
     pub fn total_rx_bytes(&self) -> u64 {
         self.tracks
             .values()
@@ -63,10 +90,10 @@ impl AgentStats {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct TrackStats {
-    pub kind: Option<MediaKind>,
-    pub rx_layers: HashMap<Option<Rid>, str0m::stats::MediaIngressStats>,
-    pub tx_layers: HashMap<Option<Rid>, str0m::stats::MediaEgressStats>,
+pub(crate) struct TrackStats {
+    kind: Option<MediaKind>,
+    rx_layers: HashMap<Option<Rid>, str0m::stats::MediaIngressStats>,
+    tx_layers: HashMap<Option<Rid>, str0m::stats::MediaEgressStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +144,6 @@ pub(crate) enum DataTrackDirection {
 
 #[derive(Debug, Clone)]
 struct DataTrackBinding {
-    direction: DataTrackDirection,
     topic: String,
     scope: Option<String>,
 }
@@ -159,10 +185,8 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
 
 pub(crate) enum AgentEvent {
     StatsUpdated,
-    LocalTrackAdded(LocalTrack),
     RemoteTrackDiscovered(Track),
     RemoteTrackRemoved(String),
-    RemoteTrackAdded(RemoteTrack),
     Connected,
     Disconnected(String),
 }
@@ -196,9 +220,46 @@ struct DataSubsystem {
 
 struct MediaSubsystem {
     media_targets: HashMap<Mid, mailbox::Sender<MediaFrame>>,
+    upstream_slots: HashMap<Mid, UpstreamSlot>,
+    pending_media_subscriptions:
+        HashMap<String, tokio::sync::oneshot::Sender<Result<RemoteTrack, AgentError>>>,
     layer_ctrl: LayerController,
     desired_ctrl: BitrateController,
     last_desired: Bitrate,
+}
+
+struct UpstreamSlot {
+    kind: MediaKind,
+    generation: u64,
+    active: bool,
+    encodings: Vec<(Option<Rid>, KeyframeReceiver)>,
+}
+
+impl UpstreamSlot {
+    fn activate(&mut self, mid: Mid) -> PublicationLease {
+        debug_assert!(!self.active);
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        self.active = true;
+        PublicationLease {
+            mid,
+            generation: self.generation,
+        }
+    }
+
+    fn accepts(&self, lease: PublicationLease) -> bool {
+        self.active && self.generation == lease.generation
+    }
+
+    fn deactivate(&mut self, lease: PublicationLease) -> bool {
+        if !self.accepts(lease) {
+            return false;
+        }
+        self.active = false;
+        true
+    }
 }
 
 struct SubscriptionSubsystem {
@@ -230,7 +291,7 @@ struct TimerSubsystem {
 
 pub(crate) struct AgentDriver {
     rtc: Rtc,
-    stats: AgentStats,
+    stats: StatisticsSnapshot,
     pending_events: VecDeque<AgentEvent>,
     shutdown_responses: Vec<tokio::sync::oneshot::Sender<()>>,
     shutdown_requested: bool,
@@ -257,7 +318,7 @@ impl AgentDriver {
 
         let mut driver = Self {
             rtc: init.rtc,
-            stats: AgentStats::default(),
+            stats: StatisticsSnapshot::default(),
             pending_events: VecDeque::new(),
             shutdown_responses: Vec::new(),
             shutdown_requested: false,
@@ -281,6 +342,8 @@ impl AgentDriver {
             ordered_topics: OrderedTopics::new(),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
+                upstream_slots: HashMap::new(),
+                pending_media_subscriptions: HashMap::new(),
                 layer_ctrl: LayerController::new(),
                 desired_ctrl: BitrateControllerConfig::default().build(),
                 last_desired: Bitrate::bps(0),
@@ -323,7 +386,7 @@ impl AgentDriver {
         driver
     }
 
-    pub fn stats(&self) -> &AgentStats {
+    pub fn stats(&self) -> &StatisticsSnapshot {
         &self.stats
     }
 
@@ -360,7 +423,6 @@ impl AgentDriver {
         self.data.data_sub_topics.insert(key.clone(), cid);
         self.data.data_targets.insert(key, tx);
         Ok(DataSubscriber::new(
-            cid,
             topic.to_string(),
             publisher_id.map(str::to_string),
             rx,
@@ -393,6 +455,60 @@ impl AgentDriver {
             })
     }
 
+    fn publish_local_track(
+        &mut self,
+        kind: MediaKind,
+    ) -> Result<super::session::LocalTrack, AgentError> {
+        let Some((&mid, slot)) = self
+            .media
+            .upstream_slots
+            .iter_mut()
+            .find(|(_, slot)| slot.kind == kind && !slot.active)
+        else {
+            return Err(AgentError::MediaCapacity(kind));
+        };
+        let lease = slot.activate(mid);
+        let encodings = slot
+            .encodings
+            .iter()
+            .map(|(rid, keyframe_rx)| LocalEncoding {
+                mid,
+                rid: *rid,
+                lease,
+                keyframe_rx: keyframe_rx.clone(),
+                tx: self.outgoing_tx.clone(),
+            })
+            .collect();
+        self.set_upstream_active(mid, true);
+        Ok(super::session::LocalTrack::new(
+            kind,
+            lease,
+            encodings,
+            self.outgoing_tx.clone(),
+        ))
+    }
+
+    fn unpublish_local_track(&mut self, lease: PublicationLease) {
+        let Some(slot) = self.media.upstream_slots.get_mut(&lease.mid) else {
+            debug_assert!(
+                false,
+                "publication lease references an unknown upstream slot"
+            );
+            return;
+        };
+        if !slot.deactivate(lease) {
+            return;
+        }
+        self.set_upstream_active(lease.mid, false);
+    }
+
+    fn set_upstream_active(&mut self, mid: Mid, active: bool) {
+        self.subscriptions.upstream_active.insert(mid, active);
+        self.subscriptions.upstream_dirty = true;
+        self.subscriptions.pending_deadline = Some(self.now);
+        self.timers.notifier.notify_one();
+    }
+
     pub async fn shutdown(&mut self) {
         if let Err(e) = self
             .session
@@ -403,25 +519,6 @@ impl AgentDriver {
             tracing::warn!(error = ?e, "failed to delete participant on shutdown");
         }
         self.rtc.disconnect();
-        self.timers.notifier.notify_one();
-    }
-
-    fn set_subscriptions(&mut self, subs: Vec<VideoSubscription>) {
-        self.subscriptions.desired_subscriptions.clear();
-        for sub in subs {
-            self.subscriptions
-                .desired_subscriptions
-                .insert(sub.track_id.clone(), sub);
-        }
-        let desired = self
-            .subscriptions
-            .desired_subscriptions
-            .values()
-            .cloned()
-            .collect();
-        self.subscriptions.sub_manager.set_desired(desired);
-        self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
-        self.flush_pending_state();
         self.timers.notifier.notify_one();
     }
 
@@ -584,19 +681,28 @@ impl AgentDriver {
                 }
             }
             OutgoingCommand::SendMedia(e) => {
-                let paused = self.media.layer_ctrl.is_paused(e.mid, e.rid);
-                self.media.layer_ctrl.record_frame(
-                    e.mid,
-                    e.rid,
-                    e.frame.data.len(),
-                    Instant::now(),
-                );
+                let Some(slot) = self.media.upstream_slots.get(&e.lease.mid) else {
+                    return;
+                };
+                if !slot.accepts(e.lease) {
+                    return;
+                }
+                let encoding_exists = slot.encodings.iter().any(|(rid, _)| *rid == e.rid);
+                debug_assert!(encoding_exists);
+                if !encoding_exists {
+                    return;
+                }
+                let mid = e.lease.mid;
+                let paused = self.media.layer_ctrl.is_paused(mid, e.rid);
+                self.media
+                    .layer_ctrl
+                    .record_frame(mid, e.rid, e.frame.data.len(), Instant::now());
 
                 if paused {
                     return;
                 }
 
-                if let Some(mut writer) = self.rtc.writer(e.mid) {
+                if let Some(mut writer) = self.rtc.writer(mid) {
                     let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
                         return;
                     };
@@ -612,16 +718,68 @@ impl AgentDriver {
                     let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
                 }
             }
-            OutgoingCommand::SetSubscriptions(subscriptions) => {
-                self.set_subscriptions(subscriptions);
-            }
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
             }
-            OutgoingCommand::SetUpstreamActive { mid, active } => {
-                self.subscriptions.upstream_active.insert(mid, active);
-                self.subscriptions.upstream_dirty = true;
+            OutgoingCommand::Publish { kind, response } => {
+                let result = self.publish_local_track(kind);
+                let _ = response.send(result);
+            }
+            OutgoingCommand::Unpublish { lease, response } => {
+                self.unpublish_local_track(lease);
+                if let Some(response) = response {
+                    let _ = response.send(Ok(()));
+                }
+            }
+            OutgoingCommand::SubscribeMedia {
+                subscription,
+                response,
+            } => {
+                let track_id = subscription.track_id.clone();
+                if let Some((mid, track)) = self.slot_manager.assigned(&track_id) {
+                    let (tx, rx) = mailbox::bounded(256);
+                    self.media.media_targets.insert(mid, tx);
+                    let _ = response.send(Ok(RemoteTrack::new(mid, track, rx)));
+                    self.subscriptions
+                        .desired_subscriptions
+                        .insert(track_id, subscription);
+                    let desired = self
+                        .subscriptions
+                        .desired_subscriptions
+                        .values()
+                        .cloned()
+                        .collect();
+                    self.subscriptions.sub_manager.set_desired(desired);
+                    self.subscriptions.pending_deadline = Some(self.now);
+                    self.flush_pending_state();
+                    self.timers.notifier.notify_one();
+                    return;
+                }
+                if self
+                    .media
+                    .pending_media_subscriptions
+                    .contains_key(&track_id)
+                {
+                    let _ = response.send(Err(AgentError::Protocol(
+                        "media publication is already being subscribed".into(),
+                    )));
+                    return;
+                }
+                self.media
+                    .pending_media_subscriptions
+                    .insert(track_id.clone(), response);
+                self.subscriptions
+                    .desired_subscriptions
+                    .insert(track_id, subscription);
+                let desired = self
+                    .subscriptions
+                    .desired_subscriptions
+                    .values()
+                    .cloned()
+                    .collect();
+                self.subscriptions.sub_manager.set_desired(desired);
                 self.subscriptions.pending_deadline = Some(self.now);
+                self.flush_pending_state();
                 self.timers.notifier.notify_one();
             }
             OutgoingCommand::Shutdown(response) => {
@@ -674,21 +832,16 @@ impl AgentDriver {
                             self.data.signaling_cid = cid;
                             self.subscriptions.sub_manager.reset_active_assignments();
                             self.subscriptions.pending_deadline = Some(Instant::now());
-                        } else if let Some((direction, topic, scope)) =
+                        } else if let Some((_direction, topic, scope)) =
                             parse_data_track_label(&label)
                         {
                             self.data
                                 .data_channels
                                 .entry(cid)
                                 .or_insert(DataTrackBinding {
-                                    direction,
                                     topic: topic.to_string(),
                                     scope: scope.clone(),
                                 });
-                            match direction {
-                                DataTrackDirection::Publish => {}
-                                DataTrackDirection::Subscribe => {}
-                            }
                         } else {
                             self.ordered_topics.open_channel(cid, &label);
                         }
@@ -772,19 +925,24 @@ impl AgentDriver {
                     vec![None]
                 };
 
+                let mut encodings = Vec::with_capacity(rids.len());
                 for rid in rids {
                     let (kf_notifier, kf_rx) = KeyframeNotifier::pair();
                     if media.kind.is_video() {
                         self.media.layer_ctrl.register(mid, rid, kf_notifier);
                     }
-                    self.emit(AgentEvent::LocalTrackAdded(LocalTrack {
-                        kind: media.kind,
-                        mid,
-                        rid,
-                        keyframe_rx: kf_rx,
-                        tx: self.outgoing_tx.clone(),
-                    }));
+                    encodings.push((rid, kf_rx));
                 }
+                let previous = self.media.upstream_slots.insert(
+                    mid,
+                    UpstreamSlot {
+                        kind: media.kind,
+                        generation: 0,
+                        active: false,
+                        encodings,
+                    },
+                );
+                debug_assert!(previous.is_none());
             }
             Direction::RecvOnly => {
                 self.slot_manager.register(mid);
@@ -814,7 +972,12 @@ impl AgentDriver {
                 for (mid, track) in assignments {
                     let (tx, rx) = mailbox::bounded(256);
                     self.media.media_targets.insert(mid, tx);
-                    self.emit(AgentEvent::RemoteTrackAdded(RemoteTrack { mid, track, rx }));
+                    let track_id = track.id.clone();
+                    let remote_track = RemoteTrack::new(mid, track, rx);
+                    if let Some(response) = self.media.pending_media_subscriptions.remove(&track_id)
+                    {
+                        let _ = response.send(Ok(remote_track));
+                    }
                 }
             }
             signaling::server_message::Payload::Error(err) => {
@@ -976,5 +1139,33 @@ fn min_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
         (Some(x), None) => Some(x),
         (None, Some(y)) => Some(y),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reused_upstream_slot_rejects_previous_generation() {
+        let mid = Mid::from("video");
+        let mut slot = UpstreamSlot {
+            kind: MediaKind::Video,
+            generation: 0,
+            active: false,
+            encodings: Vec::new(),
+        };
+
+        let camera = slot.activate(mid);
+        assert!(slot.accepts(camera));
+        assert!(slot.deactivate(camera));
+        assert!(!slot.accepts(camera));
+
+        let screen = slot.activate(mid);
+        assert_ne!(camera.generation, screen.generation);
+        assert!(!slot.accepts(camera));
+        assert!(slot.accepts(screen));
+        assert!(!slot.deactivate(camera));
+        assert!(slot.accepts(screen));
     }
 }

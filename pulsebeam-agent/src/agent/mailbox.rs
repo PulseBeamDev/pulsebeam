@@ -88,9 +88,16 @@ impl<T> Sender<T> {
     }
 }
 
-#[derive(Clone)]
 pub struct Receiver<T> {
     inner: flume::Receiver<T>,
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<T> Receiver<T> {

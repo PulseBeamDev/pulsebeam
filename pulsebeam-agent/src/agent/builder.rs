@@ -96,8 +96,11 @@ impl AgentBuilder {
 
     pub async fn connect(self, room_id: &str) -> Result<Agent, AgentError> {
         let (agent, runner) = self.connect_unmanaged(room_id).await?;
-        let task = tokio::spawn(runner.run());
-        agent.attach_runner(task).await;
+        tokio::spawn(async move {
+            if let Err(error) = runner.run().await {
+                tracing::error!(?error, "agent runner stopped");
+            }
+        });
         Ok(agent)
     }
 

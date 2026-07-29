@@ -4,9 +4,9 @@ use str0m::media::Mid;
 
 pub type TrackId = String;
 
-pub struct ReceiverSlot {
-    pub mid: Mid,
-    pub track_id: Option<TrackId>,
+struct ReceiverSlot {
+    mid: Mid,
+    track_id: Option<TrackId>,
 }
 
 pub struct SlotManager {
@@ -31,8 +31,13 @@ impl SlotManager {
         });
     }
 
-    pub fn mids(&self) -> Vec<Mid> {
-        self.slots.iter().map(|s| s.mid).collect()
+    pub fn assigned(&self, track_id: &str) -> Option<(Mid, Track)> {
+        let track = self.active_tracks.get(track_id)?.clone();
+        let slot = self
+            .slots
+            .iter()
+            .find(|slot| slot.track_id.as_deref() == Some(track_id))?;
+        Some((slot.mid, track))
     }
 
     pub fn sync(

@@ -4,7 +4,6 @@ use crate::tests::common::{
     start_sfu_node_tcp_only_multi_shard, subnet_ip,
 };
 use pulsebeam_agent::SimulcastLayer;
-use pulsebeam_agent::VideoSubscription;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -316,6 +315,14 @@ enum PendingDriverOp {
     PublishData(String, Vec<u8>),
 }
 
+#[derive(Clone)]
+pub struct VideoSubscription {
+    pub participant_id: String,
+    pub height: u32,
+    pub min_height: u32,
+    pub priority: u32,
+}
+
 // ── Per-participant shared state ────────────────────────────────────────────
 
 struct ParticipantShared {
@@ -452,14 +459,34 @@ async fn run_participant(
                 for op in ops {
                     match op {
                         PendingDriverOp::SetSubscriptions(subs) => {
-                            let agent = ctx.agent.clone();
-                            tokio::spawn(async move {
-                                agent
-                                    .media()
-                                    .set_view(subs)
-                                    .await
-                                    .expect("failed to set subscriptions");
-                            });
+                            let incoming_tracks = ctx.incoming_track_tx.clone();
+                            let new_subscriptions: Vec<_> = subs
+                                .iter()
+                                .filter(|subscription| {
+                                    ctx.requested_tracks
+                                        .insert(subscription.participant_id.clone())
+                                })
+                                .cloned()
+                                .collect();
+                            for subscription in new_subscriptions {
+                                let agent = ctx.agent.clone();
+                                let incoming_tracks = incoming_tracks.clone();
+                                tokio::spawn(async move {
+                                    let track = agent
+                                        .participant(subscription.participant_id)
+                                        .video()
+                                        .subscribe()
+                                        .target_height(subscription.height)
+                                        .minimum_height(subscription.min_height)
+                                        .priority(subscription.priority)
+                                        .await
+                                        .expect("failed to subscribe to publication");
+                                    incoming_tracks
+                                        .send(track)
+                                        .await
+                                        .expect("client media inbox closed");
+                                });
+                            }
                         }
                         PendingDriverOp::DeclarePublishTopic(t) => {
                             let agent = ctx.agent.clone();
@@ -531,10 +558,10 @@ async fn run_participant(
                 }
 
                 // 4. Update stats.
-                let stats = ctx.agent.stats();
+                let stats = ctx.agent.stats().current();
                 *shared_clone.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
                 *shared_clone.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
-                *shared_clone.connected.lock().unwrap() = stats.peer.is_some();
+                *shared_clone.connected.lock().unwrap() = stats.is_connected();
                 false
             }));
 
@@ -548,7 +575,7 @@ async fn run_participant(
 
         // Update stats one final time before handling the command.
         {
-            let stats = client.ctx.agent.stats();
+            let stats = client.ctx.agent.stats().current();
             *shared.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
             *shared.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
         }
@@ -757,8 +784,8 @@ async fn execute_plan(
                 let subs: Vec<VideoSubscription> = tracks
                     .iter()
                     .enumerate()
-                    .map(|(i, track_id)| VideoSubscription {
-                        track_id: track_id.clone(),
+                    .map(|(i, participant_id)| VideoSubscription {
+                        participant_id: participant_id.clone(),
                         height: heights_slice[i % heights_slice.len()],
                         min_height: 0,
                         priority: 0,

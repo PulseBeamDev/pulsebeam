@@ -1,15 +1,15 @@
-use super::driver::{AgentDriver, AgentError, AgentEvent, AgentStats, ParticipantId};
+use super::driver::{AgentDriver, AgentError, AgentEvent, ParticipantId, StatisticsSnapshot};
 use super::handles::{
-    DataPublisher, DataSubscriber, LocalTrack, OrderedTopicPublisher, OrderedTopicSubscriber,
-    OutgoingCommand, RemoteTrack,
+    DataPublisher, DataSubscriber, LocalEncoding, OrderedTopicPublisher, OrderedTopicSubscriber,
+    OutgoingCommand, Publication, PublicationLease, RemoteTrack,
 };
 use super::mailbox;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use tokio::sync::{Mutex, Notify, watch};
-use tokio::task::JoinHandle;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -34,17 +34,13 @@ impl Connection {
     }
 }
 
-pub enum MediaEvent {
-    RemoteTrackAdded(RemoteTrack),
-}
-
 #[derive(Clone)]
-pub struct Publications {
-    state: watch::Receiver<Arc<HashMap<String, pulsebeam_proto::signaling::Track>>>,
+pub struct Statistics {
+    state: watch::Receiver<Arc<StatisticsSnapshot>>,
 }
 
-impl Publications {
-    pub fn current(&self) -> Arc<HashMap<String, pulsebeam_proto::signaling::Track>> {
+impl Statistics {
+    pub fn current(&self) -> Arc<StatisticsSnapshot> {
         self.state.borrow().clone()
     }
 
@@ -53,30 +49,12 @@ impl Publications {
     }
 }
 
-pub struct MediaEvents {
-    rx: mailbox::Receiver<MediaEvent>,
-}
-
-impl MediaEvents {
-    pub async fn recv(&mut self) -> Result<MediaEvent, mailbox::RecvError> {
-        self.rx.recv().await
-    }
-
-    pub fn try_recv(&mut self) -> Result<MediaEvent, mailbox::TryRecvError> {
-        self.rx.try_recv()
-    }
-}
-
 struct AgentInner {
     participant_id: ParticipantId,
     commands: mailbox::Sender<OutgoingCommand>,
-    stats: Arc<RwLock<AgentStats>>,
+    stats: watch::Receiver<Arc<StatisticsSnapshot>>,
     connection: watch::Receiver<ConnectionState>,
-    media_events: Mutex<Option<MediaEvents>>,
-    local_tracks: Arc<StdMutex<Vec<LocalTrack>>>,
-    local_tracks_changed: Arc<Notify>,
-    publications: watch::Receiver<Arc<HashMap<String, pulsebeam_proto::signaling::Track>>>,
-    runner: Mutex<Option<JoinHandle<Result<(), AgentError>>>>,
+    publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
 }
 
 #[derive(Clone)]
@@ -89,12 +67,10 @@ impl Agent {
         &self.inner.participant_id
     }
 
-    pub fn stats(&self) -> AgentStats {
-        self.inner
-            .stats
-            .read()
-            .expect("agent statistics lock should not be poisoned")
-            .clone()
+    pub fn stats(&self) -> Statistics {
+        Statistics {
+            state: self.inner.stats.clone(),
+        }
     }
 
     pub fn connection(&self) -> Connection {
@@ -124,6 +100,17 @@ impl Agent {
         }
     }
 
+    pub fn participants(&self) -> Participants {
+        Participants::new(self.clone())
+    }
+
+    pub fn participant(&self, participant_id: impl Into<ParticipantId>) -> Participant {
+        Participant {
+            agent: self.clone(),
+            id: participant_id.into(),
+        }
+    }
+
     pub fn topic(&self, topic: impl Into<String>) -> Result<Topic, AgentError> {
         let topic = topic.into();
         if topic.is_empty() {
@@ -141,209 +128,106 @@ pub struct Media {
     agent: Agent,
 }
 
-pub struct LocalPublication {
-    name: String,
+pub struct LocalTrack {
     kind: str0m::media::MediaKind,
-    tracks: Option<Vec<LocalTrack>>,
+    encodings: Vec<LocalEncoding>,
+    lease: PublicationLease,
     commands: mailbox::Sender<OutgoingCommand>,
-    available: Arc<StdMutex<Vec<LocalTrack>>>,
-    available_changed: Arc<Notify>,
+    released: bool,
 }
 
-impl LocalPublication {
-    pub fn name(&self) -> &str {
-        &self.name
+impl LocalTrack {
+    pub(crate) fn new(
+        kind: str0m::media::MediaKind,
+        lease: PublicationLease,
+        encodings: Vec<LocalEncoding>,
+        commands: mailbox::Sender<OutgoingCommand>,
+    ) -> Self {
+        debug_assert!(!encodings.is_empty());
+        debug_assert!(encodings.iter().all(|encoding| encoding.mid == lease.mid));
+        Self {
+            kind,
+            encodings,
+            lease,
+            commands,
+            released: false,
+        }
     }
 
     pub fn kind(&self) -> str0m::media::MediaKind {
         self.kind
     }
 
-    pub fn tracks(&self) -> &[LocalTrack] {
-        self.tracks
-            .as_deref()
-            .expect("released publication cannot expose tracks")
+    pub fn encodings(&self) -> &[LocalEncoding] {
+        &self.encodings
     }
 
-    pub fn tracks_mut(&mut self) -> &mut [LocalTrack] {
-        self.tracks
-            .as_deref_mut()
-            .expect("released publication cannot expose tracks")
+    pub fn encodings_mut(&mut self) -> &mut [LocalEncoding] {
+        &mut self.encodings
     }
 
     pub async fn unpublish(mut self) -> Result<(), AgentError> {
-        self.deactivate().await?;
-        self.release();
-        Ok(())
-    }
-
-    async fn deactivate(&self) -> Result<(), AgentError> {
-        let mid = self
-            .tracks()
-            .first()
-            .expect("publication must contain a track")
-            .mid;
+        let (response, result) = tokio::sync::oneshot::channel();
         self.commands
-            .send(OutgoingCommand::SetUpstreamActive { mid, active: false })
+            .send(OutgoingCommand::Unpublish {
+                lease: self.lease,
+                response: Some(response),
+            })
             .await
-            .map_err(|_| AgentError::Closed)
-    }
-
-    fn release(&mut self) {
-        let Some(mut tracks) = self.tracks.take() else {
-            return;
-        };
-        debug_assert!(!tracks.is_empty());
-        self.available
-            .lock()
-            .expect("local track lock should not be poisoned")
-            .append(&mut tracks);
-        self.available_changed.notify_waiters();
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)??;
+        self.released = true;
+        Ok(())
     }
 }
 
-impl Drop for LocalPublication {
+impl Drop for LocalTrack {
     fn drop(&mut self) {
-        let Some(mid) = self
-            .tracks
-            .as_ref()
-            .and_then(|tracks| tracks.first())
-            .map(|track| track.mid)
-        else {
+        if self.released {
             return;
-        };
-        let _ = self
-            .commands
-            .try_send(OutgoingCommand::SetUpstreamActive { mid, active: false });
-        self.release();
+        }
+        let _ = self.commands.try_send(OutgoingCommand::Unpublish {
+            lease: self.lease,
+            response: None,
+        });
     }
 }
 
 impl Media {
-    pub fn publications(&self) -> Publications {
-        Publications {
-            state: self.agent.inner.publications.clone(),
-        }
+    pub async fn publish_video(&self) -> Result<LocalTrack, AgentError> {
+        self.publish(str0m::media::MediaKind::Video).await
     }
 
-    pub async fn publish_video(
-        &self,
-        name: impl Into<String>,
-    ) -> Result<LocalPublication, AgentError> {
-        self.publish(name.into(), str0m::media::MediaKind::Video)
-            .await
+    pub async fn publish_audio(&self) -> Result<LocalTrack, AgentError> {
+        self.publish(str0m::media::MediaKind::Audio).await
     }
 
-    pub async fn publish_audio(
-        &self,
-        name: impl Into<String>,
-    ) -> Result<LocalPublication, AgentError> {
-        self.publish(name.into(), str0m::media::MediaKind::Audio)
-            .await
-    }
-
-    async fn publish(
-        &self,
-        name: String,
-        kind: str0m::media::MediaKind,
-    ) -> Result<LocalPublication, AgentError> {
-        if name.is_empty() {
-            return Err(AgentError::Protocol(
-                "publication name must not be empty".into(),
-            ));
-        }
-        let mut connection = self.agent.connection();
-        loop {
-            let notified = self.agent.inner.local_tracks_changed.notified();
-            let available = {
-                let mut tracks = self
-                    .agent
-                    .inner
-                    .local_tracks
-                    .lock()
-                    .expect("local track lock should not be poisoned");
-                if let Some(mid) = tracks
-                    .iter()
-                    .find(|track| track.kind == kind)
-                    .map(|track| track.mid)
-                {
-                    let mut publication_tracks = Vec::new();
-                    let mut index = 0;
-                    while index < tracks.len() {
-                        if tracks[index].mid == mid {
-                            publication_tracks.push(tracks.swap_remove(index));
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    debug_assert!(!publication_tracks.is_empty());
-                    Some((mid, publication_tracks))
-                } else {
-                    None
-                }
-            };
-            if let Some((mid, mut publication_tracks)) = available {
-                let result = self
-                    .agent
-                    .inner
-                    .commands
-                    .send(OutgoingCommand::SetUpstreamActive { mid, active: true })
-                    .await;
-                if result.is_err() {
-                    self.agent
-                        .inner
-                        .local_tracks
-                        .lock()
-                        .expect("local track lock should not be poisoned")
-                        .append(&mut publication_tracks);
-                    return Err(AgentError::Closed);
-                }
-                return Ok(LocalPublication {
-                    name,
-                    kind,
-                    tracks: Some(publication_tracks),
-                    commands: self.agent.inner.commands.clone(),
-                    available: self.agent.inner.local_tracks.clone(),
-                    available_changed: self.agent.inner.local_tracks_changed.clone(),
-                });
-            }
-
-            match connection.current() {
-                ConnectionState::Connected => return Err(AgentError::MediaCapacity(kind)),
-                ConnectionState::Closed { .. } => return Err(AgentError::Closed),
-                ConnectionState::Connecting | ConnectionState::Reconnecting { .. } => {}
-            }
-
-            tokio::select! {
-                _ = notified => {}
-                result = connection.changed() => {
-                    result.map_err(|_| AgentError::Closed)?;
-                }
-            }
-        }
-    }
-
-    pub async fn events(&self) -> Result<MediaEvents, AgentError> {
-        self.agent
-            .inner
-            .media_events
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| AgentError::Protocol("media events are already being observed".into()))
-    }
-
-    pub async fn set_view(
-        &self,
-        subscriptions: Vec<crate::manager::VideoSubscription>,
-    ) -> Result<(), AgentError> {
+    async fn publish(&self, kind: str0m::media::MediaKind) -> Result<LocalTrack, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
         self.agent
             .inner
             .commands
-            .send(OutgoingCommand::SetSubscriptions(subscriptions))
+            .send(OutgoingCommand::Publish { kind, response })
             .await
             .map_err(|_| AgentError::Closed)?;
-        Ok(())
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        subscription: crate::manager::VideoSubscription,
+    ) -> Result<RemoteTrack, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.agent
+            .inner
+            .commands
+            .send(OutgoingCommand::SubscribeMedia {
+                subscription,
+                response,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
     }
 
     pub async fn set_playout_delay(&self, bounds: Option<(u32, u32)>) -> Result<(), AgentError> {
@@ -357,6 +241,268 @@ impl Media {
     }
 }
 
+#[derive(Clone)]
+pub struct Participant {
+    agent: Agent,
+    id: ParticipantId,
+}
+
+impl Participant {
+    pub fn id(&self) -> &ParticipantId {
+        &self.id
+    }
+
+    pub fn video(&self) -> RemoteVideo {
+        RemoteVideo {
+            participant: self.clone(),
+        }
+    }
+
+    pub fn has_video(&self) -> bool {
+        self.agent
+            .inner
+            .publications
+            .borrow()
+            .values()
+            .any(|publication| {
+                publication.publisher_id() == self.id
+                    && publication.kind() == Some(str0m::media::MediaKind::Video)
+            })
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.agent
+            .inner
+            .publications
+            .borrow()
+            .values()
+            .any(|publication| {
+                publication.publisher_id() == self.id
+                    && publication.kind() == Some(str0m::media::MediaKind::Audio)
+            })
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteVideo {
+    participant: Participant,
+}
+
+impl RemoteVideo {
+    pub fn subscribe(&self) -> VideoSubscriber {
+        VideoSubscriber {
+            participant: self.participant.clone(),
+            height: 720,
+            min_height: 0,
+            priority: 0,
+        }
+    }
+}
+
+pub struct VideoSubscriber {
+    participant: Participant,
+    height: u32,
+    min_height: u32,
+    priority: u32,
+}
+
+impl VideoSubscriber {
+    pub fn target_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+
+    pub fn minimum_height(mut self, height: u32) -> Self {
+        self.min_height = height;
+        self
+    }
+
+    pub fn priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    async fn resolve(self) -> Result<RemoteTrack, AgentError> {
+        let mut publications = self.participant.agent.inner.publications.clone();
+        loop {
+            let matching: Vec<_> = publications
+                .borrow()
+                .values()
+                .filter(|publication| {
+                    publication.publisher_id() == self.participant.id
+                        && publication.kind() == Some(str0m::media::MediaKind::Video)
+                })
+                .map(|publication| publication.id().to_owned())
+                .collect();
+            debug_assert!(matching.len() <= 1);
+            if let Some(track_id) = matching.into_iter().next() {
+                return self
+                    .participant
+                    .agent
+                    .media()
+                    .subscribe(
+                        crate::manager::VideoSubscription::new(track_id)
+                            .target_height(self.height)
+                            .minimum_height(self.min_height)
+                            .priority(self.priority),
+                    )
+                    .await;
+            }
+            publications
+                .changed()
+                .await
+                .map_err(|_| AgentError::Closed)?;
+        }
+    }
+}
+
+impl IntoFuture for VideoSubscriber {
+    type Output = Result<RemoteTrack, AgentError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.resolve())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParticipantAvailability {
+    video: bool,
+    audio: bool,
+}
+
+pub enum ParticipantChange {
+    Joined(Participant),
+    Updated(Participant),
+    Left(ParticipantId),
+}
+
+pub struct Participants {
+    agent: Agent,
+    publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
+    known: HashMap<ParticipantId, ParticipantAvailability>,
+    pending: VecDeque<ParticipantChange>,
+}
+
+impl Participants {
+    fn new(agent: Agent) -> Self {
+        let publications = agent.inner.publications.clone();
+        let known = participant_availability(&publications.borrow());
+        let pending = known
+            .keys()
+            .cloned()
+            .map(|id| ParticipantChange::Joined(agent.participant(id)))
+            .collect();
+        Self {
+            agent,
+            publications,
+            known,
+            pending,
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<ParticipantChange, AgentError> {
+        loop {
+            if let Some(change) = self.pending.pop_front() {
+                return Ok(change);
+            }
+            self.publications
+                .changed()
+                .await
+                .map_err(|_| AgentError::Closed)?;
+            let current = participant_availability(&self.publications.borrow());
+            for (id, availability) in &current {
+                match self.known.get(id) {
+                    None => self.pending.push_back(ParticipantChange::Joined(
+                        self.agent.participant(id.clone()),
+                    )),
+                    Some(previous) if previous != availability => self.pending.push_back(
+                        ParticipantChange::Updated(self.agent.participant(id.clone())),
+                    ),
+                    Some(_) => {}
+                }
+            }
+            for id in self.known.keys() {
+                if !current.contains_key(id) {
+                    self.pending.push_back(ParticipantChange::Left(id.clone()));
+                }
+            }
+            self.known = current;
+        }
+    }
+
+    pub async fn joined(&mut self) -> Result<Participant, AgentError> {
+        loop {
+            if let ParticipantChange::Joined(participant) = self.next().await? {
+                return Ok(participant);
+            }
+        }
+    }
+}
+
+fn participant_availability(
+    publications: &HashMap<String, Publication>,
+) -> HashMap<ParticipantId, ParticipantAvailability> {
+    let mut participants = HashMap::new();
+    for publication in publications.values() {
+        let availability = participants
+            .entry(publication.publisher_id().to_owned())
+            .or_insert(ParticipantAvailability {
+                video: false,
+                audio: false,
+            });
+        match publication.kind() {
+            Some(str0m::media::MediaKind::Video) => availability.video = true,
+            Some(str0m::media::MediaKind::Audio) => availability.audio = true,
+            None => {}
+        }
+    }
+    participants
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsebeam_proto::signaling::Track;
+
+    #[test]
+    fn publications_collapse_into_participant_availability() {
+        let publications = [
+            (
+                "video".to_owned(),
+                Publication::from_signaling(Track {
+                    id: "video".into(),
+                    kind: 1,
+                    participant_id: "alice".into(),
+                    meta: HashMap::new(),
+                }),
+            ),
+            (
+                "audio".to_owned(),
+                Publication::from_signaling(Track {
+                    id: "audio".into(),
+                    kind: 2,
+                    participant_id: "alice".into(),
+                    meta: HashMap::new(),
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let participants = participant_availability(&publications);
+
+        assert_eq!(participants.len(), 1);
+        assert_eq!(
+            participants["alice"],
+            ParticipantAvailability {
+                video: true,
+                audio: true,
+            }
+        );
+    }
+}
+
 impl Agent {
     pub async fn close(&self) -> Result<(), AgentError> {
         let (response, closed) = tokio::sync::oneshot::channel();
@@ -366,18 +512,7 @@ impl Agent {
             .await
             .map_err(|_| AgentError::Closed)?;
         closed.await.map_err(|_| AgentError::Closed)?;
-        if let Some(runner) = self.inner.runner.lock().await.take() {
-            runner
-                .await
-                .map_err(|error| AgentError::Protocol(format!("agent runner failed: {error}")))??;
-        }
         Ok(())
-    }
-
-    pub(crate) async fn attach_runner(&self, runner: JoinHandle<Result<(), AgentError>>) {
-        let mut current = self.inner.runner.lock().await;
-        debug_assert!(current.is_none());
-        *current = Some(runner);
     }
 }
 
@@ -554,36 +689,26 @@ impl IntoFuture for LatestSubscriberBuilder {
 
 pub struct AgentRunner {
     driver: AgentDriver,
-    stats: Arc<RwLock<AgentStats>>,
+    stats: watch::Sender<Arc<StatisticsSnapshot>>,
     connection: watch::Sender<ConnectionState>,
-    media: mailbox::Sender<MediaEvent>,
-    publications: watch::Sender<Arc<HashMap<String, pulsebeam_proto::signaling::Track>>>,
-    publication_state: HashMap<String, pulsebeam_proto::signaling::Track>,
-    local_tracks: Arc<StdMutex<Vec<LocalTrack>>>,
-    local_tracks_changed: Arc<Notify>,
+    publications: watch::Sender<Arc<HashMap<String, Publication>>>,
+    publication_state: HashMap<String, Publication>,
 }
 
 impl AgentRunner {
     pub(crate) fn new(driver: AgentDriver) -> (Agent, Self) {
         let participant_id = driver.participant_id().clone();
         let commands = driver.command_sender();
-        let stats = Arc::new(RwLock::new(driver.stats().clone()));
+        let (stats, stats_rx) = watch::channel(Arc::new(driver.stats().clone()));
         let (connection, connection_rx) = watch::channel(ConnectionState::Connecting);
-        let (media, media_rx) = mailbox::bounded(64);
         let (publications, publication_rx) = watch::channel(Arc::new(HashMap::new()));
-        let local_tracks = Arc::new(StdMutex::new(Vec::new()));
-        let local_tracks_changed = Arc::new(Notify::new());
         let agent = Agent {
             inner: Arc::new(AgentInner {
                 participant_id,
                 commands,
-                stats: stats.clone(),
+                stats: stats_rx,
                 connection: connection_rx,
-                media_events: Mutex::new(Some(MediaEvents { rx: media_rx })),
-                local_tracks: local_tracks.clone(),
-                local_tracks_changed: local_tracks_changed.clone(),
                 publications: publication_rx,
-                runner: Mutex::new(None),
             }),
         };
         (
@@ -592,41 +717,28 @@ impl AgentRunner {
                 driver,
                 stats,
                 connection,
-                media,
                 publications,
                 publication_state: HashMap::new(),
-                local_tracks,
-                local_tracks_changed,
             },
         )
     }
 
     pub async fn run(mut self) -> Result<(), AgentError> {
         while let Some(event) = self.driver.poll().await {
-            *self
-                .stats
-                .write()
-                .expect("agent statistics lock should not be poisoned") =
-                self.driver.stats().clone();
             match event {
-                AgentEvent::StatsUpdated => {}
-                AgentEvent::LocalTrackAdded(track) => {
-                    self.local_tracks
-                        .lock()
-                        .expect("local track lock should not be poisoned")
-                        .push(track);
-                    self.local_tracks_changed.notify_waiters();
+                AgentEvent::StatsUpdated => {
+                    self.stats
+                        .send_replace(Arc::new(self.driver.stats().clone()));
                 }
                 AgentEvent::RemoteTrackDiscovered(track) => {
-                    self.publication_state.insert(track.id.clone(), track);
+                    let publication = Publication::from_signaling(track);
+                    self.publication_state
+                        .insert(publication.id().to_owned(), publication);
                     self.publish_publications();
                 }
                 AgentEvent::RemoteTrackRemoved(track_id) => {
                     self.publication_state.remove(&track_id);
                     self.publish_publications();
-                }
-                AgentEvent::RemoteTrackAdded(track) => {
-                    self.send_media_event(MediaEvent::RemoteTrackAdded(track))?;
                 }
                 AgentEvent::Connected => {
                     let _ = self.connection.send(ConnectionState::Connected);
@@ -646,15 +758,6 @@ impl AgentRunner {
             reason: "agent runner stopped".into(),
         });
         Ok(())
-    }
-
-    fn send_media_event(&self, event: MediaEvent) -> Result<(), AgentError> {
-        self.media.try_send(event).map_err(|error| match error {
-            mailbox::TrySendError::Full(_) => {
-                AgentError::Protocol("media event queue capacity exceeded".into())
-            }
-            mailbox::TrySendError::Disconnected(_) => AgentError::Closed,
-        })
     }
 
     fn publish_publications(&self) {

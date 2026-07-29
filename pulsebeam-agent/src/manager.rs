@@ -2,17 +2,40 @@ use pulsebeam_proto::signaling::VideoRequest;
 use std::collections::{HashMap, HashSet};
 use str0m::media::Mid;
 
-/// A desired downstream video subscription. See `VideoRequest` in the signaling
-/// proto for the QoS field semantics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct VideoSubscription {
     pub track_id: String,
-    /// Target render height (px); `0` = hidden.
     pub height: u32,
-    /// Floor render height (px) to keep under contention; `0` = droppable.
     pub min_height: u32,
-    /// Contention order; higher wins bandwidth first.
     pub priority: u32,
+}
+
+impl VideoSubscription {
+    pub fn new(track_id: impl Into<String>) -> Self {
+        let track_id = track_id.into();
+        debug_assert!(!track_id.is_empty());
+        Self {
+            track_id,
+            height: 720,
+            min_height: 0,
+            priority: 0,
+        }
+    }
+
+    pub fn target_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+
+    pub fn minimum_height(mut self, height: u32) -> Self {
+        self.min_height = height;
+        self
+    }
+
+    pub fn priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
 }
 
 pub struct SubscriptionManager {
@@ -95,12 +118,6 @@ impl SubscriptionManager {
 
         self.active_assignments = next_assignments;
         requests
-    }
-
-    pub fn get_track_for_mid(&self, mid: Mid) -> Option<String> {
-        self.active_assignments
-            .get(&mid)
-            .map(|s| s.track_id.clone())
     }
 
     /// Clears the cached active assignments so that the next `reconcile` will

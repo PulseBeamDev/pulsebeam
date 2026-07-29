@@ -2,10 +2,12 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent::actor::AgentBuilder;
-use pulsebeam_agent::agent::{DataPublisher, DataSubscriber, MediaEvent, MediaEvents};
+use pulsebeam_agent::agent::{DataPublisher, DataSubscriber};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
-use pulsebeam_agent::{Agent, LocalPublication, Publications, SimulcastLayer};
+use pulsebeam_agent::{
+    Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
+};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{HashMap, HashSet};
@@ -91,34 +93,34 @@ impl SimClientBuilder {
             runner.run().await.expect("agent runner failed");
         });
         let local_video = if self.publishes_video {
-            Some(agent.media().publish_video("camera").await?)
+            Some(agent.media().publish_video().await?)
         } else {
             None
         };
-        let media_events = agent.media().events().await?;
-        let publications = agent.media().publications();
+        let (incoming_track_tx, incoming_tracks) = tokio::sync::mpsc::channel(32);
+        let participants = agent.participants();
         tracing::info!("connected to {room}");
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
-        let mut ctx = ClientContext {
+        let ctx = ClientContext {
             ip: self.ip,
             agent,
-            media_events,
-            publications,
-            local_mids: HashSet::new(),
+            incoming_tracks,
+            incoming_track_tx,
+            participants,
             discovered_tracks: HashSet::new(),
             published_topics: Arc::new(Mutex::new(HashMap::new())),
             subscribed_topics: Arc::new(Mutex::new(HashMap::new())),
             remote_tracks: HashMap::new(),
+            requested_tracks: HashSet::new(),
             received_data: Vec::new(),
             video_rx,
             local_publications: local_video.into_iter().collect(),
         };
         for publication in &ctx.local_publications {
-            for sender in publication.tracks().iter().cloned() {
-                ctx.local_mids.insert(sender.mid);
-                let rid = sender.rid.as_ref().map(|rid| rid.as_ref());
+            for sender in publication.encodings().iter().cloned() {
+                let rid = sender.rid();
                 let looper = create_h264_looper_for_rid(rid);
                 join_set.spawn(looper.run(sender));
             }
@@ -220,18 +222,18 @@ impl VideoReceiveLog {
 pub struct ClientContext {
     pub ip: IpAddr,
     pub agent: Agent,
-    media_events: MediaEvents,
-    publications: Publications,
+    incoming_tracks: tokio::sync::mpsc::Receiver<RemoteTrack>,
+    pub(crate) incoming_track_tx: tokio::sync::mpsc::Sender<RemoteTrack>,
+    participants: Participants,
     /// Aggregated decode-side view of every remote video track.
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
-    local_publications: Vec<LocalPublication>,
+    local_publications: Vec<LocalTrack>,
 
-    /// Local track mids (as reported by LocalTrackAdded events).
-    pub local_mids: HashSet<pulsebeam_agent::str0m::media::Mid>,
     /// Remote track IDs that have been discovered from signaling updates.
     pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
-    pub remote_tracks: HashMap<pulsebeam_agent::str0m::media::Mid, String>,
+    pub remote_tracks: HashMap<String, String>,
+    pub(crate) requested_tracks: HashSet<String>,
     pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
     pub subscribed_topics: Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>,
     /// Data channel payloads received by topic.
@@ -274,7 +276,7 @@ impl SimClient {
         let _guard = token.clone().drop_guard();
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
-                let stats = self.ctx.agent.stats();
+                let stats = self.ctx.agent.stats().current();
                 anyhow::bail!(
                     "Client {} timed out ({:?}). Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
                     self.ctx.ip,
@@ -345,27 +347,33 @@ impl SimClient {
                     _ = token.cancelled() => {
                         return Ok(());
                     }
-                    result = self.ctx.publications.changed() => {
-                        result.expect("publication state should remain available");
-                        for track in self.ctx.publications.current().values() {
-                            self.ctx.discovered_tracks.insert(track.id.clone());
+                    result = self.ctx.participants.next() => {
+                        match result.expect("participant state should remain available") {
+                            ParticipantChange::Joined(participant)
+                            | ParticipantChange::Updated(participant) => {
+                                self.ctx
+                                    .discovered_tracks
+                                    .insert(participant.id().clone());
+                            }
+                            ParticipantChange::Left(participant_id) => {
+                                self.ctx.discovered_tracks.remove(&participant_id);
+                            }
                         }
                         if predicate(&mut self.ctx) {
                             return Ok(());
                         }
                     }
-                    Ok(event) = self.ctx.media_events.recv() => {
-                        match event {
-                            MediaEvent::RemoteTrackAdded(mut t) => {
-                                self.ctx.remote_tracks.insert(t.mid, t.track.id.clone());
-                                let log = self.ctx.video_rx.clone();
-                                self.join_set.spawn(async move {
-                                    while let Ok(frame) = t.recv().await {
-                                        log.lock().unwrap().record(&frame);
-                                    }
-                                });
+                    Some(mut track) = self.ctx.incoming_tracks.recv() => {
+                        let publication_id = track.publisher_id().to_owned();
+                        self.ctx
+                            .remote_tracks
+                            .insert(publication_id.clone(), publication_id);
+                        let log = self.ctx.video_rx.clone();
+                        self.join_set.spawn(async move {
+                            while let Ok(frame) = track.recv().await {
+                                log.lock().unwrap().record(&frame);
                             }
-                        }
+                        });
 
                         // Re-check the predicate after processing an event, since a new
                         // event may indicate the desired state has been reached.
