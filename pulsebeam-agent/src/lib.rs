@@ -10,10 +10,11 @@ use tokio::time::Instant;
 pub mod clock;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentError, AgentRunner, AgentStats, ConnectionState, MediaEvent,
-    MediaEvents,
+    Agent, AgentBuilder, AgentError, AgentRunner, AgentStats, Connection, ConnectionState,
+    LocalPublication, Media, MediaEvent, MediaEvents, Publications,
 };
 pub use clock::wallclock_at;
+pub use manager::VideoSubscription;
 
 pub mod actor;
 pub mod agent;

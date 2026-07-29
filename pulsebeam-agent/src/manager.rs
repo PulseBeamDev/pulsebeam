@@ -5,7 +5,7 @@ use str0m::media::Mid;
 /// A desired downstream video subscription. See `VideoRequest` in the signaling
 /// proto for the QoS field semantics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Subscription {
+pub struct VideoSubscription {
     pub track_id: String,
     /// Target render height (px); `0` = hidden.
     pub height: u32,
@@ -16,9 +16,8 @@ pub struct Subscription {
 }
 
 pub struct SubscriptionManager {
-    desired: Vec<Subscription>,
-    // current_mid -> Subscription
-    active_assignments: HashMap<Mid, Subscription>,
+    desired: Vec<VideoSubscription>,
+    active_assignments: HashMap<Mid, VideoSubscription>,
     slots: Vec<Mid>,
 }
 
@@ -31,7 +30,7 @@ impl SubscriptionManager {
         }
     }
 
-    pub fn set_desired(&mut self, desired: Vec<Subscription>) {
+    pub fn set_desired(&mut self, desired: Vec<VideoSubscription>) {
         self.desired = desired;
     }
 

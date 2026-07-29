@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
-    MediaKind, Rid, SimulcastLayer, TransceiverDirection,
+    Rid, SimulcastLayer,
     actor::AgentBuilder,
     agent::RemoteTrack,
     api::HttpApiClient,
@@ -230,9 +230,8 @@ async fn spawn_agent(
     let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
 
     if simulcast {
-        builder = builder.with_track(
-            MediaKind::Video,
-            TransceiverDirection::SendOnly,
+        builder = builder.video_upstream_slots(
+            1,
             Some(vec![
                 SimulcastLayer::new("q"),
                 SimulcastLayer::new("h"),
@@ -240,22 +239,21 @@ async fn spawn_agent(
             ]),
         );
     } else {
-        builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
+        builder = builder.video_upstream_slots(1, None);
     }
-    builder = builder.with_track(MediaKind::Audio, TransceiverDirection::SendOnly, None);
-
-    for _ in 0..7 {
-        builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
-    }
-    for _ in 0..3 {
-        builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
-    }
+    builder = builder
+        .audio_upstream_slots(1)
+        .video_downstream_slots(7)
+        .audio_downstream_slots(3);
 
     let agent = builder.connect(&room_name).await?;
-    let mut media_events = agent
-        .take_media_events()
-        .await
-        .expect("media events should only be taken once");
+    let camera = agent.media().publish_video("camera").await?;
+    for track in camera.tracks().iter().cloned() {
+        let looper = get_looper(&track.rid, &ctx.assets);
+        tokio::spawn(looper.run(track));
+    }
+    let _microphone = agent.media().publish_audio("microphone").await?;
+    let mut media_events = agent.media().events().await?;
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -296,16 +294,9 @@ async fn spawn_agent(
             }
             Ok(event) = media_events.recv() => {
                 match event {
-                    pulsebeam_agent::MediaEvent::LocalTrackAdded(track) => {
-                        if track.kind.is_video() {
-                            let looper = get_looper(&track.rid, &ctx.assets);
-                            tokio::spawn(looper.run(track));
-                        }
-                    }
                     pulsebeam_agent::MediaEvent::RemoteTrackAdded(t) => {
                         join_set.spawn(handle_receiving(t, ctx.clone()));
                     }
-                    pulsebeam_agent::MediaEvent::RemoteTrackDiscovered(_) => {}
                 }
             }
         }

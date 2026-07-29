@@ -1,6 +1,6 @@
 use crate::MediaFrame;
 use crate::agent::mailbox;
-use crate::manager::Subscription;
+use crate::manager::VideoSubscription;
 use pulsebeam_proto::signaling::Track;
 use str0m::channel::ChannelId;
 use str0m::media::{Mid, Rid};
@@ -8,8 +8,12 @@ use str0m::media::{Mid, Rid};
 pub(crate) enum OutgoingCommand {
     SendData(SendData),
     SendMedia(SendMedia),
-    SetSubscriptions(Vec<Subscription>),
+    SetSubscriptions(Vec<VideoSubscription>),
     SetPlayoutDelay(Option<(u32, u32)>),
+    SetUpstreamActive {
+        mid: Mid,
+        active: bool,
+    },
     Shutdown(tokio::sync::oneshot::Sender<()>),
     DeclareOrderedPublisher {
         topic: String,
@@ -174,6 +178,7 @@ impl OrderedTopicSubscriber {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalTrack {
     pub kind: str0m::media::MediaKind,
     pub mid: Mid,

@@ -40,17 +40,47 @@ impl AgentBuilder {
         }
     }
 
-    pub fn with_track(
+    pub fn video_upstream_slots(
         mut self,
-        kind: MediaKind,
-        direction: TransceiverDirection,
+        capacity: usize,
         simulcast_layers: Option<Vec<SimulcastLayer>>,
     ) -> Self {
-        self.tracks.push(TrackRequest {
-            kind,
-            direction,
-            simulcast_layers,
-        });
+        debug_assert!(capacity > 0);
+        self.tracks.extend((0..capacity).map(|_| TrackRequest {
+            kind: MediaKind::Video,
+            direction: TransceiverDirection::SendOnly,
+            simulcast_layers: simulcast_layers.clone(),
+        }));
+        self
+    }
+
+    pub fn audio_upstream_slots(mut self, capacity: usize) -> Self {
+        debug_assert!(capacity > 0);
+        self.tracks.extend((0..capacity).map(|_| TrackRequest {
+            kind: MediaKind::Audio,
+            direction: TransceiverDirection::SendOnly,
+            simulcast_layers: None,
+        }));
+        self
+    }
+
+    pub fn video_downstream_slots(mut self, capacity: usize) -> Self {
+        debug_assert!(capacity > 0);
+        self.tracks.extend((0..capacity).map(|_| TrackRequest {
+            kind: MediaKind::Video,
+            direction: TransceiverDirection::RecvOnly,
+            simulcast_layers: None,
+        }));
+        self
+    }
+
+    pub fn audio_downstream_slots(mut self, capacity: usize) -> Self {
+        debug_assert!(capacity > 0);
+        self.tracks.extend((0..capacity).map(|_| TrackRequest {
+            kind: MediaKind::Audio,
+            direction: TransceiverDirection::RecvOnly,
+            simulcast_layers: None,
+        }));
         self
     }
 

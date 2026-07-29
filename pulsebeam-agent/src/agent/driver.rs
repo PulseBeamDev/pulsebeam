@@ -8,7 +8,7 @@ use crate::agent::mailbox;
 use crate::agent::ordered_topic::OrderedTopics;
 use crate::agent::slots::SlotManager;
 use crate::api::{ApiError, HttpApiClient, UpdateParticipantRequest};
-use crate::manager::{Subscription, SubscriptionManager};
+use crate::manager::{SubscriptionManager, VideoSubscription};
 use crate::media::KeyframeNotifier;
 use crate::tcp::TcpSession;
 use http::Uri;
@@ -105,6 +105,8 @@ pub enum AgentError {
     NoCandidates,
     #[error("Agent runner is no longer available")]
     Closed,
+    #[error("No reserved {0:?} publication is available")]
+    MediaCapacity(MediaKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +161,7 @@ pub(crate) enum AgentEvent {
     StatsUpdated,
     LocalTrackAdded(LocalTrack),
     RemoteTrackDiscovered(Track),
+    RemoteTrackRemoved(String),
     RemoteTrackAdded(RemoteTrack),
     Connected,
     Disconnected(String),
@@ -200,10 +203,12 @@ struct MediaSubsystem {
 
 struct SubscriptionSubsystem {
     sub_manager: SubscriptionManager,
-    desired_subscriptions: HashMap<String, Subscription>,
+    desired_subscriptions: HashMap<String, VideoSubscription>,
     pending_deadline: Option<Instant>,
     /// (min, max) receiver playout delay in ms; `None` = adaptive default.
     playout_delay_ms: Option<(u32, u32)>,
+    upstream_active: HashMap<Mid, bool>,
+    upstream_dirty: bool,
 }
 
 struct SessionSubsystem {
@@ -291,6 +296,8 @@ impl AgentDriver {
                 desired_subscriptions: HashMap::new(),
                 pending_deadline: None,
                 playout_delay_ms: None,
+                upstream_active: HashMap::new(),
+                upstream_dirty: false,
             },
             session: SessionSubsystem {
                 api: init.api,
@@ -399,7 +406,7 @@ impl AgentDriver {
         self.timers.notifier.notify_one();
     }
 
-    fn set_subscriptions(&mut self, subs: Vec<Subscription>) {
+    fn set_subscriptions(&mut self, subs: Vec<VideoSubscription>) {
         self.subscriptions.desired_subscriptions.clear();
         for sub in subs {
             self.subscriptions
@@ -611,6 +618,12 @@ impl AgentDriver {
             OutgoingCommand::SetPlayoutDelay(bounds) => {
                 self.set_playout_delay(bounds);
             }
+            OutgoingCommand::SetUpstreamActive { mid, active } => {
+                self.subscriptions.upstream_active.insert(mid, active);
+                self.subscriptions.upstream_dirty = true;
+                self.subscriptions.pending_deadline = Some(self.now);
+                self.timers.notifier.notify_one();
+            }
             OutgoingCommand::Shutdown(response) => {
                 self.shutdown_responses.push(response);
                 self.shutdown_requested = true;
@@ -791,9 +804,12 @@ impl AgentDriver {
 
         match payload {
             signaling::server_message::Payload::Update(update) => {
-                let (assignments, discovered) = self.slot_manager.sync(update);
+                let (assignments, discovered, removed) = self.slot_manager.sync(update);
                 for track in discovered {
                     self.emit(AgentEvent::RemoteTrackDiscovered(track));
+                }
+                for track_id in removed {
+                    self.emit(AgentEvent::RemoteTrackRemoved(track_id));
                 }
                 for (mid, track) in assignments {
                     let (tx, rx) = mailbox::bounded(256);
@@ -818,7 +834,7 @@ impl AgentDriver {
         };
 
         let requests = self.subscriptions.sub_manager.reconcile();
-        if requests.is_empty() {
+        if requests.is_empty() && !self.subscriptions.upstream_dirty {
             self.subscriptions.pending_deadline = None;
             return;
         }
@@ -826,7 +842,15 @@ impl AgentDriver {
         let msg = signaling::ClientMessage {
             payload: Some(signaling::client_message::Payload::Intent(
                 signaling::ClientIntent {
-                    upstream_intents: vec![],
+                    upstream_intents: self
+                        .subscriptions
+                        .upstream_active
+                        .iter()
+                        .map(|(mid, active)| signaling::UpstreamIntent {
+                            mid: mid.to_string(),
+                            active: *active,
+                        })
+                        .collect(),
                     downstream_requests: requests,
                     playout_delay: self
                         .subscriptions
@@ -841,6 +865,7 @@ impl AgentDriver {
             self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
         } else {
             self.subscriptions.pending_deadline = None;
+            self.subscriptions.upstream_dirty = false;
         }
     }
 

@@ -7,7 +7,7 @@ use crate::{MediaFrame, agent::LocalTrack};
 
 pub struct KeyframeNotifier(watch::Sender<u64>);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyframeReceiver(watch::Receiver<u64>);
 
 impl KeyframeNotifier {

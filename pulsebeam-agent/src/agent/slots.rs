@@ -38,9 +38,14 @@ impl SlotManager {
     pub fn sync(
         &mut self,
         update: pulsebeam_proto::signaling::StateUpdate,
-    ) -> (Vec<(Mid, Track)>, Vec<pulsebeam_proto::signaling::Track>) {
+    ) -> (
+        Vec<(Mid, Track)>,
+        Vec<pulsebeam_proto::signaling::Track>,
+        Vec<TrackId>,
+    ) {
         let mut new_assignments: Vec<(Mid, Track)> = Vec::new();
         let mut newly_discovered_tracks = Vec::new();
+        let removed_tracks = update.tracks_remove.clone();
 
         for t in update.tracks_remove {
             self.pending_tracks.remove(&t);
@@ -109,6 +114,6 @@ impl SlotManager {
             new_assignments.push((mid, track));
         }
 
-        (new_assignments, newly_discovered_tracks)
+        (new_assignments, newly_discovered_tracks, removed_tracks)
     }
 }

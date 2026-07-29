@@ -3,8 +3,8 @@ use crate::tests::common::{
     reserve_subnet, run_sim_or_timeout, start_sfu_node, start_sfu_node_tcp_only,
     start_sfu_node_tcp_only_multi_shard, subnet_ip,
 };
-use pulsebeam_agent::manager::Subscription;
-use pulsebeam_agent::{MediaKind, SimulcastLayer, TransceiverDirection};
+use pulsebeam_agent::SimulcastLayer;
+use pulsebeam_agent::VideoSubscription;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -201,7 +201,7 @@ pub enum Step {
     SetSubscriptions {
         description: &'static str,
         participant: &'static str,
-        subscriptions: Vec<Subscription>,
+        subscriptions: Vec<VideoSubscription>,
     },
     /// Subscribe the participant to ALL currently discovered video tracks.
     /// `heights` is applied round-robin to discovered tracks (sorted ascending).
@@ -309,7 +309,7 @@ enum ParticipantCmd {
 // ── Pending driver operations (queued by coordinator, drained on drive tick) ─
 
 enum PendingDriverOp {
-    SetSubscriptions(Vec<Subscription>),
+    SetSubscriptions(Vec<VideoSubscription>),
     DeclarePublishTopic(String),
     /// (topic, scoped_participant_id)
     DeclareSubscribeTopic(String, Option<String>),
@@ -416,14 +416,10 @@ async fn run_participant(
                 } else {
                     Some(config.rids.iter().map(|r| SimulcastLayer::new(r)).collect())
                 };
-                builder =
-                    builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, layers);
+                builder = builder.publish_video(layers);
             }
             Role::Subscriber => {
-                for _ in 0..config.slots.max(1) {
-                    builder =
-                        builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
-                }
+                builder = builder.receive_video(config.slots.max(1));
             }
             Role::DataOnly => {
                 // No tracks; data channels only.
@@ -459,7 +455,8 @@ async fn run_participant(
                             let agent = ctx.agent.clone();
                             tokio::spawn(async move {
                                 agent
-                                    .set_subscriptions(subs)
+                                    .media()
+                                    .set_view(subs)
                                     .await
                                     .expect("failed to set subscriptions");
                             });
@@ -757,10 +754,10 @@ async fn execute_plan(
                 } else {
                     *heights
                 };
-                let subs: Vec<Subscription> = tracks
+                let subs: Vec<VideoSubscription> = tracks
                     .iter()
                     .enumerate()
-                    .map(|(i, track_id)| Subscription {
+                    .map(|(i, track_id)| VideoSubscription {
                         track_id: track_id.clone(),
                         height: heights_slice[i % heights_slice.len()],
                         min_height: 0,
