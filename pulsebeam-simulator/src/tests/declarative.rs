@@ -1,185 +1,89 @@
-use crate::tests::common::{self, client::SimClientBuilder, run_sim_or_timeout};
-use pulsebeam_agent::MediaKind;
-use pulsebeam_agent::TransceiverDirection;
-use pulsebeam_agent::manager::Subscription;
+use crate::tests::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
+/// Validates the declarative subscription API end-to-end:
+/// 1. Subscriber discovers the publisher's track via signaling.
+/// 2. `set_subscriptions()` triggers media flow.
+/// 3. Updating subscriptions (height change + unknown track) does not break flow.
 #[test]
-fn declarative_subscription_test() -> turmoil::Result {
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(30))
-        .rng_seed(0xDEADBEEF)
-        .build();
-
-    let subnet = common::reserve_subnet();
-    let sfu_ip = common::subnet_ip(subnet, 1);
-
-    sim.host(sfu_ip, move || async move {
-        crate::tests::common::start_sfu_node(
-            sfu_ip,
-            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+fn declarative_subscription_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
         )
-        .await
-        .map_err(|e| e.into())
-    });
-
-    let done = CancellationToken::new();
-    let client1_ip = common::subnet_ip(subnet, 2);
-    let client2_ip = common::subnet_ip(subnet, 3);
-
-    sim.client(client1_ip, {
-        let done = done.clone();
-        async move {
-            let sfu_ip = sfu_ip;
-            let client1_ip = client1_ip;
-            let mut client = SimClientBuilder::bind(client1_ip, sfu_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-                .connect("room1")
-                .await?;
-
-            client.drive(done).await.ok();
-
-            Ok(())
-        }
-    });
-
-    sim.client(client2_ip, async move {
-        let _done = done.drop_guard();
-        let sfu_ip = sfu_ip;
-        let client2_ip = client2_ip;
-        let mut client = SimClientBuilder::bind(client2_ip, sfu_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-            .connect("room1")
-            .await?;
-
-        // 1. Wait for the publisher to advertise its track via signaling discovery.
-        client
-            .drive_until(Duration::from_secs(5), |ctx| {
-                !ctx.discovered_tracks.is_empty()
-            })
-            .await?;
-
-        let track_id = client
-            .ctx
-            .discovered_tracks
-            .iter()
-            .next()
-            .expect("No remote tracks discovered")
-            .clone();
-
-        // 2. Set declarative subscriptions
-        client.ctx.driver.set_subscriptions(vec![Subscription {
-            track_id: track_id.clone(),
-            height: 720,
-            ..Default::default()
-        }]);
-
-        // 2. Wait for media flow
-        tracing::info!("Waiting for media flow via declarative subscription...");
-        client
-            .drive_until(Duration::from_secs(20), |ctx| {
-                // We only need a small amount of flow to consider the subscription active.
-                ctx.driver.stats().total_rx_bytes() > 1_000
-            })
-            .await?;
-
-        tracing::info!("Media flow established!");
-
-        // 3. Update subscriptions (Sticky test)
-        // Add a non-existent track, Alice should stay on the same MID (internal check via logs)
-        client.ctx.driver.set_subscriptions(vec![
-            Subscription {
-                track_id: track_id.clone(),
-                height: 360,
-                ..Default::default()
+        .run(vec![
+            Step::Run {
+                description: "Establish connection and let signaling discover tracks",
+                duration: Duration::from_secs(5),
             },
-            Subscription {
-                track_id: "non_existent".to_string(),
-                height: 360,
-                ..Default::default()
+            Step::SubscribeAll {
+                description: "Bob subscribes to Alice's track at 720p",
+                participant: "bob",
+                heights: &[720],
+            },
+            Step::Run {
+                description: "Wait for declarative subscription to establish media flow",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckRxBytes {
+                description: "Bob has received media bytes via declarative subscription",
+                participant: "bob",
+                min_bytes: 1000,
+            },
+            Step::SubscribeAll {
+                description: "Update subscription to 360p (sticky-subscription test)",
+                participant: "bob",
+                heights: &[360],
+            },
+            Step::Run {
+                description: "Continue after subscription height update",
+                duration: Duration::from_secs(5),
             },
         ]);
-
-        client
-            .drive_until(Duration::from_secs(5), |_| false)
-            .await
-            .ok();
-
-        Ok(())
-    });
-
-    run_sim_or_timeout(&mut sim, Duration::from_secs(30))?;
-    Ok(())
 }
 
 #[test]
-fn reconnection_recovery_test() -> turmoil::Result {
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(60))
-        .rng_seed(0xDEADBEEF)
-        .build();
-
-    let subnet = common::reserve_subnet();
-    let sfu_ip = common::subnet_ip(subnet, 1);
-    let client1_ip = common::subnet_ip(subnet, 2);
-
-    sim.host(sfu_ip, move || async move {
-        crate::tests::common::start_sfu_node(
-            sfu_ip,
-            pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF),
+fn reconnection_recovery_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
         )
-        .await
-        .map_err(|e| e.into())
-    });
-
-    sim.client(client1_ip, async move {
-        let sfu_ip = sfu_ip;
-        let client1_ip = client1_ip;
-        let mut client = SimClientBuilder::bind(client1_ip, sfu_ip)
-            .await?
-            .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-            .connect("room1")
-            .await?;
-
-        // 1. Establish initial flow
-        client
-            .drive_until(Duration::from_secs(10), |ctx| {
-                ctx.driver.stats().total_tx_bytes() > 20_000
-            })
-            .await?;
-        tracing::info!("Initial flow established");
-
-        // 2. Simulate network failure (partition)
-        tracing::info!("Simulating network partition...");
-        turmoil::partition(client1_ip, sfu_ip);
-
-        // Drive for a bit while partitioned
-        client
-            .drive_until(Duration::from_secs(10), |_| false)
-            .await
-            .ok();
-
-        // 3. Lift partition and verify recovery
-        tracing::info!("Lifting network partition...");
-        turmoil::repair(client1_ip, sfu_ip);
-
-        // Wait for agent to reconnect and resume flow
-        tracing::info!("Waiting for reconnection and flow recovery...");
-        let start_bytes = client.ctx.driver.stats().total_tx_bytes();
-        client
-            .drive_until(Duration::from_secs(20), |ctx| {
-                ctx.driver.stats().total_tx_bytes() > start_bytes + 20_000
-            })
-            .await?;
-
-        tracing::info!("Flow recovered after reconnection!");
-
-        Ok(())
-    });
-
-    run_sim_or_timeout(&mut sim, Duration::from_secs(30))?;
-    Ok(())
+        .run(vec![
+            Step::Run {
+                description: "Establish initial flow",
+                duration: Duration::from_secs(15),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob receives renderable video before partition",
+                participant: "bob",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::Partition {
+                description: "Alice ↔ server network failure",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Partitioned period",
+                duration: Duration::from_secs(10),
+            },
+            Step::Repair {
+                description: "Lift partition — agent should auto-reconnect",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Recovery period",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckVideoQuality {
+                description: "Bob receives renderable video after Alice reconnects",
+                participant: "bob",
+                quality: VideoQuality::min_frames(100),
+            },
+        ]);
 }

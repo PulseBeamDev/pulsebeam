@@ -1,168 +1,202 @@
-use super::common;
-use pulsebeam_agent::{MediaKind, TransceiverDirection};
+use super::common::{LocalNodeSim, Participant, Room, Step, VideoQuality};
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 #[test]
-fn churn_test() -> turmoil::Result {
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(120))
-        .rng_seed(0xDEADBEEF)
-        .build();
-
-    let subnet = common::reserve_subnet();
-    let server_ip = common::subnet_ip(subnet, 1);
-    let participant1_ip = common::subnet_ip(subnet, 2);
-    let participant2_ip = common::subnet_ip(subnet, 3);
-
-    sim.host(server_ip, move || async move {
-        common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xDEADBEEF))
-            .await
-            .map_err(|e| e.into())
-    });
-    let done = CancellationToken::new();
-
-    // Participant 1: Stays in the room
-    sim.client(participant1_ip, {
-        let done = done.clone();
-        async move {
-            let mut client = common::client::SimClientBuilder::bind(participant1_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-                .connect("room1")
-                .await?;
-
-            client.drive(done).await.unwrap();
-            Ok(())
-        }
-    });
-
-    // Participant 2: Joins and leaves multiple times
-    sim.client(participant2_ip, async move {
-        let _done_guard = done.drop_guard();
-        for i in 1..=3 {
-            tracing::info!("Participant 2 joining, attempt {}", i);
-            let mut client = common::client::SimClientBuilder::bind(participant2_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-                .connect("room1")
-                .await?;
-
-            client
-                .drive_until(Duration::from_secs(10), |ctx| {
-                    let Some(peer) = &ctx.driver.stats().peer else {
-                        return false;
-                    };
-                    peer.peer_bytes_rx > 10_000
-                })
-                .await?;
-
-            tracing::info!("Participant 2 leaving, attempt {}", i);
-            client.ctx.driver.shutdown().await;
-
-            // Drop explicitly before sleeping so simulation engine cleans up its tracking
-            drop(client);
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-        Ok(())
-    });
-
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(130)).expect("Simulation failed");
-    Ok(())
+fn churn_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("stable"))
+                .with_participant(Participant::subscriber("churner")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Initial session",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQuality {
+                description: "Churner receives renderable video in first session",
+                participant: "churner",
+                quality: VideoQuality::min_frames(50),
+            },
+            Step::Disconnect {
+                description: "Churner leaves",
+                participant: "churner",
+            },
+            Step::Run {
+                description: "Pause between sessions",
+                duration: Duration::from_secs(5),
+            },
+            Step::Reconnect {
+                description: "Churner rejoins",
+                participant: "churner",
+            },
+            Step::Run {
+                description: "Second session",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQuality {
+                description: "Churner receives renderable video in second session",
+                participant: "churner",
+                quality: VideoQuality::min_frames(100),
+            },
+        ]);
 }
 
 #[test]
-fn abrupt_exit_chaos_test() -> turmoil::Result {
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(120))
-        .rng_seed(0xC0FFEE)
-        .build();
+fn abrupt_exit_chaos_test() {
+    let room = Room::new("room1")
+        .with_participant(Participant::single_publisher("stable"))
+        .with_participant(Participant::subscriber("observer"))
+        .with_participant(Participant::single_publisher("crasher1").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher2").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher3").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher4").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher5").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher6").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher7").starts_disconnected())
+        .with_participant(Participant::single_publisher("crasher8").starts_disconnected());
 
-    let subnet = common::reserve_subnet();
-    let server_ip = common::subnet_ip(subnet, 1);
-    let stable_publisher_ip = common::subnet_ip(subnet, 2);
-    let stable_subscriber_ip = common::subnet_ip(subnet, 3);
-
-    sim.host(server_ip, move || async move {
-        common::start_sfu_node(server_ip, pulsebeam_runtime::rand::seeded_rng(0xC0FFEE))
-            .await
-            .map_err(|e| e.into())
-    });
-
-    let stable_done = CancellationToken::new();
-
-    sim.client(stable_publisher_ip, {
-        let stable_done = stable_done.clone();
-        async move {
-            let mut publisher =
-                common::client::SimClientBuilder::bind(stable_publisher_ip, server_ip)
-                    .await?
-                    .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-                    .connect("room1")
-                    .await?;
-
-            publisher.drive(stable_done).await?;
-            Ok(())
-        }
-    });
-
-    sim.client(stable_subscriber_ip, async move {
-        let _done_guard = stable_done.drop_guard();
-        let mut subscriber =
-            common::client::SimClientBuilder::bind(stable_subscriber_ip, server_ip)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None)
-                .connect("room1")
-                .await?;
-
-        // Replaced wait_for_discovered_tracks: Drive until at least 1 track is discovered
-        subscriber
-            .drive_until(Duration::from_secs(20), |ctx| {
-                ctx.discovered_tracks.len() >= 1
-            })
-            .await?;
-
-        for _ in 0..6 {
-            let before = subscriber.ctx.driver.stats().total_rx_bytes();
-
-            subscriber
-                .drive_until(Duration::from_secs(8), |ctx| {
-                    ctx.driver.stats().total_rx_bytes() > before + 1_500
-                })
-                .await?;
-        }
-
-        Ok(())
-    });
-
-    for cycle in 0..8u8 {
-        let ip = common::subnet_ip(subnet, 10 + cycle);
-        let server_ip_for_client = server_ip;
-        let start_delay = Duration::from_secs(3 + (cycle as u64 * 4));
-
-        sim.client(ip, async move {
-            tokio::time::sleep(start_delay).await;
-
-            let mut churn_client = common::client::SimClientBuilder::bind(ip, server_ip_for_client)
-                .await?
-                .with_track(MediaKind::Video, TransceiverDirection::SendOnly, None)
-                .connect("room1")
-                .await?;
-
-            churn_client.drive_for(Duration::from_secs(2)).await.ok();
-
-            // Introduce network isolation modeling
-            turmoil::partition(ip, server_ip_for_client);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            // Intentionally drop without signaling disconnect to model abrupt process exits.
-            drop(churn_client);
-            turmoil::repair(ip, server_ip_for_client);
-
-            Ok(())
-        });
-    }
-
-    common::run_sim_or_timeout(&mut sim, Duration::from_secs(125)).expect("Simulation failed");
-    Ok(())
+    LocalNodeSim::new()
+        .with_rng_seed(0xC0FFEE)
+        .with_room(room)
+        .run(vec![
+            Step::Run {
+                description: "Stable pair establishes",
+                duration: Duration::from_secs(3),
+            },
+            Step::Join {
+                description: "Crasher 1 enters",
+                participant: "crasher1",
+            },
+            Step::Run {
+                description: "Crasher 1 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 1 exits without signaling",
+                participant: "crasher1",
+            },
+            Step::Run {
+                description: "Gap before crasher 2",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 2 enters",
+                participant: "crasher2",
+            },
+            Step::Run {
+                description: "Crasher 2 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 2 exits without signaling",
+                participant: "crasher2",
+            },
+            Step::Run {
+                description: "Gap before crasher 3",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 3 enters",
+                participant: "crasher3",
+            },
+            Step::Run {
+                description: "Crasher 3 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 3 exits without signaling",
+                participant: "crasher3",
+            },
+            Step::Run {
+                description: "Gap before crasher 4",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 4 enters",
+                participant: "crasher4",
+            },
+            Step::Run {
+                description: "Crasher 4 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 4 exits without signaling",
+                participant: "crasher4",
+            },
+            Step::Run {
+                description: "Gap before crasher 5",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 5 enters",
+                participant: "crasher5",
+            },
+            Step::Run {
+                description: "Crasher 5 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 5 exits without signaling",
+                participant: "crasher5",
+            },
+            Step::Run {
+                description: "Gap before crasher 6",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 6 enters",
+                participant: "crasher6",
+            },
+            Step::Run {
+                description: "Crasher 6 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 6 exits without signaling",
+                participant: "crasher6",
+            },
+            Step::Run {
+                description: "Gap before crasher 7",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 7 enters",
+                participant: "crasher7",
+            },
+            Step::Run {
+                description: "Crasher 7 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 7 exits without signaling",
+                participant: "crasher7",
+            },
+            Step::Run {
+                description: "Gap before crasher 8",
+                duration: Duration::from_secs(2),
+            },
+            Step::Join {
+                description: "Crasher 8 enters",
+                participant: "crasher8",
+            },
+            Step::Run {
+                description: "Crasher 8 active",
+                duration: Duration::from_secs(2),
+            },
+            Step::AbruptExit {
+                description: "Crasher 8 exits without signaling",
+                participant: "crasher8",
+            },
+            Step::Run {
+                description: "Final observation window",
+                duration: Duration::from_secs(8),
+            },
+            Step::CheckVideoQuality {
+                description: "Observer kept receiving renderable frames despite chaos",
+                participant: "observer",
+                quality: VideoQuality::min_frames(100).allow_gaps_for_switches(8),
+            },
+        ]);
 }

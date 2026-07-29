@@ -1,105 +1,178 @@
-use super::common;
-use crate::tests::scenario::{
-    AssertAllDisconnectedStage, ChurnStage, ConnectPeersStage, ConnectPeersTcpOnlyStage,
-    DisconnectStage, HoldStage, PartitionStage, Scenario, StartSfuStage,
-    StartSfuTcpOnlyMultiShardStage, StartSfuTcpOnlyStage,
-};
+use super::common::{LocalNodeSim, Participant, Room, Step};
 use std::time::Duration;
-
-fn run_connection_scenario(
-    name: &'static str,
-    peers: usize,
-    min_rx_bytes: u64,
-    enable_partition: bool,
-    enable_churn: bool,
-) {
-    let subnet = common::reserve_subnet();
-    let server_ip = common::subnet_ip(subnet, 1);
-    let sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(90))
-        .tick_duration(Duration::from_micros(100))
-        .rng_seed(0xDEADBEEF)
-        .build();
-
-    let mut scenario = Scenario::new(name, server_ip, sim)
-        .add_stage(StartSfuStage)
-        .add_stage(ConnectPeersStage {
-            peers,
-            min_tx_bytes: 0,
-            min_rx_bytes,
-            max_wait: Duration::from_secs(20),
-        });
-
-    if enable_partition {
-        scenario = scenario.add_stage(PartitionStage {
-            client_index: 0,
-            delay: Duration::from_secs(5),
-            duration: Duration::from_secs(10),
-        });
-
-        // Optional hold (buffering) test to validate packet flush behavior.
-        scenario = scenario.add_stage(HoldStage {
-            client_index: 1.min(peers - 1),
-            delay: Duration::from_secs(10),
-            duration: Duration::from_secs(8),
-        });
-    }
-
-    if enable_churn {
-        scenario = scenario.add_stage(ChurnStage {
-            cycles: 2,
-            num_peers: 2,
-            join_duration: Duration::from_secs(6),
-            pause_between: Duration::from_secs(4),
-        });
-    }
-
-    scenario
-        .add_stage(DisconnectStage {
-            after: Duration::from_secs(40),
-        })
-        .add_stage(AssertAllDisconnectedStage {
-            after: Duration::from_secs(60),
-        })
-        .run()
-        .expect("Simulation failed");
-}
 
 #[test]
 fn simulation_test() {
-    // Deterministic parameters to validate the full connection lifecycle.
-    // We use low byte-received thresholds to keep the test stable on CI.
-    run_connection_scenario("connection_test", 3, 1, true, true);
+    LocalNodeSim::new()
+        .with_tick(Duration::from_micros(100))
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob"))
+                .with_participant(Participant::subscriber("carol"))
+                .with_participant(Participant::single_publisher("churn1").starts_disconnected())
+                .with_participant(Participant::single_publisher("churn2").starts_disconnected())
+                .with_participant(Participant::single_publisher("churn3").starts_disconnected())
+                .with_participant(Participant::single_publisher("churn4").starts_disconnected()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish initial flow",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckRxBytes {
+                description: "Bob receives video",
+                participant: "bob",
+                min_bytes: 1,
+            },
+            Step::Partition {
+                description: "Alice ↔ server",
+                from: "alice",
+                to: "server",
+            },
+            Step::Hold {
+                description: "Hold Bob packets",
+                from: "bob",
+                to: "server",
+            },
+            Step::Run {
+                description: "Partitioned + held",
+                duration: Duration::from_secs(10),
+            },
+            Step::Release {
+                description: "Release Bob",
+                from: "bob",
+                to: "server",
+            },
+            Step::Repair {
+                description: "Restore Alice",
+                from: "alice",
+                to: "server",
+            },
+            Step::Run {
+                description: "Recovery",
+                duration: Duration::from_secs(5),
+            },
+            Step::Join {
+                description: "Churn 1a joins",
+                participant: "churn1",
+            },
+            Step::Join {
+                description: "Churn 1b joins",
+                participant: "churn2",
+            },
+            Step::Run {
+                description: "Churn cycle 1",
+                duration: Duration::from_secs(6),
+            },
+            Step::Disconnect {
+                description: "Churn 1a leaves",
+                participant: "churn1",
+            },
+            Step::Disconnect {
+                description: "Churn 1b leaves",
+                participant: "churn2",
+            },
+            Step::Run {
+                description: "Between churn cycles",
+                duration: Duration::from_secs(4),
+            },
+            Step::Join {
+                description: "Churn 2a joins",
+                participant: "churn3",
+            },
+            Step::Join {
+                description: "Churn 2b joins",
+                participant: "churn4",
+            },
+            Step::Run {
+                description: "Churn cycle 2",
+                duration: Duration::from_secs(6),
+            },
+            Step::Disconnect {
+                description: "Churn 2a leaves",
+                participant: "churn3",
+            },
+            Step::Disconnect {
+                description: "Churn 2b leaves",
+                participant: "churn4",
+            },
+            Step::Run {
+                description: "Settle after churn",
+                duration: Duration::from_secs(5),
+            },
+            Step::Disconnect {
+                description: "Alice disconnects",
+                participant: "alice",
+            },
+            Step::Disconnect {
+                description: "Bob disconnects",
+                participant: "bob",
+            },
+            Step::Disconnect {
+                description: "Carol disconnects",
+                participant: "carol",
+            },
+            Step::Run {
+                description: "Wait for disconnections",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckNotConnected {
+                description: "Alice is disconnected",
+                participant: "alice",
+            },
+            Step::CheckNotConnected {
+                description: "Bob is disconnected",
+                participant: "bob",
+            },
+            Step::CheckNotConnected {
+                description: "Carol is disconnected",
+                participant: "carol",
+            },
+        ]);
 }
 
 #[test]
 fn tcp_simulation_test() {
-    let subnet = common::reserve_subnet();
-    let server_ip = common::subnet_ip(subnet, 1);
-    let sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(90))
-        .tick_duration(Duration::from_micros(100))
-        .rng_seed(0xDEADBEEF)
-        .build();
-
-    Scenario::new("tcp_connection_test", server_ip, sim)
-        // Start a server that only advertises a TCP passive candidate
-        .add_stage(StartSfuTcpOnlyStage)
-        // Connect two peers using the TCP active path
-        .add_stage(ConnectPeersTcpOnlyStage {
-            peers: 2,
-            min_tx_bytes: 0,
-            min_rx_bytes: 1,
-            max_wait: Duration::from_secs(25),
-        })
-        .add_stage(DisconnectStage {
-            after: Duration::from_secs(40),
-        })
-        .add_stage(AssertAllDisconnectedStage {
-            after: Duration::from_secs(60),
-        })
-        .run()
-        .expect("TCP simulation failed");
+    LocalNodeSim::new()
+        .with_tick(Duration::from_micros(100))
+        .with_tcp_only()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish TCP flow",
+                duration: Duration::from_secs(40),
+            },
+            Step::CheckRxBytes {
+                description: "Bob receives over TCP",
+                participant: "bob",
+                min_bytes: 1,
+            },
+            Step::Disconnect {
+                description: "Alice disconnects",
+                participant: "alice",
+            },
+            Step::Disconnect {
+                description: "Bob disconnects",
+                participant: "bob",
+            },
+            Step::Run {
+                description: "Wait for cleanup",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckNotConnected {
+                description: "Alice is disconnected",
+                participant: "alice",
+            },
+            Step::CheckNotConnected {
+                description: "Bob is disconnected",
+                participant: "bob",
+            },
+        ]);
 }
 
 /// Reproduces the Chrome-with-UDP-disabled failure: with two shards the hash of
@@ -109,28 +182,49 @@ fn tcp_simulation_test() {
 /// The fix routes egress cross-shard via `CrossShardEvent::TcpEgressForward`.
 #[test]
 fn tcp_multi_shard_simulation_test() {
-    let subnet = common::reserve_subnet();
-    let server_ip = common::subnet_ip(subnet, 1);
-    let sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(90))
-        .tick_duration(Duration::from_micros(100))
-        .rng_seed(0xDEADBEEF)
-        .build();
-
-    Scenario::new("tcp_multi_shard_test", server_ip, sim)
-        .add_stage(StartSfuTcpOnlyMultiShardStage)
-        .add_stage(ConnectPeersTcpOnlyStage {
-            peers: 4,
-            min_tx_bytes: 0,
-            min_rx_bytes: 1,
-            max_wait: Duration::from_secs(30),
-        })
-        .add_stage(DisconnectStage {
-            after: Duration::from_secs(50),
-        })
-        .add_stage(AssertAllDisconnectedStage {
-            after: Duration::from_secs(70),
-        })
-        .run()
-        .expect("TCP multi-shard simulation failed");
+    LocalNodeSim::new()
+        .with_tick(Duration::from_micros(100))
+        .with_shards(2)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("bob"))
+                .with_participant(Participant::subscriber("carol"))
+                .with_participant(Participant::subscriber("dave")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish multi-shard TCP flow",
+                duration: Duration::from_secs(50),
+            },
+            Step::CheckRxBytes {
+                description: "Bob receives over multi-shard TCP",
+                participant: "bob",
+                min_bytes: 1,
+            },
+            Step::Disconnect {
+                description: "Alice disconnects",
+                participant: "alice",
+            },
+            Step::Disconnect {
+                description: "Bob disconnects",
+                participant: "bob",
+            },
+            Step::Disconnect {
+                description: "Carol disconnects",
+                participant: "carol",
+            },
+            Step::Disconnect {
+                description: "Dave disconnects",
+                participant: "dave",
+            },
+            Step::Run {
+                description: "Wait for cleanup",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckNotConnected {
+                description: "Alice is disconnected",
+                participant: "alice",
+            },
+        ]);
 }

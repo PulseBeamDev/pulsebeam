@@ -19,6 +19,7 @@ use tracing::Instrument;
 pub struct SimClientBuilder {
     ip: IpAddr,
     agent_builder: AgentBuilder,
+    video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -39,6 +40,7 @@ impl SimClientBuilder {
         Ok(Self {
             ip,
             agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
+            video_rx: None,
         })
     }
 
@@ -57,6 +59,7 @@ impl SimClientBuilder {
             agent_builder: AgentBuilder::new(api, socket)
                 .with_local_ip(ip)
                 .with_tcp_server_addr(server_tcp_addr),
+            video_rx: None,
         })
     }
 
@@ -70,9 +73,19 @@ impl SimClientBuilder {
         self
     }
 
+    /// Inject a shared `VideoReceiveLog` so the harness can read it externally.
+    /// If not called, `connect()` allocates a private one.
+    pub fn with_video_rx(mut self, rx: Arc<Mutex<VideoReceiveLog>>) -> Self {
+        self.video_rx = Some(rx);
+        self
+    }
+
     pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
         let driver = self.agent_builder.connect(room).await?;
         tracing::info!("connected to {room}");
+        let video_rx = self
+            .video_rx
+            .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
         let ctx = ClientContext {
             ip: self.ip,
             driver,
@@ -82,7 +95,7 @@ impl SimClientBuilder {
             subscribed_topics: HashMap::new(),
             remote_tracks: HashMap::new(),
             received_data: Vec::new(),
-            video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
+            video_rx,
         };
         Ok(SimClient {
             ctx,
@@ -106,36 +119,43 @@ pub struct VideoReceiveLog {
     /// str0m re-emits a frame when a retransmission for it lands after it was
     /// already delivered, so this is bounded by the NACK count rather than zero.
     pub duplicate_ts_frames: u64,
-    /// Largest backwards jump in RTP time, in 90kHz ticks. Ordinary reordering
-    /// moves this by a frame or two; a broken switch moves it by far more.
+    /// Number of backwards RTP-timestamp jumps seen. Ordinary reordering may
+    /// cause one; a broken simulcast switch causes one per botched transition.
+    pub ts_regression_count: u64,
+    /// Largest backwards jump in RTP time, in 90kHz ticks.
     pub max_ts_regression: u64,
-    /// Keyframes that arrived without the SPS/PPS describing them. The decoder
+    /// Keyframes that arrived without SPS+PPS in the same picture. The decoder
     /// cannot render these: the SFU keeps one egress SSRC across switches while
     /// every simulcast layer has its own SPS.
-    pub keyframes_missing_parameter_sets: u64,
+    pub missing_parameter_sets: u64,
     pub bytes: u64,
     last_ts: Option<u64>,
     seen_ts: HashSet<u64>,
 }
 
-/// Scans an Annex-B frame for the H.264 NAL unit types it contains.
-fn annexb_nalu_types(data: &[u8]) -> Vec<u8> {
-    let mut types = Vec::new();
+/// Scans an Annex-B frame for the H.264 NAL unit types it contains, using the
+/// same `pulsebeam_core::h264::classify()` classifier as the production SFU forwarder.
+fn annexb_nalu_types(data: &[u8]) -> Vec<pulsebeam_core::h264::NalFlags> {
+    let mut flags = Vec::new();
     let mut i = 0usize;
     while i + 3 < data.len() {
         let short = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
-        let long = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+        let long = i + 3 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1;
         if short || long {
             let start = i + if short { 3 } else { 4 };
-            if let Some(&b) = data.get(start) {
-                types.push(b & 0x1F);
+            if start < data.len() {
+                flags.push(pulsebeam_core::h264::classify(&data[start..]));
             }
             i = start + 1;
         } else {
             i += 1;
         }
     }
-    types
+    flags
 }
 
 impl VideoReceiveLog {
@@ -145,8 +165,10 @@ impl VideoReceiveLog {
         if frame.is_keyframe {
             self.keyframes += 1;
             let nalus = annexb_nalu_types(&frame.data);
-            if !nalus.contains(&7) || !nalus.contains(&8) {
-                self.keyframes_missing_parameter_sets += 1;
+            let has_sps = nalus.iter().any(|f| f.sps());
+            let has_pps = nalus.iter().any(|f| f.pps());
+            if !has_sps || !has_pps {
+                self.missing_parameter_sets += 1;
             }
         }
         if !frame.contiguous {
@@ -159,7 +181,14 @@ impl VideoReceiveLog {
         if let Some(prev) = self.last_ts
             && ts < prev
         {
-            self.max_ts_regression = self.max_ts_regression.max(prev - ts);
+            let delta = prev - ts;
+            self.max_ts_regression = self.max_ts_regression.max(delta);
+            // Only count as a "switch regression" if the jump is small (< 1s at 90kHz).
+            // Video loops in test data cause large backwards jumps (~entire clip duration)
+            // which are not stream quality issues.
+            if delta < 90_000 {
+                self.ts_regression_count += 1;
+            }
         }
         self.last_ts = Some(ts);
     }

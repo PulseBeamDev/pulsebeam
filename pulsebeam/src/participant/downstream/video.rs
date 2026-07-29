@@ -2672,7 +2672,8 @@ mod allocation_tests {
             matches!(decisions[slots[0].key], AllocationDecision::Forward(..)),
             "floor layer should be retained via DOWNGRADE_FACTOR hysteresis when \
              budget is inside the 75–100%% dead-band and slot was already forwarding; \
-             got {:?}", decisions[slots[0].key]
+             got {:?}",
+            decisions[slots[0].key]
         );
     }
 
@@ -2681,7 +2682,11 @@ mod allocation_tests {
         // Make only Medium healthy so there's no sub-floor fallback layer.
         let t = healthy_track();
         for q in [LayerQuality::High, LayerQuality::Low] {
-            t.by_quality(q).unwrap().state.update_for_test().quality(StreamQuality::Bad);
+            t.by_quality(q)
+                .unwrap()
+                .state
+                .update_for_test()
+                .quality(StreamQuality::Bad);
         }
         let med_bps = layer_bps(&t, LayerQuality::Medium);
         let med_h = t.by_quality(LayerQuality::Medium).unwrap().state.height();
@@ -2697,7 +2702,8 @@ mod allocation_tests {
             matches!(decisions[slots[0].key], AllocationDecision::Pause(..)),
             "new subscriber with no fallback layer should pause when budget \
              is below floor cost and hysteresis does not apply; \
-             got {:?}", decisions[slots[0].key]
+             got {:?}",
+            decisions[slots[0].key]
         );
     }
 
@@ -2708,7 +2714,11 @@ mod allocation_tests {
         // Use only a single healthy layer so best_healthy is unambiguous.
         let t = healthy_track();
         for q in [LayerQuality::Medium, LayerQuality::Low] {
-            t.by_quality(q).unwrap().state.update_for_test().quality(StreamQuality::Bad);
+            t.by_quality(q)
+                .unwrap()
+                .state
+                .update_for_test()
+                .quality(StreamQuality::Bad);
         }
 
         let reactive_bps: u64 = 400_000;
@@ -2719,8 +2729,8 @@ mod allocation_tests {
             .unwrap()
             .state
             .update_for_test()
-            .bitrate(reactive_bps)          // sets both reactive and stable
-            .stable_bitrate(stable_bps);    // overrides stable independently
+            .bitrate(reactive_bps) // sets both reactive and stable
+            .stable_bitrate(stable_bps); // overrides stable independently
 
         let slots = vec![slot("a", 1080, &t, LayerQuality::Low)];
         let desired = AllocationEngine::desired_bitrate(&slots);
@@ -2728,7 +2738,8 @@ mod allocation_tests {
         assert!(
             (desired.as_f64() - stable_bps as f64).abs() < 1.0,
             "desired_bitrate should use stable_bitrate_bps ({stable_bps}) not \
-             reactive bitrate_bps ({reactive_bps}); got {:.0}", desired.as_f64()
+             reactive bitrate_bps ({reactive_bps}); got {:.0}",
+            desired.as_f64()
         );
     }
 
