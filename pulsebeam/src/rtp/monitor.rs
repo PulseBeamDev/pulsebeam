@@ -15,7 +15,13 @@ const SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA: Duration = Duration::from_secs(10);
 const STREAM_DEAD_TIMEOUT: Duration = Duration::from_millis(3000);
 const LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_millis(500);
 const RATE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
-const RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(6);
+/// Reactive-cost fall constant — matches str0m's `EstimateSmoother::ESTIMATE_WINDOW` (3 s)
+/// so per-layer allocator costs converge on the same timescale as the reported BWE.
+const RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(3);
+/// Stable-cost fall constant — very slow decay keeps the desired-bitrate signal high,
+/// motivating str0m's probe controller to maintain headroom even when the sender
+/// temporarily reduces its declared rate.
+const STABLE_RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(30);
 // An eligibility signal, not a per-packet alarm: small 500ms windows on a
 // lossy WAN regularly contain one late/missing packet, and treating those
 // as health transitions causes false layer churn and PLI storms.
@@ -47,13 +53,21 @@ const MAX_LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_secs(5);
 struct RateFilter {
     filtered_bps: f64,
     last_update: Option<Instant>,
+    rise_tau: f64,
+    fall_tau: f64,
 }
 
 impl RateFilter {
     fn new() -> Self {
+        Self::with_taus(RATE_RISE_TIME_CONSTANT, RATE_FALL_TIME_CONSTANT)
+    }
+
+    fn with_taus(rise: Duration, fall: Duration) -> Self {
         Self {
             filtered_bps: 0.0,
             last_update: None,
+            rise_tau: rise.as_secs_f64(),
+            fall_tau: fall.as_secs_f64(),
         }
     }
 
@@ -64,9 +78,9 @@ impl RateFilter {
         };
         let elapsed = now.saturating_duration_since(last).as_secs_f64();
         let tau = if raw_bps >= self.filtered_bps {
-            RATE_RISE_TIME_CONSTANT.as_secs_f64()
+            self.rise_tau
         } else {
-            RATE_FALL_TIME_CONSTANT.as_secs_f64()
+            self.fall_tau
         };
         let alpha = (-elapsed / tau).exp();
         self.filtered_bps = raw_bps + (self.filtered_bps - raw_bps) * alpha;
@@ -130,7 +144,12 @@ impl AsRef<StreamStateInner> for StreamState {
 pub struct StreamStateInner {
     inactive: AtomicBool,
     healthy: AtomicBool,
+    /// Reactive cost — matches str0m's BWE timescale (3 s fall). Used by
+    /// the allocator's budget-fitting logic in `AllocationEngine::cost()`.
     bitrate_bps: AtomicU64,
+    /// Stable cost — very slow fall (30 s). Used by `AllocationEngine::desired_bitrate()`
+    /// so str0m's probe controller sees a conservatively high, sticky demand signal.
+    stable_bitrate_bps: AtomicU64,
     height: AtomicU32,
     #[cfg(test)]
     quality: AtomicU8,
@@ -142,6 +161,7 @@ impl StreamStateInner {
             inactive: AtomicBool::new(inactive),
             healthy: AtomicBool::new(!inactive),
             bitrate_bps: AtomicU64::new(bitrate_bps),
+            stable_bitrate_bps: AtomicU64::new(bitrate_bps),
             height: AtomicU32::new(height),
             #[cfg(test)]
             quality: AtomicU8::new(StreamQuality::Good as u8),
@@ -158,6 +178,10 @@ impl StreamStateInner {
 
     pub fn bitrate_bps(&self) -> f64 {
         self.bitrate_bps.load(Ordering::Relaxed) as f64
+    }
+
+    pub fn stable_bitrate_bps(&self) -> f64 {
+        self.stable_bitrate_bps.load(Ordering::Relaxed) as f64
     }
 
     pub fn height(&self) -> u32 {
@@ -188,6 +212,12 @@ pub struct StreamStateUpdater<'a> {
 impl<'a> StreamStateUpdater<'a> {
     pub fn bitrate(self, bps: u64) -> Self {
         self.state.bitrate_bps.store(bps, Ordering::Relaxed);
+        self.state.stable_bitrate_bps.store(bps, Ordering::Relaxed);
+        self
+    }
+
+    pub fn stable_bitrate(self, bps: u64) -> Self {
+        self.state.stable_bitrate_bps.store(bps, Ordering::Relaxed);
         self
     }
     pub fn height(self, height: u32) -> Self {
@@ -229,6 +259,7 @@ pub struct StreamMonitor {
     audio_monitor: Option<AudioMonitor>,
 
     cost_filter: RateFilter,
+    stable_filter: RateFilter,
 
     current_quality: StreamQuality,
     quality_transition_since: Option<Instant>,
@@ -272,6 +303,10 @@ impl StreamMonitor {
             audio_monitor,
             bwe: BitrateEstimate::new(),
             cost_filter: RateFilter::new(),
+            stable_filter: RateFilter::with_taus(
+                RATE_RISE_TIME_CONSTANT,
+                STABLE_RATE_FALL_TIME_CONSTANT,
+            ),
             current_quality,
             quality_transition_since: None,
             quality_transition_target: None,
@@ -293,6 +328,9 @@ impl StreamMonitor {
                 if activation_bitrate > 0 {
                     self.shared_state
                         .bitrate_bps
+                        .store(activation_bitrate, Ordering::Relaxed);
+                    self.shared_state
+                        .stable_bitrate_bps
                         .store(activation_bitrate, Ordering::Relaxed);
                     debug_assert_ne!(self.shared_state.bitrate_bps(), 0.0);
                 }
@@ -339,10 +377,14 @@ impl StreamMonitor {
         self.shared_state.healthy.store(healthy, Ordering::Relaxed);
     }
 
-    fn publish_inactive(&self) {
+    fn publish_inactive(&mut self) {
         self.shared_state.healthy.store(false, Ordering::Relaxed);
         self.shared_state.inactive.store(true, Ordering::Relaxed);
         self.shared_state.bitrate_bps.store(0, Ordering::Relaxed);
+        self.shared_state
+            .stable_bitrate_bps
+            .store(0, Ordering::Relaxed);
+        self.stable_filter.reset();
         debug_assert!(self.shared_state.is_inactive());
         debug_assert!(!self.shared_state.is_healthy());
         debug_assert_eq!(self.shared_state.bitrate_bps(), 0.0);
@@ -381,10 +423,14 @@ impl StreamMonitor {
         };
 
         self.cost_filter.update(now, raw_with_floor);
-        let smooth_bps = self.cost_filter.current() as u64;
         self.shared_state
             .bitrate_bps
-            .store(smooth_bps, Ordering::Relaxed);
+            .store(self.cost_filter.current() as u64, Ordering::Relaxed);
+
+        self.stable_filter.update(now, raw_with_floor);
+        self.shared_state
+            .stable_bitrate_bps
+            .store(self.stable_filter.current() as u64, Ordering::Relaxed);
         if let Some(audio_monitor) = self.audio_monitor.as_mut() {
             audio_monitor.poll(now);
         }
@@ -415,6 +461,7 @@ impl StreamMonitor {
                 self.quality_transition_target = None;
                 self.quality_transition_last_evidence = None;
                 self.cost_filter.reset();
+                self.stable_filter.reset();
             }
             return;
         }
@@ -604,6 +651,7 @@ impl StreamMonitor {
         self.quality_transition_last_evidence = None;
         self.bwe = BitrateEstimate::new();
         self.cost_filter.reset();
+        self.stable_filter.reset();
         // Audio stays stubbed Excellent even across a dead-stream reset —
         // see `new`.
         self.current_quality = match self.kind {
@@ -635,7 +683,10 @@ impl Default for BitrateEstimate {
 }
 
 impl BitrateEstimate {
-    const TICK: Duration = Duration::from_millis(500);
+    /// Matches str0m's `AckedBitrateEstimator::BITRATE_WINDOW` (150 ms) so
+    /// per-layer throughput samples arrive at the same frequency as str0m's
+    /// internal throughput measurement.
+    const TICK: Duration = Duration::from_millis(150);
 
     pub fn new() -> Self {
         Self {

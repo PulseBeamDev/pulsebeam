@@ -292,8 +292,11 @@ impl VideoAllocator {
 
         views.sort_by(AllocationEngine::priority_order);
 
-        let decisions = AllocationEngine::compute(available_bandwidth, &views);
-        let desired_raw = AllocationEngine::desired_bitrate(&views);
+        // Snapshot all layer atomics once so the entire allocation pass is
+        // deterministic — no re-reads from concurrent StreamMonitor::poll() writes.
+        let engine = AllocationEngine::new(&views);
+        let decisions = engine.run_compute(available_bandwidth, &views);
+        let desired_raw = engine.run_desired(&views);
         let used = AllocationEngine::used_bitrate(&decisions);
         debug_assert!(
             desired_raw >= used,
@@ -781,7 +784,54 @@ pub struct Intent {
     pub priority: u32,
 }
 
-pub struct AllocationEngine;
+/// Point-in-time snapshot of a single layer's shared (atomic) state, read
+/// once at the start of an allocation pass so the whole computation is
+/// deterministic regardless of concurrent `StreamMonitor::poll()` writes.
+#[derive(Clone, Copy, Debug)]
+struct LayerSnap {
+    bitrate_bps: f64,
+    stable_bitrate_bps: f64,
+    healthy: bool,
+    height: u32,
+}
+
+/// Allocation computation context. `AllocationEngine::new(slots)` reads every
+/// layer's shared atomics exactly once; all methods then read from that frozen
+/// snapshot rather than re-loading from atomics mid-pass.
+///
+/// Use `compute()` / `desired_bitrate()` as convenient one-shot wrappers
+/// (each builds its own snapshot). In `update_allocations()` create one engine
+/// via `new()` and call `run_compute()` + `run_desired()` to share a single
+/// consistent snapshot across both.
+pub struct AllocationEngine {
+    snaps: HashMap<usize, LayerSnap>,
+}
+
+impl AllocationEngine {
+    /// Capture a point-in-time snapshot of every layer reachable from `slots`.
+    pub fn new(slots: &[SlotView<'_>]) -> Self {
+        let snaps = slots
+            .iter()
+            .flat_map(|s| s.track.layers.iter())
+            .map(|l| {
+                let snap = LayerSnap {
+                    bitrate_bps: l.state.bitrate_bps(),
+                    stable_bitrate_bps: l.state.stable_bitrate_bps(),
+                    healthy: l.state.is_healthy(),
+                    height: l.state.height(),
+                };
+                (l as *const TrackLayer as usize, snap)
+            })
+            .collect();
+        Self { snaps }
+    }
+
+    fn snap(&self, layer: &TrackLayer) -> &LayerSnap {
+        self.snaps
+            .get(&(layer as *const TrackLayer as usize))
+            .expect("layer must belong to snapshotted slots")
+    }
+}
 
 /// Client-declared QoS for one subscribed stream. See `VideoRequest` in the
 /// signaling proto for the authoritative semantics.
@@ -824,11 +874,9 @@ impl AllocationEngine {
     // giving recoveries a hysteresis dead-band against churn.
     const DOWNGRADE_FACTOR: f64 = 0.75;
 
-    /// Frame height (px) used for spatial gating: the sender-declared height
-    /// from Video Layers Allocation when available, otherwise a per-quality
-    /// fallback for senders that don't advertise resolution.
-    fn height(layer: &TrackLayer) -> u32 {
-        let height = layer.state.height();
+    /// Frame height (px) used for spatial gating.
+    fn height(&self, layer: &TrackLayer) -> u32 {
+        let height = self.snap(layer).height;
         debug_assert_ne!(height, 0);
         height
     }
@@ -836,11 +884,11 @@ impl AllocationEngine {
     /// Shortest declared/fallback height among a track's layers. A layer at
     /// this height can never be excluded by spatial gating — there is nothing
     /// shorter to fall back to.
-    fn min_track_height(track: &Track) -> u32 {
+    fn min_track_height(&self, track: &Track) -> u32 {
         track
             .layers
             .iter()
-            .map(Self::height)
+            .map(|l| self.height(l))
             .min()
             .expect("track has at least one layer")
     }
@@ -850,55 +898,59 @@ impl AllocationEngine {
     /// whose layers are all taller than `max_height` (e.g. screen-share
     /// simulcast tiers that only differ in fps) still has something eligible
     /// instead of every layer being rejected.
-    fn spatially_allowed(slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        Self::height(layer) <= slot.max_height.max(Self::min_track_height(slot.track))
+    fn spatially_allowed(&self, slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
+        self.height(layer) <= slot.max_height.max(self.min_track_height(slot.track))
     }
 
     /// Whether a layer may currently be forwarded or switched into.
-    fn eligible(slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        let bitrate = Self::cost(layer);
+    fn eligible(&self, slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
+        let bitrate = self.cost(layer);
         debug_assert!(bitrate.is_finite());
         debug_assert!(bitrate >= 0.0);
-        Self::spatially_allowed(slot, layer) && layer.state.is_healthy() && bitrate > 0.0
+        self.spatially_allowed(slot, layer) && self.snap(layer).healthy && bitrate > 0.0
     }
 
-    fn cost(layer: &TrackLayer) -> f64 {
-        layer.state.bitrate_bps()
+    fn cost(&self, layer: &TrackLayer) -> f64 {
+        self.snap(layer).bitrate_bps
+    }
+
+    fn stable_cost(&self, layer: &TrackLayer) -> f64 {
+        self.snap(layer).stable_bitrate_bps
     }
 
     /// Lowest healthy layer ignoring the spatial constraint. Used as a
     /// last-resort fallback when all spatially-allowed layers are inactive
     /// (e.g. "f"/"h"/"q" negotiated but only "f" and "h" are active and the
     /// client requests a height that only "q" would satisfy).
-    fn closest_healthy<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
+    fn closest_healthy<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
             .layers
             .iter()
-            .filter(|layer| layer.state.is_healthy() && Self::cost(layer) > 0.0)
+            .filter(|layer| self.snap(layer).healthy && self.cost(layer) > 0.0)
             .min_by_key(|l| l.quality)
     }
 
     /// A legal layer to retain as the pause target even when no layer is
     /// currently healthy enough to forward. Falls back to the lowest healthy
     /// layer (closest rank) when no spatially-allowed layer exists.
-    fn pause_target<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
+    fn pause_target<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         let target = slot
             .track
             .layers
             .iter()
-            .filter(|layer| Self::eligible(slot, layer))
+            .filter(|layer| self.eligible(slot, layer))
             .min_by_key(|layer| layer.quality)
-            .or_else(|| Self::closest_healthy(slot))
+            .or_else(|| self.closest_healthy(slot))
             .or_else(|| {
                 slot.track
                     .layers
                     .iter()
-                    .filter(|layer| Self::spatially_allowed(slot, layer))
+                    .filter(|layer| self.spatially_allowed(slot, layer))
                     .min_by_key(|layer| layer.quality)
             });
         debug_assert!(
-            Self::closest_healthy(slot).is_none()
-                || target.is_some_and(|layer| layer.state.is_healthy())
+            self.closest_healthy(slot).is_none()
+                || target.is_some_and(|layer| self.snap(layer).healthy)
         );
         target
     }
@@ -909,18 +961,19 @@ impl AllocationEngine {
     /// the slot always gets an initial allocation rather than being silently
     /// dropped.
     fn next_layer<'a>(
+        &self,
         slot: &'a SlotView<'a>,
         current: Option<&'a TrackLayer>,
     ) -> Option<&'a TrackLayer> {
         slot.track
             .layers
             .iter()
-            .filter(|layer| Self::eligible(slot, layer))
+            .filter(|layer| self.eligible(slot, layer))
             .filter(|layer| current.is_none_or(|current| layer.quality > current.quality))
             .min_by_key(|layer| layer.quality)
             .or_else(|| {
                 if current.is_none() {
-                    Self::closest_healthy(slot)
+                    self.closest_healthy(slot)
                 } else {
                     None
                 }
@@ -934,24 +987,31 @@ impl AllocationEngine {
 
     /// Best layer worth wanting for this slot, irrespective of what the
     /// budget can currently afford. Feeds the BWE-facing desired bitrate.
-    fn best_healthy<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
+    fn best_healthy<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
             .layers
             .iter()
-            .filter(|layer| Self::eligible(slot, layer))
-            .max_by(|a, b| Self::cost(a).total_cmp(&Self::cost(b)))
-            .or_else(|| Self::closest_healthy(slot))
+            .filter(|layer| self.eligible(slot, layer))
+            .max_by(|a, b| self.cost(a).total_cmp(&self.cost(b)))
+            .or_else(|| self.closest_healthy(slot))
     }
 
-    /// Aggregate bitrate the SFU would like BWE to grant next: simply the sum
-    /// of every slot's highest eligible layer cost, independent of what is
-    /// currently affordable. Kept separate from `compute` so the demand signal
-    /// doesn't inherit the allocator's reserve/hysteresis math.
+    /// Aggregate bitrate the SFU would like BWE to grant next: the sum of the
+    /// stable cost of every slot's highest eligible layer. Uses the slow-decay
+    /// `stable_bitrate_bps` signal so this demand stays conservatively high and
+    /// motivates str0m's probe controller to maintain headroom.
+    ///
+    /// Captures its own snapshot. In `update_allocations()` use `run_desired()`
+    /// on a shared engine to avoid a second snapshot.
     pub fn desired_bitrate(slots: &[SlotView<'_>]) -> Bitrate {
+        Self::new(slots).run_desired(slots)
+    }
+
+    pub fn run_desired(&self, slots: &[SlotView<'_>]) -> Bitrate {
         let total: f64 = slots
             .iter()
-            .filter_map(Self::best_healthy)
-            .map(Self::cost)
+            .filter_map(|s| self.best_healthy(s))
+            .map(|l| self.stable_cost(l))
             .sum();
         Bitrate::from(total as u64)
     }
@@ -971,16 +1031,16 @@ impl AllocationEngine {
     /// layer at least `min_height` tall, or the tallest eligible layer if none
     /// reaches it. `None` when the slot is droppable (`min_height == 0`) or has
     /// no eligible layer.
-    fn floor_layer<'a>(slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
+    fn floor_layer<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         if slot.min_height == 0 {
             return None;
         }
-        let eligible = || slot.track.layers.iter().filter(|l| Self::eligible(slot, l));
+        let eligible = || slot.track.layers.iter().filter(|l| self.eligible(slot, l));
         eligible()
-            .filter(|l| Self::height(l) >= slot.min_height)
+            .filter(|l| self.height(l) >= slot.min_height)
             .min_by_key(|l| l.quality)
             .or_else(|| eligible().max_by_key(|l| l.quality))
-            .or_else(|| Self::closest_healthy(slot))
+            .or_else(|| self.closest_healthy(slot))
     }
 
     /// Strict-priority allocation. `slots` must be pre-sorted by `priority_order`
@@ -988,7 +1048,18 @@ impl AllocationEngine {
     /// floor first; leftover budget then raises streams toward their target in
     /// the same priority order, one genuine upgrade per call so send-rate rises
     /// gradually enough for BWE to track it.
+    ///
+    /// Captures its own snapshot. In `update_allocations()` use `run_compute()`
+    /// on a shared engine to avoid a second snapshot.
     pub fn compute<'a>(
+        bwe: Bitrate,
+        slots: &'a [SlotView<'a>],
+    ) -> SecondaryMap<SlotKey, AllocationDecision<'a>> {
+        Self::new(slots).run_compute(bwe, slots)
+    }
+
+    pub fn run_compute<'a>(
+        &self,
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
     ) -> SecondaryMap<SlotKey, AllocationDecision<'a>> {
@@ -1005,8 +1076,8 @@ impl AllocationEngine {
         // can't afford the floor for is left paused; droppable streams (no floor)
         // wait for Pass 2.
         for (i, slot) in slots.iter().enumerate() {
-            if let Some(floor) = Self::floor_layer(slot) {
-                let cost = Self::cost(floor);
+            if let Some(floor) = self.floor_layer(slot) {
+                let cost = self.cost(floor);
                 if cost <= budget {
                     budget -= cost;
                     allocs[i] = Some(floor);
@@ -1020,8 +1091,8 @@ impl AllocationEngine {
         let mut upgrade_used = false;
         for (i, slot) in slots.iter().enumerate() {
             let mut cur = allocs[i];
-            while let Some(next) = Self::next_layer(slot, cur) {
-                let step = Self::cost(next) - cur.map_or(0.0, Self::cost);
+            while let Some(next) = self.next_layer(slot, cur) {
+                let step = self.cost(next) - cur.map_or(0.0, |l| self.cost(l));
                 let admitted = if next.quality > slot.current_quality {
                     !upgrade_used && step + reserve <= budget
                 } else {
@@ -1045,12 +1116,12 @@ impl AllocationEngine {
             if let Some(layer) = allocs[i] {
                 decisions.insert(
                     slot.key,
-                    AllocationDecision::Forward(layer, Bitrate::from(Self::cost(layer) as u64)),
+                    AllocationDecision::Forward(layer, Bitrate::from(self.cost(layer) as u64)),
                 );
-            } else if let Some(target) = Self::pause_target(slot) {
+            } else if let Some(target) = self.pause_target(slot) {
                 decisions.insert(
                     slot.key,
-                    AllocationDecision::Pause(target, Bitrate::from(Self::cost(target) as u64)),
+                    AllocationDecision::Pause(target, Bitrate::from(self.cost(target) as u64)),
                 );
             }
         }
@@ -1927,7 +1998,7 @@ mod allocation_tests {
     #[test]
     fn pinned_stream_does_not_drop_when_another_joins() {
         let t = healthy_track();
-        let high_h = AllocationEngine::height(t.by_quality(LayerQuality::High).unwrap());
+        let high_h = t.by_quality(LayerQuality::High).unwrap().state.height();
         let high_bps = layer_bps(&t, LayerQuality::High);
         // Enough for the pinned High plus a little — but not for a second High.
         let available = bw((high_bps * 1.3) as u64 / 1_000);
@@ -1951,7 +2022,7 @@ mod allocation_tests {
     fn droppable_stream_pauses_before_a_floored_one() {
         let t = healthy_track();
         let low = layer_bps(&t, LayerQuality::Low);
-        let low_h = AllocationEngine::height(t.by_quality(LayerQuality::Low).unwrap());
+        let low_h = t.by_quality(LayerQuality::Low).unwrap().state.height();
         // Budget fits exactly one Low floor.
         let available = bw((low as u64) / 1_000 + 5);
         let slots = sorted(vec![
@@ -2044,12 +2115,13 @@ mod allocation_tests {
         // Client caps at 200p. The hard-coded fallback rates High at 720p and
         // would forbid it, but the declared 180p must be allowed.
         let slot = slot("a", 200, &t, LayerQuality::High);
+        let engine = AllocationEngine::new(std::slice::from_ref(&slot));
         let high = t.by_quality(LayerQuality::High).unwrap();
-        assert!(AllocationEngine::spatially_allowed(&slot, high));
+        assert!(engine.spatially_allowed(&slot, high));
 
         // The Medium layer declared nothing → keeps its 360p fallback → forbidden.
         let medium = t.by_quality(LayerQuality::Medium).unwrap();
-        assert!(!AllocationEngine::spatially_allowed(&slot, medium));
+        assert!(!engine.spatially_allowed(&slot, medium));
     }
 
     /// Screen-share simulcast tiers often share one resolution and differ
@@ -2069,10 +2141,11 @@ mod allocation_tests {
 
         // Client caps at 480p, below the shared 1080p every tier declares.
         let slot = slot("a", 480, &t, LayerQuality::Low);
+        let engine = AllocationEngine::new(std::slice::from_ref(&slot));
         for quality in [LayerQuality::High, LayerQuality::Medium, LayerQuality::Low] {
             let layer = t.by_quality(quality).unwrap();
             assert!(
-                AllocationEngine::spatially_allowed(&slot, layer),
+                engine.spatially_allowed(&slot, layer),
                 "{quality:?} at the shared minimum height must stay allowed"
             );
         }
@@ -2501,7 +2574,7 @@ mod allocation_tests {
     fn tight_budget_pauses_floored_slot() {
         let t = healthy_track();
         let low_bps = layer_bps(&t, LayerQuality::Low);
-        let low_h = AllocationEngine::height(t.by_quality(LayerQuality::Low).unwrap());
+        let low_h = t.by_quality(LayerQuality::Low).unwrap().state.height();
 
         let tight = bw((low_bps * 0.5) as u64 / 1_000);
         let slots = vec![qos_slot("a", 1080, low_h, 0, &t, LayerQuality::Low)];
@@ -2543,7 +2616,7 @@ mod allocation_tests {
     fn tight_budget_pauses_all_slots() {
         let t = healthy_track();
         let low_bps = layer_bps(&t, LayerQuality::Low);
-        let low_h = AllocationEngine::height(t.by_quality(LayerQuality::Low).unwrap());
+        let low_h = t.by_quality(LayerQuality::Low).unwrap().state.height();
 
         let tight = bw((low_bps * 0.3) as u64 / 1_000);
         let slots = sorted(vec![
