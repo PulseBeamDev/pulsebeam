@@ -1,4 +1,4 @@
-use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog, create_h264_looper_for_rid};
+use crate::tests::common::client::{SimClientBuilder, VideoReceiveLog};
 use crate::tests::common::{
     reserve_subnet, run_sim_or_timeout, start_sfu_node, start_sfu_node_tcp_only,
     start_sfu_node_tcp_only_multi_shard, subnet_ip,

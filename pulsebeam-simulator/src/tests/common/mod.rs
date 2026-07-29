@@ -1,7 +1,7 @@
 pub mod client;
 pub mod harness;
 
-pub use harness::{LocalNodeSim, Participant, Role, Room, Step, VideoQuality};
+pub use harness::{LocalNodeSim, Participant, Room, Step, VideoQuality};
 
 use pulsebeam_runtime::net::UdpMode;
 use std::{
@@ -11,7 +11,6 @@ use std::{
 };
 
 static NEXT_SUBNET: AtomicU8 = AtomicU8::new(1);
-static NEXT_TEST_ID: AtomicU8 = AtomicU8::new(1);
 
 pub fn reserve_subnet() -> u8 {
     // Avoid 0 and 255.
@@ -19,25 +18,8 @@ pub fn reserve_subnet() -> u8 {
     1 + (next % 200)
 }
 
-pub fn next_test_id() -> u8 {
-    NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
-}
-
 pub fn subnet_ip(subnet: u8, host: u8) -> IpAddr {
     format!("192.168.{}.{}", subnet, host).parse().unwrap()
-}
-
-pub async fn wait_for_publisher_id(
-    publisher_id: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    ready: &std::sync::Arc<tokio::sync::Notify>,
-) -> String {
-    loop {
-        let notified = ready.notified();
-        if let Some(id) = publisher_id.lock().unwrap().clone() {
-            return id;
-        }
-        notified.await;
-    }
 }
 
 pub async fn start_sfu_node(ip: IpAddr, rng: pulsebeam_runtime::rand::Rng) -> anyhow::Result<()> {

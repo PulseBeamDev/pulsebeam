@@ -5,7 +5,6 @@ pub mod declarative;
 pub mod dynamic;
 pub mod network;
 pub mod ramp;
-pub mod scenario;
 pub mod simulcast;
 pub mod slots;
 pub mod switching;
