@@ -7,6 +7,7 @@ use str0m::media::KeyframeRequestKind;
 
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
 use super::participants::ParticipantHandle;
+use super::reliable::ReliableRoutes;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
@@ -86,7 +87,7 @@ pub(crate) struct ShardRoomContext {
     pub audio_selector: TopNAudioSelector,
     pub data_streams: HashMap<DataStreamId, DataStreamRoute>,
     pub all_publisher_subscriptions: AllPublisherSubscriptions,
-    pub rel_data_streams: HashMap<DataStreamId, DataStreamRoute>,
+    reliable: ReliableRoutes,
 }
 
 impl ShardRoomContext {
@@ -97,7 +98,7 @@ impl ShardRoomContext {
             audio_selector: TopNAudioSelector::new(rng),
             data_streams: HashMap::default(),
             all_publisher_subscriptions: AllPublisherSubscriptions::new(),
-            rel_data_streams: HashMap::default(),
+            reliable: ReliableRoutes::new(),
         }
     }
 }
@@ -286,10 +287,7 @@ impl ShardRoutingTable {
             route.local_subscribers.swap_remove(participant_id);
         }
         room.data_streams.retain(|_, route| !route.is_unused());
-        for route in room.rel_data_streams.values_mut() {
-            route.local_subscribers.swap_remove(participant_id);
-        }
-        room.rel_data_streams.retain(|_, route| !route.is_unused());
+        room.reliable.remove_participant(participant_id);
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -848,12 +846,7 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let route = room
-            .rel_data_streams
-            .entry(DataStreamId::new(publisher, topic))
-            .or_insert_with(DataStreamRoute::new);
-        debug_assert!(!route.published);
-        route.published = true;
+        room.reliable.publish(publisher, topic);
     }
 
     pub fn unregister_reliable_data_publisher(
@@ -865,16 +858,7 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let key = DataStreamId::new(publisher, topic.clone());
-        let Some(route) = room.rel_data_streams.get_mut(&key) else {
-            debug_assert!(false, "unregistering an unknown reliable data stream");
-            return;
-        };
-        debug_assert!(route.published);
-        route.published = false;
-        if route.is_unused() {
-            room.rel_data_streams.remove(&key);
-        }
+        room.reliable.unpublish(publisher, topic);
     }
 
     pub fn register_reliable_data_subscriber(
@@ -887,13 +871,7 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let route = room
-            .rel_data_streams
-            .entry(DataStreamId::new(publisher, topic))
-            .or_insert_with(DataStreamRoute::new);
-        let was_empty = route.local_subscribers.is_empty();
-        route.local_subscribers.insert(subscriber);
-        was_empty
+        room.reliable.subscribe_local(subscriber, publisher, topic)
     }
 
     pub fn unregister_reliable_data_subscriber(
@@ -906,17 +884,8 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return false;
         };
-        let key = DataStreamId::new(publisher, topic.clone());
-        let Some(route) = room.rel_data_streams.get_mut(&key) else {
-            return false;
-        };
-        let was_one =
-            route.local_subscribers.len() == 1 && route.local_subscribers.contains(&subscriber);
-        route.local_subscribers.swap_remove(&subscriber);
-        if route.is_unused() {
-            room.rel_data_streams.remove(&key);
-        }
-        was_one
+        room.reliable
+            .unsubscribe_local(subscriber, publisher, topic)
     }
 
     pub fn register_remote_reliable_data_subscriber_shard(
@@ -929,11 +898,8 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let route = room
-            .rel_data_streams
-            .entry(DataStreamId::new(publisher, topic))
-            .or_insert_with(DataStreamRoute::new);
-        route.attach_remote_subscriber_shard(from_shard_id);
+        room.reliable
+            .subscribe_remote(from_shard_id, publisher, topic);
     }
 
     pub fn unregister_remote_reliable_data_subscriber_shard(
@@ -946,14 +912,8 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let key = DataStreamId::new(publisher, topic.clone());
-        let Some(route) = room.rel_data_streams.get_mut(&key) else {
-            return;
-        };
-        route.detach_remote_subscriber_shard(from_shard_id);
-        if route.is_unused() {
-            room.rel_data_streams.remove(&key);
-        }
+        room.reliable
+            .unsubscribe_remote(from_shard_id, publisher, topic);
     }
 
     pub fn route_reliable_data(
@@ -967,28 +927,7 @@ impl ShardRoutingTable {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
-        let stream_id = DataStreamId::new(origin, topic.clone());
-        let Some(route) = room.rel_data_streams.get(&stream_id) else {
-            return;
-        };
-        debug_assert!(route.published);
-        for &subscriber_id in &route.local_subscribers {
-            ctx.forward_reliable_sctp(subscriber_id, origin, topic, frame);
-        }
-
-        if ctx.is_local(&origin) {
-            for &shard_id in route.remote_subscriber_shards.keys() {
-                ctx.send(
-                    shard_id,
-                    CrossShardEvent::ReliableDataSctpPublished {
-                        room_id,
-                        origin,
-                        topic: topic.clone(),
-                        frame: frame.to_vec(),
-                    },
-                );
-            }
-        }
+        room.reliable.route(room_id, origin, topic, frame, ctx);
     }
 
     pub fn route_reliable_control(

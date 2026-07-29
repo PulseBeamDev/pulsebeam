@@ -132,7 +132,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&subscriber) {
             p.on_forward_reliable_sctp(topic, origin, frame);
-            self.dirty.mark(self.kind, subscriber);
+            self.dirty.mark(subscriber, p);
         }
     }
 
@@ -144,7 +144,7 @@ impl<'a, R: CrossShardSend> RoutingContext for DispatchCtx<'a, R> {
     ) {
         if let Some(p) = self.registry.get_mut(&publisher) {
             p.on_deliver_reliable_control(topic, bytes);
-            self.dirty.mark(self.kind, publisher);
+            self.dirty.mark(publisher, p);
         }
     }
 }
@@ -372,7 +372,6 @@ impl ShardCore {
                         let mut ctx = DispatchCtx {
                             registry: &mut self.registry,
                             dirty: &mut self.dirty,
-                            kind: DirtyKind::Input,
                             router,
                         };
                         self.routing
@@ -673,7 +672,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Fanout,
                     router,
                 };
                 self.routing
@@ -687,7 +685,6 @@ impl ShardCore {
                 let mut ctx = DispatchCtx {
                     registry: &mut self.registry,
                     dirty: &mut self.dirty,
-                    kind: DirtyKind::Input,
                     router,
                 };
                 ctx.deliver_reliable_control(publisher, &topic, &bytes);

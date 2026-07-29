@@ -24,6 +24,7 @@ use crate::log::plog_error;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
+use crate::participant::reliable::ReliableChannels;
 use crate::participant::signaling;
 use crate::participant::{
     batcher::{Batcher, OwnedPacketQueue},
@@ -174,8 +175,7 @@ pub struct ParticipantCore {
     data_topic_channels: HashMap<ChannelId, DataTopicChannel>,
     data_pub_channels: HashMap<Topic, ChannelId>,
     data_sub_channels: HashMap<(Topic, Option<entity::ParticipantId>), ChannelId>,
-    rel_pub_channels: HashMap<Topic, ChannelId>,
-    rel_sub_channels: HashMap<(Topic, entity::ParticipantId), ChannelId>,
+    reliable_channels: ReliableChannels,
 
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
@@ -228,8 +228,7 @@ impl ParticipantCore {
             data_topic_channels: HashMap::new(),
             data_pub_channels: HashMap::new(),
             data_sub_channels: HashMap::new(),
-            rel_pub_channels: HashMap::new(),
-            rel_sub_channels: HashMap::new(),
+            reliable_channels: ReliableChannels::new(),
             room_id: cfg.room_id,
             shard_id,
         };
@@ -474,12 +473,12 @@ impl ParticipantCore {
                 origin,
                 frame,
             } => {
-                if let Some(cid) = self.rel_sub_channels.get(&(topic.clone(), origin)).copied() {
+                if let Some(cid) = self.reliable_channels.subscriber_channel(&topic, origin) {
                     self.write_to_data_channel(cid, &topic, &frame);
                 }
             }
             PendingRtcMutation::ReliableControl { topic, bytes } => {
-                if let Some(cid) = self.rel_pub_channels.get(&topic).copied() {
+                if let Some(cid) = self.reliable_channels.publisher_channel(&topic) {
                     self.write_to_data_channel(cid, &topic, &bytes);
                 }
             }
@@ -825,19 +824,11 @@ impl ParticipantCore {
                         }
 
                         if e.lane == DataLane::Reliable {
-                            self.data_topic_channels.insert(cid, e.clone());
-                            match e.direction {
-                                DataTrackDirection::Publish => {
-                                    self.rel_pub_channels.insert(e.topic.clone(), cid);
-                                    events.publish_reliable_data_topic(e.topic);
-                                }
-                                DataTrackDirection::Subscribe => {
-                                    let publisher = e.scope.expect("reliable sub always has scope");
-                                    self.rel_sub_channels
-                                        .insert((e.topic.clone(), publisher), cid);
-                                    events.subscribe_reliable_data_topic(e.topic, publisher);
-                                }
+                            if self.reliable_channels.open(cid, &e, events).is_err() {
+                                self.disconnect(DisconnectReason::DuplicateDataChannelLabel(e));
+                                return;
                             }
+                            self.data_topic_channels.insert(cid, e);
                             return;
                         }
 
@@ -1151,8 +1142,7 @@ impl ParticipantCore {
 
         self.data_pub_channels.clear();
         self.data_sub_channels.clear();
-        self.rel_pub_channels.clear();
-        self.rel_sub_channels.clear();
+        self.reliable_channels.clear();
     }
 
     fn release_data_topic_channel(
@@ -1161,19 +1151,7 @@ impl ParticipantCore {
         events: &mut impl ParticipantSink,
     ) {
         if ch.lane == DataLane::Reliable {
-            match ch.direction {
-                DataTrackDirection::Publish => {
-                    self.rel_pub_channels.remove(&ch.topic);
-                    events.unpublish_reliable_data_topic(ch.topic);
-                }
-                DataTrackDirection::Subscribe => {
-                    let publisher = ch
-                        .scope
-                        .expect("reliable sub channel always has publisher scope");
-                    self.rel_sub_channels.remove(&(ch.topic.clone(), publisher));
-                    events.unsubscribe_reliable_data_topic(ch.topic, publisher);
-                }
-            }
+            self.reliable_channels.close(ch, events);
             return;
         }
 
