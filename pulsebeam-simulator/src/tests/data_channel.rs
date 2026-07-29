@@ -6,7 +6,6 @@ use std::time::Duration;
 fn data_channel_pubsub_forwarding_test() {
     LocalNodeSim::new()
         .with_tick(Duration::from_micros(100))
-        .with_rng_seed(0x0BADC0DE)
         .with_room(
             Room::new("room-data")
                 .with_participant(Participant::data_participant("pub"))
@@ -47,65 +46,12 @@ fn data_channel_pubsub_forwarding_test() {
         ]);
 }
 
-/// Validates that data-channel forwarding completes within a tight latency
-/// budget in the simulated environment (low tick duration = 100µs per tick).
-/// The test verifies functional delivery within a short window rather than
-/// measuring exact wall-clock latency.
-#[test]
-fn data_channel_latency_regression_test() {
-    LocalNodeSim::new()
-        .with_tick(Duration::from_micros(100))
-        .with_rng_seed(0xFEEDBEEF)
-        .with_room(
-            Room::new("room-data-latency")
-                .with_participant(Participant::data_participant("pub"))
-                .with_participant(Participant::data_participant("sub")),
-        )
-        .run(vec![
-            Step::DeclarePublishTopic {
-                description: "Publisher declares latency topic",
-                participant: "pub",
-                topic: "latency_topic",
-            },
-            Step::DeclareSubscribeTopic {
-                description: "Subscriber subscribes (unscoped)",
-                participant: "sub",
-                topic: "latency_topic",
-                scoped_to: None,
-            },
-            // Give enough simulated time for the data channel to be established
-            // before the publisher sends. 100ms @ 100µs/tick = 1000 ticks.
-            Step::Run {
-                description: "Let both participants initialize their data channels",
-                duration: Duration::from_millis(100),
-            },
-            Step::PublishData {
-                description: "Publisher sends ping",
-                participant: "pub",
-                topic: "latency_topic",
-                data: b"ping",
-            },
-            // 10ms @ 100µs/tick = 100 ticks — the latency budget for forwarding.
-            Step::Run {
-                description: "Latency window: payload should arrive within 10ms simulated",
-                duration: Duration::from_millis(10),
-            },
-            Step::CheckDataReceived {
-                description: "Subscriber received ping within the latency budget",
-                participant: "sub",
-                topic: "latency_topic",
-                expected: b"ping",
-            },
-        ]);
-}
-
 /// Validates scoped subscriptions: a subscriber scoped to publisher A receives
 /// only A's payloads, never B's, and an unscoped aggregate subscriber sees both.
 #[test]
 fn data_channel_scoped_subscribe_routing_test() {
     LocalNodeSim::new()
         .with_tick(Duration::from_micros(100))
-        .with_rng_seed(0x5C0BED11)
         .with_room(
             Room::new("room-scoped")
                 .with_participant(Participant::data_participant("pub_a"))

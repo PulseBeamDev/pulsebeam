@@ -1,13 +1,8 @@
 pub mod common;
-pub mod connection;
+pub mod connectivity;
 pub mod data_channel;
-pub mod declarative;
-pub mod dynamic;
-pub mod network;
-pub mod ramp;
-pub mod simulcast;
-pub mod slots;
-pub mod switching;
+pub mod subscriptions;
+pub mod video;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

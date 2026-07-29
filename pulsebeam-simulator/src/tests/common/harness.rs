@@ -128,6 +128,7 @@ impl VideoQuality {
     }
 
     /// Allow up to `n` keyframes without preceding SPS+PPS.
+    #[allow(dead_code)]
     pub fn allow_missing_parameter_sets(mut self, n: u64) -> Self {
         self.max_missing_parameter_sets = n;
         self
@@ -140,6 +141,7 @@ impl VideoQuality {
     }
 }
 
+#[allow(dead_code)]
 pub enum Step {
     // ── Time ──────────────────────────────────────────────────────────────
     /// Advance simulated time. All participants run during this window.
@@ -1057,6 +1059,7 @@ impl LocalNodeSim {
         self
     }
 
+    #[allow(unused)]
     pub fn with_rng_seed(mut self, seed: u64) -> Self {
         self.rng_seed = seed;
         self

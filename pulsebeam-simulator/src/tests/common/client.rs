@@ -209,9 +209,11 @@ pub struct ClientContext {
     pub published_topics: HashMap<String, DataPublisher>,
     pub subscribed_topics: HashMap<(String, Option<String>), DataSubscriber>,
     /// Data channel payloads received by topic.
+    #[allow(dead_code)]
     pub received_data: Vec<(String, Vec<u8>)>,
 }
 
+#[allow(dead_code)]
 impl ClientContext {
     pub fn data_publisher(&mut self, topic: &str) -> Option<&mut DataPublisher> {
         self.published_topics.get_mut(topic)
@@ -232,6 +234,7 @@ pub struct SimClient {
     join_set: JoinSet<()>,
 }
 
+#[allow(dead_code)]
 impl SimClient {
     pub async fn drive(&mut self, token: CancellationToken) -> anyhow::Result<()> {
         self.drive_until_cancelled(token, |_| false).await
