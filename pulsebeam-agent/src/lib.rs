@@ -9,7 +9,10 @@ use tokio::time::Instant;
 
 pub mod clock;
 
-pub use agent::AgentDriver;
+pub use agent::{
+    Agent, AgentBuilder, AgentError, AgentRunner, AgentStats, ConnectionState, MediaEvent,
+    MediaEvents,
+};
 pub use clock::wallclock_at;
 
 pub mod actor;

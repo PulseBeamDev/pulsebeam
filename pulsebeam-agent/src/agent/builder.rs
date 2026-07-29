@@ -1,5 +1,6 @@
 use crate::TransceiverDirection;
 use crate::agent::driver::{AgentDriver, AgentError, DriverInit};
+use crate::agent::{Agent, AgentRunner};
 use crate::api::{CreateParticipantRequest, HttpApiClient};
 use crate::tcp::TcpSession;
 use pulsebeam_core::net::UdpSocket;
@@ -63,7 +64,17 @@ impl AgentBuilder {
         self
     }
 
-    pub async fn connect(mut self, room_id: &str) -> Result<AgentDriver, AgentError> {
+    pub async fn connect(self, room_id: &str) -> Result<Agent, AgentError> {
+        let (agent, runner) = self.connect_unmanaged(room_id).await?;
+        let task = tokio::spawn(runner.run());
+        agent.attach_runner(task).await;
+        Ok(agent)
+    }
+
+    pub async fn connect_unmanaged(
+        mut self,
+        room_id: &str,
+    ) -> Result<(Agent, AgentRunner), AgentError> {
         let port = self.udp_socket.local_addr()?.port();
 
         if self.local_ips.is_empty() {
@@ -222,6 +233,6 @@ impl AgentBuilder {
             medias,
         };
 
-        Ok(AgentDriver::new(init))
+        Ok(AgentRunner::new(AgentDriver::new(init)))
     }
 }

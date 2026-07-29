@@ -5,11 +5,29 @@ use pulsebeam_proto::signaling::Track;
 use str0m::channel::ChannelId;
 use str0m::media::{Mid, Rid};
 
-#[derive(Clone)]
 pub(crate) enum OutgoingCommand {
     SendData(SendData),
     SendMedia(SendMedia),
-    SetSubscription(Subscription),
+    SetSubscriptions(Vec<Subscription>),
+    SetPlayoutDelay(Option<(u32, u32)>),
+    Shutdown(tokio::sync::oneshot::Sender<()>),
+    DeclareOrderedPublisher {
+        topic: String,
+        response: tokio::sync::oneshot::Sender<Result<OrderedTopicPublisher, super::AgentError>>,
+    },
+    DeclareOrderedSubscriber {
+        topic: String,
+        response: tokio::sync::oneshot::Sender<Result<OrderedTopicSubscriber, super::AgentError>>,
+    },
+    DeclareLatestPublisher {
+        topic: String,
+        response: tokio::sync::oneshot::Sender<Result<DataPublisher, super::AgentError>>,
+    },
+    DeclareLatestSubscriber {
+        topic: String,
+        publisher_id: Option<String>,
+        response: tokio::sync::oneshot::Sender<Result<DataSubscriber, super::AgentError>>,
+    },
 }
 
 #[derive(Clone, Debug)]

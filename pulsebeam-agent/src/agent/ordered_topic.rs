@@ -13,6 +13,7 @@ use super::handles::{
 use super::mailbox;
 
 const RETRANSMIT_CAPACITY: usize = 256;
+const DELIVERY_CAPACITY: usize = 256;
 const REORDER_CAPACITY: usize = 256;
 
 struct Publisher {
@@ -150,7 +151,7 @@ impl OrderedTopics {
             return Err(());
         }
         let channel_id = add_channel(rtc, DataTrackDirection::Subscribe, topic, None)?;
-        let (target, rx) = mailbox::unbounded();
+        let (target, rx) = mailbox::bounded(DELIVERY_CAPACITY);
         let handle = OrderedTopicSubscriber {
             topic: topic.to_string(),
             rx,

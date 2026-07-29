@@ -350,7 +350,7 @@ impl ParticipantShared {
 
 struct ParticipantHandle {
     shared: Arc<ParticipantShared>,
-    cmd_tx: mpsc::UnboundedSender<ParticipantCmd>,
+    cmd_tx: mpsc::Sender<ParticipantCmd>,
     /// TX bytes at the start of the most recent Step::Run (for interval checks).
     interval_tx_baseline: u64,
     /// RX bytes at the start of the most recent Step::Run (for interval checks).
@@ -358,6 +358,12 @@ struct ParticipantHandle {
 }
 
 impl ParticipantHandle {
+    fn send_command(&self, command: ParticipantCmd) {
+        self.cmd_tx
+            .try_send(command)
+            .expect("participant command queue capacity exceeded");
+    }
+
     fn tx_bytes(&self) -> u64 {
         *self.shared.tx_bytes.lock().unwrap()
     }
@@ -385,7 +391,7 @@ async fn run_participant(
     config: Participant,
     room_name: &'static str,
     shared: Arc<ParticipantShared>,
-    mut cmd_rx: mpsc::UnboundedReceiver<ParticipantCmd>,
+    mut cmd_rx: mpsc::Receiver<ParticipantCmd>,
     tcp_only: bool,
 ) -> anyhow::Result<()> {
     // Participants declared starts_disconnected wait for a Join/Reconnect command.
@@ -434,7 +440,7 @@ async fn run_participant(
         {
             let mut id_guard = shared.participant_id.lock().unwrap();
             if id_guard.is_none() {
-                *id_guard = Some(client.ctx.driver.participant_id().clone());
+                *id_guard = Some(client.ctx.agent.participant_id().clone());
             }
         }
         *shared.connected.lock().unwrap() = true;
@@ -450,16 +456,49 @@ async fn run_participant(
                 for op in ops {
                     match op {
                         PendingDriverOp::SetSubscriptions(subs) => {
-                            ctx.driver.set_subscriptions(subs);
+                            let agent = ctx.agent.clone();
+                            tokio::spawn(async move {
+                                agent
+                                    .set_subscriptions(subs)
+                                    .await
+                                    .expect("failed to set subscriptions");
+                            });
                         }
-                        PendingDriverOp::DeclarePublishTopic(ref t) => {
-                            let _ = ctx.driver.declare_publish_topic(t);
+                        PendingDriverOp::DeclarePublishTopic(t) => {
+                            let agent = ctx.agent.clone();
+                            let publishers = ctx.published_topics.clone();
+                            tokio::spawn(async move {
+                                let publisher = agent
+                                    .topic(t.clone())
+                                    .expect("invalid topic")
+                                    .publisher()
+                                    .latest()
+                                    .await
+                                    .expect("failed to declare publisher");
+                                publishers.lock().unwrap().insert(t, publisher);
+                            });
                         }
-                        PendingDriverOp::DeclareSubscribeTopic(ref t, ref pub_id) => {
-                            let _ = ctx.driver.declare_subscribe_topic(t, pub_id.as_deref());
+                        PendingDriverOp::DeclareSubscribeTopic(t, pub_id) => {
+                            let agent = ctx.agent.clone();
+                            let subscribers = ctx.subscribed_topics.clone();
+                            tokio::spawn(async move {
+                                let builder = agent
+                                    .topic(t.clone())
+                                    .expect("invalid topic")
+                                    .subscriber()
+                                    .latest();
+                                let builder = match pub_id.as_deref() {
+                                    Some(publisher_id) => builder.from_publisher(publisher_id),
+                                    None => builder,
+                                };
+                                let subscriber =
+                                    builder.await.expect("failed to declare subscriber");
+                                subscribers.lock().unwrap().insert((t, pub_id), subscriber);
+                            });
                         }
                         PendingDriverOp::PublishData(ref topic, ref data) => {
-                            if let Some(publisher) = ctx.published_topics.get(&topic.clone()) {
+                            if let Some(publisher) = ctx.published_topics.lock().unwrap().get(topic)
+                            {
                                 let _ = publisher.try_send(data.clone());
                             } else {
                                 retry_ops.push(op);
@@ -477,7 +516,9 @@ async fn run_participant(
                 // 2. Drain received data from all known subscribers.
                 {
                     let mut data_received = shared_clone.data_received.lock().unwrap();
-                    for ((topic, _scope), subscriber) in ctx.subscribed_topics.iter_mut() {
+                    for ((topic, _scope), subscriber) in
+                        ctx.subscribed_topics.lock().unwrap().iter_mut()
+                    {
                         while let Ok(payload) = subscriber.try_recv() {
                             data_received
                                 .entry(topic.clone())
@@ -493,7 +534,7 @@ async fn run_participant(
                 }
 
                 // 4. Update stats.
-                let stats = ctx.driver.stats();
+                let stats = ctx.agent.stats();
                 *shared_clone.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
                 *shared_clone.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
                 *shared_clone.connected.lock().unwrap() = stats.peer.is_some();
@@ -510,7 +551,7 @@ async fn run_participant(
 
         // Update stats one final time before handling the command.
         {
-            let stats = client.ctx.driver.stats();
+            let stats = client.ctx.agent.stats();
             *shared.tx_bytes.lock().unwrap() = stats.total_tx_bytes();
             *shared.rx_bytes.lock().unwrap() = stats.total_rx_bytes();
         }
@@ -519,7 +560,7 @@ async fn run_participant(
         match cmd {
             None | Some(ParticipantCmd::Done) => break,
             Some(ParticipantCmd::Shutdown) => {
-                client.ctx.driver.shutdown().await;
+                client.ctx.agent.close().await?;
                 drop(client);
                 match cmd_rx.recv().await {
                     Some(ParticipantCmd::Reconnect) => continue,
@@ -643,7 +684,7 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                handle.cmd_tx.send(ParticipantCmd::Reconnect).ok();
+                handle.send_command(ParticipantCmd::Reconnect);
             }
 
             Step::Disconnect {
@@ -652,7 +693,7 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                handle.cmd_tx.send(ParticipantCmd::Shutdown).ok();
+                handle.send_command(ParticipantCmd::Shutdown);
             }
 
             Step::AbruptExit {
@@ -661,7 +702,7 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                handle.cmd_tx.send(ParticipantCmd::Drop).ok();
+                handle.send_command(ParticipantCmd::Drop);
             }
 
             Step::Reconnect {
@@ -670,7 +711,7 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                handle.cmd_tx.send(ParticipantCmd::Reconnect).ok();
+                handle.send_command(ParticipantCmd::Reconnect);
             }
 
             Step::SetSubscriptions {
@@ -955,7 +996,7 @@ async fn execute_plan(
 
     // Signal all participants to stop.
     for handle in handles.values() {
-        handle.cmd_tx.send(ParticipantCmd::Done).ok();
+        handle.send_command(ParticipantCmd::Done);
     }
 
     Ok(())
@@ -1129,7 +1170,7 @@ impl LocalNodeSim {
                 name_to_ip.insert(participant.name, ip);
 
                 let shared = Arc::new(ParticipantShared::new());
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ParticipantCmd>();
+                let (cmd_tx, cmd_rx) = mpsc::channel::<ParticipantCmd>(16);
 
                 handles.insert(
                     participant.name,

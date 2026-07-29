@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
     MediaKind, Rid, SimulcastLayer, TransceiverDirection,
-    actor::{AgentBuilder, AgentEvent},
+    actor::AgentBuilder,
     agent::RemoteTrack,
     api::HttpApiClient,
     clock::clock_anchor,
@@ -251,8 +251,11 @@ async fn spawn_agent(
         builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
     }
 
-    let mut driver = builder.connect(&room_name).await?;
-
+    let agent = builder.connect(&room_name).await?;
+    let mut media_events = agent
+        .take_media_events()
+        .await
+        .expect("media events should only be taken once");
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -265,7 +268,7 @@ async fn spawn_agent(
             biased;
             _ = &mut session_end => break,
             _ = stats_interval.tick() => {
-                let stats = driver.stats();
+                let stats = agent.stats();
                 let peer = stats.peer.as_ref();
 
                 let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
@@ -291,23 +294,24 @@ async fn spawn_agent(
                     loss_pct,
                 });
             }
-            Some(event) = driver.poll() => {
+            Ok(event) = media_events.recv() => {
                 match event {
-                    AgentEvent::LocalTrackAdded(track) => {
+                    pulsebeam_agent::MediaEvent::LocalTrackAdded(track) => {
                         if track.kind.is_video() {
                             let looper = get_looper(&track.rid, &ctx.assets);
                             tokio::spawn(looper.run(track));
                         }
                     }
-                    AgentEvent::RemoteTrackAdded(t) => {
+                    pulsebeam_agent::MediaEvent::RemoteTrackAdded(t) => {
                         join_set.spawn(handle_receiving(t, ctx.clone()));
                     }
-                    AgentEvent::Connected | AgentEvent::Disconnected(_) | AgentEvent::RemoteTrackDiscovered(_) | AgentEvent::DataPublisherDeclared(_) | AgentEvent::DataSubscriberDeclared(_)  => {}
+                    pulsebeam_agent::MediaEvent::RemoteTrackDiscovered(_) => {}
                 }
             }
         }
     }
 
+    agent.close().await?;
     join_set.join_all().await;
     Ok(())
 }

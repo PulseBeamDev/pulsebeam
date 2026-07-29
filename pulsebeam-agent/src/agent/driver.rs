@@ -38,57 +38,6 @@ const BWE_SLOW_INTERVAL: Duration = Duration::from_millis(200);
 
 pub type ParticipantId = String;
 
-pub struct TopicBuilder<'a> {
-    driver: &'a mut AgentDriver,
-    topic: String,
-}
-
-pub struct OrderedTopic<'a> {
-    driver: &'a mut AgentDriver,
-    topic: String,
-}
-
-pub struct LatestTopic<'a> {
-    driver: &'a mut AgentDriver,
-    topic: String,
-}
-
-impl<'a> TopicBuilder<'a> {
-    pub fn ordered(self) -> OrderedTopic<'a> {
-        OrderedTopic {
-            driver: self.driver,
-            topic: self.topic,
-        }
-    }
-
-    pub fn latest(self) -> LatestTopic<'a> {
-        LatestTopic {
-            driver: self.driver,
-            topic: self.topic,
-        }
-    }
-}
-
-impl OrderedTopic<'_> {
-    pub fn publish(self) -> Result<OrderedTopicPublisher, AgentError> {
-        self.driver.declare_ordered_publish_topic(&self.topic)
-    }
-
-    pub fn subscribe(self) -> Result<OrderedTopicSubscriber, AgentError> {
-        self.driver.declare_ordered_subscribe_topic(&self.topic)
-    }
-}
-
-impl LatestTopic<'_> {
-    pub fn publish(self) -> Result<ChannelId, AgentError> {
-        self.driver.declare_publish_topic(&self.topic)
-    }
-
-    pub fn subscribe(self) -> Result<ChannelId, AgentError> {
-        self.driver.declare_subscribe_topic(&self.topic, None)
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct AgentStats {
     pub peer: Option<str0m::stats::PeerStats>,
@@ -154,6 +103,8 @@ pub enum AgentError {
     Protocol(String),
     #[error("No valid network candidates found")]
     NoCandidates,
+    #[error("Agent runner is no longer available")]
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,9 +155,8 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
     Some((direction, topic, scope))
 }
 
-pub enum AgentEvent {
-    DataPublisherDeclared(DataPublisher),
-    DataSubscriberDeclared(DataSubscriber),
+pub(crate) enum AgentEvent {
+    StatsUpdated,
     LocalTrackAdded(LocalTrack),
     RemoteTrackDiscovered(Track),
     RemoteTrackAdded(RemoteTrack),
@@ -236,8 +186,8 @@ struct NetworkSubsystem {
 struct DataSubsystem {
     signaling_cid: ChannelId,
     data_channels: HashMap<ChannelId, DataTrackBinding>,
-    data_pub_topics: HashMap<String, DataPublisher>,
-    data_sub_topics: HashMap<(String, Option<String>), DataSubscriber>,
+    data_pub_topics: HashMap<String, ChannelId>,
+    data_sub_topics: HashMap<(String, Option<String>), ChannelId>,
     data_targets: HashMap<(String, Option<String>), mailbox::Sender<Vec<u8>>>,
 }
 
@@ -273,10 +223,12 @@ struct TimerSubsystem {
     bwe_next_tick: Instant,
 }
 
-pub struct AgentDriver {
+pub(crate) struct AgentDriver {
     rtc: Rtc,
     stats: AgentStats,
     pending_events: VecDeque<AgentEvent>,
+    shutdown_responses: Vec<tokio::sync::oneshot::Sender<()>>,
+    shutdown_requested: bool,
 
     outgoing_tx: mailbox::Sender<OutgoingCommand>,
     outgoing_rx: mailbox::Receiver<OutgoingCommand>,
@@ -302,6 +254,8 @@ impl AgentDriver {
             rtc: init.rtc,
             stats: AgentStats::default(),
             pending_events: VecDeque::new(),
+            shutdown_responses: Vec::new(),
+            shutdown_requested: false,
             outgoing_tx,
             outgoing_rx,
             slot_manager: SlotManager::new(),
@@ -370,38 +324,40 @@ impl AgentDriver {
         &self.session.participant_id
     }
 
-    pub fn topic(&mut self, topic: impl Into<String>) -> TopicBuilder<'_> {
-        let topic = topic.into();
-        debug_assert!(!topic.is_empty());
-        TopicBuilder {
-            driver: self,
-            topic,
-        }
+    pub(crate) fn command_sender(&self) -> mailbox::Sender<OutgoingCommand> {
+        self.outgoing_tx.clone()
     }
 
-    pub fn declare_publish_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
+    pub(crate) fn take_shutdown_responses(&mut self) -> Vec<tokio::sync::oneshot::Sender<()>> {
+        std::mem::take(&mut self.shutdown_responses)
+    }
+
+    fn declare_latest_publisher(&mut self, topic: &str) -> Result<DataPublisher, AgentError> {
         let cid = self.ensure_data_topic(DataTrackDirection::Publish, topic, None)?;
-        self.data.data_pub_topics.insert(
+        self.data.data_pub_topics.insert(topic.to_string(), cid);
+        Ok(DataPublisher::new(
+            cid,
             topic.to_string(),
-            DataPublisher::new(cid, topic.to_string(), self.outgoing_tx.clone()),
-        );
-        Ok(cid)
+            self.outgoing_tx.clone(),
+        ))
     }
 
-    pub fn declare_subscribe_topic(
+    fn declare_latest_subscriber(
         &mut self,
         topic: &str,
-        scope: Option<&str>,
-    ) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_data_topic(DataTrackDirection::Subscribe, topic, scope)?;
+        publisher_id: Option<&str>,
+    ) -> Result<DataSubscriber, AgentError> {
+        let cid = self.ensure_data_topic(DataTrackDirection::Subscribe, topic, publisher_id)?;
         let (tx, rx) = mailbox::bounded(8);
-        let key = (topic.to_string(), scope.map(str::to_string));
-        self.data.data_sub_topics.insert(
-            key.clone(),
-            DataSubscriber::new(cid, topic.to_string(), key.1.clone(), rx),
-        );
+        let key = (topic.to_string(), publisher_id.map(str::to_string));
+        self.data.data_sub_topics.insert(key.clone(), cid);
         self.data.data_targets.insert(key, tx);
-        Ok(cid)
+        Ok(DataSubscriber::new(
+            cid,
+            topic.to_string(),
+            publisher_id.map(str::to_string),
+            rx,
+        ))
     }
 
     fn declare_ordered_publish_topic(
@@ -443,11 +399,20 @@ impl AgentDriver {
         self.timers.notifier.notify_one();
     }
 
-    pub fn set_subscriptions(&mut self, subs: Vec<Subscription>) {
+    fn set_subscriptions(&mut self, subs: Vec<Subscription>) {
         self.subscriptions.desired_subscriptions.clear();
         for sub in subs {
-            self.handle_outgoing_command(OutgoingCommand::SetSubscription(sub));
+            self.subscriptions
+                .desired_subscriptions
+                .insert(sub.track_id.clone(), sub);
         }
+        let desired = self
+            .subscriptions
+            .desired_subscriptions
+            .values()
+            .cloned()
+            .collect();
+        self.subscriptions.sub_manager.set_desired(desired);
         self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
         self.flush_pending_state();
         self.timers.notifier.notify_one();
@@ -457,7 +422,7 @@ impl AgentDriver {
     /// a full intent resend so the change takes effect even without a
     /// subscription change. `None` restores the adaptive default; `Some((0, 0))`
     /// disables all receiver smoothing.
-    pub fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
+    fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
         self.subscriptions.playout_delay_ms = bounds;
         self.subscriptions.sub_manager.reset_active_assignments();
         self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
@@ -465,7 +430,7 @@ impl AgentDriver {
         self.timers.notifier.notify_one();
     }
 
-    pub async fn poll(&mut self) -> Option<AgentEvent> {
+    pub(crate) async fn poll(&mut self) -> Option<AgentEvent> {
         if let Some(ev) = self.pending_events.pop_front() {
             return Some(ev);
         }
@@ -517,17 +482,15 @@ impl AgentDriver {
                 }
                 Ok(cmd) = self.outgoing_rx.recv() => {
                     self.handle_outgoing_command(cmd);
+                    if self.shutdown_requested {
+                        return None;
+                    }
                 }
                 _ = self.timers.sleep.as_mut() => {
                     self.on_sleep_tick().await;
                 }
             }
         }
-    }
-
-    pub async fn run(mut self) {
-        while self.poll().await.is_some() {}
-        self.shutdown().await;
     }
 
     fn reset_sleep_to_next_deadline(&mut self) {
@@ -642,18 +605,37 @@ impl AgentDriver {
                     let _ = writer.write(pt, e.frame.capture_time.into(), e.frame.ts, e.frame.data);
                 }
             }
-            OutgoingCommand::SetSubscription(sub) => {
-                self.subscriptions
-                    .desired_subscriptions
-                    .insert(sub.track_id.clone(), sub);
-                let desired = self
-                    .subscriptions
-                    .desired_subscriptions
-                    .values()
-                    .cloned()
-                    .collect();
-                self.subscriptions.sub_manager.set_desired(desired);
-                self.subscriptions.pending_deadline = Some(self.now + STATE_DEBOUNCE);
+            OutgoingCommand::SetSubscriptions(subscriptions) => {
+                self.set_subscriptions(subscriptions);
+            }
+            OutgoingCommand::SetPlayoutDelay(bounds) => {
+                self.set_playout_delay(bounds);
+            }
+            OutgoingCommand::Shutdown(response) => {
+                self.shutdown_responses.push(response);
+                self.shutdown_requested = true;
+                self.rtc.disconnect();
+                self.timers.notifier.notify_one();
+            }
+            OutgoingCommand::DeclareOrderedPublisher { topic, response } => {
+                let result = self.declare_ordered_publish_topic(&topic);
+                let _ = response.send(result);
+            }
+            OutgoingCommand::DeclareOrderedSubscriber { topic, response } => {
+                let result = self.declare_ordered_subscribe_topic(&topic);
+                let _ = response.send(result);
+            }
+            OutgoingCommand::DeclareLatestPublisher { topic, response } => {
+                let result = self.declare_latest_publisher(&topic);
+                let _ = response.send(result);
+            }
+            OutgoingCommand::DeclareLatestSubscriber {
+                topic,
+                publisher_id,
+                response,
+            } => {
+                let result = self.declare_latest_subscriber(&topic, publisher_id.as_deref());
+                let _ = response.send(result);
             }
         }
     }
@@ -691,23 +673,8 @@ impl AgentDriver {
                                     scope: scope.clone(),
                                 });
                             match direction {
-                                DataTrackDirection::Publish => {
-                                    if let Some(publisher) = self.data.data_pub_topics.get(&topic) {
-                                        self.emit(AgentEvent::DataPublisherDeclared(
-                                            publisher.clone(),
-                                        ));
-                                    } else {
-                                        tracing::warn!("no pending pub topic for {}.", topic);
-                                    }
-                                }
-                                DataTrackDirection::Subscribe => {
-                                    let key = (topic.clone(), scope);
-                                    if let Some(sub) = self.data.data_sub_topics.get(&key) {
-                                        self.emit(AgentEvent::DataSubscriberDeclared(sub.clone()));
-                                    } else {
-                                        tracing::warn!("no pending sub topic for {:?}.", key);
-                                    }
-                                }
+                                DataTrackDirection::Publish => {}
+                                DataTrackDirection::Subscribe => {}
                             }
                         } else {
                             self.ordered_topics.open_channel(cid, &label);
@@ -736,14 +703,17 @@ impl AgentDriver {
                     }
                     Event::PeerStats(stats) => {
                         self.stats.peer = Some(stats);
+                        self.emit(AgentEvent::StatsUpdated);
                     }
                     Event::MediaIngressStats(stats) => {
                         let track_stats = self.stats.tracks.entry(stats.mid).or_default();
                         track_stats.rx_layers.insert(stats.rid, stats);
+                        self.emit(AgentEvent::StatsUpdated);
                     }
                     Event::MediaEgressStats(stats) => {
                         let track_stats = self.stats.tracks.entry(stats.mid).or_default();
                         track_stats.tx_layers.insert(stats.rid, stats);
+                        self.emit(AgentEvent::StatsUpdated);
                     }
                     Event::KeyframeRequest(req) => {
                         self.media
@@ -946,12 +916,10 @@ impl AgentDriver {
         scope: Option<&str>,
     ) -> Result<ChannelId, AgentError> {
         let existing = match direction {
-            DataTrackDirection::Publish => {
-                self.data.data_pub_topics.get(topic).map(|p| p.channel_id)
-            }
+            DataTrackDirection::Publish => self.data.data_pub_topics.get(topic).copied(),
             DataTrackDirection::Subscribe => {
                 let key = (topic.to_string(), scope.map(str::to_string));
-                self.data.data_sub_topics.get(&key).map(|s| s.channel_id)
+                self.data.data_sub_topics.get(&key).copied()
             }
         };
         if let Some(cid) = existing {
