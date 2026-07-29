@@ -187,6 +187,22 @@ impl OrderedTopicPublisher {
             _ => unreachable!(),
         })
     }
+
+    pub fn try_send(&self, payload: Vec<u8>) -> Result<(), mailbox::TrySendError<Vec<u8>>> {
+        let command = OutgoingCommand::SendData(SendData {
+            channel_id: self.channel_id,
+            payload,
+        });
+        self.tx.try_send(command).map_err(|error| match error {
+            mailbox::TrySendError::Full(OutgoingCommand::SendData(data)) => {
+                mailbox::TrySendError::Full(data.payload)
+            }
+            mailbox::TrySendError::Disconnected(OutgoingCommand::SendData(data)) => {
+                mailbox::TrySendError::Disconnected(data.payload)
+            }
+            _ => unreachable!(),
+        })
+    }
 }
 
 pub struct OrderedTopicSubscriber {
@@ -201,6 +217,10 @@ impl OrderedTopicSubscriber {
 
     pub async fn recv(&mut self) -> Result<OrderedTopicDelivery, mailbox::RecvError> {
         self.rx.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<OrderedTopicDelivery, mailbox::TryRecvError> {
+        self.rx.try_recv()
     }
 }
 

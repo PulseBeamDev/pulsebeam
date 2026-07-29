@@ -2,7 +2,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent::actor::AgentBuilder;
-use pulsebeam_agent::agent::{DataPublisher, DataSubscriber};
+use pulsebeam_agent::agent::{
+    DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
+};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
 use pulsebeam_agent::{
@@ -112,6 +114,8 @@ impl SimClientBuilder {
             discovered_tracks: HashSet::new(),
             published_topics: Arc::new(Mutex::new(HashMap::new())),
             subscribed_topics: Arc::new(Mutex::new(HashMap::new())),
+            ordered_publishers: Arc::new(Mutex::new(HashMap::new())),
+            ordered_subscribers: Arc::new(Mutex::new(HashMap::new())),
             remote_tracks: HashMap::new(),
             requested_tracks: HashSet::new(),
             received_data: Vec::new(),
@@ -236,6 +240,8 @@ pub struct ClientContext {
     pub(crate) requested_tracks: HashSet<String>,
     pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
     pub subscribed_topics: Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>,
+    pub ordered_publishers: Arc<Mutex<HashMap<String, OrderedTopicPublisher>>>,
+    pub ordered_subscribers: Arc<Mutex<HashMap<String, OrderedTopicSubscriber>>>,
     /// Data channel payloads received by topic.
     #[allow(dead_code)]
     pub received_data: Vec<(String, Vec<u8>)>,

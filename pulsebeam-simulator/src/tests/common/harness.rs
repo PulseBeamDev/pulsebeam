@@ -233,6 +233,22 @@ pub enum Step {
         topic: &'static str,
         data: &'static [u8],
     },
+    DeclareOrderedPublisher {
+        description: &'static str,
+        participant: &'static str,
+        topic: &'static str,
+    },
+    DeclareOrderedSubscriber {
+        description: &'static str,
+        participant: &'static str,
+        topic: &'static str,
+    },
+    PublishOrdered {
+        description: &'static str,
+        participant: &'static str,
+        topic: &'static str,
+        data: &'static [u8],
+    },
 
     // ── Assertions ─────────────────────────────────────────────────────────
     /// Deep QoE check: frames are renderable, SPS/PPS present before keyframes,
@@ -290,6 +306,12 @@ pub enum Step {
         topic: &'static str,
         excluded: &'static [u8],
     },
+    CheckDataSequence {
+        description: &'static str,
+        participant: &'static str,
+        topic: &'static str,
+        expected: &'static [&'static [u8]],
+    },
 }
 
 // ── Internal lifecycle commands ─────────────────────────────────────────────
@@ -313,6 +335,9 @@ enum PendingDriverOp {
     /// (topic, scoped_participant_id)
     DeclareSubscribeTopic(String, Option<String>),
     PublishData(String, Vec<u8>),
+    DeclareOrderedPublisher(String),
+    DeclareOrderedSubscriber(String),
+    PublishOrdered(String, Vec<u8>),
 }
 
 #[derive(Clone)]
@@ -523,7 +548,48 @@ async fn run_participant(
                         PendingDriverOp::PublishData(ref topic, ref data) => {
                             if let Some(publisher) = ctx.published_topics.lock().unwrap().get(topic)
                             {
-                                let _ = publisher.try_send(data.clone());
+                                if publisher.try_send(data.clone()).is_err() {
+                                    retry_ops.push(op);
+                                }
+                            } else {
+                                retry_ops.push(op);
+                            }
+                        }
+                        PendingDriverOp::DeclareOrderedPublisher(t) => {
+                            let agent = ctx.agent.clone();
+                            let publishers = ctx.ordered_publishers.clone();
+                            tokio::spawn(async move {
+                                let publisher = agent
+                                    .topic(t.clone())
+                                    .expect("invalid topic")
+                                    .publisher()
+                                    .ordered()
+                                    .await
+                                    .expect("failed to declare ordered publisher");
+                                publishers.lock().unwrap().insert(t, publisher);
+                            });
+                        }
+                        PendingDriverOp::DeclareOrderedSubscriber(t) => {
+                            let agent = ctx.agent.clone();
+                            let subscribers = ctx.ordered_subscribers.clone();
+                            tokio::spawn(async move {
+                                let subscriber = agent
+                                    .topic(t.clone())
+                                    .expect("invalid topic")
+                                    .subscriber()
+                                    .ordered()
+                                    .await
+                                    .expect("failed to declare ordered subscriber");
+                                subscribers.lock().unwrap().insert(t, subscriber);
+                            });
+                        }
+                        PendingDriverOp::PublishOrdered(ref topic, ref data) => {
+                            if let Some(publisher) =
+                                ctx.ordered_publishers.lock().unwrap().get(topic)
+                            {
+                                if publisher.try_send(data.clone()).is_err() {
+                                    retry_ops.push(op);
+                                }
                             } else {
                                 retry_ops.push(op);
                             }
@@ -548,6 +614,18 @@ async fn run_participant(
                                 .entry(topic.clone())
                                 .or_default()
                                 .push(payload);
+                        }
+                    }
+                    for (topic, subscriber) in ctx.ordered_subscribers.lock().unwrap().iter_mut() {
+                        while let Ok(delivery) = subscriber.try_recv() {
+                            if let pulsebeam_agent::agent::OrderedTopicDelivery::Message(message) =
+                                delivery
+                            {
+                                data_received
+                                    .entry(topic.clone())
+                                    .or_default()
+                                    .push(message.payload);
+                            }
                         }
                     }
                 }
@@ -623,6 +701,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
+        Step::DeclareOrderedPublisher { .. } => "DeclareOrderedPublisher",
+        Step::DeclareOrderedSubscriber { .. } => "DeclareOrderedSubscriber",
+        Step::PublishOrdered { .. } => "PublishOrdered",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
@@ -632,6 +713,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckTxBytesInterval { .. } => "CheckTxBytesInterval",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
+        Step::CheckDataSequence { .. } => "CheckDataSequence",
     }
 }
 
@@ -869,6 +951,52 @@ async fn execute_plan(
                     ));
             }
 
+            Step::DeclareOrderedPublisher {
+                description,
+                participant,
+                topic,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::DeclareOrderedPublisher(topic.to_string()));
+            }
+
+            Step::DeclareOrderedSubscriber {
+                description,
+                participant,
+                topic,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::DeclareOrderedSubscriber(topic.to_string()));
+            }
+
+            Step::PublishOrdered {
+                description,
+                participant,
+                topic,
+                data,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::PublishOrdered(
+                        topic.to_string(),
+                        data.to_vec(),
+                    ));
+            }
+
             Step::CheckVideoQuality {
                 description,
                 participant,
@@ -1013,6 +1141,26 @@ async fn execute_plan(
                     !received.contains(&excluded_vec),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {:?} NOT in received list\n  actual:       {received:?}",
                     excluded
+                );
+            }
+
+            Step::CheckDataSequence {
+                description,
+                participant,
+                topic,
+                expected,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let data_received = handle.shared.data_received.lock().unwrap();
+                let received = data_received
+                    .get(*topic)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let expected: Vec<Vec<u8>> =
+                    expected.iter().map(|payload| payload.to_vec()).collect();
+                assert_eq!(
+                    received, expected,
+                    "step {n}/{total} {kind}: {description} ({participant}, {topic})"
                 );
             }
         }
