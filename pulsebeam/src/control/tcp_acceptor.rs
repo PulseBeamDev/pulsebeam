@@ -22,7 +22,7 @@ use std::{
 
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::shard::demux::extract_stun_server_ufrag;
@@ -80,7 +80,7 @@ async fn acceptor_loop(
 ) {
     // Back-channel: inner tasks signal completion so the loop can decrement
     // in-flight counters without blocking on those tasks.
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<SocketAddr>(MAX_PENDING_TCP);
 
     let mut pending: usize = 0;
     let mut ip_counts: HashMap<IpAddr, usize> = HashMap::new();
@@ -152,7 +152,7 @@ async fn first_frame_task(
     stream: pulsebeam_core::net::TcpStream,
     peer_addr: SocketAddr,
     event_tx: mailbox::Sender<TcpAcceptorEvent>,
-    done_tx: UnboundedSender<SocketAddr>,
+    done_tx: Sender<SocketAddr>,
 ) {
     let result = match BufferedTcpStream::read_first_frame(stream, TCP_FIRST_FRAME_TIMEOUT).await {
         Ok((stream, payload)) => {
@@ -173,7 +173,7 @@ async fn first_frame_task(
     // shut down, and we are about to be dropped too.
     let _ = event_tx.send(TcpAcceptorEvent { peer_addr, result }).await;
     // Notify the accept loop so it can decrement the in-flight counters.
-    let _ = done_tx.send(peer_addr);
+    let _ = done_tx.send(peer_addr).await;
 }
 
 #[cfg(test)]

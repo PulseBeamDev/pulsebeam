@@ -1,11 +1,15 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use pulsebeam_agent::actor::{AgentBuilder, AgentEvent};
-use pulsebeam_agent::agent::{DataPublisher, DataSubscriber};
+use pulsebeam_agent::actor::AgentBuilder;
+use pulsebeam_agent::agent::{
+    DataPublisher, DataSubscriber, OrderedTopicPublisher, OrderedTopicSubscriber,
+};
 use pulsebeam_agent::api::HttpApiClient;
 use pulsebeam_agent::media::H264Looper;
-use pulsebeam_agent::{AgentDriver, MediaKind, SimulcastLayer, TransceiverDirection};
+use pulsebeam_agent::{
+    Agent, LocalTrack, ParticipantChange, Participants, RemoteTrack, SimulcastLayer,
+};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{HashMap, HashSet};
@@ -20,6 +24,7 @@ pub struct SimClientBuilder {
     ip: IpAddr,
     agent_builder: AgentBuilder,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
+    publishes_video: bool,
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -41,6 +46,7 @@ impl SimClientBuilder {
             ip,
             agent_builder: AgentBuilder::new(api, socket).with_local_ip(ip),
             video_rx: None,
+            publishes_video: false,
         })
     }
 
@@ -60,16 +66,18 @@ impl SimClientBuilder {
                 .with_local_ip(ip)
                 .with_tcp_server_addr(server_tcp_addr),
             video_rx: None,
+            publishes_video: false,
         })
     }
 
-    pub fn with_track(
-        mut self,
-        kind: MediaKind,
-        dir: TransceiverDirection,
-        simulcast_layers: Option<Vec<SimulcastLayer>>,
-    ) -> Self {
-        self.agent_builder = self.agent_builder.with_track(kind, dir, simulcast_layers);
+    pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
+        self.agent_builder = self.agent_builder.video_upstream_slots(1, simulcast_layers);
+        self.publishes_video = true;
+        self
+    }
+
+    pub fn receive_video(mut self, capacity: usize) -> Self {
+        self.agent_builder = self.agent_builder.video_downstream_slots(capacity);
         self
     }
 
@@ -81,26 +89,47 @@ impl SimClientBuilder {
     }
 
     pub async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let driver = self.agent_builder.connect(room).await?;
+        let (agent, runner) = self.agent_builder.connect_unmanaged(room).await?;
+        let mut join_set = JoinSet::new();
+        join_set.spawn(async move {
+            runner.run().await.expect("agent runner failed");
+        });
+        let local_video = if self.publishes_video {
+            Some(agent.media().publish_video().await?)
+        } else {
+            None
+        };
+        let (incoming_track_tx, incoming_tracks) = tokio::sync::mpsc::channel(32);
+        let participants = agent.participants();
         tracing::info!("connected to {room}");
         let video_rx = self
             .video_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
         let ctx = ClientContext {
             ip: self.ip,
-            driver,
-            local_mids: HashSet::new(),
+            agent,
+            incoming_tracks,
+            incoming_track_tx,
+            participants,
             discovered_tracks: HashSet::new(),
-            published_topics: HashMap::new(),
-            subscribed_topics: HashMap::new(),
+            published_topics: Arc::new(Mutex::new(HashMap::new())),
+            subscribed_topics: Arc::new(Mutex::new(HashMap::new())),
+            ordered_publishers: Arc::new(Mutex::new(HashMap::new())),
+            ordered_subscribers: Arc::new(Mutex::new(HashMap::new())),
             remote_tracks: HashMap::new(),
+            requested_tracks: HashSet::new(),
             received_data: Vec::new(),
             video_rx,
+            local_publications: local_video.into_iter().collect(),
         };
-        Ok(SimClient {
-            ctx,
-            join_set: JoinSet::new(),
-        })
+        for publication in &ctx.local_publications {
+            for sender in publication.encodings().iter().cloned() {
+                let rid = sender.rid();
+                let looper = create_h264_looper_for_rid(rid);
+                join_set.spawn(looper.run(sender));
+            }
+        }
+        Ok(SimClient { ctx, join_set })
     }
 }
 
@@ -196,37 +225,26 @@ impl VideoReceiveLog {
 
 pub struct ClientContext {
     pub ip: IpAddr,
-    pub driver: AgentDriver,
+    pub agent: Agent,
+    incoming_tracks: tokio::sync::mpsc::Receiver<RemoteTrack>,
+    pub(crate) incoming_track_tx: tokio::sync::mpsc::Sender<RemoteTrack>,
+    participants: Participants,
     /// Aggregated decode-side view of every remote video track.
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
+    local_publications: Vec<LocalTrack>,
 
-    /// Local track mids (as reported by LocalTrackAdded events).
-    pub local_mids: HashSet<pulsebeam_agent::str0m::media::Mid>,
     /// Remote track IDs that have been discovered from signaling updates.
     pub discovered_tracks: HashSet<String>,
     /// Remote tracks that have been assigned to a slot and are actively streaming.
-    pub remote_tracks: HashMap<pulsebeam_agent::str0m::media::Mid, String>,
-    pub published_topics: HashMap<String, DataPublisher>,
-    pub subscribed_topics: HashMap<(String, Option<String>), DataSubscriber>,
+    pub remote_tracks: HashMap<String, String>,
+    pub(crate) requested_tracks: HashSet<String>,
+    pub published_topics: Arc<Mutex<HashMap<String, DataPublisher>>>,
+    pub subscribed_topics: Arc<Mutex<HashMap<(String, Option<String>), DataSubscriber>>>,
+    pub ordered_publishers: Arc<Mutex<HashMap<String, OrderedTopicPublisher>>>,
+    pub ordered_subscribers: Arc<Mutex<HashMap<String, OrderedTopicSubscriber>>>,
     /// Data channel payloads received by topic.
     #[allow(dead_code)]
     pub received_data: Vec<(String, Vec<u8>)>,
-}
-
-#[allow(dead_code)]
-impl ClientContext {
-    pub fn data_publisher(&mut self, topic: &str) -> Option<&mut DataPublisher> {
-        self.published_topics.get_mut(topic)
-    }
-
-    pub fn data_subscriber(
-        &mut self,
-        topic: &str,
-        publisher: Option<&str>,
-    ) -> Option<&mut DataSubscriber> {
-        self.subscribed_topics
-            .get_mut(&(topic.to_string(), publisher.map(str::to_string)))
-    }
 }
 
 pub struct SimClient {
@@ -264,7 +282,7 @@ impl SimClient {
         let _guard = token.clone().drop_guard();
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
-                let stats = self.ctx.driver.stats();
+                let stats = self.ctx.agent.stats().current();
                 anyhow::bail!(
                     "Client {} timed out ({:?}). Final Stats:\n{:?}\nDiscovered: {:?}\nRemoteTracks: {:?}",
                     self.ctx.ip,
@@ -314,7 +332,7 @@ impl SimClient {
     where
         F: FnMut(&mut ClientContext) -> bool,
     {
-        self.drive_until_cancelled_with_interval(token, Duration::from_millis(200), predicate)
+        self.drive_until_cancelled_with_interval(token, Duration::from_millis(10), predicate)
             .await
     }
 
@@ -327,7 +345,7 @@ impl SimClient {
     where
         F: FnMut(&mut ClientContext) -> bool,
     {
-        let span = tracing::info_span!("drive_until_cancelled", ip = %self.ctx.ip, participant_id = %self.ctx.driver.participant_id());
+        let span = tracing::info_span!("drive_until_cancelled", ip = %self.ctx.ip, participant_id = %self.ctx.agent.participant_id());
         async move {
             let mut check_interval = tokio::time::interval(check_every);
             loop {
@@ -335,39 +353,33 @@ impl SimClient {
                     _ = token.cancelled() => {
                         return Ok(());
                     }
-                    Some(event) = self.ctx.driver.poll() => {
-                        match event {
-                            AgentEvent::LocalTrackAdded(sender) => {
-                                tracing::info!("{} starting publisher for mid: {:?} rid: {:?}", self.ctx.ip, sender.mid, sender.rid);
-                                self.ctx.local_mids.insert(sender.mid);
-                                let rid = sender.rid.as_ref().map(|r| r.as_ref());
-                                let looper = create_h264_looper_for_rid(rid);
-                                self.join_set.spawn(looper.run(sender));
+                    result = self.ctx.participants.next() => {
+                        match result.expect("participant state should remain available") {
+                            ParticipantChange::Joined(participant)
+                            | ParticipantChange::Updated(participant) => {
+                                self.ctx
+                                    .discovered_tracks
+                                    .insert(participant.id().clone());
                             }
-                            AgentEvent::RemoteTrackDiscovered(track) => {
-                                tracing::info!("{} discovered remote track: {:?}", self.ctx.ip, track.id);
-                                if !self.ctx.discovered_tracks.contains(&track.id) {
-                                    self.ctx.discovered_tracks.insert(track.id.clone());
-                                }
+                            ParticipantChange::Left(participant_id) => {
+                                self.ctx.discovered_tracks.remove(&participant_id);
                             }
-                            AgentEvent::RemoteTrackAdded(mut t) => {
-                                self.ctx.remote_tracks.insert(t.mid, t.track.id.clone());
-                                let log = self.ctx.video_rx.clone();
-                                self.join_set.spawn(async move {
-                                    while let Ok(frame) = t.recv().await {
-                                        log.lock().unwrap().record(&frame);
-                                    }
-                                });
-                            }
-                            AgentEvent::DataPublisherDeclared(publisher) => {
-                                self.ctx.published_topics.insert(publisher.topic.clone(), publisher);
-                            }
-                            AgentEvent::DataSubscriberDeclared(subscriber) => {
-                                let key = (subscriber.topic.clone(), subscriber.scope.clone());
-                                self.ctx.subscribed_topics.insert(key, subscriber);
-                            }
-                            AgentEvent::Connected | AgentEvent::Disconnected(_) => {}
                         }
+                        if predicate(&mut self.ctx) {
+                            return Ok(());
+                        }
+                    }
+                    Some(mut track) = self.ctx.incoming_tracks.recv() => {
+                        let publication_id = track.publisher_id().to_owned();
+                        self.ctx
+                            .remote_tracks
+                            .insert(publication_id.clone(), publication_id);
+                        let log = self.ctx.video_rx.clone();
+                        self.join_set.spawn(async move {
+                            while let Ok(frame) = track.recv().await {
+                                log.lock().unwrap().record(&frame);
+                            }
+                        });
 
                         // Re-check the predicate after processing an event, since a new
                         // event may indicate the desired state has been reached.
@@ -382,7 +394,9 @@ impl SimClient {
                     }
                 }
             }
-        }.instrument(span).await
+        }
+        .instrument(span)
+        .await
     }
 }
 

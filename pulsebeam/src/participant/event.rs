@@ -1,4 +1,4 @@
-use crate::entity::TrackId;
+use crate::entity::{ParticipantId, TrackId};
 use crate::rtp::RtpPacket;
 use crate::track::{StreamId, Topic, Track, TrackLayer, TrackMeta};
 
@@ -24,6 +24,13 @@ pub trait ParticipantSink {
 
     fn publish_rtp(&mut self, stream_id: StreamId, pkt: RtpPacket);
     fn publish_sctp(&mut self, topic: Topic, pkt: Vec<u8>);
+
+    fn publish_reliable_data_topic(&mut self, topic: Topic);
+    fn unpublish_reliable_data_topic(&mut self, topic: Topic);
+    fn subscribe_reliable_data_topic(&mut self, topic: Topic);
+    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic);
+    fn publish_reliable_sctp(&mut self, topic: Topic, frame: Vec<u8>);
+    fn forward_reliable_control(&mut self, publisher: ParticipantId, topic: Topic, bytes: Vec<u8>);
 }
 
 #[cfg(test)]
@@ -112,6 +119,19 @@ pub mod test_utils {
 
         fn publish_sctp(&mut self, topic: Topic, _pkt: Vec<u8>) {
             self.publish_sctp_calls.push(topic);
+        }
+
+        fn publish_reliable_data_topic(&mut self, _topic: Topic) {}
+        fn unpublish_reliable_data_topic(&mut self, _topic: Topic) {}
+        fn subscribe_reliable_data_topic(&mut self, _topic: Topic) {}
+        fn unsubscribe_reliable_data_topic(&mut self, _topic: Topic) {}
+        fn publish_reliable_sctp(&mut self, _topic: Topic, _frame: Vec<u8>) {}
+        fn forward_reliable_control(
+            &mut self,
+            _publisher: ParticipantId,
+            _topic: Topic,
+            _bytes: Vec<u8>,
+        ) {
         }
     }
 }

@@ -58,12 +58,19 @@ impl fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
-#[derive(Clone)]
-pub struct Sender<T: Clone> {
+pub struct Sender<T> {
     inner: flume::Sender<T>,
 }
 
-impl<T: Clone> Sender<T> {
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Sender<T> {
     pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
         self.inner
             .send_async(msg)
@@ -81,9 +88,16 @@ impl<T: Clone> Sender<T> {
     }
 }
 
-#[derive(Clone)]
 pub struct Receiver<T> {
     inner: flume::Receiver<T>,
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<T> Receiver<T> {
@@ -108,7 +122,7 @@ pub enum TryRecvError {
     Disconnected,
 }
 
-pub fn bounded<T: Clone>(cap: usize) -> (Sender<T>, Receiver<T>) {
+pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = flume::bounded(cap);
     (Sender { inner: tx }, Receiver { inner: rx })
 }

@@ -9,13 +9,17 @@ use tokio::time::Instant;
 
 pub mod clock;
 
-pub use agent::AgentDriver;
+pub use agent::{
+    Agent, AgentBuilder, AgentError, AgentRunner, Connection, ConnectionState, LocalEncoding,
+    LocalTrack, Media, Participant, ParticipantChange, Participants, RemoteTrack, RemoteVideo,
+    Statistics, StatisticsSnapshot, VideoSubscriber,
+};
 pub use clock::wallclock_at;
 
 pub mod actor;
 pub mod agent;
 pub mod api;
-pub mod manager;
+pub(crate) mod manager;
 pub mod media;
 pub(crate) mod tcp;
 

@@ -3,11 +3,11 @@ use std::{sync::Arc, time::Duration};
 use str0m::media::MediaTime;
 use tokio::sync::watch;
 
-use crate::{MediaFrame, agent::LocalTrack};
+use crate::{MediaFrame, agent::LocalEncoding};
 
 pub struct KeyframeNotifier(watch::Sender<u64>);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyframeReceiver(watch::Receiver<u64>);
 
 impl KeyframeNotifier {
@@ -107,7 +107,7 @@ impl H264Looper {
         frame.clone()
     }
 
-    pub async fn run(mut self, mut sender: LocalTrack) {
+    pub async fn run(mut self, mut sender: LocalEncoding) {
         let clock_rate = 90_000u64;
         let frame_interval = Duration::from_secs_f64(1.0 / self.fps as f64);
         let mid = sender.mid;
@@ -141,7 +141,9 @@ impl H264Looper {
                 is_keyframe: false,
             };
 
-            sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                break;
+            }
             frame_count += 1;
         }
     }

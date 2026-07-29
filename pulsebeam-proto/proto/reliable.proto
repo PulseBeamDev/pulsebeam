@@ -1,0 +1,26 @@
+syntax = "proto3";
+package reliable;
+
+message RelMsg {
+  uint64 stream_id = 1;
+  uint64 seq       = 2;
+  bytes  payload   = 3;
+  bool resync_required = 4;
+}
+
+message RelNack {
+  uint64 stream_id = 1;
+  uint64 from_seq  = 2;
+  string publisher_id = 3;
+}
+
+message RelDelivery {
+  string publisher_id = 1;
+  bytes frame = 2;
+}
+
+message RelControl {
+  oneof msg {
+    RelNack nack = 1;
+  }
+}

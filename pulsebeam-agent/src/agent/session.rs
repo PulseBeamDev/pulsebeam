@@ -1,0 +1,768 @@
+use super::driver::{AgentDriver, AgentError, AgentEvent, ParticipantId, StatisticsSnapshot};
+use super::handles::{
+    DataPublisher, DataSubscriber, LocalEncoding, OrderedTopicPublisher, OrderedTopicSubscriber,
+    OutgoingCommand, Publication, PublicationLease, RemoteTrack,
+};
+use super::mailbox;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::watch;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting { reason: String },
+    Closed { reason: String },
+}
+
+#[derive(Clone)]
+pub struct Connection {
+    state: watch::Receiver<ConnectionState>,
+}
+
+impl Connection {
+    pub fn current(&self) -> ConnectionState {
+        self.state.borrow().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.state.changed().await
+    }
+}
+
+#[derive(Clone)]
+pub struct Statistics {
+    state: watch::Receiver<Arc<StatisticsSnapshot>>,
+}
+
+impl Statistics {
+    pub fn current(&self) -> Arc<StatisticsSnapshot> {
+        self.state.borrow().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.state.changed().await
+    }
+}
+
+struct AgentInner {
+    participant_id: ParticipantId,
+    commands: mailbox::Sender<OutgoingCommand>,
+    stats: watch::Receiver<Arc<StatisticsSnapshot>>,
+    connection: watch::Receiver<ConnectionState>,
+    publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
+}
+
+#[derive(Clone)]
+pub struct Agent {
+    inner: Arc<AgentInner>,
+}
+
+impl Agent {
+    pub fn participant_id(&self) -> &ParticipantId {
+        &self.inner.participant_id
+    }
+
+    pub fn stats(&self) -> Statistics {
+        Statistics {
+            state: self.inner.stats.clone(),
+        }
+    }
+
+    pub fn connection(&self) -> Connection {
+        Connection {
+            state: self.inner.connection.clone(),
+        }
+    }
+
+    pub async fn closed(&self) -> ConnectionState {
+        let mut connection = self.connection();
+        loop {
+            let state = connection.current();
+            if matches!(state, ConnectionState::Closed { .. }) {
+                return state;
+            }
+            if connection.changed().await.is_err() {
+                return ConnectionState::Closed {
+                    reason: "agent runner stopped".into(),
+                };
+            }
+        }
+    }
+
+    pub fn media(&self) -> Media {
+        Media {
+            agent: self.clone(),
+        }
+    }
+
+    pub fn participants(&self) -> Participants {
+        Participants::new(self.clone())
+    }
+
+    pub fn participant(&self, participant_id: impl Into<ParticipantId>) -> Participant {
+        Participant {
+            agent: self.clone(),
+            id: participant_id.into(),
+        }
+    }
+
+    pub fn topic(&self, topic: impl Into<String>) -> Result<Topic, AgentError> {
+        let topic = topic.into();
+        if topic.is_empty() {
+            return Err(AgentError::Protocol("topic must not be empty".into()));
+        }
+        Ok(Topic {
+            agent: self.clone(),
+            name: topic,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Media {
+    agent: Agent,
+}
+
+pub struct LocalTrack {
+    kind: str0m::media::MediaKind,
+    encodings: Vec<LocalEncoding>,
+    lease: PublicationLease,
+    commands: mailbox::Sender<OutgoingCommand>,
+    released: bool,
+}
+
+impl LocalTrack {
+    pub(crate) fn new(
+        kind: str0m::media::MediaKind,
+        lease: PublicationLease,
+        encodings: Vec<LocalEncoding>,
+        commands: mailbox::Sender<OutgoingCommand>,
+    ) -> Self {
+        debug_assert!(!encodings.is_empty());
+        debug_assert!(encodings.iter().all(|encoding| encoding.mid == lease.mid));
+        Self {
+            kind,
+            encodings,
+            lease,
+            commands,
+            released: false,
+        }
+    }
+
+    pub fn kind(&self) -> str0m::media::MediaKind {
+        self.kind
+    }
+
+    pub fn encodings(&self) -> &[LocalEncoding] {
+        &self.encodings
+    }
+
+    pub fn encodings_mut(&mut self) -> &mut [LocalEncoding] {
+        &mut self.encodings
+    }
+
+    pub async fn unpublish(mut self) -> Result<(), AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(OutgoingCommand::Unpublish {
+                lease: self.lease,
+                response: Some(response),
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)??;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for LocalTrack {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let _ = self.commands.try_send(OutgoingCommand::Unpublish {
+            lease: self.lease,
+            response: None,
+        });
+    }
+}
+
+impl Media {
+    pub async fn publish_video(&self) -> Result<LocalTrack, AgentError> {
+        self.publish(str0m::media::MediaKind::Video).await
+    }
+
+    pub async fn publish_audio(&self) -> Result<LocalTrack, AgentError> {
+        self.publish(str0m::media::MediaKind::Audio).await
+    }
+
+    async fn publish(&self, kind: str0m::media::MediaKind) -> Result<LocalTrack, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.agent
+            .inner
+            .commands
+            .send(OutgoingCommand::Publish { kind, response })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        subscription: crate::manager::VideoSubscription,
+    ) -> Result<RemoteTrack, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.agent
+            .inner
+            .commands
+            .send(OutgoingCommand::SubscribeMedia {
+                subscription,
+                response,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+
+    pub async fn set_playout_delay(&self, bounds: Option<(u32, u32)>) -> Result<(), AgentError> {
+        self.agent
+            .inner
+            .commands
+            .send(OutgoingCommand::SetPlayoutDelay(bounds))
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct Participant {
+    agent: Agent,
+    id: ParticipantId,
+}
+
+impl Participant {
+    pub fn id(&self) -> &ParticipantId {
+        &self.id
+    }
+
+    pub fn video(&self) -> RemoteVideo {
+        RemoteVideo {
+            participant: self.clone(),
+        }
+    }
+
+    pub fn has_video(&self) -> bool {
+        self.agent
+            .inner
+            .publications
+            .borrow()
+            .values()
+            .any(|publication| {
+                publication.publisher_id() == self.id
+                    && publication.kind() == Some(str0m::media::MediaKind::Video)
+            })
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.agent
+            .inner
+            .publications
+            .borrow()
+            .values()
+            .any(|publication| {
+                publication.publisher_id() == self.id
+                    && publication.kind() == Some(str0m::media::MediaKind::Audio)
+            })
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteVideo {
+    participant: Participant,
+}
+
+impl RemoteVideo {
+    pub fn subscribe(&self) -> VideoSubscriber {
+        VideoSubscriber {
+            participant: self.participant.clone(),
+            height: 720,
+            min_height: 0,
+            priority: 0,
+        }
+    }
+}
+
+pub struct VideoSubscriber {
+    participant: Participant,
+    height: u32,
+    min_height: u32,
+    priority: u32,
+}
+
+impl VideoSubscriber {
+    pub fn target_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+
+    pub fn minimum_height(mut self, height: u32) -> Self {
+        self.min_height = height;
+        self
+    }
+
+    pub fn priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    async fn resolve(self) -> Result<RemoteTrack, AgentError> {
+        let mut publications = self.participant.agent.inner.publications.clone();
+        loop {
+            let matching: Vec<_> = publications
+                .borrow()
+                .values()
+                .filter(|publication| {
+                    publication.publisher_id() == self.participant.id
+                        && publication.kind() == Some(str0m::media::MediaKind::Video)
+                })
+                .map(|publication| publication.id().to_owned())
+                .collect();
+            debug_assert!(matching.len() <= 1);
+            if let Some(track_id) = matching.into_iter().next() {
+                return self
+                    .participant
+                    .agent
+                    .media()
+                    .subscribe(
+                        crate::manager::VideoSubscription::new(track_id)
+                            .target_height(self.height)
+                            .minimum_height(self.min_height)
+                            .priority(self.priority),
+                    )
+                    .await;
+            }
+            publications
+                .changed()
+                .await
+                .map_err(|_| AgentError::Closed)?;
+        }
+    }
+}
+
+impl IntoFuture for VideoSubscriber {
+    type Output = Result<RemoteTrack, AgentError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.resolve())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParticipantAvailability {
+    video: bool,
+    audio: bool,
+}
+
+pub enum ParticipantChange {
+    Joined(Participant),
+    Updated(Participant),
+    Left(ParticipantId),
+}
+
+pub struct Participants {
+    agent: Agent,
+    publications: watch::Receiver<Arc<HashMap<String, Publication>>>,
+    known: HashMap<ParticipantId, ParticipantAvailability>,
+    pending: VecDeque<ParticipantChange>,
+}
+
+impl Participants {
+    fn new(agent: Agent) -> Self {
+        let publications = agent.inner.publications.clone();
+        let known = participant_availability(&publications.borrow());
+        let pending = known
+            .keys()
+            .cloned()
+            .map(|id| ParticipantChange::Joined(agent.participant(id)))
+            .collect();
+        Self {
+            agent,
+            publications,
+            known,
+            pending,
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<ParticipantChange, AgentError> {
+        loop {
+            if let Some(change) = self.pending.pop_front() {
+                return Ok(change);
+            }
+            self.publications
+                .changed()
+                .await
+                .map_err(|_| AgentError::Closed)?;
+            let current = participant_availability(&self.publications.borrow());
+            for (id, availability) in &current {
+                match self.known.get(id) {
+                    None => self.pending.push_back(ParticipantChange::Joined(
+                        self.agent.participant(id.clone()),
+                    )),
+                    Some(previous) if previous != availability => self.pending.push_back(
+                        ParticipantChange::Updated(self.agent.participant(id.clone())),
+                    ),
+                    Some(_) => {}
+                }
+            }
+            for id in self.known.keys() {
+                if !current.contains_key(id) {
+                    self.pending.push_back(ParticipantChange::Left(id.clone()));
+                }
+            }
+            self.known = current;
+        }
+    }
+
+    pub async fn joined(&mut self) -> Result<Participant, AgentError> {
+        loop {
+            if let ParticipantChange::Joined(participant) = self.next().await? {
+                return Ok(participant);
+            }
+        }
+    }
+}
+
+fn participant_availability(
+    publications: &HashMap<String, Publication>,
+) -> HashMap<ParticipantId, ParticipantAvailability> {
+    let mut participants = HashMap::new();
+    for publication in publications.values() {
+        let availability = participants
+            .entry(publication.publisher_id().to_owned())
+            .or_insert(ParticipantAvailability {
+                video: false,
+                audio: false,
+            });
+        match publication.kind() {
+            Some(str0m::media::MediaKind::Video) => availability.video = true,
+            Some(str0m::media::MediaKind::Audio) => availability.audio = true,
+            None => {}
+        }
+    }
+    participants
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsebeam_proto::signaling::Track;
+
+    #[test]
+    fn publications_collapse_into_participant_availability() {
+        let publications = [
+            (
+                "video".to_owned(),
+                Publication::from_signaling(Track {
+                    id: "video".into(),
+                    kind: 1,
+                    participant_id: "alice".into(),
+                    meta: HashMap::new(),
+                }),
+            ),
+            (
+                "audio".to_owned(),
+                Publication::from_signaling(Track {
+                    id: "audio".into(),
+                    kind: 2,
+                    participant_id: "alice".into(),
+                    meta: HashMap::new(),
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let participants = participant_availability(&publications);
+
+        assert_eq!(participants.len(), 1);
+        assert_eq!(
+            participants["alice"],
+            ParticipantAvailability {
+                video: true,
+                audio: true,
+            }
+        );
+    }
+}
+
+impl Agent {
+    pub async fn close(&self) -> Result<(), AgentError> {
+        let (response, closed) = tokio::sync::oneshot::channel();
+        self.inner
+            .commands
+            .send(OutgoingCommand::Shutdown(response))
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        closed.await.map_err(|_| AgentError::Closed)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct Topic {
+    agent: Agent,
+    name: String,
+}
+
+impl Topic {
+    pub fn publisher(&self) -> PublisherBuilder {
+        PublisherBuilder {
+            agent: self.agent.clone(),
+            topic: self.name.clone(),
+        }
+    }
+
+    pub fn subscriber(&self) -> SubscriberBuilder {
+        SubscriberBuilder {
+            agent: self.agent.clone(),
+            topic: self.name.clone(),
+            publisher_id: None,
+        }
+    }
+}
+
+pub struct PublisherBuilder {
+    agent: Agent,
+    topic: String,
+}
+
+impl PublisherBuilder {
+    pub fn ordered(self) -> OrderedPublisherBuilder {
+        OrderedPublisherBuilder(self)
+    }
+
+    pub fn latest(self) -> LatestPublisherBuilder {
+        LatestPublisherBuilder(self)
+    }
+}
+
+pub struct SubscriberBuilder {
+    agent: Agent,
+    topic: String,
+    publisher_id: Option<String>,
+}
+
+impl SubscriberBuilder {
+    pub fn ordered(self) -> OrderedSubscriberBuilder {
+        OrderedSubscriberBuilder(self)
+    }
+
+    pub fn latest(self) -> LatestSubscriberBuilder {
+        LatestSubscriberBuilder(self)
+    }
+}
+
+pub struct OrderedPublisherBuilder(PublisherBuilder);
+pub struct LatestPublisherBuilder(PublisherBuilder);
+pub struct OrderedSubscriberBuilder(SubscriberBuilder);
+pub struct LatestSubscriberBuilder(SubscriberBuilder);
+
+impl OrderedPublisherBuilder {
+    async fn resolve(self) -> Result<OrderedTopicPublisher, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.0
+            .agent
+            .inner
+            .commands
+            .send(OutgoingCommand::DeclareOrderedPublisher {
+                topic: self.0.topic,
+                response,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+}
+
+impl LatestPublisherBuilder {
+    async fn resolve(self) -> Result<DataPublisher, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.0
+            .agent
+            .inner
+            .commands
+            .send(OutgoingCommand::DeclareLatestPublisher {
+                topic: self.0.topic,
+                response,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+}
+
+impl OrderedSubscriberBuilder {
+    async fn resolve(self) -> Result<OrderedTopicSubscriber, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.0
+            .agent
+            .inner
+            .commands
+            .send(OutgoingCommand::DeclareOrderedSubscriber {
+                topic: self.0.topic,
+                response,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+}
+
+impl LatestSubscriberBuilder {
+    pub fn from_publisher(mut self, publisher_id: impl Into<String>) -> Self {
+        let publisher_id = publisher_id.into();
+        debug_assert!(!publisher_id.is_empty());
+        self.0.publisher_id = Some(publisher_id);
+        self
+    }
+
+    async fn resolve(self) -> Result<DataSubscriber, AgentError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.0
+            .agent
+            .inner
+            .commands
+            .send(OutgoingCommand::DeclareLatestSubscriber {
+                topic: self.0.topic,
+                publisher_id: self.0.publisher_id,
+                response,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+}
+
+impl IntoFuture for OrderedPublisherBuilder {
+    type Output = Result<OrderedTopicPublisher, AgentError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.resolve())
+    }
+}
+
+impl IntoFuture for LatestPublisherBuilder {
+    type Output = Result<DataPublisher, AgentError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.resolve())
+    }
+}
+
+impl IntoFuture for OrderedSubscriberBuilder {
+    type Output = Result<OrderedTopicSubscriber, AgentError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.resolve())
+    }
+}
+
+impl IntoFuture for LatestSubscriberBuilder {
+    type Output = Result<DataSubscriber, AgentError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.resolve())
+    }
+}
+
+pub struct AgentRunner {
+    driver: AgentDriver,
+    stats: watch::Sender<Arc<StatisticsSnapshot>>,
+    connection: watch::Sender<ConnectionState>,
+    publications: watch::Sender<Arc<HashMap<String, Publication>>>,
+    publication_state: HashMap<String, Publication>,
+}
+
+impl AgentRunner {
+    pub(crate) fn new(driver: AgentDriver) -> (Agent, Self) {
+        let participant_id = driver.participant_id().clone();
+        let commands = driver.command_sender();
+        let (stats, stats_rx) = watch::channel(Arc::new(driver.stats().clone()));
+        let (connection, connection_rx) = watch::channel(ConnectionState::Connecting);
+        let (publications, publication_rx) = watch::channel(Arc::new(HashMap::new()));
+        let agent = Agent {
+            inner: Arc::new(AgentInner {
+                participant_id,
+                commands,
+                stats: stats_rx,
+                connection: connection_rx,
+                publications: publication_rx,
+            }),
+        };
+        (
+            agent,
+            Self {
+                driver,
+                stats,
+                connection,
+                publications,
+                publication_state: HashMap::new(),
+            },
+        )
+    }
+
+    pub async fn run(mut self) -> Result<(), AgentError> {
+        while let Some(event) = self.driver.poll().await {
+            match event {
+                AgentEvent::StatsUpdated => {
+                    self.stats
+                        .send_replace(Arc::new(self.driver.stats().clone()));
+                }
+                AgentEvent::RemoteTrackDiscovered(track) => {
+                    let publication = Publication::from_signaling(track);
+                    self.publication_state
+                        .insert(publication.id().to_owned(), publication);
+                    self.publish_publications();
+                }
+                AgentEvent::RemoteTrackRemoved(track_id) => {
+                    self.publication_state.remove(&track_id);
+                    self.publish_publications();
+                }
+                AgentEvent::Connected => {
+                    let _ = self.connection.send(ConnectionState::Connected);
+                }
+                AgentEvent::Disconnected(reason) => {
+                    let _ = self
+                        .connection
+                        .send(ConnectionState::Reconnecting { reason });
+                }
+            }
+        }
+        self.driver.shutdown().await;
+        for response in self.driver.take_shutdown_responses() {
+            let _ = response.send(());
+        }
+        let _ = self.connection.send(ConnectionState::Closed {
+            reason: "agent runner stopped".into(),
+        });
+        Ok(())
+    }
+
+    fn publish_publications(&self) {
+        let _ = self
+            .publications
+            .send(Arc::new(self.publication_state.clone()));
+    }
+}

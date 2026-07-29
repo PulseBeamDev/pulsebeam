@@ -76,6 +76,31 @@ pub enum ParticipantControlEvent {
         publisher: Option<ParticipantId>,
     },
     KeyframeRequested(GlobalKeyframeRequest),
+    ReliableDataTopicPublished {
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    },
+    ReliableDataTopicUnpublished {
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    },
+    ReliableDataTopicSubscribed {
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: Topic,
+    },
+    ReliableDataTopicUnsubscribed {
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: Topic,
+    },
+    ReliableControlReceived {
+        publisher: ParticipantId,
+        topic: Topic,
+        bytes: Vec<u8>,
+    },
 }
 
 pub(crate) struct EventPipeline {
@@ -83,6 +108,7 @@ pub(crate) struct EventPipeline {
     audio_queue: VecDeque<AudioRtpEvent>,
     video_queue: VecDeque<VideoRtpEvent>,
     data_queue: VecDeque<SctpEvent>,
+    reliable_data_queue: VecDeque<SctpEvent>,
     shard_events: VecDeque<ShardEvent>,
 }
 
@@ -93,6 +119,7 @@ impl EventPipeline {
             audio_queue: VecDeque::with_capacity(cap),
             video_queue: VecDeque::with_capacity(cap),
             data_queue: VecDeque::with_capacity(cap),
+            reliable_data_queue: VecDeque::with_capacity(cap),
             shard_events: VecDeque::with_capacity(cap),
         }
     }
@@ -123,6 +150,10 @@ impl EventPipeline {
 
     pub fn pop_data_sctp(&mut self) -> Option<SctpEvent> {
         self.data_queue.pop_front()
+    }
+
+    pub fn pop_reliable_data_sctp(&mut self) -> Option<SctpEvent> {
+        self.reliable_data_queue.pop_front()
     }
 
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
@@ -290,5 +321,80 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             room_id: self.room_id,
             origin: self.id,
         });
+    }
+
+    #[inline]
+    fn publish_reliable_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::ReliableDataTopicPublished {
+                    room_id: self.room_id,
+                    publisher: self.id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn unpublish_reliable_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::ReliableDataTopicUnpublished {
+                    room_id: self.room_id,
+                    publisher: self.id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn subscribe_reliable_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::ReliableDataTopicSubscribed {
+                    room_id: self.room_id,
+                    subscriber: self.id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn unsubscribe_reliable_data_topic(&mut self, topic: Topic) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::ReliableDataTopicUnsubscribed {
+                    room_id: self.room_id,
+                    subscriber: self.id,
+                    topic,
+                },
+            ));
+    }
+
+    #[inline]
+    fn publish_reliable_sctp(&mut self, topic: Topic, frame: Vec<u8>) {
+        self.pipeline.reliable_data_queue.push_back(SctpEvent {
+            topic,
+            pkt: frame,
+            room_id: self.room_id,
+            origin: self.id,
+        });
+    }
+
+    #[inline]
+    fn forward_reliable_control(&mut self, publisher: ParticipantId, topic: Topic, bytes: Vec<u8>) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ParticipantControlEvent::ReliableControlReceived {
+                    publisher,
+                    topic,
+                    bytes,
+                },
+            ));
     }
 }

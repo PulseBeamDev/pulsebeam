@@ -103,6 +103,17 @@ pub enum CrossShardEvent {
         topic: Topic,
         pkt: Vec<u8>,
     },
+    ReliableDataSctpPublished {
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: Topic,
+        frame: Vec<u8>,
+    },
+    ReliableControlForward {
+        publisher: ParticipantId,
+        topic: Topic,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug)]

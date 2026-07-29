@@ -156,3 +156,192 @@ fn data_channel_scoped_subscribe_routing_test() {
             },
         ]);
 }
+
+#[test]
+fn ordered_topic_delivers_every_message_in_order() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_micros(100))
+        .with_room(
+            Room::new("room-ordered")
+                .with_participant(Participant::data_participant("pub"))
+                .with_participant(Participant::data_participant("sub")),
+        )
+        .run(vec![
+            Step::DeclareOrderedPublisher {
+                description: "Declare ordered publisher",
+                participant: "pub",
+                topic: "boxes",
+            },
+            Step::DeclareOrderedSubscriber {
+                description: "Declare ordered subscriber",
+                participant: "sub",
+                topic: "boxes",
+            },
+            Step::Run {
+                description: "Open ordered channels",
+                duration: Duration::from_millis(500),
+            },
+            Step::PublishOrdered {
+                description: "Create box",
+                participant: "pub",
+                topic: "boxes",
+                data: b"create:box-1",
+            },
+            Step::PublishOrdered {
+                description: "Create another box",
+                participant: "pub",
+                topic: "boxes",
+                data: b"create:box-2",
+            },
+            Step::PublishOrdered {
+                description: "Delete first box",
+                participant: "pub",
+                topic: "boxes",
+                data: b"delete:box-1",
+            },
+            Step::Run {
+                description: "Deliver ordered lifecycle",
+                duration: Duration::from_millis(500),
+            },
+            Step::CheckDataSequence {
+                description: "Lifecycle messages remain complete and ordered",
+                participant: "sub",
+                topic: "boxes",
+                expected: &[b"create:box-1", b"create:box-2", b"delete:box-1"],
+            },
+        ]);
+}
+
+#[test]
+fn latest_topic_eventually_delivers_newest_state() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_micros(100))
+        .with_room(
+            Room::new("room-latest")
+                .with_participant(Participant::data_participant("pub"))
+                .with_participant(Participant::data_participant("sub")),
+        )
+        .run(vec![
+            Step::DeclarePublishTopic {
+                description: "Declare latest publisher",
+                participant: "pub",
+                topic: "pose",
+            },
+            Step::DeclareSubscribeTopic {
+                description: "Declare latest subscriber",
+                participant: "sub",
+                topic: "pose",
+                scoped_to: None,
+            },
+            Step::Run {
+                description: "Open latest channels",
+                duration: Duration::from_millis(500),
+            },
+            Step::PublishData {
+                description: "Publish old pose",
+                participant: "pub",
+                topic: "pose",
+                data: b"pose:1",
+            },
+            Step::PublishData {
+                description: "Publish intermediate pose",
+                participant: "pub",
+                topic: "pose",
+                data: b"pose:2",
+            },
+            Step::PublishData {
+                description: "Publish newest pose",
+                participant: "pub",
+                topic: "pose",
+                data: b"pose:3",
+            },
+            Step::Run {
+                description: "Deliver newest state",
+                duration: Duration::from_millis(300),
+            },
+            Step::CheckDataReceived {
+                description: "Newest state arrives",
+                participant: "sub",
+                topic: "pose",
+                expected: b"pose:3",
+            },
+        ]);
+}
+
+#[test]
+fn ordered_topic_continues_after_publisher_reconnect() {
+    LocalNodeSim::new()
+        .with_tick(Duration::from_micros(100))
+        .with_room(
+            Room::new("room-ordered-reconnect")
+                .with_participant(Participant::data_participant("pub"))
+                .with_participant(Participant::data_participant("sub")),
+        )
+        .run(vec![
+            Step::DeclareOrderedPublisher {
+                description: "Declare first ordered stream",
+                participant: "pub",
+                topic: "boxes",
+            },
+            Step::DeclareOrderedSubscriber {
+                description: "Declare persistent subscriber",
+                participant: "sub",
+                topic: "boxes",
+            },
+            Step::Run {
+                description: "Open first stream",
+                duration: Duration::from_millis(500),
+            },
+            Step::PublishOrdered {
+                description: "Send before reconnect",
+                participant: "pub",
+                topic: "boxes",
+                data: b"create:before",
+            },
+            Step::Run {
+                description: "Deliver before reconnect",
+                duration: Duration::from_millis(300),
+            },
+            Step::Disconnect {
+                description: "Disconnect publisher",
+                participant: "pub",
+            },
+            Step::Run {
+                description: "Observe publisher departure",
+                duration: Duration::from_millis(300),
+            },
+            Step::Reconnect {
+                description: "Reconnect publisher",
+                participant: "pub",
+            },
+            Step::Run {
+                description: "Establish replacement connection",
+                duration: Duration::from_secs(2),
+            },
+            Step::DeclareOrderedPublisher {
+                description: "Declare replacement ordered stream",
+                participant: "pub",
+                topic: "boxes",
+            },
+            Step::Run {
+                description: "Open replacement stream",
+                duration: Duration::from_millis(500),
+            },
+            Step::PublishOrdered {
+                description: "Send after reconnect",
+                participant: "pub",
+                topic: "boxes",
+                data: b"create:after",
+            },
+            Step::Run {
+                description: "Deliver after reconnect",
+                duration: Duration::from_millis(500),
+            },
+            Step::CheckDataSequence {
+                description: "Both stream generations deliver exactly once",
+                participant: "sub",
+                topic: "boxes",
+                expected: &[b"create:before", b"create:after"],
+            },
+        ]);
+}

@@ -512,17 +512,39 @@ mod data_track {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum DataLane {
+        Realtime,
+        Reliable,
+    }
+
+    impl DataLane {
+        fn as_str(self) -> &'static str {
+            match self {
+                DataLane::Realtime => "rt",
+                DataLane::Reliable => "rel",
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct DataTopicChannel {
         pub direction: DataTrackDirection,
         pub topic: crate::track::Topic,
         pub scope: Option<ParticipantId>,
+        pub lane: DataLane,
     }
 
     impl Display for DataTopicChannel {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             debug_assert!(self.direction == DataTrackDirection::Subscribe || self.scope.is_none());
-            write!(f, "v1/rt/{}/{}", self.direction, self.topic)?;
+            write!(
+                f,
+                "v1/{}/{}/{}",
+                self.lane.as_str(),
+                self.direction,
+                self.topic
+            )?;
             if let Some(scope) = &self.scope {
                 write!(f, "/{}", scope.as_str())?;
             }
@@ -544,7 +566,7 @@ mod data_track {
         #[error("Invalid or missing API version protocol prefix (expected 'v1')")]
         InvalidVersion,
 
-        #[error("Invalid transport lane identifier (expected 'sys' or 'rt')")]
+        #[error("Invalid transport lane identifier (expected 'sys', 'rt', or 'rel')")]
         InvalidLane,
 
         #[error("Invalid routing direction parameter (expected 'pub' or 'sub')")]
@@ -572,6 +594,9 @@ mod data_track {
 
         #[error("Publish channels cannot carry a publisher scope segment")]
         ScopeNotAllowedForPublish,
+
+        #[error("Reliable subscribe channels cannot carry a publisher scope segment")]
+        ScopeNotAllowedForReliableSubscribe,
     }
 
     impl TryFrom<&ChannelConfig> for DataTrackIntent {
@@ -589,7 +614,6 @@ mod data_track {
                 return Err(DataTrackIntentError::InvalidVersion);
             }
 
-            // Branch cleanly based on the lane type (sys vs rt)
             match parts.next() {
                 Some("sys") => {
                     if parts.next() == Some("signaling") && parts.next().is_none() {
@@ -598,11 +622,24 @@ mod data_track {
                         Err(DataTrackIntentError::InvalidDirection)
                     }
                 }
-                Some("rt") => {
-                    let supported_delivery_guarantee = matches!(
-                        cfg.reliability,
-                        Reliability::MaxRetransmits { retransmits: 0 }
-                    ) && !cfg.ordered;
+                lane_str @ (Some("rt") | Some("rel")) => {
+                    let lane = if lane_str == Some("rel") {
+                        DataLane::Reliable
+                    } else {
+                        DataLane::Realtime
+                    };
+
+                    let supported_delivery_guarantee = match lane {
+                        DataLane::Realtime => {
+                            matches!(
+                                cfg.reliability,
+                                Reliability::MaxRetransmits { retransmits: 0 }
+                            ) && !cfg.ordered
+                        }
+                        DataLane::Reliable => {
+                            matches!(cfg.reliability, Reliability::Reliable) && cfg.ordered
+                        }
+                    };
                     if !supported_delivery_guarantee {
                         return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
                             label: s.clone(),
@@ -631,13 +668,16 @@ mod data_track {
                     }
 
                     let scope_slice = parts.next();
-                    let scope = match (direction, scope_slice) {
-                        (DataTrackDirection::Publish, Some(_)) => {
+                    let scope = match (lane, direction, scope_slice) {
+                        (_, DataTrackDirection::Publish, Some(_)) => {
                             return Err(DataTrackIntentError::ScopeNotAllowedForPublish);
                         }
-                        (DataTrackDirection::Publish, None) => None,
-                        (DataTrackDirection::Subscribe, None) => None,
-                        (DataTrackDirection::Subscribe, Some(raw)) => {
+                        (_, DataTrackDirection::Publish, None) => None,
+                        (_, DataTrackDirection::Subscribe, None) => None,
+                        (DataLane::Reliable, DataTrackDirection::Subscribe, Some(_)) => {
+                            return Err(DataTrackIntentError::ScopeNotAllowedForReliableSubscribe);
+                        }
+                        (_, DataTrackDirection::Subscribe, Some(raw)) => {
                             if raw.is_empty() {
                                 return Err(DataTrackIntentError::InvalidScope(raw.to_string()));
                             }
@@ -653,6 +693,7 @@ mod data_track {
                         direction,
                         topic: Topic(topic_slice.to_string()),
                         scope,
+                        lane,
                     };
                     Ok(Self::UserTopic(topic))
                 }
@@ -684,6 +725,16 @@ mod data_track {
             }
         }
 
+        fn rel_cfg(label: &str) -> ChannelConfig {
+            ChannelConfig {
+                label: label.to_string(),
+                ordered: true,
+                reliability: Reliability::Reliable,
+                negotiated: None,
+                protocol: "".to_string(),
+            }
+        }
+
         #[test]
         fn test_modern_system_routing() {
             let res = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap();
@@ -703,11 +754,11 @@ mod data_track {
 
         #[test]
         fn test_valid_user_topics() {
-            // Publish path
             let res = DataTrackIntent::try_from(&cfg("v1/rt/pub/game-sync")).unwrap();
             if let DataTrackIntent::UserTopic(e) = res {
                 assert_eq!(e.direction, DataTrackDirection::Publish);
                 assert_eq!(e.topic.deref(), "game-sync");
+                assert_eq!(e.lane, DataLane::Realtime);
             } else {
                 panic!("Expected UserTopic variant");
             }
@@ -717,9 +768,75 @@ mod data_track {
                 assert_eq!(e.direction, DataTrackDirection::Subscribe);
                 assert_eq!(e.topic.deref(), "audio_stream_12");
                 assert_eq!(e.scope, None);
+                assert_eq!(e.lane, DataLane::Realtime);
             } else {
                 panic!("Expected UserTopic variant");
             }
+        }
+
+        #[test]
+        fn test_reliable_publish() {
+            let res = DataTrackIntent::try_from(&rel_cfg("v1/rel/pub/chat")).unwrap();
+            if let DataTrackIntent::UserTopic(e) = res {
+                assert_eq!(e.direction, DataTrackDirection::Publish);
+                assert_eq!(e.topic.deref(), "chat");
+                assert_eq!(e.lane, DataLane::Reliable);
+                assert_eq!(e.scope, None);
+            } else {
+                panic!("Expected UserTopic variant");
+            }
+        }
+
+        #[test]
+        fn test_reliable_subscribe_is_topic_wide() {
+            let res = DataTrackIntent::try_from(&rel_cfg("v1/rel/sub/chat")).unwrap();
+            let DataTrackIntent::UserTopic(channel) = res else {
+                panic!("Expected UserTopic variant");
+            };
+            assert_eq!(channel.direction, DataTrackDirection::Subscribe);
+            assert_eq!(channel.topic.deref(), "chat");
+            assert_eq!(channel.lane, DataLane::Reliable);
+            assert_eq!(channel.scope, None);
+        }
+
+        #[test]
+        fn test_reliable_subscribe_rejects_publisher_scope() {
+            let mut rng = test_rng();
+            let publisher_id = ParticipantId::new(&mut rng);
+            let label = format!("v1/rel/sub/chat/{}", publisher_id.as_str());
+            let err = DataTrackIntent::try_from(&rel_cfg(&label)).unwrap_err();
+            assert_eq!(
+                err,
+                DataTrackIntentError::ScopeNotAllowedForReliableSubscribe
+            );
+        }
+
+        #[test]
+        fn test_reliable_wrong_channel_config() {
+            let err = DataTrackIntent::try_from(&cfg("v1/rel/pub/chat")).unwrap_err();
+            assert!(matches!(
+                err,
+                DataTrackIntentError::UnsupportedDataChannelConfig { .. }
+            ));
+        }
+
+        #[test]
+        fn test_reliable_display() {
+            let pub_ch = DataTopicChannel {
+                direction: DataTrackDirection::Publish,
+                topic: Topic("chat".to_string()),
+                scope: None,
+                lane: DataLane::Reliable,
+            };
+            assert_eq!(pub_ch.to_string(), "v1/rel/pub/chat");
+
+            let sub_ch = DataTopicChannel {
+                direction: DataTrackDirection::Subscribe,
+                topic: Topic("chat".to_string()),
+                scope: None,
+                lane: DataLane::Reliable,
+            };
+            assert_eq!(sub_ch.to_string(), "v1/rel/sub/chat");
         }
 
         #[test]

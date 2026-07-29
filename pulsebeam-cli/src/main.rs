@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pulsebeam_agent::{
-    MediaKind, Rid, SimulcastLayer, TransceiverDirection,
-    actor::{AgentBuilder, AgentEvent},
+    ParticipantChange, SimulcastLayer,
+    actor::AgentBuilder,
     agent::RemoteTrack,
     api::HttpApiClient,
     clock::clock_anchor,
@@ -10,7 +10,7 @@ use pulsebeam_agent::{
     wallclock_at,
 };
 use pulsebeam_core::net::UdpSocket;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tachyonix as mpsc;
 use tokio::{fs::File, io::BufWriter};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
@@ -230,9 +230,8 @@ async fn spawn_agent(
     let mut builder = AgentBuilder::new(api, socket).with_local_ip("127.0.0.1".parse().unwrap());
 
     if simulcast {
-        builder = builder.with_track(
-            MediaKind::Video,
-            TransceiverDirection::SendOnly,
+        builder = builder.video_upstream_slots(
+            1,
             Some(vec![
                 SimulcastLayer::new("q"),
                 SimulcastLayer::new("h"),
@@ -240,19 +239,22 @@ async fn spawn_agent(
             ]),
         );
     } else {
-        builder = builder.with_track(MediaKind::Video, TransceiverDirection::SendOnly, None);
+        builder = builder.video_upstream_slots(1, None);
     }
-    builder = builder.with_track(MediaKind::Audio, TransceiverDirection::SendOnly, None);
+    builder = builder
+        .audio_upstream_slots(1)
+        .video_downstream_slots(7)
+        .audio_downstream_slots(3);
 
-    for _ in 0..7 {
-        builder = builder.with_track(MediaKind::Video, TransceiverDirection::RecvOnly, None);
+    let agent = builder.connect(&room_name).await?;
+    let camera = agent.media().publish_video().await?;
+    for encoding in camera.encodings().iter().cloned() {
+        let looper = get_looper(encoding.rid(), &ctx.assets);
+        tokio::spawn(looper.run(encoding));
     }
-    for _ in 0..3 {
-        builder = builder.with_track(MediaKind::Audio, TransceiverDirection::RecvOnly, None);
-    }
-
-    let mut driver = builder.connect(&room_name).await?;
-
+    let _microphone = agent.media().publish_audio().await?;
+    let mut participants = agent.participants();
+    let mut subscribed_participants = HashSet::new();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -265,21 +267,14 @@ async fn spawn_agent(
             biased;
             _ = &mut session_end => break,
             _ = stats_interval.tick() => {
-                let stats = driver.stats();
-                let peer = stats.peer.as_ref();
-
-                let tx_bytes = peer.map(|p| p.bytes_tx).unwrap_or(0);
-                let rx_bytes = peer.map(|p| p.bytes_rx).unwrap_or(0);
-                let rtt_us = peer
-                    .and_then(|p| p.selected_candidate_pair.as_ref())
-                    .and_then(|r| r.current_round_trip_time)
-                    .map(|r| r.as_micros() as u64).unwrap_or(0);
-
-                let loss_pct = stats.tracks.values()
-                    .flat_map(|t| t.rx_layers.values())
-                    .filter_map(|layer| layer.loss)
-                    .next()
-                    .unwrap_or(0.0);
+                let stats = agent.stats().current();
+                let tx_bytes = stats.bytes_sent();
+                let rx_bytes = stats.bytes_received();
+                let rtt_us = stats
+                    .round_trip_time()
+                    .map(|rtt| rtt.as_micros() as u64)
+                    .unwrap_or(0);
+                let loss_pct = stats.receive_loss().unwrap_or(0.0);
 
                 let _ = ctx.logger.snapshot.try_send(EventSnapshot {
                     captured_at: Instant::now(),
@@ -291,23 +286,26 @@ async fn spawn_agent(
                     loss_pct,
                 });
             }
-            Some(event) = driver.poll() => {
-                match event {
-                    AgentEvent::LocalTrackAdded(track) => {
-                        if track.kind.is_video() {
-                            let looper = get_looper(&track.rid, &ctx.assets);
-                            tokio::spawn(looper.run(track));
+            result = participants.next() => {
+                let participant = match result {
+                    Ok(ParticipantChange::Joined(participant)) => participant,
+                    Ok(ParticipantChange::Updated(_)) | Ok(ParticipantChange::Left(_)) => continue,
+                    Err(_) => break,
+                };
+                if subscribed_participants.insert(participant.id().clone()) {
+                    let ctx = ctx.clone();
+                    join_set.spawn(async move {
+                        match participant.video().subscribe().await {
+                            Ok(track) => handle_receiving(track, ctx).await,
+                            Err(error) => tracing::warn!(%error, "failed to subscribe to participant video"),
                         }
-                    }
-                    AgentEvent::RemoteTrackAdded(t) => {
-                        join_set.spawn(handle_receiving(t, ctx.clone()));
-                    }
-                    AgentEvent::Connected | AgentEvent::Disconnected(_) | AgentEvent::RemoteTrackDiscovered(_) | AgentEvent::DataPublisherDeclared(_) | AgentEvent::DataSubscriberDeclared(_)  => {}
+                    });
                 }
             }
         }
     }
 
+    agent.close().await?;
     join_set.join_all().await;
     Ok(())
 }
@@ -387,8 +385,8 @@ async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File)
     Ok(())
 }
 
-fn get_looper(rid: &Option<Rid>, assets: &VideoAssets) -> H264Looper {
-    let data = match rid.as_ref().map(|r| r.as_ref()) {
+fn get_looper(rid: Option<&str>, assets: &VideoAssets) -> H264Looper {
+    let data = match rid {
         Some("f") => &assets.full,
         Some("h") => &assets.half,
         Some("q") => &assets.quarter,

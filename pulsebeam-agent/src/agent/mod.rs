@@ -3,11 +3,12 @@ mod controller;
 mod driver;
 mod handles;
 mod mailbox;
+mod ordered_topic;
+mod session;
 mod slots;
 
 pub use builder::AgentBuilder;
-pub use driver::{
-    AgentDriver, AgentError, AgentEvent, AgentStats, ParticipantId, TrackStats, VideoPreset,
-};
+pub use driver::{AgentError, ParticipantId, StatisticsSnapshot, VideoPreset};
 pub use handles::*;
-pub use mailbox::*;
+pub use mailbox::{RecvError, SendError, TryRecvError, TrySendError};
+pub use session::*;

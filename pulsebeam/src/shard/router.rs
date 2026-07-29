@@ -7,6 +7,7 @@ use str0m::media::KeyframeRequestKind;
 
 use super::events::{AudioRtpEvent, ParticipantControlEvent, ParticipantTopologyEvent};
 use super::participants::ParticipantHandle;
+use super::reliable::ReliableRoutes;
 use crate::audio_selector::TopNAudioSelector;
 use crate::entity::{ParticipantId, RoomId, TrackId, TrackKind};
 use crate::id::{AudioSelectorSlotId, ShardId};
@@ -63,6 +64,15 @@ pub(crate) trait RoutingContext: CrossShardSend {
         kind: KeyframeRequestKind,
     );
     fn is_local(&self, id: &ParticipantId) -> bool;
+
+    fn forward_reliable_sctp(
+        &mut self,
+        subscriber: ParticipantId,
+        origin: ParticipantId,
+        topic: &Topic,
+        frame: &[u8],
+    );
+    fn deliver_reliable_control(&mut self, publisher: ParticipantId, topic: &Topic, bytes: &[u8]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +87,7 @@ pub(crate) struct ShardRoomContext {
     pub audio_selector: TopNAudioSelector,
     pub data_streams: HashMap<DataStreamId, DataStreamRoute>,
     pub all_publisher_subscriptions: AllPublisherSubscriptions,
+    reliable: ReliableRoutes,
 }
 
 impl ShardRoomContext {
@@ -87,6 +98,7 @@ impl ShardRoomContext {
             audio_selector: TopNAudioSelector::new(rng),
             data_streams: HashMap::default(),
             all_publisher_subscriptions: AllPublisherSubscriptions::new(),
+            reliable: ReliableRoutes::new(),
         }
     }
 }
@@ -275,6 +287,7 @@ impl ShardRoutingTable {
             route.local_subscribers.swap_remove(participant_id);
         }
         room.data_streams.retain(|_, route| !route.is_unused());
+        room.reliable.remove_participant(participant_id);
         for id in audio_track_ids {
             room.audio_selector.remove_track((id, None));
         }
@@ -823,6 +836,103 @@ impl ShardRoutingTable {
             }
         }
     }
+
+    pub fn register_reliable_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        room.reliable.publish(publisher, topic);
+    }
+
+    pub fn unregister_reliable_data_publisher(
+        &mut self,
+        room_id: RoomId,
+        publisher: ParticipantId,
+        topic: &Topic,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        room.reliable.unpublish(publisher, topic);
+    }
+
+    pub fn register_reliable_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: Topic,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        room.reliable.subscribe_local(subscriber, topic)
+    }
+
+    pub fn unregister_reliable_data_subscriber(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        topic: &Topic,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return false;
+        };
+        room.reliable.unsubscribe_local(subscriber, topic)
+    }
+
+    pub fn route_reliable_data(
+        &mut self,
+        room_id: RoomId,
+        origin: ParticipantId,
+        topic: &Topic,
+        frame: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        let local_origin = ctx.is_local(&origin);
+        if local_origin {
+            for &shard_id in &room.remote_shards {
+                ctx.send(
+                    shard_id,
+                    CrossShardEvent::ReliableDataSctpPublished {
+                        room_id,
+                        origin,
+                        topic: topic.clone(),
+                        frame: frame.to_vec(),
+                    },
+                );
+            }
+        }
+        room.reliable.route(origin, topic, frame, local_origin, ctx);
+    }
+
+    pub fn route_reliable_control(
+        &self,
+        publisher: ParticipantId,
+        topic: &Topic,
+        bytes: &[u8],
+        ctx: &mut impl RoutingContext,
+    ) {
+        if ctx.is_local(&publisher) {
+            ctx.deliver_reliable_control(publisher, topic, bytes);
+        } else if let Some(shard_id) = self.remote_shard_for(&publisher) {
+            ctx.send(
+                shard_id,
+                CrossShardEvent::ReliableControlForward {
+                    publisher,
+                    topic: topic.clone(),
+                    bytes: bytes.to_vec(),
+                },
+            );
+        }
+    }
 }
 
 // -- participant-originated control-event routing -------------------------
@@ -877,6 +987,16 @@ pub(crate) fn route_participant_control_event(
                 subscriber = %subscriber,
                 topic = %topic.as_ref(),
                 "data topic unsubscribe is handled directly in shard core"
+            );
+        }
+        ParticipantControlEvent::ReliableDataTopicPublished { .. }
+        | ParticipantControlEvent::ReliableDataTopicUnpublished { .. }
+        | ParticipantControlEvent::ReliableDataTopicSubscribed { .. }
+        | ParticipantControlEvent::ReliableDataTopicUnsubscribed { .. }
+        | ParticipantControlEvent::ReliableControlReceived { .. } => {
+            debug_assert!(
+                false,
+                "reliable data channel events must be handled by shard core"
             );
         }
     }
@@ -968,6 +1088,24 @@ mod tests {
         }
         fn is_local(&self, id: &ParticipantId) -> bool {
             self.local.contains(id)
+        }
+
+        fn forward_reliable_sctp(
+            &mut self,
+            subscriber: ParticipantId,
+            _origin: ParticipantId,
+            _topic: &Topic,
+            _frame: &[u8],
+        ) {
+            self.forwarded_sctp.borrow_mut().push(subscriber);
+        }
+
+        fn deliver_reliable_control(
+            &mut self,
+            _publisher: ParticipantId,
+            _topic: &Topic,
+            _bytes: &[u8],
+        ) {
         }
     }
 
