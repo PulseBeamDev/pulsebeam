@@ -1,8 +1,9 @@
 use crate::MediaFrame;
 use crate::agent::controller::{BitrateController, BitrateControllerConfig, LayerController};
+use crate::agent::e2e_reliable::{ChannelReady, E2eReliable};
 use crate::agent::handles::{
-    DataPublisher, DataSubscriber, LocalTrack, OutgoingCommand, ReliableDataEvent,
-    ReliableDataMessage, ReliableDataPublisher, ReliableDataSubscriber, RemoteTrack,
+    DataPublisher, DataSubscriber, LocalTrack, OutgoingCommand, ReliableDataPublisher,
+    ReliableDataSubscriber, RemoteTrack,
 };
 use crate::agent::mailbox;
 use crate::agent::slots::SlotManager;
@@ -14,7 +15,6 @@ use http::Uri;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_proto::namespace;
 use pulsebeam_proto::prelude::Message;
-use pulsebeam_proto::reliable::{RelControl, RelMsg, RelNack, rel_control};
 use pulsebeam_proto::signaling::Track;
 use pulsebeam_proto::{signaling, signaling::ServerMessage};
 use std::collections::{HashMap, VecDeque};
@@ -153,40 +153,6 @@ fn parse_data_track_label(label: &str) -> Option<(DataTrackDirection, String, Op
     Some((direction, topic, scope))
 }
 
-fn reliable_data_track_label(
-    direction: DataTrackDirection,
-    topic: &str,
-    scope: Option<&str>,
-) -> String {
-    debug_assert!(!topic.is_empty());
-    let lane = match direction {
-        DataTrackDirection::Publish => "pub",
-        DataTrackDirection::Subscribe => "sub",
-    };
-    match scope {
-        Some(scope) => format!("v1/rel/{lane}/{topic}/{scope}"),
-        None => format!("v1/rel/{lane}/{topic}"),
-    }
-}
-
-fn parse_reliable_data_track_label(
-    label: &str,
-) -> Option<(DataTrackDirection, String, Option<String>)> {
-    let rest = label.strip_prefix("v1/rel/")?;
-    let (lane, rest) = rest.split_once('/')?;
-    let direction = match lane {
-        "pub" => DataTrackDirection::Publish,
-        "sub" => DataTrackDirection::Subscribe,
-        _ => return None,
-    };
-    let (topic, scope) = match rest.split_once('/') {
-        Some((topic, scope)) => (topic.to_string(), Some(scope.to_string())),
-        None => (rest.to_string(), None),
-    };
-    debug_assert!(!topic.is_empty());
-    Some((direction, topic, scope))
-}
-
 pub enum AgentEvent {
     DataPublisherDeclared(DataPublisher),
     DataSubscriberDeclared(DataSubscriber),
@@ -224,15 +190,6 @@ struct DataSubsystem {
     data_pub_topics: HashMap<String, DataPublisher>,
     data_sub_topics: HashMap<(String, Option<String>), DataSubscriber>,
     data_targets: HashMap<(String, Option<String>), mailbox::Sender<Vec<u8>>>,
-    rel_pub_stream_id: HashMap<String, u64>,
-    rel_pub_seq: HashMap<String, u64>,
-    rel_pub_channels: HashMap<ChannelId, String>,
-    rel_pub_buffer: HashMap<String, VecDeque<RelMsg>>,
-    rel_pub_topics: HashMap<String, ReliableDataPublisher>,
-    rel_sub_channels: HashMap<ChannelId, (String, String)>,
-    rel_sub_targets: HashMap<(String, String), mailbox::Sender<ReliableDataEvent>>,
-    rel_sub_last: HashMap<(String, String), (u64, u64)>,
-    rel_sub_topics: HashMap<(String, String), ReliableDataSubscriber>,
 }
 
 struct MediaSubsystem {
@@ -280,6 +237,7 @@ pub struct AgentDriver {
 
     network: NetworkSubsystem,
     data: DataSubsystem,
+    e2e_reliable: E2eReliable,
     media: MediaSubsystem,
     subscriptions: SubscriptionSubsystem,
     session: SessionSubsystem,
@@ -311,16 +269,8 @@ impl AgentDriver {
                 data_pub_topics: HashMap::new(),
                 data_sub_topics: HashMap::new(),
                 data_targets: HashMap::new(),
-                rel_pub_stream_id: HashMap::new(),
-                rel_pub_seq: HashMap::new(),
-                rel_pub_channels: HashMap::new(),
-                rel_pub_buffer: HashMap::new(),
-                rel_pub_topics: HashMap::new(),
-                rel_sub_channels: HashMap::new(),
-                rel_sub_targets: HashMap::new(),
-                rel_sub_last: HashMap::new(),
-                rel_sub_topics: HashMap::new(),
             },
+            e2e_reliable: E2eReliable::new(),
             media: MediaSubsystem {
                 media_targets: HashMap::new(),
                 layer_ctrl: LayerController::new(),
@@ -397,16 +347,13 @@ impl AgentDriver {
     }
 
     pub fn declare_reliable_publish_topic(&mut self, topic: &str) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_reliable_data_topic(DataTrackDirection::Publish, topic, None)?;
-        self.data.rel_pub_topics.insert(
-            topic.to_string(),
-            ReliableDataPublisher {
-                topic: topic.to_string(),
-                channel_id: cid,
-                tx: self.outgoing_tx.clone(),
-            },
-        );
-        Ok(cid)
+        self.e2e_reliable
+            .declare_publisher(&mut self.rtc, topic, self.outgoing_tx.clone())
+            .map_err(|()| {
+                AgentError::Protocol(
+                    "reliable channel declaration unexpectedly requires renegotiation".into(),
+                )
+            })
     }
 
     pub fn declare_reliable_subscribe_topic(
@@ -414,23 +361,13 @@ impl AgentDriver {
         topic: &str,
         publisher_id: &str,
     ) -> Result<ChannelId, AgentError> {
-        let cid = self.ensure_reliable_data_topic(
-            DataTrackDirection::Subscribe,
-            topic,
-            Some(publisher_id),
-        )?;
-        let (tx, rx) = mailbox::bounded(256);
-        let key = (topic.to_string(), publisher_id.to_string());
-        self.data.rel_sub_topics.insert(
-            key.clone(),
-            ReliableDataSubscriber {
-                topic: topic.to_string(),
-                publisher_id: publisher_id.to_string(),
-                rx,
-            },
-        );
-        self.data.rel_sub_targets.insert(key, tx);
-        Ok(cid)
+        self.e2e_reliable
+            .declare_subscriber(&mut self.rtc, topic, publisher_id)
+            .map_err(|()| {
+                AgentError::Protocol(
+                    "reliable channel declaration unexpectedly requires renegotiation".into(),
+                )
+            })
     }
 
     pub async fn shutdown(&mut self) {
@@ -606,37 +543,14 @@ impl AgentDriver {
     fn handle_outgoing_command(&mut self, cmd: OutgoingCommand) {
         match cmd {
             OutgoingCommand::SendData(e) => {
-                if let Some(topic) = self.data.rel_pub_channels.get(&e.channel_id).cloned() {
-                    let Some(&stream_id) = self.data.rel_pub_stream_id.get(&topic) else {
-                        return;
-                    };
-                    let seq = match self.data.rel_pub_seq.get_mut(&topic) {
-                        Some(s) => {
-                            let v = *s;
-                            *s += 1;
-                            v
-                        }
-                        None => return,
-                    };
-                    let msg = RelMsg {
-                        stream_id,
-                        seq,
-                        payload: e.payload,
-                    };
-                    let encoded = msg.encode_to_vec();
-                    let buf = self.data.rel_pub_buffer.entry(topic).or_default();
-                    if buf.len() >= 256 {
-                        buf.pop_front();
-                    }
-                    buf.push_back(msg);
-                    if let Some(mut ch) = self.rtc.channel(e.channel_id) {
-                        let _ = ch.write(true, &encoded);
-                    }
-                } else {
+                if let Err(payload) = self
+                    .e2e_reliable
+                    .send(&mut self.rtc, e.channel_id, e.payload)
+                {
                     let Some(mut channel) = self.rtc.channel(e.channel_id) else {
                         return;
                     };
-                    let _ = channel.write(true, &e.payload);
+                    let _ = channel.write(true, &payload);
                 }
             }
             OutgoingCommand::SendMedia(e) => {
@@ -735,53 +649,21 @@ impl AgentDriver {
                                     }
                                 }
                             }
-                        } else if let Some((direction, topic, scope)) =
-                            parse_reliable_data_track_label(&label)
-                        {
-                            match direction {
-                                DataTrackDirection::Publish => {
-                                    let stream_id = {
-                                        let s = self
-                                            .data
-                                            .rel_pub_stream_id
-                                            .entry(topic.clone())
-                                            .or_insert(0);
-                                        *s += 1;
-                                        *s
-                                    };
-                                    self.data.rel_pub_seq.insert(topic.clone(), 0);
-                                    self.data.rel_pub_channels.insert(cid, topic.clone());
-                                    self.data.rel_pub_buffer.entry(topic.clone()).or_default();
-                                    if let Some(h) = self.data.rel_pub_topics.get_mut(&topic) {
-                                        h.channel_id = cid;
-                                    }
-                                    let _ = stream_id;
-                                    if let Some(h) = self.data.rel_pub_topics.get(&topic).cloned() {
-                                        self.emit(AgentEvent::ReliableDataPublisherReady(h));
-                                    }
+                        } else if let Some(ready) = self.e2e_reliable.open_channel(cid, &label) {
+                            self.emit(match ready {
+                                ChannelReady::Publisher(handle) => {
+                                    AgentEvent::ReliableDataPublisherReady(handle)
                                 }
-                                DataTrackDirection::Subscribe => {
-                                    let publisher_id = scope.expect("reliable sub must have scope");
-                                    let key = (topic.clone(), publisher_id.clone());
-                                    self.data
-                                        .rel_sub_channels
-                                        .insert(cid, (topic, publisher_id));
-                                    let sub = self.data.rel_sub_topics.remove(&key);
-                                    if let Some(sub) = sub {
-                                        self.emit(AgentEvent::ReliableDataSubscriberReady(sub));
-                                    }
+                                ChannelReady::Subscriber(handle) => {
+                                    AgentEvent::ReliableDataSubscriberReady(handle)
                                 }
-                            }
+                            });
                         }
                     }
                     Event::ChannelData(data) => {
                         if data.id == self.data.signaling_cid {
                             self.handle_signaling_data(data);
-                        } else if self.data.rel_pub_channels.contains_key(&data.id) {
-                            self.handle_reliable_pub_data(data);
-                        } else if self.data.rel_sub_channels.contains_key(&data.id) {
-                            self.handle_reliable_sub_data(data);
-                        } else {
+                        } else if !self.e2e_reliable.handle_data(&mut self.rtc, &data) {
                             self.dispatch_data_message(data);
                         }
                     }
@@ -841,92 +723,6 @@ impl AgentDriver {
             return;
         };
         let _ = target.try_send(data.data);
-    }
-
-    fn handle_reliable_pub_data(&mut self, data: ChannelData) {
-        let Some(topic) = self.data.rel_pub_channels.get(&data.id).cloned() else {
-            return;
-        };
-        let Ok(ctrl) = RelControl::decode(data.data.as_ref()) else {
-            return;
-        };
-        let Some(rel_control::Msg::Nack(nack)) = ctrl.msg else {
-            return;
-        };
-        let Some(&stream_id) = self.data.rel_pub_stream_id.get(&topic) else {
-            return;
-        };
-        if nack.stream_id != stream_id {
-            return;
-        }
-        let Some(buf) = self.data.rel_pub_buffer.get(&topic) else {
-            return;
-        };
-        let retransmits: Vec<Vec<u8>> = buf
-            .iter()
-            .filter(|m| m.seq >= nack.from_seq)
-            .map(|m| m.encode_to_vec())
-            .collect();
-        if let Some(mut ch) = self.rtc.channel(data.id) {
-            for encoded in retransmits {
-                let _ = ch.write(true, &encoded);
-            }
-        }
-    }
-
-    fn handle_reliable_sub_data(&mut self, data: ChannelData) {
-        let Some((topic, publisher_id)) = self.data.rel_sub_channels.get(&data.id).cloned() else {
-            return;
-        };
-        let Ok(msg) = RelMsg::decode(data.data.as_ref()) else {
-            return;
-        };
-        let key = (topic, publisher_id);
-
-        let (is_stream_reset, should_nack, nack_from_seq) = {
-            let last = self.data.rel_sub_last.entry(key.clone()).or_insert((0, 0));
-            if last.0 == 0 {
-                *last = (msg.stream_id, msg.seq);
-                (false, false, 0u64)
-            } else if msg.stream_id != last.0 {
-                *last = (msg.stream_id, msg.seq);
-                (true, false, 0u64)
-            } else {
-                let next_expected = last.1.wrapping_add(1);
-                let has_gap = msg.seq > next_expected;
-                let nack_from = if has_gap { next_expected } else { 0 };
-                if msg.seq > last.1 {
-                    last.1 = msg.seq;
-                }
-                (false, has_gap, nack_from)
-            }
-        };
-
-        if is_stream_reset && let Some(tx) = self.data.rel_sub_targets.get(&key) {
-            let _ = tx.try_send(ReliableDataEvent::StreamReset {
-                new_stream_id: msg.stream_id,
-            });
-        }
-
-        if should_nack {
-            let nack_msg = RelControl {
-                msg: Some(rel_control::Msg::Nack(RelNack {
-                    stream_id: msg.stream_id,
-                    from_seq: nack_from_seq,
-                })),
-            };
-            if let Some(mut ch) = self.rtc.channel(data.id) {
-                let _ = ch.write(true, &nack_msg.encode_to_vec());
-            }
-        }
-
-        if let Some(tx) = self.data.rel_sub_targets.get(&key) {
-            let _ = tx.try_send(ReliableDataEvent::Message(ReliableDataMessage {
-                stream_id: msg.stream_id,
-                seq: msg.seq,
-                payload: msg.payload,
-            }));
-        }
     }
 
     fn handle_media_added(&mut self, media: MediaAdded) {
@@ -1124,29 +920,6 @@ impl AgentDriver {
             ));
         }
 
-        Ok(cid)
-    }
-
-    fn ensure_reliable_data_topic(
-        &mut self,
-        direction: DataTrackDirection,
-        topic: &str,
-        scope: Option<&str>,
-    ) -> Result<ChannelId, AgentError> {
-        let cfg = ChannelConfig {
-            label: reliable_data_track_label(direction, topic, scope),
-            ordered: true,
-            reliability: Reliability::Reliable,
-            negotiated: None,
-            protocol: "".to_string(),
-        };
-        let mut sdp_api = self.rtc.sdp_api();
-        let cid = sdp_api.add_channel_with_config(cfg);
-        if let Some((_offer, _pending)) = sdp_api.apply() {
-            return Err(AgentError::Protocol(
-                "data channel declaration unexpectedly requires renegotiation".into(),
-            ));
-        }
         Ok(cid)
     }
 }

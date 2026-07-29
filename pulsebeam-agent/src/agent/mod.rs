@@ -1,6 +1,7 @@
 mod builder;
 mod controller;
 mod driver;
+mod e2e_reliable;
 mod handles;
 mod mailbox;
 mod slots;
