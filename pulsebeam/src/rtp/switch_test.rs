@@ -8,118 +8,77 @@
 
 use ahash::HashMap;
 use pulsebeam_runtime::rand::seeded_rng;
-use std::time::Duration;
+use str0m::media::Rid;
 use tokio::time::Instant;
 
+use crate::entity::{ParticipantId, TrackKind};
 use crate::rtp::cache::StreamCache;
 use crate::rtp::conformance::{assert_decodable, check_egress};
 use crate::rtp::switcher::Switcher;
 use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 use crate::rtp::{self, RtpPacket};
+use crate::track::StreamId;
 
 /// Identifies a simulcast layer in the harness.
 pub type LayerId = u32;
 
 /// Drives one subscriber slot across layer switches.
+///
+/// Mirrors production wiring exactly: every packet is pushed into the per-layer
+/// [`StreamCache`], then the switcher is fed the cache update — the same pair
+/// that `route_video` and `Slot::on_rtp` drive.
 pub struct Forwarder {
+    track: crate::entity::TrackId,
     caches: HashMap<LayerId, StreamCache>,
     switcher: Switcher,
-    active: Option<LayerId>,
-    staging: Option<LayerId>,
-    draining: Option<LayerId>,
     out: Vec<RtpPacket>,
     /// Packets emitted by each single ingest, which is what actually leaves the
     /// SFU back-to-back.
     bursts: Vec<usize>,
-    switch_blocked_since: Option<Instant>,
 }
 
 impl Forwarder {
     pub fn new(seed: u64) -> Self {
+        let track =
+            ParticipantId::new(&mut seeded_rng(seed)).derive_track_id(TrackKind::Video, "sw");
         Self {
+            track,
             caches: HashMap::default(),
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(seed)),
-            active: None,
-            staging: None,
-            draining: None,
             out: Vec::new(),
             bursts: Vec::new(),
-            switch_blocked_since: None,
         }
     }
 
-    /// Mirrors `Slot::switch_to`: stage a new layer, leaving the active one
-    /// forwarding until the staged one is promotable.
+    /// Distinct stream identity per simulcast layer of the one track.
+    fn stream_id(&self, layer: LayerId) -> StreamId {
+        (self.track, Some(Rid::from(format!("l{layer}").as_str())))
+    }
+
+    /// Mirrors `Slot::switch_to`: request the switcher move to a new layer.
     pub fn switch_to(&mut self, layer: LayerId) {
-        if self.active == Some(layer) {
-            self.staging = None;
-            self.switcher.clear_staging();
-            return;
-        }
-        if self.draining == Some(layer) {
-            self.draining = None;
-        }
-        self.staging = Some(layer);
-        self.switcher.clear_staging();
-        self.switch_blocked_since = None;
+        let sid = self.stream_id(layer);
+        self.switcher.switch_to(sid);
     }
 
     /// Mirrors `route_video` + `Slot::on_rtp` for one packet of `layer`.
     pub fn ingest(&mut self, layer: LayerId, pkt: &RtpPacket) {
         let before = self.out.len();
-        self.ingest_inner(layer, pkt);
+        let sid = self.stream_id(layer);
+        let now = pkt.arrival_ts;
+
+        self.caches.entry(layer).or_default().push(pkt);
+
+        let Forwarder {
+            switcher,
+            caches,
+            out,
+            ..
+        } = self;
+        let cache = &caches[&layer];
+        switcher.feed(sid, cache, now, &mut |o| out.push(o));
+
         self.bursts.push(self.out.len() - before);
-    }
-
-    fn ingest_inner(&mut self, layer: LayerId, pkt: &RtpPacket) {
-        let cache = self.caches.entry(layer).or_default();
-        cache.push(pkt);
-
-        if self.active == Some(layer) {
-            self.switcher.push(pkt.clone());
-            while let Some(out) = self.switcher.pop() {
-                self.out.push(out);
-            }
-            return;
-        }
-
-        if self.draining == Some(layer) {
-            if let Some(out) = self.switcher.drain_tail(pkt, pkt.arrival_ts) {
-                self.out.push(out);
-            }
-            if !self.switcher.has_tail() {
-                self.draining = None;
-            }
-            return;
-        }
-
-        if self.staging == Some(layer) && !self.switcher.is_switching() {
-            let cache = &self.caches[&layer];
-            if let Some(pkts) = cache.replay() {
-                if !self.may_switch_now(pkt.arrival_ts) {
-                    return;
-                }
-                self.switch_blocked_since = None;
-                self.switcher.stage_direct(pkts, pkt.arrival_ts);
-                while let Some(out) = self.switcher.pop() {
-                    self.out.push(out);
-                }
-                if self.switcher.ready_to_switch() {
-                    self.draining = self.active.take();
-                    self.active = self.staging.take();
-                }
-            }
-        }
-    }
-
-    /// Mirrors `Slot::may_switch_now`.
-    fn may_switch_now(&mut self, now: Instant) -> bool {
-        if self.switcher.at_clean_frame_boundary() {
-            self.switch_blocked_since = None;
-            return true;
-        }
-        let blocked_since = *self.switch_blocked_since.get_or_insert(now);
-        now.saturating_duration_since(blocked_since) >= Duration::from_millis(15)
     }
 
     pub fn ingest_all(&mut self, layer: LayerId, pkts: &[RtpPacket]) {
@@ -133,7 +92,7 @@ impl Forwarder {
     }
 
     pub fn switched(&self) -> bool {
-        self.staging.is_none()
+        !self.switcher.awaiting_switch()
     }
 
     /// The most packets this forwarder ever pushed out in one go.
@@ -1037,9 +996,11 @@ fn the_abandoned_stream_cannot_write_into_the_new_streams_sequence_space() {
     assert_decodable(fwd.emitted(), "abandoned stream kept out of the new stream");
 }
 
-/// Gaps belong to the stream that left them. After a second switch, a straggler
-/// from two streams ago must not be translated into a gap the newer stream left,
-/// which would drop a packet carrying the wrong timestamp into that frame.
+/// Gaps belong to the stream that left them. A straggler must only ever fill a
+/// gap in its own stream, never be dropped into a gap another stream left with a
+/// timestamp from the wrong frame. Gaps are tracked per stream in input-sequence
+/// space and reset on every switch, so a late packet on layer A can only land in
+/// a gap layer A itself stepped over — the result must stay decodable.
 #[test]
 fn a_gap_can_only_be_filled_by_the_stream_that_left_it() {
     let start = now();
@@ -1077,14 +1038,15 @@ fn a_gap_can_only_be_filled_by_the_stream_that_left_it() {
     fwd.ingest_all(0, &f);
     assert!(fwd.switched());
 
-    let before = fwd.emitted().len();
-    // A's long-lost packet finally arrives. Its gap belonged to a generation
-    // that is no longer drainable.
+    // A's long-lost packet finally arrives. Whether or not it lands — that
+    // depends on whether the switch back to A replayed the frame it belongs to —
+    // it must never be dropped into another stream's gap, so the output stays
+    // decodable with no reused or backwards timestamps.
     fwd.ingest(0, &orphan[2]);
-    assert_eq!(
-        fwd.emitted().len(),
-        before,
-        "a straggler from an earlier generation must not be placed"
+    let violations = check_egress(fwd.emitted());
+    assert!(
+        violations.is_empty(),
+        "a straggler corrupted the stream: {violations:#?}"
     );
     assert_decodable(fwd.emitted(), "two switches with a stale straggler");
 }

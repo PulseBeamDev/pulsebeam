@@ -458,6 +458,7 @@ async fn run_participant(
             }
         }
 
+        let auto_subscribe = matches!(config.role, Role::Subscriber);
         let shared_clone = shared.clone();
         let mut client = builder
             .with_video_rx(shared.video_rx.clone())
@@ -601,6 +602,41 @@ async fn run_participant(
                     // Prepend so retries are tried first next tick.
                     retry_ops.extend(guard.drain(..));
                     *guard = retry_ops;
+                }
+
+                // 1b. Auto-subscribe: for subscriber participants, subscribe to any
+                // newly-discovered tracks so tests that have no explicit SubscribeAll
+                // step still receive video.
+                if auto_subscribe {
+                    let incoming_tracks = ctx.incoming_track_tx.clone();
+                    let new_track_ids: Vec<String> = ctx
+                        .discovered_tracks
+                        .iter()
+                        .filter(|id| !ctx.requested_tracks.contains(*id))
+                        .cloned()
+                        .collect();
+                    for participant_id in new_track_ids {
+                        ctx.requested_tracks.insert(participant_id.clone());
+                        let agent = ctx.agent.clone();
+                        let incoming_tracks = incoming_tracks.clone();
+                        tokio::spawn(async move {
+                            // Subscribing can legitimately fail when the publisher
+                            // has already left (churn, abrupt exit). That is not a
+                            // test failure — just skip it.
+                            let Ok(track) = agent
+                                .participant(participant_id)
+                                .video()
+                                .subscribe()
+                                .target_height(720)
+                                .minimum_height(0)
+                                .priority(0)
+                                .await
+                            else {
+                                return;
+                            };
+                            let _ = incoming_tracks.send(track).await;
+                        });
+                    }
                 }
 
                 // 2. Drain received data from all known subscribers.

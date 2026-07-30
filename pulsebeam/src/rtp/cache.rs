@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use crate::rtp::RtpPacket;
 use str0m::media::MediaTime;
+use str0m::rtp::SeqNo;
 
 const STREAM_CACHE_CAPACITY: usize = 512;
 
@@ -14,16 +15,21 @@ const STREAM_CACHE_CAPACITY: usize = 512;
 /// is refused and the slot waits for the PLI-driven keyframe instead.
 const MAX_REPLAY_FRAMES: usize = 3;
 
-/// Ceiling on the packets a switch may release at once.
+/// Ceiling on the packets a switch may release at once when the segment spans
+/// more than one frame.
 ///
 /// str0m paces egress, so a burst handed over in one go is not sprayed at the
 /// network — it queues, and shows up as delay instead. Either way it is latency
 /// the subscriber pays, so the amount released at once is what needs bounding.
-///
-/// Never applied to a lone keyframe: that is the smallest decodable unit there
-/// is, so refusing one would livelock — the keyframe request it triggers just
-/// produces another of the same size.
 const MAX_REPLAY_PACKETS: usize = 96;
+
+/// Absolute ceiling on the packets a switch may release, including lone
+/// keyframes.  A 4K IDR can exceed 400 packets; forwarding that many
+/// synchronously queues ~600 KB into the pacing layer in one event-loop tick,
+/// stalling every other stream on the subscriber's connection for hundreds of
+/// milliseconds.  Exceeding this cap returns None so the slot waits for a
+/// PLI-driven keyframe — the encoder typically adapts to a smaller size.
+const MAX_REPLAY_PACKETS_HARD: usize = 200;
 
 /// Ceiling on the media a switch segment may straddle, in milliseconds.
 ///
@@ -142,7 +148,33 @@ impl StreamCache {
         segment.sort_unstable_by_key(|p| *p.seq_no);
         segment.dedup_by_key(|p| *p.seq_no);
 
+        // Trim at the first sequence discontinuity. The burst is emitted with
+        // `rewrite_sequential`, which renumbers it onto contiguous output
+        // sequence numbers — that erases an internal gap, so a frame whose marker
+        // packet was lost upstream would be followed by the next frame with no
+        // discontinuity and read as complete. Everything past a gap is undecodable
+        // anyway (a packet is missing), so the burst stops there; the rest arrives
+        // on the live cursor, where the gap is preserved.
+        if let Some(gap) = segment
+            .windows(2)
+            .position(|w| *w[1].seq_no != (*w[0].seq_no).wrapping_add(1))
+        {
+            segment.truncate(gap + 1);
+        }
+
         if !segment.iter().any(|p| p.is_keyframe) {
+            return None;
+        }
+
+        // A late-arriving keyframe fragment can end up with a higher seq_no than
+        // the delta frames that followed it.  After sorting by seq_no the burst
+        // would have non-monotonic RTP timestamps (T0, T1, T0), and rewriting it
+        // sequentially would produce a backwards timestamp in the egress stream.
+        // Refuse the replay; a fresh PLI-driven keyframe will be clean.
+        if segment
+            .windows(2)
+            .any(|w| w[1].rtp_ts.numer() < w[0].rtp_ts.numer())
+        {
             return None;
         }
 
@@ -156,6 +188,11 @@ impl StreamCache {
             }
         }
         if frames > MAX_REPLAY_FRAMES {
+            return None;
+        }
+        // Hard per-burst cap — protects against forwarding-latency spikes even
+        // for lone keyframes.  PLI requests a fresh (often smaller) keyframe.
+        if segment.len() > MAX_REPLAY_PACKETS_HARD {
             return None;
         }
         if frames > 1 && segment.len() > MAX_REPLAY_PACKETS {
@@ -179,6 +216,53 @@ impl StreamCache {
             "replay must be ordered by sequence number"
         );
         Some(out)
+    }
+
+    /// Reads the cache from a subscriber's cursor position.
+    ///
+    /// This is the single source of packet data for a downstream slot — both
+    /// the initial switch burst and the ongoing live tail are read through it,
+    /// so there is no separate live path that could desync from the cache.
+    ///
+    /// - `cursor = None`: the subscriber has nothing yet and needs a decodable
+    ///   entry point. Returns the full keyframe segment (identical to
+    ///   `replay()`), or `None` if switching here right now would not decode.
+    /// - `cursor = Some(seq)`: the subscriber is already following this stream.
+    ///   Returns every buffered packet past `seq`, ordered and deduplicated.
+    ///   No caps or checks apply — these are the incremental live packets, and
+    ///   an empty result (nothing new yet) is `Some((vec![], seq))`, not `None`.
+    ///
+    /// The returned sequence number is the new cursor: the highest sequence
+    /// number emitted, which the caller stores and passes back next time.
+    pub fn packets_since(&self, cursor: Option<SeqNo>) -> Option<(Vec<RtpPacket>, SeqNo)> {
+        match cursor {
+            None => {
+                let segment = self.replay()?;
+                let new_cursor = segment.last()?.seq_no;
+                Some((segment, new_cursor))
+            }
+            Some(cursor) => {
+                let mut packets: Vec<RtpPacket> = self
+                    .packets
+                    .iter()
+                    .filter(|p| *p.seq_no > *cursor)
+                    .cloned()
+                    .collect();
+                packets.sort_unstable_by_key(|p| *p.seq_no);
+                packets.dedup_by_key(|p| *p.seq_no);
+                let new_cursor = packets.last().map_or(cursor, |p| p.seq_no);
+                Some((packets, new_cursor))
+            }
+        }
+    }
+
+    /// The buffered packet with this input sequence number, if still cached.
+    ///
+    /// Used by the tail drain to complete a frame left half-sent by a stream the
+    /// slot switched away from: the hole is known, so the packet that fills it is
+    /// looked up directly rather than scanned for in arrival order.
+    pub fn get(&self, seq: SeqNo) -> Option<&RtpPacket> {
+        self.packets.iter().find(|p| p.seq_no == seq)
     }
 
     /// Parameter-set packets the segment is missing, restamped onto the
@@ -341,25 +425,48 @@ mod test {
         );
     }
 
-    /// A keyframe can be larger than any bound worth putting on a replay. It
-    /// must stay replayable anyway: refusing one only triggers a keyframe
-    /// request, which produces another exactly as large — the stream would
-    /// never start.
+    /// A lone keyframe larger than the per-frame cap but within the hard cap is
+    /// still replayable.  The per-frame cap only applies to multi-frame bursts.
     #[test]
-    fn a_lone_keyframe_is_replayable_however_large() {
+    fn a_lone_keyframe_within_the_hard_packet_cap_is_replayable() {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
-        let huge = b.keyframe(400);
+        // MAX_REPLAY_PACKETS + 10 sits above the per-frame cap (96) while well
+        // below the hard cap (200), even accounting for SPS+PPS overhead (~2 pkts).
+        let kf = b.keyframe(MAX_REPLAY_PACKETS + 10);
+        assert!(kf.len() > MAX_REPLAY_PACKETS, "fixture must exceed the per-frame cap");
         assert!(
-            huge.len() > MAX_REPLAY_PACKETS,
-            "fixture must exceed the bound"
+            kf.len() <= MAX_REPLAY_PACKETS_HARD,
+            "fixture must not exceed the hard cap"
         );
-        for p in &huge {
+        for p in &kf {
             cache.push(p);
         }
         assert!(
             cache.replay().is_some(),
-            "refusing a lone keyframe livelocks the stream"
+            "a lone keyframe within the hard cap must be replayable"
+        );
+    }
+
+    /// A lone keyframe past the hard cap is refused to bound the forwarding
+    /// burst and prevent P99 latency spikes on the subscriber's connection.
+    #[test]
+    fn a_lone_keyframe_past_the_hard_packet_cap_is_refused() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        // MAX_REPLAY_PACKETS_HARD + 10 guarantees the segment exceeds the hard
+        // cap even after SPS+PPS overhead is included.
+        let kf = b.keyframe(MAX_REPLAY_PACKETS_HARD + 10);
+        assert!(
+            kf.len() > MAX_REPLAY_PACKETS_HARD,
+            "fixture must exceed the hard cap"
+        );
+        for p in &kf {
+            cache.push(p);
+        }
+        assert!(
+            cache.replay().is_none(),
+            "a lone keyframe exceeding the hard cap must be refused to prevent latency spikes"
         );
     }
 
@@ -398,6 +505,69 @@ mod test {
         assert!(
             cache.replay().is_some(),
             "a 5fps screen share must switch from cache, not fall back to a keyframe request"
+        );
+    }
+
+    #[test]
+    fn packets_since_none_returns_the_full_burst_and_its_last_seq_as_cursor() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(4) {
+            cache.push(&p);
+        }
+
+        let (burst, cursor) = cache.packets_since(None).expect("replayable");
+        let replay = cache.replay().expect("replayable");
+        assert_eq!(burst.len(), replay.len(), "None cursor mirrors replay()");
+        assert_eq!(
+            cursor,
+            burst.last().unwrap().seq_no,
+            "cursor is the highest seq in the burst"
+        );
+    }
+
+    #[test]
+    fn packets_since_a_cursor_returns_only_newer_packets_ordered() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(2) {
+            cache.push(&p);
+        }
+        let (burst, cursor) = cache.packets_since(None).expect("replayable");
+
+        // Nothing new yet: empty batch, cursor unchanged.
+        let (empty, same) = cache.packets_since(Some(cursor)).expect("live read");
+        assert!(empty.is_empty(), "no packets past the cursor yet");
+        assert_eq!(same, cursor, "cursor holds when nothing is new");
+
+        // A live delta frame arrives.
+        let delta = b.delta_frame(2);
+        for p in &delta {
+            cache.push(p);
+        }
+        let (live, advanced) = cache.packets_since(Some(cursor)).expect("live read");
+        assert!(
+            live.iter().all(|p| *p.seq_no > *cursor),
+            "only packets past the cursor are returned"
+        );
+        assert!(
+            live.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no),
+            "live packets are ordered by sequence number"
+        );
+        assert_eq!(
+            advanced,
+            live.last().unwrap().seq_no,
+            "cursor advances to the newest packet"
+        );
+        assert!(
+            *advanced > *cursor,
+            "cursor moved forward past the delta frame"
+        );
+        // The burst's own packets are never redelivered on a live read.
+        let burst_max = *burst.last().unwrap().seq_no;
+        assert!(
+            live.iter().all(|p| *p.seq_no > burst_max),
+            "packets already in the burst are not returned again"
         );
     }
 
@@ -444,5 +614,47 @@ mod test {
         }
         assert!(!cache.has_keyframe(), "an over-long GOP is not switchable");
         assert!(cache.replay().is_none());
+    }
+
+    /// A keyframe fragment that arrives after delta frames (due to network
+    /// reordering) produces a burst with non-monotonic timestamps in seq_no
+    /// order.  The egress switcher would output backwards RTP timestamps when
+    /// replaying such a burst, triggering the stream invariant violation.
+    /// The cache must refuse the replay and wait for a clean keyframe.
+    #[test]
+    fn replay_refused_when_late_idr_fragment_creates_non_monotonic_timestamps() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+
+        // Normal keyframe: SPS/PPS + 2 IDR frags (seq 1000-1002, ts=T0).
+        let kf = b.keyframe(2);
+        let kf_ts = kf[0].rtp_ts.numer();
+        for p in &kf {
+            cache.push(p);
+        }
+        assert!(cache.replay().is_some(), "clean keyframe is replayable");
+
+        // Delta frame (seq 1003-1003, ts=T1 > T0).
+        let delta = b.delta_frame(1);
+        let delta_ts = delta[0].rtp_ts.numer();
+        assert!(delta_ts > kf_ts, "delta must have a higher timestamp");
+        for p in &delta {
+            cache.push(p);
+        }
+
+        // Simulate a late IDR fragment: same ts as keyframe (T0) but
+        // seq_no higher than the delta packets (so it sorts last in the burst).
+        let delta_last_seq = *delta.last().unwrap().seq_no;
+        let mut late_frag = kf.last().unwrap().clone();
+        late_frag.seq_no = (delta_last_seq + 1).into();
+        // seq = delta_last_seq+1 is still within the keyframe's segment (same ts=T0).
+        cache.push(&late_frag);
+
+        // The burst is now [kf_seqs..., delta_seqs..., late_frag_seq] sorted by
+        // seq_no, with timestamps [T0, ..., T1, ..., T0] — non-monotonic.
+        assert!(
+            cache.replay().is_none(),
+            "a burst with non-monotonic timestamps must be refused to prevent egress violation"
+        );
     }
 }

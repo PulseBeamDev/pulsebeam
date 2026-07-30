@@ -31,14 +31,6 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
-/// How long a ready switch waits for the active layer to finish the frame it is
-/// midway through.
-///
-/// A frame's packets arrive back-to-back, so this only ever costs a millisecond
-/// or two in the normal case; it is short because a packet that has not turned
-/// up by now is late enough that waiting is worse than switching. Whatever the
-/// switch leaves behind can still be filled afterwards by the drain tail.
-const FRAME_ALIGN_GRACE: Duration = Duration::from_millis(15);
 
 pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
@@ -102,12 +94,7 @@ impl VideoAllocator {
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
         for slot in self.slots.values_mut() {
-            if slot
-                .staging
-                .as_ref()
-                .is_some_and(|l| l.meta.id == *track_id)
-                || slot.active.as_ref().is_some_and(|l| l.meta.id == *track_id)
-            {
+            if slot.matches_track_id(track_id) {
                 slot.stop();
             }
         }
@@ -212,13 +199,7 @@ impl VideoAllocator {
         let already_assigned: IndexSet<TrackId> = self
             .slots
             .values()
-            .flat_map(|s| {
-                s.staging
-                    .as_ref()
-                    .map(|t| t.meta.id)
-                    .into_iter()
-                    .chain(s.active.as_ref().map(|t| t.meta.id))
-            })
+            .filter_map(|s| s.desired.as_ref().map(|t| t.meta.id))
             .collect();
 
         let mut pending_tracks = self
@@ -382,12 +363,22 @@ impl VideoAllocator {
     pub fn reconcile_routes(&mut self, events: &mut impl ParticipantSink) {
         let mut current = HashSet::new();
         for (slot_key, slot) in &self.slots {
-            if let Some(staging) = slot.staging.as_ref() {
-                current.insert((staging.meta.id, slot_key));
+            // Subscribe to every stream the switcher needs packets for — active,
+            // staging (awaiting its keyframe), and draining (completing its tail)
+            // — plus the assigned target so a just-assigned or paused-but-staged
+            // slot stays subscribed. All resolve to a track id via StreamId.0.
+            for stream in [
+                slot.switcher.active_stream(),
+                slot.switcher.staging_stream(),
+                slot.switcher.draining_stream(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                current.insert((stream.0, slot_key));
             }
-
-            if let Some(active) = slot.active.as_ref() {
-                current.insert((active.meta.id, slot_key));
+            if let Some(desired) = slot.desired.as_ref() {
+                current.insert((desired.meta.id, slot_key));
             }
         }
 
@@ -425,18 +416,13 @@ impl VideoAllocator {
     }
 
     /// Returns `true` if every track ID appears in at most one slot's
-    /// active or staging layer.  A track must never be assigned to two
-    /// slots simultaneously, because that would cause duplicate stream
-    /// forwarding and corrupt the routing table.
+    /// assigned target.  A track must never be assigned to two slots
+    /// simultaneously, because that would cause duplicate stream forwarding
+    /// and corrupt the routing table.
     fn no_duplicate_slot_assignments(&self) -> bool {
         let mut seen: HashMap<TrackId, SlotKey> = HashMap::new();
         for (slot_key, slot) in self.slots.iter() {
-            for layer in slot
-                .staging
-                .as_ref()
-                .into_iter()
-                .chain(slot.active.as_ref())
-            {
+            if let Some(layer) = slot.desired.as_ref() {
                 if let Some(existing_slot) = seen.get(&layer.meta.id) {
                     if existing_slot != &slot_key {
                         plog_error!(
@@ -470,11 +456,11 @@ struct Slot {
     ssrc: Ssrc,
     pt: Pt,
 
-    active: Option<TrackLayer>,
-    staging: Option<TrackLayer>,
-    /// The layer this slot has just switched away from. Its packets are still
-    /// arriving and some complete frames the subscriber already has part of.
-    draining: Option<TrackLayer>,
+    /// The layer this slot is assigned to serve — the most recent BWE choice.
+    /// This is policy: it carries the quality/height the allocator reasons about.
+    /// What is *actually* being forwarded (active / staging / draining streams)
+    /// and every step of moving between them is owned by `switcher`.
+    desired: Option<TrackLayer>,
 
     switcher: Switcher,
 
@@ -491,9 +477,6 @@ struct Slot {
     staging_keyframe_last_at: Option<Instant>,
     /// Current retry interval for PLI probes while waiting for the staging keyframe.
     staging_keyframe_interval: Duration,
-    /// When the staged layer first became switchable but the active layer was
-    /// still midway through a frame.
-    switch_blocked_since: Option<Instant>,
 }
 
 impl Slot {
@@ -505,9 +488,7 @@ impl Slot {
             ssrc: cfg.ssrc,
             pt: cfg.pt,
 
-            active: None,
-            staging: None,
-            draining: None,
+            desired: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY, rng),
             // With no signaling, we assume users are viewing with 720p playback
@@ -519,16 +500,18 @@ impl Slot {
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
             staging_keyframe_interval: KEYFRAME_RETRY_INTERVAL,
-            switch_blocked_since: None,
         }
     }
 
     fn target(&self) -> Option<&TrackLayer> {
-        self.staging.as_ref().or(self.active.as_ref())
+        self.desired.as_ref()
     }
 
     fn state(&self) -> SlotState {
-        match (self.active.is_some(), self.staging.is_some()) {
+        match (
+            self.switcher.active_stream().is_some(),
+            self.switcher.staging_stream().is_some(),
+        ) {
             (false, false) => SlotState::Idle,
             (false, true) => SlotState::Starting,
             (true, false) => SlotState::Stable,
@@ -540,29 +523,18 @@ impl Slot {
         self.staging_keyframe_retries = 0;
         self.staging_keyframe_last_at = None;
         self.staging_keyframe_interval = KEYFRAME_RETRY_INTERVAL;
-        self.switch_blocked_since = None;
-    }
-
-    /// Whether the switch may land now, or should wait for the active layer to
-    /// finish the frame it is partway through.
-    fn may_switch_now(&mut self, now: Instant) -> bool {
-        if self.switcher.at_clean_frame_boundary() {
-            self.switch_blocked_since = None;
-            return true;
-        }
-        let blocked_since = *self.switch_blocked_since.get_or_insert(now);
-        now.saturating_duration_since(blocked_since) >= FRAME_ALIGN_GRACE
     }
 
     fn pli_retry(&mut self, now: Instant, events: &mut impl ParticipantSink) {
         if self.paused {
             return;
         }
-        if !matches!(self.state(), SlotState::Starting | SlotState::Switching) {
+        // The switcher is the authority on whether a switch is still pending; the
+        // layer it is waiting on is the one this slot is assigned to (`desired`).
+        if !self.switcher.awaiting_switch() {
             return;
         }
-
-        let Some(staging) = self.staging.as_ref() else {
+        let Some(staging) = self.desired.as_ref() else {
             return;
         };
         let last_at = self.staging_keyframe_last_at;
@@ -597,37 +569,39 @@ impl Slot {
 
     fn switch_to(&mut self, new_layer: &TrackLayer, force: bool) -> bool {
         let mut changed = false;
-        let old_target = self.target().map(|l| l.stream_id());
         let is_track_change = self
-            .target()
+            .desired
+            .as_ref()
             .map(|l| l.meta.id)
             .is_none_or(|id| id != new_layer.meta.id);
 
-        if force && is_track_change {
-            changed |= self.active.take().is_some();
-            self.switcher.clear();
+        // A forced track change hard-resets the switcher so no stale stream state
+        // from the previous track leaks across.
+        if force && is_track_change && self.switcher.active_stream().is_some() {
+            self.switcher.stop();
+            changed = true;
         }
 
-        if self.active.as_ref() == Some(new_layer) {
-            if self.staging.is_some() {
-                self.staging = None;
-                self.switcher.clear_staging();
-                self.pli_reset();
-                changed = true;
-                plog_debug!(self.ctx, mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot canceled in-flight transition and preserved active layer");
-            }
-        } else if self.target().as_ref() != Some(&new_layer) {
-            if self.draining.as_ref() == Some(new_layer) {
-                self.draining = None;
-            }
-            self.staging = Some(new_layer.clone());
-            // Reset the switcher staging buffer so stale seq-no state from a
-            // previous stream doesn't mix with the new stream's packets.
-            self.switcher.clear_staging();
-            // Reset retry state so the new staging layer gets fresh PLI attempts.
+        if self.desired.as_ref() != Some(new_layer) {
+            self.desired = Some(new_layer.clone());
+            changed = true;
+        }
+
+        // Drive the switcher toward the new target. It is the authority on the
+        // active/staging/draining streams; observe whether that changed.
+        let before = (
+            self.switcher.active_stream(),
+            self.switcher.staging_stream(),
+        );
+        self.switcher.switch_to(new_layer.stream_id());
+        let after = (
+            self.switcher.active_stream(),
+            self.switcher.staging_stream(),
+        );
+        if before != after {
             self.pli_reset();
             changed = true;
-            plog_debug!(self.ctx, mid=%self.mid, old_target=?old_target, new_target=?new_layer.stream_id(), "slot staging new layer");
+            plog_debug!(self.ctx, mid=%self.mid, new_target=?new_layer.stream_id(), "slot switching target");
         }
 
         if self.paused {
@@ -641,24 +615,27 @@ impl Slot {
 
     fn stop(&mut self) {
         plog_debug!(self.ctx, mid=%self.mid, "slot stopped");
-        self.active = None;
-        self.staging = None;
-        self.draining = None;
+        self.desired = None;
+        self.switcher.stop();
         self.pli_reset();
     }
 
     fn pause_at(&mut self, layer: &TrackLayer) -> bool {
         let mut changed = false;
 
-        // If we weren't active, but now we are explicitly None,
-        // we check if it was already None to avoid redundant dirtying.
-        if self.active.is_some() {
-            self.active = None;
+        if self.desired.as_ref() != Some(layer) {
+            self.desired = Some(layer.clone());
             changed = true;
         }
 
-        if self.staging.as_ref() != Some(layer) {
-            self.staging = Some(layer.clone());
+        // Stop forwarding but stay staged on the layer, so the route stays
+        // subscribed for a quick resume. `paused` gates `feed`, and `pli_retry`
+        // already skips paused slots, so no keyframes are requested meanwhile.
+        if self.switcher.active_stream().is_some()
+            || self.switcher.staging_stream() != Some(layer.stream_id())
+        {
+            self.switcher.stop();
+            self.switcher.switch_to(layer.stream_id());
             changed = true;
             plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
         }
@@ -683,57 +660,63 @@ impl Slot {
             plog_trace!(self.ctx, mid=%self.mid, stream_id=?stream_id, "slot paused, dropping incoming packet");
             return false;
         }
-        if self.active.as_ref().is_some_and(|a| a.is(stream_id)) {
-            self.switcher.push(pkt.clone());
-            while let Some(out) = self.switcher.pop() {
-                writer.write_video_owned(out, self.mid, self.rid, self.pt);
-            }
+        let Some(cache) = cache else {
             return false;
-        }
-        if self.draining.as_ref().is_some_and(|d| d.is(stream_id)) {
-            if let Some(out) = self.switcher.drain_tail(pkt, pkt.arrival_ts) {
-                writer.write_video_owned(out, self.mid, self.rid, self.pt);
-            }
-            if !self.switcher.has_tail() {
-                self.draining = None;
-            }
-            return false;
-        }
-        if self.staging.as_ref().is_some_and(|s| s.is(stream_id))
-            && !self.switcher.is_switching()
-            && let Some(pkts) = cache.and_then(|c| c.replay())
-        {
-            if !self.may_switch_now(pkt.arrival_ts) {
-                return false;
-            }
-            self.switch_blocked_since = None;
-            self.switcher.stage_direct(pkts, pkt.arrival_ts);
-            while let Some(out) = self.switcher.pop() {
-                writer.write_video_owned(out, self.mid, self.rid, self.pt);
-            }
-            if self.should_promote_staging() {
-                self.draining = self.active.take();
-                self.active = self.staging.take();
-                return true;
-            }
-        }
-        false
-    }
+        };
 
-    fn should_promote_staging(&self) -> bool {
-        self.switcher.ready_to_switch() && self.staging.is_some()
+        // The switcher owns the entire switching state machine; hand it the
+        // cache update and let it emit whatever the subscriber should see. A
+        // change in the active stream means a switch was promoted this tick.
+        let (mid, rid, pt) = (self.mid, self.rid, self.pt);
+        let before = self.switcher.active_stream();
+        self.switcher
+            .feed(*stream_id, cache, pkt.arrival_ts, &mut |out| {
+                writer.write_video_owned(out, mid, rid, pt);
+            });
+        self.switcher.active_stream() != before
     }
 
     fn matches_track_id(&self, track_id: &TrackId) -> bool {
-        self.active
-            .as_ref()
-            .map(|l| l.meta.id == *track_id)
-            .unwrap_or(false)
+        self.switcher
+            .active_stream()
+            .is_some_and(|s| s.0 == *track_id)
             || self
-                .staging
-                .as_ref()
-                .map(|l| l.meta.id == *track_id)
-                .unwrap_or(false)
+                .switcher
+                .staging_stream()
+                .is_some_and(|s| s.0 == *track_id)
+            || self
+                .switcher
+                .draining_stream()
+                .is_some_and(|s| s.0 == *track_id)
+            || self.desired.as_ref().is_some_and(|l| l.meta.id == *track_id)
+    }
+}
+
+#[cfg(test)]
+impl Slot {
+    /// The stream the switcher is actively forwarding.
+    fn test_active(&self) -> Option<StreamId> {
+        self.switcher.active_stream()
+    }
+
+    /// The stream the switcher is awaiting a keyframe on before switching.
+    fn test_staging(&self) -> Option<StreamId> {
+        self.switcher.staging_stream()
+    }
+
+    /// Force the slot's assigned layer and the switcher's stream roles, for
+    /// tests that need to construct a state without feeding real packets.
+    fn set_roles_for_test(&mut self, active: Option<&TrackLayer>, staging: Option<&TrackLayer>) {
+        self.desired = staging.or(active).cloned();
+        self.switcher.test_set_roles(
+            active.map(|l| l.stream_id()),
+            staging.map(|l| l.stream_id()),
+        );
+    }
+
+    /// Simulate the burst landing: the staged stream becomes active.
+    fn test_promote(&mut self) {
+        self.switcher.test_promote();
     }
 }
 
@@ -1330,8 +1313,7 @@ mod assignment_tests {
         let track = allocator.tracks.get(&tracks.ids[0]).unwrap();
         let low = track.lowest_quality().clone();
         let slot = allocator.slots.values_mut().next().unwrap();
-        slot.active = None;
-        slot.staging = Some(low);
+        slot.set_roles_for_test(None, Some(&low));
         slot.paused = false;
 
         let now = Instant::now();
@@ -1379,8 +1361,7 @@ mod assignment_tests {
         let high = track.by_quality(LayerQuality::High).unwrap().clone();
 
         let slot = allocator.slots.values_mut().next().unwrap();
-        slot.active = Some(low.clone());
-        slot.staging = Some(high.clone());
+        slot.set_roles_for_test(Some(&low), Some(&high));
         slot.paused = false;
 
         let mut queue = MockParticipantSink::new();
@@ -1420,8 +1401,7 @@ mod assignment_tests {
             .insert((old_stream_id.0, slot_key));
 
         let slot = allocator.slots.values_mut().next().unwrap();
-        slot.active = None;
-        slot.staging = None;
+        slot.set_roles_for_test(None, None);
         slot.paused = false;
 
         let mut queue = MockParticipantSink::new();
@@ -1444,7 +1424,7 @@ mod assignment_tests {
         let stale_slot_key = slot_keys[1];
 
         let slot = allocator.slots.get_mut(correct_slot_key).unwrap();
-        slot.active = Some(low.clone());
+        slot.set_roles_for_test(Some(&low), None);
         slot.paused = false;
 
         allocator.routes.insert(low.meta.id, stale_slot_key);
@@ -1482,8 +1462,7 @@ mod assignment_tests {
 
         let slot_key = allocator.slots.keys().next().unwrap().clone();
         let slot = allocator.slots.get_mut(slot_key).unwrap();
-        slot.active = Some(high.clone());
-        slot.staging = Some(medium.clone());
+        slot.set_roles_for_test(Some(&high), Some(&medium));
         slot.paused = false;
 
         let mut pkt = RtpPacket::default();
@@ -1492,15 +1471,12 @@ mod assignment_tests {
         let mut writer = crate::track::StreamWriter::new();
         slot.on_rtp(&high.stream_id(), &pkt, None, &mut writer);
 
-        assert!(
-            !slot.should_promote_staging(),
-            "staging should not promote before any staging packets are seen"
-        );
-        assert_eq!(slot.active.as_ref().unwrap().stream_id(), high.stream_id());
         assert_eq!(
-            slot.staging.as_ref().unwrap().stream_id(),
-            medium.stream_id()
+            slot.test_active(),
+            Some(high.stream_id()),
+            "no keyframe on the staged layer yet, so the active layer stays"
         );
+        assert_eq!(slot.test_staging(), Some(medium.stream_id()));
     }
 
     #[test]
@@ -1548,8 +1524,7 @@ mod assignment_tests {
             .clone();
 
         let slot = allocator.slots.values_mut().next().unwrap();
-        slot.active = Some(layer.clone());
-        slot.staging = None;
+        slot.set_roles_for_test(Some(&layer), None);
         slot.paused = false;
 
         assert!(
@@ -1583,15 +1558,11 @@ mod assignment_tests {
         let staging = track.by_quality(LayerQuality::Medium).unwrap().clone();
         let new_stage = track.by_quality(LayerQuality::High).unwrap().clone();
 
-        slot.active = None;
-        slot.staging = Some(staging);
+        slot.set_roles_for_test(None, Some(&staging));
         slot.paused = false;
 
         assert!(slot.switch_to(&new_stage, false));
-        assert_eq!(
-            slot.staging.as_ref().unwrap().stream_id(),
-            new_stage.stream_id()
-        );
+        assert_eq!(slot.test_staging(), Some(new_stage.stream_id()));
     }
 
     #[test]
@@ -1619,16 +1590,12 @@ mod assignment_tests {
         let active = track.by_quality(LayerQuality::Low).unwrap().clone();
         let staging = track.by_quality(LayerQuality::High).unwrap().clone();
 
-        slot.active = Some(active.clone());
-        slot.staging = Some(staging);
+        slot.set_roles_for_test(Some(&active), Some(&staging));
         slot.paused = false;
 
         assert!(slot.switch_to(&active, false));
-        assert!(slot.staging.is_none());
-        assert_eq!(
-            slot.active.as_ref().unwrap().stream_id(),
-            active.stream_id()
-        );
+        assert!(slot.test_staging().is_none());
+        assert_eq!(slot.test_active(), Some(active.stream_id()));
     }
 
     #[test]
@@ -1656,15 +1623,11 @@ mod assignment_tests {
         let staging = track.by_quality(LayerQuality::High).unwrap().clone();
         let new_stage = track.by_quality(LayerQuality::Low).unwrap().clone();
 
-        slot.active = None;
-        slot.staging = Some(staging.clone());
+        slot.set_roles_for_test(None, Some(&staging));
         slot.paused = false;
 
         assert!(slot.switch_to(&new_stage, false));
-        assert_eq!(
-            slot.staging.as_ref().unwrap().stream_id(),
-            new_stage.stream_id()
-        );
+        assert_eq!(slot.test_staging(), Some(new_stage.stream_id()));
     }
 
     #[test]
@@ -1679,18 +1642,17 @@ mod assignment_tests {
         let new_target = t1.lowest_quality().clone();
 
         let slot = allocator.slots.values_mut().next().unwrap();
-        slot.active = Some(active);
-        slot.staging = None;
+        slot.set_roles_for_test(Some(&active), None);
         slot.paused = false;
 
         assert!(slot.switch_to(&new_target, true));
         assert!(
-            slot.active.is_none(),
+            slot.test_active().is_none(),
             "force switch must clear active stream"
         );
         assert_eq!(
-            slot.staging.as_ref().unwrap().meta.id,
-            new_target.meta.id,
+            slot.test_staging().map(|s| s.0),
+            Some(new_target.meta.id),
             "new track must become staging target"
         );
     }
@@ -1707,11 +1669,9 @@ mod assignment_tests {
         add_slots(&mut allocator, 7);
 
         // Manually promote every staged slot to Stable (simulate the normal
-        // on_rtp path that sets active = staging.take()).
+        // feed path that lands the burst and makes the staged stream active).
         for slot in allocator.slots.values_mut() {
-            if let Some(layer) = slot.staging.take() {
-                slot.active = Some(layer);
-            }
+            slot.test_promote();
         }
 
         // Adding a new slot triggers rebalance().  Before the fix this would
@@ -1732,10 +1692,7 @@ mod assignment_tests {
             allocator
                 .slots
                 .values()
-                .filter(|s| {
-                    s.staging.as_ref().map_or(false, |l| l.meta.id == *id)
-                        || s.active.as_ref().map_or(false, |l| l.meta.id == *id)
-                })
+                .filter(|s| s.desired.as_ref().map_or(false, |l| l.meta.id == *id))
                 .count()
         };
         for id in &tracks.ids {
@@ -1759,9 +1716,7 @@ mod assignment_tests {
 
         // Promote all staged slots to Stable.
         for slot in allocator.slots.values_mut() {
-            if let Some(layer) = slot.staging.take() {
-                slot.active = Some(layer);
-            }
+            slot.test_promote();
         }
 
         // Trigger rebalance with a new incoming track.
@@ -1785,10 +1740,7 @@ mod assignment_tests {
             let count = allocator
                 .slots
                 .values()
-                .filter(|s| {
-                    s.staging.as_ref().map_or(false, |l| l.meta.id == *id)
-                        || s.active.as_ref().map_or(false, |l| l.meta.id == *id)
-                })
+                .filter(|s| s.desired.as_ref().map_or(false, |l| l.meta.id == *id))
                 .count();
             assert_eq!(count, 1, "existing track {:?} was double-assigned", id);
         }
@@ -1846,15 +1798,15 @@ mod assignment_tests {
 
         {
             let slot = allocator.slots.values_mut().next().unwrap();
-            slot.active = slot.staging.take();
+            slot.test_promote();
             slot.paused = false;
             // Force a quality transition for the same track, leaving active + staging in one slot.
-            slot.switch_to(&upgraded_layer, true);
-            assert!(slot.active.is_some());
-            assert!(slot.staging.is_some());
+            slot.switch_to(&upgraded_layer, false);
+            assert!(slot.test_active().is_some());
+            assert!(slot.test_staging().is_some());
             assert_eq!(
-                slot.active.as_ref().unwrap().meta.id,
-                slot.staging.as_ref().unwrap().meta.id
+                slot.test_active().unwrap().0,
+                slot.test_staging().unwrap().0
             );
         }
 
@@ -2974,7 +2926,7 @@ mod slot_switch_tests {
         }
 
         assert_eq!(
-            fx.slot.active.as_ref().map(|l| l.stream_id()),
+            fx.slot.test_active(),
             Some(low.stream_id())
         );
         assert_decodable(&fx.emitted, "Slot::on_rtp across a simulcast switch");
@@ -3015,7 +2967,7 @@ mod slot_switch_tests {
         }
 
         assert_eq!(
-            fx.slot.active.as_ref().map(|l| l.stream_id()),
+            fx.slot.test_active(),
             Some(high.stream_id()),
             "a stale GOP must not be burst at the subscriber"
         );
@@ -3043,7 +2995,7 @@ mod slot_switch_tests {
         let kf = lo.keyframe(2);
         assert!(fx.ingest_all(&low, &mut lo_cache, &kf));
         assert_eq!(
-            fx.slot.active.as_ref().map(|l| l.stream_id()),
+            fx.slot.test_active(),
             Some(low.stream_id())
         );
         assert_decodable(&fx.emitted, "deferred switch after PLI");

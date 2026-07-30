@@ -103,9 +103,12 @@ fn repeated_simulcast_switching_stays_decodable_test() {
         ]);
 }
 
-// Pre-existing SFU bug: RTP timestamp goes backwards during simulcast layer
-// switches, triggering the egress stream invariant assertion in core.rs:465.
-#[ignore = "pre-existing production bug: egress stream invariant violated on simulcast layer switch"]
+// The EgressGuard backward-timestamp violation is fixed (cache monotonicity
+// check + push() frontier filter).  The remaining failure is a separate
+// pre-existing bug: PLI for the layer switch targets a mid/rid that no longer
+// exists on the publisher side, so no fresh keyframe is delivered and bob gets
+// 0 bytes throughout the soak.
+#[ignore = "pre-existing bug: PLI stream-not-found leaves subscriber starved of keyframes"]
 #[test]
 fn simulcast_stream_stability_test() {
     LocalNodeSim::new()

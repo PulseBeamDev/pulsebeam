@@ -1,14 +1,14 @@
 use pulsebeam_runtime::rand::RngCore;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::time::Duration;
-use str0m::media::Frequency;
+use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
 use crate::rtp::RtpPacket;
+use crate::rtp::cache::StreamCache;
 use crate::rtp::timeline::Timeline;
-
-const SWITCHER_PENDING_CAPACITY: usize = 32;
+use crate::track::StreamId;
 
 /// How long after a switch the abandoned stream may still complete frames the
 /// subscriber has already been given part of.
@@ -17,6 +17,15 @@ const TAIL_DRAIN_WINDOW: Duration = Duration::from_millis(200);
 /// Cap on outstanding holes tracked at once, so a long run of loss cannot grow
 /// the set without bound.
 const MAX_TRACKED_HOLES: usize = 256;
+
+/// How long a ready switch waits for the active layer to finish the frame it is
+/// midway through.
+///
+/// A frame's packets arrive back-to-back, so this only ever costs a millisecond
+/// or two in the normal case; it is short because a packet that has not turned
+/// up by now is late enough that waiting is worse than switching. Whatever the
+/// switch leaves behind can still be filled afterwards by the drain tail.
+const FRAME_ALIGN_GRACE: Duration = Duration::from_millis(15);
 
 /// Translation for the stream a slot has just switched away from.
 ///
@@ -35,26 +44,49 @@ struct Tail {
     holes: BTreeSet<u64>,
 }
 
-/// Handles RTP stream switching with seamless seq/timestamp rewriting.
+/// The stream-switching state machine for one downstream video slot.
 ///
-/// Callers feed the active stream via `push` and a pre-validated switch segment
-/// via `stage_direct`. `pop` drains the active queue first, then the staged
-/// segment, rebasing the timeline on the first staged packet so the subscriber
-/// sees one continuous output stream.
+/// The switcher owns which upstream stream a slot forwards and every step of
+/// moving between streams. It is driven by two inputs:
 ///
-/// The staged segment is emitted onto consecutive output sequence numbers: the
-/// cache has already ordered and deduplicated it, and it may carry synthesized
-/// parameter-set packets whose original sequence numbers are unrelated. Live
-/// packets resume the stream's own numbering afterwards so later upstream loss
-/// still reaches the subscriber as a gap.
+///   * [`switch_to`](Self::switch_to) — policy: "forward this stream." The
+///     switcher stages the target and switches to it at the next clean frame
+///     boundary, replaying from its keyframe.
+///   * [`feed`](Self::feed) — a stream's [`StreamCache`] has new packets. The
+///     switcher reads whatever it needs through a cursor and emits rewritten
+///     packets that look to the subscriber like one continuous sender.
+///
+/// The cache is the single source of packet data: both the initial replay burst
+/// and the ongoing live tail are read through the same cursor, so there is no
+/// separate live path that could desync from the burst and hand the subscriber
+/// a half-frame that looks whole.
 #[derive(Debug)]
 pub struct Switcher {
     timeline: Timeline,
-    pending: VecDeque<RtpPacket>,
-    staged: VecDeque<RtpPacket>,
-    /// Highest input seq emitted from the staged burst. Live packets at or below
-    /// it were already sent and must not be emitted a second time.
-    replay_floor: Option<SeqNo>,
+
+    /// The stream currently forwarded, and how far its cache has been read.
+    /// `active_cursor` is `Some` whenever `active` is `Some`.
+    active: Option<StreamId>,
+    active_cursor: Option<SeqNo>,
+    /// Input sequence numbers the active stream has skipped over — gaps the live
+    /// forward pass has stepped past. Tracked in the stream's own input space and
+    /// reset on every switch, so a reordered packet that fills one is looked up in
+    /// the cache unambiguously (an output-space hole could alias a stale packet
+    /// left in the cache by an earlier stream on the same layer).
+    active_input_holes: BTreeSet<u64>,
+    /// Next input sequence number the active stream is expected to produce.
+    next_expected_input: Option<u64>,
+    /// The stream a switch is pending to. Its keyframe is awaited.
+    staging: Option<StreamId>,
+    /// The stream just switched away from, still completing in-flight frames.
+    draining: Option<StreamId>,
+
+    /// When the staged stream first became switchable but the active stream was
+    /// still midway through a frame.
+    switch_blocked_since: Option<Instant>,
+
+    tail: Option<Tail>,
+
     /// Highest output sequence number emitted, and the one after it.
     last_output: Option<SeqNo>,
     next_expected_output: Option<u64>,
@@ -67,89 +99,245 @@ pub struct Switcher {
     last_marker_output: Option<u64>,
     frame_start_output: Option<u64>,
     frame_ts: Option<u64>,
-    tail: Option<Tail>,
-    seen_first: bool,
-    is_switching: bool,
-    switched: bool,
+    /// Maximum output_ts ever emitted on this stream. Used to drop a reordered
+    /// live packet that would advance the sequence frontier while going backwards
+    /// in time — the exact condition the egress stream invariant forbids.
+    max_output_ts: Option<u64>,
 }
 
 impl Switcher {
     pub fn new<R: RngCore>(clock_rate: Frequency, rng: &mut R) -> Self {
         Self {
             timeline: Timeline::new(clock_rate, rng),
-            pending: VecDeque::with_capacity(SWITCHER_PENDING_CAPACITY),
-            staged: VecDeque::new(),
-            replay_floor: None,
+            active: None,
+            active_cursor: None,
+            active_input_holes: BTreeSet::new(),
+            next_expected_input: None,
+            staging: None,
+            draining: None,
+            switch_blocked_since: None,
+            tail: None,
             last_output: None,
             next_expected_output: None,
             holes: BTreeSet::new(),
             last_marker_output: None,
             frame_start_output: None,
             frame_ts: None,
-            tail: None,
-            seen_first: false,
-            is_switching: false,
-            switched: false,
+            max_output_ts: None,
         }
     }
 
-    pub fn push(&mut self, pkt: RtpPacket) {
-        debug_assert!(!self.is_switching, "push while state is switching");
-        if self.is_switching {
-            return;
-        }
-
-        // Already delivered as part of the switch burst.
-        if self.replay_floor.is_some_and(|floor| *pkt.seq_no <= *floor) {
-            return;
-        }
-
-        if self.pending.len() == SWITCHER_PENDING_CAPACITY {
-            // Callers drain after every push, so this is unreachable in practice.
-            // Drop rather than close the gap: silently renumbering around a lost
-            // packet leaves the subscriber decoding a hole it cannot detect.
-            debug_assert!(false, "switcher pending queue overflowed");
-            let _ = self.pending.pop_front();
-        }
-
-        self.pending.push_back(pkt);
-        self.switched = false;
-    }
-
-    /// Load a switch segment produced by `StreamCache::replay`.
+    /// Request that the slot forward `target` as soon as it can switch cleanly.
     ///
-    /// The segment must be ordered by sequence number and start a decodable
-    /// frame; the cache is responsible for both.
-    pub fn stage_direct(&mut self, packets: impl IntoIterator<Item = RtpPacket>, now: Instant) {
-        debug_assert!(!self.is_switching);
-        debug_assert!(
-            self.pending.is_empty(),
-            "stage_direct must follow a full drain"
-        );
+    /// Idempotent. If already active on `target`, any pending switch away from it
+    /// is cancelled. If a switch to a different stream is in flight, it retargets.
+    pub fn switch_to(&mut self, target: StreamId) {
+        if self.active == Some(target) {
+            // We are already on it; drop any pending switch away.
+            if self.staging.take().is_some() {
+                self.switch_blocked_since = None;
+            }
+            return;
+        }
+        if self.staging == Some(target) {
+            return;
+        }
+        // Switching back to the stream currently draining: stop draining it. It
+        // will re-enter as active from its own keyframe, and its old tail — a
+        // generation now two switches back — is no longer drainable.
+        if self.draining == Some(target) {
+            self.draining = None;
+            self.tail = None;
+        }
+        self.staging = Some(target);
+        self.switch_blocked_since = None;
+    }
 
-        self.staged.clear();
-        self.staged.extend(packets);
-        if self.staged.is_empty() {
+    /// Stop forwarding entirely and reset switch state. The timeline is kept so a
+    /// later stream continues the output clock forward rather than colliding.
+    pub fn stop(&mut self) {
+        self.active = None;
+        self.active_cursor = None;
+        self.active_input_holes.clear();
+        self.next_expected_input = None;
+        self.staging = None;
+        self.draining = None;
+        self.switch_blocked_since = None;
+        self.tail = None;
+        self.holes.clear();
+        self.last_output = None;
+        self.next_expected_output = None;
+        self.last_marker_output = None;
+        self.frame_start_output = None;
+        self.frame_ts = None;
+        self.max_output_ts = None;
+    }
+
+    /// A stream this slot tracks has new packets in its cache. Routes the update
+    /// to the active (live pull), staging (switch), or draining (tail) role and
+    /// emits rewritten packets via `emit`.
+    pub fn feed(
+        &mut self,
+        stream: StreamId,
+        cache: &StreamCache,
+        now: Instant,
+        emit: &mut impl FnMut(RtpPacket),
+    ) {
+        if self.active == Some(stream) {
+            self.pull_active(cache, emit);
+        } else if self.draining == Some(stream) {
+            self.drain_tail(cache, now, emit);
+        } else if self.staging == Some(stream) {
+            self.try_switch(cache, now, emit);
+        }
+    }
+
+    pub fn active_stream(&self) -> Option<StreamId> {
+        self.active
+    }
+
+    pub fn staging_stream(&self) -> Option<StreamId> {
+        self.staging
+    }
+
+    pub fn draining_stream(&self) -> Option<StreamId> {
+        self.draining
+    }
+
+    /// A switch is pending; the slot should keep sending PLIs for the staged
+    /// stream's keyframe.
+    pub fn awaiting_switch(&self) -> bool {
+        self.staging.is_some()
+    }
+
+    /// Pull new live packets from the active stream's cache and emit them,
+    /// preserving the stream's own sequence structure so upstream loss stays
+    /// visible to the subscriber as a gap.
+    fn pull_active(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket)) {
+        // Forward pass: packets past the cursor, in order.
+        if let Some((packets, new_cursor)) = cache.packets_since(self.active_cursor) {
+            for mut pkt in packets {
+                let input_seq = *pkt.seq_no;
+
+                // Drop a packet that would both advance the output sequence
+                // frontier AND carry a timestamp behind the frontier — a delayed
+                // packet from an earlier frame. Forwarding it would trip the
+                // egress stream invariant; its only valid landing spot is a hole,
+                // so it is dropped here and may be re-placed by the backfill pass.
+                let output_seq = input_seq.wrapping_add(*self.timeline.seq_base());
+                let output_ts = pkt.rtp_ts.numer().wrapping_add(self.timeline.ts_base());
+                let advances_frontier = self.last_output.is_none_or(|last| output_seq > *last);
+                if advances_frontier && self.max_output_ts.is_some_and(|m| output_ts < m) {
+                    continue;
+                }
+
+                // Record any input sequence numbers stepped over as gaps the
+                // stream may still fill by reordering.
+                if let Some(expected) = self.next_expected_input
+                    && input_seq > expected
+                    && input_seq - expected <= MAX_TRACKED_HOLES as u64
+                {
+                    self.active_input_holes.extend(expected..input_seq);
+                    while self.active_input_holes.len() > MAX_TRACKED_HOLES {
+                        let lowest = *self.active_input_holes.iter().next().expect("non-empty");
+                        self.active_input_holes.remove(&lowest);
+                    }
+                }
+                if self.next_expected_input.is_none_or(|e| input_seq >= e) {
+                    self.next_expected_input = Some(input_seq.wrapping_add(1));
+                }
+
+                self.timeline.rewrite(&mut pkt);
+                self.note_emitted(pkt.seq_no, pkt.marker, pkt.rtp_ts.numer());
+                emit(pkt);
+            }
+            self.active_cursor = Some(new_cursor);
+        }
+
+        // Backfill pass: a packet reordered behind the cursor cannot come through
+        // the forward pass (its sequence number is below it). If it fills one of
+        // the gaps the active stream stepped over, emit it so the subscriber sees
+        // a whole frame instead of counting the gap as loss. The egress guard
+        // tolerates this: a hole-fill never advances the sequence frontier, and
+        // the subscriber orders by sequence number regardless of arrival order.
+        self.backfill_active_holes(cache, emit);
+    }
+
+    /// Emit cached packets that fill a gap the active stream stepped over.
+    ///
+    /// Gaps are tracked in the stream's own input space and reset on every
+    /// switch, so the cache lookup is unambiguous — it can only return this
+    /// stream's packet, never a stale one an earlier stream left on the layer.
+    fn backfill_active_holes(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket)) {
+        if self.active_input_holes.is_empty() {
+            return;
+        }
+        let holes: Vec<u64> = self.active_input_holes.iter().copied().collect();
+        for input_seq in holes {
+            let Some(pkt) = cache.get(input_seq.into()) else {
+                continue;
+            };
+            let mut out = pkt.clone();
+            self.timeline.rewrite(&mut out);
+            self.active_input_holes.remove(&input_seq);
+            self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
+            emit(out);
+        }
+    }
+
+    /// Attempt the pending switch to the staged stream.
+    ///
+    /// Waits for a clean frame boundary on the active stream, then replays the
+    /// staged stream's keyframe segment onto a fresh, contiguous output sequence
+    /// and promotes it to active. The old active stream begins draining.
+    fn try_switch(&mut self, cache: &StreamCache, now: Instant, emit: &mut impl FnMut(RtpPacket)) {
+        if !self.may_switch_now(now) {
+            return;
+        }
+        let Some((packets, new_cursor)) = cache.packets_since(None) else {
+            // Not decodable from here yet; the slot's PLI retry keeps probing.
+            return;
+        };
+        if packets.is_empty() {
             return;
         }
 
-        debug_assert!(
-            self.staged.iter().any(|p| p.is_keyframe),
-            "staged segment must be decodable on its own"
-        );
-        debug_assert!(
-            self.staged
-                .make_contiguous()
-                .windows(2)
-                .all(|w| *w[0].seq_no <= *w[1].seq_no),
-            "staged segment must be ordered"
-        );
+        // Hand the outgoing stream a window to complete frames the subscriber has
+        // already seen part of. Must run before the rebase below, while the
+        // timeline still holds the old stream's translation.
+        if self.active.is_some() {
+            self.open_tail(now);
+        }
 
-        // The active stream was abandoned partway through a frame. Skip an
-        // output sequence number so the subscriber sees a hole and discards the
-        // fragment, instead of reassembling it into a frame it believes whole.
-        // Hand the abandoned stream a window in which its in-flight packets can
-        // still complete frames the subscriber has already seen part of.
+        // Promote: the staged stream becomes active; the old active drains.
+        self.draining = self.active;
+        self.active = self.staging.take();
+        self.active_cursor = Some(new_cursor);
+        self.active_input_holes.clear();
+        // The next live packet the stream owes is the one after the burst.
+        self.next_expected_input = Some((*new_cursor).wrapping_add(1));
+        self.switch_blocked_since = None;
+
+        // Emit the burst on a fresh, rebased, contiguous output sequence.
+        let mut first = true;
+        for mut pkt in packets {
+            if first {
+                self.timeline.rebase(&pkt);
+                first = false;
+            }
+            self.timeline.rewrite_sequential(&mut pkt);
+            self.note_emitted(pkt.seq_no, pkt.marker, pkt.rtp_ts.numer());
+            emit(pkt);
+        }
+
+        // Realign so the stream's next live packet (new_cursor + 1) continues
+        // straight on from where the burst stopped.
+        self.timeline.resync_to_input(new_cursor);
+    }
+
+    /// Snapshot the outgoing stream's translation so its in-flight packets can
+    /// still complete frames the subscriber has part of, and mark an open frame.
+    fn open_tail(&mut self, now: Instant) {
         self.tail = Some(Tail {
             seq_base: self.timeline.seq_base(),
             ts_base: self.timeline.ts_base(),
@@ -172,15 +360,67 @@ impl Switcher {
                 tail.holes.insert(reserved);
             }
         }
-
-        self.pending.clear();
-        self.seen_first = false;
-        self.is_switching = true;
-        self.replay_floor = None;
     }
 
-    pub fn is_switching(&self) -> bool {
-        self.is_switching
+    /// Complete frames on the draining stream: fill the holes the switch left
+    /// with the matching packets now in the old stream's cache, translated by the
+    /// old stream's mapping.
+    ///
+    /// A straggler that fills a hole has a sequence number *below* the point the
+    /// slot had reached on that stream, so it is looked up by the hole it fills
+    /// rather than pulled from a cursor — a cursor only ever moves forward.
+    fn drain_tail(&mut self, cache: &StreamCache, now: Instant, emit: &mut impl FnMut(RtpPacket)) {
+        let Some(tail) = self.tail.as_ref() else {
+            self.draining = None;
+            return;
+        };
+        if now >= tail.expires_at {
+            self.tail = None;
+            self.draining = None;
+            return;
+        }
+
+        let seq_base = tail.seq_base;
+        let ts_base = tail.ts_base;
+        let holes: Vec<u64> = tail.holes.iter().copied().collect();
+        for output_seq in holes {
+            let input_seq: SeqNo = output_seq.wrapping_sub(*seq_base).into();
+            let Some(pkt) = cache.get(input_seq) else {
+                continue;
+            };
+            let mut out = pkt.clone();
+            out.seq_no = output_seq.into();
+            out.rtp_ts = MediaTime::new(
+                pkt.rtp_ts.numer().wrapping_add(ts_base),
+                pkt.rtp_ts.frequency(),
+            );
+            emit(out);
+            if let Some(tail) = self.tail.as_mut() {
+                tail.holes.remove(&output_seq);
+            }
+            self.holes.remove(&output_seq);
+        }
+
+        // Nothing left to complete: retire the tail.
+        if self.tail.as_ref().is_some_and(|t| t.holes.is_empty()) {
+            self.tail = None;
+            self.draining = None;
+        }
+    }
+
+    pub fn has_tail(&self) -> bool {
+        self.tail.is_some()
+    }
+
+    /// Whether the switch may land now, or should wait for the active stream to
+    /// finish the frame it is partway through.
+    fn may_switch_now(&mut self, now: Instant) -> bool {
+        if self.at_clean_frame_boundary() {
+            self.switch_blocked_since = None;
+            return true;
+        }
+        let blocked_since = *self.switch_blocked_since.get_or_insert(now);
+        now.saturating_duration_since(blocked_since) >= FRAME_ALIGN_GRACE
     }
 
     /// Whether the output currently sits on a completed frame with no holes
@@ -190,7 +430,7 @@ impl Switcher {
     /// subscriber has already resolved one way or the other, and waiting on
     /// those — they are usually real upstream loss and will never be filled —
     /// would stall every switch for the full grace period.
-    pub fn at_clean_frame_boundary(&self) -> bool {
+    fn at_clean_frame_boundary(&self) -> bool {
         if self.newest_frame_left_open() {
             return false;
         }
@@ -242,271 +482,202 @@ impl Switcher {
         if marker {
             self.last_marker_output = Some(seq_v);
         }
-    }
-
-    /// Forward a packet from the stream this slot just switched away from.
-    ///
-    /// Accepted only if it lands in a sequence number the switch left unfilled,
-    /// which by construction is a slot the new stream does not and cannot use.
-    /// Anything else — a packet from further back, or one that would extend the
-    /// old stream past where it stopped — is dropped.
-    pub fn drain_tail(&mut self, pkt: &RtpPacket, now: Instant) -> Option<RtpPacket> {
-        let tail = self.tail.as_ref()?;
-        if now >= tail.expires_at {
-            self.tail = None;
-            return None;
+        if self.max_output_ts.is_none_or(|m| ts > m) {
+            self.max_output_ts = Some(ts);
         }
+    }
+}
 
-        let output_seq = (*pkt.seq_no).wrapping_add(*tail.seq_base);
-        if !tail.holes.contains(&output_seq) {
-            return None;
+#[cfg(test)]
+impl Switcher {
+    /// Force the stream roles for test setup, bypassing the normal switch flow.
+    pub fn test_set_roles(&mut self, active: Option<StreamId>, staging: Option<StreamId>) {
+        self.active = active;
+        self.active_cursor = active.map(|_| SeqNo::from(0u64));
+        self.staging = staging;
+        self.draining = None;
+        self.switch_blocked_since = None;
+    }
+
+    /// Simulate a burst landing: the staged stream becomes active.
+    pub fn test_promote(&mut self) {
+        if let Some(staged) = self.staging.take() {
+            self.draining = self.active;
+            self.active = Some(staged);
+            self.active_cursor = Some(SeqNo::from(0u64));
         }
-        let ts_base = tail.ts_base;
-        self.tail
-            .as_mut()
-            .expect("checked above")
-            .holes
-            .remove(&output_seq);
-        self.holes.remove(&output_seq);
-
-        let mut out = pkt.clone();
-        out.seq_no = output_seq.into();
-        out.rtp_ts = str0m::media::MediaTime::new(
-            pkt.rtp_ts.numer().wrapping_add(ts_base),
-            pkt.rtp_ts.frequency(),
-        );
-        Some(out)
-    }
-
-    pub fn has_tail(&self) -> bool {
-        self.tail.is_some()
-    }
-
-    pub fn pop(&mut self) -> Option<RtpPacket> {
-        if let Some(mut pkt) = self.pending.pop_front() {
-            self.timeline.rewrite(&mut pkt);
-            self.note_emitted(pkt.seq_no, pkt.marker, pkt.rtp_ts.numer());
-            return Some(pkt);
-        }
-
-        if self.is_switching {
-            if let Some(mut pkt) = self.staged.pop_front() {
-                if !self.seen_first {
-                    self.timeline.rebase(&pkt);
-                    self.seen_first = true;
-                }
-                let input_seq = pkt.seq_no;
-                self.timeline.rewrite_sequential(&mut pkt);
-                self.note_emitted(pkt.seq_no, pkt.marker, pkt.rtp_ts.numer());
-                if self.replay_floor.is_none_or(|floor| *input_seq > *floor) {
-                    self.replay_floor = Some(input_seq);
-                }
-                return Some(pkt);
-            }
-
-            // Burst complete: realign so the stream's own numbering resumes.
-            if let Some(floor) = self.replay_floor {
-                self.timeline.resync_to_input(floor);
-            }
-            self.is_switching = false;
-            self.switched = true;
-        }
-
-        None
-    }
-
-    pub fn ready_to_switch(&self) -> bool {
-        self.pending.is_empty() && !self.is_switching && self.switched
-    }
-
-    pub fn clear_staging(&mut self) {
-        self.staged.clear();
-        self.is_switching = false;
-        self.seen_first = false;
-        self.switched = false;
-        self.replay_floor = None;
-    }
-
-    pub fn clear(&mut self) {
-        self.pending.clear();
-        self.tail = None;
-        self.holes.clear();
-        self.clear_staging();
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::entity::{ParticipantId, TrackKind};
     use crate::rtp;
+    use crate::rtp::cache::StreamCache;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
     use pulsebeam_runtime::rand::seeded_rng;
     use std::time::Duration;
-    use str0m::{
-        media::{Frequency, MediaTime},
-        rtp::Ssrc,
-    };
+    use str0m::media::Rid;
     use tokio::time::Instant;
 
-    /// A one-packet frame: complete, so switching away from it needs no
-    /// damage signal.
-    fn pkt(ssrc: u32, seq_no: u64, rtp_ts: u64, playout_time: Instant) -> RtpPacket {
-        RtpPacket {
-            ssrc: Ssrc::from(ssrc),
-            seq_no: seq_no.into(),
-            rtp_ts: MediaTime::new(rtp_ts, Frequency::NINETY_KHZ),
-            playout_time,
-            arrival_ts: playout_time,
-            is_keyframe: true,
-            marker: true,
-            ..Default::default()
-        }
+    /// Two distinct streams (two simulcast layers of one track) to switch between.
+    fn two_streams() -> (StreamId, StreamId) {
+        let track = ParticipantId::new(&mut seeded_rng(1)).derive_track_id(TrackKind::Video, "v");
+        ((track, Some(Rid::from("q"))), (track, Some(Rid::from("h"))))
     }
 
-    /// A packet partway through a frame.
-    fn mid_frame_pkt(ssrc: u32, seq_no: u64, rtp_ts: u64, playout_time: Instant) -> RtpPacket {
-        let mut p = pkt(ssrc, seq_no, rtp_ts, playout_time);
-        p.marker = false;
-        p
+    fn builder(ssrc: u32) -> H264StreamBuilder {
+        H264StreamBuilder::new(ssrc, 1000, 90_000, Instant::now())
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket)
     }
 
-    fn drain_all(switcher: &mut Switcher) -> Vec<RtpPacket> {
-        let mut out = Vec::new();
-        while let Some(pkt) = switcher.pop() {
-            out.push(pkt);
+    /// Feed every packet into the cache then the switcher, mirroring `route_video`.
+    fn ingest(
+        switcher: &mut Switcher,
+        stream: StreamId,
+        cache: &mut StreamCache,
+        packets: &[RtpPacket],
+        out: &mut Vec<RtpPacket>,
+    ) {
+        for p in packets {
+            cache.push(p);
+            let now = p.arrival_ts;
+            switcher.feed(stream, cache, now, &mut |o| out.push(o));
         }
-        out
     }
 
     #[test]
-    fn switches_to_staged_stream_with_contiguous_output_sequence() {
-        let now = Instant::now();
+    fn initial_subscribe_replays_keyframe_then_follows_live_contiguously() {
+        let (q, _) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(7));
+        let mut cache = StreamCache::new();
+        let mut b = builder(1);
+        let mut out = Vec::new();
 
-        switcher.push(pkt(10, 10, 1_000, now));
-        let active_out = switcher.pop().expect("active packet should be emitted");
+        switcher.switch_to(q);
 
-        switcher.stage_direct([pkt(20, 100, 2_100, now + Duration::from_millis(1))], now);
-
-        let switched = drain_all(&mut switcher);
-        assert_eq!(switched.len(), 1);
-        assert_eq!(switched[0].ssrc, Ssrc::from(20));
-        assert_eq!(*switched[0].seq_no, (*active_out.seq_no).wrapping_add(1));
-        assert!(switcher.ready_to_switch());
-    }
-
-    #[test]
-    fn switching_away_mid_frame_leaves_a_gap_the_subscriber_can_see() {
-        let now = Instant::now();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(8));
-
-        // The active stream is partway through a frame when the switch lands.
-        switcher.push(mid_frame_pkt(10, 10, 1_000, now));
-        let truncated = switcher.pop().expect("active packet should be emitted");
-
-        switcher.stage_direct([pkt(20, 100, 2_100, now + Duration::from_millis(1))], now);
-        let switched = drain_all(&mut switcher);
-
-        assert_eq!(
-            *switched[0].seq_no,
-            (*truncated.seq_no).wrapping_add(2),
-            "one sequence number must be burned so the fragment reads as damaged"
-        );
-    }
-
-    #[test]
-    fn clear_resets_in_flight_transition_state() {
-        let now = Instant::now();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(9));
-
-        switcher.push(pkt(10, 1, 1_000, now));
-        let _ = switcher.pop();
-
-        switcher.stage_direct([pkt(20, 50, 2_100, now + Duration::from_millis(1))], now);
-        switcher.clear();
-
-        assert!(switcher.pop().is_none());
-        assert!(!switcher.ready_to_switch());
-    }
-
-    #[test]
-    fn clear_staging_resets_and_accepts_new_stage_direct() {
-        let now = Instant::now();
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(11));
-
-        switcher.push(pkt(10, 1, 1_000, now));
-        let _ = switcher.pop();
-
-        switcher.stage_direct([pkt(20, 100, 2_100, now + Duration::from_millis(1))], now);
-        let _ = drain_all(&mut switcher);
-        assert!(switcher.ready_to_switch());
-
-        switcher.clear_staging();
-        assert!(!switcher.ready_to_switch());
-
-        switcher.stage_direct([pkt(30, 200, 3_100, now + Duration::from_millis(2))], now);
-        let out = drain_all(&mut switcher);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].ssrc, Ssrc::from(30));
-        assert!(switcher.ready_to_switch());
-    }
-
-    #[test]
-    fn a_replayed_burst_is_emitted_contiguously_and_never_twice() {
-        let t0 = Instant::now();
-        let mut b = H264StreamBuilder::new(9, 500, 90_000, t0)
-            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
-
-        switcher.push(pkt(1, 5, 1_000, t0));
-        let last_active = switcher.pop().unwrap();
-
-        let burst = b.keyframe(3);
-        let burst_last_seq = *burst.last().unwrap().seq_no;
-        switcher.stage_direct(burst.clone(), t0);
-        let out = drain_all(&mut switcher);
-
-        assert_eq!(out.len(), burst.len());
-        assert_eq!(*out[0].seq_no, *last_active.seq_no + 1);
-        assert!(out.windows(2).all(|w| *w[1].seq_no == *w[0].seq_no + 1));
-
-        // Reordering redelivers a packet that was already in the burst.
-        for p in burst.iter().rev() {
-            switcher.push(p.clone());
-        }
+        // Keyframe arrives; the switch replays it as the initial burst.
+        let kf = b.keyframe(3);
+        ingest(&mut switcher, q, &mut cache, &kf, &mut out);
+        assert!(!out.is_empty(), "keyframe burst must be emitted");
+        assert_eq!(switcher.active_stream(), Some(q), "slot is now active on q");
+        assert!(!switcher.awaiting_switch());
         assert!(
-            drain_all(&mut switcher).is_empty(),
-            "packets already sent in the burst must not be emitted again"
+            out.windows(2).all(|w| *w[1].seq_no == *w[0].seq_no + 1),
+            "the burst is contiguous"
         );
 
-        // The next genuinely-new live packet continues seamlessly.
-        let live = b.delta_frame(1);
-        assert_eq!(*live[0].seq_no, burst_last_seq + 1);
-        switcher.push(live[0].clone());
-        let out2 = drain_all(&mut switcher);
-        assert_eq!(*out2[0].seq_no, *out.last().unwrap().seq_no + 1);
+        // Live delta frames follow, continuing the output sequence seamlessly.
+        let burst_last = *out.last().unwrap().seq_no;
+        let delta = b.delta_frame(2);
+        ingest(&mut switcher, q, &mut cache, &delta, &mut out);
+        let live_first = *out[out.len() - delta.len()].seq_no;
+        assert_eq!(live_first, burst_last + 1, "live continues from the burst");
     }
 
     #[test]
-    fn live_loss_after_a_switch_still_reaches_the_subscriber_as_a_gap() {
-        let t0 = Instant::now();
-        let mut b = H264StreamBuilder::new(9, 500, 90_000, t0)
-            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
-        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(13));
+    fn live_upstream_loss_stays_visible_as_a_gap() {
+        let (q, _) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(8));
+        let mut cache = StreamCache::new();
+        let mut b = builder(1);
+        let mut out = Vec::new();
 
-        switcher.stage_direct(b.keyframe(3), t0);
-        let out = drain_all(&mut switcher);
-        let last_out = *out.last().unwrap().seq_no;
+        switcher.switch_to(q);
+        ingest(&mut switcher, q, &mut cache, &b.keyframe(2), &mut out);
+        let before = *out.last().unwrap().seq_no;
 
+        // Four packets lost upstream, then a delta frame.
         b.drop_packets(4);
-        let f = b.delta_frame(1);
-        switcher.push(f[0].clone());
-        let out2 = drain_all(&mut switcher);
+        let delta = b.delta_frame(1);
+        ingest(&mut switcher, q, &mut cache, &delta, &mut out);
 
         assert_eq!(
-            *out2[0].seq_no - last_out,
+            *out.last().unwrap().seq_no - before,
             5,
             "4 lost upstream packets must leave a detectable hole"
         );
+    }
+
+    #[test]
+    fn a_burst_packet_is_never_emitted_twice_under_reordering() {
+        let (q, _) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(12));
+        let mut cache = StreamCache::new();
+        let mut b = builder(1);
+        let mut out = Vec::new();
+
+        switcher.switch_to(q);
+        let kf = b.keyframe(3);
+        ingest(&mut switcher, q, &mut cache, &kf, &mut out);
+        let burst_len = out.len();
+
+        // The same keyframe packets are redelivered (reordering); none re-emit.
+        ingest(&mut switcher, q, &mut cache, &kf, &mut out);
+        assert_eq!(out.len(), burst_len, "cursor prevents re-emitting the burst");
+    }
+
+    #[test]
+    fn switching_layers_stays_contiguous_and_decodable() {
+        let (q, h) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(20));
+        let mut cache_q = StreamCache::new();
+        let mut cache_h = StreamCache::new();
+        let mut bq = builder(1);
+        let mut bh = builder(2);
+        let mut out = Vec::new();
+
+        // Establish q.
+        switcher.switch_to(q);
+        ingest(&mut switcher, q, &mut cache_q, &bq.keyframe(3), &mut out);
+        ingest(&mut switcher, q, &mut cache_q, &bq.delta_frame(2), &mut out);
+
+        // Request a switch to h; h's keyframe arrives and the switch lands.
+        switcher.switch_to(h);
+        assert!(switcher.awaiting_switch());
+        ingest(&mut switcher, h, &mut cache_h, &bh.keyframe(3), &mut out);
+        assert_eq!(switcher.active_stream(), Some(h));
+
+        // Live h follows.
+        ingest(&mut switcher, h, &mut cache_h, &bh.delta_frame(2), &mut out);
+
+        assert!(
+            out.windows(2).all(|w| *w[1].seq_no > *w[0].seq_no),
+            "output sequence never goes backwards across the switch"
+        );
+        assert!(
+            out.windows(2).all(|w| w[1].rtp_ts.numer() >= w[0].rtp_ts.numer()),
+            "output timestamp never goes backwards across the switch"
+        );
+    }
+
+    #[test]
+    fn a_full_switch_scenario_stays_egress_decodable() {
+        // Regression for TruncatedFrameLooksComplete and the backwards-timestamp
+        // class: the whole output of a subscribe + soak + layer switch + soak must
+        // satisfy the egress invariants, including that no frame is cut short while
+        // the next follows on a contiguous sequence number.
+        let (q, h) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY, &mut seeded_rng(30));
+        let mut cache_q = StreamCache::new();
+        let mut cache_h = StreamCache::new();
+        let mut bq = builder(1);
+        let mut bh = builder(2);
+        let mut out = Vec::new();
+
+        switcher.switch_to(q);
+        ingest(&mut switcher, q, &mut cache_q, &bq.keyframe(3), &mut out);
+        for _ in 0..10 {
+            ingest(&mut switcher, q, &mut cache_q, &bq.delta_frame(3), &mut out);
+        }
+
+        switcher.switch_to(h);
+        ingest(&mut switcher, h, &mut cache_h, &bh.keyframe(3), &mut out);
+        for _ in 0..10 {
+            ingest(&mut switcher, h, &mut cache_h, &bh.delta_frame(3), &mut out);
+        }
+
+        rtp::conformance::assert_decodable(&out, "subscribe + simulcast switch + soak");
     }
 }
