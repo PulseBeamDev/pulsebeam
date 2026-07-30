@@ -1,10 +1,11 @@
-use std::collections::VecDeque;
-
 use crate::rtp::RtpPacket;
 use str0m::media::MediaTime;
 use str0m::rtp::SeqNo;
 
+/// Ring capacity. Must be a power of two so `seq & CACHE_MASK` indexes a slot.
 const STREAM_CACHE_CAPACITY: usize = 512;
+const CACHE_MASK: u64 = (STREAM_CACHE_CAPACITY - 1) as u64;
+const _: () = assert!(STREAM_CACHE_CAPACITY.is_power_of_two());
 
 /// How many frames a switch segment may span.
 ///
@@ -53,10 +54,17 @@ const MAX_REPLAY_SPAN_MS: u64 = 400;
 /// on more than one packet without starting a new frame.
 #[derive(Debug)]
 pub struct StreamCache {
-    /// Recent packets. Once a keyframe is seen, the front is trimmed to that
-    /// keyframe frame's first packet, so this doubles as the replay segment.
-    packets: VecDeque<RtpPacket>,
-    /// RTP timestamp of the keyframe frame the current segment starts at.
+    /// Direct-mapped ring indexed by `seq & CACHE_MASK`. Two sequence numbers
+    /// `CAPACITY` apart share a slot; a read verifies `slot.seq_no == wanted`, so
+    /// an evicted entry (overwritten by a newer packet at the same slot) reads as
+    /// absent. Packets are boxed so an idle stream's ring costs only pointers.
+    ring: Box<[Option<Box<RtpPacket>>]>,
+    /// Highest sequence number stored — the write frontier. The live window is
+    /// `[newest_seq - CAPACITY + 1, newest_seq]`.
+    newest_seq: Option<u64>,
+    /// First sequence number of the current keyframe frame, and its RTP
+    /// timestamp. The replay segment runs from here to the frontier.
+    segment_start_seq: Option<u64>,
     segment_ts: Option<u64>,
 
     /// Most recent packets carrying SPS / PPS, retained independently of the
@@ -75,11 +83,23 @@ impl Default for StreamCache {
 impl StreamCache {
     pub fn new() -> Self {
         Self {
-            packets: VecDeque::new(),
+            ring: std::iter::repeat_with(|| None)
+                .take(STREAM_CACHE_CAPACITY)
+                .collect(),
+            newest_seq: None,
+            segment_start_seq: None,
             segment_ts: None,
             sps: None,
             pps: None,
         }
+    }
+
+    /// The packet occupying `seq`'s slot, if that slot actually holds `seq`.
+    #[inline]
+    fn slot(&self, seq: u64) -> Option<&RtpPacket> {
+        self.ring[(seq & CACHE_MASK) as usize]
+            .as_deref()
+            .filter(|p| *p.seq_no == seq)
     }
 
     pub fn push(&mut self, pkt: &RtpPacket) {
@@ -90,41 +110,51 @@ impl StreamCache {
             self.pps = Some(pkt.clone());
         }
 
-        self.packets.push_back(pkt.clone());
+        let seq = *pkt.seq_no;
+
+        // Reject a packet that has already slid out of the window: its slot now
+        // holds a newer packet, and overwriting that would corrupt the window.
+        if let Some(newest) = self.newest_seq
+            && seq.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
+        {
+            return;
+        }
+
+        // Placing the packet naturally evicts whatever occupied its slot
+        // `CAPACITY` positions ago — no eviction loop needed.
+        self.ring[(seq & CACHE_MASK) as usize] = Some(Box::new(pkt.clone()));
+        self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
 
         let frame_ts = pkt.rtp_ts.numer();
         if pkt.is_keyframe && self.segment_ts != Some(frame_ts) {
-            self.open_segment(frame_ts);
+            self.open_segment(seq, frame_ts);
         }
 
-        while self.packets.len() > STREAM_CACHE_CAPACITY {
-            let evicted = self.packets.pop_front();
-            // Losing the head of the segment makes what remains start mid-frame.
-            if let (Some(evicted), Some(segment_ts)) = (evicted, self.segment_ts)
-                && evicted.rtp_ts.numer() == segment_ts
-            {
-                self.segment_ts = None;
-            }
+        // Advancing the frontier may have overwritten the segment head; if so the
+        // remaining segment would start mid-frame, so it is no longer replayable.
+        if let (Some(start), Some(newest)) = (self.segment_start_seq, self.newest_seq)
+            && start.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
+        {
+            self.segment_ts = None;
+            self.segment_start_seq = None;
         }
     }
 
     /// Anchor the segment at the earliest buffered packet belonging to the
     /// keyframe's frame, so parameter-set packets that arrived just ahead of the
-    /// IDR are kept rather than trimmed away.
-    fn open_segment(&mut self, frame_ts: u64) {
-        debug_assert!(!self.packets.is_empty(), "open_segment needs the keyframe");
-        let start = self
-            .packets
-            .iter()
-            .position(|p| p.rtp_ts.numer() == frame_ts)
-            .unwrap_or(self.packets.len() - 1);
-        self.packets.drain(..start);
+    /// IDR (sharing its RTP timestamp) are kept rather than trimmed away.
+    fn open_segment(&mut self, kf_seq: u64, frame_ts: u64) {
+        let mut start = kf_seq;
+        // Walk back over packets of the same frame. Bounded by the window.
+        for _ in 0..STREAM_CACHE_CAPACITY {
+            let Some(prev) = start.checked_sub(1) else { break };
+            match self.slot(prev) {
+                Some(p) if p.rtp_ts.numer() == frame_ts => start = prev,
+                _ => break,
+            }
+        }
+        self.segment_start_seq = Some(start);
         self.segment_ts = Some(frame_ts);
-        debug_assert_eq!(
-            self.packets.front().map(|p| p.rtp_ts.numer()),
-            Some(frame_ts),
-            "segment must start at the keyframe frame"
-        );
     }
 
     pub fn has_keyframe(&self) -> bool {
@@ -140,26 +170,25 @@ impl StreamCache {
     /// burst itself nor fall back on parameter sets from the previous layer.
     pub fn replay(&self) -> Option<Vec<RtpPacket>> {
         let segment_ts = self.segment_ts?;
-        if self.packets.is_empty() {
-            return None;
-        }
+        let start = self.segment_start_seq?;
+        let newest = self.newest_seq?;
 
-        let mut segment: Vec<RtpPacket> = self.packets.iter().cloned().collect();
-        segment.sort_unstable_by_key(|p| *p.seq_no);
-        segment.dedup_by_key(|p| *p.seq_no);
-
-        // Trim at the first sequence discontinuity. The burst is emitted with
-        // `rewrite_sequential`, which renumbers it onto contiguous output
-        // sequence numbers — that erases an internal gap, so a frame whose marker
-        // packet was lost upstream would be followed by the next frame with no
-        // discontinuity and read as complete. Everything past a gap is undecodable
-        // anyway (a packet is missing), so the burst stops there; the rest arrives
-        // on the live cursor, where the gap is preserved.
-        if let Some(gap) = segment
-            .windows(2)
-            .position(|w| *w[1].seq_no != (*w[0].seq_no).wrapping_add(1))
-        {
-            segment.truncate(gap + 1);
+        // Walk the contiguous run of sequence numbers from the segment start and
+        // stop at the first hole. Iterating by sequence number yields an ordered,
+        // deduplicated, gap-free segment for free — no sort, dedup, or separate
+        // gap-trim pass. Stopping at the gap matters: the burst is emitted with
+        // `rewrite_sequential`, which renumbers it onto contiguous output sequence
+        // numbers and would erase an internal gap, making a frame whose marker was
+        // lost upstream read as complete. The rest arrives on the live cursor,
+        // where the gap is preserved.
+        let mut segment: Vec<RtpPacket> = Vec::new();
+        let mut seq = start;
+        while seq <= newest {
+            match self.slot(seq) {
+                Some(p) => segment.push(p.clone()),
+                None => break,
+            }
+            seq += 1;
         }
 
         if !segment.iter().any(|p| p.is_keyframe) {
@@ -218,51 +247,33 @@ impl StreamCache {
         Some(out)
     }
 
-    /// Reads the cache from a subscriber's cursor position.
+    /// The live read for a subscriber following this stream: every buffered
+    /// packet strictly after `cursor`, in sequence order.
     ///
-    /// This is the single source of packet data for a downstream slot — both
-    /// the initial switch burst and the ongoing live tail are read through it,
-    /// so there is no separate live path that could desync from the cache.
-    ///
-    /// - `cursor = None`: the subscriber has nothing yet and needs a decodable
-    ///   entry point. Returns the full keyframe segment (identical to
-    ///   `replay()`), or `None` if switching here right now would not decode.
-    /// - `cursor = Some(seq)`: the subscriber is already following this stream.
-    ///   Returns every buffered packet past `seq`, ordered and deduplicated.
-    ///   No caps or checks apply — these are the incremental live packets, and
-    ///   an empty result (nothing new yet) is `Some((vec![], seq))`, not `None`.
-    ///
-    /// The returned sequence number is the new cursor: the highest sequence
-    /// number emitted, which the caller stores and passes back next time.
-    pub fn packets_since(&self, cursor: Option<SeqNo>) -> Option<(Vec<RtpPacket>, SeqNo)> {
-        match cursor {
-            None => {
-                let segment = self.replay()?;
-                let new_cursor = segment.last()?.seq_no;
-                Some((segment, new_cursor))
+    /// Borrows the ring and yields references, so the hot path allocates nothing
+    /// — the reader clones only the packets it emits. In steady state this yields
+    /// the single newly-arrived packet: the scan spans `(cursor, newest]`,
+    /// clamped to the live window, which is one element when the reader is
+    /// current. O(k), no allocation.
+    pub fn range_after(&self, cursor: SeqNo) -> impl Iterator<Item = &RtpPacket> + '_ {
+        let cursor = *cursor;
+        let (lo, hi) = match self.newest_seq {
+            Some(newest) if newest > cursor => {
+                let floor = newest.saturating_sub(STREAM_CACHE_CAPACITY as u64 - 1);
+                (cursor.wrapping_add(1).max(floor), newest)
             }
-            Some(cursor) => {
-                let mut packets: Vec<RtpPacket> = self
-                    .packets
-                    .iter()
-                    .filter(|p| *p.seq_no > *cursor)
-                    .cloned()
-                    .collect();
-                packets.sort_unstable_by_key(|p| *p.seq_no);
-                packets.dedup_by_key(|p| *p.seq_no);
-                let new_cursor = packets.last().map_or(cursor, |p| p.seq_no);
-                Some((packets, new_cursor))
-            }
-        }
+            // Empty range: nothing newer than the cursor.
+            _ => (1, 0),
+        };
+        (lo..=hi).filter_map(move |seq| self.slot(seq))
     }
 
     /// The buffered packet with this input sequence number, if still cached.
     ///
-    /// Used by the tail drain to complete a frame left half-sent by a stream the
-    /// slot switched away from: the hole is known, so the packet that fills it is
-    /// looked up directly rather than scanned for in arrival order.
+    /// Used by the tail drain and reorder backfill to complete a frame from a
+    /// known hole: O(1) index + tag check, no scan.
     pub fn get(&self, seq: SeqNo) -> Option<&RtpPacket> {
-        self.packets.iter().find(|p| p.seq_no == seq)
+        self.slot(*seq)
     }
 
     /// Parameter-set packets the segment is missing, restamped onto the
@@ -307,7 +318,11 @@ impl StreamCache {
     }
 
     pub fn clear(&mut self) {
-        self.packets.clear();
+        for slot in self.ring.iter_mut() {
+            *slot = None;
+        }
+        self.newest_seq = None;
+        self.segment_start_seq = None;
         self.segment_ts = None;
         self.sps = None;
         self.pps = None;
@@ -509,65 +524,91 @@ mod test {
     }
 
     #[test]
-    fn packets_since_none_returns_the_full_burst_and_its_last_seq_as_cursor() {
-        let mut b = builder(ParameterSetStyle::SeparatePacket);
-        let mut cache = StreamCache::new();
-        for p in b.keyframe(4) {
-            cache.push(&p);
-        }
-
-        let (burst, cursor) = cache.packets_since(None).expect("replayable");
-        let replay = cache.replay().expect("replayable");
-        assert_eq!(burst.len(), replay.len(), "None cursor mirrors replay()");
-        assert_eq!(
-            cursor,
-            burst.last().unwrap().seq_no,
-            "cursor is the highest seq in the burst"
-        );
-    }
-
-    #[test]
-    fn packets_since_a_cursor_returns_only_newer_packets_ordered() {
+    fn range_after_returns_only_newer_packets_in_sequence_order() {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
         for p in b.keyframe(2) {
             cache.push(&p);
         }
-        let (burst, cursor) = cache.packets_since(None).expect("replayable");
+        let burst = cache.replay().expect("replayable");
+        let cursor = burst.last().unwrap().seq_no;
 
-        // Nothing new yet: empty batch, cursor unchanged.
-        let (empty, same) = cache.packets_since(Some(cursor)).expect("live read");
-        assert!(empty.is_empty(), "no packets past the cursor yet");
-        assert_eq!(same, cursor, "cursor holds when nothing is new");
+        // Nothing new yet.
+        assert_eq!(cache.range_after(cursor).count(), 0, "no packets past cursor");
 
         // A live delta frame arrives.
         let delta = b.delta_frame(2);
         for p in &delta {
             cache.push(p);
         }
-        let (live, advanced) = cache.packets_since(Some(cursor)).expect("live read");
+        let live: Vec<_> = cache.range_after(cursor).collect();
         assert!(
             live.iter().all(|p| *p.seq_no > *cursor),
             "only packets past the cursor are returned"
         );
         assert!(
             live.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no),
-            "live packets are ordered by sequence number"
+            "packets are returned in sequence order"
         );
-        assert_eq!(
-            advanced,
-            live.last().unwrap().seq_no,
-            "cursor advances to the newest packet"
-        );
-        assert!(
-            *advanced > *cursor,
-            "cursor moved forward past the delta frame"
-        );
-        // The burst's own packets are never redelivered on a live read.
         let burst_max = *burst.last().unwrap().seq_no;
         assert!(
             live.iter().all(|p| *p.seq_no > burst_max),
             "packets already in the burst are not returned again"
+        );
+    }
+
+    #[test]
+    fn range_after_and_get_survive_reordered_inserts() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        let kf = b.keyframe(2);
+        for p in &kf {
+            cache.push(p);
+        }
+        let cursor = *kf.last().unwrap().seq_no;
+
+        // A delta frame arrives with its packets in reverse order.
+        let mut delta = b.delta_frame(3);
+        delta.reverse();
+        for p in &delta {
+            cache.push(p);
+        }
+
+        // The ring is keyed by sequence number, so the read is ordered regardless
+        // of arrival order, and point lookups find each packet.
+        let live: Vec<_> = cache.range_after(cursor.into()).collect();
+        assert!(
+            live.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no),
+            "reordered inserts still read back in sequence order"
+        );
+        for p in &delta {
+            assert_eq!(
+                cache.get(p.seq_no).map(|q| q.seq_no),
+                Some(p.seq_no),
+                "get finds a reordered packet by its sequence number"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_evicted_from_the_ring_reads_as_absent() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(2) {
+            cache.push(&p);
+        }
+        let old = b.delta_frame(1)[0].clone();
+        cache.push(&old);
+        assert!(cache.get(old.seq_no).is_some(), "present right after push");
+
+        // Push more than a full ring's worth so `old`'s slot is overwritten by a
+        // newer sequence number; the tag check must report the old seq as absent.
+        for p in b.delta_frames(STREAM_CACHE_CAPACITY + 4, 1) {
+            cache.push(&p);
+        }
+        assert!(
+            cache.get(old.seq_no).is_none(),
+            "an evicted sequence number must not resolve to the newer packet in its slot"
         );
     }
 

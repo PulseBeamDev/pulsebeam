@@ -354,7 +354,12 @@ impl SimClient {
                         return Ok(());
                     }
                     result = self.ctx.participants.next() => {
-                        match result.expect("participant state should remain available") {
+                        // The change feed errors when this agent is torn down
+                        // (e.g. an abrupt exit racing teardown); the drive is done.
+                        let Ok(change) = result else {
+                            return Ok(());
+                        };
+                        match change {
                             ParticipantChange::Joined(participant)
                             | ParticipantChange::Updated(participant) => {
                                 self.ctx

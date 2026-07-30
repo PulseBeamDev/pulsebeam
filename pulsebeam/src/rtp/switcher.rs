@@ -153,8 +153,14 @@ impl Switcher {
         self.switch_blocked_since = None;
     }
 
-    /// Stop forwarding entirely and reset switch state. The timeline is kept so a
-    /// later stream continues the output clock forward rather than colliding.
+    /// Stop forwarding and reset the input/role state — which stream this slot
+    /// forwards and any switch in flight.
+    ///
+    /// The output-stream state (the timeline, the last emitted sequence number
+    /// and marker, frame bounds, `max_output_ts`, holes) is deliberately kept:
+    /// the egress stream is one continuous stream across a pause/resume, so a
+    /// burst that resumes after a frame was left open still knows to break the
+    /// sequence rather than continue it and read as a whole frame.
     pub fn stop(&mut self) {
         self.active = None;
         self.active_cursor = None;
@@ -164,13 +170,6 @@ impl Switcher {
         self.draining = None;
         self.switch_blocked_since = None;
         self.tail = None;
-        self.holes.clear();
-        self.last_output = None;
-        self.next_expected_output = None;
-        self.last_marker_output = None;
-        self.frame_start_output = None;
-        self.frame_ts = None;
-        self.max_output_ts = None;
     }
 
     /// A stream this slot tracks has new packets in its cache. Routes the update
@@ -213,54 +212,71 @@ impl Switcher {
     /// Pull new live packets from the active stream's cache and emit them,
     /// preserving the stream's own sequence structure so upstream loss stays
     /// visible to the subscriber as a gap.
+    ///
+    /// Hot path: `range_after` yields the single just-arrived packet in the
+    /// common case (O(1)), and the O(holes) backfill runs only on the rare
+    /// reorder event where the forward pass produced nothing.
     fn pull_active(&mut self, cache: &StreamCache, emit: &mut impl FnMut(RtpPacket)) {
-        // Forward pass: packets past the cursor, in order.
-        if let Some((packets, new_cursor)) = cache.packets_since(self.active_cursor) {
-            for mut pkt in packets {
+        let mut forwarded_any = false;
+
+        if let Some(cursor) = self.active_cursor {
+            for pkt in cache.range_after(cursor) {
                 let input_seq = *pkt.seq_no;
+                forwarded_any = true;
 
                 // Drop a packet that would both advance the output sequence
                 // frontier AND carry a timestamp behind the frontier — a delayed
-                // packet from an earlier frame. Forwarding it would trip the
-                // egress stream invariant; its only valid landing spot is a hole,
-                // so it is dropped here and may be re-placed by the backfill pass.
+                // fragment of an earlier frame with a high sequence number.
+                // Forwarding it would trip the egress stream invariant. It is
+                // consumed (cursor advances past it) but never emitted, and not
+                // recorded as a gap, so the backfill will not resurrect it.
                 let output_seq = input_seq.wrapping_add(*self.timeline.seq_base());
                 let output_ts = pkt.rtp_ts.numer().wrapping_add(self.timeline.ts_base());
                 let advances_frontier = self.last_output.is_none_or(|last| output_seq > *last);
-                if advances_frontier && self.max_output_ts.is_some_and(|m| output_ts < m) {
-                    continue;
+                let drop_backward =
+                    advances_frontier && self.max_output_ts.is_some_and(|m| output_ts < m);
+
+                if !drop_backward {
+                    // Record the input sequence numbers stepped over as gaps the
+                    // stream may still fill by reordering (bounded).
+                    if let Some(expected) = self.next_expected_input
+                        && input_seq > expected
+                        && input_seq - expected <= MAX_TRACKED_HOLES as u64
+                    {
+                        self.active_input_holes.extend(expected..input_seq);
+                        self.trim_active_input_holes();
+                    }
+
+                    let mut out = pkt.clone();
+                    self.timeline.rewrite(&mut out);
+                    self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
+                    emit(out);
                 }
 
-                // Record any input sequence numbers stepped over as gaps the
-                // stream may still fill by reordering.
-                if let Some(expected) = self.next_expected_input
-                    && input_seq > expected
-                    && input_seq - expected <= MAX_TRACKED_HOLES as u64
-                {
-                    self.active_input_holes.extend(expected..input_seq);
-                    while self.active_input_holes.len() > MAX_TRACKED_HOLES {
-                        let lowest = *self.active_input_holes.iter().next().expect("non-empty");
-                        self.active_input_holes.remove(&lowest);
-                    }
-                }
                 if self.next_expected_input.is_none_or(|e| input_seq >= e) {
                     self.next_expected_input = Some(input_seq.wrapping_add(1));
                 }
-
-                self.timeline.rewrite(&mut pkt);
-                self.note_emitted(pkt.seq_no, pkt.marker, pkt.rtp_ts.numer());
-                emit(pkt);
+                self.active_cursor = Some(input_seq.into());
             }
-            self.active_cursor = Some(new_cursor);
         }
 
-        // Backfill pass: a packet reordered behind the cursor cannot come through
-        // the forward pass (its sequence number is below it). If it fills one of
-        // the gaps the active stream stepped over, emit it so the subscriber sees
-        // a whole frame instead of counting the gap as loss. The egress guard
-        // tolerates this: a hole-fill never advances the sequence frontier, and
-        // the subscriber orders by sequence number regardless of arrival order.
-        self.backfill_active_holes(cache, emit);
+        // Backfill: a packet reordered behind the cursor cannot come through the
+        // forward pass (its sequence number is below it), so the forward pass
+        // yields nothing this call. If such a packet fills a gap the stream
+        // stepped over, emit it so the subscriber sees a whole frame instead of
+        // counting the gap as loss. The egress guard tolerates this — a hole-fill
+        // never advances the frontier — and the subscriber orders by sequence
+        // number regardless of arrival order.
+        if !forwarded_any {
+            self.backfill_active_holes(cache, emit);
+        }
+    }
+
+    fn trim_active_input_holes(&mut self) {
+        while self.active_input_holes.len() > MAX_TRACKED_HOLES {
+            let lowest = *self.active_input_holes.iter().next().expect("non-empty");
+            self.active_input_holes.remove(&lowest);
+        }
     }
 
     /// Emit cached packets that fill a gap the active stream stepped over.
@@ -294,17 +310,31 @@ impl Switcher {
         if !self.may_switch_now(now) {
             return;
         }
-        let Some((packets, new_cursor)) = cache.packets_since(None) else {
+        let Some(packets) = cache.replay() else {
             // Not decodable from here yet; the slot's PLI retry keeps probing.
             return;
         };
-        if packets.is_empty() {
+        let Some(new_cursor) = packets.last().map(|p| p.seq_no) else {
             return;
+        };
+
+        // If the previously emitted output frame was left open — whether the old
+        // stream is now being drained or the slot was merely paused since — burn
+        // one output sequence number so the burst does not continue that frame
+        // contiguously, which the subscriber would read as a completed frame.
+        // Runs regardless of whether there is an old stream to drain, and before
+        // the rebase below so the reserved gap sits ahead of the burst.
+        if self.newest_frame_left_open()
+            && let Some(last) = self.last_output
+        {
+            self.timeline.skip_output_sequence(1);
+            self.holes.insert((*last).wrapping_add(1));
         }
 
         // Hand the outgoing stream a window to complete frames the subscriber has
         // already seen part of. Must run before the rebase below, while the
-        // timeline still holds the old stream's translation.
+        // timeline still holds the old stream's translation; it inherits the
+        // reserved hole above so a late marker packet can still fill it.
         if self.active.is_some() {
             self.open_tail(now);
         }
@@ -336,7 +366,11 @@ impl Switcher {
     }
 
     /// Snapshot the outgoing stream's translation so its in-flight packets can
-    /// still complete frames the subscriber has part of, and mark an open frame.
+    /// still complete frames the subscriber has part of.
+    ///
+    /// Inherits the current hole set — including any gap `try_switch` just
+    /// reserved for a frame left open — so a late marker packet on the old stream
+    /// can still fill it.
     fn open_tail(&mut self, now: Instant) {
         self.tail = Some(Tail {
             seq_base: self.timeline.seq_base(),
@@ -344,22 +378,6 @@ impl Switcher {
             expires_at: now + TAIL_DRAIN_WINDOW,
             holes: self.holes.clone(),
         });
-
-        // The frame in progress was never closed, so the new stream would follow
-        // it contiguously and the subscriber would read the fragment as a whole
-        // frame. Leave a hole to say otherwise — which the tail then fills if the
-        // packet that closes the frame does turn up. A hole *inside* the frame
-        // needs no such marker: it already says the frame is damaged.
-        if self.newest_frame_left_open()
-            && let Some(last) = self.last_output
-        {
-            self.timeline.skip_output_sequence(1);
-            let reserved = (*last).wrapping_add(1);
-            self.holes.insert(reserved);
-            if let Some(tail) = self.tail.as_mut() {
-                tail.holes.insert(reserved);
-            }
-        }
     }
 
     /// Complete frames on the draining stream: fill the holes the switch left
