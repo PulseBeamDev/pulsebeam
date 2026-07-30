@@ -91,9 +91,6 @@ fn slots_layout_update_test() {
         ]);
 }
 
-// Intermittently triggers the same pre-existing SFU bug as simulcast_stream_stability_test:
-// egress stream invariant violated when the layer switch produces backward RTP timestamps.
-#[ignore = "pre-existing production bug: egress stream invariant violated on simulcast layer switch"]
 #[test]
 fn slots_prioritization_test() {
     LocalNodeSim::new()

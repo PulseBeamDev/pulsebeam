@@ -32,7 +32,7 @@ fn fast_initial_ramp_up_on_good_network_test() {
             Step::CheckVideoQuality {
                 description: "Bob received renderable frames throughout ramp",
                 participant: "bob",
-                quality: VideoQuality::min_frames(200).allow_gaps_for_switches(3),
+                quality: VideoQuality::min_frames(200).allow_gaps(3),
             },
         ]);
 }
@@ -98,14 +98,17 @@ fn repeated_simulcast_switching_stays_decodable_test() {
             Step::CheckVideoQuality {
                 description: "Frames remain decodable across 4 simulcast switches",
                 participant: "bob",
-                quality: VideoQuality::min_frames(100).allow_gaps_for_switches(4),
+                quality: VideoQuality::min_frames(100).allow_gaps(4),
             },
         ]);
 }
 
-// Pre-existing SFU bug: RTP timestamp goes backwards during simulcast layer
-// switches, triggering the egress stream invariant assertion in core.rs:465.
-#[ignore = "pre-existing production bug: egress stream invariant violated on simulcast layer switch"]
+// The EgressGuard backward-timestamp violation is fixed (cache monotonicity
+// check + push() frontier filter).  The remaining failure is a separate
+// pre-existing bug: PLI for the layer switch targets a mid/rid that no longer
+// exists on the publisher side, so no fresh keyframe is delivered and bob gets
+// 0 bytes throughout the soak.
+#[ignore = "pre-existing bug: PLI stream-not-found leaves subscriber starved of keyframes"]
 #[test]
 fn simulcast_stream_stability_test() {
     LocalNodeSim::new()
@@ -132,7 +135,7 @@ fn simulcast_stream_stability_test() {
             Step::CheckVideoQuality {
                 description: "Bob received renderable frames throughout soak",
                 participant: "bob",
-                quality: VideoQuality::min_frames(500).allow_gaps_for_switches(5),
+                quality: VideoQuality::min_frames(500).allow_gaps(5),
             },
         ]);
 }

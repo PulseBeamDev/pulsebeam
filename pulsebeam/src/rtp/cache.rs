@@ -1,9 +1,11 @@
-use std::collections::VecDeque;
-
 use crate::rtp::RtpPacket;
 use str0m::media::MediaTime;
+use str0m::rtp::SeqNo;
 
+/// Ring capacity. Must be a power of two so `seq & CACHE_MASK` indexes a slot.
 const STREAM_CACHE_CAPACITY: usize = 512;
+const CACHE_MASK: u64 = (STREAM_CACHE_CAPACITY - 1) as u64;
+const _: () = assert!(STREAM_CACHE_CAPACITY.is_power_of_two());
 
 /// How many frames a switch segment may span.
 ///
@@ -14,16 +16,21 @@ const STREAM_CACHE_CAPACITY: usize = 512;
 /// is refused and the slot waits for the PLI-driven keyframe instead.
 const MAX_REPLAY_FRAMES: usize = 3;
 
-/// Ceiling on the packets a switch may release at once.
+/// Ceiling on the packets a switch may release at once when the segment spans
+/// more than one frame.
 ///
 /// str0m paces egress, so a burst handed over in one go is not sprayed at the
 /// network — it queues, and shows up as delay instead. Either way it is latency
 /// the subscriber pays, so the amount released at once is what needs bounding.
-///
-/// Never applied to a lone keyframe: that is the smallest decodable unit there
-/// is, so refusing one would livelock — the keyframe request it triggers just
-/// produces another of the same size.
 const MAX_REPLAY_PACKETS: usize = 96;
+
+/// Absolute ceiling on the packets a switch may release, including lone
+/// keyframes.  A 4K IDR can exceed 400 packets; forwarding that many
+/// synchronously queues ~600 KB into the pacing layer in one event-loop tick,
+/// stalling every other stream on the subscriber's connection for hundreds of
+/// milliseconds.  Exceeding this cap returns None so the slot waits for a
+/// PLI-driven keyframe — the encoder typically adapts to a smaller size.
+const MAX_REPLAY_PACKETS_HARD: usize = 200;
 
 /// Ceiling on the media a switch segment may straddle, in milliseconds.
 ///
@@ -47,10 +54,17 @@ const MAX_REPLAY_SPAN_MS: u64 = 400;
 /// on more than one packet without starting a new frame.
 #[derive(Debug)]
 pub struct StreamCache {
-    /// Recent packets. Once a keyframe is seen, the front is trimmed to that
-    /// keyframe frame's first packet, so this doubles as the replay segment.
-    packets: VecDeque<RtpPacket>,
-    /// RTP timestamp of the keyframe frame the current segment starts at.
+    /// Direct-mapped ring indexed by `seq & CACHE_MASK`. Two sequence numbers
+    /// `CAPACITY` apart share a slot; a read verifies `slot.seq_no == wanted`, so
+    /// an evicted entry (overwritten by a newer packet at the same slot) reads as
+    /// absent. Packets are boxed so an idle stream's ring costs only pointers.
+    ring: Box<[Option<Box<RtpPacket>>]>,
+    /// Highest sequence number stored — the write frontier. The live window is
+    /// `[newest_seq - CAPACITY + 1, newest_seq]`.
+    newest_seq: Option<u64>,
+    /// First sequence number of the current keyframe frame, and its RTP
+    /// timestamp. The replay segment runs from here to the frontier.
+    segment_start_seq: Option<u64>,
     segment_ts: Option<u64>,
 
     /// Most recent packets carrying SPS / PPS, retained independently of the
@@ -69,11 +83,23 @@ impl Default for StreamCache {
 impl StreamCache {
     pub fn new() -> Self {
         Self {
-            packets: VecDeque::new(),
+            ring: std::iter::repeat_with(|| None)
+                .take(STREAM_CACHE_CAPACITY)
+                .collect(),
+            newest_seq: None,
+            segment_start_seq: None,
             segment_ts: None,
             sps: None,
             pps: None,
         }
+    }
+
+    /// The packet occupying `seq`'s slot, if that slot actually holds `seq`.
+    #[inline]
+    fn slot(&self, seq: u64) -> Option<&RtpPacket> {
+        self.ring[(seq & CACHE_MASK) as usize]
+            .as_deref()
+            .filter(|p| *p.seq_no == seq)
     }
 
     pub fn push(&mut self, pkt: &RtpPacket) {
@@ -84,41 +110,53 @@ impl StreamCache {
             self.pps = Some(pkt.clone());
         }
 
-        self.packets.push_back(pkt.clone());
+        let seq = *pkt.seq_no;
+
+        // Reject a packet that has already slid out of the window: its slot now
+        // holds a newer packet, and overwriting that would corrupt the window.
+        if let Some(newest) = self.newest_seq
+            && seq.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
+        {
+            return;
+        }
+
+        // Placing the packet naturally evicts whatever occupied its slot
+        // `CAPACITY` positions ago — no eviction loop needed.
+        self.ring[(seq & CACHE_MASK) as usize] = Some(Box::new(pkt.clone()));
+        self.newest_seq = Some(self.newest_seq.map_or(seq, |n| n.max(seq)));
 
         let frame_ts = pkt.rtp_ts.numer();
         if pkt.is_keyframe && self.segment_ts != Some(frame_ts) {
-            self.open_segment(frame_ts);
+            self.open_segment(seq, frame_ts);
         }
 
-        while self.packets.len() > STREAM_CACHE_CAPACITY {
-            let evicted = self.packets.pop_front();
-            // Losing the head of the segment makes what remains start mid-frame.
-            if let (Some(evicted), Some(segment_ts)) = (evicted, self.segment_ts)
-                && evicted.rtp_ts.numer() == segment_ts
-            {
-                self.segment_ts = None;
-            }
+        // Advancing the frontier may have overwritten the segment head; if so the
+        // remaining segment would start mid-frame, so it is no longer replayable.
+        if let (Some(start), Some(newest)) = (self.segment_start_seq, self.newest_seq)
+            && start.wrapping_add(STREAM_CACHE_CAPACITY as u64) <= newest
+        {
+            self.segment_ts = None;
+            self.segment_start_seq = None;
         }
     }
 
     /// Anchor the segment at the earliest buffered packet belonging to the
     /// keyframe's frame, so parameter-set packets that arrived just ahead of the
-    /// IDR are kept rather than trimmed away.
-    fn open_segment(&mut self, frame_ts: u64) {
-        debug_assert!(!self.packets.is_empty(), "open_segment needs the keyframe");
-        let start = self
-            .packets
-            .iter()
-            .position(|p| p.rtp_ts.numer() == frame_ts)
-            .unwrap_or(self.packets.len() - 1);
-        self.packets.drain(..start);
+    /// IDR (sharing its RTP timestamp) are kept rather than trimmed away.
+    fn open_segment(&mut self, kf_seq: u64, frame_ts: u64) {
+        let mut start = kf_seq;
+        // Walk back over packets of the same frame. Bounded by the window.
+        for _ in 0..STREAM_CACHE_CAPACITY {
+            let Some(prev) = start.checked_sub(1) else {
+                break;
+            };
+            match self.slot(prev) {
+                Some(p) if p.rtp_ts.numer() == frame_ts => start = prev,
+                _ => break,
+            }
+        }
+        self.segment_start_seq = Some(start);
         self.segment_ts = Some(frame_ts);
-        debug_assert_eq!(
-            self.packets.front().map(|p| p.rtp_ts.numer()),
-            Some(frame_ts),
-            "segment must start at the keyframe frame"
-        );
     }
 
     pub fn has_keyframe(&self) -> bool {
@@ -134,15 +172,40 @@ impl StreamCache {
     /// burst itself nor fall back on parameter sets from the previous layer.
     pub fn replay(&self) -> Option<Vec<RtpPacket>> {
         let segment_ts = self.segment_ts?;
-        if self.packets.is_empty() {
+        let start = self.segment_start_seq?;
+        let newest = self.newest_seq?;
+
+        // Walk the contiguous run of sequence numbers from the segment start and
+        // stop at the first hole. Iterating by sequence number yields an ordered,
+        // deduplicated, gap-free segment for free — no sort, dedup, or separate
+        // gap-trim pass. Stopping at the gap matters: the burst is emitted with
+        // `rewrite_sequential`, which renumbers it onto contiguous output sequence
+        // numbers and would erase an internal gap, making a frame whose marker was
+        // lost upstream read as complete. The rest arrives on the live cursor,
+        // where the gap is preserved.
+        let mut segment: Vec<RtpPacket> = Vec::new();
+        let mut seq = start;
+        while seq <= newest {
+            match self.slot(seq) {
+                Some(p) => segment.push(p.clone()),
+                None => break,
+            }
+            seq += 1;
+        }
+
+        if !segment.iter().any(|p| p.is_keyframe) {
             return None;
         }
 
-        let mut segment: Vec<RtpPacket> = self.packets.iter().cloned().collect();
-        segment.sort_unstable_by_key(|p| *p.seq_no);
-        segment.dedup_by_key(|p| *p.seq_no);
-
-        if !segment.iter().any(|p| p.is_keyframe) {
+        // A late-arriving keyframe fragment can end up with a higher seq_no than
+        // the delta frames that followed it.  After sorting by seq_no the burst
+        // would have non-monotonic RTP timestamps (T0, T1, T0), and rewriting it
+        // sequentially would produce a backwards timestamp in the egress stream.
+        // Refuse the replay; a fresh PLI-driven keyframe will be clean.
+        if segment
+            .windows(2)
+            .any(|w| w[1].rtp_ts.numer() < w[0].rtp_ts.numer())
+        {
             return None;
         }
 
@@ -156,6 +219,11 @@ impl StreamCache {
             }
         }
         if frames > MAX_REPLAY_FRAMES {
+            return None;
+        }
+        // Hard per-burst cap — protects against forwarding-latency spikes even
+        // for lone keyframes.  PLI requests a fresh (often smaller) keyframe.
+        if segment.len() > MAX_REPLAY_PACKETS_HARD {
             return None;
         }
         if frames > 1 && segment.len() > MAX_REPLAY_PACKETS {
@@ -179,6 +247,35 @@ impl StreamCache {
             "replay must be ordered by sequence number"
         );
         Some(out)
+    }
+
+    /// The live read for a subscriber following this stream: every buffered
+    /// packet strictly after `cursor`, in sequence order.
+    ///
+    /// Borrows the ring and yields references, so the hot path allocates nothing
+    /// — the reader clones only the packets it emits. In steady state this yields
+    /// the single newly-arrived packet: the scan spans `(cursor, newest]`,
+    /// clamped to the live window, which is one element when the reader is
+    /// current. O(k), no allocation.
+    pub fn range_after(&self, cursor: SeqNo) -> impl Iterator<Item = &RtpPacket> + '_ {
+        let cursor = *cursor;
+        let (lo, hi) = match self.newest_seq {
+            Some(newest) if newest > cursor => {
+                let floor = newest.saturating_sub(STREAM_CACHE_CAPACITY as u64 - 1);
+                (cursor.wrapping_add(1).max(floor), newest)
+            }
+            // Empty range: nothing newer than the cursor.
+            _ => (1, 0),
+        };
+        (lo..=hi).filter_map(move |seq| self.slot(seq))
+    }
+
+    /// The buffered packet with this input sequence number, if still cached.
+    ///
+    /// Used by the tail drain and reorder backfill to complete a frame from a
+    /// known hole: O(1) index + tag check, no scan.
+    pub fn get(&self, seq: SeqNo) -> Option<&RtpPacket> {
+        self.slot(*seq)
     }
 
     /// Parameter-set packets the segment is missing, restamped onto the
@@ -223,7 +320,11 @@ impl StreamCache {
     }
 
     pub fn clear(&mut self) {
-        self.packets.clear();
+        for slot in self.ring.iter_mut() {
+            *slot = None;
+        }
+        self.newest_seq = None;
+        self.segment_start_seq = None;
         self.segment_ts = None;
         self.sps = None;
         self.pps = None;
@@ -341,25 +442,51 @@ mod test {
         );
     }
 
-    /// A keyframe can be larger than any bound worth putting on a replay. It
-    /// must stay replayable anyway: refusing one only triggers a keyframe
-    /// request, which produces another exactly as large — the stream would
-    /// never start.
+    /// A lone keyframe larger than the per-frame cap but within the hard cap is
+    /// still replayable.  The per-frame cap only applies to multi-frame bursts.
     #[test]
-    fn a_lone_keyframe_is_replayable_however_large() {
+    fn a_lone_keyframe_within_the_hard_packet_cap_is_replayable() {
         let mut b = builder(ParameterSetStyle::SeparatePacket);
         let mut cache = StreamCache::new();
-        let huge = b.keyframe(400);
+        // MAX_REPLAY_PACKETS + 10 sits above the per-frame cap (96) while well
+        // below the hard cap (200), even accounting for SPS+PPS overhead (~2 pkts).
+        let kf = b.keyframe(MAX_REPLAY_PACKETS + 10);
         assert!(
-            huge.len() > MAX_REPLAY_PACKETS,
-            "fixture must exceed the bound"
+            kf.len() > MAX_REPLAY_PACKETS,
+            "fixture must exceed the per-frame cap"
         );
-        for p in &huge {
+        assert!(
+            kf.len() <= MAX_REPLAY_PACKETS_HARD,
+            "fixture must not exceed the hard cap"
+        );
+        for p in &kf {
             cache.push(p);
         }
         assert!(
             cache.replay().is_some(),
-            "refusing a lone keyframe livelocks the stream"
+            "a lone keyframe within the hard cap must be replayable"
+        );
+    }
+
+    /// A lone keyframe past the hard cap is refused to bound the forwarding
+    /// burst and prevent P99 latency spikes on the subscriber's connection.
+    #[test]
+    fn a_lone_keyframe_past_the_hard_packet_cap_is_refused() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        // MAX_REPLAY_PACKETS_HARD + 10 guarantees the segment exceeds the hard
+        // cap even after SPS+PPS overhead is included.
+        let kf = b.keyframe(MAX_REPLAY_PACKETS_HARD + 10);
+        assert!(
+            kf.len() > MAX_REPLAY_PACKETS_HARD,
+            "fixture must exceed the hard cap"
+        );
+        for p in &kf {
+            cache.push(p);
+        }
+        assert!(
+            cache.replay().is_none(),
+            "a lone keyframe exceeding the hard cap must be refused to prevent latency spikes"
         );
     }
 
@@ -398,6 +525,99 @@ mod test {
         assert!(
             cache.replay().is_some(),
             "a 5fps screen share must switch from cache, not fall back to a keyframe request"
+        );
+    }
+
+    #[test]
+    fn range_after_returns_only_newer_packets_in_sequence_order() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(2) {
+            cache.push(&p);
+        }
+        let burst = cache.replay().expect("replayable");
+        let cursor = burst.last().unwrap().seq_no;
+
+        // Nothing new yet.
+        assert_eq!(
+            cache.range_after(cursor).count(),
+            0,
+            "no packets past cursor"
+        );
+
+        // A live delta frame arrives.
+        let delta = b.delta_frame(2);
+        for p in &delta {
+            cache.push(p);
+        }
+        let live: Vec<_> = cache.range_after(cursor).collect();
+        assert!(
+            live.iter().all(|p| *p.seq_no > *cursor),
+            "only packets past the cursor are returned"
+        );
+        assert!(
+            live.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no),
+            "packets are returned in sequence order"
+        );
+        let burst_max = *burst.last().unwrap().seq_no;
+        assert!(
+            live.iter().all(|p| *p.seq_no > burst_max),
+            "packets already in the burst are not returned again"
+        );
+    }
+
+    #[test]
+    fn range_after_and_get_survive_reordered_inserts() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        let kf = b.keyframe(2);
+        for p in &kf {
+            cache.push(p);
+        }
+        let cursor = *kf.last().unwrap().seq_no;
+
+        // A delta frame arrives with its packets in reverse order.
+        let mut delta = b.delta_frame(3);
+        delta.reverse();
+        for p in &delta {
+            cache.push(p);
+        }
+
+        // The ring is keyed by sequence number, so the read is ordered regardless
+        // of arrival order, and point lookups find each packet.
+        let live: Vec<_> = cache.range_after(cursor.into()).collect();
+        assert!(
+            live.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no),
+            "reordered inserts still read back in sequence order"
+        );
+        for p in &delta {
+            assert_eq!(
+                cache.get(p.seq_no).map(|q| q.seq_no),
+                Some(p.seq_no),
+                "get finds a reordered packet by its sequence number"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_evicted_from_the_ring_reads_as_absent() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for p in b.keyframe(2) {
+            cache.push(&p);
+        }
+        let old = b.delta_frame(1)[0].clone();
+        cache.push(&old);
+        assert!(cache.get(old.seq_no).is_some(), "present right after push");
+
+        // Push more than a full ring's worth so `old`'s slot is overwritten by a
+        // newer sequence number; the tag check must report the old seq as absent.
+        for p in b.delta_frames(STREAM_CACHE_CAPACITY + 4, 1) {
+            cache.push(&p);
+        }
+        assert!(
+            cache.get(old.seq_no).is_none(),
+            "an evicted sequence number must not resolve to the newer packet in its slot"
         );
     }
 
@@ -444,5 +664,47 @@ mod test {
         }
         assert!(!cache.has_keyframe(), "an over-long GOP is not switchable");
         assert!(cache.replay().is_none());
+    }
+
+    /// A keyframe fragment that arrives after delta frames (due to network
+    /// reordering) produces a burst with non-monotonic timestamps in seq_no
+    /// order.  The egress switcher would output backwards RTP timestamps when
+    /// replaying such a burst, triggering the stream invariant violation.
+    /// The cache must refuse the replay and wait for a clean keyframe.
+    #[test]
+    fn replay_refused_when_late_idr_fragment_creates_non_monotonic_timestamps() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+
+        // Normal keyframe: SPS/PPS + 2 IDR frags (seq 1000-1002, ts=T0).
+        let kf = b.keyframe(2);
+        let kf_ts = kf[0].rtp_ts.numer();
+        for p in &kf {
+            cache.push(p);
+        }
+        assert!(cache.replay().is_some(), "clean keyframe is replayable");
+
+        // Delta frame (seq 1003-1003, ts=T1 > T0).
+        let delta = b.delta_frame(1);
+        let delta_ts = delta[0].rtp_ts.numer();
+        assert!(delta_ts > kf_ts, "delta must have a higher timestamp");
+        for p in &delta {
+            cache.push(p);
+        }
+
+        // Simulate a late IDR fragment: same ts as keyframe (T0) but
+        // seq_no higher than the delta packets (so it sorts last in the burst).
+        let delta_last_seq = *delta.last().unwrap().seq_no;
+        let mut late_frag = kf.last().unwrap().clone();
+        late_frag.seq_no = (delta_last_seq + 1).into();
+        // seq = delta_last_seq+1 is still within the keyframe's segment (same ts=T0).
+        cache.push(&late_frag);
+
+        // The burst is now [kf_seqs..., delta_seqs..., late_frag_seq] sorted by
+        // seq_no, with timestamps [T0, ..., T1, ..., T0] — non-monotonic.
+        assert!(
+            cache.replay().is_none(),
+            "a burst with non-monotonic timestamps must be refused to prevent egress violation"
+        );
     }
 }
