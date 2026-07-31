@@ -633,7 +633,11 @@ mod test {
 
         // The same keyframe packets are redelivered (reordering); none re-emit.
         ingest(&mut switcher, q, &mut cache, &kf, &mut out);
-        assert_eq!(out.len(), burst_len, "cursor prevents re-emitting the burst");
+        assert_eq!(
+            out.len(),
+            burst_len,
+            "cursor prevents re-emitting the burst"
+        );
     }
 
     #[test]
@@ -665,7 +669,8 @@ mod test {
             "output sequence never goes backwards across the switch"
         );
         assert!(
-            out.windows(2).all(|w| w[1].rtp_ts.numer() >= w[0].rtp_ts.numer()),
+            out.windows(2)
+                .all(|w| w[1].rtp_ts.numer() >= w[0].rtp_ts.numer()),
             "output timestamp never goes backwards across the switch"
         );
     }

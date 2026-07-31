@@ -31,7 +31,6 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
-
 pub const MIN_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
@@ -688,7 +687,10 @@ impl Slot {
                 .switcher
                 .draining_stream()
                 .is_some_and(|s| s.0 == *track_id)
-            || self.desired.as_ref().is_some_and(|l| l.meta.id == *track_id)
+            || self
+                .desired
+                .as_ref()
+                .is_some_and(|l| l.meta.id == *track_id)
     }
 }
 
@@ -2925,10 +2927,7 @@ mod slot_switch_tests {
             fx.ingest_all(&low, &mut lo_cache, &f);
         }
 
-        assert_eq!(
-            fx.slot.test_active(),
-            Some(low.stream_id())
-        );
+        assert_eq!(fx.slot.test_active(), Some(low.stream_id()));
         assert_decodable(&fx.emitted, "Slot::on_rtp across a simulcast switch");
     }
 
@@ -2994,10 +2993,7 @@ mod slot_switch_tests {
         // And once the publisher answers, the switch completes.
         let kf = lo.keyframe(2);
         assert!(fx.ingest_all(&low, &mut lo_cache, &kf));
-        assert_eq!(
-            fx.slot.test_active(),
-            Some(low.stream_id())
-        );
+        assert_eq!(fx.slot.test_active(), Some(low.stream_id()));
         assert_decodable(&fx.emitted, "deferred switch after PLI");
     }
 

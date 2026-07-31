@@ -147,7 +147,9 @@ impl StreamCache {
         let mut start = kf_seq;
         // Walk back over packets of the same frame. Bounded by the window.
         for _ in 0..STREAM_CACHE_CAPACITY {
-            let Some(prev) = start.checked_sub(1) else { break };
+            let Some(prev) = start.checked_sub(1) else {
+                break;
+            };
             match self.slot(prev) {
                 Some(p) if p.rtp_ts.numer() == frame_ts => start = prev,
                 _ => break,
@@ -449,7 +451,10 @@ mod test {
         // MAX_REPLAY_PACKETS + 10 sits above the per-frame cap (96) while well
         // below the hard cap (200), even accounting for SPS+PPS overhead (~2 pkts).
         let kf = b.keyframe(MAX_REPLAY_PACKETS + 10);
-        assert!(kf.len() > MAX_REPLAY_PACKETS, "fixture must exceed the per-frame cap");
+        assert!(
+            kf.len() > MAX_REPLAY_PACKETS,
+            "fixture must exceed the per-frame cap"
+        );
         assert!(
             kf.len() <= MAX_REPLAY_PACKETS_HARD,
             "fixture must not exceed the hard cap"
@@ -534,7 +539,11 @@ mod test {
         let cursor = burst.last().unwrap().seq_no;
 
         // Nothing new yet.
-        assert_eq!(cache.range_after(cursor).count(), 0, "no packets past cursor");
+        assert_eq!(
+            cache.range_after(cursor).count(),
+            0,
+            "no packets past cursor"
+        );
 
         // A live delta frame arrives.
         let delta = b.delta_frame(2);
