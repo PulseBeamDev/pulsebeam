@@ -133,8 +133,10 @@ impl VideoQuality {
         self
     }
 
-    /// Allow up to `n` sequence-number gaps (one per simulcast switch is normal).
-    pub fn allow_gaps_for_switches(mut self, n: u64) -> Self {
+    /// Allow up to `n` sequence-number gaps. One gap is normal per event that
+    /// breaks the egress sequence: a simulcast switch, or a pause/resume such as
+    /// a publisher partition, reconnect, or abrupt exit.
+    pub fn allow_gaps(mut self, n: u64) -> Self {
         self.max_non_contiguous = n;
         self
     }

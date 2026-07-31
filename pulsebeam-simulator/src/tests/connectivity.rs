@@ -226,7 +226,7 @@ fn network_impairment_test() {
             Step::CheckVideoQuality {
                 description: "Bob receives renderable video after recovery",
                 participant: "bob",
-                quality: VideoQuality::min_frames(200),
+                quality: VideoQuality::min_frames(200).allow_gaps(1),
             },
         ]);
 }
@@ -270,7 +270,7 @@ fn reconnection_recovery_test() {
             Step::CheckVideoQuality {
                 description: "Bob receives renderable video after Alice reconnects",
                 participant: "bob",
-                quality: VideoQuality::min_frames(100),
+                quality: VideoQuality::min_frames(100).allow_gaps(1),
             },
         ]);
 }
@@ -400,7 +400,7 @@ fn abrupt_exit_chaos_test() {
             description: "Observer kept receiving renderable frames despite chaos",
             participant: "observer",
             quality: VideoQuality::min_frames(100)
-                .allow_gaps_for_switches(4)
+                .allow_gaps(4)
                 .allow_missing_parameter_sets(1),
         },
     ]);

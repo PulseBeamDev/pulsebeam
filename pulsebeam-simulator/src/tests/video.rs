@@ -32,7 +32,7 @@ fn fast_initial_ramp_up_on_good_network_test() {
             Step::CheckVideoQuality {
                 description: "Bob received renderable frames throughout ramp",
                 participant: "bob",
-                quality: VideoQuality::min_frames(200).allow_gaps_for_switches(3),
+                quality: VideoQuality::min_frames(200).allow_gaps(3),
             },
         ]);
 }
@@ -98,7 +98,7 @@ fn repeated_simulcast_switching_stays_decodable_test() {
             Step::CheckVideoQuality {
                 description: "Frames remain decodable across 4 simulcast switches",
                 participant: "bob",
-                quality: VideoQuality::min_frames(100).allow_gaps_for_switches(4),
+                quality: VideoQuality::min_frames(100).allow_gaps(4),
             },
         ]);
 }
@@ -135,7 +135,7 @@ fn simulcast_stream_stability_test() {
             Step::CheckVideoQuality {
                 description: "Bob received renderable frames throughout soak",
                 participant: "bob",
-                quality: VideoQuality::min_frames(500).allow_gaps_for_switches(5),
+                quality: VideoQuality::min_frames(500).allow_gaps(5),
             },
         ]);
 }

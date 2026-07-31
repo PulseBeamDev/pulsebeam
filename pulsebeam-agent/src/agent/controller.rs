@@ -329,23 +329,31 @@ impl LayerController {
                 self.debt_ticks = 0;
                 tracing::info!(mid = ?key.0, rid = ?key.1, "bwe: pause layer");
             }
-        } else if debt <= 0.0
-            && let Some(key) = self
+        } else if debt <= 0.0 {
+            let surplus = -debt;
+            // Affordability is part of the search, not a check applied after it:
+            // testing only the most expensive paused layer and giving up when it
+            // does not fit would strand every cheaper layer paused forever.
+            let candidate = self
                 .order
                 .iter()
                 .rev()
-                .find(|k| self.states.get(*k).is_some_and(|s| s.paused))
-                .cloned()
-        {
-            let candidate_bps = self.states.get(&key).map_or(0.0, |s| s.bps);
-            let surplus = -debt;
-            if candidate_bps > 0.0 && candidate_bps <= surplus {
+                .find(|k| {
+                    self.states
+                        .get(*k)
+                        .is_some_and(|s| s.paused && s.bps > 0.0 && s.bps <= surplus)
+                })
+                .cloned();
+
+            if let Some(key) = candidate {
                 if let Some(s) = self.states.get_mut(&key) {
+                    debug_assert!(s.paused);
                     s.paused = false;
                 }
                 if let Some(n) = self.notifiers.get(&key) {
                     n.notify();
                 }
+                tracing::info!(mid = ?key.0, rid = ?key.1, "bwe: resume layer");
             }
         }
 
