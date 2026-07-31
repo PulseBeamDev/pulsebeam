@@ -1796,7 +1796,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "is"
 version = "0.10.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Foverusing-readiness#1c409153dedf70374731753ba73653bb6023723d"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-fixes#6a33ce4144bbfee75d55429a55c20fd9a8c2056d"
 dependencies = [
  "crc",
  "serde",
@@ -3689,7 +3689,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "str0m"
 version = "0.21.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Foverusing-readiness#1c409153dedf70374731753ba73653bb6023723d"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-fixes#6a33ce4144bbfee75d55429a55c20fd9a8c2056d"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -3710,7 +3710,7 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.5.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Foverusing-readiness#1c409153dedf70374731753ba73653bb6023723d"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-fixes#6a33ce4144bbfee75d55429a55c20fd9a8c2056d"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -3721,7 +3721,7 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.6.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Foverusing-readiness#1c409153dedf70374731753ba73653bb6023723d"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-fixes#6a33ce4144bbfee75d55429a55c20fd9a8c2056d"
 dependencies = [
  "base64ct",
  "dimpl",
@@ -3734,7 +3734,7 @@ dependencies = [
 [[package]]
 name = "str0m-wincrypto"
 version = "0.7.0"
-source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Foverusing-readiness#1c409153dedf70374731753ba73653bb6023723d"
+source = "git+https://github.com/PulseBeamDev/str0m.git?branch=feat%2Fbwe-fixes#6a33ce4144bbfee75d55429a55c20fd9a8c2056d"
 dependencies = [
  "str0m-proto",
  "tracing",

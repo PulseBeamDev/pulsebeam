@@ -60,6 +60,7 @@ pub struct VideoAllocator {
     rng: Rng,
     last_reconciled: HashSet<(TrackId, SlotKey)>,
     desired_ctrl: BitrateController,
+    current_allocation: Bitrate,
 }
 
 impl VideoAllocator {
@@ -80,6 +81,7 @@ impl VideoAllocator {
             rng: Rng::seed_from_u64(rng.next_u64()),
             last_reconciled: HashSet::new(),
             desired_ctrl,
+            current_allocation: Bitrate::ZERO,
         }
     }
 
@@ -297,12 +299,12 @@ impl VideoAllocator {
         let engine = AllocationEngine::new(&views);
         let decisions = engine.run_compute(available_bandwidth, &views);
         let desired_raw = engine.run_desired(&views);
-        let used = AllocationEngine::used_bitrate(&decisions);
-        debug_assert!(
-            desired_raw >= used,
-            "raw desired bitrate {desired_raw} is below allocated bitrate {used}"
-        );
-        let desired = self.desired_ctrl.update(desired_raw);
+        self.current_allocation = AllocationEngine::used_bitrate(&decisions);
+        let desired = self
+            .desired_ctrl
+            .update(desired_raw)
+            .max(self.current_allocation);
+        debug_assert!(self.current_allocation <= desired);
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
@@ -328,6 +330,10 @@ impl VideoAllocator {
         }
 
         (desired, changed)
+    }
+
+    pub fn current_allocation(&self) -> Bitrate {
+        self.current_allocation
     }
 
     pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<&TrackLayer> {
@@ -1523,6 +1529,8 @@ mod assignment_tests {
 
         let (desired, _) = allocator.update_allocations(Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
+        assert!(allocator.current_allocation().as_f64() > 0.0);
+        assert!(allocator.current_allocation() <= desired);
     }
 
     #[test]
