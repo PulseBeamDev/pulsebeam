@@ -4,6 +4,7 @@ use crate::tests::common::{
     start_sfu_node_tcp_only_multi_shard, subnet_ip,
 };
 use pulsebeam_agent::SimulcastLayer;
+use pulsebeam_agent::media::VbrProfile;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,11 @@ pub struct Participant {
     /// Number of RecvOnly video slots (for multi-subscriber participants). Default 1.
     pub slots: usize,
     pub starts_disconnected: bool,
+    /// Publish with a variable-bitrate source (screen sharing) instead of constant-rate.
+    pub vbr: Option<VbrProfile>,
+    /// Also receive video. A real conference participant both sends and receives; the plain
+    /// `publisher`/`subscriber` constructors keep the one-way shape used by older tests.
+    pub subscribes: bool,
 }
 
 impl Participant {
@@ -37,6 +43,8 @@ impl Participant {
             rids: rids.to_vec(),
             slots: 0,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
         }
     }
 
@@ -47,6 +55,8 @@ impl Participant {
             rids: Vec::new(),
             slots: 0,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
         }
     }
 
@@ -57,6 +67,8 @@ impl Participant {
             rids: Vec::new(),
             slots: 1,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
         }
     }
 
@@ -68,6 +80,8 @@ impl Participant {
             rids: Vec::new(),
             slots,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
         }
     }
 
@@ -79,7 +93,26 @@ impl Participant {
             rids: Vec::new(),
             slots: 0,
             starts_disconnected: false,
+            vbr: None,
+            subscribes: false,
         }
+    }
+
+    /// A publisher whose content is screen sharing: strongly variable bitrate, long static
+    /// stretches. This is the case that exercises str0m's probe controller, because the sender
+    /// sits in ALR whenever the screen is still.
+    pub fn screensharer(name: &'static str, rids: &[&'static str]) -> Self {
+        Self {
+            vbr: Some(VbrProfile::screenshare()),
+            ..Self::publisher(name, rids)
+        }
+    }
+
+    /// Also receive video, making this a full two-way conference participant.
+    pub fn and_subscribes(mut self) -> Self {
+        self.subscribes = true;
+        self.slots = self.slots.max(1);
+        self
     }
 
     pub fn starts_disconnected(mut self) -> Self {
@@ -452,6 +485,12 @@ async fn run_participant(
                     Some(config.rids.iter().map(|r| SimulcastLayer::new(r)).collect())
                 };
                 builder = builder.publish_video(layers);
+                if let Some(profile) = config.vbr {
+                    builder = builder.with_vbr(profile);
+                }
+                if config.subscribes {
+                    builder = builder.receive_video(config.slots.max(1));
+                }
             }
             Role::Subscriber => {
                 builder = builder.receive_video(config.slots.max(1));
@@ -461,7 +500,7 @@ async fn run_participant(
             }
         }
 
-        let auto_subscribe = matches!(config.role, Role::Subscriber);
+        let auto_subscribe = matches!(config.role, Role::Subscriber) || config.subscribes;
         let shared_clone = shared.clone();
         let mut client = builder
             .with_video_rx(shared.video_rx.clone())
@@ -1276,12 +1315,78 @@ fn assert_video_quality(
 
 // ── LocalNodeSim ────────────────────────────────────────────────────────────
 
+/// Characteristics of the simulated link between every pair of hosts.
+///
+/// **This matters enormously for congestion control.** turmoil's own default is a uniform
+/// random 0-100ms latency applied independently per message. That is not a network: it has no
+/// ordering correlation, so a burst of packets sent 2ms apart arrives smeared over 100ms in
+/// arbitrary order.
+///
+/// Inter-packet arrival spacing is precisely the signal GCC measures. Under turmoil's default,
+/// every probe under-reads its own send rate by 2-4x, the trendline estimator sees pure noise,
+/// and reordering is charged as packet loss - the loss controller settles on an 8-9% inherent
+/// loss estimate on a link that drops nothing. Any BWE conclusion drawn in that environment is
+/// an artifact of the simulator.
+///
+/// These profiles instead use a tight latency band, which is what a real path looks like:
+/// propagation delay is near-constant and jitter is small relative to it.
+///
+/// Note the jitter band must stay narrow even for "bad" networks. turmoil draws each message's
+/// latency *independently*, so a +/-15ms band reorders roughly 30 consecutive packets - far more
+/// than a real link, where packets queue in order behind one another. Measured against a 1% loss
+///configuration that produced 17-51% apparent loss, because the receiver counts not-yet-arrived packets as
+/// lost. Model a worse network by raising latency and loss, not by widening jitter.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkProfile {
+    pub min_latency: Duration,
+    pub max_latency: Duration,
+    /// Fraction of messages dropped outright, 0.0..=1.0.
+    pub loss: f64,
+}
+
+impl LinkProfile {
+    /// Wired/fibre: ~10ms RTT, minimal jitter, no loss. The default.
+    pub fn fiber() -> Self {
+        Self {
+            min_latency: Duration::from_millis(5),
+            max_latency: Duration::from_millis(6),
+            loss: 0.0,
+        }
+    }
+
+    /// Home Wi-Fi: a little more latency and jitter than wired, plus occasional loss.
+    pub fn wifi() -> Self {
+        Self {
+            min_latency: Duration::from_millis(8),
+            max_latency: Duration::from_millis(13),
+            loss: 0.002,
+        }
+    }
+
+    /// Mobile: markedly higher latency and 1% loss, with jitter kept narrow (see the note above
+    /// on why a wide band is not a realistic way to model a worse network).
+    pub fn cellular() -> Self {
+        Self {
+            min_latency: Duration::from_millis(45),
+            max_latency: Duration::from_millis(52),
+            loss: 0.01,
+        }
+    }
+}
+
+impl Default for LinkProfile {
+    fn default() -> Self {
+        Self::fiber()
+    }
+}
+
 pub struct LocalNodeSim {
     rooms: Vec<Room>,
     tick_duration: Duration,
     rng_seed: u64,
     tcp_only: bool,
     num_shards: usize,
+    link: LinkProfile,
 }
 
 impl Default for LocalNodeSim {
@@ -1298,7 +1403,14 @@ impl LocalNodeSim {
             rng_seed: 0xDEAD_BEEF,
             tcp_only: false,
             num_shards: 1,
+            link: LinkProfile::default(),
         }
+    }
+
+    /// Set the simulated link characteristics. See [`LinkProfile`].
+    pub fn with_link(mut self, link: LinkProfile) -> Self {
+        self.link = link;
+        self
     }
 
     pub fn with_room(mut self, r: Room) -> Self {
@@ -1343,6 +1455,9 @@ impl LocalNodeSim {
         let mut sim = turmoil::Builder::new()
             .simulation_duration(sim_duration)
             .tick_duration(self.tick_duration)
+            .min_message_latency(self.link.min_latency)
+            .max_message_latency(self.link.max_latency)
+            .fail_rate(self.link.loss)
             .rng_seed(self.rng_seed)
             .build();
 
