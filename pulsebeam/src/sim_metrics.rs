@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Debug, Default, Clone)]
 struct Samples {
     min_bwe_bps: Option<u64>,
+    max_bwe_bps: Option<u64>,
     last_bwe_bps: Option<u64>,
     /// Number of allocation passes observed. Distinguishes "estimate stayed high" from
     /// "nothing was ever recorded", which would otherwise both satisfy a minimum.
@@ -35,6 +36,10 @@ pub fn record_downstream_bwe(bwe_bps: u64) {
         Some(m) => m.min(bwe_bps),
         None => bwe_bps,
     });
+    s.max_bwe_bps = Some(match s.max_bwe_bps {
+        Some(m) => m.max(bwe_bps),
+        None => bwe_bps,
+    });
     s.last_bwe_bps = Some(bwe_bps);
     s.count += 1;
 }
@@ -45,13 +50,14 @@ pub fn reset() {
     *samples().lock().expect("sim metrics poisoned") = Samples::default();
 }
 
-/// Lowest downstream estimate seen on any participant since [`reset`], with the sample count.
+/// Downstream estimate summary since [`reset`]: `(min, max, last, sample_count)`.
 ///
 /// Returns `None` when nothing was recorded, so a test can tell an untested path from a healthy
-/// one rather than vacuously passing.
-pub fn min_downstream_bwe_bps() -> Option<(u64, u64)> {
+/// one rather than vacuously passing. The spread matters as much as the minimum: an estimate
+/// pinned at one value across hundreds of passes is a different failure from one that dips.
+pub fn downstream_bwe_summary() -> Option<(u64, u64, u64, u64)> {
     let s = samples().lock().expect("sim metrics poisoned");
-    s.min_bwe_bps.map(|m| (m, s.count))
+    Some((s.min_bwe_bps?, s.max_bwe_bps?, s.last_bwe_bps?, s.count))
 }
 
 /// Most recent downstream estimate seen on any participant since [`reset`].
