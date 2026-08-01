@@ -171,6 +171,15 @@ pub struct VbrProfile {
     /// Frame rate while static. Real encoders drop to a few frames per second, so the bitrate
     /// falls by roughly `active_fps / idle_fps`.
     pub idle_fps: u32,
+    /// Only emit frames at or below this size while static.
+    ///
+    /// Frame *rate* alone does not reproduce what a static screen does to the sender. A still
+    /// desktop encodes near-empty P-frames - tens to a couple of hundred bytes - where moving
+    /// content produces frames several times the MTU. That difference is what reaches congestion
+    /// control: padding is drawn from the RTX cache of recently sent packets, so a quiet screen
+    /// leaves only tiny packets to pad with, and str0m emits one padding packet per event-loop
+    /// round trip. A probe cluster then cannot reach a high target however long it runs.
+    pub idle_max_frame_bytes: usize,
 }
 
 impl VbrProfile {
@@ -184,28 +193,59 @@ impl VbrProfile {
             active_fps: 30,
             idle: Duration::from_secs(20),
             idle_fps: 2,
+            // Small enough to land in a single sub-MTU RTP packet, as a near-empty P-frame does.
+            idle_max_frame_bytes: 300,
         }
     }
 }
 
-/// An [`H264Looper`] whose frame rate follows a [`VbrProfile`], approximating a VBR encoder.
+/// An [`H264Looper`] whose output follows a [`VbrProfile`], approximating a VBR encoder.
 ///
-/// Frame rate is the lever rather than frame size because it is what a real encoder actually does
-/// with static content, and because it keeps every emitted frame a valid, decodable H.264 access
-/// unit - the receiver-side QoE checks in the simulator would reject synthesised partial frames.
+/// Varies both frame rate and frame size, because congestion control reacts to each differently:
+/// rate governs whether the sender is application-limited (and so whether str0m enters ALR), while
+/// size governs what ends up in the RTX cache and therefore how large a padding packet a probe can
+/// draw. Reproducing the production failure needs both.
+///
+/// Frames are always taken whole from the asset rather than synthesised, so every emitted frame
+/// stays a valid, decodable H.264 access unit - the receiver-side QoE checks would reject
+/// truncated ones.
 pub struct VbrLooper {
     asset: Arc<SharedH264Asset>,
     index: usize,
+    /// Indices of frames small enough to stand in for static content, ascending.
+    small: Vec<usize>,
+    small_index: usize,
     profile: VbrProfile,
 }
 
 impl VbrLooper {
     pub fn new(data: &[u8], profile: VbrProfile) -> Self {
+        let asset = Arc::new(SharedH264Asset::new(data));
+        let small: Vec<usize> = asset
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.len() <= profile.idle_max_frame_bytes)
+            .map(|(i, _)| i)
+            .collect();
         Self {
-            asset: Arc::new(SharedH264Asset::new(data)),
+            asset,
             index: 0,
+            small,
+            small_index: 0,
             profile,
         }
+    }
+
+    /// Next frame for the static phase: the smallest frames the asset has. Falls back to the
+    /// normal sequence when the asset has nothing small enough.
+    fn next_small(&mut self) -> Arc<[u8]> {
+        if self.small.is_empty() {
+            return self.next();
+        }
+        let idx = self.small[self.small_index % self.small.len()];
+        self.small_index = self.small_index.wrapping_add(1);
+        self.asset.frames[idx].clone()
     }
 
     fn next(&mut self) -> Arc<[u8]> {
@@ -237,7 +277,8 @@ impl VbrLooper {
             let now = tokio::time::Instant::now();
             let elapsed = now.duration_since(start);
 
-            let fps = if self.is_active(elapsed) {
+            let active = self.is_active(elapsed);
+            let fps = if active {
                 self.profile.active_fps
             } else {
                 self.profile.idle_fps
@@ -255,7 +296,7 @@ impl VbrLooper {
             // receiver would see the media clock stall during quiet stretches.
             let frame = MediaFrame {
                 ts: MediaTime::from_90khz((elapsed.as_secs_f64() * clock_rate) as u64),
-                data: self.next(),
+                data: if active { self.next() } else { self.next_small() },
                 capture_time: now,
                 abs_capture_time: Some(crate::clock::capture_wallclock()),
                 contiguous: true,

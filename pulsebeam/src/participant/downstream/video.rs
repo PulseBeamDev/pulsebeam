@@ -317,6 +317,17 @@ impl VideoAllocator {
             }
         }
 
+        // Record every pass, not just changed ones: a steady state holding a poisoned estimate
+        // is exactly the failure we want visible, and it produces no allocation changes at all.
+        //
+        // Only connections that are actually subscribed to something. A publish-only participant
+        // still runs this pass with no slots, and its idle downstream estimate decays to the
+        // configured floor - folding that into a minimum would swamp the signal we care about.
+        #[cfg(feature = "sim")]
+        if !views.is_empty() {
+            crate::sim_metrics::record_downstream_bwe(available_bandwidth.as_f64() as u64);
+        }
+
         if changed {
             log_allocation(self.ctx, available_bandwidth, desired, &decisions, &views);
         }
