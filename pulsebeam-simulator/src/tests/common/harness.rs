@@ -237,6 +237,18 @@ pub enum Step {
         participant: &'static str,
         subscriptions: Vec<VideoSubscription>,
     },
+    /// Subscribe to specific participants by name, at the given heights.
+    ///
+    /// Prefer this over [`Step::SubscribeAll`] whenever *which* track gets which height matters.
+    /// `SubscribeAll` applies heights round-robin over tracks sorted by runtime participant id,
+    /// which is generated per run - so `heights: &[720, 0]` hides an arbitrary participant rather
+    /// than a chosen one, and a test written that way is not reproducible.
+    SubscribeTo {
+        description: &'static str,
+        participant: &'static str,
+        /// `(publisher name, target height)`. Height `0` hides that stream.
+        targets: &'static [(&'static str, u32)],
+    },
     /// Subscribe the participant to ALL currently discovered video tracks.
     /// `heights` is applied round-robin to discovered tracks (sorted ascending).
     /// Example: heights=&[720, 180] with 2 tracks → track[0]@720, track[1]@180.
@@ -786,6 +798,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Reconnect { .. } => "Reconnect",
         Step::SetSubscriptions { .. } => "SetSubscriptions",
         Step::SubscribeAll { .. } => "SubscribeAll",
+        Step::SubscribeTo { .. } => "SubscribeTo",
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
@@ -924,6 +937,39 @@ async fn execute_plan(
                     .lock()
                     .unwrap()
                     .push(PendingDriverOp::SetSubscriptions(subscriptions.clone()));
+            }
+
+            Step::SubscribeTo {
+                description,
+                participant,
+                targets,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, targets={targets:?})"
+                );
+                let mut subs: Vec<VideoSubscription> = Vec::new();
+                for (name, height) in targets.iter() {
+                    let pub_handle = get_handle(handles, name, description)?;
+                    let id = pub_handle.shared.participant_id.lock().unwrap().clone();
+                    let id = id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "step \"{description}\": SubscribeTo target \"{name}\" has no runtime participant id yet; add a Step::Run before this step"
+                        )
+                    })?;
+                    subs.push(VideoSubscription {
+                        participant_id: id,
+                        height: *height,
+                        min_height: 0,
+                        priority: 0,
+                    });
+                }
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::SetSubscriptions(subs));
             }
 
             Step::SubscribeAll {
@@ -1162,15 +1208,15 @@ async fn execute_plan(
                 tracing::info!(
                     "[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)"
                 );
-                let observed = pulsebeam::sim_metrics::min_downstream_bwe_bps();
-                let Some((min_seen, count)) = observed else {
+                let observed = pulsebeam::sim_metrics::downstream_bwe_summary();
+                let Some((min_seen, max_seen, last_seen, count)) = observed else {
                     panic!(
                         "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps\n  actual:       no allocation passes observed - the check would pass vacuously"
                     );
                 };
                 assert!(
                     min_seen >= *min_bps,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       {min_seen} bps (low-water mark over {count} allocation passes)"
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       min {min_seen} / max {max_seen} / last {last_seen} bps over {count} allocation passes"
                 );
             }
             Step::CheckRxBytesInterval {
